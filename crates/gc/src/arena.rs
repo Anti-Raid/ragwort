@@ -227,6 +227,22 @@ impl<'gc> Mutation<'gc> {
         self.alloc_inline(head, items.len(), |i| items[i])
     }
 
+    /// Allocates `len` items set to `item`, lets `init` fill them in, and keeps the first
+    /// items as many as `init` returns. For results whose length is only known once computed.
+    pub fn alloc_inline_with<T: Inline + Plain<'gc> + 'gc>(
+        &self,
+        head: T,
+        len: usize,
+        item: T::Item,
+        init: impl FnOnce(&mut [T::Item]) -> usize,
+    ) -> Result<Gc<'gc, T>, OutOfMemory>
+    where
+        T::Item: Plain<'gc> + Copy,
+    {
+        let ptr = self.heap.alloc_inline_with(head, len, item, init)?;
+        Ok(unsafe { Gc::from_raw(ptr) })
+    }
+
     /// Has `object` traced again before the next collection finishes. Call it in the same
     /// step as any `Lock::set_unbarriered` on the object's fields, after the last such write.
     pub fn retrace<T>(&self, object: Gc<'gc, T>) {

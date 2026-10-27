@@ -1,7 +1,7 @@
 //! A `Gc` can't escape the step that produced it:
 //!
 //! ```compile_fail
-//! use ragwort::gc::{Arena, Rootable};
+//! use ragwort_gc::{Arena, Rootable};
 //! struct R;
 //! impl Rootable for R { type Root<'gc> = (); }
 //! let mut arena = Arena::<R>::new(1 << 20, |_| Ok(())).unwrap();
@@ -11,7 +11,7 @@
 //! A reference from one arena can't be stored in another:
 //!
 //! ```compile_fail
-//! use ragwort::gc::{Arena, Lock, Member, Rootable};
+//! use ragwort_gc::{Arena, Lock, Member, Rootable};
 //! struct R;
 //! impl Rootable for R { type Root<'gc> = Lock<Option<Member<'gc, i64>>>; }
 //! let mut a = Arena::<R>::new(1 << 20, |_| Ok(Lock::new(None))).unwrap();
@@ -26,7 +26,7 @@
 //! write barrier on the wrong heap:
 //!
 //! ```compile_fail
-//! use ragwort::gc::{Arena, Lock, Member, Rootable};
+//! use ragwort_gc::{Arena, Lock, Member, Rootable};
 //! struct R;
 //! impl Rootable for R { type Root<'gc> = Lock<Option<Member<'gc, i64>>>; }
 //! let mut a = Arena::<R>::new(1 << 20, |_| Ok(Lock::new(None))).unwrap();
@@ -40,7 +40,7 @@
 //! Types that aren't `Plain` can't be allocated:
 //!
 //! ```compile_fail,E0277
-//! use ragwort::gc::{Arena, Rootable, Trace, Tracer};
+//! use ragwort_gc::{Arena, Rootable, Trace, Tracer};
 //! struct Flag(bool);
 //! unsafe impl Trace for Flag { const NEEDS_TRACE: bool = false; fn trace(&mut self, _: &mut Tracer) {} }
 //! struct R;
@@ -54,7 +54,7 @@
 //!
 //! ```compile_fail,E0277
 //! use std::num::NonZeroU32;
-//! use ragwort::gc::{Arena, Member, Rootable};
+//! use ragwort_gc::{Arena, Member, Rootable};
 //! struct Flag(bool);
 //! struct R;
 //! impl Rootable for R { type Root<'gc> = (); }
@@ -69,7 +69,7 @@
 //!
 //! ```compile_fail,E0080
 //! use std::num::NonZeroU32;
-//! use ragwort::gc::{Arena, Member, Rootable};
+//! use ragwort_gc::{Arena, Member, Rootable};
 //! struct R;
 //! impl Rootable for R { type Root<'gc> = (); }
 //! let mut arena = Arena::<R>::new(1 << 20, |_| Ok(())).unwrap();
@@ -81,7 +81,7 @@
 //!
 //! ```compile_fail,E0080
 //! use std::num::NonZeroU32;
-//! use ragwort::gc::{Arena, Member, Rootable};
+//! use ragwort_gc::{Arena, Member, Rootable};
 //! struct R;
 //! impl Rootable for R { type Root<'gc> = (); }
 //! let mut arena = Arena::<R>::new(1 << 20, |_| Ok(())).unwrap();
@@ -94,7 +94,7 @@
 //! A derived `Plain` type can't have padding, and every field must be `Plain`:
 //!
 //! ```compile_fail,E0080
-//! use ragwort::gc::{Arena, Plain, Rootable, Trace};
+//! use ragwort_gc::{Arena, Plain, Rootable, Trace};
 //! #[derive(Trace, Plain)]
 //! struct Padded { a: u8, b: u32 }
 //! struct R;
@@ -107,19 +107,19 @@
 //! never allocated:
 //!
 //! ```compile_fail,E0080
-//! use ragwort::gc::{Member, Plain};
+//! use ragwort_gc::{Member, Plain};
 //! #[derive(Plain)]
 //! struct Padded<'gc> { a: u8, b: Option<Member<'gc, u8>> }
 //! ```
 //!
 //! ```compile_fail,E0277
-//! use ragwort::gc::{Plain, Trace};
+//! use ragwort_gc::{Plain, Trace};
 //! #[derive(Trace, Plain)]
 //! struct HasBool { a: bool }
 //! ```
 //!
 //! ```compile_fail
-//! use ragwort::gc::Plain;
+//! use ragwort_gc::Plain;
 //! #[derive(Plain)]
 //! enum E { A, B }
 //! ```
@@ -127,7 +127,7 @@
 //! `u128` needs 16-byte alignment, which the arena doesn't give, so it isn't `Plain`:
 //!
 //! ```compile_fail,E0277
-//! use ragwort::gc::{Arena, Rootable};
+//! use ragwort_gc::{Arena, Rootable};
 //! struct R;
 //! impl Rootable for R { type Root<'gc> = (); }
 //! let mut arena = Arena::<R>::new(1 << 20, |_| Ok(())).unwrap();
@@ -137,7 +137,7 @@
 //! Full pointers can't be stored in the heap or the root; only `Member`s can:
 //!
 //! ```compile_fail,E0277
-//! use ragwort::gc::{Gc, Lock, Rootable};
+//! use ragwort_gc::{Gc, Lock, Rootable};
 //! struct R;
 //! impl Rootable for R { type Root<'gc> = Lock<Option<Gc<'gc, i64>>>; }
 //! ```
@@ -145,7 +145,7 @@
 //! Arenas stay on their thread:
 //!
 //! ```compile_fail,E0277
-//! use ragwort::gc::{Arena, Rootable};
+//! use ragwort_gc::{Arena, Rootable};
 //! struct R;
 //! impl Rootable for R { type Root<'gc> = (); }
 //! fn send<T: Send>() {}
@@ -153,19 +153,19 @@
 //! ```
 //!
 //! ```compile_fail,E0277
-//! use ragwort::gc::Gc;
+//! use ragwort_gc::Gc;
 //! fn send<T: Send>() {}
 //! send::<Gc<'static, i64>>();
 //! ```
 //!
 //! ```compile_fail,E0277
-//! use ragwort::gc::Mutation;
+//! use ragwort_gc::Mutation;
 //! fn send<T: Send>() {}
 //! send::<Mutation<'static>>();
 //! ```
 //!
 //! ```compile_fail,E0277
-//! use ragwort::gc::{Member, Root, Rooted};
+//! use ragwort_gc::{Member, Root, Rooted};
 //! struct K;
 //! impl Rooted for K { type Of<'gc> = Member<'gc, i64>; }
 //! fn send<T: Send>() {}
@@ -175,11 +175,11 @@
 //! Inline types can't go through `alloc`:
 //!
 //! ```compile_fail,E0080
-//! use ragwort::gc::{Arena, Inline, Rootable, Trace, Tracer};
+//! use ragwort_gc::{Arena, Inline, Rootable, Trace, Tracer};
 //! struct S;
 //! unsafe impl Trace for S { const INLINE: bool = true; fn trace(&mut self, _: &mut Tracer) {} }
 //! unsafe impl Inline for S { type Item = u8; }
-//! unsafe impl ragwort::gc::Plain for S {}
+//! unsafe impl ragwort_gc::Plain for S {}
 //! struct R;
 //! impl Rootable for R { type Root<'gc> = (); }
 //! let mut arena = Arena::<R>::new(1 << 20, |_| Ok(())).unwrap();
@@ -189,11 +189,11 @@
 //! Arena objects can't have drop glue (host data goes through `HostRef`):
 //!
 //! ```compile_fail,E0080
-//! use ragwort::gc::{Arena, Rootable, Trace, Tracer};
+//! use ragwort_gc::{Arena, Rootable, Trace, Tracer};
 //! struct D;
 //! impl Drop for D { fn drop(&mut self) {} }
 //! unsafe impl Trace for D { const NEEDS_TRACE: bool = false; fn trace(&mut self, _: &mut Tracer) {} }
-//! unsafe impl ragwort::gc::Plain for D {}
+//! unsafe impl ragwort_gc::Plain for D {}
 //! struct R;
 //! impl Rootable for R { type Root<'gc> = (); }
 //! let mut arena = Arena::<R>::new(1 << 20, |_| Ok(())).unwrap();
@@ -205,7 +205,7 @@
 //!
 //! ```compile_fail,E0080
 //! use std::collections::HashMap;
-//! use ragwort::gc::{Arena, Member, Rootable};
+//! use ragwort_gc::{Arena, Member, Rootable};
 //! struct R;
 //! impl Rootable for R { type Root<'gc> = HashMap<Member<'gc, i64>, i64>; }
 //! let mut arena = Arena::<R>::new(1 << 20, |_| Ok(HashMap::new())).unwrap();
@@ -217,7 +217,7 @@
 //!
 //! ```compile_fail,E0277
 //! use std::cell::RefCell;
-//! use ragwort::gc::{Arena, Rootable, Value};
+//! use ragwort_gc::{Arena, Rootable, Value};
 //! struct R;
 //! impl Rootable for R { type Root<'gc> = (); }
 //! let mut arena = Arena::<R>::new(1 << 20, |_| Ok(())).unwrap();
@@ -227,7 +227,7 @@
 //! A `Value` is branded like any other reference, so it can't leave its step:
 //!
 //! ```compile_fail
-//! use ragwort::gc::{Arena, Rootable, Value};
+//! use ragwort_gc::{Arena, Rootable, Value};
 //! struct R;
 //! impl Rootable for R { type Root<'gc> = (); }
 //! let mut arena = Arena::<R>::new(1 << 20, |_| Ok(())).unwrap();
@@ -237,7 +237,7 @@
 //! A type tag holds an arena's type index, so it can't leave its step:
 //!
 //! ```compile_fail
-//! use ragwort::gc::{Arena, Rootable};
+//! use ragwort_gc::{Arena, Rootable};
 //! struct R;
 //! impl Rootable for R { type Root<'gc> = (); }
 //! let mut arena = Arena::<R>::new(1 << 20, |_| Ok(())).unwrap();
@@ -247,7 +247,7 @@
 //! An inline type needs an inline type tag, which would otherwise never match:
 //!
 //! ```compile_fail,E0080
-//! use ragwort::gc::{Arena, Array, Rootable};
+//! use ragwort_gc::{Arena, Array, Rootable};
 //! struct R;
 //! impl Rootable for R { type Root<'gc> = (); }
 //! let mut arena = Arena::<R>::new(1 << 20, |_| Ok(())).unwrap();
@@ -258,7 +258,7 @@
 //! outlives every brand, an object's references could be carried into another arena:
 //!
 //! ```compile_fail
-//! use ragwort::gc::{AnyRef, Arena, Lock, Plain, Rootable, Trace, Value};
+//! use ragwort_gc::{AnyRef, Arena, Lock, Plain, Rootable, Trace, Value};
 //! #[derive(Trace, Plain)]
 //! struct Slot<'gc> { value: Lock<Value<'gc>> }
 //! struct R;
@@ -271,7 +271,7 @@
 //! ```
 //!
 //! ```compile_fail
-//! use ragwort::gc::{Arena, Lock, Plain, Rootable, Trace, Value};
+//! use ragwort_gc::{Arena, Lock, Plain, Rootable, Trace, Value};
 //! #[derive(Trace, Plain)]
 //! struct Slot<'gc> { value: Lock<Value<'gc>> }
 //! struct R;
@@ -281,7 +281,7 @@
 //! ```
 //!
 //! ```compile_fail
-//! use ragwort::gc::{Arena, Lock, Plain, Rootable, Trace, Value};
+//! use ragwort_gc::{Arena, Lock, Plain, Rootable, Trace, Value};
 //! #[derive(Trace, Plain)]
 //! struct Slot<'gc> { value: Lock<Value<'gc>> }
 //! struct R;
@@ -293,7 +293,7 @@
 //! A type without a lifetime that holds `'static`-branded references can never be allocated:
 //!
 //! ```compile_fail
-//! use ragwort::gc::{Arena, Lock, Plain, Rootable, Trace, Value};
+//! use ragwort_gc::{Arena, Lock, Plain, Rootable, Trace, Value};
 //! #[derive(Trace, Plain)]
 //! struct Unbranded { value: Lock<Value<'static>> }
 //! struct R;
@@ -305,7 +305,7 @@
 //! And a type with two lifetimes would have two brands:
 //!
 //! ```compile_fail
-//! use ragwort::gc::{Lock, Plain, Value};
+//! use ragwort_gc::{Lock, Plain, Value};
 //! #[derive(Plain)]
 //! struct Two<'a, 'b> { a: Lock<Value<'a>>, b: Lock<Value<'b>> }
 //! ```
@@ -314,7 +314,7 @@
 //! parks, when its slots stop being traced as a root:
 //!
 //! ```compile_fail,E0502
-//! use ragwort::gc::{Arena, Rootable, Segment, Value};
+//! use ragwort_gc::{Arena, Rootable, Segment, Value};
 //! struct R;
 //! impl Rootable for R { type Root<'gc> = (); }
 //! let mut a = Arena::<R>::new(1 << 20, |_| Ok(())).unwrap();
@@ -329,7 +329,7 @@
 //! Nor can it leave the step:
 //!
 //! ```compile_fail
-//! use ragwort::gc::{Arena, Frame, Rootable, Segment};
+//! use ragwort_gc::{Arena, Frame, Rootable, Segment};
 //! struct R;
 //! impl Rootable for R { type Root<'gc> = (); }
 //! let mut a = Arena::<R>::new(1 << 20, |_| Ok(())).unwrap();
@@ -342,7 +342,7 @@
 //!
 //! ```compile_fail
 //! use std::marker::PhantomData;
-//! use ragwort::gc::{Arena, Lock, Member, Plain, Rootable, Trace, Value};
+//! use ragwort_gc::{Arena, Lock, Member, Plain, Rootable, Trace, Value};
 //! #[derive(Trace, Plain)]
 //! #[gc(items = Lock<T>)]
 //! struct Arr<T>(PhantomData<T>);

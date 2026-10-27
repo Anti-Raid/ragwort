@@ -1,0 +1,16 @@
+[package]
+name = "ragwort-gc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ragwort-derive = { path = "../derive" }
+memmap2 = { version = "0.9.12", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[features]
+default = ["mmap"]
+mmap = ["dep:memmap2", "dep:libc"]
+gc-verify = []

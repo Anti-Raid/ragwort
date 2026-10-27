@@ -1,7 +1,7 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use ragwort::gc::*;
+use ragwort_gc::*;
 
 #[derive(Trace, Plain)]
 struct Node<'gc> {

@@ -1,4 +1,4 @@
-//! Derives for `ragwort::gc::Trace` and `ragwort::gc::Plain`, so arena types need no unsafe.
+//! Derives for `ragwort_gc::Trace` and `ragwort_gc::Plain`, so arena types need no unsafe.
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -52,7 +52,7 @@ fn trace_body(data: &Data) -> (Vec<Type>, TokenStream) {
     match data {
         Data::Struct(s) => {
             let (types, pattern, names) = bind(&s.fields);
-            (types, quote!(let Self #pattern = self; #(::ragwort::gc::Trace::trace(#names, t);)*))
+            (types, quote!(let Self #pattern = self; #(::ragwort_gc::Trace::trace(#names, t);)*))
         }
         Data::Enum(e) => {
             let mut all = Vec::new();
@@ -60,7 +60,7 @@ fn trace_body(data: &Data) -> (Vec<Type>, TokenStream) {
                 let (types, pattern, names) = bind(&v.fields);
                 all.extend(types);
                 let ident = &v.ident;
-                quote!(Self::#ident #pattern => { #(::ragwort::gc::Trace::trace(#names, t);)* })
+                quote!(Self::#ident #pattern => { #(::ragwort_gc::Trace::trace(#names, t);)* })
             });
             let arms: Vec<_> = arms.collect();
             (all, quote!(match self { #(#arms)* }))
@@ -78,26 +78,26 @@ fn trace(input: DeriveInput) -> syn::Result<TokenStream> {
     if generics.type_params().next().is_some() {
         let clause = generics.make_where_clause();
         for ty in types.iter().chain(&items) {
-            clause.predicates.push(parse_quote!(#ty: ::ragwort::gc::Trace));
+            clause.predicates.push(parse_quote!(#ty: ::ragwort_gc::Trace));
         }
     }
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let inline = items.as_ref().map(|items| {
         quote! {
-            unsafe impl #impl_generics ::ragwort::gc::Inline for #name #ty_generics #where_clause {
+            unsafe impl #impl_generics ::ragwort_gc::Inline for #name #ty_generics #where_clause {
                 type Item = #items;
             }
         }
     });
     let inline_const = items.is_some().then(|| quote!(const INLINE: bool = true;));
     Ok(quote! {
-        unsafe impl #impl_generics ::ragwort::gc::Trace for #name #ty_generics #where_clause {
-            const NEEDS_TRACE: bool = false #(|| <#types as ::ragwort::gc::Trace>::NEEDS_TRACE)*;
+        unsafe impl #impl_generics ::ragwort_gc::Trace for #name #ty_generics #where_clause {
+            const NEEDS_TRACE: bool = false #(|| <#types as ::ragwort_gc::Trace>::NEEDS_TRACE)*;
             #inline_const
 
             #[inline]
             #[allow(unused_variables)]
-            fn trace(&mut self, t: &mut ::ragwort::gc::Tracer<'_>) {
+            fn trace(&mut self, t: &mut ::ragwort_gc::Tracer<'_>) {
                 #body
             }
         }
@@ -127,7 +127,7 @@ fn plain(input: DeriveInput) -> syn::Result<TokenStream> {
     });
     let clause = generics.make_where_clause();
     for ty in types.iter().chain(&items) {
-        clause.predicates.push(parse_quote!(#ty: ::ragwort::gc::Plain<#brand>));
+        clause.predicates.push(parse_quote!(#ty: ::ragwort_gc::Plain<#brand>));
     }
     let (impl_generics, _, where_clause) = generics.split_for_impl();
     let message = format!("`{name}` has padding bytes; add explicit fields to fill them");
@@ -136,16 +136,16 @@ fn plain(input: DeriveInput) -> syn::Result<TokenStream> {
     let eager = (input.generics.type_params().next().is_none() && input.generics.const_params().next().is_none())
         .then(|| {
             let args = (!lifetimes.is_empty()).then(|| quote!(<'static>));
-            quote! { const _: () = <#name #args as ::ragwort::gc::Plain<'static>>::CHECK; }
+            quote! { const _: () = <#name #args as ::ragwort_gc::Plain<'static>>::CHECK; }
         });
     let items_iter = items.iter();
     Ok(quote! {
         #eager
-        unsafe impl #impl_generics ::ragwort::gc::Plain<#brand> for #name #ty_generics #where_clause {
+        unsafe impl #impl_generics ::ragwort_gc::Plain<#brand> for #name #ty_generics #where_clause {
             #[doc(hidden)]
             const CHECK: () = {
-                #(let () = <#types as ::ragwort::gc::Plain<#brand>>::CHECK;)*
-                #(let () = <#items_iter as ::ragwort::gc::Plain<#brand>>::CHECK;)*
+                #(let () = <#types as ::ragwort_gc::Plain<#brand>>::CHECK;)*
+                #(let () = <#items_iter as ::ragwort_gc::Plain<#brand>>::CHECK;)*
                 assert!(::core::mem::size_of::<Self>() == 0 #(+ ::core::mem::size_of::<#types>())*, #message);
             };
         }

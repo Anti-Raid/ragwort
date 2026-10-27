@@ -1,6 +1,6 @@
-extern crate self as ragwort;
+pub use ragwort_gc as gc;
 
-pub mod gc;
+pub mod num;
 
 pub enum Expr {
     Begin { exprs: Vec<Expr> },

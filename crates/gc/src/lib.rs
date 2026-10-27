@@ -1,3 +1,7 @@
+//! The arena: a garbage collected heap for one interpreter, with segmented stacks.
+
+extern crate self as ragwort_gc;
+
 mod arena;
 mod budget;
 mod heap;

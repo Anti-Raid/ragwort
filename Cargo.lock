@@ -39,9 +39,8 @@ dependencies = [
 name = "ragwort"
 version = "0.1.0"
 dependencies = [
- "libc",
- "memmap2",
- "ragwort-derive",
+ "ragwort-gc",
+ "ragwort-num",
 ]
 
 [[package]]
@@ -52,6 +51,19 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "ragwort-gc"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "memmap2",
+ "ragwort-derive",
+]
+
+[[package]]
+name = "ragwort-num"
+version = "0.1.0"
 
 [[package]]
 name = "syn"
