@@ -309,3 +309,50 @@
 //! #[derive(Plain)]
 //! struct Two<'a, 'b> { a: Lock<Value<'a>>, b: Lock<Value<'b>> }
 //! ```
+//!
+//! A frame borrows its stack, so it can't be written after the stack captures, switches or
+//! parks, when its slots stop being traced as a root:
+//!
+//! ```compile_fail,E0502
+//! use ragwort::gc::{Arena, Rootable, Segment, Value};
+//! struct R;
+//! impl Rootable for R { type Root<'gc> = (); }
+//! let mut a = Arena::<R>::new(1 << 20, |_| Ok(())).unwrap();
+//! a.mutate(|mc, _| {
+//!     let mut stack = mc.stack(Segment::new(mc, 512).unwrap()).unwrap();
+//!     let frame = stack.frame(mc, 0).unwrap();
+//!     stack.capture(mc, 8);
+//!     frame.set(0, Value::TRUE);
+//! });
+//! ```
+//!
+//! Nor can it leave the step:
+//!
+//! ```compile_fail
+//! use ragwort::gc::{Arena, Frame, Rootable, Segment};
+//! struct R;
+//! impl Rootable for R { type Root<'gc> = (); }
+//! let mut a = Arena::<R>::new(1 << 20, |_| Ok(())).unwrap();
+//! let stack = a.mutate(|mc, _| mc.stack(Segment::new(mc, 512).unwrap()).unwrap());
+//! let _frame: Frame<'_, 'static> = a.mutate(|mc, _| stack.frame(mc, 0).unwrap());
+//! ```
+//!
+//! Inline items carry the brand too, so a generic inline type can't be viewed with
+//! `'static`-branded items:
+//!
+//! ```compile_fail
+//! use std::marker::PhantomData;
+//! use ragwort::gc::{Arena, Lock, Member, Plain, Rootable, Trace, Value};
+//! #[derive(Trace, Plain)]
+//! #[gc(items = Lock<T>)]
+//! struct Arr<T>(PhantomData<T>);
+//! struct R;
+//! impl Rootable for R { type Root<'gc> = Lock<Value<'gc>>; }
+//! let mut a = Arena::<R>::new(1 << 20, |_| Ok(Lock::new(Value::NIL))).unwrap();
+//! let _: Option<Member<'static, u64>> = a.mutate(|mc, root| {
+//!     let x = mc.alloc(7u64).unwrap();
+//!     let arr = mc.alloc_inline(Arr(PhantomData), 1, |_| Lock::new(Some(Member::new(mc, x)))).unwrap();
+//!     root.set(mc, Value::object(mc, arr));
+//!     root.get().downcast::<Arr<Option<Member<'static, u64>>>>(mc).unwrap().items()[0].get()
+//! });
+//! ```

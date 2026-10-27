@@ -111,8 +111,9 @@ fn plain(input: DeriveInput) -> syn::Result<TokenStream> {
         return Err(syn::Error::new_spanned(name, "only structs can be Plain: an enum has invalid bit patterns"));
     };
     let types: Vec<Type> = data.fields.iter().map(|f| f.ty.clone()).collect();
-    // The type's one lifetime is its arena brand. Every field must carry that same brand, so
-    // the type can't be read with references from another arena.
+    let items = items_attr(&input)?;
+    // The type's one lifetime is its arena brand. Every field and the inline items must carry
+    // that same brand, so the type can't be read with references from another arena.
     let lifetimes: Vec<_> = input.generics.lifetimes().map(|l| l.lifetime.clone()).collect();
     if lifetimes.len() > 1 {
         return Err(syn::Error::new_spanned(&input.generics, "a Plain type can have at most one lifetime, its arena brand"));
@@ -125,7 +126,7 @@ fn plain(input: DeriveInput) -> syn::Result<TokenStream> {
         brand
     });
     let clause = generics.make_where_clause();
-    for ty in &types {
+    for ty in types.iter().chain(&items) {
         clause.predicates.push(parse_quote!(#ty: ::ragwort::gc::Plain<#brand>));
     }
     let (impl_generics, _, where_clause) = generics.split_for_impl();
@@ -137,12 +138,14 @@ fn plain(input: DeriveInput) -> syn::Result<TokenStream> {
             let args = (!lifetimes.is_empty()).then(|| quote!(<'static>));
             quote! { const _: () = <#name #args as ::ragwort::gc::Plain<'static>>::CHECK; }
         });
+    let items_iter = items.iter();
     Ok(quote! {
         #eager
         unsafe impl #impl_generics ::ragwort::gc::Plain<#brand> for #name #ty_generics #where_clause {
             #[doc(hidden)]
             const CHECK: () = {
                 #(let () = <#types as ::ragwort::gc::Plain<#brand>>::CHECK;)*
+                #(let () = <#items_iter as ::ragwort::gc::Plain<#brand>>::CHECK;)*
                 assert!(::core::mem::size_of::<Self>() == 0 #(+ ::core::mem::size_of::<#types>())*, #message);
             };
         }

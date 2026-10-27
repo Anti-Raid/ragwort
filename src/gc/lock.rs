@@ -88,7 +88,7 @@ impl<T: Copy + Trace> Lock<T> {
         Self::barrier_range(mc, dst, T::NEEDS_TRACE && value.holds_refs());
     }
 
-    fn barrier_range(mc: &Mutation<'_>, slots: &[Self], refs: bool) {
+    pub(crate) fn barrier_range(mc: &Mutation<'_>, slots: &[Self], refs: bool) {
         if refs {
             mc.heap.barrier_range(slots.as_ptr().addr(), size_of_val(slots), |t| {
                 for slot in slots {

@@ -2,6 +2,7 @@ use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
 use std::mem::{self, needs_drop};
 use std::ptr::{self, NonNull};
+use std::slice;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -13,6 +14,7 @@ use super::layout::{
 };
 use super::region::{self, Region};
 use super::root::{ROOT_COST, RootEntry};
+use super::stack::StackRecord;
 use super::table::Table;
 use super::trace::Mode;
 use super::{Inline, OutOfMemory, Phase, Plain, Trace, Tracer};
@@ -234,6 +236,7 @@ pub(crate) struct Heap {
     gray_limit: Cell<usize>,
     overflowed: Cell<bool>,
     pub(crate) roots: RefCell<Table<Rc<dyn RootEntry>>>,
+    pub(crate) stacks: RefCell<Table<Rc<StackRecord>>>,
     pub(crate) hosts: Hosts,
     phase: Cell<Phase>,
     cursor: Cell<usize>,
@@ -279,6 +282,7 @@ impl Heap {
             gray_limit: Cell::new(GRAY_CAPACITY),
             overflowed: Cell::new(false),
             roots: RefCell::new(Table::new()),
+            stacks: RefCell::new(Table::new()),
             hosts: Hosts::new(),
             phase: Cell::new(Phase::Idle),
             cursor: Cell::new(0),
@@ -443,23 +447,45 @@ impl Heap {
         check as u16 == ty && self.checks_out(offset, check)
     }
 
+    /// The items of the object at `offset`, if it's a `T`, for the collector.
+    ///
+    /// # Safety
+    /// Nothing else may reference the object's memory while the slice is in use.
+    #[allow(clippy::mut_from_ref)]
+    pub(crate) unsafe fn items_mut<T: Inline>(&self, offset: u32) -> Option<&mut [T::Item]> {
+        let obj = self.object_at(offset)?;
+        let (vtable, _) = self.size_of(obj)?;
+        let id: fn() -> TypeId = layout::type_id::<T>;
+        if !(ptr::fn_addr_eq(vtable.type_id, id) || (vtable.type_id)() == id()) {
+            return None;
+        }
+        // The vtable is `T`'s, and `size_of` checked that `len` items fit in the object.
+        unsafe {
+            let header = self.header_ptr(offset);
+            let len = ((*header).len as usize).min(layout::max_items::<T>());
+            let items = layout::inline_items::<T>(layout::value_ptr::<T>(header));
+            Some(slice::from_raw_parts_mut(items, len))
+        }
+    }
+
     /// The check bits for a reference to the object at `offset`.
     pub(crate) fn check_at(&self, offset: u32) -> u32 {
         layout::check_bits(self.header_at(offset))
     }
 
     /// Whether a reference's check bits match its object's header. A mismatch means the
-    /// reference outlived its object or was damaged, and marks the arena corrupted.
+    /// reference outlived its object or was damaged, and marks the arena corrupted. Stamps are
+    /// never zero, so zeroed memory never checks out.
     #[inline]
     pub(crate) fn checks_out(&self, offset: u32, check: u32) -> bool {
-        let ok = self.check_at(offset) == check;
+        let ok = check >> 16 != 0 && self.check_at(offset) == check;
         if !ok {
             self.corrupt();
         }
         ok
     }
 
-    /// The next allocation stamp, never zero, so a zeroed header never checks out.
+    /// The next allocation stamp, never zero.
     fn stamp(&self) -> u16 {
         let stamp = self.stamp.get() % (STAMPS - 1) + 1;
         self.stamp.set(stamp);
@@ -1115,6 +1141,18 @@ impl Heap {
         for entry in roots.iter() {
             entry.trace(&mut t);
         }
+        let mut stacks = self.stacks.borrow_mut();
+        for stack in stacks.iter() {
+            stack.trace(self, &mut t);
+        }
+        // A dropped stack's frames were written without a barrier, so it's only let go after
+        // this last trace.
+        if mode == Mode::Mark {
+            let before = stacks.len();
+            stacks.retain(|stack| Rc::strong_count(stack) > 1);
+            self.budget.refund((before - stacks.len()) * ROOT_COST);
+            stacks.shrink(&self.budget);
+        }
     }
 
     /// Marks everything reachable that isn't marked yet, and settles ephemerons.
@@ -1297,6 +1335,8 @@ impl Heap {
             each_bit(&p.live(), |g| {
                 let offset = granule_offset(page, g);
                 if self.moved(offset) {
+                    // References to the old copy were all rewritten, so one left over is stale.
+                    self.clear_header(offset);
                     p.start.clear(g);
                     p.mark.clear(g);
                     self.objects.set(self.objects.get() - 1);
@@ -1309,6 +1349,12 @@ impl Heap {
             });
         });
         self.evacuating.set(false);
+    }
+
+    /// Wipes the header of an object that's gone, so stale references to it don't check out.
+    fn clear_header(&self, offset: u32) {
+        // Only called for an object that was allocated, so the header is in a committed page.
+        unsafe { self.header_ptr(offset).write(Header { ty: 0, flags: 0, len: 0 }) }
     }
 
     fn move_object(&self, offset: u32) {
@@ -1332,7 +1378,12 @@ impl Heap {
             Kind::Lines => {
                 let start = p.start.load();
                 let live = p.live();
-                let dead = start.iter().zip(live).map(|(s, l)| (s & !l).count_ones() as usize).sum::<usize>();
+                let dead: [u64; WORDS] = std::array::from_fn(|i| start[i] & !live[i]);
+                // Wiping every dead header costs about 5% of young allocation, so only checked
+                // builds do it. Their stale references then always fail to check out.
+                #[cfg(any(test, feature = "gc-verify"))]
+                each_bit(&dead, |g| self.clear_header(granule_offset(page, g)));
+                let dead = dead.iter().map(|d| d.count_ones() as usize).sum::<usize>();
                 self.objects.set(self.objects.get() - dead);
                 p.start.store(live);
                 p.used.store(p.marked_lines.load());
@@ -1344,6 +1395,7 @@ impl Heap {
             Kind::Large(n) => {
                 p.flags.set(p.flags.get() & !YOUNG | SWEPT);
                 if !p.mark.get(0) {
+                    self.clear_header(page_start(page) as u32);
                     self.objects.set(self.objects.get() - 1);
                     self.free_run(page, n as usize);
                 }
@@ -1369,6 +1421,9 @@ impl Heap {
         root.trace(&mut Tracer::verifying(self, &mut v));
         for entry in self.roots.borrow().iter() {
             entry.trace(&mut Tracer::verifying(self, &mut v));
+        }
+        for stack in self.stacks.borrow().iter() {
+            stack.trace(self, &mut Tracer::verifying(self, &mut v));
         }
         while let Some(offset) = v.work.pop() {
             if self.corrupted.get() {
@@ -1462,9 +1517,9 @@ impl Heap {
         let gray_empty = !self.overflowed.get() && self.gray_len.get() == 0;
         assert!(gray_empty || self.is_marking(), "gray objects outside marking");
         assert!(!self.evacuating.get() || self.is_marking(), "evacuating outside marking");
-        let roots = self.roots.borrow();
-        let tables = pages.len() * META + roots.charged() + self.hosts.charged();
-        let expected = committed * PAGE + roots.len() * ROOT_COST + tables + GRAY_BYTES;
+        let (roots, stacks) = (self.roots.borrow(), self.stacks.borrow());
+        let tables = pages.len() * META + roots.charged() + stacks.charged() + self.hosts.charged();
+        let expected = committed * PAGE + (roots.len() + stacks.len()) * ROOT_COST + tables + GRAY_BYTES;
         assert_eq!(self.budget.used(), expected, "budget");
         assert!(self.budget.used() <= self.budget.limit());
     }

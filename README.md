@@ -9,3 +9,7 @@ To avoid memory safety issues with ragwort, ragwort includes a 'memory cage' in 
 ## GC
 
 See ``src/gc`` folder for implementation of ragworts GC. Internally uses a incremental tristate mark-sweep gc with generations (because scheme code tends to be full of short-lived allocations so most objects will likely fall into young generation)
+
+## Stack
+
+ragwort uses a segmented stack model to model its stack frames. This enables for fast ``call/cc`` by splitting the segmented stack (record `(segment, start, end)` in continuation and GC `(end top)` internally when continuation ends).

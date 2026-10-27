@@ -683,3 +683,48 @@ fn type_mismatches_are_decided_without_the_header() {
     });
     assert!(!arena.metrics().corrupted, "an ordinary type mismatch isn't corruption");
 }
+
+#[test]
+fn zeroed_references_never_check_out() {
+    let mut arena = value_arena(1 << 20);
+    arena.mutate(|mc, root| {
+        root.set(mc, Value::object(mc, mc.alloc(Num(1)).unwrap()));
+        let tag = mc.type_tag::<Num>().unwrap();
+        assert_eq!(format!("{tag:?}"), "TypeTag(0)", "Num isn't the first type, so this tests nothing");
+        let zero = unsafe { AnyRef::from_bits(0) };
+        assert!(zero.downcast::<Num>(mc).is_none() && zero.downcast_tag(mc, tag).is_none());
+        assert!(unsafe { Value::from_bits(0b0001) }.downcast::<Num>(mc).is_none());
+    });
+    assert!(arena.metrics().corrupted);
+}
+
+#[test]
+fn references_to_the_old_copy_of_a_moved_object_are_stale() {
+    let mut arena = value_arena(1 << 20);
+    let old = arena.mutate(|mc, root| {
+        let v = vector(mc, 3, |i| fix(i as i64));
+        root.set(mc, v);
+        v.to_bits()
+    });
+    arena.set_evacuate_all(true);
+    arena.collect();
+    arena.mutate(|mc, root| {
+        assert_ne!(root.get().to_bits(), old, "nothing moved");
+        assert_eq!(items(mc, root.get()).len(), 3);
+        assert!(unsafe { Value::from_bits(old) }.downcast::<Vector>(mc).is_none());
+    });
+    assert!(arena.metrics().corrupted);
+}
+
+#[test]
+fn references_to_swept_objects_are_stale_before_the_memory_is_reused() {
+    let mut arena = value_arena(1 << 20);
+    let dead = arena.mutate(|mc, root| {
+        let dead = cons(mc, fix(1), fix(2));
+        root.set(mc, cons(mc, fix(3), fix(4)));
+        dead.to_bits()
+    });
+    arena.collect();
+    arena.mutate(|mc, _| assert!(unsafe { Value::from_bits(dead) }.downcast::<Pair>(mc).is_none()));
+    assert!(arena.metrics().corrupted);
+}

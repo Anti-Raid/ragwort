@@ -119,6 +119,10 @@ impl<'a> Tracer<'a> {
         Self { heap, mode: Mode::Verify, verify: Some(verify) }
     }
 
+    pub(crate) fn mode(&self) -> Mode {
+        self.mode
+    }
+
     /// Traces the object whose header is at `*offset` in this arena, and updates `*offset` if
     /// the object moved. Zero is ignored, and an offset that isn't a live object marks the
     /// arena as corrupted.

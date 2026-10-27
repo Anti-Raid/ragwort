@@ -7,6 +7,7 @@ mod lock;
 mod ptr;
 mod region;
 mod root;
+mod stack;
 mod table;
 mod weak;
 mod trace;
@@ -17,6 +18,8 @@ mod vec;
 mod tests;
 #[cfg(test)]
 mod value_tests;
+#[cfg(test)]
+mod stack_tests;
 
 #[doc(hidden)]
 pub mod compile_fail;
@@ -28,6 +31,7 @@ pub use layout::REGION;
 pub use lock::{Lock, RefLock};
 pub use ptr::{AnyRef, Gc, Member, TypeTag};
 pub use root::{ForeignRoot, Root, Rooted};
+pub use stack::{Frame, Segment, Stack, WINDOW};
 pub use trace::{Inline, Plain, Trace, Tracer};
 pub use value::{Unpacked, Value};
 pub use vec::{Array, GcVec};

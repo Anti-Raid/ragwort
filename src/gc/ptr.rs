@@ -102,6 +102,12 @@ impl<'gc, T> Member<'gc, T> {
         unsafe { Gc::from_raw(mc.base.add(offset + HEADER).cast()) }
     }
 
+    /// `offset` must be a `T`'s, which crate code upholds by keeping it where the collector
+    /// traces it.
+    pub(crate) fn from_offset(offset: NonZeroU32) -> Self {
+        Self { offset, _marker: PhantomData }
+    }
+
     pub(crate) fn offset_mut(&mut self) -> &mut NonZeroU32 {
         &mut self.offset
     }
@@ -143,6 +149,8 @@ impl<T> fmt::Debug for Member<'_, T> {
 }
 
 // `Option<NonZeroU32>` accepts every `u32`; a bare `Member` doesn't accept zero.
+// No `T: Plain<'gc>` bound: it would make every self-referential type a trait cycle.
+// Reading through the member needs `T: Plain<'gc>` anyway, which keeps the brand.
 unsafe impl<'gc, T> Plain<'gc> for Option<Member<'gc, T>> {}
 
 unsafe impl<T> Trace for Member<'_, T> {

@@ -252,4 +252,53 @@ fn main() {
             start.elapsed()
         });
     }
+
+    for (name, on_stack) in [("register moves 50M, frame", true), ("register moves 50M, locks", false)] {
+        time(name, 7, || {
+            let mut arena = value_arena();
+            let stack = arena.mutate(|mc, root| {
+                let pair = Value::object(mc, mc.alloc(Pair { car: Lock::new(Value::NIL), cdr: Lock::new(Value::NIL) }).unwrap());
+                let v = mc.alloc_inline(Vector(Default::default()), 2048, |_| Lock::new(pair)).unwrap();
+                root.0.set(mc, Value::object(mc, v));
+                let segment = Segment::new(mc, 2048).unwrap();
+                Lock::fill(mc, segment.items(), pair);
+                mc.stack(segment).unwrap()
+            });
+            arena.collect();
+            let start = Instant::now();
+            arena.mutate(|mc, root| {
+                if on_stack {
+                    let f = black_box(stack.frame(mc, 0).unwrap());
+                    for i in 0..50_000_000u32 {
+                        f.set((i.wrapping_mul(7)) as u8, f.get((i.wrapping_mul(13)) as u8));
+                    }
+                } else {
+                    let items = root.0.get().downcast::<Vector>(mc).unwrap().items();
+                    let r: &[Lock<Value>; 256] = black_box(items.first_chunk().unwrap());
+                    for i in 0..50_000_000u32 {
+                        r[(i.wrapping_mul(7)) as u8 as usize].set(mc, r[(i.wrapping_mul(13)) as u8 as usize].get());
+                    }
+                }
+            });
+            start.elapsed()
+        });
+    }
+
+    time("frame per call 20M", 7, || {
+        let mut arena = value_arena();
+        let stack = arena.mutate(|mc, _| mc.stack(Segment::new(mc, 4096).unwrap()).unwrap());
+        arena.collect();
+        let start = Instant::now();
+        arena.mutate(|mc, _| {
+            let (mut fp, mut acc) = (0, Value::fixnum(0).unwrap());
+            for _ in 0..20_000_000u32 {
+                let f = black_box(&stack).frame(mc, fp).unwrap();
+                f.set(0, acc);
+                acc = f.get(1);
+                fp = if fp + 16 > 4096 - WINDOW { 0 } else { fp + 16 };
+            }
+            black_box(acc);
+        });
+        start.elapsed()
+    });
 }
