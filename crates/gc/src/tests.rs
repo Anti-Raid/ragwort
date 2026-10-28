@@ -2629,3 +2629,42 @@ fn only_the_gc_crate_allows_unsafe_code() {
     }
     assert!(checked >= 4, "found only {checked} other crates");
 }
+
+/// An element so large that fewer than four fit in the region.
+#[derive(Trace, Plain, Clone, Copy)]
+struct Huge([u64; (17 << 20) / 8]);
+
+impl Default for Huge {
+    fn default() -> Self {
+        Huge([0; (17 << 20) / 8])
+    }
+}
+
+struct HugeRoot;
+impl Rootable for HugeRoot {
+    type Root<'gc> = GcVec<'gc, Huge>;
+}
+
+/// Growing a vector of elements so large that fewer than four fit allocates what it can or
+/// fails with `OutOfMemory`, without panicking.
+#[test]
+#[cfg_attr(miri, ignore = "the region is smaller than one element")]
+fn vectors_of_huge_elements_grow_or_fail() {
+    assert_eq!(layout::max_items::<vec::Array<Huge>>(), 3);
+    // The elements are built on the stack, which the default test thread is too small for.
+    let run = std::thread::Builder::new().stack_size(1 << 30).spawn(|| {
+        // With room, growth stops at the three that fit, and a fourth can't be added.
+        // Without room for three, it falls back to the one needed.
+        for (limit, fits) in [(60 << 20, 3), (40 << 20, 1)] {
+            let mut arena = Arena::<HugeRoot>::new(limit, |_| Ok(GcVec::new())).unwrap();
+            arena.mutate(|mc, root| {
+                for _ in 0..fits {
+                    root.push(mc, Huge::default()).unwrap();
+                }
+                assert_eq!(root.push(mc, Huge::default()), Err(OutOfMemory), "limit {limit}");
+                assert_eq!(root.len(mc), fits);
+            }).unwrap();
+        }
+    });
+    run.unwrap().join().unwrap();
+}

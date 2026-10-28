@@ -57,7 +57,7 @@ impl<'gc, T: Trace + Copy + Default + Plain<'gc> + 'gc> GcVec<'gc, T> {
             return Ok(());
         }
         let copy = |i: usize| Lock::new(slots[..len].get(i).map_or_else(T::default, Lock::get));
-        let grown = (slots.len() * 2).clamp(4, layout::max_items::<Array<T>>());
+        let grown = (slots.len() * 2).max(4).min(layout::max_items::<Array<T>>());
         let buf = match grown > needed {
             true => mc.heap.budget.quiet(|| mc.alloc_inline(Array(PhantomData), grown, copy)).ok(),
             false => None,
