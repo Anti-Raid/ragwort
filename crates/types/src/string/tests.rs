@@ -38,7 +38,7 @@ fn strings_live_in_the_arena() {
         assert_eq!(h.string(rope.value()), Some(rope));
         assert_eq!(h.string(Value::TRUE), None);
         kept.map(|s| display(&h, s).to_string())
-    });
+    }).unwrap();
     arena.collect();
     arena.collect();
     arena.mutate(|mc, root| {
@@ -53,7 +53,7 @@ fn strings_live_in_the_arena() {
             assert_eq!(equal(&h, s, flat), Ok(true));
             assert_eq!(flatten(&h, s), Ok(flat));
         }
-    });
+    }).unwrap();
 }
 
 #[test]
@@ -64,7 +64,7 @@ fn errors_come_back_as_the_crate_error() {
         let s = from_str(&h, "abc").unwrap();
         assert_eq!(char_at(&h, s, 3), Err(Error::Str(StrError::OutOfRange)));
         assert_eq!(repeat(&h, 'x', 4 << 20), Err(Error::OutOfMemory));
-    });
+    }).unwrap();
 }
 
 /// External characters that say when they're dropped.
@@ -102,7 +102,7 @@ fn external_strings_keep_their_owner_while_reachable() {
         let short = h.external(ExternalText::new("short")).unwrap();
         assert!(!h.is_external(short), "short externals are copied");
         assert_eq!(display(&h, short).to_string(), "short");
-    });
+    }).unwrap();
     arena.collect();
     arena.collect();
     assert!(dropped.iter().all(|d| !d.get()));
@@ -115,7 +115,7 @@ fn external_strings_keep_their_owner_while_reachable() {
             assert_eq!(display(&h, with).to_string(), format!("> {text}"));
         }
         root.truncate(mc, 2);
-    });
+    }).unwrap();
     arena.collect();
     arena.collect();
     assert_eq!(dropped.each_ref().map(|d| d.get()), [false, true], "the second owner went with its strings");
@@ -134,5 +134,5 @@ fn external_characters_stored_wide_are_refused() {
         let h = Strings::new(mc).unwrap();
         assert_eq!(h.external(Wide(vec![0x41; 100])), Err(Error::Str(StrError::NotNarrowest)));
         assert!(h.is_external(h.external(Wide(vec![0x1F600; 100])).unwrap()));
-    });
+    }).unwrap();
 }

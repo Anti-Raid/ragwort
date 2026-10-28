@@ -4,7 +4,7 @@ use std::num::NonZeroU32;
 use std::ops::Deref;
 use std::ptr::NonNull;
 
-use super::layout::{self, HEADER, Object, OFFSET_MASK, type_id};
+use super::layout::{self, Check, HEADER, Object, OFFSET_MASK, TypeIndex, type_id};
 use super::{Inline, Invariant, Mutation, OutOfMemory, Plain, Trace, Tracer};
 
 /// A full pointer to an arena object, for use inside a step. Store a [`Member`] instead.
@@ -134,7 +134,8 @@ impl<'gc, T> Member<'gc, T> {
     /// # Safety
     /// `bits` must come from [`Member::to_bits`] on a `Member<T>` of the same arena, in the
     /// same step.
-    pub unsafe fn from_bits(bits: NonZeroU32) -> Self {
+    #[cfg(test)]
+    pub(crate) unsafe fn from_bits(bits: NonZeroU32) -> Self {
         Self { offset: bits, _marker: PhantomData }
     }
 }
@@ -176,7 +177,6 @@ unsafe impl<T> Trace for Member<'_, T> {
 
 /// The low bits of a reference word, as a [`Value`](super::Value) holds it.
 pub(crate) const OBJECT_TAG: u64 = 0b0001;
-const CHECK_MASK: u32 = (1 << 28) - 1;
 
 /// A reference to an arena object of any type. [`AnyRef::downcast`] checks the type.
 ///
@@ -197,15 +197,15 @@ impl<'gc> AnyRef<'gc> {
     pub fn from_member<T>(mc: &Mutation<'gc>, member: Member<'gc, T>) -> Self {
         let offset = member.offset.get();
         let check = mc.heap.check_at(offset);
-        Self::from_word((offset as u64) << 32 | (check as u64) << 4 | OBJECT_TAG)
+        Self::from_word((offset as u64) << 32 | check.to_word() | OBJECT_TAG)
     }
 
     fn offset(self) -> u32 {
         (self.word >> 32) as u32
     }
 
-    fn check(self) -> u32 {
-        (self.word >> 4) as u32 & CHECK_MASK
+    fn check(self) -> Check {
+        Check::in_word(self.word)
     }
 
     fn member<T>(self) -> Member<'gc, T> {
@@ -240,7 +240,8 @@ impl<'gc> AnyRef<'gc> {
 
     /// # Safety
     /// `bits` must come from [`AnyRef::to_bits`] in the same arena, in the same step.
-    pub unsafe fn from_bits(bits: u64) -> Self {
+    #[cfg(test)]
+    pub(crate) unsafe fn from_bits(bits: u64) -> Self {
         Self::from_word(bits)
     }
 
@@ -254,7 +255,7 @@ impl<'gc> AnyRef<'gc> {
 /// `T`'s type index in one arena, for downcasts that compare a single number. It can't leave
 /// the step, so get it again each step with [`Mutation::type_tag`].
 pub struct TypeTag<'gc, T> {
-    ty: u16,
+    ty: TypeIndex,
     _marker: PhantomData<(Invariant<'gc>, fn() -> T)>,
 }
 
@@ -268,7 +269,7 @@ impl<T> Copy for TypeTag<'_, T> {}
 
 impl<T> fmt::Debug for TypeTag<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "TypeTag({})", self.ty)
+        write!(f, "TypeTag({})", self.ty.get())
     }
 }
 

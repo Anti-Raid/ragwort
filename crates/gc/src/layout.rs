@@ -35,10 +35,79 @@ pub(crate) const FORWARDED: u16 = 1;
 pub(crate) const STAMP_SHIFT: u16 = 4;
 pub(crate) const STAMPS: u16 = 1 << (16 - STAMP_SHIFT);
 
+/// Where a slot is in memory, in the region or outside it. Collector code works in offsets into
+/// the region, which the heap's `offset_of` gives for an address inside it.
+#[derive(Clone, Copy)]
+pub(crate) struct Addr(usize);
+
+impl Addr {
+    #[inline]
+    pub(crate) fn of<T>(slot: *const T) -> Self {
+        Self(slot.addr())
+    }
+
+    #[inline]
+    pub(crate) const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// An index into an arena's table of types, as headers hold it. The table has a slot for
+/// every `u16`, so any index can be looked up, though it may name no type.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub(crate) struct TypeIndex(u16);
+
+impl TypeIndex {
+    #[inline]
+    pub(crate) const fn new(index: u16) -> Self {
+        Self(index)
+    }
+
+    #[inline]
+    pub(crate) const fn get(self) -> usize {
+        self.0 as usize
+    }
+}
+
 /// What a reference holds to check that its object is still the one it was made for: the
-/// type index and the stamp, 28 bits.
-pub(crate) const fn check_bits(header: Header) -> u32 {
-    header.ty as u32 | ((header.flags >> STAMP_SHIFT) as u32) << 16
+/// type index in the low 16 bits, then the allocation stamp, 28 bits in all. A reference word
+/// keeps them in bits 4 to 31, above its tag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Check(u32);
+
+impl Check {
+    const MASK: u32 = (1 << 28) - 1;
+
+    /// The check for references to the object with this header.
+    #[inline]
+    pub(crate) const fn of(header: Header) -> Self {
+        Self(header.ty.0 as u32 | ((header.flags >> STAMP_SHIFT) as u32) << 16)
+    }
+
+    /// The check a reference word holds. Any word has one, though it may match nothing.
+    #[inline]
+    pub(crate) const fn in_word(word: u64) -> Self {
+        Self((word >> 4) as u32 & Self::MASK)
+    }
+
+    /// The bits that hold the check in a reference word.
+    #[inline]
+    pub(crate) const fn to_word(self) -> u64 {
+        (self.0 as u64) << 4
+    }
+
+    #[inline]
+    pub(crate) const fn ty(self) -> TypeIndex {
+        TypeIndex(self.0 as u16)
+    }
+
+    /// Stamps are never zero, so a check without one came from zeroed memory or a wiped
+    /// header, and matches no object.
+    #[inline]
+    pub(crate) const fn is_stamped(self) -> bool {
+        self.0 >> 16 != 0
+    }
 }
 
 // Every object starts with a header: [Header][T] or [Header][T][items].
@@ -46,7 +115,7 @@ pub(crate) const fn check_bits(header: Header) -> u32 {
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub(crate) struct Header {
-    pub(crate) ty: u16,
+    pub(crate) ty: TypeIndex,
     pub(crate) flags: u16,
     pub(crate) len: u32,
 }

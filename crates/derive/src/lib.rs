@@ -2,8 +2,6 @@
 //! The impls they write are unsafe, and they're the gc's to vouch for: crates that use them can
 //! still forbid unsafe code, since the lint doesn't look inside other crates' macros.
 
-#![forbid(unsafe_code)]
-
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{Data, DeriveInput, Fields, Type, parse_macro_input, parse_quote};
@@ -67,7 +65,7 @@ fn trace_body(data: &Data) -> (Vec<Type>, TokenStream) {
         let types = fields.iter().map(|f| f.ty.clone()).collect();
         let pattern = match fields {
             Fields::Named(named) => {
-                let members = named.named.iter().map(|f| f.ident.as_ref().unwrap());
+                let members = named.named.iter().flat_map(|f| &f.ident);
                 quote!({ #(#members: #names),* })
             }
             Fields::Unnamed(_) => quote!((#(#names),*)),

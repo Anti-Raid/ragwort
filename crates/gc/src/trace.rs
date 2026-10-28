@@ -6,6 +6,8 @@ use std::num::NonZeroU32;
 use super::heap::Heap;
 #[cfg(any(test, feature = "gc-verify"))]
 use super::heap::Verify;
+use super::host::HostId;
+use super::layout::{Addr, Check};
 
 /// # Safety
 /// - `trace` must trace every `Member`, `HostRef` and `Ephemeron` held directly by `self`,
@@ -14,12 +16,12 @@ use super::heap::Verify;
 /// - References to arena objects must be held as `Member`, `AnyRef` or `Value` (or raw
 ///   offsets passed to [`Tracer::trace_raw`]), never as `Gc`, references or raw pointers.
 /// - In arena objects, every field holding a reference that can change must be written
-///   through [`Lock`] (or `set_unbarriered` followed by
-///   [`Mutation::retrace`](super::Mutation::retrace)). Outside the arena, in the root, any
-///   write is fine: the root is traced again before each collection finishes.
+///   through [`Lock`], directly or through a [`Batch`](super::Batch). Outside the arena, in
+///   the root, any write is fine: the root is traced again before each collection finishes.
 /// - `INLINE` must be true exactly when the type implements [`Inline`].
 /// - `holds_refs` must be true whenever `trace` would visit a reference.
-/// - `trace` should not panic. If it does, the arena is marked corrupted.
+/// - `trace` should not panic. If it does, the arena is marked corrupted and can't be entered
+///   again.
 /// - The `'gc` lifetime may only brand arena handles (`Member`, `HostRef`, `GcVec`, ...). A
 ///   type must not use it, or any other lifetime, for ordinary borrows, because roots and
 ///   the arena root are kept past the step that created them.
@@ -132,7 +134,7 @@ impl<'a> Tracer<'a> {
     /// arena as corrupted.
     pub fn trace_raw(&mut self, offset: &mut u32) {
         if *offset != 0 {
-            let slot = (offset as *mut u32).addr();
+            let slot = Addr::of(offset);
             if let Some(moved) = self.edge(*offset, slot) {
                 *offset = moved;
             }
@@ -141,9 +143,9 @@ impl<'a> Tracer<'a> {
 
     /// Traces a reference word, after checking it against its object's header.
     pub(crate) fn value(&mut self, word: &mut u64) {
-        let slot = (word as *mut u64).addr();
+        let slot = Addr::of(word);
         let offset = (*word >> 32) as u32;
-        if !self.heap.checks_out(offset, (*word >> 4) as u32 & ((1 << 28) - 1)) {
+        if !self.heap.checks_out(offset, Check::in_word(*word)) {
             return;
         }
         if let Some(moved) = self.edge(offset, slot) {
@@ -152,13 +154,13 @@ impl<'a> Tracer<'a> {
     }
 
     pub(crate) fn member(&mut self, offset: &mut NonZeroU32) {
-        let slot = (offset as *mut NonZeroU32).addr();
+        let slot = Addr::of(offset);
         if let Some(moved) = self.edge(offset.get(), slot).and_then(NonZeroU32::new) {
             *offset = moved;
         }
     }
 
-    fn edge(&mut self, offset: u32, slot: usize) -> Option<u32> {
+    fn edge(&mut self, offset: u32, slot: Addr) -> Option<u32> {
         match self.mode {
             Mode::Mark => {
                 self.heap.shade(offset);
@@ -183,7 +185,7 @@ impl<'a> Tracer<'a> {
 
     /// Looks at an ephemeron's key, rewriting it if it moved.
     pub(crate) fn ephemeron_key(&mut self, key: &mut NonZeroU32) -> KeyState {
-        let slot = (key as *mut NonZeroU32).addr();
+        let slot = Addr::of(key);
         let offset = key.get();
         match self.mode {
             // Outside the arena, as in the arena root, an ephemeron holds its key strongly.
@@ -224,20 +226,20 @@ impl<'a> Tracer<'a> {
         }
     }
 
-    pub(crate) fn trace_host(&mut self, index: u32, generation: u32) {
+    pub(crate) fn trace_host(&mut self, id: HostId) {
         match self.mode {
             Mode::Mark | Mode::Barrier => {
-                if !self.heap.hosts.mark(index, generation) {
+                if !self.heap.hosts.mark(id) {
                     self.heap.corrupt();
                 }
             }
             Mode::Fixup | Mode::Clear => {}
             #[cfg(any(test, feature = "gc-verify"))]
             Mode::Verify => {
-                if !self.heap.hosts.is_live(index, generation) {
+                if !self.heap.hosts.is_live(id) {
                     return self.heap.corrupt();
                 }
-                assert!(self.heap.hosts.is_marked(index, generation), "gc verify: reachable host value is not marked");
+                assert!(self.heap.hosts.is_marked(id), "gc verify: reachable host value is not marked");
             }
         }
     }
@@ -323,6 +325,9 @@ tuple!(A, B, C, D);
 
 // Containers for the root and other host-side state. None of them is `Plain`, so none of
 // them can end up in the arena, where writes would need a barrier.
+//
+// The rule for every impl here: each type parameter is traced, or bound by `'static`, or only
+// in a `PhantomData`. Anything else could hold an arena reference the collector never sees.
 
 // SAFETY: as for `Option`.
 unsafe impl<T: Trace> Trace for [T] {
@@ -388,11 +393,12 @@ unsafe impl<T: Trace + ?Sized> Trace for RefCell<T> {
 }
 
 // Keys can't hold references: rewriting a key after its object moved would break the map.
+// Hashers aren't traced, so they must be `'static`, which no arena reference is.
 macro_rules! map {
     ($($map:ident<$($extra:ident),*>),*) => {$(
-        // SAFETY: traces every value, and refuses keys that hold references, which it can't
-        // rewrite.
-        unsafe impl<K: Trace, V: Trace $(, $extra)*> Trace for $map<K, V $(, $extra)*> {
+        // SAFETY: traces every value, refuses keys that hold references, which it can't
+        // rewrite, and takes only hashers that can't hold any.
+        unsafe impl<K: Trace, V: Trace $(, $extra: 'static)*> Trace for $map<K, V $(, $extra)*> {
             const NEEDS_TRACE: bool = V::NEEDS_TRACE;
 
             fn trace(&mut self, t: &mut Tracer<'_>) {
@@ -411,8 +417,9 @@ map!(HashMap<S>, BTreeMap<>);
 
 macro_rules! set {
     ($($set:ident<$($extra:ident),*>),*) => {$(
-        // SAFETY: refuses elements that hold references, so there's nothing to trace.
-        unsafe impl<T: Trace $(, $extra)*> Trace for $set<T $(, $extra)*> {
+        // SAFETY: refuses elements that hold references, and takes only hashers that can't hold
+        // any, so there's nothing to trace.
+        unsafe impl<T: Trace $(, $extra: 'static)*> Trace for $set<T $(, $extra)*> {
             const NEEDS_TRACE: bool = false;
 
             fn trace(&mut self, _: &mut Tracer<'_>) {

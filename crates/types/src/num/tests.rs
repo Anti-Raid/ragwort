@@ -34,7 +34,7 @@ fn arithmetic_crosses_the_fixnum_edge() {
         assert_eq!(int::quotient(&h, two, int::from_i64(&h, 0).unwrap()), Err(Error::Num(NumError::DivideByZero)));
         assert_eq!(h.integer(Value::TRUE), None);
         assert_eq!(h.integer(big.value()), Some(big));
-    });
+    }).unwrap();
 }
 
 #[test]
@@ -54,7 +54,7 @@ fn bignums_survive_collections_that_move_them() {
                 int::to_string(&h, x, 10).unwrap()
             })
             .collect()
-    });
+    }).unwrap();
     arena.collect();
     arena.collect();
     arena.mutate(|mc, root| {
@@ -63,7 +63,7 @@ fn bignums_survive_collections_that_move_them() {
             let x = h.integer(root.get(mc, i).unwrap()).unwrap();
             assert_eq!(&int::to_string(&h, x, 10).unwrap(), want);
         }
-    });
+    }).unwrap();
 }
 
 #[test]
@@ -87,7 +87,7 @@ fn ratios_live_in_the_arena() {
         root.push(mc, sum.value()).unwrap();
         root.push(mc, x.value()).unwrap();
         [rational::to_string(&h, sum, 10).unwrap(), rational::to_string(&h, x, 10).unwrap()]
-    });
+    }).unwrap();
     arena.collect();
     arena.mutate(|mc, root| {
         let h = Nums::new(mc).unwrap();
@@ -95,7 +95,7 @@ fn ratios_live_in_the_arena() {
             let x = h.rational(root.get(mc, i).unwrap()).unwrap();
             assert_eq!(&rational::to_string(&h, x, 10).unwrap(), want);
         }
-    });
+    }).unwrap();
 }
 
 #[test]
@@ -110,7 +110,7 @@ fn running_out_of_memory_is_an_error() {
         let x = int::expt(&h, ten, 20_000).unwrap();
         let y = int::add(&h, x, two).unwrap();
         int::gcd(&h, x, y).unwrap();
-    });
+    }).unwrap();
 }
 
 fn number<'gc>(h: &Nums<'_, 'gc>, re: f64, im: f64) -> Number<'gc> {
@@ -158,7 +158,7 @@ fn flonums_and_complex_numbers_live_in_the_arena() {
             root.push(mc, z.value()).unwrap();
         }
         kept.map(|z| parts(&h, z))
-    });
+    }).unwrap();
     arena.collect();
     arena.collect();
     arena.mutate(|mc, root| {
@@ -167,5 +167,5 @@ fn flonums_and_complex_numbers_live_in_the_arena() {
             let z = h.number(root.get(mc, i).unwrap()).unwrap();
             assert_eq!(&parts(&h, z), want);
         }
-    });
+    }).unwrap();
 }

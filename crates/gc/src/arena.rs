@@ -1,9 +1,10 @@
+use std::fmt;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 
 use super::heap::{Heap, Made};
-use super::{Gc, Inline, Invariant, Member, OutOfMemory, Plain, Trace};
+use super::{Gc, Inline, Invariant, OutOfMemory, Plain, Trace};
 
 const STEP_MUL: usize = 2;
 const MIN_SLICE: usize = 64 * 1024;
@@ -12,12 +13,32 @@ pub trait Rootable: 'static {
     type Root<'gc>: Trace;
 }
 
+/// The collector found the heap in an impossible state, from a bug, damaged memory, or a
+/// `Trace` impl that panicked. References may be half rewritten, so the arena can't be entered
+/// again and should be dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Corrupted;
+
+impl fmt::Display for Corrupted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("arena is corrupted")
+    }
+}
+
+impl std::error::Error for Corrupted {}
+
 #[derive(Debug)]
 pub enum StepError<E> {
     OutOfMemory,
     /// The collector found the heap in an impossible state. The arena should be dropped.
     Corrupted,
     Failed(E),
+}
+
+impl<E> From<Corrupted> for StepError<E> {
+    fn from(_: Corrupted) -> Self {
+        Self::Corrupted
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,18 +92,32 @@ impl<R: Rootable> Arena<R> {
         Ok(Self { root, heap })
     }
 
-    pub fn mutate<T>(&mut self, f: impl for<'gc> FnOnce(&Mutation<'gc>, &R::Root<'gc>) -> T) -> T {
+    /// Runs `f` with the root. Fails without running it if the arena is corrupted, and drops
+    /// its result if the arena was found corrupted while it ran, since it may have read damaged
+    /// data.
+    pub fn mutate<T>(&mut self, f: impl for<'gc> FnOnce(&Mutation<'gc>, &R::Root<'gc>) -> T) -> Result<T, Corrupted> {
+        self.check()?;
         // SAFETY: only the brand changes. `f` is generic over `'gc`, so the root's handles can
-        // only meet the `Mutation` of this heap, and neither outlives the call.
+        // only meet the `Mutation` of this heap, and neither outlives the call. The arena isn't
+        // corrupted, so every reference the root reaches was fully rewritten.
         let root = unsafe { &*(&raw const self.root).cast::<R::Root<'_>>() };
-        f(&Mutation::new(&self.heap), root)
+        let result = f(&Mutation::new(&self.heap), root);
+        self.check().map(|()| result)
     }
 
-    pub fn mutate_root<T>(&mut self, f: impl for<'gc> FnOnce(&Mutation<'gc>, &mut R::Root<'gc>) -> T) -> T {
+    /// [`Arena::mutate`] with the root borrowed mutably.
+    pub fn mutate_root<T>(&mut self, f: impl for<'gc> FnOnce(&Mutation<'gc>, &mut R::Root<'gc>) -> T) -> Result<T, Corrupted> {
+        self.check()?;
         // SAFETY: as in `mutate`. The root is borrowed mutably through `&mut self`, so nothing
         // else reads it meanwhile.
         let root = unsafe { &mut *(&raw mut self.root).cast::<R::Root<'_>>() };
-        f(&Mutation::new(&self.heap), root)
+        let result = f(&Mutation::new(&self.heap), root);
+        self.check().map(|()| result)
+    }
+
+    #[inline(always)]
+    fn check(&self) -> Result<(), Corrupted> {
+        if self.heap.corrupted() { Err(Corrupted) } else { Ok(()) }
     }
 
     /// Runs `f` once, then a slice of collection work, or a full collection if `f` drew on
@@ -92,11 +127,8 @@ impl<R: Rootable> Arena<R> {
     /// the caller picks up from there: an interpreter runs the failed instruction again, which
     /// is safe if the instruction changes nothing before its allocations succeed.
     pub fn step<T, E>(&mut self, f: impl for<'gc> FnOnce(&Mutation<'gc>, &R::Root<'gc>) -> Result<T, E>) -> Result<T, StepError<E>> {
-        if self.heap.corrupted() {
-            return Err(StepError::Corrupted);
-        }
         self.heap.budget.clear_failed();
-        let result = self.mutate(f);
+        let result = self.mutate(f)?;
         if self.heap.budget.failed() {
             drop(result);
             self.collect();
@@ -107,9 +139,7 @@ impl<R: Rootable> Arena<R> {
         } else {
             self.pace();
         }
-        if self.heap.corrupted() {
-            return Err(StepError::Corrupted);
-        }
+        self.check()?;
         result.map_err(StepError::Failed)
     }
 
@@ -271,9 +301,10 @@ impl<'gc> Mutation<'gc> {
     }
 
     /// Has `object` traced again before the next collection finishes. Call it in the same
-    /// step as any `Lock::set_unbarriered` on the object's fields, after the last such write.
-    pub fn retrace<T>(&self, object: Gc<'gc, T>) {
-        self.heap.retrace(Member::new(self, object).to_bits().get());
+    /// step as any `Lock::set_unbarriered` on the object's fields.
+    #[cfg(test)]
+    pub(crate) fn retrace<T>(&self, object: Gc<'gc, T>) {
+        self.heap.retrace(super::Member::new(self, object).to_bits().get());
     }
 
     /// Whether an allocation has drawn on the reserve, so a full collection is due. An

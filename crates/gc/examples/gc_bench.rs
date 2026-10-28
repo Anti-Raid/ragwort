@@ -54,7 +54,7 @@ fn build(arena: &mut Arena<List>, n: i64) {
             let node = mc.alloc(Node { value: i, next: Lock::new(root.get()), _pad: 0 }).unwrap();
             root.store(mc, Some(node));
         }
-    });
+    }).unwrap();
 }
 
 fn time(name: &str, runs: usize, mut f: impl FnMut() -> Duration) {
@@ -91,7 +91,24 @@ fn main() {
             for _ in 0..50_000_000 {
                 head.next.set(mc, black_box(next));
             }
-        });
+        }).unwrap();
+        start.elapsed()
+    });
+
+    time("batch 50M sets", 7, || {
+        let mut arena = list_arena();
+        build(&mut arena, 2);
+        arena.collect();
+        let start = Instant::now();
+        arena.mutate(|mc, root| {
+            let head = root.load(mc).unwrap();
+            let next = head.next.get();
+            mc.batch(head, |b| {
+                for _ in 0..50_000_000 {
+                    b.set(&head.next, black_box(next));
+                }
+            });
+        }).unwrap();
         start.elapsed()
     });
 
@@ -138,7 +155,7 @@ fn main() {
                 sum += *black_box(host).get(mc).unwrap();
             }
             black_box(sum);
-        });
+        }).unwrap();
         start.elapsed()
     });
 
@@ -149,7 +166,7 @@ fn main() {
                 let pair = Pair { car: Lock::new(Value::fixnum(i).unwrap()), cdr: Lock::new(root.0.get()) };
                 root.0.set(mc, Value::object(mc, mc.alloc(pair).unwrap()));
             }
-        });
+        }).unwrap();
         arena.collect();
         let start = Instant::now();
         arena.mutate(|mc, root| {
@@ -161,7 +178,7 @@ fn main() {
                 }
                 black_box(sum);
             }
-        });
+        }).unwrap();
         start.elapsed()
     });
 
@@ -172,7 +189,7 @@ fn main() {
                 let pair = Pair { car: Lock::new(Value::fixnum(i).unwrap()), cdr: Lock::new(root.0.get()) };
                 root.0.set(mc, Value::object(mc, mc.alloc(pair).unwrap()));
             }
-        });
+        }).unwrap();
         arena.collect();
         let start = Instant::now();
         arena.mutate(|mc, root| {
@@ -185,7 +202,7 @@ fn main() {
                 }
                 black_box(sum);
             }
-        });
+        }).unwrap();
         start.elapsed()
     });
 
@@ -194,7 +211,7 @@ fn main() {
         arena.mutate(|mc, root| {
             let pair = Pair { car: Lock::new(Value::NIL), cdr: Lock::new(Value::NIL) };
             root.0.set(mc, Value::object(mc, mc.alloc(pair).unwrap()));
-        });
+        }).unwrap();
         arena.collect();
         let start = Instant::now();
         arena.mutate(|mc, root| {
@@ -202,7 +219,7 @@ fn main() {
             for i in 0..50_000_000 {
                 pair.car.set(mc, black_box(Value::fixnum(i).unwrap()));
             }
-        });
+        }).unwrap();
         start.elapsed()
     });
 
@@ -220,7 +237,7 @@ fn main() {
                 }
                 black_box(sum);
             }
-        });
+        }).unwrap();
         start.elapsed()
     });
 
@@ -233,7 +250,7 @@ fn main() {
                     let v = mc.alloc_inline(Vector(Default::default()), 1_000_000, |_| Lock::new(pair)).unwrap();
                     slot.set(mc, Value::object(mc, v));
                 }
-            });
+            }).unwrap();
             arena.collect();
             let start = Instant::now();
             arena.mutate(|mc, root| {
@@ -248,7 +265,7 @@ fn main() {
                         }
                     }
                 }
-            });
+            }).unwrap();
             start.elapsed()
         });
     }
@@ -263,7 +280,7 @@ fn main() {
                 let segment = Segment::new(mc, 2048).unwrap();
                 Lock::fill(mc, segment.items(), pair);
                 mc.stack(segment).unwrap()
-            });
+            }).unwrap();
             arena.collect();
             let start = Instant::now();
             arena.mutate(|mc, root| {
@@ -279,14 +296,14 @@ fn main() {
                         r[(i.wrapping_mul(7)) as u8 as usize].set(mc, r[(i.wrapping_mul(13)) as u8 as usize].get());
                     }
                 }
-            });
+            }).unwrap();
             start.elapsed()
         });
     }
 
     time("frame per call 20M", 7, || {
         let mut arena = value_arena();
-        let stack = arena.mutate(|mc, _| mc.stack(Segment::new(mc, 4096).unwrap()).unwrap());
+        let stack = arena.mutate(|mc, _| mc.stack(Segment::new(mc, 4096).unwrap()).unwrap()).unwrap();
         arena.collect();
         let start = Instant::now();
         arena.mutate(|mc, _| {
@@ -298,7 +315,7 @@ fn main() {
                 fp = if fp + 16 > 4096 - WINDOW { 0 } else { fp + 16 };
             }
             black_box(acc);
-        });
+        }).unwrap();
         start.elapsed()
     });
 }

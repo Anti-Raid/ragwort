@@ -4,8 +4,6 @@
 //! implements [`Host`] and the library does the rest, without allocating anywhere else. A
 //! flat string's characters can also live outside the heap, as an [`External`].
 
-#![forbid(unsafe_code)]
-
 mod external;
 mod hash;
 mod intern;

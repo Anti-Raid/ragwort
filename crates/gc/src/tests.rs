@@ -1,12 +1,14 @@
-use std::collections::{HashMap, HashSet};
+use std::any::TypeId;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::marker::PhantomData;
 use std::mem::size_of;
 use std::num::NonZeroU32;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use super::heap::{GRAY_BYTES, META};
-use super::layout::{self, HEADER, LINE, PAGE, RESERVE, round_up};
+use super::heap::{GRAY_BYTES, META, Verify};
+use super::layout::{self, HEADER, LINE, PAGE, RESERVE, TypeIndex, round_up};
 use super::*;
 
 #[derive(Trace, Plain)]
@@ -150,7 +152,7 @@ fn allocation_sizes() {
         assert!(empty.is_empty());
         assert_eq!(offset(mc, n) % PAGE, 0);
         assert_eq!(offset(mc, b), offset(mc, n) + NODE);
-    });
+    }).unwrap();
     let m = arena.metrics();
     // The first page is claimed whole for bump allocation.
     assert_eq!((m.objects, m.live, m.pages), (3, PAGE, 1));
@@ -166,7 +168,7 @@ fn collect_frees_unreachable() {
         for i in 0..100 {
             node(mc, i, None).unwrap();
         }
-    });
+    }).unwrap();
     assert_eq!(arena.metrics().objects, 102);
     arena.collect();
     let m = arena.metrics();
@@ -177,7 +179,7 @@ fn collect_frees_unreachable() {
         assert_eq!(b.value, 2);
         assert_eq!(b.next.load(mc).unwrap().value, 1);
         root.set(mc, None);
-    });
+    }).unwrap();
     arena.collect();
     let m = arena.metrics();
     assert_eq!((m.objects, m.live, m.used, m.pages), (0, 0, BASE, 0));
@@ -191,10 +193,10 @@ fn cycles_are_collected() {
         let b = node(mc, 2, Some(a)).unwrap();
         a.next.store(mc, Some(b));
         root.store(mc, Some(a));
-    });
+    }).unwrap();
     arena.collect();
     assert_eq!(arena.metrics().objects, 2);
-    arena.mutate(|mc, root| root.set(mc, None));
+    arena.mutate(|mc, root| root.set(mc, None)).unwrap();
     arena.collect();
     assert_eq!((arena.metrics().objects, arena.metrics().used), (0, BASE));
 }
@@ -203,7 +205,7 @@ fn cycles_are_collected() {
 fn deep_chain_marks_without_recursion() {
     let n: i64 = if cfg!(miri) { 1_000 } else { 1_000_000 };
     let mut arena = node_arena(REGION);
-    arena.mutate(|mc, root| root.store(mc, chain(mc, n, None)));
+    arena.mutate(|mc, root| root.store(mc, chain(mc, n, None))).unwrap();
     arena.collect();
     assert_eq!(arena.metrics().objects, n as usize);
     arena.mutate(|mc, root| {
@@ -214,8 +216,8 @@ fn deep_chain_marks_without_recursion() {
             cur = node.next.load(mc);
         }
         assert_eq!(count, n);
-    });
-    arena.mutate(|mc, root| root.set(mc, None));
+    }).unwrap();
+    arena.mutate(|mc, root| root.set(mc, None)).unwrap();
     arena.collect();
     assert_eq!(arena.metrics().used, BASE);
 }
@@ -227,14 +229,14 @@ fn inline_items_are_traced() {
         for (i, slot) in slot_items(root.load(mc).unwrap()).iter().enumerate() {
             slot.store(mc, Some(node(mc, i as i64, None).unwrap()));
         }
-    });
+    }).unwrap();
     arena.collect();
     assert_eq!(arena.metrics().objects, 4);
     arena.mutate(|mc, root| {
         let items = slot_items(root.load(mc).unwrap());
         assert_eq!(items.iter().map(|s| s.load(mc).unwrap().value).collect::<Vec<_>>(), [0, 1, 2]);
         items[1].set(mc, None);
-    });
+    }).unwrap();
     arena.collect();
     assert_eq!(arena.metrics().objects, 3);
 }
@@ -252,7 +254,7 @@ fn objects_of_every_size() {
             assert!(offset(mc, *b) % PAGE == 0 || bytes_size(len) <= layout::MAX_SMALL);
         }
         mc.heap.check();
-    });
+    }).unwrap();
     arena.collect();
     let m = arena.metrics();
     assert_eq!((m.objects, m.live, m.pages, m.used), (0, 0, 0, BASE));
@@ -261,14 +263,14 @@ fn objects_of_every_size() {
 #[test]
 fn freed_slots_are_reused() {
     let mut arena = node_arena(1 << 20);
-    let first: Vec<usize> = arena.mutate(|mc, _| (0..10).map(|i| offset(mc, node(mc, i, None).unwrap())).collect());
+    let first: Vec<usize> = arena.mutate(|mc, _| (0..10).map(|i| offset(mc, node(mc, i, None).unwrap())).collect()).unwrap();
     arena.collect();
-    let second: Vec<usize> = arena.mutate(|mc, _| (0..10).map(|i| offset(mc, node(mc, i, None).unwrap())).collect());
+    let second: Vec<usize> = arena.mutate(|mc, _| (0..10).map(|i| offset(mc, node(mc, i, None).unwrap())).collect()).unwrap();
     assert_eq!(first, second);
 
-    arena.mutate(|mc, root| root.store(mc, Some(node(mc, 1, None).unwrap())));
+    arena.mutate(|mc, root| root.store(mc, Some(node(mc, 1, None).unwrap()))).unwrap();
     arena.collect();
-    let reused = arena.mutate(|mc, _| offset(mc, node(mc, 2, None).unwrap()));
+    let reused = arena.mutate(|mc, _| offset(mc, node(mc, 2, None).unwrap())).unwrap();
     assert!(first.contains(&reused));
 }
 
@@ -280,7 +282,7 @@ fn large_objects_use_page_runs() {
         assert_eq!(offset(mc, b) % PAGE, 0);
         assert!(b.items().iter().all(|&x| x == 7));
         assert_eq!(mc.used(), BASE + 4 * (PAGE + META));
-    });
+    }).unwrap();
     arena.collect();
     assert_eq!(arena.metrics().used, BASE);
 }
@@ -306,7 +308,7 @@ fn budget_never_exceeds_limit() {
                 assert!(mc.used() <= limit);
             }
             mc.heap.check();
-        });
+        }).unwrap();
         arena.collect();
         assert_eq!(arena.metrics().used, BASE);
     }
@@ -329,7 +331,7 @@ fn a_failed_step_runs_once_then_collects() {
     assert!(matches!(result, Err(StepError::OutOfMemory)));
     assert_eq!(attempts, 1);
     assert_eq!(arena.metrics().objects, 1, "the collection kept only the stored node");
-    arena.mutate(|mc, root| assert_eq!(root.load(mc).unwrap().value, 4));
+    arena.mutate(|mc, root| assert_eq!(root.load(mc).unwrap().value, 4)).unwrap();
 
     let result = arena.step(|mc, root| {
         let n = node(mc, 5, root.load(mc))?;
@@ -337,7 +339,7 @@ fn a_failed_step_runs_once_then_collects() {
         Ok::<_, OutOfMemory>(())
     });
     assert!(result.is_ok());
-    arena.mutate(|mc, root| assert_eq!(root.load(mc).unwrap().value, 5));
+    arena.mutate(|mc, root| assert_eq!(root.load(mc).unwrap().value, 5)).unwrap();
 }
 
 /// A step that runs into the reserve finishes, and a full collection follows it.
@@ -363,7 +365,7 @@ fn the_reserve_lets_a_step_finish() {
     arena.mutate(|mc, root| {
         assert!(!mc.collection_due());
         assert_eq!(root.load(mc).unwrap().value, 9);
-    });
+    }).unwrap();
     // Without a reserve, the same work fails at the limit instead.
     arena.set_reserve(0);
     let result = arena.step(|mc, _| -> Result<(), OutOfMemory> {
@@ -386,8 +388,43 @@ fn optional_growth_leaves_the_reserve_alone() {
         }
         assert!(mc.used() <= 256 * 1024);
         v.capacity(mc)
+    }).unwrap();
+    assert_eq!(arena.mutate(|mc, v| v.len(mc)).unwrap(), capacity, "the growth that drew on the reserve was exact");
+}
+
+static DEFAULT_PANICS: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy, Trace, Plain)]
+struct Touchy(u64);
+
+impl Default for Touchy {
+    fn default() -> Self {
+        assert!(!DEFAULT_PANICS.load(Ordering::Relaxed), "default failed");
+        Touchy(0)
+    }
+}
+
+struct TouchyVecRoot;
+impl Rootable for TouchyVecRoot {
+    type Root<'gc> = GcVec<'gc, Touchy>;
+}
+
+/// A panic during growth a vector can do without leaves later allocations their reserve.
+#[test]
+fn a_panic_in_optional_growth_keeps_the_reserve() {
+    let mut arena = Arena::<TouchyVecRoot>::new(256 * 1024, |_| Ok(GcVec::new())).unwrap();
+    arena.set_reserve(128 * 1024);
+    DEFAULT_PANICS.store(true, Ordering::Relaxed);
+    let result = panic::catch_unwind(AssertUnwindSafe(|| arena.mutate(|mc, v| v.reserve(mc, 1)).unwrap()));
+    DEFAULT_PANICS.store(false, Ordering::Relaxed);
+    assert!(result.is_err());
+    let result = arena.step(|mc, _| {
+        while !mc.collection_due() {
+            mc.alloc(Touchy(0))?;
+        }
+        Ok::<_, OutOfMemory>(())
     });
-    assert_eq!(arena.mutate(|mc, v| v.len(mc)), capacity, "the growth that drew on the reserve was exact");
+    assert!(result.is_ok(), "the step lost its reserve");
 }
 
 /// The chosen allocation fails, of any kind, and only that one, so a test can fail each
@@ -499,7 +536,7 @@ fn oversized_layouts_fail_cleanly() {
         assert_eq!(mc.used(), used);
         assert!(mc.ensure((1 << 20) - used).is_ok());
         assert!(mc.ensure((1 << 20) - used + 1).is_err());
-    });
+    }).unwrap();
 }
 
 #[test]
@@ -509,7 +546,7 @@ fn panicking_fill_leaks_nothing() {
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
             arena.mutate(|mc, _| {
                 let _ = mc.alloc_inline(Bytes { tag: 0 }, len, |i| if i == 5 { panic!("fill failed") } else { 0 });
-            })
+            }).unwrap()
         }));
         assert!(result.is_err());
         let m = arena.metrics();
@@ -517,7 +554,7 @@ fn panicking_fill_leaks_nothing() {
     }
     arena.collect();
     assert_eq!(arena.metrics().used, BASE);
-    arena.mutate(|mc, _| assert_eq!(mc.alloc_inline_from(Bytes { tag: 1 }, b"ok").unwrap().items(), b"ok"));
+    arena.mutate(|mc, _| assert_eq!(mc.alloc_inline_from(Bytes { tag: 1 }, b"ok").unwrap().items(), b"ok")).unwrap();
 }
 
 static HOST_DROPS: AtomicUsize = AtomicUsize::new(0);
@@ -552,14 +589,14 @@ fn host_values_live_while_reachable() {
         assert_eq!(host.get(mc).unwrap().0, 42);
         let holder = mc.alloc(Holder { host: Lock::new(host) }).unwrap();
         mc.root::<HolderK>(Member::new(mc, holder)).unwrap()
-    });
+    }).unwrap();
     assert_eq!(arena.metrics().hosts, 6);
     arena.collect();
     assert_eq!(HOST_DROPS.load(Ordering::Relaxed) - base, 5);
     arena.mutate(|mc, _| {
         let holder = mc.fetch(&root).unwrap().get(mc);
         assert_eq!(holder.host.get().get(mc).unwrap().0, 42);
-    });
+    }).unwrap();
     drop(root);
     arena.collect();
     assert_eq!(HOST_DROPS.load(Ordering::Relaxed) - base, 6);
@@ -567,7 +604,7 @@ fn host_values_live_while_reachable() {
 
     arena.mutate(|mc, _| {
         mc.host(HostValue(7)).unwrap();
-    });
+    }).unwrap();
     drop(arena);
     assert_eq!(HOST_DROPS.load(Ordering::Relaxed) - base, 7);
 }
@@ -598,13 +635,13 @@ fn failed_init_frees_partial_work() {
 #[test]
 fn roots_keep_values_alive() {
     let mut arena = node_arena(1 << 20);
-    let root = arena.mutate(|mc, _| mc.root::<NodeK>(Member::new(mc, node(mc, 42, None).unwrap())).unwrap());
+    let root = arena.mutate(|mc, _| mc.root::<NodeK>(Member::new(mc, node(mc, 42, None).unwrap())).unwrap()).unwrap();
     let copy = root.clone();
     arena.collect();
     assert_eq!(arena.metrics().objects, 1);
     drop(root);
     arena.collect();
-    arena.mutate(|mc, _| assert_eq!(mc.fetch(&copy).unwrap().get(mc).value, 42));
+    arena.mutate(|mc, _| assert_eq!(mc.fetch(&copy).unwrap().get(mc).value, 42)).unwrap();
     assert_eq!(arena.metrics().used, BASE + PAGE + META + 64 + size_of::<std::rc::Rc<dyn super::root::RootEntry>>());
     drop(copy);
     arena.collect();
@@ -615,15 +652,15 @@ fn roots_keep_values_alive() {
 fn fetching_from_another_arena_fails() {
     let mut a = node_arena(1 << 20);
     let mut b = node_arena(1 << 20);
-    let root = a.mutate(|mc, _| mc.root::<NodeK>(Member::new(mc, node(mc, 1, None).unwrap())).unwrap());
-    b.mutate(|mc, _| assert_eq!(mc.fetch(&root).err(), Some(ForeignRoot)));
-    a.mutate(|mc, _| assert_eq!(mc.fetch(&root).unwrap().get(mc).value, 1));
+    let root = a.mutate(|mc, _| mc.root::<NodeK>(Member::new(mc, node(mc, 1, None).unwrap())).unwrap()).unwrap();
+    b.mutate(|mc, _| assert_eq!(mc.fetch(&root).err(), Some(ForeignRoot))).unwrap();
+    a.mutate(|mc, _| assert_eq!(mc.fetch(&root).unwrap().get(mc).value, 1)).unwrap();
 }
 
 #[test]
 fn roots_outliving_their_arena_are_harmless() {
     let mut arena = node_arena(1 << 20);
-    let root = arena.mutate(|mc, _| mc.root::<NodeK>(Member::new(mc, node(mc, 1, None).unwrap())).unwrap());
+    let root = arena.mutate(|mc, _| mc.root::<NodeK>(Member::new(mc, node(mc, 1, None).unwrap())).unwrap()).unwrap();
     drop(arena);
     drop(root);
 }
@@ -638,7 +675,7 @@ fn reflock_borrows_fail_instead_of_panicking() {
         assert!(lock.borrow_mut(mc).is_err());
         drop(guard);
         assert_eq!(*lock.borrow().unwrap(), 1);
-    });
+    }).unwrap();
 }
 
 #[derive(Trace, Plain)]
@@ -669,7 +706,7 @@ fn gcvec_grows_and_is_traced() {
         assert_eq!(v.get(mc, 3).unwrap().unwrap().get(mc).value, 3);
         assert!(v.get(mc, n as usize).is_none());
         assert!(!v.set(mc, n as usize, None));
-    });
+    }).unwrap();
     arena.collect();
     assert_eq!(arena.metrics().objects, n as usize + 2);
     arena.mutate(|mc, root| {
@@ -677,7 +714,7 @@ fn gcvec_grows_and_is_traced() {
         assert_eq!(v.pop(mc).unwrap().unwrap().get(mc).value, n - 1);
         v.truncate(mc, 10);
         assert!(v.set(mc, 0, None));
-    });
+    }).unwrap();
     arena.collect();
     assert_eq!(arena.metrics().objects, 9 + 2);
 }
@@ -685,9 +722,9 @@ fn gcvec_grows_and_is_traced() {
 #[test]
 fn mutate_root_replaces_the_root() {
     let mut arena = node_arena(1 << 20);
-    arena.mutate_root(|mc, root| *root = Lock::new(Some(Member::new(mc, node(mc, 3, None).unwrap()))));
+    arena.mutate_root(|mc, root| *root = Lock::new(Some(Member::new(mc, node(mc, 3, None).unwrap())))).unwrap();
     arena.collect();
-    arena.mutate(|mc, root| assert_eq!(root.load(mc).unwrap().value, 3));
+    arena.mutate(|mc, root| assert_eq!(root.load(mc).unwrap().value, 3)).unwrap();
 }
 
 /// Root `.1` holds a node that gets traced first; root `.0` holds a long chain ending in the
@@ -696,7 +733,7 @@ fn black_and_white(arena: &mut Arena<PairRoot>) {
     arena.mutate(|mc, root| {
         root.0.store(mc, chain(mc, 50, Some(node(mc, 7, None).unwrap())));
         root.1.store(mc, Some(node(mc, 1, None).unwrap()));
-    });
+    }).unwrap();
     arena.collect_slice(NODE);
     assert_eq!(arena.metrics().phase, Phase::Marking);
 }
@@ -718,7 +755,7 @@ fn check_moved(arena: &mut Arena<PairRoot>, objects: usize) {
     let m = arena.metrics();
     assert!(!m.corrupted);
     assert_eq!(m.objects, objects);
-    arena.mutate(|mc, root| assert_eq!(last(mc, root.1.load(mc).unwrap()).value, 7));
+    arena.mutate(|mc, root| assert_eq!(last(mc, root.1.load(mc).unwrap()).value, 7)).unwrap();
 }
 
 #[test]
@@ -728,7 +765,7 @@ fn barrier_shades_stores_into_black_objects() {
     arena.mutate(|mc, root| {
         let tail = move_tail(mc, root);
         root.1.load(mc).unwrap().next.store(mc, Some(tail));
-    });
+    }).unwrap();
     check_moved(&mut arena, 52);
 }
 
@@ -742,7 +779,7 @@ fn verifier_catches_a_missing_barrier() {
         // SAFETY: not upheld on purpose: the missing retrace is what the verifier must catch,
         // and it panics before anything reads the stale reference.
         unsafe { root.1.load(mc).unwrap().next.set_unbarriered(Some(Member::new(mc, tail))) };
-    });
+    }).unwrap();
     arena.collect();
 }
 
@@ -757,7 +794,7 @@ fn retrace_covers_unbarriered_stores() {
         unsafe { black.next.set_unbarriered(Some(Member::new(mc, tail))) };
         mc.retrace(black);
         mc.retrace(black);
-    });
+    }).unwrap();
     check_moved(&mut arena, 52);
 }
 
@@ -768,7 +805,7 @@ fn root_stores_are_rescanned() {
     arena.mutate(|mc, root| {
         let tail = move_tail(mc, root);
         root.1.store(mc, Some(node(mc, 1, Some(tail)).unwrap()));
-    });
+    }).unwrap();
     check_moved(&mut arena, 52);
 
     let mut arena = pair_arena(1 << 20);
@@ -776,7 +813,7 @@ fn root_stores_are_rescanned() {
     arena.mutate_root(|mc, root| {
         let tail = move_tail(mc, root);
         root.1 = Lock::new(Some(Member::new(mc, node(mc, 1, Some(tail)).unwrap())));
-    });
+    }).unwrap();
     check_moved(&mut arena, 52);
 }
 
@@ -788,7 +825,7 @@ fn objects_allocated_while_marking_are_traced() {
         let tail = move_tail(mc, root);
         let holder = node(mc, 1, Some(tail)).unwrap();
         root.1.load(mc).unwrap().next.store(mc, Some(holder));
-    });
+    }).unwrap();
     check_moved(&mut arena, 53);
 }
 
@@ -802,7 +839,7 @@ fn objects_allocated_while_sweeping_survive() {
         for i in 0..2000 {
             node(mc, i, None).unwrap();
         }
-    });
+    }).unwrap();
     arena.collect_slice(1);
     arena.collect_slice(1);
     assert_eq!(arena.metrics().phase, Phase::Sweeping);
@@ -812,7 +849,7 @@ fn objects_allocated_while_sweeping_survive() {
         let big = mc.alloc_inline(Bytes { tag: 3 }, 9000, |_| 3).unwrap();
         assert_eq!(big.len(), 9000);
         root.store(mc, chain(mc, 3000, None));
-    });
+    }).unwrap();
     arena.collect();
     arena.mutate(|mc, root| {
         let mut count = 0;
@@ -823,7 +860,7 @@ fn objects_allocated_while_sweeping_survive() {
             cur = n.next.load(mc);
         }
         assert_eq!(count, 3000);
-    });
+    }).unwrap();
     assert_eq!(arena.metrics().objects, 3000);
 }
 
@@ -882,7 +919,7 @@ fn stress_random_graph_mutation() {
                     cur = n.next.load(mc);
                     want = next_of[&n.value];
                 }
-            });
+            }).unwrap();
         }
         assert!(arena.metrics().collections > 0);
         arena.set_stress(None);
@@ -914,7 +951,7 @@ fn bad_offsets_are_detected() {
             // SAFETY: not upheld on purpose: the bits are made up, and the collector must
             // reject them without reading past the reservation.
             unsafe { n.next.set_unbarriered(Some(Member::from_bits(NonZeroU32::new(bits).unwrap()))) };
-        });
+        }).unwrap();
         arena.collect();
         assert!(arena.metrics().corrupted, "{bits:#x}");
         assert!(matches!(arena.step(|_, _| Ok::<_, ()>(())), Err(StepError::Corrupted)));
@@ -924,7 +961,7 @@ fn bad_offsets_are_detected() {
 #[test]
 fn bad_headers_are_detected() {
     let mut arena = slots_arena(1 << 20, 2);
-    let off = arena.mutate(|mc, root| offset(mc, root.load(mc).unwrap()));
+    let off = arena.mutate(|mc, root| offset(mc, root.load(mc).unwrap())).unwrap();
     // SAFETY: the header is an allocated object's, and no step is running. The bad length is
     // what the collector must catch.
     unsafe { (*arena.heap().header_of(off as u32)).len = 1 << 20 };
@@ -932,9 +969,9 @@ fn bad_headers_are_detected() {
     assert!(arena.metrics().corrupted);
 
     let mut arena = slots_arena(1 << 20, 2);
-    let off = arena.mutate(|mc, root| offset(mc, root.load(mc).unwrap()));
+    let off = arena.mutate(|mc, root| offset(mc, root.load(mc).unwrap())).unwrap();
     // SAFETY: as above, with a bad type.
-    unsafe { (*arena.heap().header_of(off as u32)).ty = 999 };
+    unsafe { (*arena.heap().header_of(off as u32)).ty = TypeIndex::new(999) };
     arena.collect();
     assert!(arena.metrics().corrupted);
 }
@@ -942,7 +979,7 @@ fn bad_headers_are_detected() {
 #[test]
 fn corrupted_items_stay_inside_the_reservation() {
     let mut arena = slots_arena(1 << 20, 2);
-    let off = arena.mutate(|mc, root| offset(mc, root.load(mc).unwrap()));
+    let off = arena.mutate(|mc, root| offset(mc, root.load(mc).unwrap())).unwrap();
     // SAFETY: as above. The items must stay inside the reservation whatever the length says.
     unsafe { (*arena.heap().header_of(off as u32)).len = u32::MAX };
     arena.mutate(|mc, root| {
@@ -956,7 +993,7 @@ fn corrupted_items_stay_inside_the_reservation() {
         let wild = unsafe { Member::<Node<'_>>::from_bits(NonZeroU32::new(u32::MAX).unwrap()) }.get(mc);
         let addr = Gc::as_ptr(wild).addr();
         assert!(addr >= base && addr + size_of::<Node<'_>>() <= base + RESERVE);
-    });
+    }).unwrap();
 }
 
 #[test]
@@ -976,7 +1013,7 @@ fn random_corruption_never_escapes() {
                 v.push(mc, Some(Member::new(mc, n))).unwrap();
             }
             offsets
-        });
+        }).unwrap();
         for _ in 0..1 + rng.below(4) {
             let at = offsets[rng.below(offsets.len())] + rng.below(NODE / 4) * 4;
             let value = match rng.below(3) {
@@ -996,7 +1033,7 @@ fn random_corruption_never_escapes() {
 #[test]
 fn phases_advance_in_slices() {
     let mut arena = node_arena(1 << 20);
-    arena.mutate(|mc, root| root.store(mc, chain(mc, 100, None)));
+    arena.mutate(|mc, root| root.store(mc, chain(mc, 100, None))).unwrap();
     assert_eq!(arena.metrics().phase, Phase::Idle);
     arena.collect_slice(NODE * 10);
     assert_eq!(arena.metrics().phase, Phase::Marking);
@@ -1046,12 +1083,12 @@ fn panicking_trace_marks_the_arena_corrupted() {
 #[test]
 fn retrace_works_in_every_cycle() {
     let mut arena = pair_arena(1 << 20);
-    arena.mutate(|mc, root| root.1.store(mc, Some(node(mc, 1, None).unwrap())));
+    arena.mutate(|mc, root| root.1.store(mc, Some(node(mc, 1, None).unwrap()))).unwrap();
     for tail in [7, 8, 9] {
         arena.mutate(|mc, root| {
             root.1.load(mc).unwrap().next.set(mc, None);
             root.0.store(mc, chain(mc, 50, Some(node(mc, tail, None).unwrap())));
-        });
+        }).unwrap();
         arena.collect_slice(NODE);
         assert_eq!(arena.metrics().phase, Phase::Marking);
         arena.mutate(|mc, root| {
@@ -1060,10 +1097,10 @@ fn retrace_works_in_every_cycle() {
             // SAFETY: the object is retraced below, in the same step.
             unsafe { black.next.set_unbarriered(Some(Member::new(mc, moved))) };
             mc.retrace(black);
-        });
+        }).unwrap();
         arena.collect();
         arena.heap().check();
-        arena.mutate(|mc, root| assert_eq!(last(mc, root.1.load(mc).unwrap()).value, tail));
+        arena.mutate(|mc, root| assert_eq!(last(mc, root.1.load(mc).unwrap()).value, tail)).unwrap();
     }
 }
 
@@ -1094,7 +1131,7 @@ fn many_types_keep_their_own_vtables() {
             assert_eq!(first, n as u64);
         }
         mc.heap.check();
-    });
+    }).unwrap();
 }
 
 struct BytesK;
@@ -1110,7 +1147,7 @@ fn check_bytes(arena: &mut Arena<Unit>, roots: &[(Root<BytesK>, usize)]) {
             assert!(b.items().iter().all(|&x| x == b.tag as u8));
         }
         mc.heap.check();
-    });
+    }).unwrap();
 }
 
 #[test]
@@ -1124,7 +1161,7 @@ fn page_runs_fill_holes_and_exhaust_the_region() {
         arena.mutate(|mc, _| {
             let b = mc.alloc_inline(Bytes { tag: t }, len, |_| t as u8).ok()?;
             mc.root::<BytesK>(Member::new(mc, b)).ok().map(|r| (r, len))
-        })
+        }).unwrap()
     };
     for _ in 0..40 {
         roots.push(alloc(&mut arena, 2 * PAGE - 100).unwrap());
@@ -1203,12 +1240,12 @@ fn dropping_mid_cycle_frees_everything() {
                 root.store(mc, Some(b));
                 mc.alloc_inline(Bytes { tag: 0 }, 9000, |_| 0).unwrap();
             }
-        });
+        }).unwrap();
         expected += 50;
         wait_for(&mut arena, phase, 16);
         arena.mutate(|mc, _| {
             mc.host(Counted).unwrap();
-        });
+        }).unwrap();
         expected += 1;
         arena.heap().check();
         drop(arena);
@@ -1223,13 +1260,13 @@ fn panicking_fill_while_marking_or_sweeping() {
         for _ in 0..10 {
             mc.alloc_inline(Bytes { tag: 0 }, 9000, |_| 0).unwrap();
         }
-    });
+    }).unwrap();
     black_and_white(&mut arena);
     for len in [10, 3 * PAGE] {
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
             arena.mutate(|mc, _| {
                 let _ = mc.alloc_inline(Bytes { tag: 0 }, len, |i| if i == 5 { panic!("fill failed") } else { 0 });
-            })
+            }).unwrap()
         }));
         assert!(result.is_err());
         arena.heap().check();
@@ -1238,7 +1275,7 @@ fn panicking_fill_while_marking_or_sweeping() {
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         arena.mutate(|mc, _| {
             let _ = mc.alloc_inline(Bytes { tag: 0 }, 10, |i| if i == 5 { panic!("fill failed") } else { 0 });
-        })
+        }).unwrap()
     }));
     assert!(result.is_err());
     arena.heap().check();
@@ -1265,7 +1302,7 @@ fn edge_sizes() {
         assert!(exact.items().iter().all(|&x| x == 1) && large.items().iter().all(|&x| x == 2));
         mc.alloc(()).unwrap();
         mc.heap.check();
-    });
+    }).unwrap();
     // The largest small object still fits the bump page; the next size up gets a page run.
     assert_eq!(arena.metrics().live, 2 * PAGE);
 }
@@ -1485,7 +1522,7 @@ fn model_fuzz() {
                 for (root, id) in &roots {
                     verify_obj(mc, &objs, &live, Some(mc.fetch(root).unwrap().get(mc)), Some(*id), 2);
                 }
-            });
+            }).unwrap();
         }
         arena.set_stress(None);
         arena.collect();
@@ -1515,7 +1552,7 @@ fn decommits_cover_only_free_os_pages() {
                 let r = arena.mutate(|mc, _| {
                     let b = mc.alloc_inline(Bytes { tag }, len, |_| tag as u8).ok()?;
                     mc.root::<BytesK>(Member::new(mc, b)).ok()
-                });
+                }).unwrap();
                 roots.extend(r.map(|r| (r, len)));
             }
             roots.retain(|_| rng.below(3) != 0);
@@ -1534,7 +1571,7 @@ fn corrupted_gcvec_len_is_bounded() {
             holder.items.push(mc, Some(Member::new(mc, node(mc, i, None).unwrap()))).unwrap();
         }
         offset(mc, holder) + HEADER
-    });
+    }).unwrap();
     corrupt_u32(&arena, len_at, u32::MAX);
     arena.mutate(|mc, root| {
         let v = &root.load(mc).unwrap().items;
@@ -1548,7 +1585,7 @@ fn corrupted_gcvec_len_is_bounded() {
         corrupt_u32_mc(mc, len_at, u32::MAX);
         v.truncate(mc, 0);
         assert_eq!(v.len(mc), 0);
-    });
+    }).unwrap();
 }
 
 fn corrupt_u32_mc(mc: &Mutation<'_>, offset: usize, value: u32) {
@@ -1578,7 +1615,7 @@ fn gcvec_grows_by_less_when_doubling_does_not_fit() {
         assert_eq!(v.get(mc, 32768), Some(32768));
         assert_eq!(v.get(mc, 100), Some(100));
         mc.heap.check();
-    });
+    }).unwrap();
 }
 
 #[test]
@@ -1589,7 +1626,7 @@ fn gcvec_growth_never_fails_when_the_needed_size_fits() {
                 v.push(mc, i).unwrap();
             }
             mc.used()
-        })
+        }).unwrap()
     };
     let used = fill(&mut Arena::<U64VecRoot>::new(1 << 20, |_| Ok(GcVec::new())).unwrap());
     let mut capacities = Vec::new();
@@ -1626,7 +1663,7 @@ fn panicking_fill_on_a_fresh_page_gives_it_back() {
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         arena.mutate(|mc, _| {
             let _ = mc.alloc_inline(Bytes { tag: 0 }, 40, |i| if i == 5 { panic!("fill failed") } else { 0 });
-        })
+        }).unwrap()
     }));
     assert!(result.is_err());
     arena.heap().check();
@@ -1646,7 +1683,7 @@ fn retrace_ignores_interior_offsets() {
         let interior = unsafe { Member::<Node<'_>>::from_bits(NonZeroU32::new(bits).unwrap()) }.get(mc);
         mc.retrace(interior);
         assert_eq!(black.value, 1);
-    });
+    }).unwrap();
     arena.collect();
     assert!(!arena.metrics().corrupted);
 }
@@ -1658,7 +1695,7 @@ fn corrupting_a_black_object_is_detected_not_a_verifier_panic() {
     let next_at = arena.mutate(|mc, root| {
         let black = root.1.load(mc).unwrap();
         (&black.next as *const Lock<NodeRef<'_>>).addr() - mc.base.as_ptr().addr()
-    });
+    }).unwrap();
     corrupt_u32(&arena, next_at, 12345);
     arena.collect();
     assert!(arena.metrics().corrupted);
@@ -1680,7 +1717,7 @@ fn retried<R: Rootable, T, E>(
 #[test]
 fn every_phase_is_visible_with_a_tiny_slice() {
     let mut arena = node_arena(1 << 20);
-    arena.mutate(|mc, root| root.store(mc, chain(mc, 3, None)));
+    arena.mutate(|mc, root| root.store(mc, chain(mc, 3, None))).unwrap();
     let mut seen = Vec::new();
     arena.collect_slice(1);
     for _ in 0..100 {
@@ -1705,7 +1742,7 @@ fn pacing_keeps_up_when_most_of_the_limit_is_live() {
         for i in 0..live {
             v.push(mc, i as u64).unwrap();
         }
-    });
+    }).unwrap();
     arena.collect();
     let before = arena.metrics().collections;
     for i in 0..steps {
@@ -1714,7 +1751,7 @@ fn pacing_keeps_up_when_most_of_the_limit_is_live() {
     }
     let m = arena.metrics();
     assert!(m.collections + m.minor_collections > before + 10);
-    arena.mutate(|mc, v| assert_eq!(v.get(mc, live - 1), Some(live as u64 - 1)));
+    arena.mutate(|mc, v| assert_eq!(v.get(mc, live - 1), Some(live as u64 - 1))).unwrap();
 }
 
 #[test]
@@ -1750,7 +1787,7 @@ fn host_table_is_charged_and_shrinks() {
         mc.heap.check();
         assert!(mc.used() <= limit);
         made
-    });
+    }).unwrap();
     assert!(made > 1000 && made <= limit / 32, "{made}");
     arena.collect();
     arena.heap().check();
@@ -1761,25 +1798,25 @@ fn host_table_is_charged_and_shrinks() {
             for _ in 0..100 {
                 mc.host(0u64).unwrap();
             }
-        });
+        }).unwrap();
         arena.collect();
         arena.heap().check();
     }
     assert!(arena.heap().hosts.capacity() <= 2);
-    arena.mutate(|mc, root| assert!(root.get().unwrap().get(mc).is_some()));
+    arena.mutate(|mc, root| assert!(root.get().unwrap().get(mc).is_some())).unwrap();
 }
 
 #[test]
 fn stale_host_refs_miss_after_their_slot_is_reused() {
     let mut arena = Arena::<HostHolder>::new(1 << 20, |_| Ok(Lock::new(None))).unwrap();
-    let stale = arena.mutate(|mc, _| mc.host(()).unwrap().to_bits_for_test());
+    let stale = arena.mutate(|mc, _| mc.host(()).unwrap().to_bits_for_test()).unwrap();
     arena.collect();
     arena.mutate(|mc, root| {
         let fresh = mc.host(()).unwrap();
         root.set(mc, Some(fresh));
         assert_eq!(fresh.to_bits_for_test().0, stale.0, "the slot should be reused");
         assert!(HostRef::<()>::from_bits_for_test(stale).get(mc).is_none());
-    });
+    }).unwrap();
 }
 
 #[test]
@@ -1798,7 +1835,7 @@ fn max_items_is_exactly_the_largest_allocatable_length() {
     let mut arena = unit_arena(1 << 20);
     arena.mutate(|mc, _| {
         assert!(mc.alloc_inline(Bytes { tag: 0 }, layout::max_items::<Bytes>() + 1, |_| 0).is_err());
-    });
+    }).unwrap();
 }
 
 struct HostHolder;
@@ -1809,7 +1846,7 @@ impl Rootable for HostHolder {
 #[test]
 fn minor_collections_free_young_garbage_only() {
     let mut arena = pair_arena(4 << 20);
-    arena.mutate(|mc, root| root.0.store(mc, chain(mc, 10, None)));
+    arena.mutate(|mc, root| root.0.store(mc, chain(mc, 10, None))).unwrap();
     arena.collect();
     arena.mutate(|mc, root| {
         for i in 0..100 {
@@ -1817,7 +1854,7 @@ fn minor_collections_free_young_garbage_only() {
         }
         root.1.store(mc, chain(mc, 5, None));
         root.0.load(mc).unwrap().next.set(mc, None);
-    });
+    }).unwrap();
     arena.collect_minor();
     arena.heap().check();
     let m = arena.metrics();
@@ -1827,7 +1864,7 @@ fn minor_collections_free_young_garbage_only() {
         let young = root.1.load(mc).unwrap();
         assert!(mc.heap.is_old(offset(mc, young) as u32));
         assert_eq!(last(mc, young).value, 1000);
-    });
+    }).unwrap();
     arena.collect();
     assert_eq!(arena.metrics().objects, 6);
 }
@@ -1842,14 +1879,14 @@ fn cards_keep_young_objects_reachable_from_old_ones() {
             items[0].store(mc, Some(node(mc, 1, None).unwrap()));
             items[len - 1].store(mc, Some(node(mc, 2, None).unwrap()));
             node(mc, 3, None).unwrap();
-        });
+        }).unwrap();
         arena.collect_minor();
         arena.heap().check();
         assert_eq!(arena.metrics().objects, 3, "{len} slots");
         arena.mutate(|mc, root| {
             let items = slot_items(root.load(mc).unwrap());
             assert_eq!((items[0].load(mc).unwrap().value, items[len - 1].load(mc).unwrap().value), (1, 2));
-        });
+        }).unwrap();
     }
 }
 
@@ -1857,13 +1894,13 @@ fn cards_keep_young_objects_reachable_from_old_ones() {
 #[should_panic(expected = "gc verify")]
 fn verifier_catches_a_missing_card() {
     let mut arena = node_arena(1 << 20);
-    arena.mutate(|mc, root| root.store(mc, Some(node(mc, 1, None).unwrap())));
+    arena.mutate(|mc, root| root.store(mc, Some(node(mc, 1, None).unwrap()))).unwrap();
     arena.collect();
     arena.mutate(|mc, root| {
         let young = node(mc, 2, None).unwrap();
         // SAFETY: not upheld on purpose: the missing card is what the verifier must catch.
         unsafe { root.load(mc).unwrap().next.set_unbarriered(Some(Member::new(mc, young))) };
-    });
+    }).unwrap();
     arena.collect_minor();
 }
 
@@ -1878,7 +1915,7 @@ fn retrace_covers_unbarriered_stores_into_old_objects() {
             unsafe { slot.set_unbarriered(Some(Member::new(mc, node(mc, i as i64, None).unwrap()))) };
         }
         mc.retrace(slots);
-    });
+    }).unwrap();
     arena.collect_minor();
     arena.heap().check();
     assert_eq!(arena.metrics().objects, 1 + 3000usize.div_ceil(97));
@@ -1892,7 +1929,7 @@ fn steps_run_minor_collections_for_short_lived_data() {
         for i in 0..live {
             v.push(mc, i).unwrap();
         }
-    });
+    }).unwrap();
     arena.collect();
     for _ in 0..if cfg!(miri) { 20 } else { 200 } {
         arena
@@ -1907,7 +1944,7 @@ fn steps_run_minor_collections_for_short_lived_data() {
     let m = arena.metrics();
     assert!(m.minor_collections >= if cfg!(miri) { 3 } else { 30 }, "{m:?}");
     assert_eq!(m.collections, 1, "{m:?}");
-    arena.mutate(|mc, v| assert_eq!(v.get(mc, live as usize - 1), Some(live - 1)));
+    arena.mutate(|mc, v| assert_eq!(v.get(mc, live as usize - 1), Some(live - 1))).unwrap();
 }
 
 #[test]
@@ -1922,7 +1959,7 @@ fn evacuation_moves_objects_and_fixes_every_reference() {
         let first = items[0].load(mc).unwrap();
         let rooted = mc.root::<NodeK>(Member::new(mc, last(mc, first))).unwrap();
         (offset(mc, first), rooted)
-    });
+    }).unwrap();
     for round in 0..3 {
         arena.collect();
         arena.heap().check();
@@ -1943,7 +1980,7 @@ fn evacuation_moves_objects_and_fixes_every_reference() {
                 assert_eq!(count, 20 + i as i64);
             }
             assert!(Gc::ptr_eq(mc.fetch(&root).unwrap().get(mc), last(mc, first)));
-        });
+        }).unwrap();
     }
     assert_eq!(arena.metrics().objects, 1 + (20..36).sum::<usize>());
 }
@@ -1963,7 +2000,7 @@ fn sparse_pages_are_compacted() {
                 items[i / per_page].store(mc, Some(n));
             }
         }
-    });
+    }).unwrap();
     arena.collect();
     assert!(arena.metrics().pages >= pages);
     arena.collect();
@@ -1974,7 +2011,7 @@ fn sparse_pages_are_compacted() {
         for (i, slot) in slot_items(root.load(mc).unwrap())[..pages].iter().enumerate() {
             assert_eq!(slot.load(mc).unwrap().value, (i * per_page + per_page / 2) as i64);
         }
-    });
+    }).unwrap();
 }
 
 #[test]
@@ -1987,13 +2024,13 @@ fn evacuation_without_room_leaves_objects_in_place() {
             made += 1;
         }
         made
-    });
+    }).unwrap();
     arena.set_evacuate_all(true);
     arena.collect();
     arena.heap().check();
     assert!(!arena.metrics().corrupted);
     assert!(arena.step(|_, _| Ok::<_, ()>(())).is_ok());
-    arena.mutate(|mc, root| assert_eq!(last(mc, root.load(mc).unwrap()).value, 0));
+    arena.mutate(|mc, root| assert_eq!(last(mc, root.load(mc).unwrap()).value, 0)).unwrap();
     assert_eq!(arena.metrics().objects, made as usize);
 }
 
@@ -2016,7 +2053,7 @@ fn weak_arena() -> Arena<WeakRoot> {
 }
 
 fn weak_value(arena: &mut Arena<WeakRoot>) -> Option<i64> {
-    arena.mutate(|mc, root| root.0.load(mc).unwrap().weak.get(mc).map(|n| n.value))
+    arena.mutate(|mc, root| root.0.load(mc).unwrap().weak.get(mc).map(|n| n.value)).unwrap()
 }
 
 #[test]
@@ -2031,10 +2068,10 @@ fn weak_refs_clear_once_the_target_dies() {
             let target = node(mc, 5, None).unwrap();
             root.0.load(mc).unwrap().weak.set(mc, target);
             root.1.store(mc, Some(target));
-        });
+        }).unwrap();
         arena.collect();
         assert_eq!(weak_value(&mut arena), Some(5));
-        arena.mutate(|mc, root| root.1.set(mc, None));
+        arena.mutate(|mc, root| root.1.set(mc, None)).unwrap();
         arena.collect();
         assert_eq!((weak_value(&mut arena), arena.metrics().objects), (None, 1));
         arena.heap().check();
@@ -2049,14 +2086,14 @@ fn minor_collections_clear_weak_refs_to_young_objects() {
         let target = node(mc, 6, None).unwrap();
         root.0.load(mc).unwrap().weak.set(mc, target);
         root.1.store(mc, Some(target));
-    });
+    }).unwrap();
     arena.collect_minor();
     assert_eq!(weak_value(&mut arena), Some(6));
 
     arena.mutate(|mc, root| {
         let target = node(mc, 7, None).unwrap();
         root.0.load(mc).unwrap().weak.set(mc, target);
-    });
+    }).unwrap();
     arena.collect_minor();
     arena.heap().check();
     assert_eq!((weak_value(&mut arena), arena.metrics().objects), (None, 2));
@@ -2072,7 +2109,7 @@ fn weak_refs_outside_the_arena_are_strong() {
     arena.set_evacuate_all(true);
     arena.collect();
     arena.collect();
-    arena.mutate(|mc, weak| assert_eq!(weak.get(mc).unwrap().value, 3));
+    arena.mutate(|mc, weak| assert_eq!(weak.get(mc).unwrap().value, 3)).unwrap();
 }
 
 type Entry<'gc> = Ephemeron<'gc, Node<'gc>, NodeRef<'gc>>;
@@ -2094,7 +2131,7 @@ fn ring(minor: bool, evacuate: bool) -> Arena<EntriesRoot> {
     arena.mutate(|mc, root| {
         let table = mc.alloc_inline(Entries(PhantomData), 4, |_| Entry::empty()).unwrap();
         root.0.store(mc, Some(table));
-    });
+    }).unwrap();
     // In a minor collection the table is old, so the entries are found through its cards.
     if minor {
         arena.collect();
@@ -2108,7 +2145,7 @@ fn ring(minor: bool, evacuate: bool) -> Arena<EntriesRoot> {
         entries[2].set(mc, a, m(b));
         entries[3].set(mc, d, m(a));
         root.1.store(mc, Some(a));
-    });
+    }).unwrap();
     arena
 }
 
@@ -2117,7 +2154,7 @@ fn entry_pair<'gc>(mc: &Mutation<'gc>, e: &Entry<'gc>) -> Option<(i64, Option<i6
 }
 
 fn ring_values(arena: &mut Arena<EntriesRoot>) -> Vec<Option<(i64, Option<i64>)>> {
-    arena.mutate(|mc, root| root.0.load(mc).unwrap().items().iter().map(|e| entry_pair(mc, e)).collect())
+    arena.mutate(|mc, root| root.0.load(mc).unwrap().items().iter().map(|e| entry_pair(mc, e)).collect()).unwrap()
 }
 
 #[test]
@@ -2131,7 +2168,7 @@ fn ephemerons_settle_and_clear_together() {
         assert_eq!(ring_values(&mut arena), full);
         assert_eq!(arena.metrics().objects, 5);
 
-        arena.mutate(|mc, root| root.1.set(mc, None));
+        arena.mutate(|mc, root| root.1.set(mc, None)).unwrap();
         // Old keys only die in a major collection.
         arena.collect();
         arena.heap().check();
@@ -2148,7 +2185,7 @@ fn ephemeron_values_are_reachable_only_through_their_keys() {
         let b = entries.items()[2].value().unwrap().unwrap().get(mc);
         root.1.store(mc, Some(b));
         entries.items()[0].set_value(mc, None);
-    });
+    }).unwrap();
     arena.collect();
     arena.heap().check();
     // b is held, which keeps c (b's value), but c's value was cleared, so d and a are gone.
@@ -2166,7 +2203,7 @@ fn gray_overflow_is_rescanned() {
             for (i, slot) in slot_items(root.load(mc).unwrap()).iter().enumerate() {
                 slot.store(mc, chain(mc, CHAIN, Some(node(mc, i as i64, None).unwrap())));
             }
-        });
+        }).unwrap();
         arena.collect();
         arena.heap().check();
         assert_eq!(arena.metrics().objects, 1 + (CHAIN as usize + 1) * len);
@@ -2176,7 +2213,7 @@ fn gray_overflow_is_rescanned() {
             for slot in items {
                 slot.store(mc, Some(node(mc, -1, slot.load(mc)).unwrap()));
             }
-        });
+        }).unwrap();
         arena.collect_minor();
         arena.heap().check();
         assert_eq!(arena.metrics().objects, 1 + (CHAIN as usize + 2) * len);
@@ -2186,7 +2223,7 @@ fn gray_overflow_is_rescanned() {
 #[test]
 fn unused_lines_of_an_allocation_run_are_freed() {
     let mut arena = node_arena(1 << 20);
-    arena.mutate(|mc, root| root.store(mc, Some(node(mc, 1, None).unwrap())));
+    arena.mutate(|mc, root| root.store(mc, Some(node(mc, 1, None).unwrap()))).unwrap();
     assert_eq!(arena.metrics().live, PAGE, "a fresh page is claimed whole");
     arena.collect_slice(0);
     assert_eq!(arena.metrics().phase, Phase::Marking);
@@ -2194,7 +2231,7 @@ fn unused_lines_of_an_allocation_run_are_freed() {
     arena.heap().check();
     arena.collect();
     arena.heap().check();
-    arena.mutate(|mc, root| assert_eq!(root.load(mc).unwrap().value, 1));
+    arena.mutate(|mc, root| assert_eq!(root.load(mc).unwrap().value, 1)).unwrap();
 }
 
 #[test]
@@ -2208,7 +2245,7 @@ fn retrace_while_marking_leaves_the_work_to_slices() {
         unsafe { black.next.set_unbarriered(Some(Member::new(mc, tail))) };
         mc.retrace(black);
         offset(mc, tail) as u32
-    });
+    }).unwrap();
     assert!(!arena.heap().is_old(tail));
     arena.collect_slice(NODE);
     assert_eq!(arena.metrics().phase, Phase::Marking);
@@ -2228,7 +2265,7 @@ fn panicking_init_while_marking() {
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         arena.mutate(|mc, _| {
             let _ = mc.alloc_inline_with(Values(PhantomData), 4, Value::NIL, |_| panic!("init failed"));
-        })
+        }).unwrap()
     }));
     assert!(result.is_err());
     assert_eq!(arena.metrics().objects, objects);
@@ -2250,7 +2287,7 @@ fn shrinking_while_marking_frees_the_tail() {
                 1
             })
             .unwrap();
-        });
+        }).unwrap();
         wait_for(&mut arena, Phase::Idle, 1);
         arena.heap().check();
         arena.heap().used_lines()
@@ -2268,7 +2305,7 @@ fn warm_pages_past_a_trimmed_gap_get_reused() {
         arena.mutate(|mc, _| {
             let b = mc.alloc_inline(Bytes { tag: 0 }, len, |_| 0).unwrap();
             mc.root::<BytesK>(Member::new(mc, b)).unwrap()
-        })
+        }).unwrap()
     };
     let (one, two) = (PAGE - 16, PAGE + 100);
     // Pages: a, then b over two, then c over three.
@@ -2301,7 +2338,7 @@ fn warm_pages_leave_no_os_page_half_kept() {
         let big = arena.mutate(|mc, _| {
             let b = mc.alloc_inline(Bytes { tag: 0 }, 5 * PAGE + 100, |_| 0).unwrap();
             mc.root::<BytesK>(Member::new(mc, b)).unwrap()
-        });
+        }).unwrap();
         assert_eq!(arena.heap().page_count(), 6);
         drop(big);
         arena.collect();
@@ -2324,7 +2361,7 @@ fn single_page_frees_strand_nothing() {
                     arena.mutate(|mc, _| {
                         let b = mc.alloc_inline(Bytes { tag: 0 }, PAGE - 16, |_| 0).unwrap();
                         mc.root::<BytesK>(Member::new(mc, b)).unwrap()
-                    })
+                    }).unwrap()
                 })
                 .collect();
             assert_eq!(arena.heap().page_count(), 12);
@@ -2341,4 +2378,254 @@ fn single_page_frees_strand_nothing() {
             }
         }
     }
+}
+
+/// The distinct arena objects `value` hands the tracer.
+fn edges<T: Trace>(mc: &Mutation<'_>, mut value: T) -> usize {
+    let mut v = Verify::new(mc.heap);
+    value.trace(&mut Tracer::verifying(mc.heap, &mut v));
+    v.visited()
+}
+
+/// Every library `Trace` impl hands the tracer each reference it holds, and says it holds them.
+#[test]
+fn library_impls_trace_every_reference() {
+    fn check<T: Trace>(mc: &Mutation<'_>, what: &str, value: T, expected: usize) {
+        let holds = value.holds_refs();
+        let found = edges(mc, value);
+        assert_eq!(found, expected, "{what} traced {found} references");
+        assert!(expected == 0 || (T::NEEDS_TRACE && holds), "{what} hides its references");
+    }
+    fn leaf<T: Trace>(what: &str) {
+        assert!(!T::NEEDS_TRACE, "{what} claims references");
+    }
+    let mut arena = unit_arena(1 << 20);
+    arena.mutate(|mc, _| {
+        let [x, y, z] = [1, 2, 3].map(|v| node(mc, v, None).unwrap());
+        let [a, b, c] = [x, y, z].map(|n| Member::new(mc, n));
+        let r = AnyRef::from_member(mc, a);
+        check(mc, "Member", a, 1);
+        check(mc, "AnyRef", r, 1);
+        check(mc, "Value", Value::from(r), 1);
+        check(mc, "Value::NIL", Value::NIL, 0);
+        assert!(!Value::NIL.holds_refs() && !Value::fixnum(7).unwrap().holds_refs());
+        check(mc, "Option", Some(a), 1);
+        check(mc, "None", None::<Member<'_, Node<'_>>>, 0);
+        check(mc, "Lock", Lock::new(Some(a)), 1);
+        check(mc, "Cell", Cell::new(Some(a)), 1);
+        check(mc, "array", [a, b, c], 3);
+        check(mc, "tuple", (a, b, c, Value::NIL), 3);
+        check(mc, "slice", vec![a, b, c].into_boxed_slice(), 3);
+        check(mc, "Box", Box::new(a), 1);
+        check(mc, "Vec", vec![a, b, c], 3);
+        check(mc, "VecDeque", VecDeque::from([a, b, c]), 3);
+        check(mc, "RefCell", RefCell::new(vec![a, b]), 2);
+        check(mc, "RefLock", RefLock::new(vec![a, b]), 2);
+        check(mc, "HashMap", HashMap::from([(1u64, a), (2, b), (3, c)]), 3);
+        check(mc, "BTreeMap", BTreeMap::from([(1u64, a), (2, b)]), 2);
+        // Outside the arena an ephemeron holds its key strongly, so both are traced.
+        check(mc, "Ephemeron", Ephemeron::new(mc, x, Value::from(AnyRef::new(mc, y))), 2);
+        check(mc, "Weak", Weak::new(mc, x), 1);
+        let vec = GcVec::<u64>::new();
+        vec.push(mc, 1).unwrap();
+        check(mc, "GcVec", vec, 1);
+    }).unwrap();
+    const { assert!(<HostRef<'static, u8> as Trace>::NEEDS_TRACE && <AnyHostRef<'static> as Trace>::NEEDS_TRACE) };
+    leaf::<()>("()");
+    leaf::<(bool, char, u8, u16)>("integers");
+    leaf::<(u32, u64, u128, usize)>("unsigned integers");
+    leaf::<(i8, i16, i32, i64)>("signed integers");
+    leaf::<(i128, isize, f32, f64)>("wide integers and floats");
+    leaf::<(String, Box<str>, Vec<String>, Option<u32>)>("text");
+    leaf::<[u64; 4]>("arrays of leaves");
+    leaf::<PhantomData<Member<'static, Node<'static>>>>("PhantomData");
+    leaf::<(HashSet<u64>, BTreeSet<u64>, HashMap<u64, u64>)>("sets and maps of leaves");
+}
+
+/// Type ids ignore lifetimes, which arena types only use as brands, and still tell types apart.
+#[test]
+fn type_ids_ignore_lifetimes() {
+    fn node_id<'a>(_: &'a ()) -> TypeId {
+        layout::type_id::<Node<'a>>()
+    }
+    let local = ();
+    assert_eq!(node_id(&local), layout::type_id::<Node<'static>>());
+    assert_ne!(layout::type_id::<Node<'static>>(), layout::type_id::<Bytes>());
+    assert_ne!(layout::type_id::<GcVec<'static, u64>>(), layout::type_id::<GcVec<'static, i64>>());
+}
+
+#[test]
+fn batch_covers_stores_into_black_objects() {
+    let mut arena = pair_arena(1 << 20);
+    black_and_white(&mut arena);
+    arena.mutate(|mc, root| {
+        let tail = move_tail(mc, root);
+        let black = root.1.load(mc).unwrap();
+        mc.batch(black, |b| b.set(&black.next, Some(Member::new(mc, tail))));
+    }).unwrap();
+    check_moved(&mut arena, 52);
+}
+
+/// A batch's one barrier dirties only the cards it wrote, which is enough for minor collections.
+#[test]
+fn batch_covers_stores_into_old_objects() {
+    let mut arena = slots_arena(1 << 20, 3000);
+    arena.collect();
+    arena.mutate(|mc, root| {
+        let slots = root.load(mc).unwrap();
+        mc.batch(slots, |b| {
+            for slot in &slot_items(slots)[100..110] {
+                b.set(slot, Some(Member::new(mc, node(mc, 1, None).unwrap())));
+            }
+        });
+    }).unwrap();
+    assert!(arena.heap().dirty_cards() <= 2, "dirtied {} cards", arena.heap().dirty_cards());
+    arena.collect_minor();
+    arena.heap().check();
+    assert_eq!(arena.metrics().objects, 1 + 10);
+}
+
+#[test]
+fn batch_takes_the_barrier_outside_its_object() {
+    let mut arena = pair_arena(1 << 20);
+    black_and_white(&mut arena);
+    arena.mutate(|mc, root| {
+        let tail = move_tail(mc, root);
+        let black = root.1.load(mc).unwrap();
+        let other = node(mc, 0, None).unwrap();
+        mc.batch(other, |b| b.set(&black.next, Some(Member::new(mc, tail))));
+    }).unwrap();
+    check_moved(&mut arena, 52);
+}
+
+#[test]
+fn batch_retraces_after_a_panic() {
+    let mut arena = pair_arena(1 << 20);
+    black_and_white(&mut arena);
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        arena.mutate(|mc, root| {
+            let tail = move_tail(mc, root);
+            let black = root.1.load(mc).unwrap();
+            mc.batch(black, |b| {
+                b.set(&black.next, Some(Member::new(mc, tail)));
+                panic!("batch failed");
+            });
+        }).unwrap()
+    }));
+    assert!(result.is_err());
+    check_moved(&mut arena, 52);
+}
+
+/// A batch's span ends where the page metadata says the next object starts, whatever the
+/// header claims.
+#[test]
+fn a_damaged_header_cant_stretch_a_batch() {
+    let mut arena = unit_arena(1 << 20);
+    arena.mutate(|mc, _| {
+        let first = mc.alloc_inline(Slots(PhantomData), 4, |_| Lock::new(None)).unwrap();
+        let second = mc.alloc_inline(Slots(PhantomData), 4, |_| Lock::new(None)).unwrap();
+        let (a, b) = (offset(mc, first), offset(mc, second));
+        assert_eq!(mc.heap.object_span(a as u32), Some(a..b));
+        // SAFETY: no reference into the object is used after the write.
+        unsafe { (*mc.heap.header_of(a as u32)).len = 1000 };
+        assert_eq!(mc.heap.object_span(a as u32), Some(a..b));
+    }).unwrap();
+}
+
+/// Two references to one object, with a `Trace` that panics once the first is rewritten, so the
+/// second is left pointing at the old copy, whose header now holds forwarding data.
+#[derive(Plain)]
+struct Torn<'gc> {
+    a: Lock<Option<Member<'gc, Slots<'gc>>>>,
+    b: Lock<Option<Member<'gc, Slots<'gc>>>>,
+}
+
+// SAFETY: traces both members. Panicking is allowed: the arena is then marked corrupted.
+unsafe impl Trace for Torn<'_> {
+    fn trace(&mut self, t: &mut Tracer<'_>) {
+        let before = self.a.get().map(|m| m.to_bits());
+        self.a.trace(t);
+        if self.a.get().map(|m| m.to_bits()) != before {
+            panic!("fixup panicked");
+        }
+        self.b.trace(t);
+    }
+}
+
+fn torn<'gc>(mc: &Mutation<'gc>) -> Result<Torn<'gc>, OutOfMemory> {
+    let s = mc.alloc_inline(Slots(PhantomData), 4, |_| Lock::new(None))?;
+    let s = Some(Member::new(mc, s));
+    Ok(Torn { a: Lock::new(s), b: Lock::new(s) })
+}
+
+struct TornRoot;
+impl Rootable for TornRoot {
+    type Root<'gc> = Torn<'gc>;
+}
+
+struct TornObjectRoot;
+impl Rootable for TornObjectRoot {
+    type Root<'gc> = Lock<Option<Member<'gc, Torn<'gc>>>>;
+}
+
+fn panics_in_fixup<R: Rootable>(arena: &mut Arena<R>) {
+    arena.set_evacuate_all(true);
+    let result = panic::catch_unwind(AssertUnwindSafe(|| arena.collect()));
+    assert!(result.is_err(), "nothing panicked");
+    assert!(arena.metrics().corrupted);
+    assert_eq!(arena.mutate(|_, _| ()), Err(Corrupted));
+    assert_eq!(arena.mutate_root(|_, _| ()), Err(Corrupted));
+    assert!(matches!(arena.step(|_, _| Ok::<_, ()>(())), Err(StepError::Corrupted)));
+}
+
+#[test]
+fn a_panic_while_fixing_up_the_root_closes_the_arena() {
+    let mut arena = Arena::<TornRoot>::new(1 << 20, torn).unwrap();
+    panics_in_fixup(&mut arena);
+}
+
+#[test]
+fn a_panic_while_fixing_up_an_object_closes_the_arena() {
+    let mut arena = Arena::<TornObjectRoot>::new(1 << 20, |mc| Ok(Lock::new(Some(Member::new(mc, mc.alloc(torn(mc)?)?))))).unwrap();
+    panics_in_fixup(&mut arena);
+}
+
+/// The lines of each `[section]` of a manifest, trimmed, without comments or blank lines.
+fn manifest_sections(path: &std::path::Path) -> HashMap<String, Vec<String>> {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let mut sections = HashMap::<String, Vec<String>>::new();
+    let mut current = String::new();
+    for line in text.lines().map(|l| l.split('#').next().unwrap_or("").trim()).filter(|l| !l.is_empty()) {
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            current = name.trim().to_string();
+        } else {
+            sections.entry(current.clone()).or_default().push(line.split_whitespace().collect());
+        }
+    }
+    sections
+}
+
+/// Unsafe code is forbidden in every crate but this one, so a hand-written `Trace`, `Plain` or
+/// `Inline` impl can only be here, and other crates get them from the derive.
+#[test]
+fn only_the_gc_crate_allows_unsafe_code() {
+    let gc = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let crates = gc.parent().unwrap();
+    let root = manifest_sections(&crates.parent().unwrap().join("Cargo.toml"));
+    let has = |section: &str, line: &str| root.get(section).is_some_and(|lines| lines.iter().any(|l| l == line));
+    assert!(has("workspace.lints.rust", "unsafe_code=\"forbid\""), "the workspace doesn't forbid unsafe code");
+    assert!(has("workspace.lints.clippy", "unwrap_used=\"forbid\""), "the workspace doesn't forbid unwrap");
+    let mut checked = 0;
+    for dir in std::fs::read_dir(crates).unwrap().map(|e| e.unwrap().path()) {
+        let manifest = dir.join("Cargo.toml");
+        if dir == gc || !manifest.exists() {
+            continue;
+        }
+        let sections = manifest_sections(&manifest);
+        let lints = sections.get("lints").map(Vec::as_slice).unwrap_or_default();
+        assert_eq!(lints, ["workspace=true"], "{} must take the workspace lints and nothing else", manifest.display());
+        assert!(!sections.keys().any(|s| s.starts_with("lints.")), "{} overrides a workspace lint", manifest.display());
+        checked += 1;
+    }
+    assert!(checked >= 4, "found only {checked} other crates");
 }

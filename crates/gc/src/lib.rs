@@ -30,11 +30,11 @@ mod stack_tests;
 #[doc(hidden)]
 pub mod compile_fail;
 
-pub use arena::{Arena, Metrics, Mutation, Phase, Rootable, StepError};
+pub use arena::{Arena, Corrupted, Metrics, Mutation, Phase, Rootable, StepError};
 pub use budget::OutOfMemory;
 pub use host::{AnyHostRef, HostRef};
 pub use layout::REGION;
-pub use lock::{Lock, RefLock};
+pub use lock::{Batch, Lock, RefLock};
 pub use ptr::{AnyRef, Gc, Member, TypeTag};
 pub use root::{ForeignRoot, Root, Rooted};
 pub use stack::{Frame, Segment, Stack, WINDOW};

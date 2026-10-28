@@ -11,6 +11,20 @@ use super::{Invariant, Mutation, OutOfMemory, Plain, Trace, Tracer};
 
 const NO_SLOT: u32 = u32::MAX;
 
+/// Names a host value: its slot, and the slot's generation when the value went in, so an id
+/// that outlived its value matches nothing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostId {
+    index: u32,
+    generation: u32,
+}
+
+impl fmt::Debug for HostId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}#{}", self.index, self.generation)
+    }
+}
+
 enum Slot {
     Used { generation: u32, marked: bool, cost: usize, value: Box<dyn Any> },
     Free { next: u32 },
@@ -31,7 +45,7 @@ impl Hosts {
     }
 
     /// Takes ownership of `value` and charges `cost` for it, plus any growth of the table.
-    fn insert(&self, budget: &Budget, value: Box<dyn Any>, cost: usize, marked: bool) -> Result<(u32, u32), OutOfMemory> {
+    fn insert(&self, budget: &Budget, value: Box<dyn Any>, cost: usize, marked: bool) -> Result<HostId, OutOfMemory> {
         let mut slots = self.slots.borrow_mut();
         let head = self.free.get();
         let growth = if head == NO_SLOT { slots.growth_cost(1) } else { 0 };
@@ -53,21 +67,21 @@ impl Hosts {
             head as usize
         };
         budget.charge(cost)?;
-        Ok((index as u32, generation))
+        Ok(HostId { index: index as u32, generation })
     }
 
     /// The value's address. It stays put while the slot is used, since the box doesn't move
     /// when the table grows, and slots are only freed between steps.
-    fn get<T: 'static>(&self, index: u32, generation: u32) -> Option<NonNull<T>> {
-        match self.slots.borrow().get(index as usize)? {
-            Slot::Used { generation: g, value, .. } if *g == generation => value.downcast_ref::<T>().map(NonNull::from),
+    fn get<T: 'static>(&self, id: HostId) -> Option<NonNull<T>> {
+        match self.slots.borrow().get(id.index as usize)? {
+            Slot::Used { generation, value, .. } if *generation == id.generation => value.downcast_ref::<T>().map(NonNull::from),
             _ => None,
         }
     }
 
-    pub(crate) fn mark(&self, index: u32, generation: u32) -> bool {
-        match self.slots.borrow_mut().get_mut(index as usize) {
-            Some(Slot::Used { generation: g, marked, .. }) if *g == generation => {
+    pub(crate) fn mark(&self, id: HostId) -> bool {
+        match self.slots.borrow_mut().get_mut(id.index as usize) {
+            Some(Slot::Used { generation, marked, .. }) if *generation == id.generation => {
                 *marked = true;
                 true
             }
@@ -76,14 +90,14 @@ impl Hosts {
     }
 
     #[cfg(any(test, feature = "gc-verify"))]
-    pub(crate) fn is_live(&self, index: u32, generation: u32) -> bool {
-        matches!(self.slots.borrow().get(index as usize), Some(Slot::Used { generation: g, .. }) if *g == generation)
+    pub(crate) fn is_live(&self, id: HostId) -> bool {
+        matches!(self.slots.borrow().get(id.index as usize), Some(Slot::Used { generation, .. }) if *generation == id.generation)
     }
 
     #[cfg(any(test, feature = "gc-verify"))]
-    pub(crate) fn is_marked(&self, index: u32, generation: u32) -> bool {
+    pub(crate) fn is_marked(&self, id: HostId) -> bool {
         let slots = self.slots.borrow();
-        matches!(slots.get(index as usize), Some(Slot::Used { generation: g, marked: true, .. }) if *g == generation)
+        matches!(slots.get(id.index as usize), Some(Slot::Used { generation, marked: true, .. }) if *generation == id.generation)
     }
 
     /// Unmarks every value, at the start of a major cycle.
@@ -143,8 +157,7 @@ impl Hosts {
 
 /// A reference from the arena to a host value, checked on every access.
 pub struct HostRef<'gc, T: 'static> {
-    index: u32,
-    generation: u32,
+    id: HostId,
     _marker: PhantomData<(Invariant<'gc>, fn() -> T)>,
 }
 
@@ -152,17 +165,17 @@ impl<'gc, T: 'static> HostRef<'gc, T> {
     pub fn get(self, mc: &Mutation<'gc>) -> Option<&'gc T> {
         // SAFETY: `get` checked the slot's generation and type. The box doesn't move or get
         // freed until a collection, which can't run while `mc` is borrowed for `'gc`.
-        mc.heap.hosts.get::<T>(self.index, self.generation).map(|p| unsafe { p.as_ref() })
+        mc.heap.hosts.get::<T>(self.id).map(|p| unsafe { p.as_ref() })
     }
 
     #[cfg(test)]
     pub(crate) fn to_bits_for_test(self) -> (u32, u32) {
-        (self.index, self.generation)
+        (self.id.index, self.id.generation)
     }
 
     #[cfg(test)]
     pub(crate) fn from_bits_for_test((index, generation): (u32, u32)) -> Self {
-        Self { index, generation, _marker: PhantomData }
+        Self { id: HostId { index, generation }, _marker: PhantomData }
     }
 }
 
@@ -176,26 +189,25 @@ impl<T> Copy for HostRef<'_, T> {}
 
 impl<T> fmt::Debug for HostRef<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "HostRef({}#{})", self.index, self.generation)
+        write!(f, "HostRef({:?})", self.id)
     }
 }
 
-// SAFETY: two `u32`s and a marker, so no padding and every bit pattern valid: a bad index
-// or generation just fails to look up. The brand is `'gc`.
+// SAFETY: a `HostId`, two `u32`s, and a marker, so no padding and every bit pattern valid: a
+// bad id just fails to look up. The brand is `'gc`.
 unsafe impl<'gc, T> Plain<'gc> for HostRef<'gc, T> {}
 
 // SAFETY: traces the one host reference it holds.
 unsafe impl<T> Trace for HostRef<'_, T> {
     fn trace(&mut self, t: &mut Tracer<'_>) {
-        t.trace_host(self.index, self.generation);
+        t.trace_host(self.id);
     }
 }
 
 /// A reference to a host value of any type. Downcasts check the type.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct AnyHostRef<'gc> {
-    index: u32,
-    generation: u32,
+    id: HostId,
     _brand: Invariant<'gc>,
 }
 
@@ -210,20 +222,20 @@ impl<'gc> AnyHostRef<'gc> {
     }
 
     pub fn downcast<T: 'static>(self, mc: &Mutation<'gc>) -> Option<HostRef<'gc, T>> {
-        mc.heap.hosts.get::<T>(self.index, self.generation)?;
-        Some(HostRef { index: self.index, generation: self.generation, _marker: PhantomData })
+        mc.heap.hosts.get::<T>(self.id)?;
+        Some(HostRef { id: self.id, _marker: PhantomData })
     }
 }
 
 impl<'gc, T> From<HostRef<'gc, T>> for AnyHostRef<'gc> {
     fn from(r: HostRef<'gc, T>) -> Self {
-        Self { index: r.index, generation: r.generation, _brand: PhantomData }
+        Self { id: r.id, _brand: PhantomData }
     }
 }
 
 impl fmt::Debug for AnyHostRef<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "AnyHostRef({}#{})", self.index, self.generation)
+        write!(f, "AnyHostRef({:?})", self.id)
     }
 }
 
@@ -233,7 +245,7 @@ unsafe impl<'gc> Plain<'gc> for AnyHostRef<'gc> {}
 // SAFETY: as for `HostRef`.
 unsafe impl Trace for AnyHostRef<'_> {
     fn trace(&mut self, t: &mut Tracer<'_>) {
-        t.trace_host(self.index, self.generation);
+        t.trace_host(self.id);
     }
 }
 
@@ -243,8 +255,8 @@ impl<'gc> Mutation<'gc> {
         self.heap.budget.count_allocation()?;
         let cost = size_of::<T>();
         let marked = self.heap.is_marking();
-        let (index, generation) = self.heap.hosts.insert(&self.heap.budget, Box::new(value), cost, marked)?;
+        let id = self.heap.hosts.insert(&self.heap.budget, Box::new(value), cost, marked)?;
         self.heap.demand(cost);
-        Ok(HostRef { index, generation, _marker: PhantomData })
+        Ok(HostRef { id, _marker: PhantomData })
     }
 }

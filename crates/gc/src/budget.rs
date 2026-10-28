@@ -121,9 +121,12 @@ impl Budget {
     /// Runs an allocation that the caller can do without, so failing it doesn't fail the step,
     /// and it doesn't draw on the reserve.
     pub(crate) fn quiet<R>(&self, f: impl FnOnce() -> Result<R, OutOfMemory>) -> Result<R, OutOfMemory> {
-        let (failed, optional) = (self.failed.get(), self.optional.replace(true));
-        let result = f();
-        self.optional.set(optional);
+        let failed = self.failed.get();
+        let result = {
+            // Restored on unwind too, so a panic in `f` doesn't leave later steps without the reserve.
+            let _optional = Restore(&self.optional, self.optional.replace(true));
+            f()
+        };
         if result.is_err() {
             self.failed.set(failed);
         }
@@ -143,5 +146,14 @@ impl Budget {
     pub(crate) fn refund(&self, bytes: usize) {
         debug_assert!(bytes <= self.used.get());
         self.used.set(self.used.get() - bytes);
+    }
+}
+
+/// Puts a flag back to what it was when dropped.
+struct Restore<'a>(&'a Cell<bool>, bool);
+
+impl Drop for Restore<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.1);
     }
 }

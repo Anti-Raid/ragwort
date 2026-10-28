@@ -1,7 +1,8 @@
 use std::cell::{BorrowError, BorrowMutError, Cell, Ref, RefCell, RefMut};
 use std::fmt;
-use std::mem::size_of_val;
+use std::mem::{size_of, size_of_val};
 
+use super::layout::Addr;
 use super::{Gc, Member, Mutation, Plain, Trace, Tracer};
 
 #[repr(transparent)]
@@ -31,7 +32,7 @@ impl<T: Copy + Trace> Lock<T> {
     {
         self.0.set(value);
         if T::NEEDS_TRACE && value.holds_refs() {
-            mc.heap.write_barrier(self.0.as_ptr().addr(), |t| {
+            mc.heap.write_barrier(Addr::of(self.0.as_ptr()), |t| {
                 let mut value = value;
                 value.trace(t);
             });
@@ -39,10 +40,10 @@ impl<T: Copy + Trace> Lock<T> {
     }
 
     /// # Safety
-    /// If the lock is inside an arena object, call [`Mutation::retrace`] on that object in the
-    /// same step, after the last such write.
+    /// If the lock is inside an arena object, have that object retraced in the same step, as
+    /// [`Mutation::batch`] and the stack do.
     #[inline]
-    pub unsafe fn set_unbarriered(&self, value: T) {
+    pub(crate) unsafe fn set_unbarriered(&self, value: T) {
         self.0.set(value);
     }
 
@@ -90,11 +91,62 @@ impl<T: Copy + Trace> Lock<T> {
 
     pub(crate) fn barrier_range(mc: &Mutation<'_>, slots: &[Self], refs: bool) {
         if refs {
-            mc.heap.barrier_range(slots.as_ptr().addr(), size_of_val(slots), |t| {
+            mc.heap.barrier_range(Addr::of(slots.as_ptr()), size_of_val(slots), |t| {
                 for slot in slots {
                     slot.get().trace(t);
                 }
             });
+        }
+    }
+}
+
+/// Writes to the locks inside one arena object without a barrier each, for [`Mutation::batch`].
+/// The object gets one barrier for all of them when the batch ends.
+pub struct Batch<'b, 'gc> {
+    mc: &'b Mutation<'gc>,
+    object: u32,
+    /// The object's address and size. A lock outside them takes the usual barrier.
+    start: usize,
+    len: usize,
+    /// The addresses written without a barrier so far. Empty while the first is past the second.
+    lo: usize,
+    hi: usize,
+}
+
+impl<'gc> Mutation<'gc> {
+    /// Runs `f` with a [`Batch`] for writing many locks inside `object`. Writes into the object
+    /// skip the per-write barrier, and once `f` returns or panics the object gets one barrier
+    /// covering everything written. Writes to locks anywhere else take the usual barrier.
+    pub fn batch<T, R>(&self, object: Gc<'gc, T>, f: impl FnOnce(&mut Batch<'_, 'gc>) -> R) -> R {
+        let offset = Member::new(self, object).to_bits().get();
+        let span = self.heap.object_span(offset).unwrap_or(0..0);
+        let start = self.base.as_ptr().addr() + span.start;
+        f(&mut Batch { mc: self, object: offset, start, len: span.len(), lo: usize::MAX, hi: 0 })
+    }
+}
+
+impl<'gc> Batch<'_, 'gc> {
+    #[inline]
+    pub fn set<T: Copy + Trace + 'gc>(&mut self, lock: &Lock<T>, value: T) {
+        if !(T::NEEDS_TRACE && value.holds_refs()) {
+            return lock.0.set(value);
+        }
+        let at = Addr::of(lock.0.as_ptr()).get();
+        if self.len.checked_sub(size_of::<T>()).is_some_and(|room| at.wrapping_sub(self.start) <= room) {
+            lock.0.set(value);
+            self.lo = self.lo.min(at);
+            self.hi = self.hi.max(at + size_of::<T>());
+        } else {
+            lock.set(self.mc, value);
+        }
+    }
+}
+
+impl Drop for Batch<'_, '_> {
+    fn drop(&mut self) {
+        if self.lo < self.hi {
+            let base = self.mc.base.as_ptr().addr();
+            self.mc.heap.retrace_part(self.object, self.lo - base..self.hi - base);
         }
     }
 }

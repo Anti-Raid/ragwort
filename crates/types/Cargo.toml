@@ -12,3 +12,6 @@ ragwort-string = { path = "../string" }
 default = ["mmap"]
 mmap = ["ragwort-gc/mmap"]
 gc-verify = ["ragwort-gc/gc-verify"]
+
+[lints]
+workspace = true

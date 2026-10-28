@@ -2,8 +2,6 @@
 //! complex numbers. Each layer has a host trait the heap implements, [`Host`] for integers,
 //! then [`RationalHost`], [`RealHost`] and [`ComplexHost`], and the library does the rest.
 
-#![forbid(unsafe_code)]
-
 pub mod bigint;
 mod cfloat;
 pub mod complex;

@@ -53,34 +53,31 @@
 //! getting one requires the type to be `Plain`:
 //!
 //! ```compile_fail,E0277
-//! use std::num::NonZeroU32;
 //! use ragwort_gc::{Arena, Member, Rootable};
 //! struct Flag(bool);
 //! struct R;
 //! impl Rootable for R { type Root<'gc> = (); }
 //! let mut arena = Arena::<R>::new(1 << 20, |_| Ok(())).unwrap();
 //! arena.mutate(|mc, _| {
-//!     let m = unsafe { Member::<Flag>::from_bits(NonZeroU32::new(8).unwrap()) };
-//!     let _ = m.get(mc);
+//!     let m: Option<Member<'_, Flag>> = None;
+//!     let _ = m.map(|m| m.get(mc));
 //! });
 //! ```
 //!
 //! and checks its layout too. Oversized or over-aligned types don't compile:
 //!
 //! ```compile_fail,E0080
-//! use std::num::NonZeroU32;
 //! use ragwort_gc::{Arena, Member, Rootable};
 //! struct R;
 //! impl Rootable for R { type Root<'gc> = (); }
 //! let mut arena = Arena::<R>::new(1 << 20, |_| Ok(())).unwrap();
 //! arena.mutate(|mc, _| {
-//!     let m = unsafe { Member::<[u64; 1 << 24]>::from_bits(NonZeroU32::new(8).unwrap()) };
-//!     let _ = m.get(mc);
+//!     let m: Option<Member<'_, [u64; 1 << 24]>> = None;
+//!     let _ = m.map(|m| m.get(mc));
 //! });
 //! ```
 //!
 //! ```compile_fail,E0080
-//! use std::num::NonZeroU32;
 //! use ragwort_gc::{Arena, Member, Rootable};
 //! #[repr(C, align(16))]
 //! struct Wide([u64; 2]);
@@ -89,8 +86,8 @@
 //! impl Rootable for R { type Root<'gc> = (); }
 //! let mut arena = Arena::<R>::new(1 << 20, |_| Ok(())).unwrap();
 //! arena.mutate(|mc, _| {
-//!     let m = unsafe { Member::<Wide>::from_bits(NonZeroU32::new(8).unwrap()) };
-//!     let _ = m.get(mc);
+//!     let m: Option<Member<'_, Wide>> = None;
+//!     let _ = m.map(|m| m.get(mc));
 //! });
 //! ```
 //!
@@ -358,4 +355,20 @@
 //!     root.set(mc, Value::object(mc, arr));
 //!     root.get().downcast::<Arr<Option<Member<'static, u64>>>>(mc).unwrap().items()[0].get()
 //! });
+//! ```
+//!
+//! Hashers aren't traced, so a map or set can't keep one that holds an arena reference:
+//!
+//! ```compile_fail,E0477
+//! use std::collections::HashMap;
+//! use ragwort_gc::{Member, Rootable};
+//! struct R;
+//! impl Rootable for R { type Root<'gc> = HashMap<u64, u64, Member<'gc, i64>>; }
+//! ```
+//!
+//! ```compile_fail,E0477
+//! use std::collections::HashSet;
+//! use ragwort_gc::{Member, Rootable};
+//! struct R;
+//! impl Rootable for R { type Root<'gc> = HashSet<u64, Member<'gc, i64>>; }
 //! ```

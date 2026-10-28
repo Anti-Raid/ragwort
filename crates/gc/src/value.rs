@@ -269,7 +269,8 @@ impl<'gc> Value<'gc> {
     /// # Safety
     /// If the bits hold a reference (an object or a boxed flonum), they must come from
     /// [`Value::to_bits`] in the same arena, in the same step. Other bits are always valid.
-    pub const unsafe fn from_bits(bits: u64) -> Self {
+    #[cfg(test)]
+    pub(crate) const unsafe fn from_bits(bits: u64) -> Self {
         Self::from_word(bits)
     }
 }

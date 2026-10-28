@@ -1,8 +1,6 @@
 //! Ragwort's data types in the arena: numbers, strings and symbols, with the arena as the
 //! host that `ragwort-num` and `ragwort-string` work over.
 
-#![forbid(unsafe_code)]
-
 pub use ragwort_gc as gc;
 
 pub mod num;
