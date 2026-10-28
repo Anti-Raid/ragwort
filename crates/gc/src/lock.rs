@@ -1,4 +1,4 @@
-use std::cell::{BorrowError, BorrowMutError, Cell, Ref, RefCell, RefMut};
+use std::cell::Cell;
 use std::fmt;
 use std::mem::{size_of, size_of_val};
 
@@ -183,7 +183,7 @@ impl<T: Copy + fmt::Debug> fmt::Debug for Lock<T> {
     }
 }
 
-// SAFETY: traces what it holds, and claims to need tracing exactly when that does.
+// SAFETY: [trace] traces what it holds, and claims to need tracing exactly when that does.
 unsafe impl<T: Trace + Copy> Trace for Lock<T> {
     const NEEDS_TRACE: bool = T::NEEDS_TRACE;
 
@@ -193,48 +193,7 @@ unsafe impl<T: Trace + Copy> Trace for Lock<T> {
     }
 }
 
-// SAFETY: a transparent `Cell<T>`, so it has `T`'s layout, padding and valid bit patterns.
+// SAFETY: [plain] a transparent `Cell<T>`, so it has `T`'s layout, padding and valid bit patterns.
 unsafe impl<'gc, T: Plain<'gc>> Plain<'gc> for Lock<T> {
     const CHECK: () = T::CHECK;
-}
-
-/// Interior mutability for host-side data, such as the root. It isn't `Plain`, so it can't
-/// be stored in the arena, which is why writes through it need no barrier.
-pub struct RefLock<T>(RefCell<T>);
-
-impl<T: Trace> RefLock<T> {
-    pub const fn new(value: T) -> Self {
-        Self(RefCell::new(value))
-    }
-
-    pub fn borrow(&self) -> Result<Ref<'_, T>, BorrowError> {
-        self.0.try_borrow()
-    }
-
-    pub fn borrow_mut(&self, _mc: &Mutation<'_>) -> Result<RefMut<'_, T>, BorrowMutError> {
-        self.0.try_borrow_mut()
-    }
-
-    pub fn into_inner(self) -> T {
-        self.0.into_inner()
-    }
-}
-
-impl<T: fmt::Debug> fmt::Debug for RefLock<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0.try_borrow() {
-            Ok(v) => f.debug_tuple("RefLock").field(&*v).finish(),
-            Err(_) => f.write_str("RefLock(<borrowed>)"),
-        }
-    }
-}
-
-// SAFETY: traces what it holds. It isn't `Plain`, so it's never in arena memory, where
-// writes would need a barrier.
-unsafe impl<T: Trace> Trace for RefLock<T> {
-    const NEEDS_TRACE: bool = T::NEEDS_TRACE;
-
-    fn trace(&mut self, t: &mut Tracer<'_>) {
-        self.0.get_mut().trace(t);
-    }
 }

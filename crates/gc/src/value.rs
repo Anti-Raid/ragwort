@@ -323,11 +323,11 @@ impl fmt::Debug for Value<'_> {
     }
 }
 
-// SAFETY: one `u64` and a brand. Any word is a valid value: an object reference is
+// SAFETY: [plain] one `u64` and a brand. Any word is a valid value: an object reference is
 // checked against its object's header before use.
 unsafe impl<'gc> Plain<'gc> for Value<'gc> {}
 
-// SAFETY: traces the word when it's an object reference, which is exactly when
+// SAFETY: [trace] traces the word when it's an object reference, which is exactly when
 // `holds_refs` says so.
 unsafe impl Trace for Value<'_> {
     #[inline]

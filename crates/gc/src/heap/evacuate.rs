@@ -87,8 +87,8 @@ impl Heap {
         let Some((_, size)) = self.size_of(obj) else { return self.corrupt() };
         let Ok(new) = self.budget.quiet(|| self.reserve(size)) else { return };
         let new_obj = self.object_at(new).expect("new object");
-        // SAFETY: both are validated objects of `size` bytes, distinct since `new` was just
-        // reserved, and nothing borrows arena memory during a collection.
+        // SAFETY: [steps, plain, moves] both are validated objects of `size` bytes, distinct since
+        // `new` was just reserved, and nothing borrows arena memory during a collection.
         unsafe {
             ptr::copy_nonoverlapping(self.header_ptr(offset).cast::<u8>(), self.header_ptr(new).cast::<u8>(), size);
             let old = self.header_ptr(offset);

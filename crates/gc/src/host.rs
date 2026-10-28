@@ -163,7 +163,7 @@ pub struct HostRef<'gc, T: 'static> {
 
 impl<'gc, T: 'static> HostRef<'gc, T> {
     pub fn get(self, mc: &Mutation<'gc>) -> Option<&'gc T> {
-        // SAFETY: `get` checked the slot's generation and type. The box doesn't move or get
+        // SAFETY: [steps] `get` checked the slot's generation and type. The box doesn't move or get
         // freed until a collection, which can't run while `mc` is borrowed for `'gc`.
         mc.heap.hosts.get::<T>(self.id).map(|p| unsafe { p.as_ref() })
     }
@@ -193,11 +193,11 @@ impl<T> fmt::Debug for HostRef<'_, T> {
     }
 }
 
-// SAFETY: a `HostId`, two `u32`s, and a marker, so no padding and every bit pattern valid: a
-// bad id just fails to look up. The brand is `'gc`.
+// SAFETY: [plain, brand] a `HostId`, two `u32`s, and a marker, so no padding and every bit pattern
+// valid: a bad id just fails to look up. The brand is `'gc`.
 unsafe impl<'gc, T> Plain<'gc> for HostRef<'gc, T> {}
 
-// SAFETY: traces the one host reference it holds.
+// SAFETY: [trace] traces the one host reference it holds.
 unsafe impl<T> Trace for HostRef<'_, T> {
     fn trace(&mut self, t: &mut Tracer<'_>) {
         t.trace_host(self.id);

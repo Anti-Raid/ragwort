@@ -4,6 +4,7 @@ use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 
 use super::heap::{Heap, Made};
+use super::layout;
 use super::{Gc, Inline, Invariant, OutOfMemory, Plain, Trace};
 
 const STEP_MUL: usize = 2;
@@ -85,7 +86,7 @@ impl<R: Rootable> Arena<R> {
     ) -> Result<Self, OutOfMemory> {
         let heap = Box::new(Heap::new(limit).ok_or(OutOfMemory)?);
         let root = ManuallyDrop::new(init(&Mutation::new(&heap))?);
-        // SAFETY: `Root<'gc>` differs from `Root<'static>` only in a brand, which changes
+        // SAFETY: [brand] `Root<'gc>` differs from `Root<'static>` only in a brand, which changes
         // neither layout nor validity. The root is read once out of the `ManuallyDrop`, so it
         // isn't dropped twice, and stored beside the heap its handles refer to.
         let root = unsafe { (&raw const *root).cast::<R::Root<'static>>().read() };
@@ -97,9 +98,9 @@ impl<R: Rootable> Arena<R> {
     /// data.
     pub fn mutate<T>(&mut self, f: impl for<'gc> FnOnce(&Mutation<'gc>, &R::Root<'gc>) -> T) -> Result<T, Corrupted> {
         self.check()?;
-        // SAFETY: only the brand changes. `f` is generic over `'gc`, so the root's handles can
-        // only meet the `Mutation` of this heap, and neither outlives the call. The arena isn't
-        // corrupted, so every reference the root reaches was fully rewritten.
+        // SAFETY: [brand, unwind] only the brand changes. `f` is generic over `'gc`, so the root's
+        // handles can only meet the `Mutation` of this heap, and neither outlives the call. The
+        // arena isn't corrupted, so every reference the root reaches was fully rewritten.
         let root = unsafe { &*(&raw const self.root).cast::<R::Root<'_>>() };
         let result = f(&Mutation::new(&self.heap), root);
         self.check().map(|()| result)
@@ -108,8 +109,8 @@ impl<R: Rootable> Arena<R> {
     /// [`Arena::mutate`] with the root borrowed mutably.
     pub fn mutate_root<T>(&mut self, f: impl for<'gc> FnOnce(&Mutation<'gc>, &mut R::Root<'gc>) -> T) -> Result<T, Corrupted> {
         self.check()?;
-        // SAFETY: as in `mutate`. The root is borrowed mutably through `&mut self`, so nothing
-        // else reads it meanwhile.
+        // SAFETY: [brand] as in `mutate`. The root is borrowed mutably through `&mut self`, so
+        // nothing else reads it meanwhile.
         let root = unsafe { &mut *(&raw mut self.root).cast::<R::Root<'_>>() };
         let result = f(&Mutation::new(&self.heap), root);
         self.check().map(|()| result)
@@ -251,6 +252,11 @@ pub struct Mutation<'gc> {
     _brand: Invariant<'gc>,
 }
 
+/// The largest length [`Mutation::alloc_inline`] accepts for `T`, or 0 if it can't allocate `T`.
+pub const fn max_items<T: Inline>() -> usize {
+    if layout::fits_inline::<T>() { layout::max_items::<T>() } else { 0 }
+}
+
 impl<'gc> Mutation<'gc> {
     fn new(heap: &'gc Heap) -> Self {
         Self { heap, base: heap.base, _brand: PhantomData }
@@ -294,9 +300,20 @@ impl<'gc> Mutation<'gc> {
         self.heap.alloc_inline_with(head, len, item, init).map(|ptr| self.made(ptr))
     }
 
+    /// Runs allocations the caller can do without, such as growing a buffer by more than it
+    /// needs: failing them doesn't fail the step, and they don't draw on the reserve.
+    pub fn optional<R>(&self, f: impl FnOnce() -> Result<R, OutOfMemory>) -> Result<R, OutOfMemory> {
+        self.heap.budget.quiet(f)
+    }
+
+    /// Fails the step as a failed allocation would, for a request too large to even size.
+    pub fn out_of_memory(&self) -> OutOfMemory {
+        self.heap.budget.fail()
+    }
+
     fn made<T: Plain<'gc>>(&self, new: Made<T>) -> Gc<'gc, T> {
-        // SAFETY: only the heap's builder makes a `Made`, for the value of an object it just
-        // finished in this arena's region.
+        // SAFETY: [memory] only the heap's builder makes a `Made`, for the value of an object it
+        // just finished in this arena's region.
         unsafe { Gc::from_raw(new.get()) }
     }
 

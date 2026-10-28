@@ -3,6 +3,7 @@
 
 pub use ragwort_gc as gc;
 
+pub mod buffer;
 pub mod num;
 pub mod string;
 pub mod symbol;

@@ -246,11 +246,11 @@ impl<T> Object<T> {
 }
 
 impl<T: Inline> Object<T> {
-    /// The length its header gives, capped at [`max_items`]: the header may be corrupted, and
-    /// the cap keeps the items inside the reservation whatever it says.
+    /// The length its header gives, which is the object's item count. The cap at
+    /// [`max_items`] keeps even a damaged length inside the reservation.
     #[inline]
     pub(crate) fn len(self) -> usize {
-        // SAFETY: the header is the object's, written when it was made, so it can be read.
+        // SAFETY: [headers, memory] the header is the object's, in mapped memory.
         (unsafe { (*self.header).len } as usize).min(max_items::<T>())
     }
 
@@ -303,8 +303,9 @@ impl<T: Inline> InlineVTable<T> {
     }
 
     unsafe fn trace_range(header: *mut Header, from: usize, to: usize, t: &mut Tracer<'_>) {
-        // SAFETY: the caller matched this vtable to the header, and nothing else references the
-        // object. The value and the items don't overlap, and `items` is capped to the object.
+        // SAFETY: [alias, headers] the caller matched this vtable to the header, and nothing else
+        // references the object. The value and the items don't overlap, and the items are the
+        // object's.
         let (value, items) = unsafe {
             let object = Object::<T>::at(header);
             (&mut *object.value(), &mut *object.items())

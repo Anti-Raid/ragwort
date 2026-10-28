@@ -200,30 +200,6 @@
 //! arena.mutate(|mc, _| { let _ = mc.alloc(D); });
 //! ```
 //!
-//! Map keys can't hold arena references, since the collector rewrites references to objects
-//! it moves:
-//!
-//! ```compile_fail,E0080
-//! use std::collections::HashMap;
-//! use ragwort_gc::{Arena, Member, Rootable};
-//! struct R;
-//! impl Rootable for R { type Root<'gc> = HashMap<Member<'gc, i64>, i64>; }
-//! let mut arena = Arena::<R>::new(1 << 20, |_| Ok(HashMap::new())).unwrap();
-//! arena.collect();
-//! ```
-//!
-//! Host-side containers aren't `Plain`, so they can't go in the arena, where writes through
-//! `&mut` would skip the barrier:
-//!
-//! ```compile_fail,E0277
-//! use std::cell::RefCell;
-//! use ragwort_gc::{Arena, Rootable, Value};
-//! struct R;
-//! impl Rootable for R { type Root<'gc> = (); }
-//! let mut arena = Arena::<R>::new(1 << 20, |_| Ok(())).unwrap();
-//! arena.mutate(|mc, _| { let _ = mc.alloc(RefCell::new(Vec::<Value>::new())); });
-//! ```
-//!
 //! A `Value` is branded like any other reference, so it can't leave its step:
 //!
 //! ```compile_fail
@@ -247,11 +223,14 @@
 //! An inline type needs an inline type tag, which would otherwise never match:
 //!
 //! ```compile_fail,E0080
-//! use ragwort_gc::{Arena, Array, Rootable};
+//! use ragwort_gc::{Arena, Plain, Rootable, Trace};
+//! #[derive(Trace, Plain)]
+//! #[gc(items = u8)]
+//! struct Bytes;
 //! struct R;
 //! impl Rootable for R { type Root<'gc> = (); }
 //! let mut arena = Arena::<R>::new(1 << 20, |_| Ok(())).unwrap();
-//! arena.mutate(|mc, _| { let _ = mc.type_tag::<Array<u8>>(); });
+//! arena.mutate(|mc, _| { let _ = mc.type_tag::<Bytes>(); });
 //! ```
 //!
 //! Arena memory can only be read with the arena's own brand. Viewed as `'static`, which
@@ -355,20 +334,4 @@
 //!     root.set(mc, Value::object(mc, arr));
 //!     root.get().downcast::<Arr<Option<Member<'static, u64>>>>(mc).unwrap().items()[0].get()
 //! });
-//! ```
-//!
-//! Hashers aren't traced, so a map or set can't keep one that holds an arena reference:
-//!
-//! ```compile_fail,E0477
-//! use std::collections::HashMap;
-//! use ragwort_gc::{Member, Rootable};
-//! struct R;
-//! impl Rootable for R { type Root<'gc> = HashMap<u64, u64, Member<'gc, i64>>; }
-//! ```
-//!
-//! ```compile_fail,E0477
-//! use std::collections::HashSet;
-//! use ragwort_gc::{Member, Rootable};
-//! struct R;
-//! impl Rootable for R { type Root<'gc> = HashSet<u64, Member<'gc, i64>>; }
 //! ```

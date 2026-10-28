@@ -122,8 +122,8 @@ impl Heap {
     pub(super) fn trace_with(&self, obj: Obj, vtable: &VTable, range: Option<(usize, usize)>, t: &mut Tracer<'_>) {
         let header = self.header_ptr(obj.offset);
         match range {
-            // SAFETY: as above, the header starts an object of the vtable's type, which
-            // nothing else references while it's traced.
+            // SAFETY: [steps, alias] as above, the header starts an object of the vtable's type,
+            // which nothing else references while it's traced.
             Some((from, to)) => unsafe { (vtable.trace_range)(header, from, to, t) },
             // SAFETY: as for `trace_range`.
             None => unsafe { (vtable.trace)(header, t) },

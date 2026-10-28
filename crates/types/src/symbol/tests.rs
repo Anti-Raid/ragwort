@@ -1,15 +1,16 @@
-use ragwort_gc::{Arena, GcVec, Rootable};
+use ragwort_gc::{Arena, Rootable};
 
 use super::*;
+use crate::buffer::Buffer;
 use crate::string::*;
 
 struct Table;
 impl Rootable for Table {
-    type Root<'gc> = (Symbols<'gc>, GcVec<'gc, Value<'gc>>);
+    type Root<'gc> = (Symbols<'gc>, Buffer<'gc, Value<'gc>>);
 }
 
 fn arena() -> Arena<Table> {
-    Arena::<Table>::new(16 << 20, |_| Ok((Symbols::with_seed(1), GcVec::new()))).unwrap()
+    Arena::<Table>::new(16 << 20, |_| Ok((Symbols::with_seed(1), Buffer::new()))).unwrap()
 }
 
 fn names(n: usize) -> Vec<String> {

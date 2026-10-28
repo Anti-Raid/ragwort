@@ -59,7 +59,8 @@ impl Backing {
 
     fn decommit(&self, offset: usize, len: usize) {
         #[cfg(unix)]
-        // SAFETY: nothing lives in the range, and nothing relies on what reads back from it.
+        // SAFETY: [memory] nothing lives in the range. `DontNeed` leaves it mapped and readable,
+        // which reads at masked offsets need, though what they read back doesn't matter.
         unsafe {
             let _ = self.0.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, offset, len);
         }

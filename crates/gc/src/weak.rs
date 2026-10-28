@@ -59,7 +59,7 @@ impl<'gc, K: 'gc, V: Trace + Copy + Default + 'gc> Ephemeron<'gc, K, V> {
     }
 }
 
-// SAFETY: the key goes to the tracer as an ephemeron key, and the value is traced once the
+// SAFETY: [trace] the key goes to the tracer as an ephemeron key, and the value is traced once the
 // key is live. Clearing both when the key died is the change `Trace` allows ephemerons.
 unsafe impl<K, V: Trace + Copy + Default> Trace for Ephemeron<'_, K, V> {
     fn trace(&mut self, t: &mut Tracer<'_>) {

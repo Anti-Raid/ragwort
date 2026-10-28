@@ -43,6 +43,12 @@ pub(crate) use pages::META;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// The next arena id. Handles that outlive steps are told apart by id, so ids are never reused:
+/// once they run out, no more arenas can be made.
+pub(crate) fn take_id(next: &AtomicU64) -> Option<u64> {
+    next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1)).ok()
+}
+
 pub(crate) struct Heap {
     pub(crate) budget: Budget,
     pub(crate) id: u64,
@@ -67,9 +73,10 @@ impl Heap {
         let limit = limit.min(REGION);
         let budget = Budget::new(limit);
         budget.charge(GRAY_BYTES).ok()?;
+        let id = take_id(&NEXT_ID)?;
         Some(Self {
             budget,
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            id,
             base: space.base(),
             space,
             pages: Pages::new(),

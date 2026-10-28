@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # A longer fuzz run every Monday.
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: test (${{ matrix.os }}, ${{ matrix.features || 'default features' }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        features: ["", "--all-features", "--no-default-features"]
+        include:
+          - os: macos-latest
+            features: ""
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+      - run: cargo clippy --locked --workspace --all-targets ${{ matrix.features }}
+      - run: cargo test --locked --workspace ${{ matrix.features }}
+
+  fuzz:
+    name: fuzz the gc
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # New seeds every run. A failure prints its seed, which reruns alone with RAGWORT_FUZZ_SEED.
+      RAGWORT_FUZZ_FIRST: ${{ github.run_number }}000000
+      FUZZ: cargo test --locked --release -p ragwort-gc --features gc-verify --lib model_fuzz
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: many short runs
+        run: RAGWORT_FUZZ_SEEDS=${{ github.event_name == 'schedule' && 50000 || 3000 }} $FUZZ
+      - name: fewer long runs
+        run: RAGWORT_FUZZ_SEEDS=${{ github.event_name == 'schedule' && 1000 || 100 }} RAGWORT_FUZZ_OPS=30000 $FUZZ

@@ -1,5 +1,4 @@
-use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::cell::Cell;
 use std::hint::black_box;
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -66,12 +65,26 @@ impl Rootable for TwoRoot {
 
 #[derive(Trace)]
 struct Vm<'gc> {
-    stack: RefCell<Vec<Value<'gc>>>,
-    frames: RefCell<VecDeque<Value<'gc>>>,
-    globals: RefCell<HashMap<u32, Value<'gc>>>,
-    constants: Box<[Value<'gc>]>,
-    acc: Cell<Value<'gc>>,
-    scratch: RefLock<Option<Value<'gc>>>,
+    stack: Lock<Value<'gc>>,
+    frames: (Lock<Value<'gc>>, Option<Lock<Value<'gc>>>),
+    globals: Lock<Option<Value<'gc>>>,
+    constants: [Value<'gc>; 2],
+    acc: Lock<Value<'gc>>,
+    /// Written through `mutate_root`, with no barrier.
+    scratch: Option<Value<'gc>>,
+}
+
+impl Vm<'_> {
+    fn new() -> Self {
+        Self {
+            stack: Lock::new(Value::NIL),
+            frames: (Lock::new(Value::NIL), None),
+            globals: Lock::new(None),
+            constants: [Value::NIL; 2],
+            acc: Lock::new(Value::NIL),
+            scratch: None,
+        }
+    }
 }
 
 struct VmRoot;
@@ -141,41 +154,32 @@ fn flonums_round_trip() {
         // Mostly ordinary magnitudes, which are what has to fit inline.
         doubles.push(f64::from_bits(rng.next() >> 2 | 0x3000_0000_0000_0000));
     }
-    let mut arena = Arena::<VmRoot>::new(16 << 20, |_| {
-        Ok(Vm {
-            stack: RefCell::new(Vec::new()),
-            frames: RefCell::default(),
-            globals: RefCell::default(),
-            constants: Box::new([]),
-            acc: Cell::new(Value::VOID),
-            scratch: RefLock::new(None),
-        })
-    })
-    .unwrap();
+    let mut arena = Arena::<VmRoot>::new(16 << 20, |_| Ok(Vm::new())).unwrap();
     arena.set_evacuate_all(true);
     let boxed = arena.mutate(|mc, vm| {
-        let mut boxed = 0;
+        let (mut boxed, mut stack) = (0, Vec::with_capacity(doubles.len()));
         for &f in &doubles {
             let v = Value::flonum(mc, f).unwrap();
             assert_eq!(Value::inline_flonum(f).is_some(), fits_inline(f.to_bits()), "{f:e}");
             check_flonum(mc, v, f);
             boxed += usize::from(!fits_inline(f.to_bits()));
-            vm.stack.borrow_mut().push(v);
+            stack.push(v);
         }
         assert!(Value::inline_flonum(0.0).is_some() && Value::inline_flonum(0.1).is_some());
         for f in [-0.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN, -f64::NAN, 0.0 / black_box(0.0)] {
             assert!(Value::inline_flonum(f).is_some(), "{f}");
         }
         assert!(Value::inline_flonum(1e100).is_none() && Value::inline_flonum(f64::from_bits(DISPLACED[0])).is_none());
+        vm.stack.set(mc, vector(mc, stack.len(), |i| stack[i]));
         boxed
     }).unwrap();
     arena.collect();
     arena.collect();
     arena.heap().check();
-    assert_eq!(arena.metrics().objects, boxed);
+    assert_eq!(arena.metrics().objects, boxed + 1, "the boxed doubles and the stack");
     arena.mutate(|mc, vm| {
-        for (&v, &f) in vm.stack.borrow().iter().zip(&doubles) {
-            check_flonum(mc, v, f);
+        for (i, &f) in doubles.iter().enumerate() {
+            check_flonum(mc, items(mc, vm.stack.get())[i].get(), f);
         }
     }).unwrap();
 }
@@ -352,26 +356,20 @@ fn young_objects_stored_in_old_values_survive_minor_collections() {
 #[test]
 fn root_containers_are_traced() {
     let mut arena = Arena::<VmRoot>::new(4 << 20, |mc| {
-        Ok(Vm {
-            stack: RefCell::new(Vec::new()),
-            frames: RefCell::default(),
-            globals: RefCell::default(),
-            constants: vec![list(mc, 5), Value::flonum(mc, 1e100)?].into_boxed_slice(),
-            acc: Cell::new(Value::NIL),
-            scratch: RefLock::new(None),
-        })
+        Ok(Vm { constants: [list(mc, 5), Value::flonum(mc, 1e100)?], ..Vm::new() })
     })
     .unwrap();
     arena.set_evacuate_all(true);
-    arena.mutate(|mc, vm| {
-        vm.stack.borrow_mut().extend((0..10).map(|i| list(mc, i)));
-        vm.frames.borrow_mut().push_front(list(mc, 7));
-        vm.globals.borrow_mut().insert(1, list(mc, 8));
-        vm.acc.set(list(mc, 9));
-        *vm.scratch.borrow_mut(mc).unwrap() = Some(list(mc, 4));
+    arena.mutate_root(|mc, vm| {
+        vm.stack.set(mc, vector(mc, 10, |i| list(mc, i as i64)));
+        vm.frames.0.set(mc, list(mc, 7));
+        vm.globals.set(mc, Some(list(mc, 8)));
+        vm.acc.set(mc, list(mc, 9));
+        vm.scratch = Some(list(mc, 4));
         list(mc, 50);
     }).unwrap();
-    let objects = 2 * (45 + 5 + 7 + 8 + 9 + 4) + 1;
+    // The lists, the boxed double and the stack.
+    let objects = 2 * (45 + 5 + 7 + 8 + 9 + 4) + 1 + 1;
     for _ in 0..2 {
         arena.collect_minor();
         assert_eq!(arena.metrics().objects, objects);
@@ -379,20 +377,22 @@ fn root_containers_are_traced() {
         arena.heap().check();
         assert_eq!(arena.metrics().objects, objects);
         arena.mutate(|mc, vm| {
-            for (i, &v) in vm.stack.borrow().iter().enumerate() {
-                assert_eq!(read_list(mc, v), (0..i as i64).collect::<Vec<_>>());
+            for i in 0..10 {
+                assert_eq!(read_list(mc, items(mc, vm.stack.get())[i].get()), (0..i as i64).collect::<Vec<_>>());
             }
-            assert_eq!(read_list(mc, vm.frames.borrow()[0]).len(), 7);
-            assert_eq!(read_list(mc, vm.globals.borrow()[&1]).len(), 8);
+            assert_eq!(read_list(mc, vm.frames.0.get()).len(), 7);
+            assert_eq!(read_list(mc, vm.globals.get().unwrap()).len(), 8);
             assert_eq!(read_list(mc, vm.constants[0]).len(), 5);
             assert_eq!(vm.constants[1].as_flonum(mc), Some(1e100));
             assert_eq!(read_list(mc, vm.acc.get()).len(), 9);
-            assert_eq!(read_list(mc, vm.scratch.borrow().unwrap().unwrap()).len(), 4);
+            assert_eq!(read_list(mc, vm.scratch.unwrap()).len(), 4);
         }).unwrap();
     }
-    arena.mutate(|_, vm| {
-        vm.stack.borrow_mut().clear();
-        vm.globals.borrow_mut().clear();
+    arena.mutate(|mc, vm| {
+        for slot in items(mc, vm.stack.get()) {
+            slot.set(mc, Value::NIL);
+        }
+        vm.globals.set(mc, None);
     }).unwrap();
     arena.collect();
     assert_eq!(arena.metrics().objects, objects - 2 * (45 + 8));

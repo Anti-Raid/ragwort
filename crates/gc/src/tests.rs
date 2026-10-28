@@ -1,6 +1,5 @@
 use std::any::TypeId;
-use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::mem::size_of;
 use std::num::NonZeroU32;
@@ -377,54 +376,52 @@ fn the_reserve_lets_a_step_finish() {
     assert!(matches!(result, Err(StepError::OutOfMemory)));
 }
 
-/// Growth a vector can do without stays out of the reserve, so it grows by what it needs.
+/// A panic in an optional allocation leaves later allocations their reserve.
 #[test]
-fn optional_growth_leaves_the_reserve_alone() {
-    let mut arena = Arena::<U64VecRoot>::new(256 * 1024, |_| Ok(GcVec::new())).unwrap();
+fn a_panic_in_an_optional_allocation_keeps_the_reserve() {
+    let mut arena = unit_arena(256 * 1024);
     arena.set_reserve(128 * 1024);
-    let capacity = arena.mutate(|mc, v| {
-        while !mc.collection_due() {
-            v.push(mc, 0).unwrap();
-        }
-        assert!(mc.used() <= 256 * 1024);
-        v.capacity(mc)
-    }).unwrap();
-    assert_eq!(arena.mutate(|mc, v| v.len(mc)).unwrap(), capacity, "the growth that drew on the reserve was exact");
-}
-
-static DEFAULT_PANICS: AtomicBool = AtomicBool::new(false);
-
-#[derive(Clone, Copy, Trace, Plain)]
-struct Touchy(u64);
-
-impl Default for Touchy {
-    fn default() -> Self {
-        assert!(!DEFAULT_PANICS.load(Ordering::Relaxed), "default failed");
-        Touchy(0)
-    }
-}
-
-struct TouchyVecRoot;
-impl Rootable for TouchyVecRoot {
-    type Root<'gc> = GcVec<'gc, Touchy>;
-}
-
-/// A panic during growth a vector can do without leaves later allocations their reserve.
-#[test]
-fn a_panic_in_optional_growth_keeps_the_reserve() {
-    let mut arena = Arena::<TouchyVecRoot>::new(256 * 1024, |_| Ok(GcVec::new())).unwrap();
-    arena.set_reserve(128 * 1024);
-    DEFAULT_PANICS.store(true, Ordering::Relaxed);
-    let result = panic::catch_unwind(AssertUnwindSafe(|| arena.mutate(|mc, v| v.reserve(mc, 1)).unwrap()));
-    DEFAULT_PANICS.store(false, Ordering::Relaxed);
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        arena.mutate(|mc, _| mc.optional(|| -> Result<(), OutOfMemory> { panic!("optional allocation failed") }))
+    }));
     assert!(result.is_err());
     let result = arena.step(|mc, _| {
         while !mc.collection_due() {
-            mc.alloc(Touchy(0))?;
+            mc.alloc(0u64)?;
         }
         Ok::<_, OutOfMemory>(())
     });
     assert!(result.is_ok(), "the step lost its reserve");
+}
+
+/// An optional allocation that fails leaves the step alone; `out_of_memory` fails it.
+#[test]
+fn only_required_failures_fail_the_step() {
+    let mut arena = unit_arena(1 << 20);
+    let result = arena.step(|mc, _| {
+        assert!(mc.optional(|| mc.alloc_inline(Bytes { tag: 0 }, 2 << 20, |_| 0)).is_err());
+        Ok::<_, OutOfMemory>(())
+    });
+    assert!(result.is_ok());
+    let result = arena.step(|mc, _| {
+        let _ = mc.out_of_memory();
+        Ok::<_, OutOfMemory>(())
+    });
+    assert!(matches!(result, Err(StepError::OutOfMemory)));
+}
+
+#[derive(Trace, Plain)]
+#[gc(items = u64)]
+struct Words;
+
+struct WordsRoot;
+impl Rootable for WordsRoot {
+    type Root<'gc> = Lock<Option<Member<'gc, Words>>>;
+}
+
+/// An arena whose root holds `0..len`.
+fn words_arena(limit: usize, len: usize) -> Arena<WordsRoot> {
+    Arena::new(limit, |mc| Ok(Lock::new(Some(Member::new(mc, mc.alloc_inline(Words, len, |i| i as u64)?))))).unwrap()
 }
 
 /// The chosen allocation fails, of any kind, and only that one, so a test can fail each
@@ -663,60 +660,6 @@ fn roots_outliving_their_arena_are_harmless() {
     let root = arena.mutate(|mc, _| mc.root::<NodeK>(Member::new(mc, node(mc, 1, None).unwrap())).unwrap()).unwrap();
     drop(arena);
     drop(root);
-}
-
-#[test]
-fn reflock_borrows_fail_instead_of_panicking() {
-    let mut arena = unit_arena(1 << 20);
-    arena.mutate(|mc, _| {
-        let lock = RefLock::new(1);
-        let guard = lock.borrow_mut(mc).unwrap();
-        assert!(lock.borrow().is_err());
-        assert!(lock.borrow_mut(mc).is_err());
-        drop(guard);
-        assert_eq!(*lock.borrow().unwrap(), 1);
-    }).unwrap();
-}
-
-#[derive(Trace, Plain)]
-struct VecHolder<'gc> {
-    items: GcVec<'gc, NodeRef<'gc>>,
-}
-
-struct VecRoot;
-impl Rootable for VecRoot {
-    type Root<'gc> = Lock<Option<Member<'gc, VecHolder<'gc>>>>;
-}
-
-fn vec_arena(limit: usize) -> Arena<VecRoot> {
-    Arena::new(limit, |mc| Ok(Lock::new(Some(Member::new(mc, mc.alloc(VecHolder { items: GcVec::new() })?))))).unwrap()
-}
-
-#[test]
-fn gcvec_grows_and_is_traced() {
-    let n = if cfg!(miri) { 100 } else { 1000 };
-    let mut arena = vec_arena(4 << 20);
-    arena.mutate(|mc, root| {
-        let v = &root.load(mc).unwrap().items;
-        for i in 0..n {
-            v.push(mc, Some(Member::new(mc, node(mc, i, None).unwrap()))).unwrap();
-        }
-        assert_eq!(v.len(mc), n as usize);
-        assert!(v.capacity(mc) >= v.len(mc));
-        assert_eq!(v.get(mc, 3).unwrap().unwrap().get(mc).value, 3);
-        assert!(v.get(mc, n as usize).is_none());
-        assert!(!v.set(mc, n as usize, None));
-    }).unwrap();
-    arena.collect();
-    assert_eq!(arena.metrics().objects, n as usize + 2);
-    arena.mutate(|mc, root| {
-        let v = &root.load(mc).unwrap().items;
-        assert_eq!(v.pop(mc).unwrap().unwrap().get(mc).value, n - 1);
-        v.truncate(mc, 10);
-        assert!(v.set(mc, 0, None));
-    }).unwrap();
-    arena.collect();
-    assert_eq!(arena.metrics().objects, 9 + 2);
 }
 
 #[test]
@@ -1002,15 +945,15 @@ fn random_corruption_never_escapes() {
     let mut rng = Rng(0xdeadbeefcafef00d);
     let mut detected = 0;
     for _ in 0..rounds {
-        let mut arena = vec_arena(1 << 20);
+        let mut arena = slots_arena(1 << 20, 40);
         let offsets = arena.mutate(|mc, root| {
-            let v = &root.load(mc).unwrap().items;
+            let slots = slot_items(root.load(mc).unwrap());
             let mut offsets = vec![];
-            for i in 0..40 {
-                let next = v.get(mc, rng.below(v.len(mc).max(1))).flatten().map(|m| m.get(mc));
-                let n = node(mc, i, next).unwrap();
+            for i in 0..slots.len() {
+                let next = slots[rng.below(i.max(1))].get().map(|m| m.get(mc));
+                let n = node(mc, i as i64, next).unwrap();
                 offsets.push(offset(mc, n));
-                v.push(mc, Some(Member::new(mc, n))).unwrap();
+                slots[i].set(mc, Some(Member::new(mc, n)));
             }
             offsets
         }).unwrap();
@@ -1386,12 +1329,45 @@ fn verify_obj<'gc>(
     }
 }
 
+/// A number from the environment variable `name`, if it's set.
+fn fuzz_knob(name: &str) -> Option<u64> {
+    let value = std::env::var(name).ok()?;
+    Some(value.parse().unwrap_or_else(|_| panic!("{name} must be a number, not {value:?}")))
+}
+
+/// Reports which seed was running if it panics.
+struct FuzzSeed(u64);
+
+impl Drop for FuzzSeed {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("model_fuzz failed on seed {0}; rerun it alone with RAGWORT_FUZZ_SEED={0}", self.0);
+        }
+    }
+}
+
+/// Random steps and collections, checked against a model. Longer runs on demand:
+/// `RAGWORT_FUZZ_SEEDS` seeds from `RAGWORT_FUZZ_FIRST`, of `RAGWORT_FUZZ_OPS` operations each,
+/// or only seed `RAGWORT_FUZZ_SEED`. Seeds cycle through a roomy limit and two tight ones.
 #[test]
 fn model_fuzz() {
     const SLOTS: usize = 16;
-    let ops = if cfg!(miri) { 120 } else { 3000 };
+    const LIMITS: [usize; 3] = [3 << 20, 192 << 10, 96 << 10];
+    let default_ops = if cfg!(miri) { 120 } else { 3000 };
+    let ops = fuzz_knob("RAGWORT_FUZZ_OPS").unwrap_or(default_ops);
+    let seeds = match fuzz_knob("RAGWORT_FUZZ_SEED") {
+        Some(seed) => seed..=seed,
+        None => {
+            let first = fuzz_knob("RAGWORT_FUZZ_FIRST").unwrap_or(1);
+            first..=first.saturating_add(fuzz_knob("RAGWORT_FUZZ_SEEDS").unwrap_or(3)).saturating_sub(1)
+        }
+    };
     let mut total_ooms = 0;
-    for (seed, limit) in [(1u64, 3 << 20), (2, 192 << 10), (3, 96 << 10)] {
+    let mut tight = false;
+    for seed in seeds {
+        let _report = FuzzSeed(seed);
+        let limit = LIMITS[(seed as usize + LIMITS.len() - 1) % LIMITS.len()];
+        tight |= limit < LIMITS[0];
         let mut arena = Arena::<ObjsRoot>::new(limit, |mc| {
             Ok(Lock::new(Some(Member::new(mc, mc.alloc_inline(Objs(PhantomData), SLOTS, |_| Lock::new(None))?))))
         })
@@ -1535,7 +1511,9 @@ fn model_fuzz() {
         eprintln!("seed {seed}: {ooms} ooms, {} + {} minor collections, {} objects", m.collections, m.minor_collections, m.objects);
         total_ooms += ooms;
     }
-    assert!(total_ooms > 0, "the tight limits should hit out of memory");
+    if tight && ops >= default_ops {
+        assert!(total_ooms > 0, "the tight limits should hit out of memory");
+    }
 }
 
 #[test]
@@ -1560,101 +1538,6 @@ fn decommits_cover_only_free_os_pages() {
             check_bytes(&mut arena, &roots);
         }
     }
-}
-
-#[test]
-fn corrupted_gcvec_len_is_bounded() {
-    let mut arena = vec_arena(1 << 20);
-    let len_at = arena.mutate(|mc, root| {
-        let holder = root.load(mc).unwrap();
-        for i in 0..8 {
-            holder.items.push(mc, Some(Member::new(mc, node(mc, i, None).unwrap()))).unwrap();
-        }
-        offset(mc, holder) + HEADER
-    }).unwrap();
-    corrupt_u32(&arena, len_at, u32::MAX);
-    arena.mutate(|mc, root| {
-        let v = &root.load(mc).unwrap().items;
-        assert_eq!((v.len(mc), v.capacity(mc)), (8, 8));
-        assert!(v.get(mc, 1000).is_none());
-        v.truncate(mc, 1000);
-        assert!((0..8).all(|i| v.get(mc, i).flatten().is_some()), "truncating above the length cleared items");
-        assert!(v.pop(mc).is_some());
-        v.truncate(mc, 2);
-        assert_eq!(v.len(mc), 2);
-        corrupt_u32_mc(mc, len_at, u32::MAX);
-        v.truncate(mc, 0);
-        assert_eq!(v.len(mc), 0);
-    }).unwrap();
-}
-
-fn corrupt_u32_mc(mc: &Mutation<'_>, offset: usize, value: u32) {
-    // SAFETY: as in `corrupt_u32`; callers hold no borrow of the object while it runs.
-    unsafe { mc.base.as_ptr().add(offset).cast::<u32>().write_unaligned(value) }
-}
-
-struct U64VecRoot;
-impl Rootable for U64VecRoot {
-    type Root<'gc> = GcVec<'gc, u64>;
-}
-
-#[test]
-fn gcvec_grows_by_less_when_doubling_does_not_fit() {
-    let limit = 1 << 20;
-    let mut arena = Arena::<U64VecRoot>::new(limit, |_| Ok(GcVec::new())).unwrap();
-    arena.mutate(|mc, v| {
-        for i in 0..32768 {
-            v.push(mc, i).unwrap();
-        }
-        assert_eq!(v.capacity(mc), 32768);
-        while mc.limit() - mc.used() > 420 * 1024 {
-            mc.alloc_inline(Bytes { tag: 0 }, PAGE - 16, |_| 0).unwrap();
-        }
-        v.push(mc, 32768).unwrap();
-        assert_eq!(v.capacity(mc), 32769);
-        assert_eq!(v.get(mc, 32768), Some(32768));
-        assert_eq!(v.get(mc, 100), Some(100));
-        mc.heap.check();
-    }).unwrap();
-}
-
-#[test]
-fn gcvec_growth_never_fails_when_the_needed_size_fits() {
-    let fill = |arena: &mut Arena<U64VecRoot>| {
-        arena.mutate(|mc, v| {
-            for i in 0..2048 {
-                v.push(mc, i).unwrap();
-            }
-            mc.used()
-        }).unwrap()
-    };
-    let used = fill(&mut Arena::<U64VecRoot>::new(1 << 20, |_| Ok(GcVec::new())).unwrap());
-    let mut capacities = Vec::new();
-    for spare in (33_000..54_000).step_by(if cfg!(miri) { 700 } else { 100 }) {
-        let mut arena = Arena::<U64VecRoot>::new(used + spare, |_| Ok(GcVec::new())).unwrap();
-        arena.set_reserve(0);
-        fill(&mut arena);
-        // With too little spare even the needed size doesn't fit until a collection, so the
-        // push is run again. Once it fits, the bigger allocation tried first must never fail
-        // the step.
-        let mut runs = 0;
-        let capacity = loop {
-            runs += 1;
-            match arena.step(|mc, v| v.push(mc, 2048).map(|_| v.capacity(mc))) {
-                Ok(capacity) => break capacity,
-                Err(StepError::OutOfMemory) if runs == 1 => {}
-                Err(e) => panic!("{e:?}"),
-            }
-        };
-        if runs == 1 || !capacities.is_empty() {
-            assert_eq!(runs, 1, "a fallback allocation made the step retry ({spare} bytes spare)");
-            capacities.push(capacity);
-        }
-        arena.heap().check();
-    }
-    assert_eq!(capacities.first(), Some(&2049));
-    assert_eq!(capacities.last(), Some(&4096));
-    assert!(capacities.is_sorted() && capacities.len() > 100);
 }
 
 #[test]
@@ -1736,13 +1619,7 @@ fn every_phase_is_visible_with_a_tiny_slice() {
 #[test]
 fn pacing_keeps_up_when_most_of_the_limit_is_live() {
     let (limit, live, steps) = if cfg!(miri) { (128 << 10, 9_000, 200) } else { (1 << 20, 70_000, 2000) };
-    let mut arena = Arena::<U64VecRoot>::new(limit, |_| Ok(GcVec::new())).unwrap();
-    arena.mutate(|mc, v| {
-        v.reserve(mc, live).unwrap();
-        for i in 0..live {
-            v.push(mc, i as u64).unwrap();
-        }
-    }).unwrap();
+    let mut arena = words_arena(limit, live);
     arena.collect();
     let before = arena.metrics().collections;
     for i in 0..steps {
@@ -1751,7 +1628,7 @@ fn pacing_keeps_up_when_most_of_the_limit_is_live() {
     }
     let m = arena.metrics();
     assert!(m.collections + m.minor_collections > before + 10);
-    arena.mutate(|mc, v| assert_eq!(v.get(mc, live - 1), Some(live as u64 - 1))).unwrap();
+    arena.mutate(|mc, root| assert_eq!(root.load(mc).unwrap().items()[live - 1], live as u64 - 1)).unwrap();
 }
 
 #[test]
@@ -1830,7 +1707,7 @@ fn max_items_is_exactly_the_largest_allocatable_length() {
     }
     check::<Bytes>();
     check::<Slots<'static>>();
-    check::<Array<u64>>();
+    check::<Words>();
     check::<Obj<'static>>();
     let mut arena = unit_arena(1 << 20);
     arena.mutate(|mc, _| {
@@ -1924,12 +1801,7 @@ fn retrace_covers_unbarriered_stores_into_old_objects() {
 #[test]
 fn steps_run_minor_collections_for_short_lived_data() {
     let live = if cfg!(miri) { 6_000 } else { 60_000 };
-    let mut arena = Arena::<U64VecRoot>::new(4 << 20, |_| Ok(GcVec::new())).unwrap();
-    arena.mutate(|mc, v| {
-        for i in 0..live {
-            v.push(mc, i).unwrap();
-        }
-    }).unwrap();
+    let mut arena = words_arena(4 << 20, live);
     arena.collect();
     for _ in 0..if cfg!(miri) { 20 } else { 200 } {
         arena
@@ -1944,7 +1816,7 @@ fn steps_run_minor_collections_for_short_lived_data() {
     let m = arena.metrics();
     assert!(m.minor_collections >= if cfg!(miri) { 3 } else { 30 }, "{m:?}");
     assert_eq!(m.collections, 1, "{m:?}");
-    arena.mutate(|mc, v| assert_eq!(v.get(mc, live as usize - 1), Some(live - 1))).unwrap();
+    arena.mutate(|mc, root| assert_eq!(root.load(mc).unwrap().items()[live - 1], live as u64 - 1)).unwrap();
 }
 
 #[test]
@@ -2412,23 +2284,11 @@ fn library_impls_trace_every_reference() {
         check(mc, "Option", Some(a), 1);
         check(mc, "None", None::<Member<'_, Node<'_>>>, 0);
         check(mc, "Lock", Lock::new(Some(a)), 1);
-        check(mc, "Cell", Cell::new(Some(a)), 1);
         check(mc, "array", [a, b, c], 3);
         check(mc, "tuple", (a, b, c, Value::NIL), 3);
-        check(mc, "slice", vec![a, b, c].into_boxed_slice(), 3);
-        check(mc, "Box", Box::new(a), 1);
-        check(mc, "Vec", vec![a, b, c], 3);
-        check(mc, "VecDeque", VecDeque::from([a, b, c]), 3);
-        check(mc, "RefCell", RefCell::new(vec![a, b]), 2);
-        check(mc, "RefLock", RefLock::new(vec![a, b]), 2);
-        check(mc, "HashMap", HashMap::from([(1u64, a), (2, b), (3, c)]), 3);
-        check(mc, "BTreeMap", BTreeMap::from([(1u64, a), (2, b)]), 2);
         // Outside the arena an ephemeron holds its key strongly, so both are traced.
         check(mc, "Ephemeron", Ephemeron::new(mc, x, Value::from(AnyRef::new(mc, y))), 2);
         check(mc, "Weak", Weak::new(mc, x), 1);
-        let vec = GcVec::<u64>::new();
-        vec.push(mc, 1).unwrap();
-        check(mc, "GcVec", vec, 1);
     }).unwrap();
     const { assert!(<HostRef<'static, u8> as Trace>::NEEDS_TRACE && <AnyHostRef<'static> as Trace>::NEEDS_TRACE) };
     leaf::<()>("()");
@@ -2436,10 +2296,9 @@ fn library_impls_trace_every_reference() {
     leaf::<(u32, u64, u128, usize)>("unsigned integers");
     leaf::<(i8, i16, i32, i64)>("signed integers");
     leaf::<(i128, isize, f32, f64)>("wide integers and floats");
-    leaf::<(String, Box<str>, Vec<String>, Option<u32>)>("text");
+    leaf::<(String, Option<u32>)>("text");
     leaf::<[u64; 4]>("arrays of leaves");
     leaf::<PhantomData<Member<'static, Node<'static>>>>("PhantomData");
-    leaf::<(HashSet<u64>, BTreeSet<u64>, HashMap<u64, u64>)>("sets and maps of leaves");
 }
 
 /// Type ids ignore lifetimes, which arena types only use as brands, and still tell types apart.
@@ -2451,7 +2310,7 @@ fn type_ids_ignore_lifetimes() {
     let local = ();
     assert_eq!(node_id(&local), layout::type_id::<Node<'static>>());
     assert_ne!(layout::type_id::<Node<'static>>(), layout::type_id::<Bytes>());
-    assert_ne!(layout::type_id::<GcVec<'static, u64>>(), layout::type_id::<GcVec<'static, i64>>());
+    assert_ne!(layout::type_id::<Ephemeron<'static, Bytes, u64>>(), layout::type_id::<Ephemeron<'static, Bytes, i64>>());
 }
 
 #[test]
@@ -2630,41 +2489,25 @@ fn only_the_gc_crate_allows_unsafe_code() {
     assert!(checked >= 4, "found only {checked} other crates");
 }
 
-/// An element so large that fewer than four fit in the region.
-#[derive(Trace, Plain, Clone, Copy)]
-struct Huge([u64; (17 << 20) / 8]);
-
-impl Default for Huge {
-    fn default() -> Self {
-        Huge([0; (17 << 20) / 8])
-    }
-}
-
-struct HugeRoot;
-impl Rootable for HugeRoot {
-    type Root<'gc> = GcVec<'gc, Huge>;
-}
-
-/// Growing a vector of elements so large that fewer than four fit allocates what it can or
-/// fails with `OutOfMemory`, without panicking.
 #[test]
-#[cfg_attr(miri, ignore = "the region is smaller than one element")]
-fn vectors_of_huge_elements_grow_or_fail() {
-    assert_eq!(layout::max_items::<vec::Array<Huge>>(), 3);
-    // The elements are built on the stack, which the default test thread is too small for.
-    let run = std::thread::Builder::new().stack_size(1 << 30).spawn(|| {
-        // With room, growth stops at the three that fit, and a fourth can't be added.
-        // Without room for three, it falls back to the one needed.
-        for (limit, fits) in [(60 << 20, 3), (40 << 20, 1)] {
-            let mut arena = Arena::<HugeRoot>::new(limit, |_| Ok(GcVec::new())).unwrap();
-            arena.mutate(|mc, root| {
-                for _ in 0..fits {
-                    root.push(mc, Huge::default()).unwrap();
-                }
-                assert_eq!(root.push(mc, Huge::default()), Err(OutOfMemory), "limit {limit}");
-                assert_eq!(root.len(mc), fits);
-            }).unwrap();
-        }
-    });
-    run.unwrap().join().unwrap();
+fn arena_ids_are_never_reused() {
+    use std::sync::atomic::AtomicU64;
+    let next = AtomicU64::new(u64::MAX - 2);
+    assert_eq!(heap::take_id(&next), Some(u64::MAX - 2));
+    assert_eq!(heap::take_id(&next), Some(u64::MAX - 1));
+    assert_eq!(heap::take_id(&next), None);
+    assert_eq!(heap::take_id(&next), None, "running out is permanent");
+}
+
+#[derive(Trace, Plain)]
+#[gc(items = u8)]
+struct PageHead([u64; PAGE / 8]);
+
+/// The public `max_items` matches allocation, and is 0 for types that can't be allocated.
+#[test]
+fn public_max_items_matches_allocation() {
+    assert_eq!(max_items::<Bytes>(), layout::max_items::<Bytes>());
+    assert_eq!(max_items::<Words>(), layout::max_items::<Words>());
+    assert!(!layout::fits_inline::<PageHead>());
+    assert_eq!(max_items::<PageHead>(), 0);
 }

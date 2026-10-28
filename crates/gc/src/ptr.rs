@@ -31,9 +31,9 @@ impl<'gc, T> Gc<'gc, T> {
 
     #[allow(clippy::should_implement_trait)]
     pub fn as_ref(this: Self) -> &'gc T {
-        // SAFETY: `from_raw` made it for a `T` in this arena's region. Objects only move or
-        // die in collections, which can't run during `'gc`, and arena memory is only written
-        // through cells then, so a shared borrow holds.
+        // SAFETY: [refs, steps, alias] `from_raw` made it for a `T` in this arena's region. Objects
+        // only move or die in collections, which can't run during `'gc`, and arena memory is only
+        // written through cells then, so a shared borrow holds.
         unsafe { this.ptr.as_ref() }
     }
 
@@ -49,14 +49,14 @@ impl<'gc, T> Gc<'gc, T> {
 impl<'gc, T: Inline> Gc<'gc, T> {
     fn object(self) -> Object<T> {
         const { assert!(T::INLINE && layout::fits_inline::<T>(), "type is too large or too aligned for the arena") };
-        // SAFETY: `from_raw` made it for the value of an object holding a `T`, which doesn't
-        // move during `'gc`.
+        // SAFETY: [refs, steps] `from_raw` made it for the value of an object holding a `T`, which
+        // doesn't move during `'gc`.
         unsafe { Object::of_value(self.ptr.as_ptr()) }
     }
 
     pub fn items(self) -> &'gc [T::Item] {
-        // SAFETY: the items are inside the object, as `Object::items` caps them, and borrowed
-        // shared as in `as_ref`.
+        // SAFETY: [headers, alias] the header's length is the object's own item count, so the
+        // items are inside the object, and they're borrowed shared as in `as_ref`.
         unsafe { &*self.object().items() }
     }
 
@@ -109,9 +109,9 @@ impl<'gc, T> Member<'gc, T> {
         T: Plain<'gc>,
     {
         let offset = (self.offset.get() & OFFSET_MASK) as usize;
-        // SAFETY: masked, the offset is aligned and below `REGION`, so the `T` after the header
-        // lies inside the reservation, as `from_raw` checks `T` fits. Corrupted memory may
-        // put some other object there, but `T: Plain` makes any bits a valid `T`.
+        // SAFETY: [refs, memory] the offset names a live `T` in this arena's region. Masked, it
+        // stays aligned and inside the reservation whatever the bits, as `from_raw` checks
+        // that `T` fits.
         unsafe { Gc::from_raw(mc.base.add(offset + HEADER).cast()) }
     }
 
@@ -162,9 +162,9 @@ impl<T> fmt::Debug for Member<'_, T> {
     }
 }
 
-// SAFETY: `Option<NonZeroU32>` accepts every `u32`; a bare `Member` doesn't accept zero.
-// No `T: Plain<'gc>` bound: it would make every self-referential type a trait cycle.
-// Reading through the member needs `T: Plain<'gc>` anyway, which keeps the brand.
+// SAFETY: [plain, brand] `Option<NonZeroU32>` accepts every `u32`; a bare `Member` doesn't accept
+// zero. No `T: Plain<'gc>` bound: it would make every self-referential type a trait cycle. Reading
+// through the member needs `T: Plain<'gc>` anyway, which keeps the brand.
 unsafe impl<'gc, T> Plain<'gc> for Option<Member<'gc, T>> {}
 
 // SAFETY: hands its one reference to the tracer, which may rewrite it.
@@ -292,7 +292,7 @@ impl fmt::Debug for AnyRef<'_> {
     }
 }
 
-// SAFETY: one `u64` and a brand. Any word is valid: the check bits are compared against the
+// SAFETY: [plain] one `u64` and a brand. Any word is valid: the check bits are compared against the
 // object's header before use.
 unsafe impl<'gc> Plain<'gc> for AnyRef<'gc> {}
 

@@ -1,21 +1,23 @@
 use std::marker::PhantomData;
 
-use super::layout;
-use super::{Lock, Member, Mutation, OutOfMemory, Plain, Trace};
+use ragwort_gc::{Lock, Member, Mutation, OutOfMemory, Plain, Trace, max_items};
 
-/// The inline buffer behind a [`GcVec`].
+#[cfg(test)]
+mod tests;
+
+/// The slots behind a [`Buffer`], stored inline.
 #[derive(Trace, Plain)]
 #[gc(items = Lock<T>)]
-pub struct Array<T>(PhantomData<T>);
+pub struct Slots<T>(PhantomData<T>);
 
-/// A growable vector stored entirely in the arena. Slots past `len` hold `T::default()`.
+/// A growable array stored entirely in the arena. Slots past `len` hold `T::default()`.
 #[derive(Trace, Plain)]
-pub struct GcVec<'gc, T> {
+pub struct Buffer<'gc, T> {
     len: Lock<u32>,
-    buf: Lock<Option<Member<'gc, Array<T>>>>,
+    buf: Lock<Option<Member<'gc, Slots<T>>>>,
 }
 
-impl<'gc, T: Trace + Copy + Default + Plain<'gc> + 'gc> GcVec<'gc, T> {
+impl<'gc, T: Trace + Copy + Default + Plain<'gc> + 'gc> Buffer<'gc, T> {
     pub fn new() -> Self {
         Self { len: Lock::new(0), buf: Lock::new(None) }
     }
@@ -52,19 +54,19 @@ impl<'gc, T: Trace + Copy + Default + Plain<'gc> + 'gc> GcVec<'gc, T> {
 
     pub fn reserve(&self, mc: &Mutation<'gc>, additional: usize) -> Result<(), OutOfMemory> {
         let (slots, len) = self.parts(mc);
-        let needed = len.checked_add(additional).ok_or_else(|| mc.heap.budget.fail())?;
+        let needed = len.checked_add(additional).ok_or_else(|| mc.out_of_memory())?;
         if needed <= slots.len() {
             return Ok(());
         }
         let copy = |i: usize| Lock::new(slots[..len].get(i).map_or_else(T::default, Lock::get));
-        let grown = (slots.len() * 2).max(4).min(layout::max_items::<Array<T>>());
+        let grown = (slots.len() * 2).max(4).min(max_items::<Slots<T>>());
         let buf = match grown > needed {
-            true => mc.heap.budget.quiet(|| mc.alloc_inline(Array(PhantomData), grown, copy)).ok(),
+            true => mc.optional(|| mc.alloc_inline(Slots(PhantomData), grown, copy)).ok(),
             false => None,
         };
         let buf = match buf {
             Some(buf) => buf,
-            None => mc.alloc_inline(Array(PhantomData), needed, copy)?,
+            None => mc.alloc_inline(Slots(PhantomData), needed, copy)?,
         };
         self.buf.store(mc, Some(buf));
         self.len.set(mc, len as u32);
@@ -98,7 +100,7 @@ impl<'gc, T: Trace + Copy + Default + Plain<'gc> + 'gc> GcVec<'gc, T> {
     }
 }
 
-impl<'gc, T: Trace + Copy + Default + Plain<'gc> + 'gc> Default for GcVec<'gc, T> {
+impl<'gc, T: Trace + Copy + Default + Plain<'gc> + 'gc> Default for Buffer<'gc, T> {
     fn default() -> Self {
         Self::new()
     }

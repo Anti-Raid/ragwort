@@ -1,4 +1,7 @@
 //! The arena: a garbage collected heap for one interpreter, with segmented stacks.
+//!
+//! `SOUNDNESS.md` explains why the unsafe code is sound, and the `SAFETY` comments cite its
+//! invariants by name.
 
 #![warn(clippy::undocumented_unsafe_blocks)]
 
@@ -18,7 +21,6 @@ mod table;
 mod weak;
 mod trace;
 mod value;
-mod vec;
 
 #[cfg(test)]
 mod tests;
@@ -30,17 +32,16 @@ mod stack_tests;
 #[doc(hidden)]
 pub mod compile_fail;
 
-pub use arena::{Arena, Corrupted, Metrics, Mutation, Phase, Rootable, StepError};
+pub use arena::{Arena, Corrupted, Metrics, Mutation, Phase, Rootable, StepError, max_items};
 pub use budget::OutOfMemory;
 pub use host::{AnyHostRef, HostRef};
 pub use layout::REGION;
-pub use lock::{Batch, Lock, RefLock};
+pub use lock::{Batch, Lock};
 pub use ptr::{AnyRef, Gc, Member, TypeTag};
 pub use root::{ForeignRoot, Root, Rooted};
 pub use stack::{Frame, Segment, Stack, WINDOW};
 pub use trace::{Inline, Plain, Trace, Tracer};
 pub use value::{Unpacked, Value};
-pub use vec::{Array, GcVec};
 pub use weak::{Ephemeron, Weak};
 
 pub use ragwort_derive::{Plain, Trace};

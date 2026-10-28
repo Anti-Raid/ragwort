@@ -34,7 +34,8 @@ impl Heap {
     /// every bit pattern is a valid `Header`.
     #[inline]
     fn header_at(&self, offset: u32) -> Header {
-        // SAFETY: as above, the read stays inside the reservation, and any bits are a header.
+        // SAFETY: [memory, plain] as above, the read stays inside the reservation, and any bits are
+        // a header.
         unsafe { self.header_ptr(offset & OFFSET_MASK).read() }
     }
 
@@ -123,17 +124,17 @@ impl Heap {
         if !(ptr::fn_addr_eq(vtable.type_id, id) || (vtable.type_id)() == id()) {
             return None;
         }
-        // SAFETY: the vtable is `T`'s, so the header starts a `T`, and `size_of` checked that its
-        // items fit in the object. The caller holds no other view of it, and the `Collecting`
-        // token means no step does.
+        // SAFETY: [steps, alias] the vtable is `T`'s, so the header starts a `T`, and `size_of`
+        // checked that its items fit in the object. The caller holds no other view of it, and the
+        // `Collecting` token means no step does.
         unsafe { Some(&mut *Object::<T>::at(self.header_ptr(offset)).items()) }
     }
 
     /// Wipes the header of an object that's gone, so stale references to it don't check out.
     #[inline]
     pub(super) fn clear_header(&self, offset: u32) {
-        // SAFETY: only called for an object that was allocated, so the header is in a committed
-        // page, and nothing borrows it.
+        // SAFETY: [memory, steps] only called for an object that was allocated, so the header is in
+        // a committed page, and nothing borrows it.
         unsafe { self.header_ptr(offset).write(Header { ty: TypeIndex::new(0), flags: 0, len: 0 }) }
     }
 

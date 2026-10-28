@@ -1,5 +1,3 @@
-use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
 
@@ -22,7 +20,7 @@ use super::layout::{Addr, Check};
 /// - `holds_refs` must be true whenever `trace` would visit a reference.
 /// - `trace` should not panic. If it does, the arena is marked corrupted and can't be entered
 ///   again.
-/// - The `'gc` lifetime may only brand arena handles (`Member`, `HostRef`, `GcVec`, ...). A
+/// - The `'gc` lifetime may only brand arena handles (`Member`, `HostRef`, `Weak`, ...). A
 ///   type must not use it, or any other lifetime, for ordinary borrows, because roots and
 ///   the arena root are kept past the step that created them.
 ///
@@ -58,16 +56,16 @@ pub unsafe trait Plain<'gc> {
 }
 
 macro_rules! plain {
-    // SAFETY: integers and floats have no padding, and every bit pattern is a valid value.
+    // SAFETY: [plain] integers and floats have no padding, and every bit pattern is a valid value.
     ($($t:ty),* $(,)?) => {$(unsafe impl<'gc> Plain<'gc> for $t {})*};
 }
 
 plain!((), u8, u16, u32, u64, usize, i8, i16, i32, i64, isize, f32, f64);
 
-// SAFETY: it has no bytes, and holds no handle.
+// SAFETY: [plain] it has no bytes, and holds no handle.
 unsafe impl<T: ?Sized> Plain<'_> for PhantomData<T> {}
 
-// SAFETY: elements follow each other with no padding between them, so an array has what its
+// SAFETY: [plain] elements follow each other with no padding between them, so an array has what its
 // element has.
 unsafe impl<'gc, T: Plain<'gc>, const N: usize> Plain<'gc> for [T; N] {
     const CHECK: () = T::CHECK;
@@ -259,21 +257,19 @@ macro_rules! leaf {
 
 leaf!((), bool, char, u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f64, String);
 
-// SAFETY: it holds no references, and says so.
-unsafe impl Trace for str {
-    const NEEDS_TRACE: bool = false;
+// The rule for every generic impl: each type parameter is traced, or only in a `PhantomData`.
+// Anything else could hold an arena reference the collector never sees. Rust's collections
+// have no impls: data that holds references belongs in the arena, where it's charged and
+// traced in slices.
 
-    fn trace(&mut self, _: &mut Tracer<'_>) {}
-}
-
-// SAFETY: it holds nothing, and says so.
+// SAFETY: [trace] it holds nothing, and says so.
 unsafe impl<T: ?Sized> Trace for PhantomData<T> {
     const NEEDS_TRACE: bool = false;
 
     fn trace(&mut self, _: &mut Tracer<'_>) {}
 }
 
-// SAFETY: traces what it holds, and needs tracing exactly when that does. The same goes for
+// SAFETY: [trace] traces what it holds, and needs tracing exactly when that does. The same goes for
 // the containers below.
 unsafe impl<T: Trace> Trace for Option<T> {
     const NEEDS_TRACE: bool = T::NEEDS_TRACE;
@@ -322,111 +318,3 @@ tuple!(A);
 tuple!(A, B);
 tuple!(A, B, C);
 tuple!(A, B, C, D);
-
-// Containers for the root and other host-side state. None of them is `Plain`, so none of
-// them can end up in the arena, where writes would need a barrier.
-//
-// The rule for every impl here: each type parameter is traced, or bound by `'static`, or only
-// in a `PhantomData`. Anything else could hold an arena reference the collector never sees.
-
-// SAFETY: as for `Option`.
-unsafe impl<T: Trace> Trace for [T] {
-    const NEEDS_TRACE: bool = T::NEEDS_TRACE;
-
-    fn trace(&mut self, t: &mut Tracer<'_>) {
-        if T::NEEDS_TRACE {
-            for v in self {
-                v.trace(t);
-            }
-        }
-    }
-}
-
-// SAFETY: as for `Option`.
-unsafe impl<T: Trace + ?Sized> Trace for Box<T> {
-    const NEEDS_TRACE: bool = T::NEEDS_TRACE;
-
-    fn trace(&mut self, t: &mut Tracer<'_>) {
-        (**self).trace(t);
-    }
-}
-
-// SAFETY: as for `Option`.
-unsafe impl<T: Trace> Trace for Vec<T> {
-    const NEEDS_TRACE: bool = T::NEEDS_TRACE;
-
-    fn trace(&mut self, t: &mut Tracer<'_>) {
-        self.as_mut_slice().trace(t);
-    }
-}
-
-// SAFETY: as for `Option`.
-unsafe impl<T: Trace> Trace for VecDeque<T> {
-    const NEEDS_TRACE: bool = T::NEEDS_TRACE;
-
-    fn trace(&mut self, t: &mut Tracer<'_>) {
-        if T::NEEDS_TRACE {
-            for v in self {
-                v.trace(t);
-            }
-        }
-    }
-}
-
-// SAFETY: as for `Option`.
-unsafe impl<T: Trace + Copy> Trace for Cell<T> {
-    const NEEDS_TRACE: bool = T::NEEDS_TRACE;
-
-    fn trace(&mut self, t: &mut Tracer<'_>) {
-        self.get_mut().trace(t);
-    }
-}
-
-// SAFETY: as for `Option`. Collections only run between steps, when nothing can hold a
-// borrow, so `get_mut` reaches the value.
-unsafe impl<T: Trace + ?Sized> Trace for RefCell<T> {
-    const NEEDS_TRACE: bool = T::NEEDS_TRACE;
-
-    fn trace(&mut self, t: &mut Tracer<'_>) {
-        self.get_mut().trace(t);
-    }
-}
-
-// Keys can't hold references: rewriting a key after its object moved would break the map.
-// Hashers aren't traced, so they must be `'static`, which no arena reference is.
-macro_rules! map {
-    ($($map:ident<$($extra:ident),*>),*) => {$(
-        // SAFETY: traces every value, refuses keys that hold references, which it can't
-        // rewrite, and takes only hashers that can't hold any.
-        unsafe impl<K: Trace, V: Trace $(, $extra: 'static)*> Trace for $map<K, V $(, $extra)*> {
-            const NEEDS_TRACE: bool = V::NEEDS_TRACE;
-
-            fn trace(&mut self, t: &mut Tracer<'_>) {
-                const { assert!(!K::NEEDS_TRACE, "map keys can't hold arena references") };
-                if V::NEEDS_TRACE {
-                    for v in self.values_mut() {
-                        v.trace(t);
-                    }
-                }
-            }
-        }
-    )*};
-}
-
-map!(HashMap<S>, BTreeMap<>);
-
-macro_rules! set {
-    ($($set:ident<$($extra:ident),*>),*) => {$(
-        // SAFETY: refuses elements that hold references, and takes only hashers that can't hold
-        // any, so there's nothing to trace.
-        unsafe impl<T: Trace $(, $extra: 'static)*> Trace for $set<T $(, $extra)*> {
-            const NEEDS_TRACE: bool = false;
-
-            fn trace(&mut self, _: &mut Tracer<'_>) {
-                const { assert!(!T::NEEDS_TRACE, "set elements can't hold arena references") };
-            }
-        }
-    )*};
-}
-
-set!(HashSet<S>, BTreeSet<>);

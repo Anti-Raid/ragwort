@@ -39,7 +39,7 @@ impl<T> Building<'_, T> {
     fn finish(self, value: T) -> Made<T> {
         let this = ManuallyDrop::new(self);
         let ptr = this.object.value();
-        // SAFETY: there's room for the value after the header, and nothing else refers to
+        // SAFETY: [alias] there's room for the value after the header, and nothing else refers to
         // either until the object is colored below.
         unsafe {
             (*this.object.header()).len = this.len;
@@ -58,8 +58,8 @@ impl<'h, T: Inline> Unfilled<'h, T> {
     fn init_items(self, mut fill: impl FnMut(usize) -> T::Item, keep: impl FnOnce(&mut [T::Item]) -> Option<usize>) -> Building<'h, T> {
         let mut object = self.0;
         let items = object.object.items();
-        // SAFETY: the header's length of items fit in what was reserved, and only this refers
-        // to them. Each is written before the slice is made.
+        // SAFETY: [alias] the header's length of items fit in what was reserved, and only this
+        // refers to them. Each is written before the slice is made.
         let items = unsafe {
             let first = items.cast::<T::Item>();
             for i in 0..items.len() {
@@ -168,9 +168,9 @@ impl Heap {
         let ty = self.type_index(vtable)?;
         let offset = self.reserve(size)?;
         let header = self.header_ptr(offset);
-        // SAFETY: `reserve` handed out `size` bytes at `offset`, room for the header, the value
-        // and the items, which nothing else refers to. With its header written, it's the object
-        // reserved for a `T` that `Object` asks for.
+        // SAFETY: [alias, headers] `reserve` handed out `size` bytes at `offset`, room for the
+        // header, the value and the items, which nothing else refers to. With its header written,
+        // it's the object reserved for a `T` that `Object` asks for.
         let object = unsafe {
             header.write(Header { ty, flags: self.stamp(), len: len as u32 });
             Object::at(header)

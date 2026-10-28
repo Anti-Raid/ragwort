@@ -73,8 +73,8 @@ impl StackRecord {
         if self.parked.get() {
             return;
         }
-        // SAFETY: the collection holds no other view of the segment's slots while this one is
-        // used, and the `Collecting` token means no step does either.
+        // SAFETY: [steps, alias] the collection holds no other view of the segment's slots while
+        // this one is used, and the `Collecting` token means no step does either.
         let Some(slots) = (unsafe { heap.items_mut::<Segment<'static>>(segment.get(), c) }) else {
             return heap.corrupt();
         };
@@ -303,8 +303,8 @@ impl<S: ?Sized> Copy for Live<'_, S> {}
 impl<'gc, S: ?Sized + Index<usize, Output = Lock<Value<'gc>>>> Live<'_, S> {
     #[inline]
     fn set(self, i: usize, value: Value<'gc>) {
-        // SAFETY: the slot is at or above `base`, in the part of the stack every collection
-        // traces as a root, so it needs no barrier.
+        // SAFETY: [stacks] the slot is at or above `base`, in the part of the stack every
+        // collection traces as a root, so it needs no barrier.
         unsafe { self.0[i].set_unbarriered(value) }
     }
 }

@@ -1,10 +1,11 @@
-use ragwort_gc::{Arena, GcVec, Rootable};
+use ragwort_gc::{Arena, Rootable};
 
 use super::*;
+use crate::buffer::Buffer;
 
 struct Ints;
 impl Rootable for Ints {
-    type Root<'gc> = GcVec<'gc, Value<'gc>>;
+    type Root<'gc> = Buffer<'gc, Value<'gc>>;
 }
 
 fn parse<'gc>(h: &Nums<'_, 'gc>, text: &str) -> Integer<'gc> {
@@ -14,7 +15,7 @@ fn parse<'gc>(h: &Nums<'_, 'gc>, text: &str) -> Integer<'gc> {
 
 #[test]
 fn arithmetic_crosses_the_fixnum_edge() {
-    let mut arena = Arena::<Ints>::new(4 << 20, |_| Ok(GcVec::new())).unwrap();
+    let mut arena = Arena::<Ints>::new(4 << 20, |_| Ok(Buffer::new())).unwrap();
     arena.mutate(|mc, _| {
         let h = Nums::new(mc).unwrap();
         let max = int::from_i64(&h, Value::MAX_FIXNUM).unwrap();
@@ -39,7 +40,7 @@ fn arithmetic_crosses_the_fixnum_edge() {
 
 #[test]
 fn bignums_survive_collections_that_move_them() {
-    let mut arena = Arena::<Ints>::new(16 << 20, |_| Ok(GcVec::new())).unwrap();
+    let mut arena = Arena::<Ints>::new(16 << 20, |_| Ok(Buffer::new())).unwrap();
     arena.set_evacuate_all(true);
     let expected: Vec<String> = arena.mutate(|mc, root| {
         let h = Nums::new(mc).unwrap();
@@ -68,7 +69,7 @@ fn bignums_survive_collections_that_move_them() {
 
 #[test]
 fn ratios_live_in_the_arena() {
-    let mut arena = Arena::<Ints>::new(4 << 20, |_| Ok(GcVec::new())).unwrap();
+    let mut arena = Arena::<Ints>::new(4 << 20, |_| Ok(Buffer::new())).unwrap();
     arena.set_evacuate_all(true);
     let expected = arena.mutate(|mc, root| {
         let h = Nums::new(mc).unwrap();
@@ -100,7 +101,7 @@ fn ratios_live_in_the_arena() {
 
 #[test]
 fn running_out_of_memory_is_an_error() {
-    let mut arena = Arena::<Ints>::new(1 << 20, |_| Ok(GcVec::new())).unwrap();
+    let mut arena = Arena::<Ints>::new(1 << 20, |_| Ok(Buffer::new())).unwrap();
     arena.mutate(|mc, _| {
         let h = Nums::new(mc).unwrap();
         let two = int::from_i64(&h, 2).unwrap();
@@ -131,7 +132,7 @@ fn parts<'gc>(h: &Nums<'_, 'gc>, z: Number<'gc>) -> (String, String) {
 
 #[test]
 fn flonums_and_complex_numbers_live_in_the_arena() {
-    let mut arena = Arena::<Ints>::new(4 << 20, |_| Ok(GcVec::new())).unwrap();
+    let mut arena = Arena::<Ints>::new(4 << 20, |_| Ok(Buffer::new())).unwrap();
     arena.set_evacuate_all(true);
     let expected = arena.mutate(|mc, root| {
         let h = Nums::new(mc).unwrap();

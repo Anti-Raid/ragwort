@@ -2,19 +2,20 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use ragwort_gc::{Arena, GcVec, Rootable};
+use ragwort_gc::{Arena, Rootable};
 
 use super::*;
+use crate::buffer::Buffer;
 
 struct Strs;
 impl Rootable for Strs {
-    type Root<'gc> = GcVec<'gc, Value<'gc>>;
+    type Root<'gc> = Buffer<'gc, Value<'gc>>;
 }
 
 /// Flat strings of each width and ropes over them survive collections that move them.
 #[test]
 fn strings_live_in_the_arena() {
-    let mut arena = Arena::<Strs>::new(8 << 20, |_| Ok(GcVec::new())).unwrap();
+    let mut arena = Arena::<Strs>::new(8 << 20, |_| Ok(Buffer::new())).unwrap();
     arena.set_evacuate_all(true);
     let pieces = ["", "plain ascii", "café", "Ārvīds 日本語", "emoji 😀 here"];
     let expected = arena.mutate(|mc, root| {
@@ -58,7 +59,7 @@ fn strings_live_in_the_arena() {
 
 #[test]
 fn errors_come_back_as_the_crate_error() {
-    let mut arena = Arena::<Strs>::new(1 << 20, |_| Ok(GcVec::new())).unwrap();
+    let mut arena = Arena::<Strs>::new(1 << 20, |_| Ok(Buffer::new())).unwrap();
     arena.mutate(|mc, _| {
         let h = Strings::new(mc).unwrap();
         let s = from_str(&h, "abc").unwrap();
@@ -86,7 +87,7 @@ impl Drop for Watched {
 /// collections, and their owner is dropped once it isn't.
 #[test]
 fn external_strings_keep_their_owner_while_reachable() {
-    let mut arena = Arena::<Strs>::new(8 << 20, |_| Ok(GcVec::new())).unwrap();
+    let mut arena = Arena::<Strs>::new(8 << 20, |_| Ok(Buffer::new())).unwrap();
     arena.set_evacuate_all(true);
     let dropped = [Rc::new(Cell::new(false)), Rc::new(Cell::new(false))];
     let texts: [Arc<str>; 2] = ["a message from discord, long enough to stay outside ".repeat(20).into(), "日本語のメッセージ 😀 ".repeat(20).into()];
@@ -129,7 +130,7 @@ fn external_characters_stored_wide_are_refused() {
             Units::Four(&self.0)
         }
     }
-    let mut arena = Arena::<Strs>::new(1 << 20, |_| Ok(GcVec::new())).unwrap();
+    let mut arena = Arena::<Strs>::new(1 << 20, |_| Ok(Buffer::new())).unwrap();
     arena.mutate(|mc, _| {
         let h = Strings::new(mc).unwrap();
         assert_eq!(h.external(Wide(vec![0x41; 100])), Err(Error::Str(StrError::NotNarrowest)));
