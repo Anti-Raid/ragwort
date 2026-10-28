@@ -7,6 +7,8 @@
 #![forbid(unsafe_code)]
 
 mod external;
+mod hash;
+mod intern;
 mod iter;
 mod rope;
 mod units;
@@ -18,9 +20,10 @@ mod tests;
 
 use std::cmp::Ordering;
 use std::fmt;
-use std::hash::Hasher;
 
 pub use external::{External, ExternalText, check_external};
+pub use hash::{hash, hash_str};
+pub use intern::{Table, intern, intern_str};
 pub use iter::{Chars, Chunks};
 pub use rope::{concat, concat_all, flatten, substring};
 pub use units::{Units, UnitsMut, Width};
@@ -244,24 +247,28 @@ pub fn equal<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<bool, H::Error> {
     Ok(compare(h, a, b)? == Ordering::Equal)
 }
 
-/// Hashes the characters, so equal strings hash the same whatever their shape.
-pub fn hash<H: Host, S: Hasher>(h: &H, s: H::Str, state: &mut S) -> Result<(), H::Error> {
-    let n = len(h, s);
-    h.charge(n as u64)?;
-    state.write_usize(n);
-    match flat_units(h, s) {
-        Some(units) => units.chars().for_each(|c| state.write_u32(c as u32)),
-        None => chars(h, s).for_each(|c| state.write_u32(c as u32)),
+/// Whether `s` holds the characters of `t`.
+pub fn equal_str<H: Host>(h: &H, s: H::Str, t: &str) -> Result<bool, H::Error> {
+    let (info, flat) = summary(h, s);
+    if let Some(Units::One(bytes)) = flat
+        && bytes.len() == t.len()
+    {
+        h.charge(t.len() as u64)?;
+        // Equal bytes are equal characters only if they're ASCII: Latin-1 isn't UTF-8 past it.
+        return Ok(bytes == t.as_bytes() && t.is_ascii());
     }
-    Ok(())
+    if info.len > t.len() || info.len < t.len().div_ceil(4) {
+        return Ok(false);
+    }
+    h.charge(info.len as u64)?;
+    Ok(match flat {
+        Some(units) => units.chars().eq(t.chars()),
+        None => chars(h, s).eq(t.chars()),
+    })
 }
 
-/// The characters of a flat string, or of a rope's flat copy.
-fn flat_units<H: Host>(h: &H, s: H::Str) -> Option<Units<'_>> {
-    summary(h, s).1
-}
-
-/// What [`info`] says of `s`, and [`flat_units`], from one view.
+/// What [`info`] says of `s`, and the characters of a flat string or of a rope's flat copy,
+/// from one view.
 fn summary<H: Host>(h: &H, s: H::Str) -> (Info, Option<Units<'_>>) {
     match h.view(s) {
         StrView::Flat(u) => (Info { len: u.len(), width: u.width(), depth: 0 }, Some(u)),

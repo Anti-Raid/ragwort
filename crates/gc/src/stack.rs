@@ -2,11 +2,11 @@ use std::cell::Cell;
 use std::fmt;
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
-use std::ops::Range;
+use std::ops::{Index, Range};
 use std::ptr;
 use std::rc::Rc;
 
-use super::heap::Heap;
+use super::heap::{Collecting, Heap};
 use super::root::ROOT_COST;
 use super::trace::Mode;
 use super::{Gc, Lock, Member, Mutation, OutOfMemory, Plain, Trace, Tracer, Value};
@@ -66,15 +66,16 @@ impl StackRecord {
 
     /// Traces the segment and the live slots, and voids the slots above `top`, which were
     /// written without a barrier and aren't traced.
-    pub(crate) fn trace(&self, heap: &Heap, t: &mut Tracer<'_>) {
+    pub(crate) fn trace(&self, heap: &Heap, t: &mut Tracer<'_>, c: &Collecting) {
         let mut segment = self.segment.get();
         t.member(&mut segment);
         self.segment.set(segment);
         if self.parked.get() {
             return;
         }
-        // Collections run between steps, when nothing borrows arena memory.
-        let Some(slots) = (unsafe { heap.items_mut::<Segment<'static>>(segment.get()) }) else {
+        // SAFETY: the collection holds no other view of the segment's slots while this one is
+        // used, and the `Collecting` token means no step does either.
+        let Some(slots) = (unsafe { heap.items_mut::<Segment<'static>>(segment.get(), c) }) else {
             return heap.corrupt();
         };
         let live = self.live(slots.len());
@@ -168,12 +169,24 @@ impl Stack {
     /// fit in the segment.
     #[inline]
     pub fn frame<'s, 'gc: 's>(&'s self, mc: &Mutation<'gc>, fp: usize) -> Option<Frame<'s, 'gc>> {
-        if fp < self.base() {
+        Some(Frame { slots: self.live(mc, fp, <[_]>::first_chunk)? })
+    }
+
+    /// The slots `pick` takes from those from `at`, which must be at or above `base`, for
+    /// writing without a barrier.
+    #[inline]
+    fn live<'s, 'gc: 's, S: ?Sized>(
+        &'s self,
+        mc: &Mutation<'gc>,
+        at: usize,
+        pick: impl FnOnce(&'s [Lock<Value<'gc>>]) -> Option<&'s S>,
+    ) -> Option<Live<'s, S>> {
+        if at < self.base() {
             return None;
         }
-        let slots = self.slots(mc).get(fp..)?.first_chunk()?;
+        let slots = pick(self.slots(mc).get(at..)?)?;
         self.record.parked.set(false);
-        Some(Frame { slots })
+        Some(Live(slots))
     }
 
     pub fn get<'gc>(&self, mc: &Mutation<'gc>, index: usize) -> Option<Value<'gc>> {
@@ -182,28 +195,22 @@ impl Stack {
 
     /// Sets a slot at or above `base`. Returns whether it was in range.
     pub fn set<'gc>(&self, mc: &Mutation<'gc>, index: usize, value: Value<'gc>) -> bool {
-        let Some(slot) = self.slots(mc).get(index).filter(|_| index >= self.base()) else { return false };
-        self.record.parked.set(false);
-        // The slot is in the live part of the segment, which the collector traces as a root.
-        unsafe { slot.set_unbarriered(value) };
+        let Some(slot) = self.live(mc, index, |slots| slots.first_chunk::<1>()) else { return false };
+        slot.set(0, value);
         true
     }
 
     /// Copies `src` to the slots from `at`, which must be at or above `base`, such as frames
     /// of a continuation. Returns whether it was in range.
     pub fn write<'gc>(&self, mc: &Mutation<'gc>, at: usize, src: &[Lock<Value<'gc>>]) -> bool {
-        let slots = self.slots(mc);
-        let Some(dst) = at.checked_add(src.len()).and_then(|end| slots.get(at..end)) else { return false };
-        if at < self.base() {
-            return false;
-        }
-        self.record.parked.set(false);
-        let copy = |(d, s): (&Lock<Value<'gc>>, &Lock<Value<'gc>>)| unsafe { d.set_unbarriered(s.get()) };
-        // The slots are in the live part of the segment, as in `set`. `src` may overlap them.
-        if dst.as_ptr() > src.as_ptr() {
-            dst.iter().zip(src).rev().for_each(copy);
+        let n = src.len();
+        let Some(dst) = self.live(mc, at, |slots| slots.get(..n)) else { return false };
+        // `src` may overlap the slots.
+        let copy = |i: usize| dst.set(i, src[i].get());
+        if dst.0.as_ptr() > src.as_ptr() {
+            (0..n).rev().for_each(copy);
         } else {
-            dst.iter().zip(src).for_each(copy);
+            (0..n).for_each(copy);
         }
         true
     }
@@ -260,24 +267,44 @@ impl fmt::Debug for Stack {
 /// number needs no bounds check.
 #[derive(Clone, Copy)]
 pub struct Frame<'s, 'gc> {
-    slots: &'s [Lock<Value<'gc>>; WINDOW],
+    slots: Live<'s, [Lock<Value<'gc>>; WINDOW]>,
 }
 
 impl<'s, 'gc> Frame<'s, 'gc> {
     #[inline]
     pub fn get(self, register: u8) -> Value<'gc> {
-        self.slots[register as usize].get()
+        self.slots.0[register as usize].get()
     }
 
     #[inline]
     pub fn set(self, register: u8, value: Value<'gc>) {
-        // A frame only comes from `Stack::frame`, at or above `base`, and borrows the stack, so
-        // it can't outlive the slot being live.
-        unsafe { self.slots[register as usize].set_unbarriered(value) }
+        self.slots.set(register as usize, value);
     }
 
     /// The registers as locks, for bulk reads. Writes through them take the barrier.
     pub fn slots(self) -> &'s [Lock<Value<'gc>>; WINDOW] {
-        self.slots
+        self.slots.0
+    }
+}
+
+/// Slots at or above `base` of a stack's segment, borrowed from the stack, which makes them
+/// only in [`Stack::live`]. The collector traces that part as a root in every
+/// collection, so writes to it skip the barrier.
+struct Live<'s, S: ?Sized>(&'s S);
+
+impl<S: ?Sized> Clone for Live<'_, S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<S: ?Sized> Copy for Live<'_, S> {}
+
+impl<'gc, S: ?Sized + Index<usize, Output = Lock<Value<'gc>>>> Live<'_, S> {
+    #[inline]
+    fn set(self, i: usize, value: Value<'gc>) {
+        // SAFETY: the slot is at or above `base`, in the part of the stack every collection
+        // traces as a root, so it needs no barrier.
+        unsafe { self.0[i].set_unbarriered(value) }
     }
 }

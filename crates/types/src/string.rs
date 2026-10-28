@@ -6,6 +6,7 @@ use ragwort_gc::{Gc, HostRef, Lock, Mutation, OutOfMemory, Plain, Trace, TypeTag
 pub use ragwort_string::*;
 
 pub use crate::Error;
+use crate::symbol::Sym;
 
 /// A flat string of characters up to U+00FF.
 #[derive(Trace, Plain)]
@@ -47,7 +48,7 @@ const COPY_EXTERNAL: usize = 64;
 /// A flat string, a [`Rope`] or an [`Extern`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(transparent)]
-pub struct Str<'gc>(Value<'gc>);
+pub struct Str<'gc>(pub(crate) Value<'gc>);
 
 impl<'gc> Str<'gc> {
     pub fn value(self) -> Value<'gc> {
@@ -55,15 +56,16 @@ impl<'gc> Str<'gc> {
     }
 }
 
-/// The arena as a [`Host`] for `ragwort-string`.
+/// The arena as a [`Host`] for `ragwort-string`, which also reads [`Symbol`](crate::symbol::Symbol)s.
 #[derive(Clone, Copy)]
 pub struct Strings<'a, 'gc> {
-    mc: &'a Mutation<'gc>,
+    pub(crate) mc: &'a Mutation<'gc>,
     one: TypeTag<'gc, Str8>,
     two: TypeTag<'gc, Str16>,
     four: TypeTag<'gc, Str32>,
     rope: TypeTag<'gc, Rope<'gc>>,
     external: TypeTag<'gc, Extern<'gc>>,
+    pub(crate) sym: TypeTag<'gc, Sym<'gc>>,
 }
 
 impl<'a, 'gc> Strings<'a, 'gc> {
@@ -75,6 +77,7 @@ impl<'a, 'gc> Strings<'a, 'gc> {
             four: mc.inline_type_tag()?,
             rope: mc.type_tag()?,
             external: mc.type_tag()?,
+            sym: mc.type_tag()?,
         })
     }
 

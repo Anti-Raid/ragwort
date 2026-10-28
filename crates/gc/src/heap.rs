@@ -1,15 +1,14 @@
 use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
-use std::mem::{self, needs_drop};
+use std::mem::{self, ManuallyDrop, needs_drop};
 use std::ptr::{self, NonNull};
-use std::slice;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::budget::Budget;
 use super::host::Hosts;
 use super::layout::{
-    self, CARD, CARDS, FORWARDED, GRANULE, Header, InlineVTable, LINE, LINES, MAX_PAGES, MAX_SMALL, PAGE, PAGE_SHIFT,
+    self, CARD, CARDS, FORWARDED, GRANULE, Header, InlineVTable, LINE, LINES, MAX_PAGES, MAX_SMALL, Object, PAGE, PAGE_SHIFT,
     OFFSET_MASK, REGION, STAMP_SHIFT, STAMPS, SizedVTable, VTable, WORDS,
 };
 use super::region::{self, Region};
@@ -398,6 +397,7 @@ impl Heap {
     /// every bit pattern is a valid `Header`.
     #[inline]
     fn header_at(&self, offset: u32) -> Header {
+        // SAFETY: as above, the read stays inside the reservation, and any bits are a header.
         unsafe { self.header_ptr(offset & OFFSET_MASK).read() }
     }
 
@@ -460,22 +460,20 @@ impl Heap {
     /// The items of the object at `offset`, if it's a `T`, for the collector.
     ///
     /// # Safety
-    /// Nothing else may reference the object's memory while the slice is in use.
+    /// Nothing else in the collection may reference the object's memory while the slice is in
+    /// use. The mutator can't: collections hold the heap mutably.
     #[allow(clippy::mut_from_ref)]
-    pub(crate) unsafe fn items_mut<T: Inline>(&self, offset: u32) -> Option<&mut [T::Item]> {
+    pub(crate) unsafe fn items_mut<T: Inline>(&self, offset: u32, _: &Collecting) -> Option<&mut [T::Item]> {
         let obj = self.object_at(offset)?;
         let (vtable, _) = self.size_of(obj)?;
         let id: fn() -> TypeId = layout::type_id::<T>;
         if !(ptr::fn_addr_eq(vtable.type_id, id) || (vtable.type_id)() == id()) {
             return None;
         }
-        // The vtable is `T`'s, and `size_of` checked that `len` items fit in the object.
-        unsafe {
-            let header = self.header_ptr(offset);
-            let len = ((*header).len as usize).min(layout::max_items::<T>());
-            let items = layout::inline_items::<T>(layout::value_ptr::<T>(header));
-            Some(slice::from_raw_parts_mut(items, len))
-        }
+        // SAFETY: the vtable is `T`'s, so the header starts a `T`, and `size_of` checked that its
+        // items fit in the object. The caller holds no other view of it, and the `Collecting`
+        // token means no step does.
+        unsafe { Some(&mut *Object::<T>::at(self.header_ptr(offset)).items()) }
     }
 
     /// The check bits for a reference to the object at `offset`.
@@ -1025,45 +1023,28 @@ impl Heap {
         }
     }
 
-    pub(crate) fn alloc<'gc, T: Trace + Plain<'gc>>(&self, value: T) -> Result<NonNull<T>, OutOfMemory> {
+    pub(crate) fn alloc<'gc, T: Trace + Plain<'gc>>(&self, value: T) -> Result<Made<T>, OutOfMemory> {
         const {
             let () = T::CHECK;
             assert!(!T::INLINE, "inline types must use alloc_inline");
             assert!(layout::fits::<T>(), "type is too large or too aligned for the arena");
             assert!(!needs_drop::<T>(), "arena objects can't need drop; hold host data through a HostRef");
         };
-        let vtable = &SizedVTable::<T>::VTABLE;
-        let ty = self.type_index(vtable)?;
-        let size = const { layout::sized_size::<T>() };
-        let offset = self.reserve(size)?;
-        unsafe {
-            let header = self.header_ptr(offset);
-            header.write(Header { ty, flags: self.stamp(), len: 0 });
-            let value_ptr = layout::value_ptr::<T>(header);
-            value_ptr.write(value);
-            self.color(offset, size, size, vtable.needs_trace);
-            Ok(NonNull::new_unchecked(value_ptr))
-        }
+        self.budget.count_allocation()?;
+        let object = self.build::<T>(&SizedVTable::<T>::VTABLE, const { layout::sized_size::<T>() }, 0)?;
+        Ok(object.finish(value))
     }
 
     pub(crate) fn alloc_inline<'gc, T: Inline + Plain<'gc>>(
         &self,
         head: T,
         len: usize,
-        mut fill: impl FnMut(usize) -> T::Item,
-    ) -> Result<NonNull<T>, OutOfMemory>
+        fill: impl FnMut(usize) -> T::Item,
+    ) -> Result<Made<T>, OutOfMemory>
     where
         T::Item: Plain<'gc>,
     {
-        // Each item is written once, and all `len` are kept.
-        unsafe {
-            self.alloc_items(head, len, |items| {
-                for i in 0..len {
-                    items.add(i).write(fill(i));
-                }
-                len
-            })
-        }
+        Ok(self.build_inline::<T>(len)?.init_items(fill, |_| None).finish(head))
     }
 
     /// Like `alloc_inline` with every item `item`, then `init` gets the items to fill in and
@@ -1074,34 +1055,15 @@ impl Heap {
         len: usize,
         item: T::Item,
         init: impl FnOnce(&mut [T::Item]) -> usize,
-    ) -> Result<NonNull<T>, OutOfMemory>
+    ) -> Result<Made<T>, OutOfMemory>
     where
         T::Item: Plain<'gc> + Copy,
     {
-        // The items are written before `init` sees them, and the object is new, so nothing
-        // else refers to them. A collection can't run until the step ends.
-        unsafe {
-            self.alloc_items(head, len, |items| {
-                for i in 0..len {
-                    items.add(i).write(item);
-                }
-                init(slice::from_raw_parts_mut(items, len))
-            })
-        }
+        Ok(self.build_inline::<T>(len)?.init_items(|_| item, |items| Some(init(items))).finish(head))
     }
 
-    /// Reserves an inline object, lets `fill` write its items and say how many to keep, and
-    /// only then colors it, so a panic in `fill` leaves nothing marked or queued and marking
-    /// covers just the kept items.
-    ///
-    /// # Safety
-    /// `fill` gets room for `len` items and must initialize the first `len` before returning.
-    unsafe fn alloc_items<'gc, T: Inline + Plain<'gc>>(
-        &self,
-        head: T,
-        len: usize,
-        fill: impl FnOnce(*mut T::Item) -> usize,
-    ) -> Result<NonNull<T>, OutOfMemory>
+    #[inline(always)]
+    fn build_inline<'gc, T: Inline + Plain<'gc>>(&self, len: usize) -> Result<Unfilled<'_, T>, OutOfMemory>
     where
         T::Item: Plain<'gc>,
     {
@@ -1112,27 +1074,27 @@ impl Heap {
             assert!(layout::fits_inline::<T>(), "type is too large or too aligned for the arena");
             assert!(!needs_drop::<T>() && !needs_drop::<T::Item>(), "arena objects can't need drop");
         };
+        self.budget.count_allocation()?;
         let size = layout::inline_size::<T>(len)
             .filter(|&size| size <= REGION - PAGE && len <= layout::max_items::<T>())
             .ok_or_else(|| self.budget.fail())?;
-        let vtable = &InlineVTable::<T>::VTABLE;
+        Ok(Unfilled(self.build::<T>(&InlineVTable::<T>::VTABLE, size, len)?))
+    }
+
+    /// Reserves `size` bytes for a `T` with `len` items and writes the header.
+    #[inline(always)]
+    fn build<T>(&self, vtable: &'static VTable, size: usize, len: usize) -> Result<Building<'_, T>, OutOfMemory> {
         let ty = self.type_index(vtable)?;
         let offset = self.reserve(size)?;
-        unsafe {
-            let header = self.header_ptr(offset);
+        let header = self.header_ptr(offset);
+        // SAFETY: `reserve` handed out `size` bytes at `offset`, room for the header, the value
+        // and the items, which nothing else refers to. With its header written, it's the object
+        // reserved for a `T` that `Object` asks for.
+        let object = unsafe {
             header.write(Header { ty, flags: self.stamp(), len: len as u32 });
-            let value = layout::value_ptr::<T>(header);
-            let guard = Release { heap: self, offset };
-            let kept = fill(layout::inline_items::<T>(value)).min(len);
-            mem::forget(guard);
-            value.write(head);
-            // A shorter length only shrinks the object. Its tail stays claimed until the next
-            // sweep, so pacing counts it, but marking doesn't keep it for another cycle.
-            (*header).len = kept as u32;
-            let kept_size = layout::inline_size::<T>(kept).unwrap_or(size);
-            self.color(offset, size, kept_size, vtable.needs_trace);
-            Ok(NonNull::new_unchecked(value))
-        }
+            Object::at(header)
+        };
+        Ok(Building { heap: self, offset, size, marked: size, len: len as u32, needs_trace: vtable.needs_trace, object })
     }
 
     /// Traces an object's contents, or only what overlaps `range` of it. Returns its size.
@@ -1154,7 +1116,10 @@ impl Heap {
     fn trace_with(&self, obj: Obj, vtable: &VTable, range: Option<(usize, usize)>, t: &mut Tracer<'_>) {
         let header = self.header_ptr(obj.offset);
         match range {
+            // SAFETY: as above, the header starts an object of the vtable's type, which
+            // nothing else references while it's traced.
             Some((from, to)) => unsafe { (vtable.trace_range)(header, from, to, t) },
+            // SAFETY: as for `trace_range`.
             None => unsafe { (vtable.trace)(header, t) },
         }
     }
@@ -1259,7 +1224,7 @@ impl Heap {
         }
     }
 
-    fn trace_roots<R: Trace>(&self, root: &mut R, mode: Mode) {
+    fn trace_roots<R: Trace>(&self, root: &mut R, mode: Mode, c: &Collecting) {
         let mut t = Tracer::new(self, mode);
         root.trace(&mut t);
         let mut roots = self.roots.borrow_mut();
@@ -1272,7 +1237,7 @@ impl Heap {
         }
         let mut stacks = self.stacks.borrow_mut();
         for stack in stacks.iter() {
-            stack.trace(self, &mut t);
+            stack.trace(self, &mut t, c);
         }
         // A dropped stack's frames were written without a barrier, so it's only let go after
         // this last trace.
@@ -1285,24 +1250,25 @@ impl Heap {
     }
 
     /// Marks everything reachable that isn't marked yet, and settles ephemerons.
-    fn mark_all<R: Trace>(&self, root: &mut R) -> usize {
-        self.trace_roots(root, Mode::Mark);
+    fn mark_all<R: Trace>(&self, root: &mut R, c: &Collecting) -> usize {
+        self.trace_roots(root, Mode::Mark, c);
         self.scan_cards(Mode::Mark);
         let work = 1 + (usize::MAX - self.drain(usize::MAX));
         self.settle_ephemerons();
         #[cfg(any(test, feature = "gc-verify"))]
-        self.verify(root);
+        self.verify(root, c);
         work
     }
 
     /// Collects young objects only. Survivors stay marked, which makes them old.
-    pub(crate) fn minor<R: Trace>(&self, root: &mut R) {
+    pub(crate) fn minor<R: Trace>(&mut self, root: &mut R) {
         if self.phase.get() != Phase::Idle || self.corrupted.get() {
             return;
         }
+        let c = &Collecting(());
         let guard = CorruptOnUnwind(self);
         self.reset_allocators();
-        self.mark_all(root);
+        self.mark_all(root, c);
         if self.corrupted.get() {
             return mem::forget(guard);
         }
@@ -1323,10 +1289,11 @@ impl Heap {
         drop(dropped);
     }
 
-    pub(crate) fn start<R: Trace>(&self, root: &mut R) {
+    pub(crate) fn start<R: Trace>(&mut self, root: &mut R) {
         if self.phase.get() != Phase::Idle || self.corrupted.get() {
             return;
         }
+        let c = &Collecting(());
         let guard = CorruptOnUnwind(self);
         self.phase.set(Phase::Marking);
         self.reset_allocators();
@@ -1339,7 +1306,7 @@ impl Heap {
         // traces everything from the roots.
         self.clear_cards();
         self.choose_candidates();
-        self.trace_roots(root, Mode::Mark);
+        self.trace_roots(root, Mode::Mark, c);
         mem::forget(guard);
     }
 
@@ -1367,7 +1334,8 @@ impl Heap {
     }
 
     /// Advances the current cycle by about `budget` bytes of work.
-    pub(crate) fn work<R: Trace>(&self, root: &mut R, budget: usize) {
+    pub(crate) fn work<R: Trace>(&mut self, root: &mut R, budget: usize) {
+        let c = &Collecting(());
         let mut left = budget;
         let mut dropped = Vec::new();
         let guard = CorruptOnUnwind(self);
@@ -1379,7 +1347,7 @@ impl Heap {
                     if self.corrupted.get() || left == 0 {
                         break;
                     }
-                    let (values, work) = self.atomic(root);
+                    let (values, work) = self.atomic(root, c);
                     dropped = values;
                     left = left.saturating_sub(work);
                     if left == 0 {
@@ -1406,16 +1374,16 @@ impl Heap {
         drop(dropped);
     }
 
-    fn atomic<R: Trace>(&self, root: &mut R) -> (Vec<Box<dyn Any>>, usize) {
-        let work = self.mark_all(root);
+    fn atomic<R: Trace>(&self, root: &mut R, c: &Collecting) -> (Vec<Box<dyn Any>>, usize) {
+        let work = self.mark_all(root, c);
         if self.corrupted.get() {
             return (Vec::new(), work);
         }
         self.clear_dead_ephemerons();
         if self.evacuating.get() {
-            self.evacuate(root);
+            self.evacuate(root, c);
             #[cfg(any(test, feature = "gc-verify"))]
-            self.verify(root);
+            self.verify(root, c);
             if self.corrupted.get() {
                 return (Vec::new(), work);
             }
@@ -1444,11 +1412,11 @@ impl Heap {
 
     /// Copies the marked objects off candidate pages while there's room, then rewrites every
     /// reference to them. Objects that don't fit stay where they are.
-    fn evacuate<R: Trace>(&self, root: &mut R) {
+    fn evacuate<R: Trace>(&self, root: &mut R, c: &Collecting) {
         self.each_candidate(|page| {
             each_bit(&self.page(page).live(), |g| self.move_object(granule_offset(page, g)));
         });
-        self.trace_roots(root, Mode::Fixup);
+        self.trace_roots(root, Mode::Fixup, c);
         self.scan_cards(Mode::Fixup);
         self.each_candidate(|page| {
             each_bit(&self.page(page).live(), |g| {
@@ -1482,7 +1450,8 @@ impl Heap {
 
     /// Wipes the header of an object that's gone, so stale references to it don't check out.
     fn clear_header(&self, offset: u32) {
-        // Only called for an object that was allocated, so the header is in a committed page.
+        // SAFETY: only called for an object that was allocated, so the header is in a committed
+        // page, and nothing borrows it.
         unsafe { self.header_ptr(offset).write(Header { ty: 0, flags: 0, len: 0 }) }
     }
 
@@ -1491,7 +1460,8 @@ impl Heap {
         let Some((_, size)) = self.size_of(obj) else { return self.corrupt() };
         let Ok(new) = self.budget.quiet(|| self.reserve(size)) else { return };
         let new_obj = self.object_at(new).expect("new object");
-        // Both are validated objects of `size` bytes, and nothing borrows arena memory.
+        // SAFETY: both are validated objects of `size` bytes, distinct since `new` was just
+        // reserved, and nothing borrows arena memory during a collection.
         unsafe {
             ptr::copy_nonoverlapping(self.header_ptr(offset).cast::<u8>(), self.header_ptr(new).cast::<u8>(), size);
             let old = self.header_ptr(offset);
@@ -1541,7 +1511,7 @@ impl Heap {
     }
 
     #[cfg(any(test, feature = "gc-verify"))]
-    fn verify<R: Trace>(&self, root: &mut R) {
+    fn verify<R: Trace>(&self, root: &mut R, c: &Collecting) {
         if self.corrupted.get() {
             return;
         }
@@ -1552,7 +1522,7 @@ impl Heap {
             entry.trace(&mut Tracer::verifying(self, &mut v));
         }
         for stack in self.stacks.borrow().iter() {
-            stack.trace(self, &mut Tracer::verifying(self, &mut v));
+            stack.trace(self, &mut Tracer::verifying(self, &mut v), c);
         }
         while let Some(offset) = v.work.pop() {
             if self.corrupted.get() {
@@ -1735,11 +1705,13 @@ impl Heap {
 /// All-zero bytes must be a valid value of the type.
 unsafe trait Zeroed {}
 
-// `Kind` is `repr(u32)` with `Free` = 0, and the rest of a page is cells of integers.
+// SAFETY: `Kind` is `repr(u32)` with `Free` = 0, and the rest of a page is cells of integers.
 unsafe impl Zeroed for [Page; MAX_PAGES] {}
+// SAFETY: zero is `None`, since a reference is never null.
 unsafe impl Zeroed for [Cell<Option<&'static VTable>>; TYPES] {}
 
 fn zeroed<T: Zeroed>() -> Box<T> {
+    // SAFETY: `Zeroed` promises all-zero bytes are a valid `T`.
     unsafe { Box::new_zeroed().assume_init() }
 }
 
@@ -1752,13 +1724,79 @@ impl Drop for CorruptOnUnwind<'_> {
     }
 }
 
-/// Gives a reserved object back if filling it panics.
-struct Release<'a> {
-    heap: &'a Heap,
-    offset: u32,
+/// Proof that a collection is running, which only the heap's collection entry points make.
+/// They take the heap mutably, so no step is running and nothing borrows arena memory.
+pub(crate) struct Collecting(());
+
+/// The value of an object the heap just made, which only it can hand out.
+pub(crate) struct Made<T>(NonNull<T>);
+
+impl<T> Made<T> {
+    pub(crate) fn get(self) -> NonNull<T> {
+        self.0
+    }
 }
 
-impl Drop for Release<'_> {
+/// An object being made: reserved, with its header written, but not yet colored, so the
+/// collector doesn't know of it. Dropped unfinished, as when a fill panics, it's released.
+struct Building<'h, T> {
+    heap: &'h Heap,
+    offset: u32,
+    size: usize,
+    /// How much of `size` the items kept take, and how many those are.
+    marked: usize,
+    len: u32,
+    needs_trace: bool,
+    object: Object<T>,
+}
+
+/// A [`Building`] of an inline object whose items aren't written yet, which it must be
+/// before it can be finished.
+struct Unfilled<'h, T>(Building<'h, T>);
+
+impl<T> Building<'_, T> {
+    /// Writes the value and colors the object, which is then the collector's.
+    #[inline(always)]
+    fn finish(self, value: T) -> Made<T> {
+        let this = ManuallyDrop::new(self);
+        let ptr = this.object.value();
+        // SAFETY: there's room for the value after the header, and nothing else refers to
+        // either until the object is colored below.
+        unsafe {
+            (*this.object.header()).len = this.len;
+            ptr.write(value);
+        }
+        this.heap.color(this.offset, this.size, this.marked, this.needs_trace);
+        Made(NonNull::new(ptr).expect("in the region"))
+    }
+}
+
+impl<'h, T: Inline> Unfilled<'h, T> {
+    /// Writes every item from `fill`, then lends them to `keep`, which may say to keep fewer.
+    /// The rest of the reservation stays claimed until the next sweep, so pacing counts it,
+    /// but marking doesn't keep it for another cycle.
+    #[inline(always)]
+    fn init_items(self, mut fill: impl FnMut(usize) -> T::Item, keep: impl FnOnce(&mut [T::Item]) -> Option<usize>) -> Building<'h, T> {
+        let mut object = self.0;
+        let items = object.object.items();
+        // SAFETY: the header's length of items fit in what was reserved, and only this refers
+        // to them. Each is written before the slice is made.
+        let items = unsafe {
+            let first = items.cast::<T::Item>();
+            for i in 0..items.len() {
+                first.add(i).write(fill(i));
+            }
+            &mut *items
+        };
+        if let Some(kept) = keep(items).filter(|&kept| kept < object.len as usize) {
+            object.len = kept as u32;
+            object.marked = layout::inline_size::<T>(kept).unwrap_or(object.size);
+        }
+        object
+    }
+}
+
+impl<T> Drop for Building<'_, T> {
     fn drop(&mut self) {
         self.heap.release(self.offset);
     }

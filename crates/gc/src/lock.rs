@@ -131,6 +131,7 @@ impl<T: Copy + fmt::Debug> fmt::Debug for Lock<T> {
     }
 }
 
+// SAFETY: traces what it holds, and claims to need tracing exactly when that does.
 unsafe impl<T: Trace + Copy> Trace for Lock<T> {
     const NEEDS_TRACE: bool = T::NEEDS_TRACE;
 
@@ -140,6 +141,7 @@ unsafe impl<T: Trace + Copy> Trace for Lock<T> {
     }
 }
 
+// SAFETY: a transparent `Cell<T>`, so it has `T`'s layout, padding and valid bit patterns.
 unsafe impl<'gc, T: Plain<'gc>> Plain<'gc> for Lock<T> {
     const CHECK: () = T::CHECK;
 }
@@ -175,6 +177,8 @@ impl<T: fmt::Debug> fmt::Debug for RefLock<T> {
     }
 }
 
+// SAFETY: traces what it holds. It isn't `Plain`, so it's never in arena memory, where
+// writes would need a barrier.
 unsafe impl<T: Trace> Trace for RefLock<T> {
     const NEEDS_TRACE: bool = T::NEEDS_TRACE;
 

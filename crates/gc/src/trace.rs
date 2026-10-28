@@ -56,13 +56,17 @@ pub unsafe trait Plain<'gc> {
 }
 
 macro_rules! plain {
+    // SAFETY: integers and floats have no padding, and every bit pattern is a valid value.
     ($($t:ty),* $(,)?) => {$(unsafe impl<'gc> Plain<'gc> for $t {})*};
 }
 
 plain!((), u8, u16, u32, u64, usize, i8, i16, i32, i64, isize, f32, f64);
 
+// SAFETY: it has no bytes, and holds no handle.
 unsafe impl<T: ?Sized> Plain<'_> for PhantomData<T> {}
 
+// SAFETY: elements follow each other with no padding between them, so an array has what its
+// element has.
 unsafe impl<'gc, T: Plain<'gc>, const N: usize> Plain<'gc> for [T; N] {
     const CHECK: () = T::CHECK;
 }
@@ -241,6 +245,7 @@ impl<'a> Tracer<'a> {
 
 macro_rules! leaf {
     ($($t:ty),* $(,)?) => {$(
+        // SAFETY: it holds no references, and says so.
         unsafe impl Trace for $t {
             const NEEDS_TRACE: bool = false;
 
@@ -252,18 +257,22 @@ macro_rules! leaf {
 
 leaf!((), bool, char, u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f64, String);
 
+// SAFETY: it holds no references, and says so.
 unsafe impl Trace for str {
     const NEEDS_TRACE: bool = false;
 
     fn trace(&mut self, _: &mut Tracer<'_>) {}
 }
 
+// SAFETY: it holds nothing, and says so.
 unsafe impl<T: ?Sized> Trace for PhantomData<T> {
     const NEEDS_TRACE: bool = false;
 
     fn trace(&mut self, _: &mut Tracer<'_>) {}
 }
 
+// SAFETY: traces what it holds, and needs tracing exactly when that does. The same goes for
+// the containers below.
 unsafe impl<T: Trace> Trace for Option<T> {
     const NEEDS_TRACE: bool = T::NEEDS_TRACE;
 
@@ -279,6 +288,7 @@ unsafe impl<T: Trace> Trace for Option<T> {
     }
 }
 
+// SAFETY: as for `Option`.
 unsafe impl<T: Trace, const N: usize> Trace for [T; N] {
     const NEEDS_TRACE: bool = T::NEEDS_TRACE;
 
@@ -293,6 +303,7 @@ unsafe impl<T: Trace, const N: usize> Trace for [T; N] {
 
 macro_rules! tuple {
     ($($name:ident),+) => {
+        // SAFETY: as for `Option`.
         unsafe impl<$($name: Trace),+> Trace for ($($name,)+) {
             const NEEDS_TRACE: bool = false $(|| $name::NEEDS_TRACE)+;
 
@@ -313,6 +324,7 @@ tuple!(A, B, C, D);
 // Containers for the root and other host-side state. None of them is `Plain`, so none of
 // them can end up in the arena, where writes would need a barrier.
 
+// SAFETY: as for `Option`.
 unsafe impl<T: Trace> Trace for [T] {
     const NEEDS_TRACE: bool = T::NEEDS_TRACE;
 
@@ -325,6 +337,7 @@ unsafe impl<T: Trace> Trace for [T] {
     }
 }
 
+// SAFETY: as for `Option`.
 unsafe impl<T: Trace + ?Sized> Trace for Box<T> {
     const NEEDS_TRACE: bool = T::NEEDS_TRACE;
 
@@ -333,6 +346,7 @@ unsafe impl<T: Trace + ?Sized> Trace for Box<T> {
     }
 }
 
+// SAFETY: as for `Option`.
 unsafe impl<T: Trace> Trace for Vec<T> {
     const NEEDS_TRACE: bool = T::NEEDS_TRACE;
 
@@ -341,6 +355,7 @@ unsafe impl<T: Trace> Trace for Vec<T> {
     }
 }
 
+// SAFETY: as for `Option`.
 unsafe impl<T: Trace> Trace for VecDeque<T> {
     const NEEDS_TRACE: bool = T::NEEDS_TRACE;
 
@@ -353,6 +368,7 @@ unsafe impl<T: Trace> Trace for VecDeque<T> {
     }
 }
 
+// SAFETY: as for `Option`.
 unsafe impl<T: Trace + Copy> Trace for Cell<T> {
     const NEEDS_TRACE: bool = T::NEEDS_TRACE;
 
@@ -361,7 +377,8 @@ unsafe impl<T: Trace + Copy> Trace for Cell<T> {
     }
 }
 
-// Collections only run between steps, when nothing can hold a borrow.
+// SAFETY: as for `Option`. Collections only run between steps, when nothing can hold a
+// borrow, so `get_mut` reaches the value.
 unsafe impl<T: Trace + ?Sized> Trace for RefCell<T> {
     const NEEDS_TRACE: bool = T::NEEDS_TRACE;
 
@@ -373,6 +390,8 @@ unsafe impl<T: Trace + ?Sized> Trace for RefCell<T> {
 // Keys can't hold references: rewriting a key after its object moved would break the map.
 macro_rules! map {
     ($($map:ident<$($extra:ident),*>),*) => {$(
+        // SAFETY: traces every value, and refuses keys that hold references, which it can't
+        // rewrite.
         unsafe impl<K: Trace, V: Trace $(, $extra)*> Trace for $map<K, V $(, $extra)*> {
             const NEEDS_TRACE: bool = V::NEEDS_TRACE;
 
@@ -392,6 +411,7 @@ map!(HashMap<S>, BTreeMap<>);
 
 macro_rules! set {
     ($($set:ident<$($extra:ident),*>),*) => {$(
+        // SAFETY: refuses elements that hold references, so there's nothing to trace.
         unsafe impl<T: Trace $(, $extra)*> Trace for $set<T $(, $extra)*> {
             const NEEDS_TRACE: bool = false;
 

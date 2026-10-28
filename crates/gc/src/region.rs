@@ -47,6 +47,7 @@ impl Backing {
 
     #[cfg(unix)]
     fn os_page() -> Option<usize> {
+        // SAFETY: `sysconf` only reads a system setting.
         let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         usize::try_from(size).ok().filter(|s| s.is_power_of_two())
     }
@@ -58,7 +59,7 @@ impl Backing {
 
     fn decommit(&self, offset: usize, len: usize) {
         #[cfg(unix)]
-        // Nothing lives in the range, and nothing relies on what reads back from it.
+        // SAFETY: nothing lives in the range, and nothing relies on what reads back from it.
         unsafe {
             let _ = self.0.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, offset, len);
         }
@@ -78,6 +79,7 @@ impl Backing {
     };
 
     fn new() -> Option<(Self, NonNull<u8>)> {
+        // SAFETY: the layout has a nonzero size.
         let base = NonNull::new(unsafe { std::alloc::alloc_zeroed(Self::LAYOUT) })?;
         Some((Self(base), base))
     }
@@ -93,6 +95,7 @@ impl Backing {
 #[cfg(not(all(feature = "mmap", not(miri))))]
 impl Drop for Backing {
     fn drop(&mut self) {
+        // SAFETY: `new` allocated it with this layout, and this is the only free.
         unsafe { std::alloc::dealloc(self.0.as_ptr(), Self::LAYOUT) }
     }
 }

@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 
-use super::heap::Heap;
+use super::heap::{Heap, Made};
 use super::{Gc, Inline, Invariant, Member, OutOfMemory, Plain, Trace};
 
 const STEP_MUL: usize = 2;
@@ -33,6 +33,8 @@ pub struct Metrics {
     pub used: usize,
     pub peak: usize,
     pub limit: usize,
+    /// The last bytes under `limit` kept for steps to finish in. See [`Arena::set_reserve`].
+    pub reserve: usize,
     /// Bytes in lines and page runs the allocator can't hand out: live objects, garbage not
     /// yet swept, and the rest of the run being allocated into.
     pub live: usize,
@@ -62,52 +64,57 @@ impl<R: Rootable> Arena<R> {
     ) -> Result<Self, OutOfMemory> {
         let heap = Box::new(Heap::new(limit).ok_or(OutOfMemory)?);
         let root = ManuallyDrop::new(init(&Mutation::new(&heap))?);
+        // SAFETY: `Root<'gc>` differs from `Root<'static>` only in a brand, which changes
+        // neither layout nor validity. The root is read once out of the `ManuallyDrop`, so it
+        // isn't dropped twice, and stored beside the heap its handles refer to.
         let root = unsafe { (&raw const *root).cast::<R::Root<'static>>().read() };
         Ok(Self { root, heap })
     }
 
     pub fn mutate<T>(&mut self, f: impl for<'gc> FnOnce(&Mutation<'gc>, &R::Root<'gc>) -> T) -> T {
+        // SAFETY: only the brand changes. `f` is generic over `'gc`, so the root's handles can
+        // only meet the `Mutation` of this heap, and neither outlives the call.
         let root = unsafe { &*(&raw const self.root).cast::<R::Root<'_>>() };
         f(&Mutation::new(&self.heap), root)
     }
 
     pub fn mutate_root<T>(&mut self, f: impl for<'gc> FnOnce(&Mutation<'gc>, &mut R::Root<'gc>) -> T) -> T {
+        // SAFETY: as in `mutate`. The root is borrowed mutably through `&mut self`, so nothing
+        // else reads it meanwhile.
         let root = unsafe { &mut *(&raw mut self.root).cast::<R::Root<'_>>() };
         f(&Mutation::new(&self.heap), root)
     }
 
-    /// Runs `f`, then a slice of collection work. If any allocation failed, the result is
-    /// discarded, a full collection runs, and `f` runs once more, so `f` must not change
-    /// existing objects before an allocation that can fail.
-    pub fn step<T, E>(
-        &mut self,
-        mut f: impl for<'gc> FnMut(&Mutation<'gc>, &R::Root<'gc>) -> Result<T, E>,
-    ) -> Result<T, StepError<E>> {
-        let mut retried = false;
-        loop {
-            if self.heap.corrupted() {
-                return Err(StepError::Corrupted);
-            }
-            self.heap.budget.clear_failed();
-            let result = self.mutate(|mc, root| f(mc, root));
-            if !self.heap.budget.failed() {
-                self.pace();
-                if self.heap.corrupted() {
-                    return Err(StepError::Corrupted);
-                }
-                return result.map_err(StepError::Failed);
-            }
-            drop(result);
-            if retried {
-                return Err(StepError::OutOfMemory);
-            }
-            self.collect();
-            retried = true;
+    /// Runs `f` once, then a slice of collection work, or a full collection if `f` drew on
+    /// the reserve (see [`Mutation::collection_due`]). If an allocation failed, even one `f`
+    /// went on without, the result is dropped, a full collection runs, and the step fails
+    /// with [`StepError::OutOfMemory`]. Whatever `f` did before the failure stays done, so
+    /// the caller picks up from there: an interpreter runs the failed instruction again, which
+    /// is safe if the instruction changes nothing before its allocations succeed.
+    pub fn step<T, E>(&mut self, f: impl for<'gc> FnOnce(&Mutation<'gc>, &R::Root<'gc>) -> Result<T, E>) -> Result<T, StepError<E>> {
+        if self.heap.corrupted() {
+            return Err(StepError::Corrupted);
         }
+        self.heap.budget.clear_failed();
+        let result = self.mutate(f);
+        if self.heap.budget.failed() {
+            drop(result);
+            self.collect();
+            return Err(if self.heap.corrupted() { StepError::Corrupted } else { StepError::OutOfMemory });
+        }
+        if self.heap.budget.collection_due() {
+            self.collect();
+        } else {
+            self.pace();
+        }
+        if self.heap.corrupted() {
+            return Err(StepError::Corrupted);
+        }
+        result.map_err(StepError::Failed)
     }
 
     fn pace(&mut self) {
-        let heap = &*self.heap;
+        let heap = &mut *self.heap;
         let root = &mut self.root;
         let allocated = heap.take_allocated();
         if let Some(work) = heap.stress.get() {
@@ -130,12 +137,21 @@ impl<R: Rootable> Arena<R> {
         }
     }
 
+    /// Keeps the last `bytes` under the limit for a step to finish in once the rest is used,
+    /// so a heap full of garbage doesn't fail the step. Optional allocations, such as a
+    /// vector growing by more than it needs, don't draw on it. It starts at a sixteenth of
+    /// the limit.
+    pub fn set_reserve(&mut self, bytes: usize) {
+        self.heap.budget.set_reserve(bytes);
+    }
+
     /// Finishes any cycle in progress, then runs a full one.
     pub fn collect(&mut self) {
         self.finish();
         self.heap.start(&mut self.root);
         self.finish();
         self.heap.clear_allocated();
+        self.heap.budget.clear_due();
     }
 
     /// Collects young objects only, if no major cycle is running.
@@ -167,6 +183,7 @@ impl<R: Rootable> Arena<R> {
             used: heap.budget.used(),
             peak: heap.budget.peak(),
             limit: heap.budget.limit(),
+            reserve: heap.budget.reserve(),
             live: heap.live(),
             objects: heap.objects(),
             pages: heap.committed(),
@@ -177,6 +194,13 @@ impl<R: Rootable> Arena<R> {
             phase: heap.phase(),
             corrupted: heap.corrupted(),
         }
+    }
+
+    /// Testing: lets `allocations` more allocations through, then fails the next one, once.
+    /// Objects, inline objects, host values and roots all count.
+    #[doc(hidden)]
+    pub fn fail_after(&mut self, allocations: Option<u64>) {
+        self.heap.budget.fail_after(allocations);
     }
 
     /// Testing: compact every page in each major cycle.
@@ -203,8 +227,7 @@ impl<'gc> Mutation<'gc> {
     }
 
     pub fn alloc<T: Trace + Plain<'gc> + 'gc>(&self, value: T) -> Result<Gc<'gc, T>, OutOfMemory> {
-        let ptr = self.heap.alloc(value)?;
-        Ok(unsafe { Gc::from_raw(ptr) })
+        self.heap.alloc(value).map(|ptr| self.made(ptr))
     }
 
     pub fn alloc_inline<T: Inline + Plain<'gc> + 'gc>(
@@ -216,8 +239,7 @@ impl<'gc> Mutation<'gc> {
     where
         T::Item: Plain<'gc>,
     {
-        let ptr = self.heap.alloc_inline(head, len, fill)?;
-        Ok(unsafe { Gc::from_raw(ptr) })
+        self.heap.alloc_inline(head, len, fill).map(|ptr| self.made(ptr))
     }
 
     pub fn alloc_inline_from<T: Inline + Plain<'gc> + 'gc>(&self, head: T, items: &[T::Item]) -> Result<Gc<'gc, T>, OutOfMemory>
@@ -239,14 +261,25 @@ impl<'gc> Mutation<'gc> {
     where
         T::Item: Plain<'gc> + Copy,
     {
-        let ptr = self.heap.alloc_inline_with(head, len, item, init)?;
-        Ok(unsafe { Gc::from_raw(ptr) })
+        self.heap.alloc_inline_with(head, len, item, init).map(|ptr| self.made(ptr))
+    }
+
+    fn made<T: Plain<'gc>>(&self, new: Made<T>) -> Gc<'gc, T> {
+        // SAFETY: only the heap's builder makes a `Made`, for the value of an object it just
+        // finished in this arena's region.
+        unsafe { Gc::from_raw(new.get()) }
     }
 
     /// Has `object` traced again before the next collection finishes. Call it in the same
     /// step as any `Lock::set_unbarriered` on the object's fields, after the last such write.
     pub fn retrace<T>(&self, object: Gc<'gc, T>) {
         self.heap.retrace(Member::new(self, object).to_bits().get());
+    }
+
+    /// Whether an allocation has drawn on the reserve, so a full collection is due. An
+    /// interpreter checks it between instructions and ends the step, which collects.
+    pub fn collection_due(&self) -> bool {
+        self.heap.budget.collection_due()
     }
 
     pub fn ensure(&self, bytes: usize) -> Result<(), OutOfMemory> {

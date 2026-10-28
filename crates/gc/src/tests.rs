@@ -313,23 +313,111 @@ fn budget_never_exceeds_limit() {
     assert!(arena.metrics().peak <= limit);
 }
 
+/// A failed step isn't run again. What it did before the failure stays, and the collection
+/// it ran lets the caller pick up from there.
 #[test]
-fn step_retries_after_collecting_garbage() {
+fn a_failed_step_runs_once_then_collects() {
     let mut arena = node_arena(64 * 1024);
-    arena.mutate(|mc, _| while node(mc, 0, None).is_ok() {});
-    assert_eq!(arena.metrics().pages, 3);
-
     let mut attempts = 0;
     let result = arena.step(|mc, root| {
         attempts += 1;
-        let n = node(mc, 5, None)?;
+        let first = node(mc, 4, None).unwrap();
+        root.store(mc, Some(first));
+        while node(mc, 0, None).is_ok() {}
+        node(mc, 5, None).map(|_| ())
+    });
+    assert!(matches!(result, Err(StepError::OutOfMemory)));
+    assert_eq!(attempts, 1);
+    assert_eq!(arena.metrics().objects, 1, "the collection kept only the stored node");
+    arena.mutate(|mc, root| assert_eq!(root.load(mc).unwrap().value, 4));
+
+    let result = arena.step(|mc, root| {
+        let n = node(mc, 5, root.load(mc))?;
         root.store(mc, Some(n));
         Ok::<_, OutOfMemory>(())
     });
     assert!(result.is_ok());
-    assert_eq!(attempts, 2);
-    assert_eq!(arena.metrics().objects, 1);
     arena.mutate(|mc, root| assert_eq!(root.load(mc).unwrap().value, 5));
+}
+
+/// A step that runs into the reserve finishes, and a full collection follows it.
+#[test]
+fn the_reserve_lets_a_step_finish() {
+    let mut arena = node_arena(256 * 1024);
+    assert_eq!(arena.metrics().reserve, 16 * 1024);
+    let mut drew = None;
+    let result = arena.step(|mc, root| {
+        while !mc.collection_due() {
+            node(mc, 0, None)?;
+        }
+        drew = Some(mc.used());
+        let kept = node(mc, 9, None)?;
+        root.store(mc, Some(kept));
+        Ok::<_, OutOfMemory>(())
+    });
+    assert!(result.is_ok());
+    let drew = drew.unwrap();
+    assert!(drew > 256 * 1024 - 16 * 1024 && drew <= 256 * 1024, "{drew}");
+    let m = arena.metrics();
+    assert_eq!((m.collections, m.objects), (1, 1));
+    arena.mutate(|mc, root| {
+        assert!(!mc.collection_due());
+        assert_eq!(root.load(mc).unwrap().value, 9);
+    });
+    // Without a reserve, the same work fails at the limit instead.
+    arena.set_reserve(0);
+    let result = arena.step(|mc, _| -> Result<(), OutOfMemory> {
+        loop {
+            node(mc, 0, None)?;
+            assert!(!mc.collection_due());
+        }
+    });
+    assert!(matches!(result, Err(StepError::OutOfMemory)));
+}
+
+/// Growth a vector can do without stays out of the reserve, so it grows by what it needs.
+#[test]
+fn optional_growth_leaves_the_reserve_alone() {
+    let mut arena = Arena::<U64VecRoot>::new(256 * 1024, |_| Ok(GcVec::new())).unwrap();
+    arena.set_reserve(128 * 1024);
+    let capacity = arena.mutate(|mc, v| {
+        while !mc.collection_due() {
+            v.push(mc, 0).unwrap();
+        }
+        assert!(mc.used() <= 256 * 1024);
+        v.capacity(mc)
+    });
+    assert_eq!(arena.mutate(|mc, v| v.len(mc)), capacity, "the growth that drew on the reserve was exact");
+}
+
+/// The chosen allocation fails, of any kind, and only that one, so a test can fail each
+/// allocation of some work in turn.
+#[test]
+fn injected_failures_hit_one_allocation() {
+    let mut arena = unit_arena(1 << 20);
+    for k in 0..4 {
+        arena.fail_after(Some(k));
+        let mut done = 0;
+        let result = arena.step(|mc, _| {
+            node(mc, 0, None)?;
+            done += 1;
+            mc.alloc_inline(Bytes { tag: 0 }, 8, |_| 0)?;
+            done += 1;
+            mc.host(7u64)?;
+            done += 1;
+            let root = mc.root::<NodeK>(Member::new(mc, node(mc, 1, None)?))?;
+            done += 1;
+            Ok::<_, OutOfMemory>(root)
+        });
+        assert!(matches!(result, Err(StepError::OutOfMemory)), "failing allocation {k}");
+        assert_eq!(done, k.min(3));
+        assert!(arena.step(|mc, _| node(mc, 0, None).map(|_| ())).is_ok(), "only one fails");
+    }
+    arena.fail_after(Some(5));
+    let roots = arena.step(|mc, _| (0..4).map(|i| mc.root::<NodeK>(Member::new(mc, node(mc, i, None)?))).collect::<Result<Vec<_>, _>>());
+    assert!(matches!(roots, Err(StepError::OutOfMemory)), "each root takes two");
+    arena.fail_after(None);
+    assert!(arena.step(|mc, _| (0..100).try_for_each(|_| node(mc, 0, None).map(|_| ()))).is_ok());
 }
 
 #[test]
@@ -651,6 +739,8 @@ fn verifier_catches_a_missing_barrier() {
     black_and_white(&mut arena);
     arena.mutate(|mc, root| {
         let tail = move_tail(mc, root);
+        // SAFETY: not upheld on purpose: the missing retrace is what the verifier must catch,
+        // and it panics before anything reads the stale reference.
         unsafe { root.1.load(mc).unwrap().next.set_unbarriered(Some(Member::new(mc, tail))) };
     });
     arena.collect();
@@ -663,6 +753,7 @@ fn retrace_covers_unbarriered_stores() {
     arena.mutate(|mc, root| {
         let tail = move_tail(mc, root);
         let black = root.1.load(mc).unwrap();
+        // SAFETY: the object is retraced below, in the same step.
         unsafe { black.next.set_unbarriered(Some(Member::new(mc, tail))) };
         mc.retrace(black);
         mc.retrace(black);
@@ -808,6 +899,8 @@ fn stress_random_graph_mutation() {
 }
 
 fn corrupt_u32(arena: &Arena<impl Rootable>, offset: usize, value: u32) {
+    // SAFETY: the offset is inside an allocated object, and no step is running, so nothing
+    // borrows it. The heap must cope with whatever the bits say.
     unsafe { arena.heap().base.as_ptr().add(offset).cast::<u32>().write_unaligned(value) }
 }
 
@@ -818,6 +911,8 @@ fn bad_offsets_are_detected() {
         arena.mutate(|mc, root| {
             let n = node(mc, 1, None).unwrap();
             root.store(mc, Some(n));
+            // SAFETY: not upheld on purpose: the bits are made up, and the collector must
+            // reject them without reading past the reservation.
             unsafe { n.next.set_unbarriered(Some(Member::from_bits(NonZeroU32::new(bits).unwrap()))) };
         });
         arena.collect();
@@ -830,12 +925,15 @@ fn bad_offsets_are_detected() {
 fn bad_headers_are_detected() {
     let mut arena = slots_arena(1 << 20, 2);
     let off = arena.mutate(|mc, root| offset(mc, root.load(mc).unwrap()));
+    // SAFETY: the header is an allocated object's, and no step is running. The bad length is
+    // what the collector must catch.
     unsafe { (*arena.heap().header_of(off as u32)).len = 1 << 20 };
     arena.collect();
     assert!(arena.metrics().corrupted);
 
     let mut arena = slots_arena(1 << 20, 2);
     let off = arena.mutate(|mc, root| offset(mc, root.load(mc).unwrap()));
+    // SAFETY: as above, with a bad type.
     unsafe { (*arena.heap().header_of(off as u32)).ty = 999 };
     arena.collect();
     assert!(arena.metrics().corrupted);
@@ -845,6 +943,7 @@ fn bad_headers_are_detected() {
 fn corrupted_items_stay_inside_the_reservation() {
     let mut arena = slots_arena(1 << 20, 2);
     let off = arena.mutate(|mc, root| offset(mc, root.load(mc).unwrap()));
+    // SAFETY: as above. The items must stay inside the reservation whatever the length says.
     unsafe { (*arena.heap().header_of(off as u32)).len = u32::MAX };
     arena.mutate(|mc, root| {
         let slots = root.load(mc).unwrap();
@@ -852,6 +951,8 @@ fn corrupted_items_stay_inside_the_reservation() {
         let start = slots.items().as_ptr().addr();
         assert!(start >= base && start + slots.len() * 4 <= base + RESERVE);
 
+        // SAFETY: not upheld on purpose: the bits are made up, and the read must stay inside
+        // the reservation, where any bits are a valid `Node`.
         let wild = unsafe { Member::<Node<'_>>::from_bits(NonZeroU32::new(u32::MAX).unwrap()) }.get(mc);
         let addr = Gc::as_ptr(wild).addr();
         assert!(addr >= base && addr + size_of::<Node<'_>>() <= base + RESERVE);
@@ -913,6 +1014,8 @@ static TRACE_PANICS: AtomicBool = AtomicBool::new(false);
 
 struct Bomb;
 
+// SAFETY: it holds nothing. Panicking breaks the "should not panic" rule on purpose, which
+// marks the arena corrupted.
 unsafe impl Trace for Bomb {
     fn trace(&mut self, _: &mut Tracer<'_>) {
         if TRACE_PANICS.load(Ordering::Relaxed) {
@@ -921,6 +1024,7 @@ unsafe impl Trace for Bomb {
     }
 }
 
+// SAFETY: it has no bytes.
 unsafe impl Plain<'_> for Bomb {}
 
 struct BombRoot;
@@ -953,6 +1057,7 @@ fn retrace_works_in_every_cycle() {
         arena.mutate(|mc, root| {
             let moved = move_tail(mc, root);
             let black = root.1.load(mc).unwrap();
+            // SAFETY: the object is retraced below, in the same step.
             unsafe { black.next.set_unbarriered(Some(Member::new(mc, moved))) };
             mc.retrace(black);
         });
@@ -984,6 +1089,7 @@ fn many_types_keep_their_own_vtables() {
         }
         for (off, size, n) in out {
             assert_eq!(mc.heap.vtable_size(off), Some(size), "Blob<{n}>");
+            // SAFETY: the object holds a `u64` right after its header, and nothing writes it.
             let first = unsafe { mc.base.as_ptr().add(off as usize + HEADER).cast::<u64>().read() };
             assert_eq!(first, n as u64);
         }
@@ -1446,6 +1552,7 @@ fn corrupted_gcvec_len_is_bounded() {
 }
 
 fn corrupt_u32_mc(mc: &Mutation<'_>, offset: usize, value: u32) {
+    // SAFETY: as in `corrupt_u32`; callers hold no borrow of the object while it runs.
     unsafe { mc.base.as_ptr().add(offset).cast::<u32>().write_unaligned(value) }
 }
 
@@ -1488,15 +1595,20 @@ fn gcvec_growth_never_fails_when_the_needed_size_fits() {
     let mut capacities = Vec::new();
     for spare in (33_000..54_000).step_by(if cfg!(miri) { 700 } else { 100 }) {
         let mut arena = Arena::<U64VecRoot>::new(used + spare, |_| Ok(GcVec::new())).unwrap();
+        arena.set_reserve(0);
         fill(&mut arena);
+        // With too little spare even the needed size doesn't fit until a collection, so the
+        // push is run again. Once it fits, the bigger allocation tried first must never fail
+        // the step.
         let mut runs = 0;
-        let result = arena.step(|mc, v| {
+        let capacity = loop {
             runs += 1;
-            v.push(mc, 2048).map(|_| v.capacity(mc))
-        });
-        // With too little spare even the needed size doesn't fit, so the step retries. Once
-        // it fits, the bigger allocation tried first must never cause a retry.
-        let capacity = result.unwrap();
+            match arena.step(|mc, v| v.push(mc, 2048).map(|_| v.capacity(mc))) {
+                Ok(capacity) => break capacity,
+                Err(StepError::OutOfMemory) if runs == 1 => {}
+                Err(e) => panic!("{e:?}"),
+            }
+        };
         if runs == 1 || !capacities.is_empty() {
             assert_eq!(runs, 1, "a fallback allocation made the step retry ({spare} bytes spare)");
             capacities.push(capacity);
@@ -1529,6 +1641,8 @@ fn retrace_ignores_interior_offsets() {
     arena.mutate(|mc, root| {
         let black = root.1.load(mc).unwrap();
         let bits = Member::new(mc, black).to_bits().get() + 8;
+        // SAFETY: not upheld on purpose: the bits point inside an object, and `retrace` must
+        // reject them.
         let interior = unsafe { Member::<Node<'_>>::from_bits(NonZeroU32::new(bits).unwrap()) }.get(mc);
         mc.retrace(interior);
         assert_eq!(black.value, 1);
@@ -1747,6 +1861,7 @@ fn verifier_catches_a_missing_card() {
     arena.collect();
     arena.mutate(|mc, root| {
         let young = node(mc, 2, None).unwrap();
+        // SAFETY: not upheld on purpose: the missing card is what the verifier must catch.
         unsafe { root.load(mc).unwrap().next.set_unbarriered(Some(Member::new(mc, young))) };
     });
     arena.collect_minor();
@@ -1759,6 +1874,7 @@ fn retrace_covers_unbarriered_stores_into_old_objects() {
     arena.mutate(|mc, root| {
         let slots = root.load(mc).unwrap();
         for (i, slot) in slot_items(slots).iter().enumerate().step_by(97) {
+            // SAFETY: the object is retraced after the loop, in the same step.
             unsafe { slot.set_unbarriered(Some(Member::new(mc, node(mc, i as i64, None).unwrap()))) };
         }
         mc.retrace(slots);
@@ -2088,6 +2204,7 @@ fn retrace_while_marking_leaves_the_work_to_slices() {
     let tail = arena.mutate(|mc, root| {
         let tail = move_tail(mc, root);
         let black = root.1.load(mc).unwrap();
+        // SAFETY: the object is retraced below, in the same step.
         unsafe { black.next.set_unbarriered(Some(Member::new(mc, tail))) };
         mc.retrace(black);
         offset(mc, tail) as u32

@@ -3,9 +3,8 @@ use std::marker::PhantomData;
 use std::num::NonZeroU32;
 use std::ops::Deref;
 use std::ptr::NonNull;
-use std::slice;
 
-use super::layout::{self, HEADER, OFFSET_MASK, type_id};
+use super::layout::{self, HEADER, Object, OFFSET_MASK, type_id};
 use super::{Inline, Invariant, Mutation, OutOfMemory, Plain, Trace, Tracer};
 
 /// A full pointer to an arena object, for use inside a step. Store a [`Member`] instead.
@@ -32,6 +31,9 @@ impl<'gc, T> Gc<'gc, T> {
 
     #[allow(clippy::should_implement_trait)]
     pub fn as_ref(this: Self) -> &'gc T {
+        // SAFETY: `from_raw` made it for a `T` in this arena's region. Objects only move or
+        // die in collections, which can't run during `'gc`, and arena memory is only written
+        // through cells then, so a shared borrow holds.
         unsafe { this.ptr.as_ref() }
     }
 
@@ -45,14 +47,21 @@ impl<'gc, T> Gc<'gc, T> {
 }
 
 impl<'gc, T: Inline> Gc<'gc, T> {
+    fn object(self) -> Object<T> {
+        const { assert!(T::INLINE && layout::fits_inline::<T>(), "type is too large or too aligned for the arena") };
+        // SAFETY: `from_raw` made it for the value of an object holding a `T`, which doesn't
+        // move during `'gc`.
+        unsafe { Object::of_value(self.ptr.as_ptr()) }
+    }
+
     pub fn items(self) -> &'gc [T::Item] {
-        unsafe { slice::from_raw_parts(layout::inline_items::<T>(self.ptr.as_ptr()), self.len()) }
+        // SAFETY: the items are inside the object, as `Object::items` caps them, and borrowed
+        // shared as in `as_ref`.
+        unsafe { &*self.object().items() }
     }
 
     pub fn len(self) -> usize {
-        const { assert!(T::INLINE && layout::fits_inline::<T>(), "type is too large or too aligned for the arena") };
-        let len = unsafe { (*layout::header_ptr(self.ptr.as_ptr())).len } as usize;
-        len.min(layout::max_items::<T>())
+        self.object().len()
     }
 
     pub fn is_empty(self) -> bool {
@@ -72,6 +81,7 @@ impl<T> Deref for Gc<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
+        // SAFETY: as in `as_ref`.
         unsafe { self.ptr.as_ref() }
     }
 }
@@ -99,6 +109,9 @@ impl<'gc, T> Member<'gc, T> {
         T: Plain<'gc>,
     {
         let offset = (self.offset.get() & OFFSET_MASK) as usize;
+        // SAFETY: masked, the offset is aligned and below `REGION`, so the `T` after the header
+        // lies inside the reservation, as `from_raw` checks `T` fits. Corrupted memory may
+        // put some other object there, but `T: Plain` makes any bits a valid `T`.
         unsafe { Gc::from_raw(mc.base.add(offset + HEADER).cast()) }
     }
 
@@ -148,11 +161,12 @@ impl<T> fmt::Debug for Member<'_, T> {
     }
 }
 
-// `Option<NonZeroU32>` accepts every `u32`; a bare `Member` doesn't accept zero.
+// SAFETY: `Option<NonZeroU32>` accepts every `u32`; a bare `Member` doesn't accept zero.
 // No `T: Plain<'gc>` bound: it would make every self-referential type a trait cycle.
 // Reading through the member needs `T: Plain<'gc>` anyway, which keeps the brand.
 unsafe impl<'gc, T> Plain<'gc> for Option<Member<'gc, T>> {}
 
+// SAFETY: hands its one reference to the tracer, which may rewrite it.
 unsafe impl<T> Trace for Member<'_, T> {
     #[inline]
     fn trace(&mut self, t: &mut Tracer<'_>) {
@@ -277,8 +291,11 @@ impl fmt::Debug for AnyRef<'_> {
     }
 }
 
+// SAFETY: one `u64` and a brand. Any word is valid: the check bits are compared against the
+// object's header before use.
 unsafe impl<'gc> Plain<'gc> for AnyRef<'gc> {}
 
+// SAFETY: hands its one reference to the tracer, which may rewrite it.
 unsafe impl Trace for AnyRef<'_> {
     #[inline]
     fn trace(&mut self, t: &mut Tracer<'_>) {

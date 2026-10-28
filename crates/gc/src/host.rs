@@ -150,6 +150,8 @@ pub struct HostRef<'gc, T: 'static> {
 
 impl<'gc, T: 'static> HostRef<'gc, T> {
     pub fn get(self, mc: &Mutation<'gc>) -> Option<&'gc T> {
+        // SAFETY: `get` checked the slot's generation and type. The box doesn't move or get
+        // freed until a collection, which can't run while `mc` is borrowed for `'gc`.
         mc.heap.hosts.get::<T>(self.index, self.generation).map(|p| unsafe { p.as_ref() })
     }
 
@@ -178,8 +180,11 @@ impl<T> fmt::Debug for HostRef<'_, T> {
     }
 }
 
+// SAFETY: two `u32`s and a marker, so no padding and every bit pattern valid: a bad index
+// or generation just fails to look up. The brand is `'gc`.
 unsafe impl<'gc, T> Plain<'gc> for HostRef<'gc, T> {}
 
+// SAFETY: traces the one host reference it holds.
 unsafe impl<T> Trace for HostRef<'_, T> {
     fn trace(&mut self, t: &mut Tracer<'_>) {
         t.trace_host(self.index, self.generation);
@@ -222,8 +227,10 @@ impl fmt::Debug for AnyHostRef<'_> {
     }
 }
 
+// SAFETY: as for `HostRef`.
 unsafe impl<'gc> Plain<'gc> for AnyHostRef<'gc> {}
 
+// SAFETY: as for `HostRef`.
 unsafe impl Trace for AnyHostRef<'_> {
     fn trace(&mut self, t: &mut Tracer<'_>) {
         t.trace_host(self.index, self.generation);
@@ -233,6 +240,7 @@ unsafe impl Trace for AnyHostRef<'_> {
 impl<'gc> Mutation<'gc> {
     /// Moves `value` into the host table. It's dropped once nothing in the arena reaches it.
     pub fn host<T: 'static>(&self, value: T) -> Result<HostRef<'gc, T>, OutOfMemory> {
+        self.heap.budget.count_allocation()?;
         let cost = size_of::<T>();
         let marked = self.heap.is_marking();
         let (index, generation) = self.heap.hosts.insert(&self.heap.budget, Box::new(value), cost, marked)?;

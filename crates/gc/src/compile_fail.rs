@@ -82,11 +82,14 @@
 //! ```compile_fail,E0080
 //! use std::num::NonZeroU32;
 //! use ragwort_gc::{Arena, Member, Rootable};
+//! #[repr(C, align(16))]
+//! struct Wide([u64; 2]);
+//! unsafe impl<'gc> ragwort_gc::Plain<'gc> for Wide {}
 //! struct R;
 //! impl Rootable for R { type Root<'gc> = (); }
 //! let mut arena = Arena::<R>::new(1 << 20, |_| Ok(())).unwrap();
 //! arena.mutate(|mc, _| {
-//!     let m = unsafe { Member::<u128>::from_bits(NonZeroU32::new(8).unwrap()) };
+//!     let m = unsafe { Member::<Wide>::from_bits(NonZeroU32::new(8).unwrap()) };
 //!     let _ = m.get(mc);
 //! });
 //! ```
@@ -179,7 +182,7 @@
 //! struct S;
 //! unsafe impl Trace for S { const INLINE: bool = true; fn trace(&mut self, _: &mut Tracer) {} }
 //! unsafe impl Inline for S { type Item = u8; }
-//! unsafe impl ragwort_gc::Plain for S {}
+//! unsafe impl<'gc> ragwort_gc::Plain<'gc> for S {}
 //! struct R;
 //! impl Rootable for R { type Root<'gc> = (); }
 //! let mut arena = Arena::<R>::new(1 << 20, |_| Ok(())).unwrap();
@@ -193,7 +196,7 @@
 //! struct D;
 //! impl Drop for D { fn drop(&mut self) {} }
 //! unsafe impl Trace for D { const NEEDS_TRACE: bool = false; fn trace(&mut self, _: &mut Tracer) {} }
-//! unsafe impl ragwort_gc::Plain for D {}
+//! unsafe impl<'gc> ragwort_gc::Plain<'gc> for D {}
 //! struct R;
 //! impl Rootable for R { type Root<'gc> = (); }
 //! let mut arena = Arena::<R>::new(1 << 20, |_| Ok(())).unwrap();

@@ -36,15 +36,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ragwort"
-version = "0.1.0"
-dependencies = [
- "ragwort-gc",
- "ragwort-num",
- "ragwort-string",
-]
-
-[[package]]
 name = "ragwort-derive"
 version = "0.1.0"
 dependencies = [
@@ -69,6 +60,15 @@ version = "0.1.0"
 [[package]]
 name = "ragwort-string"
 version = "0.1.0"
+
+[[package]]
+name = "ragwort-types"
+version = "0.1.0"
+dependencies = [
+ "ragwort-gc",
+ "ragwort-num",
+ "ragwort-string",
+]
 
 [[package]]
 name = "syn"

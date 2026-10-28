@@ -56,6 +56,8 @@ pub(crate) struct VTable {
     /// so two vtables at different addresses may describe the same type.
     pub(crate) type_id: fn() -> TypeId,
     pub(crate) needs_trace: bool,
+    /// Traces the object. Safety: `header` starts an object of this vtable's type, which
+    /// nothing else references while it runs. The same goes for `trace_range`.
     pub(crate) trace: unsafe fn(*mut Header, &mut Tracer<'_>),
     /// Traces only what overlaps bytes `from..to` of the object, counted from its header.
     pub(crate) trace_range: unsafe fn(*mut Header, usize, usize, &mut Tracer<'_>),
@@ -116,7 +118,8 @@ pub(crate) fn type_id<T: ?Sized>() -> TypeId {
         }
     }
     let marker: &dyn Erased = &PhantomData::<T>;
-    // Only the bound changes; `id` never sees a value of `T`.
+    // SAFETY: only the lifetime bound changes, and `id` never sees a value of `T`, so no
+    // borrow can be used past its lifetime.
     let marker: &(dyn Erased + 'static) = unsafe { std::mem::transmute(marker) };
     marker.id()
 }
@@ -133,6 +136,61 @@ pub(crate) fn inline_items<T: Inline>(value: *const T) -> *mut T::Item {
     value.cast::<u8>().wrapping_add(items_offset::<T>()).cast::<T::Item>().cast_mut()
 }
 
+/// Where the parts of an object holding a `T` are. Made only from a header known to start
+/// one, or one reserved for a `T` that's being made, so its methods can rely on that.
+pub(crate) struct Object<T> {
+    header: *mut Header,
+    _type: PhantomData<*const T>,
+}
+
+impl<T> Clone for Object<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for Object<T> {}
+
+impl<T> Object<T> {
+    /// # Safety
+    /// `header` starts an object holding a `T`, which stays where it is while this is used.
+    #[inline]
+    pub(crate) unsafe fn at(header: *mut Header) -> Self {
+        Self { header, _type: PhantomData }
+    }
+
+    /// # Safety
+    /// As for [`Self::at`], with `value` the object's value.
+    #[inline]
+    pub(crate) unsafe fn of_value(value: *const T) -> Self {
+        // SAFETY: the header sits just before the value, and the caller vouches for both.
+        unsafe { Self::at(header_ptr(value).cast_mut()) }
+    }
+
+    pub(crate) fn header(self) -> *mut Header {
+        self.header
+    }
+
+    pub(crate) fn value(self) -> *mut T {
+        value_ptr::<T>(self.header)
+    }
+}
+
+impl<T: Inline> Object<T> {
+    /// The length its header gives, capped at [`max_items`]: the header may be corrupted, and
+    /// the cap keeps the items inside the reservation whatever it says.
+    #[inline]
+    pub(crate) fn len(self) -> usize {
+        // SAFETY: the header is the object's, written when it was made, so it can be read.
+        (unsafe { (*self.header).len } as usize).min(max_items::<T>())
+    }
+
+    #[inline]
+    pub(crate) fn items(self) -> *mut [T::Item] {
+        ptr::slice_from_raw_parts_mut(inline_items::<T>(self.value()), self.len())
+    }
+}
+
 pub(crate) struct SizedVTable<T>(PhantomData<T>);
 
 impl<T: Trace> SizedVTable<T> {
@@ -145,10 +203,12 @@ impl<T: Trace> SizedVTable<T> {
     };
 
     unsafe fn trace(header: *mut Header, t: &mut Tracer<'_>) {
-        unsafe { (*value_ptr::<T>(header)).trace(t) }
+        // SAFETY: the caller vouches that the header starts a `T` nothing else references.
+        unsafe { (*Object::<T>::at(header).value()).trace(t) }
     }
 
     unsafe fn trace_range(header: *mut Header, _: usize, _: usize, t: &mut Tracer<'_>) {
+        // SAFETY: the same contract as `trace`.
         unsafe { Self::trace(header, t) }
     }
 
@@ -169,27 +229,27 @@ impl<T: Inline> InlineVTable<T> {
     };
 
     unsafe fn trace(header: *mut Header, t: &mut Tracer<'_>) {
+        // SAFETY: the same contract as `trace_range`.
         unsafe { Self::trace_range(header, 0, usize::MAX, t) }
     }
 
     unsafe fn trace_range(header: *mut Header, from: usize, to: usize, t: &mut Tracer<'_>) {
-        unsafe {
-            let value = value_ptr::<T>(header);
-            let items_at = HEADER + items_offset::<T>();
-            if from < items_at {
-                (*value).trace(t);
-            }
-            let item = size_of::<T::Item>();
-            if <T::Item as Trace>::NEEDS_TRACE && item > 0 {
-                let len = ((*header).len as usize).min(max_items::<T>());
-                let first = from.saturating_sub(items_at) / item;
-                let last = to.saturating_sub(items_at).div_ceil(item).min(len);
-                if first < last {
-                    let items = inline_items::<T>(value).add(first);
-                    for item in &mut *ptr::slice_from_raw_parts_mut(items, last - first) {
-                        item.trace(t);
-                    }
-                }
+        // SAFETY: the caller matched this vtable to the header, and nothing else references the
+        // object. The value and the items don't overlap, and `items` is capped to the object.
+        let (value, items) = unsafe {
+            let object = Object::<T>::at(header);
+            (&mut *object.value(), &mut *object.items())
+        };
+        let items_at = HEADER + items_offset::<T>();
+        if from < items_at {
+            value.trace(t);
+        }
+        let item = size_of::<T::Item>();
+        if <T::Item as Trace>::NEEDS_TRACE && item > 0 {
+            let first = from.saturating_sub(items_at) / item;
+            let last = to.saturating_sub(items_at).div_ceil(item).min(items.len());
+            for item in items.get_mut(first..last).unwrap_or_default() {
+                item.trace(t);
             }
         }
     }

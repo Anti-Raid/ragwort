@@ -244,8 +244,9 @@ fn immediates_unpack() {
         assert_eq!(Value::default(), Value::VOID);
         assert_eq!(format!("{:?} {:?} {:?}", fix(-7), Value::char('x'), Value::inline_flonum(1.5).unwrap()), "-7 'x' 1.5");
 
-        // Any bits are a valid value.
+        // SAFETY: neither holds a reference, and any other bits are a valid value.
         assert_eq!(unsafe { Value::from_bits(0xD800 << 32 | 0b0101) }.as_char(), Some(char::REPLACEMENT_CHARACTER));
+        // SAFETY: as above.
         assert_eq!(unsafe { Value::from_bits(99 << 32 | 0b1101) }.unpack(mc), Unpacked::Void);
     });
     assert!(!arena.metrics().corrupted);
@@ -270,6 +271,7 @@ fn downcasts_check_the_type() {
         let r = pair.as_object().unwrap();
         assert_eq!(Value::from(r), pair);
         assert_eq!(r.downcast_member::<Pair>(mc).map(|m| Value::from_member(mc, m)), Some(pair));
+        // SAFETY: the bits come from `to_bits` in this arena and step.
         assert!(unsafe { AnyRef::from_bits(r.to_bits()) }.is::<Pair>(mc));
         assert!(matches!(pair.unpack(mc), Unpacked::Object(o) if o == r));
     });
@@ -283,6 +285,7 @@ fn forged_references_are_caught_by_the_collector() {
         let mut arena = value_arena(1 << 20);
         arena.mutate(|mc, root| {
             cons(mc, fix(1), fix(2));
+            // SAFETY: not upheld on purpose: made-up references, which the collector must reject.
             root.set(mc, unsafe { Value::from_bits(bits) });
         });
         arena.collect();
@@ -559,6 +562,7 @@ fn stores_without_references_skip_the_barrier() {
 #[derive(Clone, Copy)]
 struct Liar<'gc>(Option<Member<'gc, Num>>);
 
+// SAFETY: not upheld on purpose: `holds_refs` lies, which the verifier must catch.
 unsafe impl Trace for Liar<'_> {
     fn trace(&mut self, t: &mut Tracer<'_>) {
         self.0.trace(t);
@@ -569,6 +573,7 @@ unsafe impl Trace for Liar<'_> {
     }
 }
 
+// SAFETY: an `Option<Member>`, which is `Plain`.
 unsafe impl<'gc> Plain<'gc> for Liar<'gc> {}
 
 #[derive(Trace, Plain)]
@@ -647,6 +652,8 @@ fn stale_references_are_caught_when_used() {
         let mut arena = value_arena(1 << 20);
         let bits = stale_value(&mut arena, reuse);
         arena.mutate(|mc, _| {
+            // SAFETY: not upheld on purpose: the bits are from an earlier step, and the downcast
+            // must tell.
             let stale = unsafe { Value::from_bits(bits) };
             assert!(stale.downcast::<Pair>(mc).is_none());
         });
@@ -661,6 +668,7 @@ fn stale_references_are_caught_by_the_collector() {
     let mut arena = value_arena(1 << 20);
     let bits = stale_value(&mut arena, new_pair);
     arena.mutate(|mc, root| {
+        // SAFETY: as above.
         let holder = cons(mc, root.get(), unsafe { Value::from_bits(bits) });
         root.set(mc, holder);
     });
@@ -675,6 +683,7 @@ fn damaged_references_are_caught_when_used() {
         arena.mutate(|mc, root| {
             let pair = cons(mc, fix(1), fix(2));
             root.set(mc, pair);
+            // SAFETY: not upheld on purpose: one bit is flipped, which the checks must catch.
             let damaged = unsafe { Value::from_bits(pair.to_bits() ^ 1 << flip) };
             let tag = mc.type_tag::<Pair>().unwrap();
             assert!(damaged.downcast::<Pair>(mc).is_none() && damaged.downcast_tag(mc, tag).is_none());
@@ -702,8 +711,11 @@ fn zeroed_references_never_check_out() {
         root.set(mc, Value::object(mc, mc.alloc(Num(1)).unwrap()));
         let tag = mc.type_tag::<Num>().unwrap();
         assert_eq!(format!("{tag:?}"), "TypeTag(0)", "Num isn't the first type, so this tests nothing");
+        // SAFETY: not upheld on purpose: zero never comes from `to_bits`, and downcasts must
+        // refuse it.
         let zero = unsafe { AnyRef::from_bits(0) };
         assert!(zero.downcast::<Num>(mc).is_none() && zero.downcast_tag(mc, tag).is_none());
+        // SAFETY: as above.
         assert!(unsafe { Value::from_bits(0b0001) }.downcast::<Num>(mc).is_none());
     });
     assert!(arena.metrics().corrupted);
@@ -722,6 +734,7 @@ fn references_to_the_old_copy_of_a_moved_object_are_stale() {
     arena.mutate(|mc, root| {
         assert_ne!(root.get().to_bits(), old, "nothing moved");
         assert_eq!(items(mc, root.get()).len(), 3);
+        // SAFETY: not upheld on purpose: the bits are from before the object moved.
         assert!(unsafe { Value::from_bits(old) }.downcast::<Vector>(mc).is_none());
     });
     assert!(arena.metrics().corrupted);
@@ -736,6 +749,7 @@ fn references_to_swept_objects_are_stale_before_the_memory_is_reused() {
         dead.to_bits()
     });
     arena.collect();
+    // SAFETY: not upheld on purpose: the object is dead.
     arena.mutate(|mc, _| assert!(unsafe { Value::from_bits(dead) }.downcast::<Pair>(mc).is_none()));
     assert!(arena.metrics().corrupted);
 }

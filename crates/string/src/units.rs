@@ -77,22 +77,42 @@ macro_rules! each_mut {
     };
 }
 
-trait Unit: Copy + Ord {
+pub(crate) trait Unit: Copy + Ord {
+    const BITS: u32;
     fn code(self) -> u32;
     /// `code`, which must fit.
     fn of(code: u32) -> Self;
+    /// Up to `64 / BITS` units, the first lowest.
+    #[inline]
+    fn pack(units: &[Self]) -> u64 {
+        units.iter().rev().fold(0, |w, u| w << Self::BITS | u.code() as u64)
+    }
 }
 
 impl Unit for u8 {
+    const BITS: u32 = 8;
     fn code(self) -> u32 {
         self as u32
     }
     fn of(code: u32) -> Self {
         code as u8
     }
+    /// Reads overlap for a part word, ORing equal bytes into the same places.
+    #[inline]
+    fn pack(units: &[Self]) -> u64 {
+        let n = units.len();
+        let four = |i: usize| u32::from_le_bytes(units[i..i + 4].try_into().expect("four bytes")) as u64;
+        match n {
+            8 => u64::from_le_bytes(units.try_into().expect("eight bytes")),
+            4..=7 => four(0) | four(n - 4) << (8 * (n - 4)),
+            1..=3 => units[0] as u64 | (units[n / 2] as u64) << (8 * (n / 2)) | (units[n - 1] as u64) << (8 * (n - 1)),
+            _ => 0,
+        }
+    }
 }
 
 impl Unit for u16 {
+    const BITS: u32 = 16;
     fn code(self) -> u32 {
         self as u32
     }
@@ -102,6 +122,7 @@ impl Unit for u16 {
 }
 
 impl Unit for u32 {
+    const BITS: u32 = 32;
     fn code(self) -> u32 {
         self
     }

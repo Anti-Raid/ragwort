@@ -1,5 +1,7 @@
 //! The arena: a garbage collected heap for one interpreter, with segmented stacks.
 
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 extern crate self as ragwort_gc;
 
 mod arena;

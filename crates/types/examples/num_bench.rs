@@ -3,9 +3,9 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use ragwort::gc::{Arena, Gc, GcVec, Mutation, Rootable, TypeTag, Value};
-use ragwort::num::bigint::{self, Digits, RWDigits};
-use ragwort::num::{Big, Host, Integer, IntView, Nums, int};
+use ragwort_types::gc::{Arena, Gc, GcVec, Mutation, Rootable, TypeTag, Value};
+use ragwort_types::num::bigint::{self, Digits, RWDigits};
+use ragwort_types::num::{Big, Host, Integer, IntView, Nums, int};
 
 struct Ints;
 impl Rootable for Ints {

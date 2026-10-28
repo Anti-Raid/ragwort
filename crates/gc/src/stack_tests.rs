@@ -240,6 +240,30 @@ fn frames_check_their_bounds() {
     });
 }
 
+/// Copies between overlapping slots of the stack's own segment move them as `copy_within`
+/// does, in either direction.
+#[test]
+fn writes_from_overlapping_slots_move_them() {
+    for shift in [-3isize, -1, 1, 3] {
+        let mut arena = arena();
+        let stack = new_stack(&mut arena, 512);
+        fill(&mut arena, &stack, 0, 20, 100);
+        let mut want = expected(20, 100);
+        want.resize(30, Some(-1));
+        let (from, to) = (5, (5 + shift) as usize);
+        want.copy_within(from..from + 10, to);
+        arena.mutate(|mc, _| {
+            for i in 20..30 {
+                stack.set(mc, i, num(mc, -1));
+            }
+            let segment = stack.segment(mc);
+            assert!(stack.write(mc, to, &segment.items()[from..from + 10]));
+        });
+        arena.collect();
+        assert_eq!(frame_values(&mut arena, &stack, 0, 30), want, "shifted by {shift}");
+    }
+}
+
 #[test]
 #[should_panic(expected = "different arena")]
 fn stacks_belong_to_one_arena() {

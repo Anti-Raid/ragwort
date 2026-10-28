@@ -1,5 +1,4 @@
 use std::cmp::Ordering;
-use std::hash::{DefaultHasher, Hasher};
 
 use crate::testing::{Rng, TestError, TestHost, TestStr};
 use crate::*;
@@ -10,19 +9,10 @@ fn make(h: &TestHost, text: &[char]) -> TestStr {
     s
 }
 
-fn hash_of(h: &TestHost, s: TestStr) -> u64 {
-    let mut state = DefaultHasher::new();
-    hash(h, s, &mut state).unwrap();
-    state.finish()
-}
+const SEED: u64 = 0x5eed;
 
-fn model_hash(text: &[char]) -> u64 {
-    let mut state = DefaultHasher::new();
-    state.write_usize(text.len());
-    for &c in text {
-        state.write_u32(c as u32);
-    }
-    state.finish()
+fn hash_of(h: &TestHost, s: TestStr) -> u64 {
+    hash(h, s, SEED).unwrap()
 }
 
 /// Checks everything readable of `s` against the characters it should hold.
@@ -40,7 +30,13 @@ fn agrees(h: &TestHost, rng: &mut Rng, s: TestStr, want: &[char]) {
     let text: String = want.iter().collect();
     assert_eq!(display(h, s).to_string(), text);
     assert_eq!(utf8_len(h, s), Ok(text.len()));
-    assert_eq!(hash_of(h, s), model_hash(want));
+    assert_eq!(hash_of(h, s), hash_str(&text, SEED));
+    assert_eq!(equal_str(h, s, &text), Ok(true));
+    if let Some(&last) = want.last() {
+        let changed: String = want[..want.len() - 1].iter().chain([&char::from_u32(last as u32 ^ 1).unwrap_or('a')]).collect();
+        assert_eq!(equal_str(h, s, &changed), Ok(false));
+        assert_eq!(equal_str(h, s, &text[..text.len() - last.len_utf8()]), Ok(false));
+    }
 }
 
 #[test]
@@ -316,6 +312,58 @@ fn near_misses_compare_by_their_characters() {
                         assert_eq!(compare(&h, y, x), Ok(other.cmp(&text)));
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Ropes with pieces narrower than the whole, cut at each offset in a word, hash as the flat
+/// string does, while every character and the seed change the hash.
+#[test]
+fn hashes_follow_the_characters() {
+    let h = TestHost::with_capacity(1 << 20);
+    let mut rng = Rng(5);
+    for widest in [Width::One, Width::Two, Width::Four] {
+        let mut text: Vec<char> = (0..1500).map(|_| rng.char(Width::One)).collect();
+        text.extend((0..1500).map(|_| rng.char(widest)));
+        let flat = make(&h, &text);
+        let want = hash_of(&h, flat);
+        for cut in 1..20 {
+            let cuts = [0, cut, 700 + cut, 1500 + cut, 2200 + cut, text.len()];
+            let rope = cuts.windows(2).fold(empty(&h).unwrap(), |acc, w| concat(&h, acc, make(&h, &text[w[0]..w[1]])).unwrap());
+            assert!(!is_flat(&h, rope));
+            assert_eq!(hash_of(&h, rope), want);
+        }
+        let mut seen = std::collections::HashSet::from([want]);
+        for i in [0, 1, 7, 8, 9, 15, 16, 1499, 1500, 2999] {
+            let mut other = text.clone();
+            other[i] = if other[i] == 'a' { 'b' } else { 'a' };
+            assert!(seen.insert(hash_of(&h, make(&h, &other))), "changing {i}");
+        }
+        assert!(seen.insert(hash(&h, flat, SEED + 1).unwrap()));
+    }
+    // Every string of up to four of these, including ones whose packed words match across widths.
+    let alphabet = ['\0', 'a', 'b', '\u{6261}', '😀'];
+    let mut texts = vec![String::new()];
+    for _ in 0..4 {
+        let longer: Vec<String> = texts.iter().flat_map(|t| alphabet.map(|c| format!("{t}{c}"))).collect();
+        texts.extend(longer);
+        texts.dedup();
+    }
+    texts.sort();
+    texts.dedup();
+    let hashes: std::collections::HashSet<u64> = texts.iter().map(|t| hash_str(t, SEED)).collect();
+    assert_eq!(hashes.len(), texts.len());
+    assert_ne!(hash_str("abcd", SEED), hash_str("\u{6261}\u{6463}\0\0", SEED));
+    // Each character of a short string changes its hash, wherever it falls in a word.
+    for widest in [Width::One, Width::Two, Width::Four] {
+        let text: Vec<char> = (0..40).map(|_| rng.char(widest)).collect();
+        for n in 0..=text.len() {
+            let mut seen = std::collections::HashSet::from([hash_of(&h, make(&h, &text[..n]))]);
+            for i in 0..n {
+                let mut other = text[..n].to_vec();
+                other[i] = char::from_u32(other[i] as u32 ^ 1).unwrap_or('a');
+                assert!(seen.insert(hash_of(&h, make(&h, &other))), "{n} long, changing {i}");
             }
         }
     }
