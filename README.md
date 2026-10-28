@@ -13,3 +13,9 @@ See ``src/gc`` folder for implementation of ragworts GC. Internally uses a incre
 ## Stack
 
 ragwort uses a segmented stack model to model its stack frames. This enables for fast ``call/cc`` by splitting the segmented stack (record `(segment, start, end)` in continuation and GC `(end top)` internally when continuation ends).
+
+## Dependencies
+
+- `syn`
+- `memmap2` (gc memory cage)
+- `libc` (gc memory cage)

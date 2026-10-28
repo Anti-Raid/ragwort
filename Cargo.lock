@@ -41,6 +41,7 @@ version = "0.1.0"
 dependencies = [
  "ragwort-gc",
  "ragwort-num",
+ "ragwort-string",
 ]
 
 [[package]]
@@ -63,6 +64,10 @@ dependencies = [
 
 [[package]]
 name = "ragwort-num"
+version = "0.1.0"
+
+[[package]]
+name = "ragwort-string"
 version = "0.1.0"
 
 [[package]]

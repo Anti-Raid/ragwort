@@ -1,4 +1,8 @@
 //! Derives for `ragwort_gc::Trace` and `ragwort_gc::Plain`, so arena types need no unsafe.
+//! The impls they write are unsafe, and they're the gc's to vouch for: crates that use them can
+//! still forbid unsafe code, since the lint doesn't look inside other crates' macros.
+
+#![forbid(unsafe_code)]
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -6,6 +10,28 @@ use syn::{Data, DeriveInput, Fields, Type, parse_macro_input, parse_quote};
 
 /// Traces every field. With `#[gc(items = Type)]` the type becomes an inline head, followed in
 /// its allocation by items of `Type`, which the collector traces.
+///
+/// # Inline types
+///
+/// The struct is the fixed-size head of an object that ends in `len` items of `Type`, all in
+/// one allocation, like a C struct with a flexible array member:
+///
+/// ```text
+/// [ header: ty, flags, len ][ head ][ padding to Type's alignment ][ item 0 ] … [ item len-1 ]
+/// ```
+///
+/// Next to a head that points at a separate buffer, this saves an allocation and a pointer
+/// hop, and the length lives in the object header rather than in a field.
+///
+/// The head's `trace` covers only its fields. The heap traces the items, and skips them when
+/// `Type` holds no references.
+///
+/// The type must also derive `Plain`, and `Type` must be `Plain`. Allocate with
+/// `Mutation::alloc_inline`, `alloc_inline_from` or `alloc_inline_with`, and read the items
+/// with `Gc::items`. A type tag for it must come from `Mutation::inline_type_tag`.
+///
+/// The derive implements `Inline` with `type Item = Type` and sets `Trace::INLINE`, which
+/// gives the type an inline vtable in the heap.
 #[proc_macro_derive(Trace, attributes(gc))]
 pub fn derive_trace(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);

@@ -238,13 +238,13 @@ fn split<H: RealHost>(h: &H, r: H::Rational) -> Result<(f64, i64), H::Error> {
     Ok((rational::to_f64(h, times_power_of_two(h, r, -k)?)?, k))
 }
 
-/// Exact `a` and `b` as doubles with a shared power of two taken out where either would
-/// overflow or underflow, which keeps their ratio.
-fn exact_pair<H: RealHost>(h: &H, a: H::Rational, b: H::Rational) -> Result<(f64, f64), H::Error> {
+/// Exact `a` and `b` as `(x, y, k)` with `a ≈ x · 2^k` and `b ≈ y · 2^k`, where `k` is even and
+/// is zero unless a double of `a` or `b` would overflow or underflow.
+fn exact_pair<H: RealHost>(h: &H, a: H::Rational, b: H::Rational) -> Result<(f64, f64, i64), H::Error> {
     let (fa, fb) = (rational::to_f64(h, a)?, rational::to_f64(h, b)?);
     let fits = |f: f64, r| f.is_normal() || rational::sign(h, r) == Ordering::Equal;
     if fits(fa, a) && fits(fb, b) {
-        return Ok((fa, fb));
+        return Ok((fa, fb, 0));
     }
     let mut k = i64::MIN;
     for r in [a, b] {
@@ -252,7 +252,9 @@ fn exact_pair<H: RealHost>(h: &H, a: H::Rational, b: H::Rational) -> Result<(f64
             k = k.max(exponent(h, r)?);
         }
     }
-    Ok((rational::to_f64(h, times_power_of_two(h, a, -k)?)?, rational::to_f64(h, times_power_of_two(h, b, -k)?)?))
+    let k = k + (k & 1);
+    let scaled = |r| rational::to_f64(h, times_power_of_two(h, r, -k)?);
+    Ok((scaled(a)?, scaled(b)?, k))
 }
 
 /// The exact square root of `r >= 0`, if it's rational.
@@ -323,7 +325,10 @@ pub fn angle<H: ComplexHost>(h: &H, z: H::Number) -> RealRes<H> {
         ComplexView::Complex { re, im } => (re, im),
     };
     let (a, b) = match (h.real_view(re), h.real_view(im)) {
-        (RealView::Exact(a), RealView::Exact(b)) => exact_pair(h, a, b)?,
+        (RealView::Exact(a), RealView::Exact(b)) => {
+            let (x, y, _) = exact_pair(h, a, b)?;
+            (x, y)
+        }
         _ => (real::to_f64(h, re)?, real::to_f64(h, im)?),
     };
     h.flonum(b.atan2(a))
@@ -365,6 +370,9 @@ pub fn sqrt<H: ComplexHost>(h: &H, z: H::Number) -> Res<H> {
                 return rectangular(h, h.of_rational(p), h.of_rational(q));
             }
         }
+        let (x, y, k) = exact_pair(h, a, b)?;
+        let s = cfloat::sqrt(C { re: x, im: y });
+        return from_c(h, C { re: cfloat::ldexp(s.re, k / 2), im: cfloat::ldexp(s.im, k / 2) });
     }
     from_c(h, cfloat::sqrt(to_c(h, z)?))
 }
@@ -473,7 +481,10 @@ pub fn atan2<H: RealHost>(h: &H, y: H::Real, x: H::Real) -> RealRes<H> {
         }
     }
     let (fy, fx) = match (h.real_view(y), h.real_view(x)) {
-        (RealView::Exact(a), RealView::Exact(b)) => exact_pair(h, a, b)?,
+        (RealView::Exact(a), RealView::Exact(b)) => {
+            let (y, x, _) = exact_pair(h, a, b)?;
+            (y, x)
+        }
         _ => (real::to_f64(h, y)?, real::to_f64(h, x)?),
     };
     h.flonum(fy.atan2(fx))
@@ -515,7 +526,8 @@ pub fn expt<H: ComplexHost>(h: &H, z: H::Number, w: H::Number) -> Res<H> {
     }
     if let ComplexView::Real(b) = h.complex_view(z) {
         let (fb, fe) = (real::to_f64(h, b)?, real::to_f64(h, e)?);
-        if real::sign(h, b) != Some(Ordering::Less) || fe.is_finite() && fe.fract() == 0.0 {
+        let whole = matches!(h.real_view(e), RealView::Flonum(f) if f.is_finite() && f.fract() == 0.0);
+        if real::sign(h, b) != Some(Ordering::Less) || whole {
             return flonum(h, fb.powf(fe));
         }
     }

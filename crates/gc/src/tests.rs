@@ -2098,3 +2098,130 @@ fn retrace_while_marking_leaves_the_work_to_slices() {
     assert!(arena.heap().is_old(tail), "the retraced object wasn't traced incrementally");
     check_moved(&mut arena, 52);
 }
+
+#[derive(Trace, Plain)]
+#[gc(items = Value<'gc>)]
+struct Values<'gc>(PhantomData<&'gc ()>);
+
+#[test]
+fn panicking_init_while_marking() {
+    let mut arena = pair_arena(1 << 20);
+    black_and_white(&mut arena);
+    let objects = arena.metrics().objects;
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        arena.mutate(|mc, _| {
+            let _ = mc.alloc_inline_with(Values(PhantomData), 4, Value::NIL, |_| panic!("init failed"));
+        })
+    }));
+    assert!(result.is_err());
+    assert_eq!(arena.metrics().objects, objects);
+    arena.heap().check();
+    arena.collect();
+    arena.heap().check();
+    assert!(!arena.metrics().corrupted);
+}
+
+/// An object shrunk while marking keeps only its kept lines through the cycle.
+#[test]
+fn shrinking_while_marking_frees_the_tail() {
+    let lines_after = |len: usize| {
+        let mut arena = pair_arena(1 << 20);
+        black_and_white(&mut arena);
+        arena.mutate(|mc, _| {
+            mc.alloc_inline_with(Bytes { tag: 0 }, len, 0, |items| {
+                items[0] = 1;
+                1
+            })
+            .unwrap();
+        });
+        wait_for(&mut arena, Phase::Idle, 1);
+        arena.heap().check();
+        arena.heap().used_lines()
+    };
+    assert_eq!(lines_after(4000), lines_after(1));
+}
+
+/// Warm pages that trimming leaves past the end, above pages that were given back, are
+/// still the first reused.
+#[test]
+fn warm_pages_past_a_trimmed_gap_get_reused() {
+    let mut arena = unit_arena(512 << 10);
+    assert_eq!(arena.heap().warm_pages(), (0, 4));
+    let alloc = |arena: &mut Arena<Unit>, len: usize| {
+        arena.mutate(|mc, _| {
+            let b = mc.alloc_inline(Bytes { tag: 0 }, len, |_| 0).unwrap();
+            mc.root::<BytesK>(Member::new(mc, b)).unwrap()
+        })
+    };
+    let (one, two) = (PAGE - 16, PAGE + 100);
+    // Pages: a, then b over two, then c over three.
+    let a = alloc(&mut arena, one);
+    let b = alloc(&mut arena, two);
+    let c: Vec<_> = (0..3).map(|_| alloc(&mut arena, one)).collect();
+    assert_eq!(arena.heap().page_count(), 6);
+    drop((a, c));
+    arena.collect();
+    assert_eq!((arena.heap().warm_pages().0, arena.heap().page_count()), (4, 3));
+    // No warm room is left, so b's pages are given back, and the table trims to nothing.
+    drop(b);
+    arena.collect();
+    assert_eq!((arena.heap().warm_pages().0, arena.heap().page_count()), (4, 0));
+    let mut kept = Vec::new();
+    for warm in (0..4).rev() {
+        kept.push(alloc(&mut arena, one));
+        assert_eq!(arena.heap().warm_pages().0, warm, "a new page wasn't a warm one");
+        arena.heap().check();
+    }
+}
+
+/// With OS pages bigger than ours, each OS page of a freed run is warm or given back whole.
+#[test]
+fn warm_pages_leave_no_os_page_half_kept() {
+    for os_page in [PAGE, 4 * PAGE] {
+        let _os_page = super::region::test_os_page::Override::new(Some(os_page));
+        let mut arena = unit_arena(512 << 10);
+        assert_eq!(arena.heap().warm_pages(), (0, 4));
+        let big = arena.mutate(|mc, _| {
+            let b = mc.alloc_inline(Bytes { tag: 0 }, 5 * PAGE + 100, |_| 0).unwrap();
+            mc.root::<BytesK>(Member::new(mc, b)).unwrap()
+        });
+        assert_eq!(arena.heap().page_count(), 6);
+        drop(big);
+        arena.collect();
+        arena.heap().check();
+        assert_eq!(arena.heap().stranded_pages(), 0, "OS pages of {os_page} bytes");
+        assert!(arena.heap().warm_pages().0 > 0);
+    }
+}
+
+/// Pages freed one at a time leave none committed and unaccounted for, whichever order they
+/// go in and wherever the warm quota runs out.
+#[test]
+fn single_page_frees_strand_nothing() {
+    for os_page in [PAGE, 2 * PAGE, 4 * PAGE] {
+        for reverse in [false, true] {
+            let _os_page = super::region::test_os_page::Override::new(Some(os_page));
+            let mut arena = unit_arena(512 << 10);
+            let mut roots: Vec<_> = (0..12)
+                .map(|_| {
+                    arena.mutate(|mc, _| {
+                        let b = mc.alloc_inline(Bytes { tag: 0 }, PAGE - 16, |_| 0).unwrap();
+                        mc.root::<BytesK>(Member::new(mc, b)).unwrap()
+                    })
+                })
+                .collect();
+            assert_eq!(arena.heap().page_count(), 12);
+            if reverse {
+                roots.reverse();
+            }
+            while let Some(root) = roots.pop() {
+                drop(root);
+                arena.collect();
+                arena.heap().check();
+                let (warm, limit) = arena.heap().warm_pages();
+                assert!(warm <= limit);
+                assert_eq!(arena.heap().stranded_pages(), 0, "OS pages of {os_page} bytes, {} left", roots.len());
+            }
+        }
+    }
+}

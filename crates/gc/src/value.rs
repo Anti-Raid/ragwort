@@ -17,28 +17,36 @@ const CHAR: u64 = 0b0101;
 const CONSTANT: u64 = 0b1101;
 /// Both tags that hold an offset end in 001.
 const REFERENCE: u64 = 0b0111;
-/// +0.0 takes the word of the one inline double whose encoding would end up here.
+/// The special doubles take the words of the lowest few inline ones, ±1.7272337110188889e-77
+/// and the two above, which are boxed instead. The NaNs are the defaults ARM and x86 make.
+const SPECIALS: [u64; 6] = [0, 1 << 63, 0x7FF0 << 48, 0xFFF0 << 48, 0x7FF8 << 48, 0xFFF8 << 48];
+/// The first special's word. Each next one is 4 above it.
 const ZERO: u64 = 0x8000_0000_0000_0003;
-const COLLIDES_WITH_ZERO: u64 = 0x3000_0000_0000_0000;
+const LAST_SPECIAL: u64 = 4 * (SPECIALS.len() as u64 - 1);
 
-/// A double that doesn't fit in a word: ±0 aside, magnitudes beyond about 1e±77, -0.0,
-/// infinities and NaNs.
+/// A double that doesn't fit in a word: magnitudes beyond about 1e±77, and NaNs other than
+/// the two in [`SPECIALS`].
 #[derive(Trace, Plain)]
 struct Boxed(f64);
 
+#[inline]
 fn encode(f: f64) -> Option<u64> {
     let bits = f.to_bits();
-    if bits == 0 {
-        return Some(ZERO);
-    }
     // Exponents starting 011 or 100: the second and third bits copy the inverse of the first.
     let top = bits >> 60 & 0b111;
-    ((top == 0b011 || top == 0b100) && bits != COLLIDES_WITH_ZERO).then(|| bits.rotate_left(3) | 0b11)
+    if top == 0b011 || top == 0b100 {
+        let word = bits.rotate_left(3) | 0b11;
+        return (word.wrapping_sub(ZERO) > LAST_SPECIAL).then_some(word);
+    }
+    let i = SPECIALS.iter().position(|&s| s == bits)?;
+    Some(ZERO + 4 * i as u64)
 }
 
+#[inline]
 fn decode(word: u64) -> f64 {
-    if word == ZERO {
-        return 0.0;
+    let special = word.wrapping_sub(ZERO);
+    if special <= LAST_SPECIAL {
+        return f64::from_bits(SPECIALS[special as usize / 4]);
     }
     let first = word >> 63;
     f64::from_bits((word & !0b11 | (2 - first)).rotate_right(3))
@@ -127,6 +135,7 @@ impl<'gc> Value<'gc> {
     }
 
     /// Stores the double in the word when it fits, and boxes it otherwise.
+    #[inline]
     pub fn flonum(mc: &Mutation<'gc>, f: f64) -> Result<Self, OutOfMemory> {
         match encode(f) {
             Some(word) => Ok(Self::from_word(word)),
@@ -138,6 +147,7 @@ impl<'gc> Value<'gc> {
     }
 
     /// The double as a value without allocating, if it fits in the word.
+    #[inline]
     pub fn inline_flonum(f: f64) -> Option<Self> {
         encode(f).map(Self::from_word)
     }
@@ -150,6 +160,7 @@ impl<'gc> Value<'gc> {
         self.word & 1 == 0
     }
 
+    #[inline]
     pub const fn is_flonum(self) -> bool {
         self.word & 0b11 == 0b11 || self.word & TAG == BOXED
     }
@@ -161,6 +172,7 @@ impl<'gc> Value<'gc> {
         }
     }
 
+    #[inline]
     pub fn as_flonum(self, mc: &Mutation<'gc>) -> Option<f64> {
         if self.word & 0b11 == 0b11 {
             Some(decode(self.word))

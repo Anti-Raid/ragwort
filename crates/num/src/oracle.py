@@ -595,7 +595,7 @@ def expt(z, w):
         if is_flo(w, 0.0) or is_flo(z, 1.0):
             return 1.0
         fb, fe = flo(z), flo(w)
-        if not (cmp(z, 0) == -1) or (math.isfinite(fe) and fe == int(fe)):
+        if not (cmp(z, 0) == -1) or (not exact(w) and math.isfinite(fe) and fe == int(fe)):
             return cpow(fb, fe)
     return cexp(cmul(w, clog(z)))
 

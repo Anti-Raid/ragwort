@@ -135,6 +135,8 @@ impl From<NumError> for TestError {
 pub struct TestHost {
     bits: u32,
     bigs: Box<[OnceCell<Box<[Digit]>>]>,
+    /// How many digits each big integer was made from, before it kept fewer.
+    reserved: Box<[Cell<usize>]>,
     used: Cell<usize>,
 }
 
@@ -142,7 +144,8 @@ pub const CAPACITY: usize = if cfg!(miri) { 1 << 12 } else { 1 << 16 };
 
 impl TestHost {
     pub fn new(bits: u32) -> Self {
-        Self { bits, bigs: (0..CAPACITY).map(|_| OnceCell::new()).collect(), used: Cell::new(0) }
+        let bigs = (0..CAPACITY).map(|_| OnceCell::new()).collect();
+        Self { bits, bigs, reserved: (0..CAPACITY).map(|_| Cell::new(0)).collect(), used: Cell::new(0) }
     }
 
     pub fn digits(&self, at: usize) -> &[Digit] {
@@ -175,6 +178,7 @@ impl Host for TestHost {
         digits.truncate(kept);
         let at = self.used.get();
         self.bigs.get(at).expect("test host is full").set(digits.into_boxed_slice()).expect("cells are set once");
+        self.reserved[at].set(len);
         self.used.set(at + 1);
         Ok(TestInt::Big { negative, at })
     }
@@ -188,11 +192,14 @@ pub fn hex_i64(n: i64) -> String {
 }
 
 impl TestHost {
-    /// Asserts the result is normalized, and shows it as Python reads it.
+    /// Asserts the result is normalized and holds no more than twice its digits, and shows it
+    /// as Python reads it.
     pub fn show(&self, x: TestInt) -> String {
         if let TestInt::Big { negative, at } = x {
             let digits = self.digits(at);
             assert!(!digits.is_empty() && *digits.last().unwrap() != 0, "big zero or high zero digits");
+            let reserved = self.reserved[at].get();
+            assert!(reserved <= 2 * digits.len(), "{} digits kept of {reserved}", digits.len());
             let value = (digits.len() == 1).then(|| if negative { (digits[0] as i64).wrapping_neg() } else { digits[0] as i64 });
             let small = value.filter(|&v| (v < 0) == negative && v != 0).and_then(|v| self.small(v));
             assert!(small.is_none(), "{x:?} should be small");

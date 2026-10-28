@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
+use std::hint::black_box;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
@@ -95,8 +96,12 @@ fn check_flonum<'gc>(mc: &Mutation<'gc>, v: Value<'gc>, f: f64) {
     assert!(matches!(v.unpack(mc), Unpacked::Flonum(g) if g.to_bits() == f.to_bits()));
 }
 
+const SPECIALS: [u64; 6] = [0, 1 << 63, 0x7FF0 << 48, 0xFFF0 << 48, 0x7FF8 << 48, 0xFFF8 << 48];
+/// The inline doubles whose words the specials took.
+const DISPLACED: [u64; 6] = [0x3000 << 48, 0xB000 << 48, (0x3000 << 48) + 1, (0xB000 << 48) + 1, (0x3000 << 48) + 2, (0xB000 << 48) + 2];
+
 fn fits_inline(bits: u64) -> bool {
-    bits == 0 || (matches!(bits >> 60 & 7, 3 | 4) && bits != 0x3000_0000_0000_0000)
+    SPECIALS.contains(&bits) || (matches!(bits >> 60 & 7, 3 | 4) && !DISPLACED.contains(&bits))
 }
 
 #[test]
@@ -123,7 +128,10 @@ fn flonums_round_trip() {
         f64::NAN,
         -f64::NAN,
     ];
-    for bits in [0x3000_0000_0000_0000u64, 0x3000_0000_0000_0001, 0x2FFF_FFFF_FFFF_FFFF, 0x4FFF_FFFF_FFFF_FFFF, 0x5000_0000_0000_0000] {
+    doubles.extend(DISPLACED.map(f64::from_bits));
+    // NaNs with other payloads.
+    doubles.extend([0x7FF8_0000_0000_0001u64, 0xFFF0_0000_0000_0001, 0x7FF4_0000_0000_0000].map(f64::from_bits));
+    for bits in [0x3000_0000_0000_0003u64, 0x2FFF_FFFF_FFFF_FFFF, 0x4FFF_FFFF_FFFF_FFFF, 0x5000_0000_0000_0000] {
         doubles.push(f64::from_bits(bits));
         doubles.push(f64::from_bits(bits | 1 << 63));
     }
@@ -155,7 +163,10 @@ fn flonums_round_trip() {
             vm.stack.borrow_mut().push(v);
         }
         assert!(Value::inline_flonum(0.0).is_some() && Value::inline_flonum(0.1).is_some());
-        assert!(Value::inline_flonum(-0.0).is_none() && Value::inline_flonum(f64::NAN).is_none());
+        for f in [-0.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN, -f64::NAN, 0.0 / black_box(0.0)] {
+            assert!(Value::inline_flonum(f).is_some(), "{f}");
+        }
+        assert!(Value::inline_flonum(1e100).is_none() && Value::inline_flonum(f64::from_bits(DISPLACED[0])).is_none());
         boxed
     });
     arena.collect();
@@ -321,7 +332,7 @@ fn young_objects_stored_in_old_values_survive_minor_collections() {
         arena.mutate(|mc, root| {
             let slots = items(mc, root.get());
             slots[0].set(mc, cons(mc, fix(1), Value::NIL));
-            slots[len - 1].set(mc, Value::flonum(mc, f64::NAN).unwrap());
+            slots[len - 1].set(mc, Value::flonum(mc, 1e100).unwrap());
             cons(mc, fix(3), Value::NIL);
         });
         arena.collect_minor();
@@ -330,7 +341,7 @@ fn young_objects_stored_in_old_values_survive_minor_collections() {
         arena.mutate(|mc, root| {
             let slots = items(mc, root.get());
             assert_eq!(slots[0].get().downcast::<Pair>(mc).unwrap().car.get(), fix(1));
-            assert!(slots[len - 1].get().as_flonum(mc).unwrap().is_nan());
+            assert_eq!(slots[len - 1].get().as_flonum(mc), Some(1e100));
         });
     }
 }
@@ -342,7 +353,7 @@ fn root_containers_are_traced() {
             stack: RefCell::new(Vec::new()),
             frames: RefCell::default(),
             globals: RefCell::default(),
-            constants: vec![list(mc, 5), Value::flonum(mc, -0.0)?].into_boxed_slice(),
+            constants: vec![list(mc, 5), Value::flonum(mc, 1e100)?].into_boxed_slice(),
             acc: Cell::new(Value::NIL),
             scratch: RefLock::new(None),
         })
@@ -371,7 +382,7 @@ fn root_containers_are_traced() {
             assert_eq!(read_list(mc, vm.frames.borrow()[0]).len(), 7);
             assert_eq!(read_list(mc, vm.globals.borrow()[&1]).len(), 8);
             assert_eq!(read_list(mc, vm.constants[0]).len(), 5);
-            assert_eq!(vm.constants[1].as_flonum(mc).map(f64::to_bits), Some((-0.0f64).to_bits()));
+            assert_eq!(vm.constants[1].as_flonum(mc), Some(1e100));
             assert_eq!(read_list(mc, vm.acc.get()).len(), 9);
             assert_eq!(read_list(mc, vm.scratch.borrow().unwrap().unwrap()).len(), 4);
         });
@@ -538,7 +549,7 @@ fn stores_without_references_skip_the_barrier() {
     assert_eq!(dirty(&mut arena, &|mc, slots| Lock::copy(mc, &slots[4..], &slots[..4])), 0);
 
     assert_eq!(dirty(&mut arena, &|mc, slots| slots[0].set(mc, cons(mc, fix(1), Value::NIL))), 1);
-    assert_eq!(dirty(&mut arena, &|mc, slots| slots[1].set(mc, Value::flonum(mc, f64::NAN).unwrap())), 1);
+    assert_eq!(dirty(&mut arena, &|mc, slots| slots[1].set(mc, Value::flonum(mc, 1e100).unwrap())), 1);
     assert_eq!(dirty(&mut arena, &|mc, slots| Lock::write(mc, &slots[2..4], &[fix(1), slots[0].get()])), 1);
     assert_eq!(dirty(&mut arena, &|mc, slots| Lock::copy(mc, &slots[4..], &slots[..4])), 1);
     arena.collect();

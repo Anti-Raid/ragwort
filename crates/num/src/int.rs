@@ -121,15 +121,21 @@ fn make<H: Host>(h: &H, negative: bool, len: usize, init: impl FnOnce(RWDigits<'
         return from_digits(h, negative, Digits::new(&buf[..len]));
     }
     // A long result can still come out short, as when subtracting nearly equal numbers.
-    let mut short = None;
+    let (mut short, mut kept) = (None, 0);
     let x = h.big(negative, len, |mut z| {
         init(z.reborrow());
         let digits = z.read().normalize();
-        short = to_small(negative, digits);
-        digits.len()
+        (short, kept) = (to_small(negative, digits), digits.len());
+        kept
     })?;
     match short.and_then(|n| h.small(n)) {
         Some(small) => Ok(small),
+        // Moved to an allocation its size, as the rest of this one, up to a whole run of pages,
+        // would stay with it. The copy costs less than making it did.
+        None if kept * 2 < len => match h.view(x) {
+            IntView::Big { negative, digits } => from_digits(h, negative, digits),
+            IntView::Small(_) => Ok(x),
+        },
         None => Ok(x),
     }
 }

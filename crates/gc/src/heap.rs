@@ -381,7 +381,7 @@ impl Heap {
         &self.pages[page]
     }
 
-    fn page_count(&self) -> usize {
+    pub(crate) fn page_count(&self) -> usize {
         self.page_count.get()
     }
 
@@ -843,10 +843,9 @@ impl Heap {
         let mut run = 0;
         let mut start = None;
         if n == 1 && self.warm.get() > 0 {
-            start = pages.iter().position(|p| p.has(WARM));
-            if start.is_none() && self.pages.get(pages.len()).is_some_and(|p| p.has(WARM)) {
-                start = Some(pages.len());
-            }
+            // Trimming can leave warm pages past the end, above pages that were given back.
+            // The count says one exists, so the search stops there.
+            start = self.pages.iter().position(|p| p.has(WARM));
         }
         if start.is_some() {
         } else if self.free_pages.get() >= n {
@@ -881,7 +880,8 @@ impl Heap {
         #[cfg(test)]
         self.used_pages.borrow_mut()[start + 1..start + 1 + n].fill(true);
         self.committed.set(self.committed.get() + n);
-        self.free_pages.set(self.free_pages.get() - (n - grow));
+        // Pages between the old end and a warm page past it join the table free.
+        self.free_pages.set(self.free_pages.get() + grow - n);
         Ok(start)
     }
 
@@ -900,15 +900,50 @@ impl Heap {
         self.free_pages.set(self.free_pages.get() + n);
         // Young pages empty out every minor collection and fill again right after, so about a
         // nursery's worth stays committed. Giving them back would fault on every reuse.
-        let keep = n.min(self.warm_limit().saturating_sub(self.warm.get()));
-        for p in &self.pages()[page..page + keep] {
-            p.add(WARM);
-        }
-        self.warm.set(self.warm.get() + keep);
-        if keep < n {
-            self.decommit(page + keep, n - keep);
+        match region::os_page() {
+            Some(os_page) if os_page > PAGE => self.settle_os_pages(page, n, os_page),
+            os_page => {
+                let keep = n.min(self.warm_limit().saturating_sub(self.warm.get()));
+                for p in &self.pages()[page..page + keep] {
+                    p.add(WARM);
+                }
+                self.warm.set(self.warm.get() + keep);
+                if let Some(os_page) = os_page
+                    && keep < n
+                {
+                    let (lo, hi) = (page_start(page + keep), page_start(page + n));
+                    self.decommit(lo.next_multiple_of(os_page), hi / os_page * os_page);
+                }
+            }
         }
         self.trim();
+    }
+
+    /// When an OS page holds several of ours, it's warm or given back as a whole once nothing
+    /// on it is live. A free page that shares an OS page with live ones isn't warm: its memory
+    /// stays committed either way.
+    fn settle_os_pages(&self, page: usize, n: usize, os_page: usize) {
+        let per = os_page / PAGE;
+        for os in page_start(page) / os_page..page_start(page + n).div_ceil(os_page) {
+            // Table index `i` is region page `i + 1`, and region page 0 is never used.
+            let pages = &self.pages[(os * per).max(1) - 1..((os + 1) * per - 1).min(self.pages.len())];
+            if pages.iter().any(|p| p.kind.get() != Kind::Free) {
+                continue;
+            }
+            let warm = pages.iter().filter(|p| p.has(WARM)).count();
+            if self.warm.get() + pages.len() - warm <= self.warm_limit() {
+                for p in pages {
+                    p.add(WARM);
+                }
+                self.warm.set(self.warm.get() + pages.len() - warm);
+            } else {
+                for p in pages {
+                    p.remove(WARM);
+                }
+                self.warm.set(self.warm.get() - warm);
+                self.decommit(os * os_page, (os + 1) * os_page);
+            }
+        }
     }
 
     /// How many free pages stay committed: the memory of one nursery, beyond the budget.
@@ -926,36 +961,20 @@ impl Heap {
         self.cursor.set(self.cursor.get().min(len));
     }
 
-    /// Gives the OS pages of a freed run back. When OS pages are bigger than arena pages, the
-    /// OS page at each end of the run goes too if the rest of it is already free.
-    fn decommit(&self, page: usize, n: usize) {
-        let Some(os_page) = region::os_page() else { return };
-        // Table index `i` is region page `i + 1`, and region page 0 is never used. Pages past
-        // the table's end are free.
-        let free = |from: usize, to: usize| {
-            (from / PAGE..to.div_ceil(PAGE))
-                .all(|r| r == 0 || self.pages.get(r - 1).is_none_or(|p| p.kind.get() == Kind::Free && !p.has(WARM)))
-        };
-        let (start, end) = (page_start(page), page_start(page + n));
-        let mut lo = start / os_page * os_page;
-        let mut hi = end.next_multiple_of(os_page);
-        if !free(lo, start) {
-            lo += os_page;
-        }
-        if !free(end, hi) {
-            hi -= os_page;
-        }
+    /// Gives back the OS pages in `lo..hi`, offsets on OS page boundaries.
+    fn decommit(&self, lo: usize, hi: usize) {
         if lo >= hi {
             return;
         }
         #[cfg(test)]
-        self.check_decommit(lo, hi, os_page);
+        self.check_decommit(lo, hi);
         self.region.decommit(lo, hi - lo);
     }
 
     /// Each OS page given back must be free and must have been used since it was last given back.
     #[cfg(test)]
-    fn check_decommit(&self, lo: usize, hi: usize, os_page: usize) {
+    fn check_decommit(&self, lo: usize, hi: usize) {
+        let os_page = region::os_page().unwrap();
         let pages = self.pages();
         let mut used = self.used_pages.borrow_mut();
         for os in (lo..hi).step_by(os_page) {
@@ -986,11 +1005,12 @@ impl Heap {
 
     /// Objects allocated while marking are marked, since the mutator may already have stored
     /// them somewhere that was traced, and queued so their contents get traced.
+    /// `size` is what the object took from the region, and `marked` ia how much of it is in use.
     #[inline]
-    fn color(&self, offset: u32, size: usize, needs_trace: bool) {
+    fn color(&self, offset: u32, size: usize, marked: usize, needs_trace: bool) {
         self.allocated.set(self.allocated.get() + size);
         if self.is_marking() {
-            self.color_marked(offset, size, needs_trace);
+            self.color_marked(offset, marked, needs_trace);
         } else {
             self.young.set(self.young.get() + size);
         }
@@ -1021,7 +1041,7 @@ impl Heap {
             header.write(Header { ty, flags: self.stamp(), len: 0 });
             let value_ptr = layout::value_ptr::<T>(header);
             value_ptr.write(value);
-            self.color(offset, size, vtable.needs_trace);
+            self.color(offset, size, size, vtable.needs_trace);
             Ok(NonNull::new_unchecked(value_ptr))
         }
     }
@@ -1031,6 +1051,56 @@ impl Heap {
         head: T,
         len: usize,
         mut fill: impl FnMut(usize) -> T::Item,
+    ) -> Result<NonNull<T>, OutOfMemory>
+    where
+        T::Item: Plain<'gc>,
+    {
+        // Each item is written once, and all `len` are kept.
+        unsafe {
+            self.alloc_items(head, len, |items| {
+                for i in 0..len {
+                    items.add(i).write(fill(i));
+                }
+                len
+            })
+        }
+    }
+
+    /// Like `alloc_inline` with every item `item`, then `init` gets the items to fill in and
+    /// returns how many to keep, which shrinks the object.
+    pub(crate) fn alloc_inline_with<'gc, T: Inline + Plain<'gc>>(
+        &self,
+        head: T,
+        len: usize,
+        item: T::Item,
+        init: impl FnOnce(&mut [T::Item]) -> usize,
+    ) -> Result<NonNull<T>, OutOfMemory>
+    where
+        T::Item: Plain<'gc> + Copy,
+    {
+        // The items are written before `init` sees them, and the object is new, so nothing
+        // else refers to them. A collection can't run until the step ends.
+        unsafe {
+            self.alloc_items(head, len, |items| {
+                for i in 0..len {
+                    items.add(i).write(item);
+                }
+                init(slice::from_raw_parts_mut(items, len))
+            })
+        }
+    }
+
+    /// Reserves an inline object, lets `fill` write its items and say how many to keep, and
+    /// only then colors it, so a panic in `fill` leaves nothing marked or queued and marking
+    /// covers just the kept items.
+    ///
+    /// # Safety
+    /// `fill` gets room for `len` items and must initialize the first `len` before returning.
+    unsafe fn alloc_items<'gc, T: Inline + Plain<'gc>>(
+        &self,
+        head: T,
+        len: usize,
+        fill: impl FnOnce(*mut T::Item) -> usize,
     ) -> Result<NonNull<T>, OutOfMemory>
     where
         T::Item: Plain<'gc>,
@@ -1052,43 +1122,17 @@ impl Heap {
             let header = self.header_ptr(offset);
             header.write(Header { ty, flags: self.stamp(), len: len as u32 });
             let value = layout::value_ptr::<T>(header);
-            let items = layout::inline_items::<T>(value);
             let guard = Release { heap: self, offset };
-            for i in 0..len {
-                items.add(i).write(fill(i));
-            }
+            let kept = fill(layout::inline_items::<T>(value)).min(len);
             mem::forget(guard);
             value.write(head);
-            self.color(offset, size, vtable.needs_trace);
+            // A shorter length only shrinks the object. Its tail stays claimed until the next
+            // sweep, so pacing counts it, but marking doesn't keep it for another cycle.
+            (*header).len = kept as u32;
+            let kept_size = layout::inline_size::<T>(kept).unwrap_or(size);
+            self.color(offset, size, kept_size, vtable.needs_trace);
             Ok(NonNull::new_unchecked(value))
         }
-    }
-
-    /// Like `alloc_inline` with every item `item`, then `init` gets the items to fill in and
-    /// returns how many to keep, which shrinks the object.
-    pub(crate) fn alloc_inline_with<'gc, T: Inline + Plain<'gc>>(
-        &self,
-        head: T,
-        len: usize,
-        item: T::Item,
-        init: impl FnOnce(&mut [T::Item]) -> usize,
-    ) -> Result<NonNull<T>, OutOfMemory>
-    where
-        T::Item: Plain<'gc> + Copy,
-    {
-        let value = self.alloc_inline(head, len, |_| item)?;
-        let offset = (value.as_ptr().addr() - self.base.as_ptr().addr() - layout::HEADER) as u32;
-        let guard = Release { heap: self, offset };
-        // The object was just made, so nothing else refers to it, and a collection can't run
-        // until the step ends.
-        let kept = unsafe {
-            let items = slice::from_raw_parts_mut(layout::inline_items::<T>(value.as_ptr()), len);
-            init(items).min(len)
-        };
-        mem::forget(guard);
-        // A shorter length only shrinks the object. Its lines stay claimed until the next sweep.
-        unsafe { (*self.header_ptr(offset)).len = kept as u32 };
-        Ok(value)
     }
 
     /// Traces an object's contents, or only what overlaps `range` of it. Returns its size.
@@ -1634,6 +1678,31 @@ impl Heap {
     #[cfg(test)]
     pub(crate) fn set_gray_limit(&self, limit: usize) {
         self.gray_limit.set(limit.min(GRAY_CAPACITY));
+    }
+
+    /// How many free pages are kept committed, and how many may be.
+    #[cfg(test)]
+    pub(crate) fn warm_pages(&self) -> (usize, usize) {
+        (self.warm.get(), self.warm_limit())
+    }
+
+    /// Free pages that aren't warm but are still committed, on OS pages with nothing live,
+    /// so they take memory the warm count doesn't know about.
+    #[cfg(test)]
+    pub(crate) fn stranded_pages(&self) -> usize {
+        let Some(os_page) = region::os_page() else { return 0 };
+        let used = self.used_pages.borrow();
+        let free = |i: usize| self.pages.get(i).is_none_or(|p| p.kind.get() == Kind::Free);
+        let os_page_free = |i: usize| {
+            let at = page_start(i) / os_page * os_page;
+            (at / PAGE..(at + os_page) / PAGE).all(|r| r == 0 || free(r - 1))
+        };
+        (0..MAX_PAGES).filter(|&i| used[i + 1] && free(i) && !self.pages[i].has(WARM) && os_page_free(i)).count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn used_lines(&self) -> usize {
+        self.pages().iter().filter(|p| p.kind.get() == Kind::Lines).map(|p| p.used.count()).sum()
     }
 
     #[cfg(test)]

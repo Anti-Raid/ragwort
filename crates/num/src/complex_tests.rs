@@ -354,3 +354,76 @@ fn extreme_parts() {
     }
     oracle.check();
 }
+
+/// Racket's answers for exact parts past the range of doubles, and for negative bases with
+/// exact fractional powers, including one that rounds to a whole double.
+#[test]
+#[allow(clippy::approx_constant, reason = "Racket's printed answers")]
+fn racket_agrees_past_the_range_of_doubles() {
+    let h = TestHost::new(64);
+    let int = |n: i64| int::from_i64(&h, n).unwrap();
+    // n · 10^k, exactly.
+    let exact = |n: i64, k: i64| {
+        let power = int::expt(&h, int(10), k.unsigned_abs()).unwrap();
+        let r = if k >= 0 { TestRational::Int(int::mul(&h, int(n), power).unwrap()) } else { rational::from_parts(&h, int(n), power).unwrap() };
+        TestReal::Exact(r)
+    };
+    let complex = |a, b| rectangular(&h, a, b).unwrap();
+    let two_100 = int::arithmetic_shift(&h, int(1), 100).unwrap();
+    let near_one = TestNumber::Real(TestReal::Exact(rational::from_parts(&h, int::add(&h, two_100, int(1)).unwrap(), two_100).unwrap()));
+    let p = |s| parse(&h, s);
+    let cases = [
+        ("(sqrt 10^400+10^400i)", sqrt(&h, complex(exact(1, 400), exact(1, 400))), (1.09868411346781e200, 4.550898605622274e199)),
+        ("(sqrt 10^400+i)", sqrt(&h, complex(exact(1, 400), exact(1, 0))), (1e200, 0.0)),
+        ("(sqrt 1+10^-400i)", sqrt(&h, complex(exact(1, 0), exact(1, -400))), (1.0, 0.0)),
+        ("(sqrt 10^-400+3·10^-400i)", sqrt(&h, complex(exact(1, -400), exact(3, -400))), (1.442615274452683e-200, 1.0397782600555706e-200)),
+        ("(expt -2 (+ 1 2^-100))", expt(&h, p("-2"), near_one), (-2.0, 2.4492935982947064e-16)),
+        ("(expt -8 1/3)", expt(&h, p("-8"), p("1/3")), (1.0, 1.732050807568877)),
+        ("(expt -2.0 0.5)", expt(&h, p("-2.0"), p("0.5")), (8.659560562354932e-17, 1.414213562373095)),
+    ];
+    for (what, got, (re, im)) in cases {
+        let (re, im): (f64, f64) = (re, im);
+        let Ok(TestNumber::Complex(TestReal::Flonum(x), TestReal::Flonum(y))) = got else { panic!("{what}: {got:?}") };
+        let tolerance = 4.0 * f64::EPSILON * re.abs().max(im.abs());
+        assert!((x - re).abs() <= tolerance && (y - im).abs() <= tolerance, "{what} = {x:e}+{y:e}i, want {re:e}+{im:e}i");
+    }
+}
+
+/// C99 Annex G's special values, from `special.txt` (see `special.py`). NaNs match any NaN,
+/// zeros and infinities match with their signs unless the table leaves a sign unspecified, and
+/// other finite parts may be a few ulps off.
+#[test]
+fn special_values_follow_annex_g() {
+    let h = TestHost::new(64);
+    let functions: [(&str, Unary); 9] =
+        [("exp", exp), ("log", log), ("sqrt", sqrt), ("sin", sin), ("cos", cos), ("tan", tan), ("asin", asin), ("acos", acos), ("atan", atan)];
+    let flonum = |x: TestReal| match x {
+        TestReal::Flonum(f) => f,
+        TestReal::Exact(_) => panic!("exact part"),
+    };
+    let mut wrong = Vec::new();
+    for line in include_str!("special.txt").lines() {
+        let mut words = line.split(' ');
+        let name = words.next().unwrap();
+        let [re, im, want_re, want_im] = [(); 4].map(|_| f64::from_bits(u64::from_str_radix(words.next().unwrap(), 16).unwrap()));
+        let loose = words.next().unwrap();
+        let f = functions.iter().find(|(n, _)| *n == name).unwrap().1;
+        let z = rectangular(&h, TestReal::Flonum(re), TestReal::Flonum(im)).unwrap();
+        let (got_re, got_im) = match f(&h, z) {
+            Ok(TestNumber::Complex(r, i)) => (flonum(r), flonum(i)),
+            Ok(TestNumber::Real(r)) => (flonum(r), 0.0),
+            Err(e) => panic!("{name}({re:?}, {im:?}): {e:?}"),
+        };
+        let scale = [want_re, want_im].iter().filter(|f| f.is_finite()).fold(0.0f64, |m, f| m.max(f.abs()));
+        let close = |want: f64, got: f64, any_sign: bool| {
+            let (want, got) = if any_sign { (want.abs(), got.abs()) } else { (want, got) };
+            want.is_nan() && got.is_nan()
+                || want.to_bits() == got.to_bits()
+                || want.is_finite() && got.is_finite() && (want != 0.0 || got != 0.0) && (want - got).abs() <= 4.0 * f64::EPSILON * scale
+        };
+        if !close(want_re, got_re, loose.contains('r')) || !close(want_im, got_im, loose.contains('i')) {
+            wrong.push(format!("{name}({re:?}, {im:?}) = ({got_re:?}, {got_im:?}), want ({want_re:?}, {want_im:?})"));
+        }
+    }
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}

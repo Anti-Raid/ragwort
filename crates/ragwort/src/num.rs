@@ -5,6 +5,8 @@ use ragwort_gc::{Gc, Mutation, OutOfMemory, Plain, Trace, TypeTag, Value};
 use ragwort_num::bigint::{Digits, RWDigits};
 pub use ragwort_num::*;
 
+pub use crate::Error;
+
 /// A bignum: sign and magnitude, with digits inline and no high zeros. Never zero and never
 /// in fixnum range.
 #[derive(Trace, Plain)]
@@ -80,24 +82,6 @@ pub struct Number<'gc>(Value<'gc>);
 impl<'gc> Number<'gc> {
     pub fn value(self) -> Value<'gc> {
         self.0
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Error {
-    OutOfMemory,
-    Num(NumError),
-}
-
-impl From<NumError> for Error {
-    fn from(e: NumError) -> Self {
-        Self::Num(e)
-    }
-}
-
-impl From<OutOfMemory> for Error {
-    fn from(_: OutOfMemory) -> Self {
-        Self::OutOfMemory
     }
 }
 
