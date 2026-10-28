@@ -72,6 +72,10 @@ slots.
   `get` made, and `AnyRef` and `Value` from those. Downcasts compare the header's type with the
   vtable's `TypeId` before making a `Gc<T>`. The `from_bits` functions, which make references
   from raw bits, are test-only.
+- Every crate-private function that makes or rewrites a reference from raw parts is an
+  `unsafe fn` (`AnyRef::member`, `AnyRef::from_word`, `Value::from_word`, `Value::reference`,
+  `Member::from_offset`, `Member::offset_mut`), so each call site states its proof. Words
+  without a reference go through `Value::immediate`, which debug builds check.
 - Objects are freed only by sweeping, and only when unmarked, after [reach](#reach) has marked
   everything reachable.
 - Objects move only in compaction, which rewrites every reference ([moves](#moves)).

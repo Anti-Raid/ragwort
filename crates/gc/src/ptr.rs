@@ -115,13 +115,17 @@ impl<'gc, T> Member<'gc, T> {
         unsafe { Gc::from_raw(mc.base.add(offset + HEADER).cast()) }
     }
 
-    /// `offset` must be a `T`'s, which crate code upholds by keeping it where the collector
-    /// traces it.
-    pub(crate) fn from_offset(offset: NonZeroU32) -> Self {
+    /// # Safety
+    /// `offset` must be a live `T`'s in this arena, kept where the collector traces it so it's
+    /// rewritten when the object moves.
+    pub(crate) unsafe fn from_offset(offset: NonZeroU32) -> Self {
         Self { offset, _marker: PhantomData }
     }
 
-    pub(crate) fn offset_mut(&mut self) -> &mut NonZeroU32 {
+    /// # Safety
+    /// Only a new offset for the same object may be written, as the tracer does when the
+    /// object moves.
+    pub(crate) unsafe fn offset_mut(&mut self) -> &mut NonZeroU32 {
         &mut self.offset
     }
 
@@ -197,7 +201,8 @@ impl<'gc> AnyRef<'gc> {
     pub fn from_member<T>(mc: &Mutation<'gc>, member: Member<'gc, T>) -> Self {
         let offset = member.offset.get();
         let check = mc.heap.check_at(offset);
-        Self::from_word((offset as u64) << 32 | check.to_word() | OBJECT_TAG)
+        // SAFETY: [refs] the offset of a live object, with the check bits of its header.
+        unsafe { Self::from_word((offset as u64) << 32 | check.to_word() | OBJECT_TAG) }
     }
 
     fn offset(self) -> u32 {
@@ -208,7 +213,9 @@ impl<'gc> AnyRef<'gc> {
         Check::in_word(self.word)
     }
 
-    fn member<T>(self) -> Member<'gc, T> {
+    /// # Safety
+    /// The object must be a `T`, as [`AnyRef::is`] or a type tag checks.
+    unsafe fn member<T>(self) -> Member<'gc, T> {
         let offset = NonZeroU32::new(self.offset()).unwrap_or(NonZeroU32::MIN);
         Member { offset, _marker: PhantomData }
     }
@@ -223,13 +230,15 @@ impl<'gc> AnyRef<'gc> {
     }
 
     pub fn downcast_member<T: Plain<'gc> + 'gc>(self, mc: &Mutation<'gc>) -> Option<Member<'gc, T>> {
-        self.is::<T>(mc).then(|| self.member())
+        // SAFETY: [refs] `is` just found the object to be a `T`.
+        self.is::<T>(mc).then(|| unsafe { self.member() })
     }
 
     /// Like [`AnyRef::downcast`], but compares a single number.
     #[inline]
     pub fn downcast_tag<T: Plain<'gc> + 'gc>(self, mc: &Mutation<'gc>, tag: TypeTag<'gc, T>) -> Option<Gc<'gc, T>> {
-        mc.heap.has_type_index(self.offset(), self.check(), tag.ty).then(|| self.member().get(mc))
+        // SAFETY: [refs] the object's header just matched `T`'s type index and the check bits.
+        mc.heap.has_type_index(self.offset(), self.check(), tag.ty).then(|| unsafe { self.member() }.get(mc))
     }
 
     /// The reference as a word. Its offset only holds until the step ends, as with
@@ -242,12 +251,14 @@ impl<'gc> AnyRef<'gc> {
     /// `bits` must come from [`AnyRef::to_bits`] in the same arena, in the same step.
     #[cfg(test)]
     pub(crate) unsafe fn from_bits(bits: u64) -> Self {
-        Self::from_word(bits)
+        // SAFETY: [refs] passed on to the caller.
+        unsafe { Self::from_word(bits) }
     }
 
-    /// `word` must be a reference word made for a live object, which crate code upholds the
-    /// same way as for a `Member`.
-    pub(crate) const fn from_word(word: u64) -> Self {
+    /// # Safety
+    /// `word` must be a live object's reference word in this arena: its offset, the check bits
+    /// of its header, and the object tag.
+    pub(crate) const unsafe fn from_word(word: u64) -> Self {
         Self { word, _brand: PhantomData }
     }
 }

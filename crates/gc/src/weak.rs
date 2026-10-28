@@ -66,7 +66,8 @@ unsafe impl<K, V: Trace + Copy + Default> Trace for Ephemeron<'_, K, V> {
         // Without a key the value is unreachable, so it isn't traced.
         let key = self.key.get_mut();
         let Some(member) = key else { return };
-        match t.ephemeron_key(member.offset_mut()) {
+        // SAFETY: [moves] the tracer only writes the key's new offset, when its object moved.
+        match t.ephemeron_key(unsafe { member.offset_mut() }) {
             KeyState::Live => self.value.trace(t),
             KeyState::Pending => {}
             KeyState::Dead => {

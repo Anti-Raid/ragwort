@@ -145,7 +145,9 @@ impl Stack {
 
     pub fn segment<'gc>(&self, mc: &Mutation<'gc>) -> Gc<'gc, Segment<'gc>> {
         assert_eq!(self.arena, mc.heap.id, "stack belongs to a different arena");
-        Member::from_offset(self.record.segment.get()).get(mc)
+        // SAFETY: [refs, stacks] the record holds its segment's offset, which the collector traces
+        // and rewrites when the segment moves, and the stack belongs to this arena.
+        unsafe { Member::from_offset(self.record.segment.get()) }.get(mc)
     }
 
     /// Where the frames this stack can write start.

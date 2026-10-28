@@ -89,16 +89,21 @@ impl<'gc> Value<'gc> {
     pub const MIN_FIXNUM: i64 = i64::MIN >> 1;
     pub const MAX_FIXNUM: i64 = i64::MAX >> 1;
 
-    const fn from_word(word: u64) -> Self {
+    /// A word that holds no reference: a fixnum, flonum, char or constant.
+    const fn immediate(word: u64) -> Self {
+        debug_assert!(word & REFERENCE != OBJECT, "an immediate with a reference tag");
+        Self { word, _brand: PhantomData }
+    }
+
+    /// # Safety
+    /// A word with a reference tag must be a live object's reference word in this arena, as
+    /// [`AnyRef::from_word`] requires, with the object or boxed tag.
+    const unsafe fn from_word(word: u64) -> Self {
         Self { word, _brand: PhantomData }
     }
 
     const fn constant(id: u32) -> Self {
-        Self::from_word((id as u64) << 32 | CONSTANT)
-    }
-
-    const fn tagged(tag: u64, payload: u32) -> Self {
-        Self::from_word((payload as u64) << 32 | tag)
+        Self::immediate((id as u64) << 32 | CONSTANT)
     }
 
     const fn payload(self) -> u32 {
@@ -106,14 +111,19 @@ impl<'gc> Value<'gc> {
     }
 
     /// The reference word with the object tag, whichever reference tag the value has.
-    fn reference(self) -> AnyRef<'gc> {
-        AnyRef::from_word(self.word & !TAG | OBJECT)
+    ///
+    /// # Safety
+    /// The value must hold a reference: its tag is the object or boxed tag.
+    unsafe fn reference(self) -> AnyRef<'gc> {
+        // SAFETY: [refs] the value holds a live object's reference word, and the two reference
+        // tags differ only in bits the object tag replaces.
+        unsafe { AnyRef::from_word(self.word & !TAG | OBJECT) }
     }
 
     /// `None` outside `MIN_FIXNUM..=MAX_FIXNUM`.
     pub const fn fixnum(n: i64) -> Option<Self> {
         match n >= Self::MIN_FIXNUM && n <= Self::MAX_FIXNUM {
-            true => Some(Self::from_word((n << 1) as u64)),
+            true => Some(Self::immediate((n << 1) as u64)),
             false => None,
         }
     }
@@ -123,7 +133,7 @@ impl<'gc> Value<'gc> {
     }
 
     pub const fn char(c: char) -> Self {
-        Self::tagged(CHAR, c as u32)
+        Self::immediate((c as u64) << 32 | CHAR)
     }
 
     pub fn object<T>(mc: &Mutation<'gc>, gc: Gc<'gc, T>) -> Self {
@@ -138,10 +148,12 @@ impl<'gc> Value<'gc> {
     #[inline]
     pub fn flonum(mc: &Mutation<'gc>, f: f64) -> Result<Self, OutOfMemory> {
         match encode(f) {
-            Some(word) => Ok(Self::from_word(word)),
+            Some(word) => Ok(Self::immediate(word)),
             None => {
                 let boxed = AnyRef::new(mc, mc.alloc(Boxed(f))?);
-                Ok(Self::from_word(boxed.to_bits() & !TAG | BOXED))
+                // SAFETY: [refs] the new box's reference word, with the boxed tag in place of the
+                // object tag.
+                Ok(unsafe { Self::from_word(boxed.to_bits() & !TAG | BOXED) })
             }
         }
     }
@@ -149,7 +161,7 @@ impl<'gc> Value<'gc> {
     /// The double as a value without allocating, if it fits in the word.
     #[inline]
     pub fn inline_flonum(f: f64) -> Option<Self> {
-        encode(f).map(Self::from_word)
+        encode(f).map(Self::immediate)
     }
 
     pub const fn is_true(self) -> bool {
@@ -177,7 +189,8 @@ impl<'gc> Value<'gc> {
         if self.word & 0b11 == 0b11 {
             Some(decode(self.word))
         } else if self.word & TAG == BOXED {
-            Some(self.reference().downcast::<Boxed>(mc).map_or(f64::NAN, |b| b.0))
+            // SAFETY: [refs] the boxed tag was just checked.
+            Some(unsafe { self.reference() }.downcast::<Boxed>(mc).map_or(f64::NAN, |b| b.0))
         } else {
             None
         }
@@ -196,7 +209,8 @@ impl<'gc> Value<'gc> {
     }
 
     pub fn as_object(self) -> Option<AnyRef<'gc>> {
-        (self.word & TAG == OBJECT).then(|| self.reference())
+        // SAFETY: [refs] the object tag was just checked.
+        (self.word & TAG == OBJECT).then(|| unsafe { self.reference() })
     }
 
     /// Whether the value is an object of type `T`.
@@ -222,7 +236,8 @@ impl<'gc> Value<'gc> {
             return Unpacked::Flonum(f);
         }
         match self.word & TAG {
-            OBJECT => Unpacked::Object(self.reference()),
+            // SAFETY: [refs] the arm matched the object tag.
+            OBJECT => Unpacked::Object(unsafe { self.reference() }),
             CHAR => Unpacked::Char(char::from_u32(self.payload()).unwrap_or(char::REPLACEMENT_CHARACTER)),
             _ => match self {
                 Self::FALSE => Unpacked::Bool(false),
@@ -241,7 +256,7 @@ impl<'gc> Value<'gc> {
         if (self.word | other.word) & 1 != 0 {
             return None;
         }
-        (self.word as i64).checked_add(other.word as i64).map(|w| Self::from_word(w as u64))
+        (self.word as i64).checked_add(other.word as i64).map(|w| Self::immediate(w as u64))
     }
 
     #[inline]
@@ -249,7 +264,7 @@ impl<'gc> Value<'gc> {
         if (self.word | other.word) & 1 != 0 {
             return None;
         }
-        (self.word as i64).checked_sub(other.word as i64).map(|w| Self::from_word(w as u64))
+        (self.word as i64).checked_sub(other.word as i64).map(|w| Self::immediate(w as u64))
     }
 
     #[inline]
@@ -258,7 +273,7 @@ impl<'gc> Value<'gc> {
         if !other.is_fixnum() {
             return None;
         }
-        n.checked_mul(other.word as i64).map(|w| Self::from_word(w as u64))
+        n.checked_mul(other.word as i64).map(|w| Self::immediate(w as u64))
     }
 
     /// The word. Object offsets in it only hold until the step ends.
@@ -271,7 +286,8 @@ impl<'gc> Value<'gc> {
     /// [`Value::to_bits`] in the same arena, in the same step. Other bits are always valid.
     #[cfg(test)]
     pub(crate) const unsafe fn from_bits(bits: u64) -> Self {
-        Self::from_word(bits)
+        // SAFETY: [refs] passed on to the caller.
+        unsafe { Self::from_word(bits) }
     }
 }
 
@@ -295,7 +311,8 @@ impl From<char> for Value<'_> {
 
 impl<'gc> From<AnyRef<'gc>> for Value<'gc> {
     fn from(r: AnyRef<'gc>) -> Self {
-        Self::from_word(r.to_bits())
+        // SAFETY: [refs] an `AnyRef` holds a live object's reference word.
+        unsafe { Self::from_word(r.to_bits()) }
     }
 }
 
