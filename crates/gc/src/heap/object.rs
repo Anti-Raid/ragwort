@@ -54,6 +54,13 @@ impl Heap {
     /// The allocated object whose header is exactly at `offset`.
     #[inline]
     pub(super) fn object_at(&self, offset: u32) -> Option<Obj> {
+        self.locate(offset).map(|(obj, _)| obj)
+    }
+
+    /// [`Heap::object_at`], with the start bits from the object's up to the end of their word,
+    /// the object's own as the lowest.
+    #[inline]
+    fn locate(&self, offset: u32) -> Option<(Obj, u64)> {
         let offset = offset as usize;
         if !offset.is_multiple_of(GRANULE) {
             return None;
@@ -67,16 +74,58 @@ impl Heap {
             _ => return None,
         };
         let granule = in_page / GRANULE;
-        p.start.get(granule).then_some(Obj { offset: offset as u32, page, granule, room })
+        let starts = p.start.from(granule);
+        (starts & 1 != 0).then_some((Obj { offset: offset as u32, page, granule, room }, starts))
     }
 
     /// The object's size, checked against its type and the space it can occupy.
     #[inline]
     pub(super) fn size_of(&self, obj: Obj) -> Option<(&'static VTable, usize)> {
+        let (vtable, size) = self.claimed(obj)?;
+        (size <= obj.room).then_some((vtable, size))
+    }
+
+    /// The object's vtable and the size its header claims, unchecked.
+    #[inline]
+    fn claimed(&self, obj: Obj) -> Option<(&'static VTable, usize)> {
         let header = self.header(obj);
         let vtable = self.vtable(header.ty)?;
-        let size = (vtable.size)(header)?;
-        (size <= obj.room).then_some((vtable, size))
+        Some((vtable, (vtable.size)(header)?))
+    }
+
+    /// The object at `offset`, its vtable and its size, for the collector's views of it. With
+    /// `gc-hardened`, they're [`Heap::checked_view`]'s.
+    #[inline]
+    pub(super) fn view_at(&self, offset: u32) -> Option<(Obj, &'static VTable, usize)> {
+        if cfg!(feature = "gc-hardened") {
+            return self.checked_view(offset);
+        }
+        let obj = self.object_at(offset)?;
+        let (vtable, size) = self.size_of(obj)?;
+        Some((obj, vtable, size))
+    }
+
+    /// [`Heap::view_at`], with the size also checked against where the next object starts,
+    /// which the page records outside the region. A damaged header can then only claim the
+    /// object's own bytes, and no view of it overlaps another object.
+    #[inline]
+    pub(super) fn checked_view(&self, offset: u32) -> Option<(Obj, &'static VTable, usize)> {
+        let (obj, starts) = self.locate(offset)?;
+        let (vtable, size) = self.claimed(obj)?;
+        // The granules the start-bit word shows are the object's own: up to the next start, or
+        // the word's end, which is never past the page's. Beyond them, it's checked further.
+        let own = ((starts & !1).trailing_zeros() as usize).min(64 - obj.granule % 64);
+        (size <= own * GRANULE || self.fits_far(obj, size)).then_some((obj, vtable, size))
+    }
+
+    /// [`Heap::checked_view`]'s check for an object whose granules go past their start-bit word. A
+    /// large page's object, alone in its pages, only needs to fit them.
+    #[cold]
+    #[inline(never)]
+    fn fits_far(&self, obj: Obj, size: usize) -> bool {
+        let p = self.page(obj.page);
+        size <= obj.room
+            && (p.kind.get() != Kind::Lines || !p.start.any_in(obj.granule + 1, obj.granule + size.div_ceil(GRANULE)))
     }
 
     /// The check for a reference to the object at `offset`.
@@ -118,14 +167,13 @@ impl Heap {
     /// use. The mutator can't: collections hold the heap mutably.
     #[allow(clippy::mut_from_ref)]
     pub(crate) unsafe fn items_mut<T: Inline>(&self, offset: u32, _: &Collecting) -> Option<&mut [T::Item]> {
-        let obj = self.object_at(offset)?;
-        let (vtable, _) = self.size_of(obj)?;
+        let (_, vtable, _) = self.view_at(offset)?;
         let id: fn() -> TypeId = layout::type_id::<T>;
         if !(ptr::fn_addr_eq(vtable.type_id, id) || (vtable.type_id)() == id()) {
             return None;
         }
-        // SAFETY: [steps, alias] the vtable is `T`'s, so the header starts a `T`, and `size_of`
-        // checked that its items fit in the object. The caller holds no other view of it, and the
+        // SAFETY: [steps, alias, headers, extents] the vtable is `T`'s, so the header starts a
+        // `T`, and its items are the object's. The caller holds no other view of it, and the
         // `Collecting` token means no step does.
         unsafe { Some(&mut *Object::<T>::at(self.header_ptr(offset)).items()) }
     }
@@ -144,20 +192,11 @@ impl Heap {
         (self.vtable(header.ty)?.size)(header)
     }
 
-    /// The region offsets of the object at `offset`. They end where the page metadata says the
-    /// next object starts, or its page run ends, so a damaged header can't stretch them over
-    /// another object.
+    /// The region offsets of the object at `offset`, or `None` if its header claims more than
+    /// its own bytes.
     pub(crate) fn object_span(&self, offset: u32) -> Option<Range<usize>> {
-        let obj = self.object_at(offset)?;
-        let (_, size) = self.size_of(obj)?;
-        let (start, mut end) = (offset as usize, offset as usize + size);
-        let p = self.page(obj.page);
-        if p.kind.get() == Kind::Lines
-            && let Some(next) = p.start.next(obj.granule + 1)
-        {
-            end = end.min(obj.page.granule(next) as usize);
-        }
-        Some(start..end)
+        let (_, _, size) = self.checked_view(offset)?;
+        Some(offset as usize..offset as usize + size)
     }
 
     #[cfg(test)]

@@ -17,7 +17,8 @@ Other crates can't add such impls. They forbid unsafe code through the workspace
 which belongs to the gc's trusted code.
 
 Damaged memory, from a bug in this crate or from unsafe code elsewhere, is outside the claim.
-[Defense in depth](#defense-in-depth) covers what the crate does about it anyway.
+[Defense in depth](#defense-in-depth) covers what the crate does about it anyway, and
+[damaged memory](#damaged-memory) how far that goes.
 
 ## Invariants
 
@@ -95,9 +96,10 @@ allocation wrote, so `ty` is its type and `len` its item count.
 - Forwarded headers exist only during the atomic phase. If it unwinds, the arena is corrupted
   and refuses steps ([unwind](#unwind)).
 
-Relied on by `Object::len` and `items`, and so `Gc::items` and `InlineVTable::trace_range`: the
-items are exactly the object's, and the `max_items` cap is only a backstop. Also by `Batch`,
-through `object_span`.
+Relied on by `Object::len` and `items`, and so `Gc::items`, and by the collector's views
+(`trace_with`, `items_mut`): the items are exactly the object's, and the `max_items` cap is only
+a backstop. `Batch`, and with `gc-hardened` the collector, don't rely on it, since
+[extents](#extents) bounds their views.
 
 ### memory
 
@@ -139,11 +141,35 @@ its header, and no step's references exist.
 - `Building` writes new objects into memory `reserve` just took from free lines or pages, which
   no reference reaches. `alloc_inline_with`'s `init` gets `&mut` to the new items before any
   `Gc` to them exists.
-- In a collection, `trace_with` and `items_mut` take `&mut` to one object at a time. The tracer
-  reads other headers by value through raw pointers, so tracing an object that refers to itself
-  doesn't alias the `&mut`.
+- In a collection, `trace_with` and `items_mut` take `&mut` to one object at a time, within its
+  own bytes ([headers](#headers), and with `gc-hardened` also [extents](#extents)). The tracer reads other headers by value through raw
+  pointers, so tracing an object that refers to itself doesn't alias the `&mut`.
 
 Relied on by `Gc::as_ref`, `items`, `Building`, the vtables' `trace`, and `items_mut`.
+
+### extents
+
+Every span a `Batch` writes without the barrier, and with the `gc-hardened` feature every view
+the collector takes of an object, stays within that object's own bytes, whatever its header
+claims. The feature costs about 10% on collections, so it's off by default.
+
+- Start bits are page metadata, outside the region. `reserve` sets an object's, and `release`,
+  sweeping and evacuation clear it when the object goes, so they mark exactly the allocated
+  objects.
+- `checked_view` checks the size the header claims, which bounds the value and the items,
+  against the next start bit after the object, or against its page run for a large object.
+  `object_span` always uses it, and `view_at` does with `gc-hardened`. When the size doesn't
+  fit, `trace_object` marks the arena corrupted instead of tracing, `items_mut` returns `None`,
+  and `object_span` returns `None`, so a `Batch` takes the barrier for every store.
+- The collector's views only come from `view_at`: `trace_with`, `items_mut` and `gc-verify`'s
+  trace. Plain `size_of`, bounded only by the page run, is for what takes no view: counting
+  the lines marking keeps, and compaction's copy, which only reads the old bytes through raw
+  pointers into memory just reserved for it.
+
+`a_damaged_header_cant_stretch_a_batch` and, with the feature,
+`a_damaged_length_cant_stretch_a_trace` damage a length so it covers a neighbor.
+
+Relied on by [alias](#alias), the vtables' `trace`, `items_mut`, and `Batch`.
 
 ### reach
 
@@ -270,16 +296,27 @@ The argument doesn't need these. They contain bugs and damaged memory:
 - **Check bits.** References carry the type and stamp of their object's header (`Check`).
   Downcasts and the tracer compare them, and a mismatch marks the arena corrupted. Builds with
   `test` or `gc-verify` also wipe dead headers, so stale references always fail.
-- **Validation.** Collector code looks objects up through `object_at` and `size_of`, which check
-  the page metadata, start bits and sizes against the room an object has.
+- **Validation.** Collector code looks objects up through `object_at`, `size_of` and `view_at`,
+  which check the page metadata, start bits and sizes against the object's own bytes.
 - **Caps.** Offsets are masked and `Object::len` caps lengths at `max_items`, so a damaged
   reference or header still reads inside the reservation ([memory](#memory)), as some valid
   value ([plain](#plain)).
 - **`gc-verify`.** After marking and after compaction, it checks that everything reachable is
   marked and that no reference was left pointing at an old copy.
 
-They keep damage inside the region, but don't make it sound: a damaged length can make one
-object's items overlap another object, which breaks [alias](#alias).
+### Damaged memory
+
+The model: between any two operations, the region's bytes, headers included, may hold
+anything. What lies outside it is trusted: the page table with its start, mark and line bits,
+the vtables, the host table, and the root and stack tables. Under that model:
+
+- With `gc-hardened`, collections stay sound. Their views are bounded by trusted start bits
+  ([extents](#extents)), every bit pattern is a valid value ([plain](#plain)), offsets are
+  masked ([memory](#memory)), and other headers are only read by value. Without it, a damaged
+  length can stretch a traced object's `&mut` over its neighbors.
+- Steps don't yet. A damaged length, or a damaged reference whose check bits happen to match,
+  can make a `&T` or `&[Item]` from a `Gc` cover another object, whose cells the step may then
+  write. That breaks [alias](#alias).
 
 ## Assumptions
 
@@ -312,5 +349,7 @@ the primitives, covered by [stacks](#stacks). The VM should still:
 ## Open
 
 - Kani harnesses for the arithmetic the unsafe code relies on: `PageIndex::overlapping`,
-  `page_of`, `Bits::next`, `object_span`, `max_items`, `inline_size`, and the `Batch` bounds
+  `page_of`, `Bits::any_in`, `view_at`, `max_items`, `inline_size`, and the `Batch` bounds
   check.
+- Steps under [damaged memory](#damaged-memory): reads that borrow a token and writes by handle
+  instead of through `&T`, so no step's view can overlap a write.

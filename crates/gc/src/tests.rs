@@ -2375,8 +2375,8 @@ fn batch_retraces_after_a_panic() {
     check_moved(&mut arena, 52);
 }
 
-/// A batch's span ends where the page metadata says the next object starts, whatever the
-/// header claims.
+/// A header claiming more than the object's extent gives a batch no span, so the batch takes
+/// the barrier for every store rather than reaching into the next object.
 #[test]
 fn a_damaged_header_cant_stretch_a_batch() {
     let mut arena = unit_arena(1 << 20);
@@ -2385,9 +2385,14 @@ fn a_damaged_header_cant_stretch_a_batch() {
         let second = mc.alloc_inline(Slots(PhantomData), 4, |_| Lock::new(None)).unwrap();
         let (a, b) = (offset(mc, first), offset(mc, second));
         assert_eq!(mc.heap.object_span(a as u32), Some(a..b));
+        let slot = &first.items()[0];
         // SAFETY: no reference into the object is used after the write.
         unsafe { (*mc.heap.header_of(a as u32)).len = 1000 };
-        assert_eq!(mc.heap.object_span(a as u32), Some(a..b));
+        assert_eq!(mc.heap.object_span(a as u32), None);
+        // With no span the batch takes the barrier for every store, and the neighbor is untouched.
+        let n = node(mc, 1, None).unwrap();
+        mc.batch(first, |b| b.set(slot, Some(Member::new(mc, n))));
+        assert!(second.items().iter().all(|s| s.get().is_none()));
     }).unwrap();
 }
 
@@ -2510,4 +2515,25 @@ fn public_max_items_matches_allocation() {
     assert_eq!(max_items::<Words>(), layout::max_items::<Words>());
     assert!(!layout::fits_inline::<PageHead>());
     assert_eq!(max_items::<PageHead>(), 0);
+}
+
+/// A header claiming more than its object's extent stops the collection at that object, which
+/// isn't traced over its neighbor, and closes the arena.
+#[cfg(feature = "gc-hardened")]
+#[test]
+fn a_damaged_length_cant_stretch_a_trace() {
+    let mut arena = slots_arena(1 << 20, 2);
+    let first = arena.mutate(|mc, root| {
+        let first = root.load(mc).unwrap();
+        let neighbor = mc.alloc_inline(Slots(PhantomData), 2, |_| Lock::new(None)).unwrap();
+        slot_items(neighbor)[0].set(mc, Some(Member::new(mc, node(mc, 1, None).unwrap())));
+        assert_eq!(offset(mc, neighbor), offset(mc, first) + HEADER + 8, "the objects are neighbors");
+        assert_eq!(mc.heap.object_span(offset(mc, first) as u32), Some(offset(mc, first)..offset(mc, neighbor)));
+        offset(mc, first)
+    }).unwrap();
+    // SAFETY: no step is running, so nothing borrows the header.
+    unsafe { (*arena.heap().header_of(first as u32)).len = 6 };
+    arena.collect();
+    assert!(arena.metrics().corrupted);
+    assert_eq!(arena.mutate(|_, _| ()), Err(Corrupted));
 }

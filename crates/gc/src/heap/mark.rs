@@ -105,11 +105,7 @@ impl Heap {
 
     /// Traces an object's contents, or only what overlaps `range` of it. Returns its size.
     pub(super) fn trace_object(&self, offset: u32, mode: Mode, range: Option<(usize, usize)>) -> usize {
-        let Some(obj) = self.object_at(offset) else {
-            self.corrupt();
-            return 0;
-        };
-        let Some((vtable, size)) = self.size_of(obj) else {
+        let Some((obj, vtable, size)) = self.view_at(offset) else {
             self.corrupt();
             return 0;
         };
@@ -117,8 +113,10 @@ impl Heap {
         size
     }
 
-    /// The vtable matches the object's header and its size fits where it sits. Collections
-    /// only run between steps, when nothing borrows arena memory, so tracing may take `&mut`.
+    /// The object and vtable come from [`Heap::view_at`], so the vtable matches the header, and
+    /// the size it claims stays within the object's own bytes ([headers, extents] in
+    /// SOUNDNESS.md). Collections only run between steps, when nothing borrows arena memory, so
+    /// tracing may take `&mut`.
     pub(super) fn trace_with(&self, obj: Obj, vtable: &VTable, range: Option<(usize, usize)>, t: &mut Tracer<'_>) {
         let header = self.header_ptr(obj.offset);
         match range {

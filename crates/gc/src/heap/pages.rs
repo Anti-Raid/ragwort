@@ -137,7 +137,13 @@ pub(super) struct Bits<const N: usize>([Cell<u64>; N]);
 impl<const N: usize> Bits<N> {
     #[inline]
     pub(super) fn get(&self, i: usize) -> bool {
-        self.0[i / 64].get() >> (i % 64) & 1 != 0
+        self.from(i) & 1 != 0
+    }
+
+    /// The bits of `i`'s word from `i` up, with `i` as the lowest.
+    #[inline]
+    pub(super) fn from(&self, i: usize) -> u64 {
+        self.0[i / 64].get() >> (i % 64)
     }
 
     #[inline]
@@ -193,18 +199,21 @@ impl<const N: usize> Bits<N> {
         self.0.iter().all(|w| w.get() == !0)
     }
 
-    /// The lowest set bit at or above `i`.
+    /// Whether any bit in `from..to` is set. Both must be within the bitmap.
     #[inline]
-    pub(super) fn next(&self, i: usize) -> Option<usize> {
-        let mut w = i / 64;
-        let mut word = self.0.get(w)?.get() & (u64::MAX << (i % 64));
-        loop {
-            if word != 0 {
-                return Some(w * 64 + word.trailing_zeros() as usize);
-            }
-            w += 1;
-            word = self.0.get(w)?.get();
+    pub(super) fn any_in(&self, from: usize, to: usize) -> bool {
+        if from >= to {
+            return false;
         }
+        let (first, last) = (from / 64, (to - 1) / 64);
+        let low = u64::MAX << (from % 64);
+        let high = u64::MAX >> (63 - (to - 1) % 64);
+        if first == last {
+            return self.0[first].get() & low & high != 0;
+        }
+        self.0[first].get() & low != 0
+            || self.0[first + 1..last].iter().any(|w| w.get() != 0)
+            || self.0[last].get() & high != 0
     }
 
     /// The highest set bit at or below `i`.

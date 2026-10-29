@@ -126,10 +126,12 @@ pub(crate) struct VTable {
     pub(crate) type_id: fn() -> TypeId,
     pub(crate) needs_trace: bool,
     /// Traces the object. Safety: `header` starts an object of this vtable's type, which
-    /// nothing else references while it runs. The same goes for `trace_range`.
+    /// nothing else references while it runs, and `size` of the header doesn't reach past the
+    /// object's own bytes. The same goes for `trace_range`.
     pub(crate) trace: unsafe fn(*mut Header, &mut Tracer<'_>),
     /// Traces only what overlaps bytes `from..to` of the object, counted from its header.
     pub(crate) trace_range: unsafe fn(*mut Header, usize, usize, &mut Tracer<'_>),
+    /// The size the header claims. It bounds every view `trace` and `items` take of the object.
     pub(crate) size: fn(Header) -> Option<usize>,
 }
 
@@ -272,7 +274,8 @@ impl<T: Trace> SizedVTable<T> {
     };
 
     unsafe fn trace(header: *mut Header, t: &mut Tracer<'_>) {
-        // SAFETY: the caller vouches that the header starts a `T` nothing else references.
+        // SAFETY: the caller vouches that the header starts a `T` nothing else references, with
+        // `size` bytes of its own, which hold the value.
         unsafe { (*Object::<T>::at(header).value()).trace(t) }
     }
 
@@ -303,9 +306,9 @@ impl<T: Inline> InlineVTable<T> {
     }
 
     unsafe fn trace_range(header: *mut Header, from: usize, to: usize, t: &mut Tracer<'_>) {
-        // SAFETY: [alias, headers] the caller matched this vtable to the header, and nothing else
-        // references the object. The value and the items don't overlap, and the items are the
-        // object's.
+        // SAFETY: [alias, headers, extents] the caller matched this vtable to the header, and
+        // nothing else references the object. The value and the items don't overlap, and the
+        // items, capped below the length `size` counts, are within the object's own bytes.
         let (value, items) = unsafe {
             let object = Object::<T>::at(header);
             (&mut *object.value(), &mut *object.items())

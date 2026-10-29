@@ -14,3 +14,6 @@ libc = { version = "0.2", optional = true }
 default = ["mmap"]
 mmap = ["dep:memmap2", "dep:libc"]
 gc-verify = []
+# Bounds every view the collector takes by the page metadata, so a damaged header closes the
+# arena instead of reaching into another object. About 10% on collections.
+gc-hardened = []

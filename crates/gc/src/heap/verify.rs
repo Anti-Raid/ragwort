@@ -55,10 +55,9 @@ impl Heap {
             if self.corrupted.get() {
                 return;
             }
-            let Some(obj) = self.object_at(offset) else { return self.corrupt() };
+            let Some((obj, vtable, _)) = self.view_at(offset) else { return self.corrupt() };
             assert!(self.is_marked(obj), "gc verify: reachable object {offset:#x} is not marked");
             assert!(!self.moved(offset), "gc verify: reachable object {offset:#x} was moved");
-            let Some((vtable, _)) = self.size_of(obj) else { return self.corrupt() };
             self.trace_with(obj, vtable, None, &mut Tracer::verifying(self, &mut v));
         }
     }
