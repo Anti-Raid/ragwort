@@ -72,6 +72,7 @@ dependencies = [
 name = "ragwort-gc-words"
 version = "0.1.0"
 dependencies = [
+ "ragwort-derive",
  "ragwort-gc-region",
 ]
 

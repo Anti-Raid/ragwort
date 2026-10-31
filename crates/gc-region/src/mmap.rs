@@ -30,28 +30,28 @@ impl Backing {
         unsafe { std::slice::from_raw_parts(self.map.as_mut_ptr().cast::<Cell<u64>>(), self.len) }
     }
 
-    pub(crate) fn release(&mut self, range: Range<usize>) {
-        let Some(page) = os_page() else { return };
+    pub(crate) fn release(&mut self, range: Range<usize>) -> Range<usize> {
+        let Some(page) = os_page() else { return 0..0 };
         let lo = (range.start.min(self.len) * 8).next_multiple_of(page);
         let hi = range.end.min(self.len) * 8 / page * page;
-        if lo >= hi {
-            return;
+        if lo >= hi || !self.free_pages(lo, hi - lo) {
+            return 0..0;
         }
-        self.free_pages(lo, hi - lo);
+        lo / 8..hi / 8
     }
 
-    /// Frees the pages now, leaving zeroed ones in their place.
+    /// Frees the pages now, leaving zeroed ones in their place. Returns whether it did.
     #[cfg(not(target_vendor = "apple"))]
-    fn free_pages(&mut self, offset: usize, len: usize) {
+    fn free_pages(&mut self, offset: usize, len: usize) -> bool {
         // SAFETY: `&mut self` means no view of the words is alive. The pages stay mapped and
         // read back as zero, or as they were if the advice fails; `u64`s either way.
-        let _ = unsafe { self.map.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, offset, len) };
+        unsafe { self.map.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, offset, len) }.is_ok()
     }
 
     /// macOS keeps anonymous pages after `DontNeed`, and pages marked reusable need another
     /// call before they're written again, so fresh zeroed pages are mapped over them instead.
     #[cfg(target_vendor = "apple")]
-    fn free_pages(&mut self, offset: usize, len: usize) {
+    fn free_pages(&mut self, offset: usize, len: usize) -> bool {
         let at = self.map.as_mut_ptr().wrapping_add(offset);
         let flags = libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED;
         // SAFETY: `&mut self` means no view of the words is alive, and the range is whole OS
@@ -62,6 +62,7 @@ impl Backing {
             // readable.
             std::process::abort();
         }
+        true
     }
 
     pub(crate) fn releases() -> bool {

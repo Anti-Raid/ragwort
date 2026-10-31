@@ -1,14 +1,10 @@
 use super::*;
 
-/// A boxed number, so whether it's alive can be seen.
-struct Num;
-impl Object for Num {
-    const DESC: Desc = Desc::of::<Num>(1);
-}
-
-struct Pair;
-impl Object for Pair {
-    const DESC: Desc = Desc::of::<Pair>(2).values(0b11);
+objects! {
+    kind Kind;
+    /// A boxed number, so whether it's alive can be seen.
+    struct Num { n: i64 }
+    struct Pair { car: Value, cdr: Value }
 }
 
 fn arena() -> Arena {
@@ -16,11 +12,11 @@ fn arena() -> Arena {
 }
 
 fn num<'gc>(mc: &Mutation<'gc>, n: i64) -> Value<'gc> {
-    Value::object(mc, mc.alloc::<Num, 1>([n as u64]).unwrap())
+    Value::object(mc, Num::new(mc, n).unwrap())
 }
 
 fn read<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> Option<i64> {
-    Some(v.downcast::<Num>(mc)?.word(mc, 0) as i64)
+    Some(v.downcast::<Num>(mc)?.n(mc))
 }
 
 /// Objects alive after the last sweep.
@@ -107,7 +103,7 @@ fn frame_writes_while_marking_are_traced_before_the_cycle_ends() {
     let stack = new_stack(&mut arena, 512);
     let segment = segment_index(&mut arena, &stack);
     arena.mutate(|mc| {
-        let pair = mc.alloc::<Pair, 2>([num(mc, 7).to_bits(), Value::object(mc, stack.segment(mc)).to_bits()]).unwrap();
+        let pair = Pair::new(mc, num(mc, 7), Value::object(mc, stack.segment(mc))).unwrap();
         mc.set_root(0, Value::object(mc, pair));
     });
     arena.collect();
@@ -119,8 +115,8 @@ fn frame_writes_while_marking_are_traced_before_the_cycle_ends() {
     assert!(arena.meta.work.borrow().gray.contains(&pair), "the pair was traced first");
     arena.mutate(|mc| {
         let pair = mc.root(0).downcast::<Pair>(mc).unwrap();
-        stack.frame(mc, 0).unwrap().set(0, pair.value(mc, 0));
-        pair.set_value(mc, 0, Value::VOID);
+        stack.frame(mc, 0).unwrap().set(0, pair.car(mc));
+        pair.set_car(mc, Value::VOID);
     });
     arena.collect_slice(usize::MAX);
     assert_eq!(arena.phase(), Phase::Idle);
@@ -255,7 +251,7 @@ fn frame_writes_while_marking_are_fixed_by_evacuation() {
     let mut arena = arena();
     let stack = new_stack(&mut arena, 512);
     arena.mutate(|mc| {
-        let pair = mc.alloc::<Pair, 2>([num(mc, 5).to_bits(), Value::object(mc, stack.segment(mc)).to_bits()]).unwrap();
+        let pair = Pair::new(mc, num(mc, 5), Value::object(mc, stack.segment(mc))).unwrap();
         mc.set_root(0, Value::object(mc, pair));
     });
     arena.collect();
@@ -263,7 +259,7 @@ fn frame_writes_while_marking_are_fixed_by_evacuation() {
     arena.collect_slice(1);
     arena.mutate(|mc| {
         let pair = mc.root(0).downcast::<Pair>(mc).unwrap();
-        stack.frame(mc, 0).unwrap().set(3, pair.value(mc, 0));
+        stack.frame(mc, 0).unwrap().set(3, pair.car(mc));
     });
     arena.collect_slice(usize::MAX);
     arena.set_evacuate_all(false);
@@ -271,7 +267,7 @@ fn frame_writes_while_marking_are_fixed_by_evacuation() {
     assert_eq!(frame_values(&mut arena, &stack, 0, 4)[3], Some(5));
     arena.mutate(|mc| {
         let pair = mc.root(0).downcast::<Pair>(mc).unwrap();
-        assert!(stack.frame(mc, 0).unwrap().get(3) == pair.value(mc, 0));
+        assert!(stack.frame(mc, 0).unwrap().get(3) == pair.car(mc));
     });
 }
 
@@ -435,8 +431,8 @@ fn random_stack_traffic_under_stress() {
                     1 => {
                         let segment = Segment::new(mc, LEN).unwrap();
                         stack.switch(mc, segment);
-                        let list = [Value::object(mc, segment).to_bits(), mc.root(0).to_bits()];
-                        mc.set_root(0, Value::object(mc, mc.alloc::<Pair, 2>(list).unwrap()));
+                        let list = Pair::new(mc, Value::object(mc, segment), mc.root(0)).unwrap();
+                        mc.set_root(0, Value::object(mc, list));
                         live = vec![None; LEN];
                         captured.push(Vec::new());
                     }
@@ -472,7 +468,7 @@ fn random_stack_traffic_under_stress() {
                 let mut list = mc.root(0);
                 for want in captured.iter().rev() {
                     let (segment, rest) = match list.downcast::<Pair>(mc) {
-                        Some(pair) => (pair.value(mc, 0), pair.value(mc, 1)),
+                        Some(pair) => (pair.car(mc), pair.cdr(mc)),
                         None => (list, Value::NIL),
                     };
                     let slots = segment.downcast::<Segment>(mc).unwrap().slots(mc);

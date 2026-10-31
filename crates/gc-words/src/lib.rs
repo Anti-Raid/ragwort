@@ -10,9 +10,116 @@
 //! through `ragwort-gc-region`, which holds the only unsafe code. Memory is counted against a
 //! budget with a reserve, as in `ragwort-gc`, and VM stacks have its segments, continuation
 //! capture and parking.
+//!
+//! # Typed objects
+//!
+//! [`objects!`] declares a group of types. Each field names what it holds, and the macro
+//! derives the collector's description from that, so the two can't disagree:
+//!
+//! ```
+//! use ragwort_gc_words::*;
+//!
+//! objects! {
+//!     /// Every type the program allocates.
+//!     pub kind Kind;
+//!
+//!     pub struct Pair { car: Value, cdr: Value }
+//!     pub struct Node { n: i64, next: Member<Node>, cache: Weak<Node> }
+//!     pub struct Labelled { label: Host<String>, flags: u32 }
+//!     pub struct Vector {} items Value
+//! }
+//!
+//! let mut arena = Arena::new(1 << 20, 1);
+//! arena.mutate(|mc| {
+//!     let p = Pair::new(mc, Value::NIL, Value::TRUE).unwrap();
+//!     assert_eq!(p.cdr(mc), Value::TRUE);
+//!     p.set_car(mc, Value::fixnum(1).unwrap());
+//!     assert_eq!(p.get(mc, Pair::CAR), Value::fixnum(1).unwrap());
+//!
+//!     let tail = Node::new(mc, 2, None, None).unwrap();
+//!     let head = Node::new(mc, 1, Some(tail), None).unwrap();
+//!     assert_eq!(head.next(mc).map(|n| n.n(mc)), Some(2));
+//!
+//!     let v = Vector::new(mc, 3, Value::NIL).unwrap();
+//!     v.items(mc).set(mc, 0, Value::object(mc, p));
+//!
+//!     match Kind::of(v.items(mc).get(0)) {
+//!         Some(Kind::Pair(p)) => assert_eq!(p.cdr(mc), Value::TRUE),
+//!         _ => unreachable!(),
+//!     }
+//! });
+//! ```
+//!
+//! For each `struct` it generates:
+//! - a unit struct implementing [`Object`];
+//! - a [`Field`] constant per field, named in capitals (`Pair::CAR`), for [`Gc::get`] and
+//!   [`Gc::set`];
+//! - `new(mc, fields…)`, which also takes a length and fill value for `items Value` or a word
+//!   type, and an entry count for `items Ephemeron`;
+//! - a trait `PairFields` for `Gc<Pair>`, with a getter and a `set_` setter per field, and
+//!   `items` when the type has value or word items.
+//!
+//! A field holds a `Value`, a word (`u64`, `i64`, `u32`, `f64` or `bool`), a `Member<T>`, a
+//! `Weak<T>`, a `Host<T>` or an `Ephemeron`. Writes take the barrier their kind needs, and a
+//! member or weak read checks that the target has the type the field declares.
+//!
+//! The group's enum, `Kind` here, has a variant per type. `Kind::of(value)` reads the type
+//! number the value carries, so it needs no memory read. Types get fixed numbers from
+//! `Kind::BASE`, in declaration order. Groups used in one arena mustn't overlap: declare the
+//! second `kind Extra after Kind;`. If they overlap, the first allocation of a clashing type
+//! panics. `kind Name at N;` starts the group at `N` instead.
+//!
+//! Fields can't take a name that a method of `Gc` or a constructor parameter uses. The raw API
+//! beneath, fields by number, is in the hidden `raw` module.
+//!
+//! What doesn't compile: storing an object of the wrong type,
+//!
+//! ```compile_fail
+//! # use ragwort_gc_words::*;
+//! # objects! { kind Kind; struct Pair { car: Value, cdr: Value } struct Node { next: Member<Node> } }
+//! # let mut arena = Arena::new(1 << 20, 1);
+//! arena.mutate(|mc| {
+//!     let pair = Pair::new(mc, Value::NIL, Value::NIL).unwrap();
+//!     let node = Node::new(mc, None).unwrap();
+//!     node.set_next(mc, Some(pair));
+//! });
+//! ```
+//!
+//! using one type's field on another,
+//!
+//! ```compile_fail
+//! # use ragwort_gc_words::*;
+//! # objects! { kind Kind; struct Pair { car: Value, cdr: Value } struct Node { next: Member<Node> } }
+//! # let mut arena = Arena::new(1 << 20, 1);
+//! arena.mutate(|mc| {
+//!     let node = Node::new(mc, None).unwrap();
+//!     node.get(mc, Pair::CAR);
+//! });
+//! ```
+//!
+//! a field handle whose kind doesn't match the description,
+//!
+//! ```compile_fail
+//! # use ragwort_gc_words::*;
+//! # objects! { kind Kind; struct Pair { car: Value, cdr: Value } }
+//! const CAR_AS_WORD: Field<Pair, slot::u64> = Field::new(0);
+//! # let mut arena = Arena::new(1 << 20, 1);
+//! arena.mutate(|mc| {
+//!     let pair = Pair::new(mc, Value::NIL, Value::NIL).unwrap();
+//!     pair.get(mc, CAR_AS_WORD);
+//! });
+//! ```
+//!
+//! and a field named like a method of `Gc`:
+//!
+//! ```compile_fail
+//! # use ragwort_gc_words::*;
+//! objects! { kind Kind; struct Buffer { len: u64 } items u64 }
+//! ```
 
 use std::any::{Any, TypeId};
 use std::cell::{Cell, OnceCell, Ref, RefCell};
+use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Range;
 use std::rc::Rc;
@@ -20,11 +127,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ragwort_gc_region::Region;
 
+extern crate self as ragwort_gc_words;
+
 mod budget;
+#[doc(hidden)]
+pub mod raw;
+pub mod slot;
 mod stack;
 
 use budget::Budget;
 pub use budget::Charge;
+use raw::Raw;
+pub use ragwort_derive::objects;
+use slot::{Item, Role, Slot};
 use stack::{STACK_COST, StackRecord};
 pub use stack::{Frame, Segment, Stack};
 
@@ -37,6 +152,9 @@ mod stack_tests;
 #[cfg(test)]
 #[path = "tests/budget.rs"]
 mod budget_tests;
+#[cfg(test)]
+#[path = "tests/objects.rs"]
+mod objects_tests;
 
 pub const REGION: usize = 64 << 20;
 /// The region in words: twice `REGION`, so evacuation has fresh pages to copy into.
@@ -88,12 +206,17 @@ fn decode(word: u64) -> f64 {
 }
 
 /// A double that doesn't fit in a word: magnitudes beyond about 1e±77, and the NaNs not in
-/// `SPECIALS`. Every arena registers it first, so it's type 0.
+/// `SPECIALS`. Every arena registers it first, as type 0.
 struct Boxed;
 
 impl Object for Boxed {
-    const DESC: Desc = Desc::of::<Boxed>(1);
+    const DESC: Desc = Desc::of::<Boxed>(1).numbered(0);
 }
+
+/// Type numbers below this are the collector's own: `Boxed`, then `Segment`. An `objects!` group
+/// declared without a base starts here.
+#[doc(hidden)]
+pub const FIRST_TYPE: u16 = 2;
 /// A header is the type index, a flag, and the item count in the upper half. A forwarded one
 /// has the new index there instead.
 const TYPE_BITS: u64 = 0xFFFF;
@@ -132,6 +255,9 @@ pub struct Desc {
     /// `Value::BROKEN`. A key that isn't an object never dies.
     pub ephemerons: u64,
     pub items: Items,
+    /// A fixed type number, which `objects!` gives its types so type checks compare against a
+    /// constant. Types without one are numbered by each arena as it first sees them.
+    pub number: Option<u16>,
 }
 
 impl Desc {
@@ -145,7 +271,61 @@ impl Desc {
             weaks: 0,
             ephemerons: 0,
             items: Items::None,
+            number: None,
         }
+    }
+
+    /// Fields with these roles in order, where an ephemeron takes two words.
+    #[doc(hidden)]
+    pub const fn layout<T: 'static>(roles: &[Role], items: Items) -> Self {
+        let mut desc = Self::of::<T>(0).items(items);
+        let mut i = 0;
+        while i < roles.len() {
+            let bit = if desc.fields < 64 { 1 << desc.fields } else { 0 };
+            assert!(bit != 0 || matches!(roles[i], Role::Word), "only the first 64 fields can hold references");
+            match roles[i] {
+                Role::Word => {}
+                Role::Value => desc.values |= bit,
+                Role::Member => desc.members |= bit,
+                Role::Weak => desc.weaks |= bit,
+                Role::Host => desc.hosts |= bit,
+                Role::Ephemeron => {
+                    desc.ephemerons |= bit;
+                    desc.fields += 1;
+                }
+            }
+            desc.fields += 1;
+            i += 1;
+        }
+        desc
+    }
+
+    /// What field `field` holds, or `None` past the fields and for an ephemeron's value.
+    pub const fn role(&self, field: usize) -> Option<Role> {
+        if field >= self.fields as usize {
+            return None;
+        }
+        let bit = if field < 64 { 1 << field } else { 0 };
+        let prev = if field >= 1 && field <= 64 { 1 << (field - 1) } else { 0 };
+        Some(if self.values & bit != 0 {
+            Role::Value
+        } else if self.members & bit != 0 {
+            Role::Member
+        } else if self.weaks & bit != 0 {
+            Role::Weak
+        } else if self.hosts & bit != 0 {
+            Role::Host
+        } else if self.ephemerons & bit != 0 && field + 1 < self.fields as usize {
+            Role::Ephemeron
+        } else if self.ephemerons & (bit | prev) != 0 {
+            return None;
+        } else {
+            Role::Word
+        })
+    }
+
+    pub const fn numbered(self, number: u16) -> Self {
+        Self { number: Some(number), ..self }
     }
 
     pub const fn values(self, values: u64) -> Self {
@@ -274,7 +454,10 @@ impl<'gc> Value<'gc> {
 
     #[inline]
     pub fn object<T: Object>(mc: &Mutation<'gc>, gc: Gc<'gc, T>) -> Self {
-        let ty = mc.heap.words[mask(gc.index as usize)].get() & TYPE_BITS;
+        let ty = match T::DESC.number {
+            Some(ty) => u64::from(ty),
+            None => mc.heap.words[mask(gc.index as usize)].get() & TYPE_BITS,
+        };
         Self::from_bits(u64::from(gc.index) << 32 | ty << 16 | OBJECT)
     }
 
@@ -287,6 +470,13 @@ impl<'gc> Value<'gc> {
     #[inline]
     pub fn downcast_tag<T: Object>(self, tag: TypeTag<'gc, T>) -> Option<Gc<'gc, T>> {
         (self.word & (TYPE_BITS << 16 | TAG) == u64::from(tag.ty) << 16 | OBJECT).then(|| Gc::new((self.word >> 32) as u32))
+    }
+
+    /// The type number and index of the object this refers to, for `objects!` kinds.
+    #[doc(hidden)]
+    #[inline]
+    pub fn object_parts(self) -> Option<(u16, u32)> {
+        (self.word & TAG == OBJECT).then_some(((self.word >> 16 & TYPE_BITS) as u16, (self.word >> 32) as u32))
     }
 }
 
@@ -323,101 +513,33 @@ impl<T> PartialEq for Gc<'_, T> {
     }
 }
 
+impl<T> fmt::Debug for Gc<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Gc").field(&self.index).finish()
+    }
+}
+
 impl<'gc, T: Object> Gc<'gc, T> {
     const fn new(index: u32) -> Self {
         Self { index, _marker: PhantomData }
     }
 
-    /// The word a field declared in `Desc::members` holds.
-    pub fn to_word(self) -> u64 {
-        u64::from(self.index)
-    }
-
-    /// The word of field `field`. Panics past the declared fields, so a write can't reach the
-    /// next object; constant field numbers fold the check away.
-    #[inline]
-    fn slot(self, field: usize) -> usize {
-        assert!(field < T::DESC.fields as usize, "field {field} of {}", T::DESC.fields);
-        mask(self.index as usize) + 1 + field
-    }
-
-    /// Where the items start.
-    #[inline]
-    fn items_at(self) -> usize {
-        mask(self.index as usize) + 1 + T::DESC.fields as usize
-    }
-
-    /// Indexes a view of the words shifted by the field, so for a constant field the masked
-    /// index is the whole address computation, as a list walk's chain of loads wants.
-    #[inline]
-    pub fn word(self, mc: &Mutation<'gc>, field: usize) -> u64 {
-        assert!(field < T::DESC.fields as usize, "field {field} of {}", T::DESC.fields);
-        let words = mc.heap.words;
-        match words.get(1 + field..).and_then(<[_]>::first_chunk::<WORDS>) {
-            Some(shifted) => shifted[mask(self.index as usize)].get(),
-            None => words[mask(self.index as usize) + 1 + field].get(),
-        }
-    }
-
-    /// For fields that hold no reference: no barrier.
-    #[inline]
-    pub fn set_word(self, mc: &Mutation<'gc>, field: usize, word: u64) {
-        mc.heap.words[self.slot(field)].set(word);
+    /// The object at `index`, taken to be a `T`: for `objects!` kinds, which have checked the
+    /// type the value carries.
+    #[doc(hidden)]
+    pub const fn forge(index: u32) -> Self {
+        Self::new(index)
     }
 
     #[inline]
-    pub fn value(self, mc: &Mutation<'gc>, field: usize) -> Value<'gc> {
-        Value::from_bits(self.word(mc, field))
+    pub fn get<S: Slot>(self, mc: &Mutation<'gc>, field: Field<T, S>) -> S::Out<'gc> {
+        S::get(self, mc, field.index)
     }
 
+    /// Takes the barrier the field's kind needs.
     #[inline]
-    pub fn set_value(self, mc: &Mutation<'gc>, field: usize, value: Value<'gc>) {
-        let slot = self.slot(field);
-        mc.heap.words[slot].set(value.word);
-        mc.heap.barrier(slot, self.index, value.word);
-    }
-
-    #[inline]
-    pub fn member<U: Object>(self, mc: &Mutation<'gc>, field: usize) -> Option<Gc<'gc, U>> {
-        let index = self.word(mc, field) as u32;
-        (index != 0).then(|| Gc::new(index))
-    }
-
-    #[inline]
-    pub fn set_member<U: Object>(self, mc: &Mutation<'gc>, field: usize, member: Option<Gc<'gc, U>>) {
-        let slot = self.slot(field);
-        let index = member.map_or(0, |m| m.index);
-        mc.heap.words[slot].set(u64::from(index));
-        if index != 0 {
-            mc.heap.barrier_ref(slot, self.index, index);
-        }
-    }
-
-    /// The target of a weak field, or `None` once it has died.
-    #[inline]
-    pub fn weak<U: Object>(self, mc: &Mutation<'gc>, field: usize) -> Option<Gc<'gc, U>> {
-        self.member(mc, field)
-    }
-
-    /// Dirties the card, for minor collections to clear the field, but doesn't shade the target.
-    #[inline]
-    pub fn set_weak<U: Object>(self, mc: &Mutation<'gc>, field: usize, target: Option<Gc<'gc, U>>) {
-        let slot = self.slot(field);
-        mc.heap.words[slot].set(u64::from(target.map_or(0, |t| t.index)));
-        mc.heap.dirty(slot);
-    }
-
-    pub fn set_host<U: Any>(self, mc: &Mutation<'gc>, field: usize, host: HostRef<'gc, U>) {
-        mc.heap.words[self.slot(field)].set(host.to_word());
-        if mc.heap.m.phase.get() == Phase::Marking && mc.heap.has_bit(self.index as usize, |p| &p.marks) {
-            mc.heap.mark_host(host.to_word());
-        }
-    }
-
-    #[inline]
-    pub fn host<U: Any>(self, mc: &Mutation<'gc>, field: usize) -> Option<HostRef<'gc, U>> {
-        let (id, generation) = host_parts(self.word(mc, field))?;
-        Some(HostRef { id, generation, _marker: PhantomData })
+    pub fn set<S: Slot>(self, mc: &Mutation<'gc>, field: Field<T, S>, value: S::In<'gc>) {
+        S::set(self, mc, field.index, value);
     }
 
     pub fn len(self, mc: &Mutation<'gc>) -> usize {
@@ -428,57 +550,87 @@ impl<'gc, T: Object> Gc<'gc, T> {
         self.len(mc) == 0
     }
 
-    /// The object's first `N` fields. `N` past the declared fields doesn't compile.
-    #[inline]
-    pub fn fields<const N: usize>(self, mc: &Mutation<'gc>) -> Option<Fields<'gc, N>> {
-        const { assert!(N <= T::DESC.fields as usize, "more fields than the type declares") };
-        let at = mask(self.index as usize) + 1;
-        let heap = mc.heap;
-        let words = heap.words.get(at..)?.first_chunk()?;
-        Some(Fields { words, at, owner: self.index, _brand: PhantomData })
-    }
-
-    /// The key and value of the ephemeron at `field`, one in `Desc::ephemerons`, or `None` once
-    /// its key has died.
-    #[inline]
-    pub fn ephemeron(self, mc: &Mutation<'gc>, field: usize) -> Option<(Value<'gc>, Value<'gc>)> {
-        assert!(field + 1 < T::DESC.fields as usize, "ephemeron at field {field} of {}", T::DESC.fields);
-        mc.heap.ephemeron_at(self.slot(field))
-    }
-
-    /// Neither part is shaded while marking: the value is traced once the key is found live.
-    /// The cards are dirtied, so a minor collection sees both.
-    #[inline]
-    pub fn set_ephemeron(self, mc: &Mutation<'gc>, field: usize, key: Value<'gc>, value: Value<'gc>) {
-        assert!(field + 1 < T::DESC.fields as usize, "ephemeron at field {field} of {}", T::DESC.fields);
-        mc.heap.set_ephemeron_at(self.slot(field), key, value);
-    }
-
     /// Entry `i` of `Items::Ephemerons` items, or `None` once its key has died. Panics past
     /// the end.
     #[inline]
     pub fn entry(self, mc: &Mutation<'gc>, i: usize) -> Option<(Value<'gc>, Value<'gc>)> {
         assert!(2 * i + 1 < self.len(mc), "entry {i} out of bounds");
-        mc.heap.ephemeron_at(mask(self.items_at() + 2 * i))
+        mc.heap.ephemeron_at(mask(items_start(self) + 2 * i))
     }
 
     #[inline]
     pub fn set_entry(self, mc: &Mutation<'gc>, i: usize, key: Value<'gc>, value: Value<'gc>) {
         assert!(2 * i + 1 < self.len(mc), "entry {i} out of bounds");
-        mc.heap.set_ephemeron_at(mask(self.items_at() + 2 * i), key, value);
+        mc.heap.set_ephemeron_at(mask(items_start(self) + 2 * i), key, value);
+    }
+}
+
+/// The word of field `field`. Panics past the declared fields, so a write can't reach the next
+/// object; constant field numbers fold the check away.
+#[inline]
+fn field_slot<T: Object>(gc: Gc<'_, T>, field: usize) -> usize {
+    assert!(field < T::DESC.fields as usize, "field {field} of {}", T::DESC.fields);
+    mask(gc.index as usize) + 1 + field
+}
+
+#[inline]
+fn items_start<T: Object>(gc: Gc<'_, T>) -> usize {
+    mask(gc.index as usize) + 1 + T::DESC.fields as usize
+}
+
+/// A member or weak field's target, checked against the type the field declares when that type
+/// has a fixed number: one load and compare.
+#[inline]
+fn target<'gc, U: Object>(mc: &Mutation<'gc>, index: u32) -> Option<Gc<'gc, U>> {
+    if index == 0 {
+        return None;
+    }
+    if let Some(ty) = U::DESC.number
+        && mc.heap.words[mask(index as usize)].get() & TYPE_BITS != u64::from(ty)
+    {
+        wrong_target(index, ty);
+    }
+    Some(Gc::new(index))
+}
+
+#[cold]
+#[inline(never)]
+fn wrong_target(index: u32, ty: u16) -> ! {
+    panic!("object {index} isn't of type {ty}, which the field it was read from declares")
+}
+
+/// A typed handle to field `index` of a `T`, which holds an `S`. `objects!` makes them, and
+/// one whose kind doesn't match `T`'s description doesn't compile.
+pub struct Field<T, S> {
+    index: usize,
+    _marker: PhantomData<fn() -> (T, S)>,
+}
+
+impl<T, S> Clone for Field<T, S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T, S> Copy for Field<T, S> {}
+
+impl<T: Object, S: Slot> Field<T, S> {
+    #[doc(hidden)]
+    pub const fn new(index: usize) -> Self {
+        match T::DESC.role(index) {
+            Some(role) if role as u8 == S::ROLE as u8 => Self { index, _marker: PhantomData },
+            _ => panic!("the field's kind doesn't match the type's description"),
+        }
     }
 
-    #[inline]
-    pub fn slots(self, mc: &Mutation<'gc>) -> Slots<'gc> {
-        let at = self.items_at();
-        let heap = mc.heap;
-        let words = heap.words.get(at..at + self.len(mc)).unwrap_or(&[]);
-        Slots { words, at, owner: self.index, _brand: PhantomData }
+    pub const fn index(self) -> usize {
+        self.index
     }
 }
 
 /// An object's fields as a fixed array, so constant field numbers need no bounds check: the
 /// safe counterpart of a `&'gc T`.
+#[doc(hidden)]
 #[derive(Clone, Copy)]
 pub struct Fields<'gc, const N: usize> {
     words: &'gc [Cell<u64>; N],
@@ -505,16 +657,23 @@ impl<'gc, const N: usize> Fields<'gc, N> {
     }
 }
 
-/// An object's items, read and written as values.
-#[derive(Clone, Copy)]
-pub struct Slots<'gc> {
+/// An object's items, each an `S`: values unless the type declares words.
+pub struct Slots<'gc, S = slot::Value> {
     words: &'gc [Cell<u64>],
     at: usize,
     owner: u32,
-    _brand: Brand<'gc>,
+    _marker: PhantomData<(Brand<'gc>, fn() -> S)>,
 }
 
-impl<'gc> Slots<'gc> {
+impl<S> Clone for Slots<'_, S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<S> Copy for Slots<'_, S> {}
+
+impl<'gc, S: Item> Slots<'gc, S> {
     pub fn len(self) -> usize {
         self.words.len()
     }
@@ -524,16 +683,27 @@ impl<'gc> Slots<'gc> {
     }
 
     #[inline]
-    pub fn get(self, i: usize) -> Value<'gc> {
-        Value::from_bits(self.words[i].get())
+    pub fn get(self, i: usize) -> S::Out<'gc> {
+        S::load(self.words[i].get())
     }
 
     #[inline]
-    pub fn set(self, mc: &Mutation<'gc>, i: usize, value: Value<'gc>) {
-        self.words[i].set(value.word);
-        mc.heap.barrier(self.at + i, self.owner, value.word);
+    pub fn set(self, mc: &Mutation<'gc>, i: usize, value: S::In<'gc>) {
+        let word = S::store(value);
+        self.words[i].set(word);
+        if S::BARRIER {
+            mc.heap.barrier(self.at + i, self.owner, word);
+        }
     }
 
+    /// The items in `range`, or `None` past the end.
+    pub fn slice(self, range: Range<usize>) -> Option<Self> {
+        let words = self.words.get(range.clone())?;
+        Some(Slots { words, at: self.at + range.start, owner: self.owner, _marker: PhantomData })
+    }
+}
+
+impl<'gc> Slots<'gc> {
     /// Copies `src` in, which may overlap, with one barrier for the whole range. Panics if the
     /// lengths differ.
     pub fn copy_from(self, mc: &Mutation<'gc>, src: Slots<'gc>) {
@@ -560,12 +730,6 @@ impl<'gc> Slots<'gc> {
         if value.word & TAG == OBJECT {
             mc.heap.barrier_range(self.at, self.words, self.owner);
         }
-    }
-
-    /// The items in `range`, or `None` past the end.
-    pub fn slice(self, range: Range<usize>) -> Option<Slots<'gc>> {
-        let words = self.words.get(range.clone())?;
-        Some(Slots { words, at: self.at + range.start, owner: self.owner, _brand: PhantomData })
     }
 
     /// The first `WINDOW` items, indexed by a byte so no access needs a bounds check.
@@ -763,8 +927,12 @@ struct Meta {
     /// Whether this cycle evacuates the pages flagged at its start.
     evacuating: Cell<bool>,
     evacuate_all: Cell<bool>,
+    /// Fixed type numbers count up from 0, and the rest down from the top.
     descs: Chunked<Cell<Option<&'static Desc>>, 256, { TYPES / 256 }>,
-    count: Cell<usize>,
+    /// One past the highest fixed number in use.
+    low: Cell<usize>,
+    /// The next number for a type without a fixed one.
+    next: Cell<usize>,
     cache: [Cell<(usize, u16)>; 64],
     roots: Box<[Cell<u64>]>,
     stacks: RefCell<Vec<Rc<StackRecord>>>,
@@ -836,7 +1004,8 @@ impl Arena {
             evacuating: Cell::new(false),
             evacuate_all: Cell::new(false),
             descs: Chunked::new(),
-            count: Cell::new(1),
+            low: Cell::new(1),
+            next: Cell::new(TYPES - 1),
             cache: [const { Cell::new((0, 0)) }; 64],
             roots: vec![Cell::new(Value::NIL.word); roots].into_boxed_slice(),
             stacks: RefCell::new(Vec::new()),
@@ -898,37 +1067,38 @@ impl Arena {
         if m.phase.get() != Phase::Idle || !m.settle.replace(false) {
             return;
         }
+        let used = m.used.get();
         let mut warm = m.nursery / (PAGE * 8);
-        let mut kept = 0;
         let mut run: Option<usize> = None;
-        for p in 1..=m.used.get() {
-            let release = m.pages[..m.used.get()].get(p).is_some_and(|page| {
-                if page.used.get() != 0 {
-                    kept = p;
-                    return false;
-                }
-                if page.released.get() {
+        for p in 1..=used {
+            let release = m.pages[..used].get(p).is_some_and(|page| {
+                if page.used.get() != 0 || page.released.get() {
                     return false;
                 }
                 if warm > 0 {
                     warm -= 1;
-                    kept = p;
                     return false;
                 }
-                page.released.set(true);
-                m.budget.refund(PAGE_COST);
                 true
             });
             match (release, run) {
                 (true, None) => run = Some(p),
                 (false, Some(first)) => {
-                    self.memory.release(first * PAGE..p * PAGE);
+                    // Only pages the system wholly took back stop being charged; the rest stay
+                    // committed.
+                    let words = self.memory.release(first * PAGE..p * PAGE);
+                    let gone = words.start.div_ceil(PAGE).max(first)..(words.end / PAGE).min(p);
+                    for page in m.pages.get(gone).unwrap_or_default() {
+                        page.released.set(true);
+                        m.budget.refund(PAGE_COST);
+                    }
                     run = None;
                 }
                 _ => {}
             }
         }
-        let used = (kept + 1).min(m.used.get());
+        // Pages past the last one still committed are handed out again as fresh ones.
+        let used = (1..used).rev().find(|&p| !m.pages[p].released.get()).map_or(1, |p| p + 1);
         m.used.set(used);
         m.occupied.set(m.pages[..used].iter().filter(|p| p.used.get() != 0).count());
     }
@@ -1079,11 +1249,14 @@ pub struct Mutation<'gc> {
 }
 
 impl<'gc> Mutation<'gc> {
+    /// Fields by their words, beneath `objects!` constructors.
+    #[doc(hidden)]
     #[inline]
     pub fn alloc<T: Object, const N: usize>(&self, fields: [u64; N]) -> Result<Gc<'gc, T>, OutOfMemory> {
         self.heap.alloc_fixed(&T::DESC, &fields).map(Gc::new)
     }
 
+    #[doc(hidden)]
     pub fn alloc_items<T: Object, const N: usize>(
         &self,
         fields: [u64; N],
@@ -1095,7 +1268,11 @@ impl<'gc> Mutation<'gc> {
 
     #[inline]
     pub fn type_tag<T: Object>(&self) -> Option<TypeTag<'gc, T>> {
-        Some(TypeTag { ty: self.heap.type_index(&T::DESC)?, _marker: PhantomData })
+        let ty = match T::DESC.number {
+            Some(ty) => ty,
+            None => self.heap.type_index(&T::DESC)?,
+        };
+        Some(TypeTag { ty, _marker: PhantomData })
     }
 
     pub fn root(&self, i: usize) -> Value<'gc> {
@@ -1182,14 +1359,30 @@ impl<'a> Heap<'a> {
     #[inline(never)]
     fn type_index_slow(self, desc: &'static Desc) -> Option<u16> {
         let addr = (desc as *const Desc).addr();
-        let count = self.m.count.get();
+        let (m, next) = (self.m, self.m.next.get());
         let same = |d: &'static Desc| std::ptr::eq(d, desc) || (d.type_id)() == (desc.type_id)();
-        let ty = match (0..count).find(|&i| self.m.descs.get(i).and_then(Cell::get).is_some_and(same)) {
-            Some(ty) => ty,
-            None => {
-                self.m.descs.get_or_grow(count)?.set(Some(desc));
-                self.m.count.set(count + 1);
-                count
+        let ty = if let Some(ty) = desc.number {
+            let ty = usize::from(ty);
+            if ty > next {
+                return None;
+            }
+            let slot = m.descs.get_or_grow(ty)?;
+            match slot.get() {
+                None => slot.set(Some(desc)),
+                Some(d) if same(d) => {}
+                Some(_) => panic!("two types have type number {ty}: declare one objects! group `after` the other"),
+            }
+            m.low.set(m.low.get().max(ty + 1));
+            ty
+        } else {
+            match (next + 1..TYPES).find(|&i| m.descs.get(i).and_then(Cell::get).is_some_and(same)) {
+                Some(ty) => ty,
+                None if next < m.low.get() => return None,
+                None => {
+                    m.descs.get_or_grow(next)?.set(Some(desc));
+                    m.next.set(next - 1);
+                    next
+                }
             }
         };
         self.m.cache[(addr >> 4) % 64].set((addr, ty as u16));

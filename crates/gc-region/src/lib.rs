@@ -40,9 +40,10 @@ impl Region {
     }
 
     /// Lets the system take back the memory under `range`, rounded inward to whole OS pages.
-    /// The words stay usable: afterwards they read as zero, or as what they held.
-    pub fn release(&mut self, range: Range<usize>) {
-        self.0.release(range);
+    /// The words stay usable: afterwards they read as zero, or as what they held. Returns the
+    /// words given back, empty if none were, so a caller counts only memory that's gone.
+    pub fn release(&mut self, range: Range<usize>) -> Range<usize> {
+        self.0.release(range)
     }
 
     /// Whether [`Region::release`] gives memory back at all.

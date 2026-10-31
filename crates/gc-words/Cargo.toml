@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+ragwort-derive = { path = "../derive" }
 ragwort-gc-region = { path = "../gc-region" }
 
 [features]

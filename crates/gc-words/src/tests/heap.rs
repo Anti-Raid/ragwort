@@ -2,31 +2,24 @@ use std::rc::Rc;
 
 use super::*;
 
-struct Pair;
-impl Object for Pair {
-    const DESC: Desc = Desc::of::<Pair>(2).values(0b11);
-}
-
-struct Node;
-impl Object for Node {
-    const DESC: Desc = Desc::of::<Node>(2).members(0b10);
-}
-
-struct Vector;
-impl Object for Vector {
-    const DESC: Desc = Desc::of::<Vector>(0).items(Items::Values);
-}
-
-struct Boxed;
-impl Object for Boxed {
-    const DESC: Desc = Desc::of::<Boxed>(1).hosts(1);
+objects! {
+    kind Kind;
+    struct Pair { car: Value, cdr: Value }
+    struct Node { n: u64, next: Member<Node> }
+    struct Vector {} items Value
+    struct Boxed { data: Host<String> }
+    struct Counter { count: Host<i32> }
+    /// Weakly holds a node, and links to the next holder.
+    struct Holder { target: Weak<Node>, next: Member<Holder> }
+    struct Table {} items Ephemeron
+    struct Cached { n: Value, cache: Ephemeron }
 }
 
 /// A list of fixnums `0..n` in root 0, last first.
 fn build(arena: &mut Arena, n: i64) {
     arena.mutate(|mc| {
         for i in 0..n {
-            let pair = mc.alloc::<Pair, 2>([Value::fixnum(i).unwrap().to_bits(), mc.root(0).to_bits()]).unwrap();
+            let pair = Pair::new(mc, Value::fixnum(i).unwrap(), mc.root(0)).unwrap();
             mc.set_root(0, Value::object(mc, pair));
         }
     });
@@ -36,9 +29,9 @@ fn sum(arena: &mut Arena) -> (i64, usize) {
     arena.mutate(|mc| {
         let (mut sum, mut len, mut cur) = (0, 0, mc.root(0));
         while let Some(pair) = cur.downcast::<Pair>(mc) {
-            sum += pair.value(mc, 0).as_fixnum().unwrap();
+            sum += pair.car(mc).as_fixnum().unwrap();
             len += 1;
-            cur = pair.value(mc, 1);
+            cur = pair.cdr(mc);
         }
         (sum, len)
     })
@@ -66,7 +59,7 @@ fn garbage_is_reused() {
     for _ in 0..50 {
         arena.step(|mc| {
             for i in 0..10_000 {
-                mc.alloc::<Pair, 2>([Value::fixnum(i).unwrap().to_bits(), Value::NIL.to_bits()]).unwrap();
+                Pair::new(mc, Value::fixnum(i).unwrap(), Value::NIL).unwrap();
             }
         })
         .unwrap();
@@ -81,26 +74,26 @@ fn garbage_is_reused() {
 fn cards_keep_young_objects_alive() {
     let mut arena = Arena::new(REGION, 1);
     arena.mutate(|mc| {
-        let old = mc.alloc::<Node, 2>([1, 0]).unwrap();
+        let old = Node::new(mc, 1, None).unwrap();
         mc.set_root(0, Value::object(mc, old));
     });
     arena.collect();
     arena.mutate(|mc| {
         let old = mc.root(0).downcast::<Node>(mc).unwrap();
-        let young = mc.alloc::<Node, 2>([2, 0]).unwrap();
-        old.set_member(mc, 1, Some(young));
+        let young = Node::new(mc, 2, None).unwrap();
+        old.set_next(mc, Some(young));
         for _ in 0..10_000 {
-            mc.alloc::<Node, 2>([9, 0]).unwrap();
+            Node::new(mc, 9, None).unwrap();
         }
     });
     arena.collect_minor();
     arena.mutate(|mc| {
         for _ in 0..10_000 {
-            mc.alloc::<Node, 2>([7, 0]).unwrap();
+            Node::new(mc, 7, None).unwrap();
         }
         let old = mc.root(0).downcast::<Node>(mc).unwrap();
-        let young = old.member::<Node>(mc, 1).unwrap();
-        assert_eq!(young.word(mc, 0), 2);
+        let young = old.next(mc).unwrap();
+        assert_eq!(young.n(mc), 2);
     });
 }
 
@@ -109,9 +102,9 @@ fn stacks_and_vectors_are_traced_and_moved() {
     let mut arena = Arena::new(REGION, 1);
     let stack = arena.mutate(|mc| {
         let segment = Segment::new(mc, 1024).unwrap();
-        let vector = mc.alloc_items::<Vector, 0>([], 300_000, Value::NIL).unwrap();
-        let pair = mc.alloc::<Pair, 2>([Value::fixnum(5).unwrap().to_bits(), Value::NIL.to_bits()]).unwrap();
-        vector.slots(mc).set(mc, 299_999, Value::object(mc, pair));
+        let vector = Vector::new(mc, 300_000, Value::NIL).unwrap();
+        let pair = Pair::new(mc, Value::fixnum(5).unwrap(), Value::NIL).unwrap();
+        vector.items(mc).set(mc, 299_999, Value::object(mc, pair));
         mc.set_root(0, Value::object(mc, vector));
         let stack = mc.stack(segment).unwrap();
         stack.frame(mc, 512).unwrap().set(3, Value::object(mc, pair));
@@ -122,10 +115,10 @@ fn stacks_and_vectors_are_traced_and_moved() {
     arena.collect_minor();
     arena.mutate(|mc| {
         let vector = mc.root(0).downcast::<Vector>(mc).unwrap();
-        let from_vector = vector.slots(mc).get(299_999).downcast::<Pair>(mc).unwrap();
+        let from_vector = vector.items(mc).get(299_999).downcast::<Pair>(mc).unwrap();
         let from_stack = stack.frame(mc, 512).unwrap().get(3).downcast::<Pair>(mc).unwrap();
         assert!(from_vector == from_stack);
-        assert_eq!(from_stack.value(mc, 0).as_fixnum(), Some(5));
+        assert_eq!(from_stack.car(mc).as_fixnum(), Some(5));
     });
 }
 
@@ -134,14 +127,14 @@ fn hosts_live_while_referenced() {
     let mut arena = Arena::new(1 << 20, 1);
     arena.mutate(|mc| {
         let host = mc.host(String::from("kept")).unwrap();
-        let boxed = mc.alloc::<Boxed, 1>([host.to_word()]).unwrap();
+        let boxed = Boxed::new(mc, Some(host)).unwrap();
         mc.set_root(0, Value::object(mc, boxed));
         mc.host(String::from("dropped")).unwrap();
     });
     arena.collect();
     arena.mutate(|mc| {
         let boxed = mc.root(0).downcast::<Boxed>(mc).unwrap();
-        assert_eq!(*boxed.host::<String>(mc, 0).unwrap().get(mc).unwrap(), "kept");
+        assert_eq!(*boxed.data(mc).unwrap().get(mc).unwrap(), "kept");
     });
     assert!(arena.meta.hosts.borrow()[1].value.is_none());
 }
@@ -152,27 +145,26 @@ fn forged_references_are_only_wrong() {
     let mut arena = Arena::new(1 << 20, 1);
     arena.mutate(|mc| mc.set_root(0, Value::from_bits(u64::MAX << 4 | OBJECT)));
     arena.collect();
-    arena.mutate(|mc| assert!(mc.root(0).downcast::<Pair>(mc).is_none()));
-}
-
-struct Holder;
-impl Object for Holder {
-    const DESC: Desc = Desc::of::<Holder>(2).weaks(0b01).members(0b10);
+    arena.mutate(|mc| {
+        if let Some(pair) = mc.root(0).downcast::<Pair>(mc) {
+            pair.set_car(mc, pair.cdr(mc));
+        }
+    });
 }
 
 /// A chain of holders in root 0, each weakly holding a node; every other node is also held
 /// strongly from root 1's vector.
 fn holders(arena: &mut Arena, n: usize) {
     arena.mutate(|mc| {
-        let kept = mc.alloc_items::<Vector, 0>([], n / 2, Value::NIL).unwrap();
+        let kept = Vector::new(mc, n / 2, Value::NIL).unwrap();
         mc.set_root(1, Value::object(mc, kept));
         for i in 0..n {
-            let node = mc.alloc::<Node, 2>([i as u64, 0]).unwrap();
+            let node = Node::new(mc, i as u64, None).unwrap();
             if i % 2 == 0 {
-                kept.slots(mc).set(mc, i / 2, Value::object(mc, node));
+                kept.items(mc).set(mc, i / 2, Value::object(mc, node));
             }
-            let next = mc.root(0).downcast::<Holder>(mc).map_or(0, Gc::to_word);
-            let holder = mc.alloc::<Holder, 2>([node.to_word(), next]).unwrap();
+            let next = mc.root(0).downcast::<Holder>(mc);
+            let holder = Holder::new(mc, Some(node), next).unwrap();
             mc.set_root(0, Value::object(mc, holder));
         }
     });
@@ -184,10 +176,10 @@ fn weak_targets(arena: &mut Arena) -> Vec<u64> {
         let mut out = Vec::new();
         let mut cur = mc.root(0).downcast::<Holder>(mc);
         while let Some(holder) = cur {
-            if let Some(node) = holder.weak::<Node>(mc, 0) {
-                out.push(node.word(mc, 0));
+            if let Some(node) = holder.target(mc) {
+                out.push(node.n(mc));
             }
-            cur = holder.member(mc, 1);
+            cur = holder.next(mc);
         }
         out
     })
@@ -225,12 +217,12 @@ fn incremental_marking_keeps_what_the_mutator_moves_around() {
         arena.mutate(|mc| {
             let mut cur = mc.root(0);
             for _ in 0..10_000 {
-                cur = cur.downcast::<Pair>(mc).unwrap().value(mc, 1);
+                cur = cur.downcast::<Pair>(mc).unwrap().cdr(mc);
             }
             let cut = cur.downcast::<Pair>(mc).unwrap();
-            let tail = cut.value(mc, 1);
-            cut.set_value(mc, 1, Value::NIL);
-            let fresh = mc.alloc::<Pair, 2>([Value::fixnum(-1).unwrap().to_bits(), tail.to_bits()]).unwrap();
+            let tail = cut.cdr(mc);
+            cut.set_cdr(mc, Value::NIL);
+            let fresh = Pair::new(mc, Value::fixnum(-1).unwrap(), tail).unwrap();
             mc.set_root(1, Value::object(mc, fresh));
         });
         // A slice when idle would start another cycle.
@@ -241,9 +233,9 @@ fn incremental_marking_keeps_what_the_mutator_moves_around() {
             let fresh = mc.root(1).downcast::<Pair>(mc).unwrap();
             let mut cur = mc.root(0);
             for _ in 0..10_000 {
-                cur = cur.downcast::<Pair>(mc).unwrap().value(mc, 1);
+                cur = cur.downcast::<Pair>(mc).unwrap().cdr(mc);
             }
-            cur.downcast::<Pair>(mc).unwrap().set_value(mc, 1, fresh.value(mc, 1));
+            cur.downcast::<Pair>(mc).unwrap().set_cdr(mc, fresh.cdr(mc));
             mc.set_root(1, Value::NIL);
         });
         if arena.phase() == Phase::Marking {
@@ -263,9 +255,9 @@ fn steps_collect_as_they_go() {
     for step in 0..20_000 {
         arena.step(|mc| {
             for i in 0..100 {
-                mc.alloc::<Pair, 2>([Value::fixnum(i).unwrap().to_bits(), Value::NIL.to_bits()]).unwrap();
+                Pair::new(mc, Value::fixnum(i).unwrap(), Value::NIL).unwrap();
             }
-            let kept = mc.alloc::<Pair, 2>([Value::fixnum(step).unwrap().to_bits(), mc.root(0).to_bits()]).unwrap();
+            let kept = Pair::new(mc, Value::fixnum(step).unwrap(), mc.root(0)).unwrap();
             mc.set_root(0, Value::object(mc, kept));
         })
         .unwrap();
@@ -282,7 +274,7 @@ fn garbage_alone_needs_only_minors() {
     for _ in 0..2000 {
         arena.step(|mc| {
             for i in 0..1000 {
-                mc.alloc::<Pair, 2>([Value::fixnum(i).unwrap().to_bits(), Value::NIL.to_bits()]).unwrap();
+                Pair::new(mc, Value::fixnum(i).unwrap(), Value::NIL).unwrap();
             }
         })
         .unwrap();
@@ -296,7 +288,7 @@ fn garbage_alone_needs_only_minors() {
 fn large_objects_reuse_freed_pages() {
     let mut arena = Arena::new(16 << 20, 1);
     for _ in 0..200 {
-        arena.step(|mc| mc.alloc_items::<Vector, 0>([], 128 << 10, Value::NIL).map(|_| ())).unwrap().unwrap();
+        arena.step(|mc| Vector::new(mc, 128 << 10, Value::NIL).map(|_| ())).unwrap().unwrap();
     }
     assert!(arena.pages_bytes() <= 16 << 20);
 }
@@ -307,7 +299,7 @@ fn sparse_pages_are_compacted() {
     let mut arena = Arena::new(REGION, 1);
     arena.mutate(|mc| {
         for i in 0..400_000 {
-            let pair = mc.alloc::<Pair, 2>([Value::fixnum(i).unwrap().to_bits(), mc.root(0).to_bits()]).unwrap();
+            let pair = Pair::new(mc, Value::fixnum(i).unwrap(), mc.root(0)).unwrap();
             // One pair in forty is kept, so most lines stay empty but every page keeps some.
             if i % 40 == 0 {
                 mc.set_root(0, Value::object(mc, pair));
@@ -329,15 +321,15 @@ fn host_slots_are_reused() {
     for i in 0..100 {
         arena.mutate(|mc| {
             let host = mc.host(i).unwrap();
-            let boxed = mc.alloc::<Boxed, 1>([host.to_word()]).unwrap();
+            let boxed = Counter::new(mc, Some(host)).unwrap();
             mc.set_root(0, Value::object(mc, boxed));
         });
         arena.collect();
     }
     assert!(arena.hosts() <= 2, "{} host slots", arena.hosts());
     arena.mutate(|mc| {
-        let boxed = mc.root(0).downcast::<Boxed>(mc).unwrap();
-        assert_eq!(*boxed.host::<i32>(mc, 0).unwrap().get(mc).unwrap(), 99);
+        let boxed = mc.root(0).downcast::<Counter>(mc).unwrap();
+        assert_eq!(*boxed.count(mc).unwrap().get(mc).unwrap(), 99);
     });
 }
 
@@ -349,7 +341,7 @@ fn allocation_during_lazy_sweeping_is_kept() {
     arena.mutate(|mc| {
         // Garbage, so the sweep has holes to hand out.
         for i in 0..200_000 {
-            mc.alloc::<Pair, 2>([Value::fixnum(i).unwrap().to_bits(), Value::NIL.to_bits()]).unwrap();
+            Pair::new(mc, Value::fixnum(i).unwrap(), Value::NIL).unwrap();
         }
     });
     while arena.phase() != Phase::Sweeping {
@@ -359,7 +351,7 @@ fn allocation_during_lazy_sweeping_is_kept() {
     while arena.phase() == Phase::Sweeping {
         arena.mutate(|mc| {
             for i in 0..1000 {
-                let pair = mc.alloc::<Pair, 2>([Value::fixnum(i).unwrap().to_bits(), mc.root(1).to_bits()]).unwrap();
+                let pair = Pair::new(mc, Value::fixnum(i).unwrap(), mc.root(1)).unwrap();
                 mc.set_root(1, Value::object(mc, pair));
             }
         });
@@ -372,14 +364,15 @@ fn allocation_during_lazy_sweeping_is_kept() {
         let (mut n, mut cur) = (0, mc.root(1));
         while let Some(pair) = cur.downcast::<Pair>(mc) {
             n += 1;
-            cur = pair.value(mc, 1);
+            cur = pair.cdr(mc);
         }
         n
     });
     assert_eq!(young, steps * 1000);
 }
 
-/// Free pages past a nursery's worth go back to the system, and come back when needed.
+/// Free pages past a nursery's worth go back to the system, and come back when needed. A
+/// backing that can't give memory back keeps counting them.
 #[test]
 fn free_pages_are_given_back() {
     let mut arena = Arena::new(64 << 20, 2);
@@ -387,25 +380,29 @@ fn free_pages_are_given_back() {
     arena.mutate(|mc| {
         // 32 MiB of vectors, dropped right after.
         for _ in 0..32 {
-            let v = mc.alloc_items::<Vector, 0>([], 128 << 10, Value::NIL).unwrap();
+            let v = Vector::new(mc, 128 << 10, Value::NIL).unwrap();
             mc.set_root(1, Value::object(mc, v));
         }
         mc.set_root(1, Value::NIL);
     });
     arena.collect();
     let committed = arena.committed_bytes();
-    assert!(committed < 12 << 20, "{committed} bytes still committed");
+    if ragwort_gc_region::Region::releases() {
+        assert!(committed < 12 << 20, "{committed} bytes still committed");
+    } else {
+        assert_eq!(committed, arena.pages_bytes());
+    }
     assert_eq!(sum(&mut arena), (10_000 * 9_999 / 2, 10_000));
     // Allocating again reuses them, and what's written there reads back.
     arena.mutate(|mc| {
-        let v = mc.alloc_items::<Vector, 0>([], 1 << 20, Value::fixnum(7).unwrap()).unwrap();
+        let v = Vector::new(mc, 1 << 20, Value::fixnum(7).unwrap()).unwrap();
         mc.set_root(1, Value::object(mc, v));
     });
     arena.collect();
     arena.mutate(|mc| {
         let v = mc.root(1).downcast::<Vector>(mc).unwrap();
         assert_eq!(v.len(mc), 1 << 20);
-        assert!((0..1 << 20).step_by(997).all(|i| v.slots(mc).get(i) == Value::fixnum(7).unwrap()));
+        assert!((0..1 << 20).step_by(997).all(|i| v.items(mc).get(i) == Value::fixnum(7).unwrap()));
     });
     assert_eq!(sum(&mut arena), (10_000 * 9_999 / 2, 10_000));
 }
@@ -415,15 +412,15 @@ fn fixnum<'gc>(n: usize) -> Value<'gc> {
 }
 
 fn pair<'gc>(mc: &Mutation<'gc>, car: Value<'gc>, cdr: Value<'gc>) -> Value<'gc> {
-    Value::object(mc, mc.alloc::<Pair, 2>([car.to_bits(), cdr.to_bits()]).unwrap())
+    Value::object(mc, Pair::new(mc, car, cdr).unwrap())
 }
 
 fn car<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> Value<'gc> {
-    v.downcast::<Pair>(mc).unwrap().value(mc, 0)
+    v.downcast::<Pair>(mc).unwrap().car(mc)
 }
 
 fn cdr<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> Value<'gc> {
-    v.downcast::<Pair>(mc).unwrap().value(mc, 1)
+    v.downcast::<Pair>(mc).unwrap().cdr(mc)
 }
 
 #[test]
@@ -435,7 +432,7 @@ fn flonums_round_trip_and_survive_moves() {
     let mut arena = Arena::new(REGION, 1);
     arena.mutate(|mc| {
         // A type of the test's own registered first mustn't pass for a boxed flonum.
-        let other = mc.alloc::<Pair, 2>([0, 0]).unwrap();
+        let other = Pair::new(mc, Value::FALSE, Value::FALSE).unwrap();
         assert!(!Value::object(mc, other).is_flonum());
         let mut list = Value::NIL;
         for &f in &doubles {
@@ -466,22 +463,12 @@ fn flonums_round_trip_and_survive_moves() {
     check(&mut arena);
 }
 
-struct Table;
-impl Object for Table {
-    const DESC: Desc = Desc::of::<Table>(0).items(Items::Ephemerons);
-}
-
 /// Field 0 is a value, fields 1 and 2 an ephemeron.
-struct Cached;
-impl Object for Cached {
-    const DESC: Desc = Desc::of::<Cached>(3).values(1).ephemerons(0b10);
-}
-
 /// A table whose even keys are also held from root 1. Each value refers back to its key, which
 /// mustn't keep the key alive.
 fn half_held_table(arena: &mut Arena, n: usize) {
     arena.mutate(|mc| {
-        let table = mc.alloc_items::<Table, 0>([], 2 * n, Value::BROKEN).unwrap();
+        let table = Table::new(mc, n).unwrap();
         for i in 0..n {
             let key = pair(mc, fixnum(i), Value::NIL);
             let value = pair(mc, fixnum(i), key);
@@ -539,7 +526,7 @@ fn ephemeron_chains_are_followed() {
     const LINKS: usize = 20;
     let mut arena = Arena::new(REGION, 2);
     arena.mutate(|mc| {
-        let table = mc.alloc_items::<Table, 0>([], 2 * (LINKS + 1), Value::BROKEN).unwrap();
+        let table = Table::new(mc, LINKS + 1).unwrap();
         let mut key = pair(mc, fixnum(LINKS), Value::NIL);
         mc.set_root(1, key);
         for i in (0..LINKS).rev() {
@@ -578,7 +565,7 @@ fn ephemeron_values_stored_while_marking_are_kept() {
         }
         mc.set_root(1, chain);
         mc.set_root(2, pair(mc, fixnum(1), Value::NIL));
-        mc.set_root(3, Value::object(mc, mc.alloc_items::<Table, 0>([], 2, Value::BROKEN).unwrap()));
+        mc.set_root(3, Value::object(mc, Table::new(mc, 1).unwrap()));
     });
     arena.set_evacuate_all(true);
     arena.collect_slice(1024);
@@ -590,7 +577,7 @@ fn ephemeron_values_stored_while_marking_are_kept() {
         }
         let table = mc.root(3).downcast::<Table>(mc).unwrap();
         table.set_entry(mc, 0, mc.root(2), car(mc, end));
-        end.downcast::<Pair>(mc).unwrap().set_value(mc, 0, Value::NIL);
+        end.downcast::<Pair>(mc).unwrap().set_car(mc, Value::NIL);
     });
     while arena.phase() != Phase::Idle {
         arena.collect_slice(1024);
@@ -612,7 +599,7 @@ fn ephemeron_values_stored_while_marking_are_kept() {
 fn old_ephemerons_hold_young_values() {
     let mut arena = Arena::new(REGION, 2);
     arena.mutate(|mc| {
-        let cached = mc.alloc::<Cached, 3>([fixnum(5).to_bits(), Value::BROKEN.to_bits(), Value::BROKEN.to_bits()]).unwrap();
+        let cached = Cached::new(mc, fixnum(5), (Value::BROKEN, Value::BROKEN)).unwrap();
         mc.set_root(0, Value::object(mc, cached));
     });
     arena.collect();
@@ -620,14 +607,14 @@ fn old_ephemerons_hold_young_values() {
         let key = pair(mc, fixnum(1), Value::NIL);
         let value = pair(mc, fixnum(2), key);
         mc.set_root(1, key);
-        mc.root(0).downcast::<Cached>(mc).unwrap().set_ephemeron(mc, 1, key, value);
+        mc.root(0).downcast::<Cached>(mc).unwrap().set_cache(mc, (key, value));
     });
     arena.collect_minor();
     let entry = |arena: &mut Arena| {
         arena.mutate(|mc| {
             let cached = mc.root(0).downcast::<Cached>(mc).unwrap();
-            assert_eq!(cached.value(mc, 0), fixnum(5));
-            cached.ephemeron(mc, 1).map(|(key, value)| (car(mc, key).as_fixnum(), car(mc, value).as_fixnum()))
+            assert_eq!(cached.n(mc), fixnum(5));
+            cached.cache(mc).map(|(key, value)| (car(mc, key).as_fixnum(), car(mc, value).as_fixnum()))
         })
     };
     assert_eq!(entry(&mut arena), Some((Some(1), Some(2))));
@@ -643,7 +630,7 @@ fn old_ephemerons_hold_young_values() {
 fn immediate_keys_keep_their_values() {
     let mut arena = Arena::new(REGION, 1);
     arena.mutate(|mc| {
-        let table = mc.alloc_items::<Table, 0>([], 4, Value::BROKEN).unwrap();
+        let table = Table::new(mc, 2).unwrap();
         table.set_entry(mc, 0, fixnum(1), pair(mc, fixnum(10), Value::NIL));
         table.set_entry(mc, 1, Value::NIL, pair(mc, fixnum(20), Value::NIL));
         mc.set_root(0, Value::object(mc, table));
@@ -691,9 +678,9 @@ fn stale_host_refs_never_read_the_next_value() {
 fn large_first_allocation_is_not_none() {
     let mut arena = Arena::new(REGION, 1);
     arena.mutate(|mc| {
-        let big = mc.alloc_items::<Vector, 0>([], 3000, Value::NIL).unwrap();
+        let big = Vector::new(mc, 3000, Value::NIL).unwrap();
         assert_ne!(big.to_word(), 0);
-        let node = mc.alloc::<Node, 2>([0, 0]).unwrap();
+        let node = Node::new(mc, 0, None).unwrap();
         node.set_member(mc, 1, Some(big));
         assert!(node.member::<Vector>(mc, 1) == Some(big));
         mc.set_root(0, Value::object(mc, node));
@@ -729,9 +716,9 @@ impl Drop for Flag {
 fn dropped_stacks_are_pruned() {
     let mut arena = Arena::new(REGION, 1);
     arena.mutate(|mc| {
-        let segments = mc.alloc_items::<Vector, 0>([], 200, Value::NIL).unwrap();
+        let segments = Vector::new(mc, 200, Value::NIL).unwrap();
         for i in 0..200 {
-            segments.slots(mc).set(mc, i, Value::object(mc, Segment::new(mc, WINDOW).unwrap()));
+            segments.items(mc).set(mc, i, Value::object(mc, Segment::new(mc, WINDOW).unwrap()));
         }
         mc.set_root(0, Value::object(mc, segments));
     });
@@ -740,7 +727,7 @@ fn dropped_stacks_are_pruned() {
     arena.mutate(|mc| {
         let segments = mc.root(0).downcast::<Vector>(mc).unwrap();
         for i in 0..200 {
-            let stack = mc.stack(segments.slots(mc).get(i).downcast::<Segment>(mc).unwrap()).unwrap();
+            let stack = mc.stack(segments.items(mc).get(i).downcast::<Segment>(mc).unwrap()).unwrap();
             stack.frame(mc, 0).unwrap().set(0, Value::TRUE);
         }
     });
@@ -806,7 +793,7 @@ fn dirty_cards_of_large_objects() {
     const LEN: usize = 300_000;
     let mut arena = Arena::new(REGION, 2);
     arena.mutate(|mc| {
-        let vector = mc.alloc_items::<Vector, 0>([], LEN, Value::NIL).unwrap();
+        let vector = Vector::new(mc, LEN, Value::NIL).unwrap();
         mc.set_root(0, Value::object(mc, vector));
         // Lands in the free lines after the vector's end.
         let tail = pair(mc, Value::NIL, Value::NIL);
@@ -818,11 +805,11 @@ fn dirty_cards_of_large_objects() {
         let vector = mc.root(0).downcast::<Vector>(mc).unwrap();
         for &i in &stores {
             // Garbage between them, so no two share a line and survive together.
-            mc.alloc_items::<Vector, 0>([], 32, Value::NIL).unwrap();
-            vector.slots(mc).set(mc, i, pair(mc, fixnum(i), Value::NIL));
+            Vector::new(mc, 32, Value::NIL).unwrap();
+            vector.items(mc).set(mc, i, pair(mc, fixnum(i), Value::NIL));
         }
         let tail = mc.root(1).downcast::<Pair>(mc).unwrap();
-        tail.set_value(mc, 0, pair(mc, fixnum(1_000_001), Value::NIL));
+        tail.set_car(mc, pair(mc, fixnum(1_000_001), Value::NIL));
     });
     arena.collect_minor();
     arena.mutate(|mc| {
@@ -831,7 +818,7 @@ fn dirty_cards_of_large_objects() {
         }
         let vector = mc.root(0).downcast::<Vector>(mc).unwrap();
         for &i in &stores {
-            assert_eq!(car(mc, vector.slots(mc).get(i)), fixnum(i));
+            assert_eq!(car(mc, vector.items(mc).get(i)), fixnum(i));
         }
         assert_eq!(car(mc, car(mc, mc.root(1))), fixnum(1_000_001));
         // The vector dies; the tail pair, on its last page, lives on.
@@ -840,7 +827,7 @@ fn dirty_cards_of_large_objects() {
     arena.collect();
     arena.mutate(|mc| {
         let tail = mc.root(1).downcast::<Pair>(mc).unwrap();
-        tail.set_value(mc, 1, pair(mc, fixnum(1_000_002), Value::NIL));
+        tail.set_cdr(mc, pair(mc, fixnum(1_000_002), Value::NIL));
     });
     arena.collect_minor();
     arena.mutate(|mc| {
@@ -848,7 +835,7 @@ fn dirty_cards_of_large_objects() {
             pair(mc, fixnum(i), Value::NIL);
         }
         let tail = mc.root(1).downcast::<Pair>(mc).unwrap();
-        assert_eq!(car(mc, tail.value(mc, 1)), fixnum(1_000_002));
+        assert_eq!(car(mc, tail.cdr(mc)), fixnum(1_000_002));
     });
 }
 

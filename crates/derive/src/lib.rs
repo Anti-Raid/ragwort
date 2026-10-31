@@ -1,6 +1,10 @@
 //! Derives for `ragwort_gc::Trace` and `ragwort_gc::Plain`, so arena types need no unsafe.
 //! The impls they write are unsafe, and they're the gc's to vouch for: crates that use them can
 //! still forbid unsafe code, since the lint doesn't look inside other crates' macros.
+//!
+//! Also `objects!`, which declares `ragwort_gc_words` types. What it writes is safe code.
+
+mod objects;
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -174,4 +178,11 @@ fn plain(input: DeriveInput) -> syn::Result<TokenStream> {
             };
         }
     })
+}
+
+/// Declares a group of `ragwort_gc_words` object types, with typed fields and an enum over the
+/// group. See that crate's docs for the syntax and what's generated.
+#[proc_macro]
+pub fn objects(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    objects::expand(input.into()).unwrap_or_else(syn::Error::into_compile_error).into()
 }

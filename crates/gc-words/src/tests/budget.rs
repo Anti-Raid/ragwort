@@ -1,12 +1,12 @@
 use super::*;
 
-struct Pair;
-impl Object for Pair {
-    const DESC: Desc = Desc::of::<Pair>(2).values(0b11);
+objects! {
+    kind Kind;
+    struct Pair { car: Value, cdr: Value }
 }
 
 fn pair<'gc>(mc: &Mutation<'gc>, car: Value<'gc>, cdr: Value<'gc>) -> Result<Value<'gc>, OutOfMemory> {
-    Ok(Value::object(mc, mc.alloc::<Pair, 2>([car.to_bits(), cdr.to_bits()])?))
+    Ok(Value::object(mc, Pair::new(mc, car, cdr)?))
 }
 
 /// Grows root 0's list until an allocation fails.
@@ -30,7 +30,7 @@ fn the_limit_fails_the_step_and_the_arena_recovers() {
         let mut v = mc.root(0);
         while let Some(p) = v.downcast::<Pair>(mc) {
             n += 1;
-            v = p.value(mc, 1);
+            v = p.cdr(mc);
         }
         n
     });
@@ -137,7 +137,8 @@ fn injected_failures_fail_the_picked_allocation() {
     arena.step(|mc| (0..1000).try_for_each(|_| pair(mc, Value::NIL, Value::NIL).map(drop))).unwrap().unwrap();
 }
 
-/// Pages given back to the system are refunded, and charged again once reused.
+/// Pages given back to the system are refunded, and charged again once reused. A backing that
+/// can't give memory back keeps them charged.
 #[test]
 fn released_pages_are_refunded() {
     let mut arena = Arena::new(64 << 20, 1);
@@ -153,9 +154,14 @@ fn released_pages_are_refunded() {
     assert!(peak > 20 << 20, "{peak}");
     arena.collect();
     let pages = arena.committed_bytes() / (PAGE * 8);
-    assert!(arena.used() < peak / 4, "{} of {peak}", arena.used());
     assert!(arena.used() >= pages * PAGE_COST);
     assert!(arena.pages_bytes() > 20 << 20, "the pages were trimmed");
+    if !ragwort_gc_region::Region::releases() {
+        assert_eq!(arena.committed_bytes(), arena.pages_bytes());
+        assert!(arena.used() >= peak - (1 << 20), "{} of {peak}", arena.used());
+        return;
+    }
+    assert!(arena.used() < peak / 4, "{} of {peak}", arena.used());
     arena.mutate(|mc| {
         for _ in 0..1_000_000 {
             pair(mc, Value::NIL, Value::NIL).unwrap();

@@ -5,6 +5,7 @@ use std::ops::Range;
 use std::ptr;
 use std::rc::Rc;
 
+use super::raw::Raw;
 use super::{Brand, Desc, Gc, Heap, Items, Mutation, Object, OutOfMemory, Slots, Value, WINDOW, Work};
 
 /// One segment of a [`Stack`]: a run of value slots in the arena. Its one field is set while a
@@ -12,7 +13,7 @@ use super::{Brand, Desc, Gc, Heap, Items, Mutation, Object, OutOfMemory, Slots, 
 pub struct Segment;
 
 impl Object for Segment {
-    const DESC: Desc = Desc::of::<Segment>(1).items(Items::Values);
+    const DESC: Desc = Desc::of::<Segment>(1).items(Items::Values).numbered(1);
 }
 
 impl Segment {
@@ -186,9 +187,10 @@ impl Stack {
     }
 
     /// The frame starting at slot `fp`, or `None` unless `base <= fp` and `fp + WINDOW` slots
-    /// fit in the segment.
+    /// fit in the segment. It borrows the stack, so the stack can't capture, park or switch
+    /// while the frame can still write without a barrier.
     #[inline]
-    pub fn frame<'gc>(&self, mc: &Mutation<'gc>, fp: usize) -> Option<Frame<'gc>> {
+    pub fn frame<'s, 'gc: 's>(&'s self, mc: &Mutation<'gc>, fp: usize) -> Option<Frame<'s, 'gc>> {
         Some(Frame { slots: self.live(mc, fp, WINDOW)?.first_chunk()?, _brand: PhantomData })
     }
 
@@ -287,13 +289,38 @@ impl fmt::Debug for Stack {
 
 /// [`WINDOW`] registers from a frame's base. Writes take no barrier: the stack's live part is
 /// a root, rescanned by every collection, and none runs during a step.
+///
+/// A frame borrows its stack, so it can't outlive a capture, park or switch, after which its
+/// slots are ordinary memory that needs the barrier:
+///
+/// ```
+/// # use ragwort_gc_words::*;
+/// let mut arena = Arena::new(1 << 20, 1);
+/// arena.mutate(|mc| {
+///     let mut stack = mc.stack(Segment::new(mc, 512).unwrap()).unwrap();
+///     let frame = stack.frame(mc, 0).unwrap();
+///     frame.set(0, Value::NIL);
+///     stack.capture(mc, 8);
+/// });
+/// ```
+///
+/// ```compile_fail
+/// # use ragwort_gc_words::*;
+/// let mut arena = Arena::new(1 << 20, 1);
+/// arena.mutate(|mc| {
+///     let mut stack = mc.stack(Segment::new(mc, 512).unwrap()).unwrap();
+///     let frame = stack.frame(mc, 0).unwrap();
+///     stack.capture(mc, 8);
+///     frame.set(0, Value::NIL);
+/// });
+/// ```
 #[derive(Clone, Copy)]
-pub struct Frame<'gc> {
-    slots: &'gc [Cell<u64>; WINDOW],
+pub struct Frame<'s, 'gc> {
+    slots: &'s [Cell<u64>; WINDOW],
     _brand: Brand<'gc>,
 }
 
-impl<'gc> Frame<'gc> {
+impl<'gc> Frame<'_, 'gc> {
     #[inline]
     pub fn get(self, r: u8) -> Value<'gc> {
         Value::from_bits(self.slots[r as usize].get())

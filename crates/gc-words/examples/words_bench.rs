@@ -7,34 +7,14 @@ use std::time::{Duration, Instant};
 
 use ragwort_gc_words::*;
 
-struct Node;
-impl Object for Node {
-    const DESC: Desc = Desc::of::<Node>(2).members(0b10);
-}
-
-struct Pair;
-impl Object for Pair {
-    const DESC: Desc = Desc::of::<Pair>(2).values(0b11);
-}
-
-struct Vector;
-impl Object for Vector {
-    const DESC: Desc = Desc::of::<Vector>(0).items(Items::Values);
-}
-
-struct Holder;
-impl Object for Holder {
-    const DESC: Desc = Desc::of::<Holder>(2).weaks(0b01).members(0b10);
-}
-
-struct Table;
-impl Object for Table {
-    const DESC: Desc = Desc::of::<Table>(0).items(Items::Ephemerons);
-}
-
-struct Host;
-impl Object for Host {
-    const DESC: Desc = Desc::of::<Host>(1).hosts(1);
+objects! {
+    kind Kind;
+    struct Node { n: u64, next: Member<Node> }
+    struct Pair { car: Value, cdr: Value }
+    struct Vector {} items Value
+    struct Holder { target: Weak<Node>, next: Member<Holder> }
+    struct Table {} items Ephemeron
+    struct HostBox { data: Host<u64> }
 }
 
 fn fixnum<'gc>(n: i64) -> Value<'gc> {
@@ -42,7 +22,7 @@ fn fixnum<'gc>(n: i64) -> Value<'gc> {
 }
 
 fn pair<'gc>(mc: &Mutation<'gc>, car: Value<'gc>, cdr: Value<'gc>) -> Value<'gc> {
-    Value::object(mc, mc.alloc::<Pair, 2>([car.to_bits(), cdr.to_bits()]).expect("alloc"))
+    Value::object(mc, Pair::new(mc, car, cdr).expect("alloc"))
 }
 
 fn head<'gc>(mc: &Mutation<'gc>) -> Option<Gc<'gc, Node>> {
@@ -53,8 +33,7 @@ fn head<'gc>(mc: &Mutation<'gc>) -> Option<Gc<'gc, Node>> {
 fn build(arena: &mut Arena, n: i64) {
     arena.mutate(|mc| {
         for i in 0..n {
-            let next = head(mc).map_or(0, Gc::to_word);
-            let node = mc.alloc::<Node, 2>([i as u64, next]).expect("alloc");
+            let node = Node::new(mc, i as u64, head(mc)).expect("alloc");
             mc.set_root(0, Value::object(mc, node));
         }
     });
@@ -73,7 +52,7 @@ fn main() {
         for _ in 0..4000 {
             arena.step(|mc| {
                 for i in 0..1000 {
-                    black_box(mc.alloc::<Node, 2>([i, 0]).expect("alloc"));
+                    black_box(Node::new(mc, i, None).expect("alloc"));
                 }
             })
             .expect("step");
@@ -88,9 +67,9 @@ fn main() {
         let start = Instant::now();
         arena.mutate(|mc| {
             let head = head(mc).expect("head");
-            let next = head.member::<Node>(mc, 1);
+            let next = head.next(mc);
             for _ in 0..50_000_000 {
-                head.set_member(mc, 1, black_box(next));
+                head.set_next(mc, black_box(next));
             }
         });
         start.elapsed()
@@ -118,7 +97,7 @@ fn main() {
     time("minor, 1M vector, 1K stores x 100", 7, || {
         let mut arena = Arena::new(REGION, 1);
         arena.mutate(|mc| {
-            let vector = mc.alloc_items::<Vector, 0>([], 1_000_000, Value::NIL).expect("alloc");
+            let vector = Vector::new(mc, 1_000_000, Value::NIL).expect("alloc");
             mc.set_root(0, Value::object(mc, vector));
         });
         arena.collect();
@@ -128,7 +107,7 @@ fn main() {
                 let vector = mc.root(0).downcast::<Vector>(mc).expect("vector");
                 for i in 0..1000 {
                     let at = (round * 1000 + i) * 7919 % 1_000_000;
-                    vector.slots(mc).set(mc, at as usize, pair(mc, fixnum(i), Value::NIL));
+                    vector.items(mc).set(mc, at as usize, pair(mc, fixnum(i), Value::NIL));
                 }
             });
             arena.collect_minor();
@@ -150,12 +129,12 @@ fn main() {
         let mut arena = Arena::new(1 << 20, 1);
         arena.mutate(|mc| {
             let host = mc.host(7u64).expect("host");
-            let object = mc.alloc::<Host, 1>([host.to_word()]).expect("alloc");
+            let object = HostBox::new(mc, Some(host)).expect("alloc");
             mc.set_root(0, Value::object(mc, object));
         });
         let start = Instant::now();
         arena.mutate(|mc| {
-            let host = mc.root(0).downcast::<Host>(mc).and_then(|h| h.host::<u64>(mc, 0)).expect("host");
+            let host = mc.root(0).downcast::<HostBox>(mc).and_then(|h| h.data(mc)).expect("host");
             let mut sum = 0;
             for _ in 0..50_000_000 {
                 sum += *black_box(host).get(mc).expect("host");
@@ -184,8 +163,8 @@ fn main() {
                     loop {
                         let pair = if tagged { cur.downcast_tag(tag) } else { cur.downcast::<Pair>(mc) };
                         let Some(pair) = pair else { break };
-                        sum = sum.fixnum_add(pair.value(mc, 0)).expect("sum");
-                        cur = pair.value(mc, 1);
+                        sum = sum.fixnum_add(pair.car(mc)).expect("sum");
+                        cur = pair.cdr(mc);
                     }
                     black_box(sum);
                 }
@@ -205,7 +184,7 @@ fn main() {
         arena.mutate(|mc| {
             let pair = mc.root(0).downcast::<Pair>(mc).expect("pair");
             for i in 0..50_000_000 {
-                pair.set_value(mc, 0, black_box(fixnum(i)));
+                pair.set_car(mc, black_box(fixnum(i)));
             }
         });
         start.elapsed()
@@ -220,8 +199,8 @@ fn main() {
             for _ in 0..20 {
                 let (mut sum, mut cur) = (0i64, head(mc));
                 while let Some(node) = cur {
-                    sum += node.word(mc, 0) as i64;
-                    cur = node.member(mc, 1);
+                    sum += node.n(mc) as i64;
+                    cur = node.next(mc);
                 }
                 black_box(sum);
             }
@@ -235,15 +214,15 @@ fn main() {
             arena.mutate(|mc| {
                 let p = pair(mc, Value::NIL, Value::NIL);
                 for root in 0..2 {
-                    let v = mc.alloc_items::<Vector, 0>([], 1_000_000, p).expect("alloc");
+                    let v = Vector::new(mc, 1_000_000, p).expect("alloc");
                     mc.set_root(root, Value::object(mc, v));
                 }
             });
             arena.collect();
             let start = Instant::now();
             arena.mutate(|mc| {
-                let a = mc.root(0).downcast::<Vector>(mc).expect("vector").slots(mc);
-                let b = mc.root(1).downcast::<Vector>(mc).expect("vector").slots(mc);
+                let a = mc.root(0).downcast::<Vector>(mc).expect("vector").items(mc);
+                let b = mc.root(1).downcast::<Vector>(mc).expect("vector").items(mc);
                 for _ in 0..50 {
                     if bulk {
                         black_box(a).copy_from(mc, b);
@@ -264,7 +243,7 @@ fn main() {
             let mut arena = Arena::new(REGION, 1);
             let stack = arena.mutate(|mc| {
                 let p = pair(mc, Value::NIL, Value::NIL);
-                let v = mc.alloc_items::<Vector, 0>([], 2048, p).expect("alloc");
+                let v = Vector::new(mc, 2048, p).expect("alloc");
                 mc.set_root(0, Value::object(mc, v));
                 let segment = mc.alloc_items::<Segment, 1>([0], 2048, p).expect("alloc");
                 mc.stack(segment).expect("stack")
@@ -278,7 +257,7 @@ fn main() {
                         f.set((i.wrapping_mul(7)) as u8, f.get((i.wrapping_mul(13)) as u8));
                     }
                 } else {
-                    let slots = mc.root(0).downcast::<Vector>(mc).expect("vector").slots(mc);
+                    let slots = mc.root(0).downcast::<Vector>(mc).expect("vector").items(mc);
                     let r = black_box(slots.window().expect("window"));
                     for i in 0..50_000_000u32 {
                         r.set(mc, (i.wrapping_mul(7)) as u8, r.get((i.wrapping_mul(13)) as u8));
@@ -341,9 +320,9 @@ fn main() {
         let start = Instant::now();
         arena.mutate(|mc| {
             let head = head(mc).expect("head");
-            let next = head.member::<Node>(mc, 1);
+            let next = head.next(mc);
             for _ in 0..50_000_000 {
-                head.set_member(mc, 1, black_box(next));
+                head.set_next(mc, black_box(next));
             }
         });
         start.elapsed()
@@ -353,9 +332,9 @@ fn main() {
         let mut arena = Arena::new(REGION, 1);
         arena.mutate(|mc| {
             for i in 0..1_000_000 {
-                let node = mc.alloc::<Node, 2>([i, 0]).expect("alloc");
-                let next = mc.root(0).downcast::<Holder>(mc).map_or(0, Gc::to_word);
-                let holder = mc.alloc::<Holder, 2>([node.to_word(), next]).expect("alloc");
+                let node = Node::new(mc, i, None).expect("alloc");
+                let next = mc.root(0).downcast::<Holder>(mc);
+                let holder = Holder::new(mc, Some(node), next).expect("alloc");
                 mc.set_root(0, Value::object(mc, holder));
             }
         });
@@ -375,7 +354,7 @@ fn main() {
         arena.mutate(|mc| {
             let pair = mc.root(0).downcast::<Pair>(mc).expect("pair");
             for i in 0..50_000_000 {
-                pair.set_value(mc, 0, Value::inline_flonum(black_box(i as f64 + 0.5)).expect("inline"));
+                pair.set_car(mc, Value::inline_flonum(black_box(i as f64 + 0.5)).expect("inline"));
             }
         });
         start.elapsed()
@@ -395,8 +374,8 @@ fn main() {
             for _ in 0..20 {
                 let (mut sum, mut cur) = (0.0, mc.root(0));
                 while let Some(pair) = cur.downcast::<Pair>(mc) {
-                    sum += pair.value(mc, 0).as_flonum(mc).expect("flonum");
-                    cur = pair.value(mc, 1);
+                    sum += pair.car(mc).as_flonum(mc).expect("flonum");
+                    cur = pair.cdr(mc);
                 }
                 black_box(sum);
             }
@@ -421,7 +400,7 @@ fn main() {
     time("ephemeron 500K, half die", 7, || {
         let mut arena = Arena::new(REGION, 2);
         arena.mutate(|mc| {
-            let table = mc.alloc_items::<Table, 0>([], 1_000_000, Value::BROKEN).expect("alloc");
+            let table = Table::new(mc, 500_000).expect("alloc");
             for i in 0..500_000 {
                 let key = pair(mc, fixnum(i), Value::NIL);
                 table.set_entry(mc, i as usize, key, pair(mc, fixnum(i), key));
