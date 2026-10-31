@@ -210,6 +210,9 @@ impl<'a> Units<'a> {
     /// Whether these are the same characters, given both are at their narrowest width.
     pub(crate) fn equal(self, other: Units<'_>) -> bool {
         match (self, other) {
+            (Self::One(a), Units::One(b)) if a.len() <= crate::hash::SHORT => {
+                a.len() == b.len() && crate::hash::words(a) == crate::hash::words(b)
+            }
             (Self::One(a), Units::One(b)) => a == b,
             (Self::Two(a), Units::Two(b)) => a == b,
             (Self::Four(a), Units::Four(b)) => a == b,

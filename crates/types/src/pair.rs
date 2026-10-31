@@ -5,6 +5,7 @@
 use ragwort_gc::{Gc, Mutation, OutOfMemory, Plain, Trace, TypeTag, Value};
 
 #[cfg(test)]
+#[path = "tests/pair.rs"]
 mod tests;
 
 #[derive(Trace, Plain)]
@@ -58,7 +59,21 @@ impl<'a, 'gc> Pairs<'a, 'gc> {
 
     /// A list of `items`.
     pub fn list(&self, items: &[Value<'gc>]) -> Result<Value<'gc>, OutOfMemory> {
-        items.iter().rev().try_fold(Value::NIL, |tail, &head| Ok(Value::object(self.mc, self.cons(head, tail)?)))
+        self.list_with_tail(items.iter().copied(), Value::NIL)
+    }
+
+    /// Prepends `items`, in order, to a proper or dotted `tail`.
+    pub fn list_with_tail<I>(&self, items: I, mut tail: Value<'gc>) -> Result<Value<'gc>, OutOfMemory>
+    where
+        I: IntoIterator<Item = Value<'gc>>,
+        I::IntoIter: DoubleEndedIterator,
+    {
+        let mut len = self.list_len(tail);
+        for head in items.into_iter().rev() {
+            len = len.map(|n| n.saturating_add(1));
+            tail = Value::object(self.mc, self.mc.alloc(Pair { head, tail, len: len.unwrap_or(0) })?);
+        }
+        Ok(tail)
     }
 
     /// The length of `v` if it's a list: `()` or a pair whose pairs end in `()`.

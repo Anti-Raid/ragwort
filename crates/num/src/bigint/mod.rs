@@ -9,6 +9,7 @@ mod string;
 mod vector;
 
 #[cfg(test)]
+#[path = "../tests/bigint.rs"]
 mod tests;
 
 pub use bitwise::*;

@@ -226,4 +226,5 @@ impl<'gc> Host for Nums<'_, 'gc> {
 }
 
 #[cfg(test)]
+#[path = "tests/num.rs"]
 mod tests;

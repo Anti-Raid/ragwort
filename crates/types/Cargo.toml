@@ -4,15 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+ragwort-gc-prims = { path = "../gc-prims", default-features = false }
 ragwort-gc = { path = "../gc", default-features = false }
 ragwort-num = { path = "../num" }
 ragwort-string = { path = "../string" }
 
 [features]
 default = ["mmap"]
-mmap = ["ragwort-gc/mmap"]
-gc-verify = ["ragwort-gc/gc-verify"]
-gc-hardened = ["ragwort-gc/gc-hardened"]
+mmap = ["ragwort-gc/mmap", "ragwort-gc-prims/mmap"]
+gc-verify = ["ragwort-gc/gc-verify", "ragwort-gc-prims/gc-verify"]
+gc-hardened = ["ragwort-gc/gc-hardened", "ragwort-gc-prims/gc-hardened"]
 
 [lints]
 workspace = true

@@ -8,6 +8,7 @@ use std::marker::PhantomData;
 use ragwort_gc::{Gc, Lock, Mutation, OutOfMemory, Plain, Trace, TypeTag, Value};
 
 #[cfg(test)]
+#[path = "tests/vector.rs"]
 mod tests;
 
 #[derive(Trace, Plain)]
@@ -92,6 +93,10 @@ impl<'a, 'gc> Vectors<'a, 'gc> {
 
     pub fn immutable_from_slice(&self, items: &[Value<'gc>]) -> Result<Gc<'gc, ImmutableVector<'gc>>, OutOfMemory> {
         self.mc.alloc_inline_from(ImmutableVector(PhantomData), items)
+    }
+
+    pub fn immutable_with(&self, len: usize, fill: impl FnMut(usize) -> Value<'gc>) -> Result<Gc<'gc, ImmutableVector<'gc>>, OutOfMemory> {
+        self.mc.alloc_inline(ImmutableVector(PhantomData), len, fill)
     }
 
     /// `v`'s elements as they are now, in a vector that can't change: `v` itself if it's

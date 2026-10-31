@@ -1,13 +1,14 @@
-//! Ragwort's data types in the arena: numbers, strings, symbols, pairs and vectors, with the arena as the
+//! Ragwort's data types in the arena: numbers, strings, symbols, pairs, vectors and syntax, with the arena as the
 //! host that `ragwort-num` and `ragwort-string` work over.
 
 pub use ragwort_gc as gc;
+pub use ragwort_gc_prims as gc_prims;
 
-pub mod buffer;
 pub mod num;
 pub mod pair;
 pub mod string;
 pub mod symbol;
+pub mod syntax;
 pub mod vector;
 
 use ragwort_gc::OutOfMemory;

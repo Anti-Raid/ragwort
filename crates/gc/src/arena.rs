@@ -5,7 +5,7 @@ use std::ptr::NonNull;
 
 use super::heap::{Heap, Made};
 use super::layout;
-use super::{Gc, Inline, Invariant, OutOfMemory, Plain, Trace};
+use super::{Charge, Gc, Inline, Invariant, OutOfMemory, Plain, Trace};
 
 const STEP_MUL: usize = 2;
 const MIN_SLICE: usize = 64 * 1024;
@@ -328,6 +328,12 @@ impl<'gc> Mutation<'gc> {
     /// interpreter checks it between instructions and ends the step, which collects.
     pub fn collection_due(&self) -> bool {
         self.heap.budget.collection_due()
+    }
+
+    /// A charge of nothing yet against the budget, for memory kept outside the arena. See
+    /// [`Charge`].
+    pub fn charge(&self) -> Charge<'gc> {
+        Charge::new(&self.heap.budget)
     }
 
     pub fn ensure(&self, bytes: usize) -> Result<(), OutOfMemory> {

@@ -46,7 +46,7 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// The next arena id. Handles that outlive steps are told apart by id, so ids are never reused:
 /// once they run out, no more arenas can be made.
 pub(crate) fn take_id(next: &AtomicU64) -> Option<u64> {
-    next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1)).ok()
+    next.try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1)).ok()
 }
 
 pub(crate) struct Heap {

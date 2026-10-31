@@ -160,13 +160,13 @@ impl Heap {
         check.ty() == ty && self.checks_out(offset, check)
     }
 
-    /// The items of the object at `offset`, if it's a `T`, for the collector.
+    /// The head and items of the object at `offset`, if it's a `T`, for the collector.
     ///
     /// # Safety
-    /// Nothing else in the collection may reference the object's memory while the slice is in
+    /// Nothing else in the collection may reference the object's memory while these views are in
     /// use. The mutator can't: collections hold the heap mutably.
     #[allow(clippy::mut_from_ref)]
-    pub(crate) unsafe fn items_mut<T: Inline>(&self, offset: u32, _: &Collecting) -> Option<&mut [T::Item]> {
+    pub(crate) unsafe fn inline_mut<T: Inline>(&self, offset: u32, _: &Collecting) -> Option<(&mut T, &mut [T::Item])> {
         let (_, vtable, _) = self.view_at(offset)?;
         let id: fn() -> TypeId = layout::type_id::<T>;
         if !(ptr::fn_addr_eq(vtable.type_id, id) || (vtable.type_id)() == id()) {
@@ -175,7 +175,10 @@ impl Heap {
         // SAFETY: [steps, alias, headers, extents] the vtable is `T`'s, so the header starts a
         // `T`, and its items are the object's. The caller holds no other view of it, and the
         // `Collecting` token means no step does.
-        unsafe { Some(&mut *Object::<T>::at(self.header_ptr(offset)).items()) }
+        unsafe {
+            let object = Object::<T>::at(self.header_ptr(offset));
+            Some((&mut *object.value(), &mut *object.items()))
+        }
     }
 
     /// Wipes the header of an object that's gone, so stale references to it don't check out.

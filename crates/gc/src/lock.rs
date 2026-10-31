@@ -30,8 +30,9 @@ impl<T: Copy + Trace> Lock<T> {
     where
         T: 'gc,
     {
+        let refs = T::NEEDS_TRACE && value.holds_refs();
         self.0.set(value);
-        if T::NEEDS_TRACE && value.holds_refs() {
+        if refs {
             mc.heap.write_barrier(Addr::of(self.0.as_ptr()), |t| {
                 let mut value = value;
                 value.trace(t);
@@ -54,6 +55,7 @@ impl<T: Copy + Trace> Lock<T> {
         T: 'gc,
     {
         assert_eq!(dst.len(), src.len(), "copy between slices of different lengths");
+        let refs = T::NEEDS_TRACE && src.iter().any(|s| s.get().holds_refs());
         if dst.as_ptr() > src.as_ptr() {
             for (d, s) in dst.iter().zip(src).rev() {
                 d.0.set(s.get());
@@ -63,7 +65,7 @@ impl<T: Copy + Trace> Lock<T> {
                 d.0.set(s.get());
             }
         }
-        Self::barrier_range(mc, dst, T::NEEDS_TRACE && dst.iter().any(|d| d.get().holds_refs()));
+        Self::barrier_range(mc, dst, refs);
     }
 
     /// Writes `src` into `dst`, with one barrier for the whole range. Panics if the lengths
@@ -73,20 +75,22 @@ impl<T: Copy + Trace> Lock<T> {
         T: 'gc,
     {
         assert_eq!(dst.len(), src.len(), "copy between slices of different lengths");
+        let refs = T::NEEDS_TRACE && src.iter().any(T::holds_refs);
         for (d, s) in dst.iter().zip(src) {
             d.0.set(*s);
         }
-        Self::barrier_range(mc, dst, T::NEEDS_TRACE && src.iter().any(T::holds_refs));
+        Self::barrier_range(mc, dst, refs);
     }
 
     pub fn fill<'gc>(mc: &Mutation<'gc>, dst: &[Self], value: T)
     where
         T: 'gc,
     {
+        let refs = T::NEEDS_TRACE && value.holds_refs();
         for d in dst {
             d.0.set(value);
         }
-        Self::barrier_range(mc, dst, T::NEEDS_TRACE && value.holds_refs());
+        Self::barrier_range(mc, dst, refs);
     }
 
     pub(crate) fn barrier_range(mc: &Mutation<'_>, slots: &[Self], refs: bool) {

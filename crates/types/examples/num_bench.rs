@@ -3,14 +3,14 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use ragwort_types::buffer::Buffer;
+use ragwort_gc_prims::GcVec;
 use ragwort_types::gc::{Arena, Gc, Mutation, Rootable, TypeTag, Value};
 use ragwort_types::num::bigint::{self, Digits, RWDigits};
 use ragwort_types::num::{Big, Host, Integer, IntView, Nums, int};
 
 struct Ints;
 impl Rootable for Ints {
-    type Root<'gc> = Buffer<'gc, Value<'gc>>;
+    type Root<'gc> = GcVec<'gc, Value<'gc>>;
 }
 
 /// Keeps each benchmark's best time, since runs interleave and noise only adds.
@@ -122,7 +122,7 @@ const MULS: usize = 4_000_000;
 const BATCH: usize = 50_000;
 
 fn main() {
-    let mut arena = Arena::<Ints>::new(256 << 20, |_| Ok(Buffer::new())).expect("arena");
+    let mut arena = Arena::<Ints>::new(256 << 20, |_| Ok(GcVec::new())).expect("arena");
     let mut best = Best::default();
     for _ in 0..9 {
         arena.mutate(|mc, _| {

@@ -149,6 +149,44 @@ impl Budget {
     }
 }
 
+/// Bytes kept outside the arena, such as a step's scratch vectors, counted against its budget
+/// while this lives. It gives back exactly what it took when dropped, so the budget can't be
+/// refunded more than was charged.
+pub struct Charge<'gc> {
+    bytes: usize,
+    budget: &'gc Budget,
+}
+
+impl<'gc> Charge<'gc> {
+    pub(crate) fn new(budget: &'gc Budget) -> Self {
+        Self { bytes: 0, budget }
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Charges `more` bytes, failing as an allocation would if the budget can't cover them.
+    pub fn grow(&mut self, more: usize) -> Result<(), OutOfMemory> {
+        self.budget.charge(more)?;
+        self.bytes += more;
+        Ok(())
+    }
+
+    /// Gives back up to `less` bytes.
+    pub fn shrink(&mut self, less: usize) {
+        let less = less.min(self.bytes);
+        self.budget.refund(less);
+        self.bytes -= less;
+    }
+}
+
+impl Drop for Charge<'_> {
+    fn drop(&mut self) {
+        self.budget.refund(self.bytes);
+    }
+}
+
 /// Puts a flag back to what it was when dropped.
 struct Restore<'a>(&'a Cell<bool>, bool);
 

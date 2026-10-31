@@ -1,0 +1,16 @@
+[package]
+name = "ragwort-gc-words"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+ragwort-gc-region = { path = "../gc-region" }
+
+[features]
+default = ["mmap"]
+# Gives freed pages back to the system. The unsafe code for it is in ragwort-gc-region.
+mmap = ["ragwort-gc-region/mmap"]
+
+[lints]
+workspace = true

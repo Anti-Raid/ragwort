@@ -9,9 +9,12 @@ use std::marker::PhantomData;
 use ragwort_gc::{Gc, Lock, Member, Plain, Trace, Value, Weak};
 
 use crate::Error;
+use ragwort_gc_prims::GcMap;
+
 use crate::string::{self, Str, Strings, Table};
 
 #[cfg(test)]
+#[path = "tests/symbol.rs"]
 mod tests;
 
 /// A symbol's name, a flat string, and the name's hash.
@@ -99,13 +102,10 @@ impl Default for Symbols<'_> {
 /// The table's storage as [`Table`] sees it, kept private so only interning changes it.
 struct Interner<'s, 'gc>(&'s Symbols<'gc>);
 
-impl<'gc> Table<Strings<'_, 'gc>> for Interner<'_, 'gc> {
-    type Symbol = Gc<'gc, Sym<'gc>>;
+impl<'gc> GcMap<Strings<'_, 'gc>> for Interner<'_, 'gc> {
+    type Entry = Gc<'gc, Sym<'gc>>;
+    type Error = Error;
     type Slot = Slot<'gc>;
-
-    fn seed(&self) -> u64 {
-        self.0.seed
-    }
 
     fn slots<'a>(&'a self, h: &'a Strings<'_, 'gc>) -> &'a [Slot<'gc>] {
         self.0.slots.load(h.mc).map_or(&[], |slots| slots.items())
@@ -121,7 +121,7 @@ impl<'gc> Table<Strings<'_, 'gc>> for Interner<'_, 'gc> {
         slot.key.get()
     }
 
-    fn symbol(&self, h: &Strings<'_, 'gc>, slot: &Slot<'gc>) -> Option<Gc<'gc, Sym<'gc>>> {
+    fn entry(&self, h: &Strings<'_, 'gc>, slot: &Slot<'gc>) -> Option<Gc<'gc, Sym<'gc>>> {
         slot.symbol.get(h.mc)
     }
 
@@ -136,6 +136,12 @@ impl<'gc> Table<Strings<'_, 'gc>> for Interner<'_, 'gc> {
 
     fn set_used(&self, h: &Strings<'_, 'gc>, used: usize) {
         self.0.used.set(h.mc, used as u32);
+    }
+}
+
+impl<'gc> Table<Strings<'_, 'gc>> for Interner<'_, 'gc> {
+    fn seed(&self) -> u64 {
+        self.0.seed
     }
 
     fn make(&self, h: &Strings<'_, 'gc>, name: Str<'gc>, hash: u64) -> Result<Gc<'gc, Sym<'gc>>, Error> {

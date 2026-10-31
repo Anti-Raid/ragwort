@@ -3,5 +3,8 @@ name = "ragwort-string"
 version = "0.1.0"
 edition = "2024"
 
+[dependencies]
+ragwort-gc-prims = { path = "../gc-prims", default-features = false }
+
 [lints]
 workspace = true

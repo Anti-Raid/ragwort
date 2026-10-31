@@ -168,4 +168,5 @@ fn init_all(init: impl FnOnce(UnitsMut<'_>), units: UnitsMut<'_>) -> usize {
 }
 
 #[cfg(test)]
+#[path = "tests/string.rs"]
 mod tests;

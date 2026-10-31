@@ -1,0 +1,23 @@
+[package]
+name = "ragwort-gc-region"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+memmap2 = { version = "0.9.12", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[features]
+# Maps the region and gives freed pages back to the system. Without it, the region is a plain
+# allocation and the crate has no unsafe code.
+mmap = ["dep:memmap2", "dep:libc"]
+
+# Not the workspace lints, which forbid unsafe code: `src/mmap.rs` allows it, nothing else.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "forbid"
+undocumented_unsafe_blocks = "warn"

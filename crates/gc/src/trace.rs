@@ -77,6 +77,11 @@ unsafe impl<'gc, T: Plain<'gc>, const N: usize> Plain<'gc> for [T; N] {
 /// `Trace::trace` covers the head only; the heap traces the items.
 pub unsafe trait Inline: Trace {
     type Item: Trace;
+
+    /// Called before exposing the items through `Gc::items`. Types that track writes can
+    /// conservatively account for the whole slice, including writes through its cells.
+    #[inline]
+    fn items_accessed(&self, _len: usize) {}
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -245,7 +250,7 @@ impl<'a> Tracer<'a> {
 
 macro_rules! leaf {
     ($($t:ty),* $(,)?) => {$(
-        // SAFETY: it holds no references, and says so.
+        // SAFETY: it holds no GC references, and says so.
         unsafe impl Trace for $t {
             const NEEDS_TRACE: bool = false;
 
@@ -255,7 +260,7 @@ macro_rules! leaf {
     )*};
 }
 
-leaf!((), bool, char, u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f64, String);
+leaf!((), bool, char, u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f64);
 
 // The rule for every generic impl: each type parameter is traced, or only in a `PhantomData`.
 // Anything else could hold an arena reference the collector never sees. Rust's collections

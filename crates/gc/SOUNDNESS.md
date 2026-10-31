@@ -59,7 +59,7 @@ A collection never runs during a step, nor a step during a collection.
   takes free memory, and sweeping only runs in collection slices.
 
 Relied on by `Gc::as_ref`, `Deref` and `items`, whose `&'gc` borrows last the step;
-`HostRef::get`, since host values are only freed by sweeping; and `items_mut` and the vtables'
+`HostRef::get`, since host values are only freed by sweeping; and `inline_mut` and the vtables'
 `trace`, which take `&mut` because no step holds a reference.
 
 ### refs
@@ -97,7 +97,7 @@ allocation wrote, so `ty` is its type and `len` its item count.
   and refuses steps ([unwind](#unwind)).
 
 Relied on by `Object::len` and `items`, and so `Gc::items`, and by the collector's views
-(`trace_with`, `items_mut`): the items are exactly the object's, and the `max_items` cap is only
+(`trace_with`, `inline_mut`): the items are exactly the object's, and the `max_items` cap is only
 a backstop. `Batch`, and with `gc-hardened` the collector, don't rely on it, since
 [extents](#extents) bounds their views.
 
@@ -141,11 +141,11 @@ its header, and no step's references exist.
 - `Building` writes new objects into memory `reserve` just took from free lines or pages, which
   no reference reaches. `alloc_inline_with`'s `init` gets `&mut` to the new items before any
   `Gc` to them exists.
-- In a collection, `trace_with` and `items_mut` take `&mut` to one object at a time, within its
+- In a collection, `trace_with` and `inline_mut` take `&mut` to one object at a time, within its
   own bytes ([headers](#headers), and with `gc-hardened` also [extents](#extents)). The tracer reads other headers by value through raw
   pointers, so tracing an object that refers to itself doesn't alias the `&mut`.
 
-Relied on by `Gc::as_ref`, `items`, `Building`, the vtables' `trace`, and `items_mut`.
+Relied on by `Gc::as_ref`, `items`, `Building`, the vtables' `trace`, and `inline_mut`.
 
 ### extents
 
@@ -159,9 +159,9 @@ claims. The feature costs about 10% on collections, so it's off by default.
 - `checked_view` checks the size the header claims, which bounds the value and the items,
   against the next start bit after the object, or against its page run for a large object.
   `object_span` always uses it, and `view_at` does with `gc-hardened`. When the size doesn't
-  fit, `trace_object` marks the arena corrupted instead of tracing, `items_mut` returns `None`,
+  fit, `trace_object` marks the arena corrupted instead of tracing, `inline_mut` returns `None`,
   and `object_span` returns `None`, so a `Batch` takes the barrier for every store.
-- The collector's views only come from `view_at`: `trace_with`, `items_mut` and `gc-verify`'s
+- The collector's views only come from `view_at`: `trace_with`, `inline_mut` and `gc-verify`'s
   trace. Plain `size_of`, bounded only by the page run, is for what takes no view: counting
   the lines marking keeps, and compaction's copy, which only reads the old bytes through raw
   pointers into memory just reserved for it.
@@ -169,7 +169,7 @@ claims. The feature costs about 10% on collections, so it's off by default.
 `a_damaged_header_cant_stretch_a_batch` and, with the feature,
 `a_damaged_length_cant_stretch_a_trace` damage a length so it covers a neighbor.
 
-Relied on by [alias](#alias), the vtables' `trace`, `items_mut`, and `Batch`.
+Relied on by [alias](#alias), the vtables' `trace`, `inline_mut`, and `Batch`.
 
 ### reach
 
@@ -179,6 +179,9 @@ Major cycles:
 
 - Marking clears the marks and traces the roots: the arena root, `Root` entries, and live
   stacks (`trace_roots`).
+- Lock writes evaluate `holds_refs` before changing storage. Bulk writes check the source
+  before the first store, including overlapping copies. No user code runs between those
+  stores and entering the barrier, whose tracing callback is guarded against unwinding.
 - Storing into a marked object shades the stored value (`write_barrier`). `Lock::fill` and
   `barrier_range` shade ranges, and a `Batch` grays its object again when it ends
   (`retrace_part`). Writes to the root and to stack frames skip barriers; the atomic phase
@@ -225,6 +228,16 @@ or moved.
 - Frames stop skipping the barrier only after a barrier over all of them: in `capture`, for the
   frames below the new `base`, in `switch` and `park` (`retire`), and in `attach`, for a dropped
   stack that used the same segment.
+- Slots written without a barrier lie below a bound in the stack's record, outside the arena:
+  `Stack::live` extends it before exposing slots. Public `Gc::items` calls
+  `Inline::items_accessed`, which extends a second bound in the segment to its full length,
+  since callers can write through those locks; those writes take the barrier, so that bound
+  only keeps them from outliving `top`. Internal reads bypass the hook. No exposed slice
+  survives a collection.
+- Marking and retirement clear only `top` up to the higher bound (clamped to the segment and
+  `base`). Only marking resets the bounds to the live end: retirement runs inside a step,
+  where previously exposed raw slices can still write afterward. Both bounds are slot
+  indices, so compaction doesn't change them.
 - A dropped `Stack`'s record is let go only after a `Mark` trace.
 - One live stack uses a segment at a time (`attach` panics otherwise), so no record voids
   another's frames.
@@ -261,6 +274,7 @@ this relies on a destructor safe code could skip.
 
 | Where it can panic | What's half done | Why it's safe |
 |---|---|---|
+| `holds_refs` in a lock write | no destination writes yet: `set`, `copy`, `write`, `fill` and `Batch::set` check before storing | the operation leaves its destination unchanged |
 | `Trace` code in a collection (`minor`, `start`, `work`) | marks, the gray stack, forwarding | `CorruptOnUnwind` closes the arena |
 | `Trace` code in a barrier (`barrier_slow`, `barrier_range`) | a stored value, partly shaded | `CorruptOnUnwind`: nothing is freed again, and the step's `mutate` returns `Corrupted` |
 | `fill` or `init` in `alloc_inline*` | a reserved object | `Building`'s drop releases it, and nothing names it yet |

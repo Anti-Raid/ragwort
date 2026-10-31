@@ -23,17 +23,20 @@ mod trace;
 mod value;
 
 #[cfg(test)]
+#[path = "tests/arena.rs"]
 mod tests;
 #[cfg(test)]
+#[path = "tests/value.rs"]
 mod value_tests;
 #[cfg(test)]
+#[path = "tests/stack.rs"]
 mod stack_tests;
 
 #[doc(hidden)]
 pub mod compile_fail;
 
 pub use arena::{Arena, Corrupted, Metrics, Mutation, Phase, Rootable, StepError, max_items};
-pub use budget::OutOfMemory;
+pub use budget::{Charge, OutOfMemory};
 pub use host::{AnyHostRef, HostRef};
 pub use layout::REGION;
 pub use lock::{Batch, Lock};

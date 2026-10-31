@@ -55,6 +55,14 @@ impl<'gc, T: Inline> Gc<'gc, T> {
     }
 
     pub fn items(self) -> &'gc [T::Item] {
+        self.items_accessed(self.len());
+        // SAFETY: the access hook above accounts for the exposed slice.
+        unsafe { self.items_untracked() }
+    }
+
+    /// # Safety
+    /// The caller must provide the bookkeeping normally done by `Inline::items_accessed`.
+    pub(crate) unsafe fn items_untracked(self) -> &'gc [T::Item] {
         // SAFETY: [headers, alias] the header's length is the object's own item count, so the
         // items are inside the object, and they're borrowed shared as in `as_ref`.
         unsafe { &*self.object().items() }

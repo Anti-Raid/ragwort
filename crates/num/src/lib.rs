@@ -10,12 +10,16 @@ pub mod rational;
 pub mod real;
 
 #[cfg(test)]
+#[path = "tests/complex.rs"]
 mod complex_tests;
 #[cfg(test)]
+#[path = "tests/int.rs"]
 mod int_tests;
 #[cfg(test)]
+#[path = "tests/rational.rs"]
 mod rational_tests;
 #[cfg(test)]
+#[path = "tests/real.rs"]
 mod real_tests;
 #[cfg(test)]
 mod testing;

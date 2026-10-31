@@ -12,8 +12,10 @@ mod rope;
 mod units;
 
 #[cfg(test)]
+#[path = "tests/support.rs"]
 mod testing;
 #[cfg(test)]
+#[path = "tests/string.rs"]
 mod tests;
 
 use std::cmp::Ordering;
@@ -253,6 +255,10 @@ pub fn equal_str<H: Host>(h: &H, s: H::Str, t: &str) -> Result<bool, H::Error> {
     {
         h.charge(t.len() as u64)?;
         // Equal bytes are equal characters only if they're ASCII: Latin-1 isn't UTF-8 past it.
+        if t.len() <= hash::SHORT {
+            let w = hash::words(t.as_bytes());
+            return Ok(hash::words(bytes) == w && (w.0 | w.1) & hash::HIGH == 0);
+        }
         return Ok(bytes == t.as_bytes() && t.is_ascii());
     }
     if info.len > t.len() || info.len < t.len().div_ceil(4) {
