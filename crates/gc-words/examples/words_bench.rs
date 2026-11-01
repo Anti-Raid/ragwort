@@ -1,6 +1,5 @@
-//! `ragwort-gc`'s `gc_bench`, row for row, on the word heap. Objects are the same sizes: a
-//! header word and two fields. Run with `--release` and compare with
-//! `cargo run --release -p ragwort-gc --example gc_bench`.
+//! The collector's benchmark: allocation, collections, barriers, weak references and frames. Objects are a
+//! header word and two fields. Run with `--release`.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -15,6 +14,8 @@ objects! {
     struct Holder { target: Weak<Node>, next: Member<Holder> }
     struct Table {} items Ephemeron
     struct HostBox { data: Host<u64> }
+    struct Nodes {} items Member<Node>
+    struct Weaks {} items Weak<Node>
 }
 
 fn fixnum<'gc>(n: i64) -> Value<'gc> {
@@ -337,6 +338,26 @@ fn main() {
                 let holder = Holder::new(mc, Some(node), next).expect("alloc");
                 mc.set_root(0, Value::object(mc, holder));
             }
+        });
+        let start = Instant::now();
+        arena.collect();
+        start.elapsed()
+    });
+
+    time("weak items 1M, half die, major", 7, || {
+        let mut arena = Arena::new(REGION, 2);
+        arena.mutate(|mc| {
+            let weak = Weaks::new(mc, 1_000_000, None).expect("alloc");
+            let strong = Nodes::new(mc, 500_000, None).expect("alloc");
+            for i in 0..1_000_000 {
+                let node = Node::new(mc, i as u64, None).expect("alloc");
+                weak.items(mc).set(mc, i, Some(node));
+                if i % 2 == 0 {
+                    strong.items(mc).set(mc, i / 2, Some(node));
+                }
+            }
+            mc.set_root(0, Value::object(mc, weak));
+            mc.set_root(1, Value::object(mc, strong));
         });
         let start = Instant::now();
         arena.collect();

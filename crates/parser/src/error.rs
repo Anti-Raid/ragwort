@@ -1,7 +1,7 @@
 use std::fmt;
 
 use ragwort_types::Error;
-use ragwort_types::gc::{Gc, OutOfMemory};
+use ragwort_types::gc::{Mutation, OutOfMemory};
 use ragwort_types::syntax::{SyntaxLocation, SyntaxSource};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,8 +53,8 @@ impl ReadError {
     }
 
     /// The line and column where the error starts.
-    pub fn location<'gc>(&self, source: Gc<'gc, SyntaxSource<'gc>>) -> Option<SyntaxLocation> {
-        SyntaxSource::location(source, self.start)
+    pub fn location<'gc>(&self, mc: &Mutation<'gc>, source: SyntaxSource<'gc>) -> Option<SyntaxLocation> {
+        source.location(mc, self.start)
     }
 }
 

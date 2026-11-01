@@ -5,7 +5,7 @@
 use std::any::Any;
 use std::marker::PhantomData;
 
-use super::{Gc, HostRef, Items, Mutation, Object, Raw};
+use super::{AnyHostRef, BlobRef, FrozenRef, Gc, HostRef, Items, Mutation, OBJECT, Object, Raw, RegionWords, TAG, Unit};
 
 pub use core::primitive::{bool, f64, i64, u32, u64};
 
@@ -21,9 +21,55 @@ pub struct Weak<T>(PhantomData<fn() -> T>);
 /// Host data of type `T`, or none.
 pub struct Host<T>(PhantomData<fn() -> T>);
 
+/// Host data of any type, or none.
+pub struct AnyHost;
+
+/// A write-once array of `U`s outside the region, read as `&'gc [U]`, empty if none.
+pub struct Blob<U>(PhantomData<fn() -> U>);
+
+/// A write-once `T` outside the region, read as `&'gc T`.
+pub struct Frozen<T>(PhantomData<fn() -> T>);
+
 /// A key and a value, two words. The value is kept alive only while the key is reachable some
 /// other way; once the key dies, the field reads as none.
 pub struct Ephemeron;
+
+/// What an item's word refers to, which decides its barrier.
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Refs {
+    None,
+    Values,
+    Members,
+    Weaks,
+}
+
+impl Refs {
+    pub(crate) const fn of(items: Items) -> Option<Self> {
+        match items {
+            Items::Words => Some(Self::None),
+            Items::Values => Some(Self::Values),
+            Items::Members => Some(Self::Members),
+            Items::Weaks => Some(Self::Weaks),
+            Items::None | Items::Ephemerons => None,
+        }
+    }
+
+    /// The object a word refers to.
+    #[inline]
+    pub(crate) fn target(self, word: u64) -> Option<u32> {
+        match self {
+            Self::None => None,
+            Self::Values => (word & TAG == OBJECT).then_some((word >> 32) as u32),
+            Self::Members | Self::Weaks => Some(word as u32).filter(|&t| t != 0),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn refers(self, word: u64) -> bool {
+        self.target(word).is_some()
+    }
+}
 
 /// Which of the collector's masks a field is in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -33,6 +79,7 @@ pub enum Role {
     Member,
     Weak,
     Host,
+    Blob,
     Ephemeron,
 }
 
@@ -63,10 +110,11 @@ pub trait Slot: sealed::Sealed + 'static {
 pub trait Item: Slot {
     const ITEMS: Items;
     #[doc(hidden)]
-    const BARRIER: bool;
+    const REFS: Refs;
 
+    /// Reads an item's word; `region` is for checking what an index refers to.
     #[doc(hidden)]
-    fn load<'gc>(word: u64) -> Self::Out<'gc>;
+    fn load<'gc>(region: &'gc RegionWords, word: u64) -> Self::Out<'gc>;
 
     #[doc(hidden)]
     fn store(value: Self::In<'_>) -> u64;
@@ -83,7 +131,7 @@ macro_rules! words {
 
             #[inline]
             fn get<'gc, T: Object>(gc: Gc<'gc, T>, mc: &Mutation<'gc>, field: usize) -> $ty {
-                Self::load(gc.word(mc, field))
+                Self::load(mc.heap.words, gc.word(mc, field))
             }
 
             #[inline]
@@ -99,10 +147,10 @@ macro_rules! words {
 
         impl Item for $ty {
             const ITEMS: Items = Items::Words;
-            const BARRIER: bool = false;
+            const REFS: Refs = Refs::None;
 
             #[inline]
-            fn load<'gc>($w: u64) -> Self::Out<'gc> {
+            fn load<'gc>(_: &'gc RegionWords, $w: u64) -> Self::Out<'gc> {
                 $load
             }
 
@@ -147,10 +195,10 @@ impl Slot for Value {
 
 impl Item for Value {
     const ITEMS: Items = Items::Values;
-    const BARRIER: bool = true;
+    const REFS: Refs = Refs::Values;
 
     #[inline]
-    fn load<'gc>(word: u64) -> super::Value<'gc> {
+    fn load<'gc>(_: &'gc RegionWords, word: u64) -> super::Value<'gc> {
         super::Value::from_bits(word)
     }
 
@@ -169,7 +217,7 @@ impl<U: Object> Slot for Member<U> {
 
     #[inline]
     fn get<'gc, T: Object>(gc: Gc<'gc, T>, mc: &Mutation<'gc>, field: usize) -> Option<Gc<'gc, U>> {
-        super::target(mc, gc.word(mc, field) as u32)
+        super::target(mc.heap.words, gc.word(mc, field) as u32)
     }
 
     #[inline]
@@ -183,6 +231,21 @@ impl<U: Object> Slot for Member<U> {
     }
 }
 
+impl<U: Object> Item for Member<U> {
+    const ITEMS: Items = Items::Members;
+    const REFS: Refs = Refs::Members;
+
+    #[inline]
+    fn load<'gc>(region: &'gc RegionWords, word: u64) -> Option<Gc<'gc, U>> {
+        super::target(region, word as u32)
+    }
+
+    #[inline]
+    fn store(value: Option<Gc<'_, U>>) -> u64 {
+        value.map_or(0, Raw::to_word)
+    }
+}
+
 impl<U: Object> sealed::Sealed for Weak<U> {}
 
 impl<U: Object> Slot for Weak<U> {
@@ -192,7 +255,7 @@ impl<U: Object> Slot for Weak<U> {
 
     #[inline]
     fn get<'gc, T: Object>(gc: Gc<'gc, T>, mc: &Mutation<'gc>, field: usize) -> Option<Gc<'gc, U>> {
-        super::target(mc, gc.word(mc, field) as u32)
+        super::target(mc.heap.words, gc.word(mc, field) as u32)
     }
 
     #[inline]
@@ -206,6 +269,22 @@ impl<U: Object> Slot for Weak<U> {
     }
 }
 
+impl<U: Object> Item for Weak<U> {
+    const ITEMS: Items = Items::Weaks;
+    const REFS: Refs = Refs::Weaks;
+
+    /// `None` once the target has died.
+    #[inline]
+    fn load<'gc>(region: &'gc RegionWords, word: u64) -> Option<Gc<'gc, U>> {
+        super::target(region, word as u32)
+    }
+
+    #[inline]
+    fn store(value: Option<Gc<'_, U>>) -> u64 {
+        value.map_or(0, Raw::to_word)
+    }
+}
+
 impl<U: Any> sealed::Sealed for Host<U> {}
 
 impl<U: Any> Slot for Host<U> {
@@ -215,11 +294,34 @@ impl<U: Any> Slot for Host<U> {
 
     #[inline]
     fn get<'gc, T: Object>(gc: Gc<'gc, T>, mc: &Mutation<'gc>, field: usize) -> Option<HostRef<'gc, U>> {
-        gc.host(mc, field)
+        gc.host(mc, field).map(AnyHostRef::assume)
     }
 
     #[inline]
     fn set<'gc, T: Object>(gc: Gc<'gc, T>, mc: &Mutation<'gc>, field: usize, value: Option<HostRef<'gc, U>>) {
+        AnyHost::set(gc, mc, field, value.map(HostRef::erase));
+    }
+
+    #[inline]
+    fn init(value: Option<HostRef<'_, U>>, words: &mut [u64]) {
+        words[0] = value.map_or(0, HostRef::to_word);
+    }
+}
+
+impl sealed::Sealed for AnyHost {}
+
+impl Slot for AnyHost {
+    const ROLE: Role = Role::Host;
+    type Out<'gc> = Option<AnyHostRef<'gc>>;
+    type In<'gc> = Option<AnyHostRef<'gc>>;
+
+    #[inline]
+    fn get<'gc, T: Object>(gc: Gc<'gc, T>, mc: &Mutation<'gc>, field: usize) -> Option<AnyHostRef<'gc>> {
+        gc.host(mc, field)
+    }
+
+    #[inline]
+    fn set<'gc, T: Object>(gc: Gc<'gc, T>, mc: &Mutation<'gc>, field: usize, value: Option<AnyHostRef<'gc>>) {
         match value {
             Some(host) => gc.set_host(mc, field, host),
             None => gc.set_word(mc, field, 0),
@@ -227,8 +329,8 @@ impl<U: Any> Slot for Host<U> {
     }
 
     #[inline]
-    fn init(value: Option<HostRef<'_, U>>, words: &mut [u64]) {
-        words[0] = value.map_or(0, HostRef::to_word);
+    fn init(value: Option<AnyHostRef<'_>>, words: &mut [u64]) {
+        words[0] = value.map_or(0, AnyHostRef::to_word);
     }
 }
 
@@ -253,5 +355,61 @@ impl Slot for Ephemeron {
     fn init((key, value): Self::In<'_>, words: &mut [u64]) {
         words[0] = key.to_bits();
         words[1] = value.to_bits();
+    }
+}
+
+/// A blob written into an object already marked, old or traced, would be missed by the
+/// collections that don't trace the object again, so it's marked now.
+#[inline]
+fn set_blob<'gc, T: Object>(gc: Gc<'gc, T>, mc: &Mutation<'gc>, field: usize, word: u64) {
+    gc.set_word(mc, field, word);
+    if mc.heap.has_bit(gc.to_word() as usize, |p| &p.marks) {
+        mc.heap.m.blobs.mark(word);
+    }
+}
+
+impl<U: Unit> sealed::Sealed for Blob<U> {}
+
+impl<U: Unit> Slot for Blob<U> {
+    const ROLE: Role = Role::Blob;
+    type Out<'gc> = &'gc [U];
+    type In<'gc> = BlobRef<'gc, U>;
+
+    #[inline]
+    fn get<'gc, T: Object>(gc: Gc<'gc, T>, mc: &Mutation<'gc>, field: usize) -> &'gc [U] {
+        mc.heap.m.blobs.units(gc.word(mc, field))
+    }
+
+    #[inline]
+    fn set<'gc, T: Object>(gc: Gc<'gc, T>, mc: &Mutation<'gc>, field: usize, value: BlobRef<'gc, U>) {
+        set_blob(gc, mc, field, value.to_word());
+    }
+
+    #[inline]
+    fn init(value: BlobRef<'_, U>, words: &mut [u64]) {
+        words[0] = value.to_word();
+    }
+}
+
+impl<U: Any> sealed::Sealed for Frozen<U> {}
+
+impl<U: Any> Slot for Frozen<U> {
+    const ROLE: Role = Role::Blob;
+    type Out<'gc> = Option<&'gc U>;
+    type In<'gc> = FrozenRef<'gc, U>;
+
+    #[inline]
+    fn get<'gc, T: Object>(gc: Gc<'gc, T>, mc: &Mutation<'gc>, field: usize) -> Option<&'gc U> {
+        mc.heap.m.blobs.frozen(gc.word(mc, field))
+    }
+
+    #[inline]
+    fn set<'gc, T: Object>(gc: Gc<'gc, T>, mc: &Mutation<'gc>, field: usize, value: FrozenRef<'gc, U>) {
+        set_blob(gc, mc, field, value.to_word());
+    }
+
+    #[inline]
+    fn init(value: FrozenRef<'_, U>, words: &mut [u64]) {
+        words[0] = value.to_word();
     }
 }

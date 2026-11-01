@@ -2,33 +2,44 @@
 //! `length` and `list?` take constant time. A pair can't come to reach itself, so the length
 //! is always exact.
 
-use ragwort_gc::{Gc, Mutation, OutOfMemory, Plain, Trace, TypeTag, Value};
+use crate::gc::{Gc, Mutation, OutOfMemory, Value};
+use crate::objects::{self, Data, PairFields};
 
 #[cfg(test)]
 #[path = "tests/pair.rs"]
 mod tests;
 
-#[derive(Trace, Plain)]
-pub struct Pair<'gc> {
-    head: Value<'gc>,
-    tail: Value<'gc>,
-    /// The length of the list this pair starts, or 0 if its pairs don't end in `()`.
-    len: u64,
-}
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Pair<'gc>(Gc<'gc, objects::Pair>);
 
 impl<'gc> Pair<'gc> {
-    pub fn head(&self) -> Value<'gc> {
-        self.head
+    #[inline]
+    pub fn of(v: Value<'gc>) -> Option<Self> {
+        match Data::of(v) {
+            Some(Data::Pair(p)) => Some(Self(p)),
+            _ => None,
+        }
     }
 
-    pub fn tail(&self) -> Value<'gc> {
-        self.tail
+    pub fn value(self, mc: &Mutation<'gc>) -> Value<'gc> {
+        Value::object(mc, self.0)
+    }
+
+    #[inline]
+    pub fn head(self, mc: &Mutation<'gc>) -> Value<'gc> {
+        self.0.head(mc)
+    }
+
+    #[inline]
+    pub fn tail(self, mc: &Mutation<'gc>) -> Value<'gc> {
+        self.0.tail(mc)
     }
 
     /// The length of the list this pair starts, unless its pairs end in something other than
     /// `()`.
-    pub fn list_len(&self) -> Option<u64> {
-        (self.len != 0).then_some(self.len)
+    #[inline]
+    pub fn list_len(self, mc: &Mutation<'gc>) -> Option<u64> {
+        Some(self.0.length(mc)).filter(|&n| n != 0)
     }
 }
 
@@ -36,25 +47,21 @@ impl<'gc> Pair<'gc> {
 #[derive(Clone, Copy)]
 pub struct Pairs<'a, 'gc> {
     mc: &'a Mutation<'gc>,
-    tag: TypeTag<'gc, Pair<'gc>>,
 }
 
 impl<'a, 'gc> Pairs<'a, 'gc> {
-    pub fn new(mc: &'a Mutation<'gc>) -> Result<Self, OutOfMemory> {
-        Ok(Self { mc, tag: mc.type_tag()? })
+    pub fn new(mc: &'a Mutation<'gc>) -> Self {
+        Self { mc }
     }
 
-    pub fn pair(&self, v: Value<'gc>) -> Option<Gc<'gc, Pair<'gc>>> {
-        v.downcast_tag(self.mc, self.tag)
+    #[inline]
+    pub fn pair(&self, v: Value<'gc>) -> Option<Pair<'gc>> {
+        Pair::of(v)
     }
 
-    pub fn cons(&self, head: Value<'gc>, tail: Value<'gc>) -> Result<Gc<'gc, Pair<'gc>>, OutOfMemory> {
-        let len = match self.pair(tail) {
-            Some(p) if p.len != 0 => p.len.saturating_add(1),
-            Some(_) => 0,
-            None => u64::from(tail == Value::NIL),
-        };
-        self.mc.alloc(Pair { head, tail, len })
+    pub fn cons(&self, head: Value<'gc>, tail: Value<'gc>) -> Result<Pair<'gc>, OutOfMemory> {
+        let len = self.list_len(tail).map_or(0, |n| n.saturating_add(1));
+        Ok(Pair(objects::Pair::new(self.mc, head, tail, len)?))
     }
 
     /// A list of `items`.
@@ -71,15 +78,16 @@ impl<'a, 'gc> Pairs<'a, 'gc> {
         let mut len = self.list_len(tail);
         for head in items.into_iter().rev() {
             len = len.map(|n| n.saturating_add(1));
-            tail = Value::object(self.mc, self.mc.alloc(Pair { head, tail, len: len.unwrap_or(0) })?);
+            tail = Value::object(self.mc, objects::Pair::new(self.mc, head, tail, len.unwrap_or(0))?);
         }
         Ok(tail)
     }
 
     /// The length of `v` if it's a list: `()` or a pair whose pairs end in `()`.
+    #[inline]
     pub fn list_len(&self, v: Value<'gc>) -> Option<u64> {
-        match self.pair(v) {
-            Some(p) => p.list_len(),
+        match Pair::of(v) {
+            Some(p) => p.list_len(self.mc),
             None => (v == Value::NIL).then_some(0),
         }
     }
@@ -90,13 +98,13 @@ impl<'a, 'gc> Pairs<'a, 'gc> {
 
     /// The heads of the pairs starting at `v`. [`Elements::rest`] is what follows them.
     pub fn elements(&self, v: Value<'gc>) -> Elements<'a, 'gc> {
-        Elements { pairs: *self, rest: v }
+        Elements { mc: self.mc, rest: v }
     }
 }
 
 /// The heads of a chain of pairs, from [`Pairs::elements`].
 pub struct Elements<'a, 'gc> {
-    pairs: Pairs<'a, 'gc>,
+    mc: &'a Mutation<'gc>,
     rest: Value<'gc>,
 }
 
@@ -111,8 +119,8 @@ impl<'gc> Iterator for Elements<'_, 'gc> {
     type Item = Value<'gc>;
 
     fn next(&mut self) -> Option<Value<'gc>> {
-        let p = self.pairs.pair(self.rest)?;
-        self.rest = p.tail;
-        Some(p.head)
+        let p = Pair::of(self.rest)?;
+        self.rest = p.tail(self.mc);
+        Some(p.head(self.mc))
     }
 }

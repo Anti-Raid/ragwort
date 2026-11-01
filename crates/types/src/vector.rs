@@ -1,48 +1,103 @@
-//! Vectors, of fixed length, their elements stored inline. A [`Vector`] is mutable: write its
-//! elements through [`Gc::items`], whose locks take the barrier, one with [`Lock::set`] or a
-//! range with [`Lock::fill`] or [`Lock::copy`]. An [`ImmutableVector`], such as a literal,
-//! holds plain values, so nothing can write to it.
+//! Vectors, of fixed length. A [`Vector`] is mutable: write its elements through
+//! [`Vector::items`], whose writes take the barrier. An [`ImmutableVector`], such as a literal,
+//! can only be read.
 
-use std::marker::PhantomData;
-
-use ragwort_gc::{Gc, Lock, Mutation, OutOfMemory, Plain, Trace, TypeTag, Value};
+use crate::gc::{Gc, Mutation, OutOfMemory, Slots, Value};
+use crate::objects::{self, Data, ImmutableVectorFields, VectorFields};
 
 #[cfg(test)]
 #[path = "tests/vector.rs"]
 mod tests;
 
-#[derive(Trace, Plain)]
-#[gc(items = Lock<Value<'gc>>)]
-pub struct Vector<'gc>(PhantomData<&'gc ()>);
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Vector<'gc>(Gc<'gc, objects::Vector>);
 
-#[derive(Trace, Plain)]
-#[gc(items = Value<'gc>)]
-pub struct ImmutableVector<'gc>(PhantomData<&'gc ()>);
+impl<'gc> Vector<'gc> {
+    #[inline]
+    pub fn of(v: Value<'gc>) -> Option<Self> {
+        match Data::of(v) {
+            Some(Data::Vector(v)) => Some(Self(v)),
+            _ => None,
+        }
+    }
+
+    pub fn value(self, mc: &Mutation<'gc>) -> Value<'gc> {
+        Value::object(mc, self.0)
+    }
+
+    #[inline]
+    pub fn items(self, mc: &Mutation<'gc>) -> Slots<'gc> {
+        self.0.items(mc)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ImmutableVector<'gc>(Gc<'gc, objects::ImmutableVector>);
+
+impl<'gc> ImmutableVector<'gc> {
+    #[inline]
+    pub fn of(v: Value<'gc>) -> Option<Self> {
+        match Data::of(v) {
+            Some(Data::ImmutableVector(v)) => Some(Self(v)),
+            _ => None,
+        }
+    }
+
+    pub fn value(self, mc: &Mutation<'gc>) -> Value<'gc> {
+        Value::object(mc, self.0)
+    }
+
+    pub fn len(self, mc: &Mutation<'gc>) -> usize {
+        self.0.items(mc).len()
+    }
+
+    pub fn is_empty(self, mc: &Mutation<'gc>) -> bool {
+        self.len(mc) == 0
+    }
+
+    #[inline]
+    pub fn get(self, mc: &Mutation<'gc>, index: usize) -> Option<Value<'gc>> {
+        let items = self.0.items(mc);
+        (index < items.len()).then(|| items.get(index))
+    }
+}
 
 /// Either kind of vector, for reading.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AnyVector<'gc> {
-    Mutable(Gc<'gc, Vector<'gc>>),
-    Immutable(Gc<'gc, ImmutableVector<'gc>>),
+    Mutable(Vector<'gc>),
+    Immutable(ImmutableVector<'gc>),
 }
 
 impl<'gc> AnyVector<'gc> {
-    pub fn len(self) -> usize {
-        match self {
-            Self::Mutable(v) => v.items().len(),
-            Self::Immutable(v) => v.items().len(),
+    #[inline]
+    pub fn of(v: Value<'gc>) -> Option<Self> {
+        match Data::of(v) {
+            Some(Data::Vector(v)) => Some(Self::Mutable(Vector(v))),
+            Some(Data::ImmutableVector(v)) => Some(Self::Immutable(ImmutableVector(v))),
+            _ => None,
         }
     }
 
-    pub fn is_empty(self) -> bool {
-        self.len() == 0
+    fn items(self, mc: &Mutation<'gc>) -> Slots<'gc> {
+        match self {
+            Self::Mutable(v) => v.0.items(mc),
+            Self::Immutable(v) => v.0.items(mc),
+        }
     }
 
-    pub fn get(self, index: usize) -> Option<Value<'gc>> {
-        match self {
-            Self::Mutable(v) => v.items().get(index).map(Lock::get),
-            Self::Immutable(v) => v.items().get(index).copied(),
-        }
+    pub fn len(self, mc: &Mutation<'gc>) -> usize {
+        self.items(mc).len()
+    }
+
+    pub fn is_empty(self, mc: &Mutation<'gc>) -> bool {
+        self.len(mc) == 0
+    }
+
+    #[inline]
+    pub fn get(self, mc: &Mutation<'gc>, index: usize) -> Option<Value<'gc>> {
+        let items = self.items(mc);
+        (index < items.len()).then(|| items.get(index))
     }
 
     pub fn is_mutable(self) -> bool {
@@ -51,8 +106,8 @@ impl<'gc> AnyVector<'gc> {
 
     pub fn value(self, mc: &Mutation<'gc>) -> Value<'gc> {
         match self {
-            Self::Mutable(v) => Value::object(mc, v),
-            Self::Immutable(v) => Value::object(mc, v),
+            Self::Mutable(v) => v.value(mc),
+            Self::Immutable(v) => v.value(mc),
         }
     }
 }
@@ -61,53 +116,60 @@ impl<'gc> AnyVector<'gc> {
 #[derive(Clone, Copy)]
 pub struct Vectors<'a, 'gc> {
     mc: &'a Mutation<'gc>,
-    mutable: TypeTag<'gc, Vector<'gc>>,
-    immutable: TypeTag<'gc, ImmutableVector<'gc>>,
 }
 
 impl<'a, 'gc> Vectors<'a, 'gc> {
-    pub fn new(mc: &'a Mutation<'gc>) -> Result<Self, OutOfMemory> {
-        Ok(Self { mc, mutable: mc.inline_type_tag()?, immutable: mc.inline_type_tag()? })
+    pub fn new(mc: &'a Mutation<'gc>) -> Self {
+        Self { mc }
     }
 
     pub fn vector(&self, v: Value<'gc>) -> Option<AnyVector<'gc>> {
-        match self.mutable(v) {
-            Some(v) => Some(AnyVector::Mutable(v)),
-            None => v.downcast_tag(self.mc, self.immutable).map(AnyVector::Immutable),
-        }
+        AnyVector::of(v)
     }
 
     /// `v` if it's a vector that can be written to.
-    pub fn mutable(&self, v: Value<'gc>) -> Option<Gc<'gc, Vector<'gc>>> {
-        v.downcast_tag(self.mc, self.mutable)
+    pub fn mutable(&self, v: Value<'gc>) -> Option<Vector<'gc>> {
+        Vector::of(v)
     }
 
     /// A vector of `len` copies of `fill`.
-    pub fn make(&self, len: usize, fill: Value<'gc>) -> Result<Gc<'gc, Vector<'gc>>, OutOfMemory> {
-        self.mc.alloc_inline(Vector(PhantomData), len, |_| Lock::new(fill))
+    pub fn make(&self, len: usize, fill: Value<'gc>) -> Result<Vector<'gc>, OutOfMemory> {
+        objects::Vector::new(self.mc, len, fill).map(Vector)
     }
 
-    pub fn from_slice(&self, items: &[Value<'gc>]) -> Result<Gc<'gc, Vector<'gc>>, OutOfMemory> {
-        self.mc.alloc_inline(Vector(PhantomData), items.len(), |i| Lock::new(items[i]))
+    pub fn from_slice(&self, items: &[Value<'gc>]) -> Result<Vector<'gc>, OutOfMemory> {
+        let v = self.make(items.len(), Value::NIL)?;
+        fill(self.mc, v.items(self.mc), items.iter().copied());
+        Ok(v)
     }
 
-    pub fn immutable_from_slice(&self, items: &[Value<'gc>]) -> Result<Gc<'gc, ImmutableVector<'gc>>, OutOfMemory> {
-        self.mc.alloc_inline_from(ImmutableVector(PhantomData), items)
+    pub fn immutable_from_slice(&self, items: &[Value<'gc>]) -> Result<ImmutableVector<'gc>, OutOfMemory> {
+        self.immutable_with(items.len(), |i| items[i])
     }
 
-    pub fn immutable_with(&self, len: usize, fill: impl FnMut(usize) -> Value<'gc>) -> Result<Gc<'gc, ImmutableVector<'gc>>, OutOfMemory> {
-        self.mc.alloc_inline(ImmutableVector(PhantomData), len, fill)
+    pub fn immutable_with(&self, len: usize, fill: impl FnMut(usize) -> Value<'gc>) -> Result<ImmutableVector<'gc>, OutOfMemory> {
+        let v = objects::ImmutableVector::new(self.mc, len, Value::NIL)?;
+        self::fill(self.mc, v.items(self.mc), (0..len).map(fill));
+        Ok(ImmutableVector(v))
     }
 
     /// `v`'s elements as they are now, in a vector that can't change: `v` itself if it's
     /// already immutable, otherwise a copy.
-    pub fn freeze(&self, v: AnyVector<'gc>) -> Result<Gc<'gc, ImmutableVector<'gc>>, OutOfMemory> {
+    pub fn freeze(&self, v: AnyVector<'gc>) -> Result<ImmutableVector<'gc>, OutOfMemory> {
         match v {
             AnyVector::Immutable(v) => Ok(v),
             AnyVector::Mutable(v) => {
-                let items = v.items();
-                self.mc.alloc_inline(ImmutableVector(PhantomData), items.len(), |i| items[i].get())
+                let items = v.items(self.mc);
+                let frozen = objects::ImmutableVector::new(self.mc, items.len(), Value::NIL)?;
+                frozen.items(self.mc).copy_from(self.mc, items);
+                Ok(ImmutableVector(frozen))
             }
         }
+    }
+}
+
+fn fill<'gc>(mc: &Mutation<'gc>, slots: Slots<'gc>, items: impl Iterator<Item = Value<'gc>>) {
+    for (i, item) in items.enumerate().take(slots.len()) {
+        slots.set(mc, i, item);
     }
 }

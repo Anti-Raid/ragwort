@@ -112,6 +112,53 @@ fn hosts_are_charged_until_freed() {
     assert_eq!(arena.used(), used);
 }
 
+/// What a host value owns outside the arena counts until it's freed, at whatever it was last
+/// set to.
+#[test]
+fn hosts_count_the_bytes_they_own() {
+    let mut arena = Arena::new(1 << 20, 1);
+    arena.mutate(|mc| {
+        mc.host(0u64).unwrap();
+    });
+    arena.collect();
+    let used = arena.used();
+    let base = size_of::<String>() + HOST_COST;
+    arena.mutate(|mc| {
+        let text = mc.host(String::from("hi")).unwrap();
+        text.set_owned_bytes(mc, 1000).unwrap();
+        assert_eq!(mc.used(), used + base + 1000);
+        text.erase().set_owned_bytes(mc, 300).unwrap();
+        assert_eq!(mc.used(), used + base + 300);
+        let held = text.get(mc).unwrap();
+        assert_eq!(text.set_owned_bytes(mc, 0), Err(HostError::InUse));
+        drop(held);
+        assert_eq!(text.set_owned_bytes(mc, 2 << 20), Err(HostError::OutOfMemory));
+        assert_eq!(mc.used(), used + base + 300, "a failed claim counts nothing");
+    });
+    // Nothing holds the value, so a collection frees it with all it was charged.
+    assert_eq!(arena.used(), used + base + 300);
+    arena.collect();
+    assert_eq!(arena.used(), used);
+}
+
+#[test]
+fn freed_hosts_ignore_owned_bytes() {
+    let mut arena = Arena::new(1 << 20, 1);
+    let stale = arena.mutate(|mc| mc.host(String::new()).unwrap().to_word());
+    arena.collect();
+    let used = arena.used();
+    arena.mutate(|mc| {
+        let fresh = mc.host(String::new()).unwrap();
+        assert_eq!(fresh.to_word() & 0xffff_ffff, stale & 0xffff_ffff, "the slot should be reused");
+        let used = mc.used();
+        let stale = HostRef::<String> { id: fresh.id, generation: fresh.generation - 1, _marker: PhantomData };
+        stale.set_owned_bytes(mc, 5000).unwrap();
+        assert_eq!(mc.used(), used);
+    });
+    arena.collect();
+    assert_eq!(arena.used(), used);
+}
+
 #[test]
 fn injected_failures_fail_the_picked_allocation() {
     let mut arena = Arena::new(4 << 20, 1);

@@ -10,23 +10,17 @@ thread_local! {
     pub(super) static KEY_BITS: Cell<u64> = const { Cell::new(u64::MAX) };
 }
 
-struct Slot {
-    key: Cell<u64>,
-    symbol: Cell<Option<usize>>,
-}
-
-/// Symbols are indexes into `symbols`, and die when killed. Old slots are leaked, so they
-/// stay readable.
+/// Symbols are indexes into `symbols`, and die when killed. Entries are found by a scan, which
+/// is all interning needs of a table: probing is the host's.
 struct TestTable {
     seed: u64,
-    slots: Cell<&'static [Slot]>,
-    used: Cell<usize>,
+    entries: RefCell<Vec<(u64, usize)>>,
     symbols: RefCell<Vec<(TestStr, u64, bool)>>,
 }
 
 impl TestTable {
     fn new(seed: u64) -> Self {
-        Self { seed, slots: Cell::new(&[]), used: Cell::new(0), symbols: RefCell::new(Vec::new()) }
+        Self { seed, entries: RefCell::new(Vec::new()), symbols: RefCell::new(Vec::new()) }
     }
 
     fn kill(&self, symbol: usize) {
@@ -38,45 +32,9 @@ impl TestTable {
     }
 }
 
-impl GcMap<TestHost> for TestTable {
-    type Entry = usize;
-    type Error = TestError;
-    type Slot = Slot;
-
-    fn slots<'a>(&'a self, _: &'a TestHost) -> &'a [Slot] {
-        self.slots.get()
-    }
-
-    fn replace<'a>(&'a self, _: &'a TestHost, len: usize) -> Result<&'a [Slot], TestError> {
-        let slots = Vec::from_iter((0..len).map(|_| Slot { key: Cell::new(0), symbol: Cell::new(None) })).leak();
-        self.slots.set(slots);
-        Ok(slots)
-    }
-
-    fn key(&self, slot: &Slot) -> u64 {
-        slot.key.get()
-    }
-
-    fn entry(&self, _: &TestHost, slot: &Slot) -> Option<usize> {
-        slot.symbol.get().filter(|&i| self.symbols.borrow()[i].2)
-    }
-
-    fn set(&self, _: &TestHost, slot: &Slot, key: u64, symbol: usize) {
-        slot.key.set(key);
-        slot.symbol.set(Some(symbol));
-    }
-
-    fn used(&self) -> usize {
-        self.used.get()
-    }
-
-    fn set_used(&self, _: &TestHost, used: usize) {
-        self.used.set(used);
-    }
-
-}
-
 impl Table<TestHost> for TestTable {
+    type Entry = usize;
+
     fn seed(&self) -> u64 {
         self.seed
     }
@@ -90,6 +48,24 @@ impl Table<TestHost> for TestTable {
 
     fn name(&self, _: &TestHost, symbol: usize) -> TestStr {
         self.symbols.borrow()[symbol].0
+    }
+
+    fn find_or_insert(
+        &self,
+        _: &TestHost,
+        hash: u64,
+        same: impl Fn(usize) -> Result<bool, TestError>,
+        make: impl FnOnce() -> Result<usize, TestError>,
+    ) -> Result<usize, TestError> {
+        let candidates: Vec<usize> = self.entries.borrow().iter().filter(|e| e.0 == hash).map(|e| e.1).collect();
+        for symbol in candidates {
+            if self.symbols.borrow()[symbol].2 && same(symbol)? {
+                return Ok(symbol);
+            }
+        }
+        let symbol = make()?;
+        self.entries.borrow_mut().push((hash, symbol));
+        Ok(symbol)
     }
 }
 
@@ -146,57 +122,4 @@ fn names_sharing_a_key_stay_apart() {
         assert_eq!(fresh.len(), names.len());
     }
     KEY_BITS.set(u64::MAX);
-}
-
-/// Names made and killed over and over don't grow the table past what the live ones need, and
-/// dead slots are reused.
-#[test]
-fn churn_leaves_the_table_small() {
-    let h = TestHost::new();
-    let table = TestTable::new(2);
-    let kept: Vec<_> = names(100).iter().map(|n| intern_str(&h, &table, n).unwrap()).collect();
-    for round in 0..30 {
-        for i in 0..500 {
-            let s = intern_str(&h, &table, &format!("round {round} message {i}")).unwrap();
-            table.kill(s);
-        }
-        assert!(table.slots(&h).len() <= 1024, "{} slots", table.slots(&h).len());
-        assert!(table.used() * 4 <= table.slots(&h).len() * 3);
-    }
-    for (n, s) in names(100).iter().zip(kept) {
-        assert_eq!(intern_str(&h, &table, n), Ok(s));
-    }
-}
-
-/// Every live symbol is found where a probe from its home reaches it, after any growth.
-#[test]
-fn growth_keeps_every_symbol() {
-    let h = TestHost::new();
-    let table = TestTable::new(3);
-    let names = names(5000);
-    let made: Vec<_> = names.iter().map(|n| intern_str(&h, &table, n).unwrap()).collect();
-    let slots = table.slots(&h);
-    assert!(slots.len().is_power_of_two() && table.used() * 4 <= slots.len() * 3);
-    assert_eq!(table.used(), slots.iter().filter(|s| s.key.get() != 0).count());
-    for (n, s) in names.iter().zip(made) {
-        assert_eq!(intern_str(&h, &table, n), Ok(s));
-    }
-}
-
-/// A name whose symbol died takes its old slot back, so interning it again and again neither
-/// counts new slots nor rebuilds the table.
-#[test]
-fn a_dead_name_takes_its_slot_back() {
-    let h = TestHost::new();
-    let table = TestTable::new(4);
-    for n in names(40) {
-        intern_str(&h, &table, &n).unwrap();
-    }
-    let (used, slots) = (table.used(), table.slots(&h).as_ptr());
-    for _ in 0..1000 {
-        let s = intern_str(&h, &table, "comes and goes").unwrap();
-        table.kill(s);
-    }
-    assert_eq!(table.used(), used + 1);
-    assert_eq!(table.slots(&h).as_ptr(), slots, "rebuilt");
 }

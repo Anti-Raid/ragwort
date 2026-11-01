@@ -2,8 +2,8 @@
 members = ["crates/*"]
 resolver = "3"
 
-# Every crate but gc and gc-region opts in, so unsafe code, and with it hand-written `Trace` impls,
-# stays in gc. gc-region allows it in one file, for mapping memory and giving it back.
+# Every crate but gc-region opts in. gc-region allows unsafe code in one file, for mapping memory
+# and giving it back, so the collector and everything above it have none.
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

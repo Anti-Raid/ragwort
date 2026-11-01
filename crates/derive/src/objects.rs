@@ -40,6 +40,8 @@ enum Class {
     Word,
     Value,
     Reference,
+    Host,
+    Blob,
     Ephemeron,
 }
 
@@ -110,8 +112,11 @@ impl Parse for Object {
         let items = if keyword(input, "items") {
             let word: Ident = input.parse()?;
             let slot = slot(&input.parse()?)?;
-            if slot.class == Class::Reference {
-                return Err(Error::new(word.span(), "items can be Value, Ephemeron or a word type"));
+            if slot.class == Class::Host {
+                return Err(Error::new(word.span(), "items can't be hosts"));
+            }
+            if slot.class == Class::Blob {
+                return Err(Error::new(word.span(), "items can't be blobs"));
             }
             Some(slot)
         } else {
@@ -144,7 +149,10 @@ impl Parse for Field {
 
 fn slot(ty: &Type) -> syn::Result<Slot> {
     let w = krate();
-    let err = || Error::new_spanned(ty, "expected Value, Member<T>, Weak<T>, Host<T>, Ephemeron, u64, i64, u32, f64 or bool");
+    let err = || {
+        let kinds = "Value, Member<T>, Weak<T>, Host<T>, AnyHost, Blob<U>, Frozen<T>, Ephemeron, u64, i64, u32, f64 or bool";
+        Error::new_spanned(ty, format!("expected {kinds}"))
+    };
     let Type::Path(TypePath { qself: None, path }) = ty else { return Err(err()) };
     let [segment] = &path.segments.iter().collect::<Vec<_>>()[..] else { return Err(err()) };
     if path.leading_colon.is_some() {
@@ -172,8 +180,21 @@ fn slot(ty: &Type) -> syn::Result<Slot> {
         }
         ("Host", Some(t)) => {
             let out = quote!(::core::option::Option<#w::HostRef<'gc, #t>>);
-            slot(quote!(#w::slot::Host<#t>), out.clone(), out, Class::Reference)
+            slot(quote!(#w::slot::Host<#t>), out.clone(), out, Class::Host)
         }
+        ("AnyHost", None) => {
+            let out = quote!(::core::option::Option<#w::AnyHostRef<'gc>>);
+            slot(quote!(#w::slot::AnyHost), out.clone(), out, Class::Host)
+        }
+        ("Blob", Some(t)) => {
+            slot(quote!(#w::slot::Blob<#t>), quote!(&'gc [#t]), quote!(#w::BlobRef<'gc, #t>), Class::Blob)
+        }
+        ("Frozen", Some(t)) => slot(
+            quote!(#w::slot::Frozen<#t>),
+            quote!(::core::option::Option<&'gc #t>),
+            quote!(#w::FrozenRef<'gc, #t>),
+            Class::Blob,
+        ),
         ("Ephemeron", None) => slot(
             quote!(#w::slot::Ephemeron),
             quote!(::core::option::Option<(#value, #value)>),

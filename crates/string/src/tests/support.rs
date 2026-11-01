@@ -61,6 +61,7 @@ enum Node {
     One(Box<[u8]>),
     Two(Box<[u16]>),
     Four(Box<[u32]>),
+    Packed { words: Box<[Cell<u64>]>, len: usize, width: Width },
     Rope { left: TestStr, right: TestStr, info: u64, flat: Cell<Option<TestStr>>, reads: Cell<u64> },
     External(Box<dyn External>),
 }
@@ -68,6 +69,8 @@ enum Node {
 pub struct TestHost {
     nodes: Box<[OnceCell<Node>]>,
     used: Cell<usize>,
+    /// Flat strings made, every other one packed.
+    flats: Cell<usize>,
 }
 
 impl TestHost {
@@ -76,7 +79,7 @@ impl TestHost {
     }
 
     pub fn with_capacity(strings: usize) -> Self {
-        Self { nodes: (0..strings).map(|_| OnceCell::new()).collect(), used: Cell::new(0) }
+        Self { nodes: (0..strings).map(|_| OnceCell::new()).collect(), used: Cell::new(0), flats: Cell::new(0) }
     }
 
     fn push(&self, node: Node) -> TestStr {
@@ -146,12 +149,24 @@ impl Host for TestHost {
             Node::One(u) => StrView::Flat(Units::One(u)),
             Node::Two(u) => StrView::Flat(Units::Two(u)),
             Node::Four(u) => StrView::Flat(Units::Four(u)),
+            Node::Packed { words, len, width } => StrView::Flat(Units::Packed(Packed::new(words, *len, *width))),
             Node::Rope { left, right, info, flat, .. } => StrView::Rope { left: *left, right: *right, info: Info::from_bits(*info), flat: flat.get() },
             Node::External(chars) => StrView::Flat(chars.units()),
         }
     }
 
     fn flat(&self, width: Width, len: usize, init: impl FnOnce(UnitsMut<'_>)) -> Result<TestStr, TestError> {
+        self.flats.set(self.flats.get() + 1);
+        if self.flats.get().is_multiple_of(2) {
+            let words: Box<[Cell<u64>]> = (0..len.div_ceil(width.per_word())).map(|_| Cell::new(0)).collect();
+            init(UnitsMut::Packed(PackedMut::new(&words, len, width)));
+            // What's past the end must be ignored.
+            let used = len % width.per_word() * width.bytes() * 8;
+            if let Some(last) = words.last().filter(|_| used > 0) {
+                last.set(last.get() | u64::MAX << used);
+            }
+            return Ok(self.push(Node::Packed { words, len, width }));
+        }
         let node = match width {
             Width::One => {
                 let mut u = vec![0; len];

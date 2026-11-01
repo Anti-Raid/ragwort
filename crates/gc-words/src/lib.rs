@@ -1,15 +1,17 @@
-//! A prototype garbage collector with no unsafe code, to measure what that costs against
-//! `ragwort-gc`. The region is words in `Cell`s, references are word indices, and a type is
-//! described by data the collector reads rather than code it runs. A wrong description or a
-//! forged reference gives wrong results or a panic, never undefined behavior.
+//! Ragwort's garbage collector, with no unsafe code. The region is words in `Cell`s, references
+//! are word indices, and a type is described by data the collector reads rather than code it
+//! runs. A wrong description or a forged reference gives wrong results or a panic, never
+//! undefined behavior.
 //!
-//! It has `ragwort-gc`'s structure: 16 KiB pages of 128-byte lines, 512-byte cards, sticky mark
-//! bits for minor collections, major cycles marked in incremental slices with the same pacing,
-//! weak references and ephemerons, evacuation of fragmented pages through forwarding headers in
-//! the atomic phase, and lazy sweeping. Free pages past a nursery's worth go back to the system
-//! through `ragwort-gc-region`, which holds the only unsafe code. Memory is counted against a
-//! budget with a reserve, as in `ragwort-gc`, and VM stacks have its segments, continuation
-//! capture and parking.
+//! It has 16 KiB pages of 128-byte lines, 512-byte cards, sticky mark bits for minor
+//! collections, major cycles marked in incremental slices, weak references and ephemerons,
+//! evacuation of fragmented pages through forwarding headers in the atomic phase, and lazy
+//! sweeping. Free pages past a nursery's worth go back to the system through
+//! `ragwort-gc-region`, which holds the only unsafe code. Memory is counted against a budget
+//! with a reserve, and VM stacks have segments, continuation capture and parking.
+//!
+//! The arena has a fixed number of value roots, set when it's made. A [`Root`] keeps an object
+//! alive across steps from outside the arena, such as from a task.
 //!
 //! # Typed objects
 //!
@@ -54,14 +56,16 @@
 //! - a unit struct implementing [`Object`];
 //! - a [`Field`] constant per field, named in capitals (`Pair::CAR`), for [`Gc::get`] and
 //!   [`Gc::set`];
-//! - `new(mc, fields…)`, which also takes a length and fill value for `items Value` or a word
-//!   type, and an entry count for `items Ephemeron`;
+//! - `new(mc, fields…)`, which also takes a length and fill value when the type has items, or
+//!   an entry count for `items Ephemeron`;
 //! - a trait `PairFields` for `Gc<Pair>`, with a getter and a `set_` setter per field, and
-//!   `items` when the type has value or word items.
+//!   `items` for any items but ephemerons, which `Gc::entry` reads.
 //!
 //! A field holds a `Value`, a word (`u64`, `i64`, `u32`, `f64` or `bool`), a `Member<T>`, a
-//! `Weak<T>`, a `Host<T>` or an `Ephemeron`. Writes take the barrier their kind needs, and a
-//! member or weak read checks that the target has the type the field declares.
+//! `Weak<T>`, a `Host<T>`, an `AnyHost`, a `Blob<U>`, a `Frozen<T>` or an `Ephemeron`. Items
+//! can be any of these but hosts and blobs. A `Host<T>` holds a [`HostRef`], and an `AnyHost`
+//! an [`AnyHostRef`], a host value of any type whose reads check the type. Writes take the barrier their kind needs, and a member or weak read
+//! checks that the target has the type the field or items declare.
 //!
 //! The group's enum, `Kind` here, has a variant per type. `Kind::of(value)` reads the type
 //! number the value carries, so it needs no memory read. Types get fixed numbers from
@@ -71,6 +75,47 @@
 //!
 //! Fields can't take a name that a method of `Gc` or a constructor parameter uses. The raw API
 //! beneath, fields by number, is in the hidden `raw` module.
+//!
+//! # Blobs
+//!
+//! A `Blob<U>` field holds an array of bytes, `u16`s, `u32`s or `u64`s outside the region, made
+//! once by [`Mutation::blob`] and read as `&'gc [U]`; a `Frozen<T>` field holds any value, made
+//! by [`Mutation::frozen`] and read as `&'gc T`. Nothing is freed while a step runs, so the
+//! borrow checker keeps a slice from outliving it: a collection needs the arena mutably.
+//!
+//! ```
+//! use ragwort_gc_words::*;
+//!
+//! objects! { kind Kind; struct Text { chars: Blob<u8> } }
+//!
+//! let mut arena = Arena::new(1 << 20, 1);
+//! arena.mutate(|mc| {
+//!     let chars = mc.blob(5, |u| {
+//!         u.copy_from_slice(b"hello");
+//!         5
+//!     }).unwrap();
+//!     let text = Text::new(mc, chars).unwrap();
+//!     assert_eq!(text.chars(mc), b"hello");
+//! });
+//! ```
+//!
+//! ```compile_fail
+//! # use ragwort_gc_words::*;
+//! # objects! { kind Kind; struct Text { chars: Blob<u8> } }
+//! let mut arena = Arena::new(1 << 20, 1);
+//! let chars: &[u8] = arena.mutate(|mc| {
+//!     let chars = mc.blob(5, |u| u.len()).unwrap();
+//!     Text::new(mc, chars).unwrap().chars(mc)
+//! });
+//! arena.collect();
+//! ```
+//!
+//! # Containers, strings and numbers
+//!
+//! [`GcVec`] is a growable array, [`Table`] a hash table of strong, ephemeron or weak entries,
+//! and [`ScratchVec`] a step's scratch space outside the arena, counted against its budget.
+//! [`strings`] and [`nums`] hold `ragwort-string`'s strings and `ragwort-num`'s numbers: a flat
+//! string's characters are packed into its own items, and a bignum's digits are in a blob.
 //!
 //! What doesn't compile: storing an object of the wrong type,
 //!
@@ -129,19 +174,33 @@ use ragwort_gc_region::Region;
 
 extern crate self as ragwort_gc_words;
 
+mod blob;
 mod budget;
+pub mod nums;
 #[doc(hidden)]
 pub mod raw;
+mod root;
 pub mod slot;
+mod scratch;
 mod stack;
+pub mod strings;
+pub mod table;
+mod vec;
 
+use blob::Blobs;
+pub use blob::{BlobRef, FrozenRef, Unit};
 use budget::Budget;
 pub use budget::Charge;
 use raw::Raw;
 pub use ragwort_derive::objects;
-use slot::{Item, Role, Slot};
+use root::{ROOT_COST, RootRecord};
+pub use root::{ForeignRoot, Root};
+use slot::{Item, Refs, Role, Slot};
 use stack::{STACK_COST, StackRecord};
+pub use scratch::ScratchVec;
 pub use stack::{Frame, Segment, Stack};
+pub use table::{Table, eq_hash};
+pub use vec::{GcVec, VecHead};
 
 #[cfg(test)]
 #[path = "tests/heap.rs"]
@@ -155,10 +214,24 @@ mod budget_tests;
 #[cfg(test)]
 #[path = "tests/objects.rs"]
 mod objects_tests;
+#[cfg(test)]
+#[path = "tests/items.rs"]
+mod items_tests;
+#[cfg(test)]
+#[path = "tests/blob.rs"]
+mod blob_tests;
+#[cfg(test)]
+#[path = "tests/root.rs"]
+mod root_tests;
+#[cfg(test)]
+#[path = "tests/fuzz.rs"]
+mod fuzz_tests;
 
 pub const REGION: usize = 64 << 20;
 /// The region in words: twice `REGION`, so evacuation has fresh pages to copy into.
 const WORDS: usize = 2 * REGION / 8;
+/// The words of the region, as everything that reads them sees it.
+type RegionWords = [Cell<u64>; WORDS + SLACK];
 /// Page, line and card sizes in words.
 const PAGE: usize = 2048;
 const LINE: usize = 16;
@@ -213,10 +286,11 @@ impl Object for Boxed {
     const DESC: Desc = Desc::of::<Boxed>(1).numbered(0);
 }
 
-/// Type numbers below this are the collector's own: `Boxed`, then `Segment`. An `objects!` group
-/// declared without a base starts here.
+/// Type numbers below this are the collector's own: `Boxed`, `Segment`, its containers, strings
+/// and numbers. An
+/// `objects!` group declared without a base starts here.
 #[doc(hidden)]
-pub const FIRST_TYPE: u16 = 2;
+pub const FIRST_TYPE: u16 = nums::Numbers::END;
 /// A header is the type index, a flag, and the item count in the upper half. A forwarded one
 /// has the new index there instead.
 const TYPE_BITS: u64 = 0xFFFF;
@@ -229,6 +303,32 @@ type Brand<'gc> = PhantomData<Cell<&'gc ()>>;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct OutOfMemory;
 
+/// What string and number operations fail with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Error {
+    OutOfMemory,
+    Num(ragwort_num::NumError),
+    Str(ragwort_string::StrError),
+}
+
+impl From<OutOfMemory> for Error {
+    fn from(_: OutOfMemory) -> Self {
+        Self::OutOfMemory
+    }
+}
+
+impl From<ragwort_num::NumError> for Error {
+    fn from(e: ragwort_num::NumError) -> Self {
+        Self::Num(e)
+    }
+}
+
+impl From<ragwort_string::StrError> for Error {
+    fn from(e: ragwort_string::StrError) -> Self {
+        Self::Str(e)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Items {
     None,
@@ -236,6 +336,10 @@ pub enum Items {
     Words,
     /// Pairs of a key and a value, held like `Desc::ephemerons`. The length counts words.
     Ephemerons,
+    /// Object indices, 0 for none, that keep their targets alive.
+    Members,
+    /// Object indices, 0 for none, cleared once their targets die.
+    Weaks,
 }
 
 /// How the collector sees a type: its fixed words, which of them hold references, and its items.
@@ -250,6 +354,8 @@ pub struct Desc {
     pub hosts: u64,
     /// Fields holding an object index that doesn't keep the object alive, 0 for none.
     pub weaks: u64,
+    /// Fields holding a blob id plus one, 0 for none: write-once storage outside the region.
+    pub blobs: u64,
     /// Fields holding an ephemeron's key, with its value in the next field. The value is kept
     /// alive only while the key is reachable some other way; once the key dies, both become
     /// `Value::BROKEN`. A key that isn't an object never dies.
@@ -258,6 +364,9 @@ pub struct Desc {
     /// A fixed type number, which `objects!` gives its types so type checks compare against a
     /// constant. Types without one are numbered by each arena as it first sees them.
     pub number: Option<u16>,
+    /// Whether marking an object of the type has anything to trace, kept up to date by every
+    /// builder: marking asks for each object, and working it out each time costs 4%.
+    traces: bool,
 }
 
 impl Desc {
@@ -269,9 +378,11 @@ impl Desc {
             members: 0,
             hosts: 0,
             weaks: 0,
+            blobs: 0,
             ephemerons: 0,
             items: Items::None,
             number: None,
+            traces: false,
         }
     }
 
@@ -289,6 +400,7 @@ impl Desc {
                 Role::Member => desc.members |= bit,
                 Role::Weak => desc.weaks |= bit,
                 Role::Host => desc.hosts |= bit,
+                Role::Blob => desc.blobs |= bit,
                 Role::Ephemeron => {
                     desc.ephemerons |= bit;
                     desc.fields += 1;
@@ -297,7 +409,7 @@ impl Desc {
             desc.fields += 1;
             i += 1;
         }
-        desc
+        desc.settled()
     }
 
     /// What field `field` holds, or `None` past the fields and for an ephemeron's value.
@@ -315,6 +427,8 @@ impl Desc {
             Role::Weak
         } else if self.hosts & bit != 0 {
             Role::Host
+        } else if self.blobs & bit != 0 {
+            Role::Blob
         } else if self.ephemerons & bit != 0 && field + 1 < self.fields as usize {
             Role::Ephemeron
         } else if self.ephemerons & (bit | prev) != 0 {
@@ -329,31 +443,41 @@ impl Desc {
     }
 
     pub const fn values(self, values: u64) -> Self {
-        Self { values, ..self }
+        Self { values, ..self }.settled()
     }
 
     pub const fn members(self, members: u64) -> Self {
-        Self { members, ..self }
+        Self { members, ..self }.settled()
     }
 
     pub const fn hosts(self, hosts: u64) -> Self {
-        Self { hosts, ..self }
+        Self { hosts, ..self }.settled()
     }
 
     pub const fn weaks(self, weaks: u64) -> Self {
-        Self { weaks, ..self }
+        Self { weaks, ..self }.settled()
+    }
+
+    pub const fn blobs(self, blobs: u64) -> Self {
+        Self { blobs, ..self }.settled()
     }
 
     pub const fn ephemerons(self, ephemerons: u64) -> Self {
-        Self { ephemerons, ..self }
+        Self { ephemerons, ..self }.settled()
     }
 
     pub const fn items(self, items: Items) -> Self {
-        Self { items, ..self }
+        Self { items, ..self }.settled()
     }
 
-    const fn traces(&self) -> bool {
-        self.values | self.members | self.hosts | self.weaks != 0 || self.has_ephemerons() || matches!(self.items, Items::Values)
+    const fn settled(self) -> Self {
+        Self { traces: self.find_traces(), ..self }
+    }
+
+    const fn find_traces(&self) -> bool {
+        self.values | self.members | self.hosts | self.weaks | self.blobs != 0
+            || self.has_ephemerons()
+            || matches!(self.items, Items::Values | Items::Members | Items::Weaks)
     }
 
     const fn has_ephemerons(&self) -> bool {
@@ -411,12 +535,37 @@ impl<'gc> Value<'gc> {
         (self.word & 1 == 0).then_some(self.word as i64 >> 1)
     }
 
+    pub const MAX_FIXNUM: i64 = i64::MAX >> 1;
+    pub const MIN_FIXNUM: i64 = i64::MIN >> 1;
+
+    #[inline]
+    pub fn is_fixnum(self) -> bool {
+        self.word & 1 == 0
+    }
+
     #[inline]
     pub fn fixnum_add(self, other: Self) -> Option<Self> {
         if (self.word | other.word) & 1 != 0 {
             return None;
         }
         (self.word as i64).checked_add(other.word as i64).map(|w| Self::from_bits(w as u64))
+    }
+
+    #[inline]
+    pub fn fixnum_sub(self, other: Self) -> Option<Self> {
+        if (self.word | other.word) & 1 != 0 {
+            return None;
+        }
+        (self.word as i64).checked_sub(other.word as i64).map(|w| Self::from_bits(w as u64))
+    }
+
+    /// Twice `a` times `b` is twice their product, so one operand stays shifted.
+    #[inline]
+    pub fn fixnum_mul(self, other: Self) -> Option<Self> {
+        if (self.word | other.word) & 1 != 0 {
+            return None;
+        }
+        (self.word as i64).checked_mul(other.word as i64 >> 1).map(|w| Self::from_bits(w as u64))
     }
 
     /// Stores the double in the word when it fits, and boxes it otherwise.
@@ -513,6 +662,8 @@ impl<T> PartialEq for Gc<'_, T> {
     }
 }
 
+impl<T> Eq for Gc<'_, T> {}
+
 impl<T> fmt::Debug for Gc<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Gc").field(&self.index).finish()
@@ -581,12 +732,12 @@ fn items_start<T: Object>(gc: Gc<'_, T>) -> usize {
 /// A member or weak field's target, checked against the type the field declares when that type
 /// has a fixed number: one load and compare.
 #[inline]
-fn target<'gc, U: Object>(mc: &Mutation<'gc>, index: u32) -> Option<Gc<'gc, U>> {
+fn target<'gc, U: Object>(region: &RegionWords, index: u32) -> Option<Gc<'gc, U>> {
     if index == 0 {
         return None;
     }
     if let Some(ty) = U::DESC.number
-        && mc.heap.words[mask(index as usize)].get() & TYPE_BITS != u64::from(ty)
+        && region[mask(index as usize)].get() & TYPE_BITS != u64::from(ty)
     {
         wrong_target(index, ty);
     }
@@ -660,6 +811,8 @@ impl<'gc, const N: usize> Fields<'gc, N> {
 /// An object's items, each an `S`: values unless the type declares words.
 pub struct Slots<'gc, S = slot::Value> {
     words: &'gc [Cell<u64>],
+    /// The whole region, for reads that check what an index refers to.
+    region: &'gc RegionWords,
     at: usize,
     owner: u32,
     _marker: PhantomData<(Brand<'gc>, fn() -> S)>,
@@ -673,6 +826,14 @@ impl<S> Clone for Slots<'_, S> {
 
 impl<S> Copy for Slots<'_, S> {}
 
+impl<'gc> Slots<'gc, slot::u64> {
+    /// The words themselves: plain words refer to nothing, so writing them takes no barrier.
+    #[inline]
+    pub fn words(self) -> &'gc [Cell<u64>] {
+        self.words
+    }
+}
+
 impl<'gc, S: Item> Slots<'gc, S> {
     pub fn len(self) -> usize {
         self.words.len()
@@ -684,31 +845,34 @@ impl<'gc, S: Item> Slots<'gc, S> {
 
     #[inline]
     pub fn get(self, i: usize) -> S::Out<'gc> {
-        S::load(self.words[i].get())
+        S::load(self.region, self.words[i].get())
     }
 
     #[inline]
     pub fn set(self, mc: &Mutation<'gc>, i: usize, value: S::In<'gc>) {
         let word = S::store(value);
         self.words[i].set(word);
-        if S::BARRIER {
-            mc.heap.barrier(self.at + i, self.owner, word);
+        let slot = self.at + i;
+        match S::REFS {
+            Refs::None => {}
+            Refs::Values => mc.heap.barrier(slot, self.owner, word),
+            Refs::Members if word != 0 => mc.heap.barrier_ref(slot, self.owner, word as u32),
+            Refs::Members => {}
+            Refs::Weaks => mc.heap.dirty(slot),
         }
     }
 
     /// The items in `range`, or `None` past the end.
     pub fn slice(self, range: Range<usize>) -> Option<Self> {
         let words = self.words.get(range.clone())?;
-        Some(Slots { words, at: self.at + range.start, owner: self.owner, _marker: PhantomData })
+        Some(Slots { words, at: self.at + range.start, ..self })
     }
-}
 
-impl<'gc> Slots<'gc> {
     /// Copies `src` in, which may overlap, with one barrier for the whole range. Panics if the
     /// lengths differ.
-    pub fn copy_from(self, mc: &Mutation<'gc>, src: Slots<'gc>) {
+    pub fn copy_from(self, mc: &Mutation<'gc>, src: Self) {
         assert_eq!(self.len(), src.len(), "copy between slices of different lengths");
-        let refs = src.words.iter().any(|s| s.get() & TAG == OBJECT);
+        let refs = S::REFS != Refs::None && src.words.iter().any(|s| S::REFS.refers(s.get()));
         if self.at > src.at {
             for (d, s) in self.words.iter().zip(src.words).rev() {
                 d.set(s.get());
@@ -719,19 +883,22 @@ impl<'gc> Slots<'gc> {
             }
         }
         if refs {
-            mc.heap.barrier_range(self.at, self.words, self.owner);
+            mc.heap.barrier_range(self.at, self.words, self.owner, S::REFS);
         }
     }
 
-    pub fn fill(self, mc: &Mutation<'gc>, value: Value<'gc>) {
+    pub fn fill(self, mc: &Mutation<'gc>, value: S::In<'gc>) {
+        let word = S::store(value);
         for slot in self.words {
-            slot.set(value.word);
+            slot.set(word);
         }
-        if value.word & TAG == OBJECT {
-            mc.heap.barrier_range(self.at, self.words, self.owner);
+        if S::REFS.refers(word) {
+            mc.heap.barrier_range(self.at, self.words, self.owner, S::REFS);
         }
     }
+}
 
+impl<'gc> Slots<'gc> {
     /// The first `WINDOW` items, indexed by a byte so no access needs a bounds check.
     pub fn window(self) -> Option<Window<'gc>> {
         Some(Window { slots: self.words.first_chunk()?, at: self.at, owner: self.owner, _brand: PhantomData })
@@ -779,16 +946,103 @@ impl<'gc, T: Any> HostRef<'gc, T> {
     /// took its slot. While the `Ref` is held, `Mutation::host` fails with `HostError::InUse`.
     #[inline]
     pub fn get(self, mc: &Mutation<'gc>) -> Option<Ref<'gc, T>> {
-        let hosts = mc.heap.m.hosts.try_borrow().ok()?;
-        Ref::filter_map(hosts, |hosts| {
-            let slot = hosts.get(self.id as usize).filter(|s| s.generation == self.generation)?;
-            slot.value.as_deref()?.downcast_ref::<T>()
-        })
-        .ok()
+        self.erase().downcast_ref(mc)
+    }
+
+    /// The same reference, with its type left to be checked on each read.
+    pub fn erase(self) -> AnyHostRef<'gc> {
+        AnyHostRef { id: self.id, generation: self.generation, _brand: PhantomData }
+    }
+
+    /// See [`AnyHostRef::set_owned_bytes`].
+    pub fn set_owned_bytes(self, mc: &Mutation<'gc>, bytes: usize) -> Result<(), HostError> {
+        self.erase().set_owned_bytes(mc, bytes)
     }
 
     /// The word a field declared in `Desc::hosts` holds: the slot's generation, and its id plus
     /// one so that 0 is none.
+    pub fn to_word(self) -> u64 {
+        self.erase().to_word()
+    }
+}
+
+impl<T> fmt::Debug for HostRef<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostRef").field("id", &self.id).field("generation", &self.generation).finish()
+    }
+}
+
+impl<'gc, T: Any> From<HostRef<'gc, T>> for AnyHostRef<'gc> {
+    fn from(host: HostRef<'gc, T>) -> Self {
+        host.erase()
+    }
+}
+
+/// A reference to a host value of any type, for a field that can hold several. Each read checks
+/// the type, and like [`HostRef`], a stale reference reads nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct AnyHostRef<'gc> {
+    id: u32,
+    generation: u32,
+    _brand: Brand<'gc>,
+}
+
+impl<'gc> AnyHostRef<'gc> {
+    /// The value, or `None` once it's been freed.
+    #[inline]
+    fn value(self, mc: &Mutation<'gc>) -> Option<Ref<'gc, dyn Any>> {
+        let hosts = mc.heap.m.hosts.try_borrow().ok()?;
+        Ref::filter_map(hosts, |hosts| {
+            let slot = hosts.get(self.id as usize).filter(|s| s.generation == self.generation)?;
+            slot.value.as_deref()
+        })
+        .ok()
+    }
+
+    /// Whether the value is alive and a `T`.
+    pub fn is<T: Any>(self, mc: &Mutation<'gc>) -> bool {
+        self.value(mc).is_some_and(|v| (*v).is::<T>())
+    }
+
+    /// The value, if it's alive and a `T`. While the `Ref` is held, `Mutation::host` fails with
+    /// `HostError::InUse`.
+    #[inline]
+    pub fn downcast_ref<T: Any>(self, mc: &Mutation<'gc>) -> Option<Ref<'gc, T>> {
+        Ref::filter_map(self.value(mc)?, |v| v.downcast_ref::<T>()).ok()
+    }
+
+    /// Counts `bytes` the value owns outside the arena, such as a `String`'s characters, in place
+    /// of what was counted before, until the value is freed. Call it again whenever that memory
+    /// grows or shrinks. Growing fails as an allocation would, failing the step, and counts
+    /// nothing; shrinking gives the difference back at once. A freed value's reference does
+    /// nothing. Fails with `HostError::InUse` while a `Ref` from a read is held.
+    pub fn set_owned_bytes(self, mc: &Mutation<'gc>, bytes: usize) -> Result<(), HostError> {
+        let m = mc.heap.m;
+        let mut hosts = m.hosts.try_borrow_mut().map_err(|_| HostError::InUse)?;
+        let Some(slot) = hosts.get_mut(self.id as usize).filter(|s| s.generation == self.generation && s.value.is_some()) else {
+            return Ok(());
+        };
+        if bytes > slot.owned {
+            m.budget.charge(bytes - slot.owned)?;
+        } else {
+            m.budget.refund(slot.owned - bytes);
+        }
+        slot.cost = slot.cost - slot.owned + bytes;
+        slot.owned = bytes;
+        Ok(())
+    }
+
+    /// A typed reference, if the value is alive and a `T`.
+    pub fn downcast<T: Any>(self, mc: &Mutation<'gc>) -> Option<HostRef<'gc, T>> {
+        self.is::<T>(mc).then_some(self.assume())
+    }
+
+    /// Typed without checking: `HostRef::get` checks on every read.
+    pub(crate) fn assume<T>(self) -> HostRef<'gc, T> {
+        HostRef { id: self.id, generation: self.generation, _marker: PhantomData }
+    }
+
+    /// The word a host field holds: see [`HostRef::to_word`].
     pub fn to_word(self) -> u64 {
         u64::from(self.generation) << 32 | (u64::from(self.id) + 1)
     }
@@ -801,8 +1055,10 @@ fn host_parts(word: u64) -> Option<(u32, u32)> {
 struct HostSlot {
     generation: u32,
     marked: bool,
-    /// What the value is charged, refunded when it's freed.
+    /// What the value is charged, refunded when it's freed: its size, `HOST_COST`, and `owned`.
     cost: usize,
+    /// Bytes the value owns outside the arena, as `AnyHostRef::set_owned_bytes` last set them.
+    owned: usize,
     value: Option<Box<dyn Any>>,
 }
 
@@ -890,8 +1146,11 @@ struct Work {
     gray: Vec<u32>,
     /// Slots that refer to objects on pages being evacuated, as (object, word in it).
     fixups: Vec<(u32, u32)>,
-    /// Objects with weak fields that were traced.
+    /// Objects with weak fields or items that were traced.
     holders: Vec<u32>,
+    /// Runs of weak items on dirty cards, which a minor collection clears without the rest of
+    /// their object.
+    weak_runs: Vec<(u32, u32)>,
     /// Objects with ephemerons that were traced.
     ephemerons: Vec<u32>,
 }
@@ -936,12 +1195,14 @@ struct Meta {
     cache: [Cell<(usize, u16)>; 64],
     roots: Box<[Cell<u64>]>,
     stacks: RefCell<Vec<Rc<StackRecord>>>,
+    handles: RefCell<Vec<Rc<RootRecord>>>,
     /// Tells arenas apart, for handles that live outside them.
     id: u64,
     hosts: RefCell<Vec<HostSlot>>,
     free_hosts: RefCell<Vec<u32>>,
     /// Freed by the last collection, dropped once it has returned.
     dead_hosts: RefCell<Vec<Box<dyn Any>>>,
+    blobs: Blobs,
     work: RefCell<Work>,
     /// What the work lists and tables outside the region were last charged.
     tables: Cell<usize>,
@@ -949,6 +1210,8 @@ struct Meta {
     stress: Cell<Option<usize>>,
     collections: Cell<u64>,
     minors: Cell<u64>,
+    /// Collections that moved objects, which identity tables rehash after.
+    evacuations: Cell<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -1009,15 +1272,18 @@ impl Arena {
             cache: [const { Cell::new((0, 0)) }; 64],
             roots: vec![Cell::new(Value::NIL.word); roots].into_boxed_slice(),
             stacks: RefCell::new(Vec::new()),
+            handles: RefCell::new(Vec::new()),
             id: NEXT_ARENA.fetch_add(1, Ordering::Relaxed),
             hosts: RefCell::new(Vec::new()),
             free_hosts: RefCell::new(Vec::new()),
             dead_hosts: RefCell::new(Vec::new()),
+            blobs: Blobs::new(limit),
             work: RefCell::new(Work::default()),
             tables: Cell::new(0),
             stress: Cell::new(None),
             collections: Cell::new(0),
             minors: Cell::new(0),
+            evacuations: Cell::new(0),
         };
         if let Some(boxed) = meta.descs.get_or_grow(0) {
             boxed.set(Some(&Boxed::DESC));
@@ -1037,6 +1303,8 @@ impl Arena {
         self.settle();
         let dead = std::mem::take(&mut *self.meta.dead_hosts.borrow_mut());
         drop(dead);
+        let m = &mut self.meta;
+        m.blobs.free_dead(&m.budget);
         self.charge_tables();
     }
 
@@ -1046,11 +1314,13 @@ impl Arena {
         let m = &self.meta;
         let work = m.work.borrow();
         let bytes = (work.gray.capacity() + work.holders.capacity() + work.ephemerons.capacity()) * size_of::<u32>()
-            + work.fixups.capacity() * size_of::<(u32, u32)>()
+            + (work.fixups.capacity() + work.weak_runs.capacity()) * size_of::<(u32, u32)>()
             + m.hosts.borrow().capacity() * size_of::<HostSlot>()
             + m.free_hosts.borrow().capacity() * size_of::<u32>()
             + m.dead_hosts.borrow().capacity() * size_of::<Box<dyn Any>>()
-            + m.stacks.borrow().capacity() * size_of::<Rc<StackRecord>>();
+            + m.stacks.borrow().capacity() * size_of::<Rc<StackRecord>>()
+            + m.handles.borrow().capacity() * size_of::<Rc<RootRecord>>()
+            + m.blobs.table_bytes();
         let before = m.tables.replace(bytes);
         if bytes > before {
             m.budget.force(bytes - before);
@@ -1201,8 +1471,19 @@ impl Arena {
         self.meta.occupied.get() * PAGE * 8
     }
 
+    /// Objects marked and not yet swept away: after [`Arena::collect`], the live ones.
+    pub fn objects(&self) -> usize {
+        let pages = &self.meta.pages[..self.meta.used.get()];
+        pages.iter().flat_map(|p| p.starts.iter().zip(&p.marks)).map(|(s, k)| (s.get() & k.get()).count_ones() as usize).sum()
+    }
+
     pub fn hosts(&self) -> usize {
         self.meta.hosts.borrow().len()
+    }
+
+    /// Blobs not yet freed, including any a collection found dead that the next one frees.
+    pub fn blobs(&self) -> usize {
+        self.meta.blobs.count()
     }
 
     /// Bytes charged against the limit: committed pages, roots, stacks, host values, the
@@ -1256,6 +1537,14 @@ impl<'gc> Mutation<'gc> {
         self.heap.alloc_fixed(&T::DESC, &fields).map(Gc::new)
     }
 
+    /// `alloc_items` with zero items, the zero word reading as fixnum 0, none or 0: small
+    /// enough to inline, for objects made often with few items.
+    #[doc(hidden)]
+    #[inline]
+    pub fn alloc_zeroed<T: Object, const N: usize>(&self, fields: [u64; N], len: usize) -> Result<Gc<'gc, T>, OutOfMemory> {
+        self.heap.alloc_zeroed(&T::DESC, &fields, len).map(Gc::new)
+    }
+
     #[doc(hidden)]
     pub fn alloc_items<T: Object, const N: usize>(
         &self,
@@ -1284,7 +1573,7 @@ impl<'gc> Mutation<'gc> {
     }
 
     /// Charged its size, plus `HOST_COST`. Memory the value owns elsewhere, such as a
-    /// `String`'s bytes, can be counted with a `Charge`.
+    /// `String`'s bytes, can be counted with [`HostRef::set_owned_bytes`].
     pub fn host<T: Any>(&self, value: T) -> Result<HostRef<'gc, T>, HostError> {
         let m = self.heap.m;
         let mut hosts = m.hosts.try_borrow_mut().map_err(|_| HostError::InUse)?;
@@ -1300,7 +1589,7 @@ impl<'gc> Mutation<'gc> {
                 let Some(id) = u32::try_from(hosts.len()).ok().filter(|&id| id < u32::MAX) else {
                     return Err(m.budget.fail().into());
                 };
-                hosts.push(HostSlot { generation: 0, marked: false, cost: 0, value: None });
+                hosts.push(HostSlot { generation: 0, marked: false, cost: 0, owned: 0, value: None });
                 id
             }
         };
@@ -1309,7 +1598,23 @@ impl<'gc> Mutation<'gc> {
         slot.value = Some(value);
         slot.marked = marked;
         slot.cost = cost;
+        slot.owned = 0;
         Ok(HostRef { id, generation: slot.generation, _marker: PhantomData })
+    }
+
+    /// An array of `len` units outside the region, zeroed for `init` to fill in, which keeps as
+    /// many as `init` returns. Charged its size plus `BLOB_COST`. Store it in an object's blob
+    /// field this step: a blob nothing holds is freed by the next collection.
+    pub fn blob<U: Unit>(&self, len: usize, init: impl FnOnce(&mut [U]) -> usize) -> Result<BlobRef<'gc, U>, OutOfMemory> {
+        let m = self.heap.m;
+        m.blobs.alloc_units(&m.budget, false, len, init).map(BlobRef::new)
+    }
+
+    /// `value` outside the region, readable as `&'gc T` and never changed: what a blob field of
+    /// `Frozen<T>` holds.
+    pub fn frozen<T: Any>(&self, value: T) -> Result<FrozenRef<'gc, T>, OutOfMemory> {
+        let m = self.heap.m;
+        m.blobs.alloc_frozen(&m.budget, false, value).map(FrozenRef::new)
     }
 
     /// Runs allocations the caller can do without, such as growing a buffer by more than it
@@ -1410,6 +1715,30 @@ impl<'a> Heap<'a> {
         }
         for slot in items {
             slot.set(item);
+        }
+        self.m.young.set(self.m.young.get() + size * 8);
+        if self.m.phase.get() == Phase::Marking {
+            self.color_marked(at);
+        }
+        Ok(at as u32)
+    }
+
+    #[inline(always)]
+    fn alloc_zeroed(self, desc: &'static Desc, fields: &[u64], len: usize) -> Result<u32, OutOfMemory> {
+        if desc.items == Items::None || len > u32::MAX as usize {
+            return self.alloc(desc, fields, len, 0);
+        }
+        let ty = self.type_index(desc).ok_or_else(|| self.m.budget.fail())?;
+        let size = 1 + desc.fields as usize + len;
+        let at = self.reserve(size)?;
+        let object = &self.words[at..at + size];
+        object[0].set(u64::from(ty) | (len as u64) << 32);
+        let (head, items) = object[1..].split_at(desc.fields as usize);
+        for (slot, &word) in head.iter().zip(fields.iter().chain(std::iter::repeat(&0))) {
+            slot.set(word);
+        }
+        for slot in items {
+            slot.set(0);
         }
         self.m.young.set(self.m.young.get() + size * 8);
         if self.m.phase.get() == Phase::Marking {
@@ -1668,7 +1997,9 @@ impl<'a> Heap<'a> {
         }
     }
 
-    fn barrier_range(self, at: usize, slots: &[Cell<u64>], owner: u32) {
+    /// Dirties the cards under `slots`, and while marking shades what they refer to, as `refs`
+    /// reads them.
+    fn barrier_range(self, at: usize, slots: &[Cell<u64>], owner: u32, refs: Refs) {
         let (mut i, end) = (at, at + slots.len());
         while i < end {
             let Some(page) = self.m.pages.get(i / PAGE) else { return };
@@ -1677,11 +2008,10 @@ impl<'a> Heap<'a> {
             page.cards.set(page.cards.get() | ((u64::MAX >> (63 - last)) & (u64::MAX << first)) as u32);
             i = to;
         }
-        if self.m.phase.get() == Phase::Marking {
+        if self.m.phase.get() == Phase::Marking && matches!(refs, Refs::Values | Refs::Members) {
             for (k, slot) in slots.iter().enumerate() {
-                let word = slot.get();
-                if word & TAG == OBJECT {
-                    self.shade(at + k, owner, (word >> 32) as u32);
+                if let Some(target) = refs.target(slot.get()) {
+                    self.shade(at + k, owner, target);
                 }
             }
         }
@@ -1704,7 +2034,9 @@ impl<'a> Heap<'a> {
         self.drain(&mut work, usize::MAX);
         self.trace_ephemerons(&mut work);
         self.clear_weaks(&mut work);
+        self.m.blobs.sweep_young();
         work.holders.clear();
+        work.weak_runs.clear();
         work.ephemerons.clear();
         self.sweep();
         self.reset_allocator();
@@ -1719,8 +2051,8 @@ impl<'a> Heap<'a> {
         if m.phase.get() != Phase::Idle {
             return;
         }
-        // Pages at most a quarter in use are evacuated while half the free room covers them, as
-        // in `ragwort-gc`. Pages of large objects stay.
+        // Pages at most a quarter in use are evacuated while half the free room covers them.
+        // Pages of large objects stay.
         let pages = &m.pages[..m.used.get()];
         let all = m.evacuate_all.get();
         let occupied: usize = pages.iter().map(|p| p.used.get().count_ones() as usize * LINE).sum();
@@ -1743,6 +2075,7 @@ impl<'a> Heap<'a> {
             pages.iter().for_each(|p| p.evacuating.set(false));
         }
         m.hosts.borrow_mut().iter_mut().for_each(|h| h.marked = false);
+        m.blobs.clear_marks();
         m.evacuating.set(evacuating);
         m.to_cursor.set(0);
         m.to_end.set(0);
@@ -1750,6 +2083,7 @@ impl<'a> Heap<'a> {
         let mut work = std::mem::take(&mut *m.work.borrow_mut());
         work.fixups.clear();
         work.holders.clear();
+        work.weak_runs.clear();
         work.ephemerons.clear();
         self.mark_roots(&mut work);
         *m.work.borrow_mut() = work;
@@ -1807,7 +2141,9 @@ impl<'a> Heap<'a> {
         self.clear_weaks(work);
         if m.evacuating.get() {
             self.evacuate(work);
+            m.evacuations.set(m.evacuations.get() + 1);
         }
+        m.blobs.sweep_all();
         let mut free = m.free_hosts.borrow_mut();
         let mut dead = m.dead_hosts.borrow_mut();
         for (id, host) in m.hosts.borrow_mut().iter_mut().enumerate() {
@@ -1833,6 +2169,7 @@ impl<'a> Heap<'a> {
         m.phase.set(Phase::Sweeping);
         work.fixups.clear();
         work.holders.clear();
+        work.weak_runs.clear();
         work.ephemerons.clear();
     }
 
@@ -1864,6 +2201,13 @@ impl<'a> Heap<'a> {
         let before = stacks.len();
         stacks.retain(|s| Rc::strong_count(s) > 1);
         self.m.budget.refund((before - stacks.len()) * STACK_COST);
+        let mut handles = self.m.handles.borrow_mut();
+        let before = handles.len();
+        handles.retain(|h| Rc::strong_count(h) > 1);
+        self.m.budget.refund((before - handles.len()) * ROOT_COST);
+        for handle in handles.iter() {
+            self.visit(&handle.word, work);
+        }
     }
 
     /// Sweeps every page at once, for a minor collection.
@@ -1898,12 +2242,19 @@ impl<'a> Heap<'a> {
             let mut bits = desc.weaks;
             while bits != 0 {
                 if let Some(slot) = self.words.get(i + 1 + bits.trailing_zeros() as usize) {
-                    let target = slot.get() as u32;
-                    if target != 0 && !self.has_bit(target as usize, |p| &p.marks) {
-                        slot.set(0);
-                    }
+                    self.clear_dead(slot);
                 }
                 bits &= bits - 1;
+            }
+            if desc.items == Items::Weaks {
+                for slot in self.items_of(i) {
+                    self.clear_dead(slot);
+                }
+            }
+        }
+        for &(from, to) in &work.weak_runs {
+            for slot in self.words.get(from as usize..to as usize).unwrap_or(&[]) {
+                self.clear_dead(slot);
             }
         }
         for &holder in &work.ephemerons {
@@ -1914,6 +2265,23 @@ impl<'a> Heap<'a> {
                 }
             });
         }
+    }
+
+    /// Clears a weak slot whose target wasn't marked.
+    #[inline]
+    fn clear_dead(self, slot: &Cell<u64>) {
+        let target = slot.get() as u32;
+        if target != 0 && !self.has_bit(target as usize, |p| &p.marks) {
+            slot.set(0);
+        }
+    }
+
+    /// The items of the object at `i`.
+    fn items_of(self, i: usize) -> &'a [Cell<u64>] {
+        let Some(header) = self.words.get(i).map(Cell::get) else { return &[] };
+        let Some(desc) = self.desc(header) else { return &[] };
+        let start = i + 1 + desc.fields as usize;
+        self.words.get(start..start + (header >> 32) as usize).unwrap_or(&[])
     }
 
     /// Calls `f` with the key and value slots of each ephemeron in the object at `i`.
@@ -1987,7 +2355,7 @@ impl<'a> Heap<'a> {
         let Some(desc) = self.desc(self.words[i].get()) else { return false };
         marks.set(marks.get() | bit);
         self.cover_lines(i, desc.size(self.words[i].get()), |p| &p.lines);
-        if desc.traces() {
+        if desc.traces {
             work.gray.push(index);
         }
         true
@@ -2043,7 +2411,7 @@ impl<'a> Heap<'a> {
                 }
             });
         }
-        if desc.weaks != 0 {
+        if desc.weaks != 0 || items && desc.items == Items::Weaks {
             work.holders.push(i as u32);
             let mut bits = desc.weaks;
             while bits != 0 {
@@ -2061,17 +2429,33 @@ impl<'a> Heap<'a> {
             }
             bits &= bits - 1;
         }
+        let mut bits = desc.blobs;
+        while bits != 0 {
+            if let Some(slot) = fields.get(bits.trailing_zeros() as usize) {
+                self.m.blobs.mark(slot.get());
+            }
+            bits &= bits - 1;
+        }
         let mut size = 1 + desc.fields as usize;
         if desc.items != Items::None {
             let len = (header >> 32) as usize;
             size += len;
+            let start = desc.fields as usize;
+            let slots = || self.words.get(i + 1 + start..i + 1 + start + len).unwrap_or(&[]).iter().enumerate();
             if items && desc.items == Items::Values {
-                let start = desc.fields as usize;
-                for (j, slot) in self.words.get(i + 1 + start..i + 1 + start + len).unwrap_or(&[]).iter().enumerate() {
+                for (j, slot) in slots() {
                     let word = slot.get();
                     if word & TAG == OBJECT {
                         self.mark((word >> 32) as u32, work);
                         note(work, start + j, (word >> 32) as u32);
+                    }
+                }
+            } else if items && desc.items == Items::Members {
+                for (j, slot) in slots() {
+                    let target = slot.get() as u32;
+                    if target != 0 {
+                        self.mark(target, work);
+                        note(work, start + j, target);
                     }
                 }
             }
@@ -2080,7 +2464,7 @@ impl<'a> Heap<'a> {
     }
 
     /// Moves the marked objects off the pages being evacuated, then fixes every reference
-    /// to them: the roots and stacks, which are rescanned, and the slots noted while marking.
+    /// to them: the roots, root handles and stacks, which are rescanned, and the slots noted while marking.
     fn evacuate(self, work: &mut Work) {
         let used = self.m.used.get();
         for p in 0..used {
@@ -2102,17 +2486,24 @@ impl<'a> Heap<'a> {
         for stack in self.m.stacks.borrow().iter() {
             stack.fix(self);
         }
+        for handle in self.m.handles.borrow().iter() {
+            self.fix_value(&handle.word);
+        }
         for &(owner, at) in &work.fixups {
             let o = self.resolve(owner) as usize;
             let Some(desc) = self.words.get(o).and_then(|h| self.desc(h.get())) else { continue };
             let Some(slot) = self.words.get(o + at as usize) else { continue };
             let field = at as usize - 1;
             let bit = if field < 64 { 1 << field } else { 0 };
-            if field >= desc.fields as usize || desc.values & bit != 0 {
+            let index = if field >= desc.fields as usize {
+                matches!(desc.items, Items::Members | Items::Weaks)
+            } else {
+                (desc.members | desc.weaks) & bit != 0
+            };
+            if index {
+                self.fix_index(slot);
+            } else if field >= desc.fields as usize || desc.values & bit != 0 {
                 self.fix_value(slot);
-            } else if (desc.members | desc.weaks) & bit != 0 {
-                let target = slot.get() as u32;
-                slot.set(slot.get() & !0xFFFF_FFFF | u64::from(self.resolve(target)));
             }
         }
         for &holder in &work.holders {
@@ -2121,9 +2512,14 @@ impl<'a> Heap<'a> {
             let mut bits = desc.weaks;
             while bits != 0 {
                 if let Some(slot) = self.words.get(o + 1 + bits.trailing_zeros() as usize) {
-                    slot.set(slot.get() & !0xFFFF_FFFF | u64::from(self.resolve(slot.get() as u32)));
+                    self.fix_index(slot);
                 }
                 bits &= bits - 1;
+            }
+            if desc.items == Items::Weaks {
+                for slot in self.items_of(o) {
+                    self.fix_index(slot);
+                }
             }
         }
         for &holder in &work.ephemerons {
@@ -2201,6 +2597,10 @@ impl<'a> Heap<'a> {
         }
     }
 
+    fn fix_index(self, slot: &Cell<u64>) {
+        slot.set(slot.get() & !0xFFFF_FFFF | u64::from(self.resolve(slot.get() as u32)));
+    }
+
     fn fix_value(self, slot: &Cell<u64>) {
         let word = slot.get();
         if word & TAG == OBJECT {
@@ -2237,19 +2637,23 @@ impl<'a> Heap<'a> {
     fn trace_card(self, i: usize, card: Range<usize>, first: bool, work: &mut Work) {
         let header = self.words[mask(i)].get();
         let Some(desc) = self.desc(header) else { return };
-        if desc.items != Items::Values {
+        let Some(refs @ (Refs::Values | Refs::Members | Refs::Weaks)) = Refs::of(desc.items) else {
             if first {
                 self.trace(i, work);
             }
             return;
-        }
+        };
         if first {
             self.trace_parts(i, work, false);
         }
         let items = i + 1 + desc.fields as usize;
-        let end = items + (header >> 32) as usize;
-        for slot in self.words.get(card.start.max(items)..card.end.min(end)).unwrap_or(&[]) {
-            self.visit(slot, work);
+        let (from, to) = (card.start.max(items), card.end.min(items + (header >> 32) as usize));
+        let slots = self.words.get(from..to).unwrap_or(&[]);
+        match refs {
+            Refs::Values => slots.iter().for_each(|slot| self.visit(slot, work)),
+            Refs::Members => slots.iter().filter(|s| s.get() as u32 != 0).for_each(|s| _ = self.mark(s.get() as u32, work)),
+            _ if from < to => work.weak_runs.push((from as u32, to as u32)),
+            _ => {}
         }
     }
 

@@ -3,7 +3,7 @@
 //! same text. Strings whose units fit in [`SHORT`] bytes, such as most names, hash in one step.
 
 use crate::units::Unit;
-use crate::{Host, Units, Width, chunks, summary};
+use crate::{Host, Info, Packed, Units, Width, chunks, summary};
 
 const K0: u64 = 0x243f_6a88_85a3_08d3;
 const K1: u64 = 0x1319_8a2e_0370_7344;
@@ -49,12 +49,7 @@ fn gather(buf: &mut [u8; SHORT], mut at: usize, codes: impl Iterator<Item = u32>
 }
 
 fn codes(u: Units<'_>) -> impl Iterator<Item = u32> + '_ {
-    let (one, two, four) = match u {
-        Units::One(s) => (s, &[][..], &[][..]),
-        Units::Two(s) => (&[][..], s, &[][..]),
-        Units::Four(s) => (&[][..], &[][..], s),
-    };
-    one.iter().map(|&c| c as u32).chain(two.iter().map(|&c| c as u32)).chain(four.iter().copied())
+    (0..u.len()).map(move |i| u.code(i))
 }
 
 #[inline]
@@ -100,11 +95,47 @@ impl State {
         }
     }
 
+    #[inline]
     fn units(&mut self, u: Units<'_>) {
         match u {
             Units::One(s) => self.run(s),
             Units::Two(s) => self.run(s),
             Units::Four(s) => self.run(s),
+            Units::Packed(p) => self.packed(p),
+        }
+    }
+
+    /// Whole words go straight in once a part-packed word is filled.
+    #[inline]
+    fn packed(&mut self, p: Packed<'_>) {
+        if p.width() != self.width {
+            (0..p.len()).for_each(|i| self.unit(p.code(i)));
+            return;
+        }
+        let mut i = 0;
+        while self.bits != 0 && i < p.len() {
+            self.unit(p.code(i));
+            i += 1;
+        }
+        let p = if i == 0 { p } else { p.slice(i..p.len()) };
+        let bytes = p.len() * p.width().bytes();
+        let (whole, rest) = (bytes / 8, bytes % 8);
+        let mut k = 0;
+        if self.half.is_some() && whole > 0 {
+            self.word(p.word_at(0, 8));
+            k = 1;
+        }
+        let (mut acc, key) = (self.acc, self.key);
+        while k + 2 <= whole {
+            acc = mix(p.word_at(k, 8) ^ acc, p.word_at(k + 1, 8) ^ key);
+            k += 2;
+        }
+        self.acc = acc;
+        if k < whole {
+            self.word(p.word_at(k, 8));
+        }
+        if rest > 0 {
+            (self.packing, self.bits) = (p.word_at(whole, rest), 8 * rest as u32);
         }
     }
 
@@ -157,25 +188,41 @@ impl State {
 pub fn hash<H: Host>(h: &H, s: H::Str, seed: u64) -> Result<u64, H::Error> {
     let (info, flat) = summary(h, s);
     h.charge(info.len as u64)?;
+    Ok(match flat {
+        Some(units) => hash_flat(units, seed),
+        None => hash_chunks(h, s, info, seed),
+    })
+}
+
+/// The hash of a flat string's characters, which are at their narrowest width.
+#[inline]
+fn hash_flat(units: Units<'_>, seed: u64) -> u64 {
+    let (len, width) = (units.len(), units.width());
+    if len * width.bytes() > SHORT {
+        let mut state = State::new(seed, width);
+        state.units(units);
+        return state.finish(len);
+    }
+    let mut buf = [0; SHORT];
+    let n = len * width.bytes();
+    match units {
+        Units::One(b) => return short(words(b), seed, len, width),
+        Units::Packed(p) => p.copy_bytes(0, &mut buf[..n]),
+        _ => _ = gather(&mut buf, 0, codes(units), width),
+    }
+    short(words(&buf[..n]), seed, len, width)
+}
+
+#[inline(never)]
+fn hash_chunks<H: Host>(h: &H, s: H::Str, info: Info, seed: u64) -> u64 {
     if info.len * info.width.bytes() <= SHORT {
-        if let Some(Units::One(b)) = flat
-            && info.width == Width::One
-        {
-            return Ok(short(words(b), seed, info.len, info.width));
-        }
         let mut buf = [0; SHORT];
-        let n = match flat {
-            Some(units) => gather(&mut buf, 0, codes(units), info.width),
-            None => chunks(h, s).fold(0, |at, units| gather(&mut buf, at, codes(units), info.width)),
-        };
-        return Ok(short(words(&buf[..n]), seed, info.len, info.width));
+        let n = chunks(h, s).fold(0, |at, units| gather(&mut buf, at, codes(units), info.width));
+        return short(words(&buf[..n]), seed, info.len, info.width);
     }
     let mut state = State::new(seed, info.width);
-    match flat {
-        Some(units) => state.units(units),
-        None => chunks(h, s).for_each(|units| state.units(units)),
-    }
-    Ok(state.finish(info.len))
+    chunks(h, s).for_each(|units| state.units(units));
+    state.finish(info.len)
 }
 
 /// What [`hash`] gives a string of these characters.

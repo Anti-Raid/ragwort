@@ -5,14 +5,9 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use ragwort_parser::read_all;
-use ragwort_types::gc::{Arena, Rootable};
+use ragwort_types::gc::Arena;
 use ragwort_types::symbol::Symbols;
 use ragwort_types::syntax::SyntaxSession;
-
-struct Root;
-impl Rootable for Root {
-    type Root<'gc> = Symbols<'gc>;
-}
 
 /// Roughly `bytes` of source, the same every run.
 fn source(bytes: usize) -> String {
@@ -66,17 +61,17 @@ fn main() {
     let mut data = 0;
     let (mut best, mut best_session) = (Duration::MAX, Duration::MAX);
     for _ in 0..7 {
-        let mut arena = Arena::<Root>::new(64 << 20, |_| Ok(Symbols::with_seed(1))).expect("arena");
-        let (session, read) = arena
-            .mutate(|mc, symbols| {
+        let mut arena = Arena::new(64 << 20, 1);
+        arena.mutate(|mc| mc.set_root(0, Symbols::with_seed(mc, 1).expect("table").value(mc)));
+        let (session, read) = arena.mutate(|mc| {
+                let symbols = Symbols::of(mc.root(0)).expect("table");
                 let start = Instant::now();
                 let session = SyntaxSession::new(mc, &text).expect("session");
                 let made = start.elapsed();
                 let start = Instant::now();
                 data = black_box(read_all(mc, symbols, &session).expect("read")).len();
                 (made, start.elapsed())
-            })
-            .expect("step");
+            });
         best = best.min(read);
         best_session = best_session.min(session);
     }

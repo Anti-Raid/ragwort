@@ -1,41 +1,14 @@
-//! Ragwort's data types in the arena: numbers, strings, symbols, pairs, vectors and syntax, with the arena as the
-//! host that `ragwort-num` and `ragwort-string` work over.
+//! Ragwort's data types in the arena: numbers, strings, symbols, pairs, vectors and syntax. The
+//! arena is `ragwort-gc-words`, which holds the strings and numbers itself; this crate adds the
+//! rest, as views of objects only it can change.
 
-pub use ragwort_gc as gc;
-pub use ragwort_gc_prims as gc_prims;
+pub use ragwort_gc_words as gc;
+pub use ragwort_gc_words::Error;
 
 pub mod num;
+mod objects;
 pub mod pair;
 pub mod string;
 pub mod symbol;
 pub mod syntax;
 pub mod vector;
-
-use ragwort_gc::OutOfMemory;
-use ragwort_num::NumError;
-use ragwort_string::StrError;
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Error {
-    OutOfMemory,
-    Num(NumError),
-    Str(StrError),
-}
-
-impl From<OutOfMemory> for Error {
-    fn from(_: OutOfMemory) -> Self {
-        Self::OutOfMemory
-    }
-}
-
-impl From<NumError> for Error {
-    fn from(e: NumError) -> Self {
-        Self::Num(e)
-    }
-}
-
-impl From<StrError> for Error {
-    fn from(e: StrError) -> Self {
-        Self::Str(e)
-    }
-}

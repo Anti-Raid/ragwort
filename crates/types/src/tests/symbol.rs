@@ -1,16 +1,20 @@
-use ragwort_gc::{Arena, Rootable};
+use crate::gc::{Arena, GcVec, slot};
 
 use super::*;
-use ragwort_gc_prims::GcVec;
 use crate::string::*;
 
-struct Table;
-impl Rootable for Table {
-    type Root<'gc> = (Symbols<'gc>, GcVec<'gc, Value<'gc>>);
+/// Root 0 holds the table, root 1 the symbols a test keeps.
+fn arena() -> Arena {
+    let mut arena = Arena::new(16 << 20, 2);
+    arena.mutate(|mc| {
+        mc.set_root(0, Symbols::with_seed(mc, 1).unwrap().value(mc));
+        mc.set_root(1, Value::object(mc, GcVec::<slot::Value>::new(mc).unwrap().head()));
+    });
+    arena
 }
 
-fn arena() -> Arena<Table> {
-    Arena::<Table>::new(16 << 20, |_| Ok((Symbols::with_seed(1), GcVec::new()))).unwrap()
+fn roots<'gc>(mc: &Mutation<'gc>) -> (Symbols<'gc>, GcVec<'gc>) {
+    (Symbols::of(mc.root(0)).unwrap(), GcVec::of(mc.root(1).downcast(mc).unwrap()))
 }
 
 fn names(n: usize) -> Vec<String> {
@@ -21,8 +25,9 @@ fn names(n: usize) -> Vec<String> {
 #[test]
 fn one_symbol_per_name() {
     let mut arena = arena();
-    arena.mutate(|mc, (symbols, _)| {
-        let h = Strings::new(mc).unwrap();
+    arena.mutate(|mc| {
+        let (symbols, _) = roots(mc);
+        let h = Strings::new(mc);
         for text in ["content", "", "café", "日本語", "😀", &"long name ".repeat(300)] {
             let half = text.len() / 2;
             let half = (0..=half).rev().find(|&i| text.is_char_boundary(i)).unwrap();
@@ -35,18 +40,18 @@ fn one_symbol_per_name() {
                 assert_eq!(symbols.intern(&h, s), Ok(first), "{text:?}");
             }
             assert_eq!(symbols.intern_str(&h, text), Ok(first));
-            let name = h.name(first);
+            let name = first.name(mc);
             assert!(is_flat(&h, name));
             assert_eq!(display(&h, name).to_string(), text);
-            assert_eq!(h.symbol_hash(first), hash_str(text, symbols.seed()));
-            assert_eq!(h.symbol(first.value()), Some(first));
-            assert_eq!(h.string(first.value()), None);
-            assert_eq!(h.symbol(name.value()), None);
+            assert_eq!(first.hash(mc), hash_str(text, symbols.seed(mc)));
+            assert_eq!(Symbol::of(first.value(mc)), Some(first));
+            assert_eq!(h.string(first.value(mc)), None);
+            assert_eq!(Symbol::of(name.value()), None);
         }
         let all: Vec<_> = names(500).iter().map(|n| symbols.intern_str(&h, n).unwrap()).collect();
-        let distinct: std::collections::HashSet<_> = all.iter().map(|s| s.value().to_bits()).collect();
+        let distinct: std::collections::HashSet<_> = all.iter().map(|s| s.value(mc).to_bits()).collect();
         assert_eq!(distinct.len(), all.len());
-    }).unwrap();
+    });
 }
 
 /// Symbols kept through collections that move everything are still the ones their names
@@ -56,22 +61,24 @@ fn symbols_survive_moving_collections() {
     let mut arena = arena();
     arena.set_evacuate_all(true);
     let names = names(2000);
-    arena.mutate(|mc, (symbols, kept)| {
-        let h = Strings::new(mc).unwrap();
+    arena.mutate(|mc| {
+        let (symbols, kept) = roots(mc);
+        let h = Strings::new(mc);
         for n in &names {
-            kept.push(mc, symbols.intern_str(&h, n).unwrap().value()).unwrap();
+            kept.push(mc, symbols.intern_str(&h, n).unwrap().value(mc)).unwrap();
         }
-    }).unwrap();
+    });
     arena.collect();
     arena.collect();
-    arena.mutate(|mc, (symbols, kept)| {
-        let h = Strings::new(mc).unwrap();
+    arena.mutate(|mc| {
+        let (symbols, kept) = roots(mc);
+        let h = Strings::new(mc);
         for (i, n) in names.iter().enumerate() {
             let s = symbols.intern_str(&h, n).unwrap();
-            assert_eq!(Some(s.value()), kept.get(mc, i));
-            assert_eq!(display(&h, h.name(s)).to_string(), *n);
+            assert_eq!(Some(s.value(mc)), kept.get(mc, i));
+            assert_eq!(display(&h, s.name(mc)).to_string(), *n);
         }
-    }).unwrap();
+    });
 }
 
 /// The table doesn't keep symbols alive. Ones still reached stay unique however many of their
@@ -80,63 +87,69 @@ fn symbols_survive_moving_collections() {
 fn unreachable_symbols_are_collected() {
     let mut arena = arena();
     let names = names(3000);
-    arena.mutate(|mc, (symbols, kept)| {
-        let h = Strings::new(mc).unwrap();
+    arena.mutate(|mc| {
+        let (symbols, kept) = roots(mc);
+        let h = Strings::new(mc);
         for (i, n) in names.iter().enumerate() {
             let s = symbols.intern_str(&h, n).unwrap();
             if i % 3 == 0 {
-                kept.push(mc, s.value()).unwrap();
+                kept.push(mc, s.value(mc)).unwrap();
             }
         }
-    }).unwrap();
-    let before = arena.metrics().objects;
+    });
     arena.collect();
     arena.collect();
-    let after = arena.metrics().objects;
-    assert!(after + 2 * 2000 <= before, "{before} objects, then {after}");
-    arena.mutate(|mc, (symbols, kept)| {
-        let h = Strings::new(mc).unwrap();
+    // The kept symbols and their names, and a few containers.
+    let live = arena.objects();
+    assert!((2 * 1000..2 * 1000 + 10).contains(&live), "{live} objects");
+    arena.mutate(|mc| {
+        let (symbols, kept) = roots(mc);
+        let h = Strings::new(mc);
         let again: Vec<_> = names.iter().map(|n| symbols.intern_str(&h, n).unwrap()).collect();
         for (i, s) in again.iter().enumerate() {
             match i % 3 {
-                0 => assert_eq!(Some(s.value()), kept.get(mc, i / 3)),
-                _ => assert!(kept.get(mc, i / 3) != Some(s.value())),
+                0 => assert_eq!(Some(s.value(mc)), kept.get(mc, i / 3)),
+                _ => assert!(kept.get(mc, i / 3) != Some(s.value(mc))),
             }
             assert_eq!(symbols.intern_str(&h, &names[i]), Ok(*s));
-            assert_eq!(symbols.intern(&h, h.name(*s)), Ok(*s));
+            assert_eq!(symbols.intern(&h, s.name(mc)), Ok(*s));
         }
-    }).unwrap();
+    });
 }
 
 /// Names made and dropped over and over don't grow the table past what the live ones need.
 #[test]
 fn churn_leaves_the_table_small() {
     let mut arena = arena();
-    arena.mutate(|mc, (symbols, kept)| {
-        let h = Strings::new(mc).unwrap();
+    arena.mutate(|mc| {
+        let (symbols, kept) = roots(mc);
+        let h = Strings::new(mc);
         for n in names(100) {
-            kept.push(mc, symbols.intern_str(&h, &n).unwrap().value()).unwrap();
+            kept.push(mc, symbols.intern_str(&h, &n).unwrap().value(mc)).unwrap();
         }
-    }).unwrap();
+    });
     for round in 0..30 {
-        arena.mutate(|mc, (symbols, _)| {
-            let h = Strings::new(mc).unwrap();
+        arena.mutate(|mc| {
+            let (symbols, _) = roots(mc);
+            let h = Strings::new(mc);
             for i in 0..500 {
                 symbols.intern_str(&h, &format!("round {round} message {i}")).unwrap();
             }
-            assert!(symbols.capacity(&h) <= 2048, "{} slots", symbols.capacity(&h));
-        }).unwrap();
+            assert!(symbols.capacity(mc) <= 2048, "{} slots", symbols.capacity(mc));
+        });
         arena.collect();
     }
-    arena.mutate(|mc, (symbols, kept)| {
-        let h = Strings::new(mc).unwrap();
+    arena.mutate(|mc| {
+        let (symbols, kept) = roots(mc);
+        let h = Strings::new(mc);
         for (i, n) in names(100).iter().enumerate() {
-            assert_eq!(Some(symbols.intern_str(&h, n).unwrap().value()), kept.get(mc, i));
+            assert_eq!(Some(symbols.intern_str(&h, n).unwrap().value(mc)), kept.get(mc, i));
         }
-    }).unwrap();
+    });
 }
 
 #[test]
 fn tables_are_seeded_apart() {
-    assert_ne!(Symbols::new().seed(), Symbols::new().seed());
+    let mut arena = Arena::new(1 << 20, 0);
+    arena.mutate(|mc| assert_ne!(Symbols::new(mc).unwrap().seed(mc), Symbols::new(mc).unwrap().seed(mc)));
 }

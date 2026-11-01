@@ -344,6 +344,14 @@ fn short_strings_hash_alike_in_every_shape() {
     let s = make(&h, &"caf\u{e9}".chars().collect::<Vec<_>>());
     assert_eq!(equal_str(&h, s, "caf\u{e9}"), Ok(true));
     assert_eq!(equal_str(&h, s, "cafi"), Ok(false));
+    // One-byte characters whose bytes spell other text in UTF-8: "Ã©" is C3 A9, which is "é".
+    for n in [0, 3, 6, 7, 14, 15, 30] {
+        let pad = "x".repeat(n);
+        let latin: Vec<char> = format!("{pad}\u{c3}\u{a9}").chars().collect();
+        for s in [make(&h, &latin), make(&h, &latin)] {
+            assert_eq!(equal_str(&h, s, &format!("{pad}\u{e9}")), Ok(false), "{n} before");
+        }
+    }
 }
 
 /// Ropes with pieces narrower than the whole, cut at each offset in a word, hash as the flat

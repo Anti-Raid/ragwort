@@ -7,6 +7,8 @@ publish = false
 [dependencies]
 ragwort-derive = { path = "../derive" }
 ragwort-gc-region = { path = "../gc-region" }
+ragwort-num = { path = "../num" }
+ragwort-string = { path = "../string" }
 
 [features]
 default = ["mmap"]

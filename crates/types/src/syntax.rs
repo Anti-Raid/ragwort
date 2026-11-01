@@ -1,51 +1,68 @@
-//! GC-managed syntax, lexical context, and source locations.
+//! Syntax, lexical context, and source locations, in the arena.
 //!
-//! Syntax spans retain source metadata. A `SyntaxSession` separately keeps the source bytes
-//! alive; dropping its last clone allows the text to be collected.
+//! Syntax spans keep their source's metadata. A [`SyntaxSession`] separately keeps the source
+//! bytes alive; dropping its last clone allows the text to be collected.
 
-use ragwort_gc::{ForeignRoot, Gc, Member, Mutation, OutOfMemory, Plain, Root, Rooted, Trace, Value, Weak};
+use crate::gc::{ForeignRoot, Gc, Mutation, OutOfMemory, Root, Value};
+use crate::objects::{
+    self, Data, SessionFields, SyntaxContextFields, SyntaxFields, SyntaxMetaFields, SyntaxOriginFields, SyntaxSourceFields,
+    SyntaxTextFields,
+};
 
-/// Source bytes, stored inline without an encoding requirement.
-#[derive(Trace, Plain)]
-#[gc(items = u8)]
-pub struct SyntaxText;
+#[cfg(test)]
+#[path = "tests/syntax.rs"]
+mod tests;
 
-impl SyntaxText {
-    pub fn new<'gc>(mc: &Mutation<'gc>, bytes: impl AsRef<[u8]>) -> Result<Gc<'gc, Self>, OutOfMemory> {
-        mc.alloc_inline_from(Self, bytes.as_ref())
+/// Source bytes, without an encoding requirement.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SyntaxText<'gc>(Gc<'gc, objects::SyntaxText>);
+
+impl<'gc> SyntaxText<'gc> {
+    pub fn new(mc: &Mutation<'gc>, bytes: impl AsRef<[u8]>) -> Result<Self, OutOfMemory> {
+        let bytes = bytes.as_ref();
+        let blob = mc.blob(bytes.len(), |b| {
+            b.copy_from_slice(bytes);
+            b.len()
+        })?;
+        Ok(Self(objects::SyntaxText::new(mc, blob)?))
+    }
+
+    pub fn bytes(self, mc: &Mutation<'gc>) -> &'gc [u8] {
+        self.0.bytes(mc)
     }
 }
 
-/// Source metadata. Inline items are line-start byte offsets, beginning with zero.
-/// Sessions retain the text; spans retain only this record.
-#[derive(Trace, Plain)]
-#[gc(items = u32)]
-pub struct SyntaxSource<'gc> {
-    name: Option<Member<'gc, SyntaxText>>,
-    text: Weak<'gc, SyntaxText>,
-    len: u32,
-}
+/// Source metadata: a name, the text while a session keeps it, and where lines start.
+/// Sessions keep the text; spans keep only this.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SyntaxSource<'gc>(Gc<'gc, objects::SyntaxSource>);
 
 impl<'gc> SyntaxSource<'gc> {
-    pub fn name(&self, mc: &Mutation<'gc>) -> Option<Gc<'gc, SyntaxText>> {
-        self.name.map(|name| name.get(mc))
+    pub fn name(self, mc: &Mutation<'gc>) -> Option<SyntaxText<'gc>> {
+        self.0.name(mc).map(SyntaxText)
     }
 
     /// Returns `None` once the text has been collected.
-    pub fn text(&self, mc: &Mutation<'gc>) -> Option<Gc<'gc, SyntaxText>> {
-        self.text.get(mc)
+    pub fn text(self, mc: &Mutation<'gc>) -> Option<SyntaxText<'gc>> {
+        self.0.text(mc).map(SyntaxText)
     }
 
-    pub fn byte_len(&self) -> usize {
-        self.len as usize
+    #[inline]
+    pub fn byte_len(self, mc: &Mutation<'gc>) -> usize {
+        self.0.size(mc) as usize
+    }
+
+    /// Each line's first byte offset, from zero.
+    pub fn line_starts(self, mc: &Mutation<'gc>) -> &'gc [u32] {
+        self.0.lines(mc)
     }
 
     /// Looks up a byte offset, including EOF. Works after the text is collected.
-    pub fn location(this: Gc<'gc, Self>, offset: u32) -> Option<SyntaxLocation> {
-        if offset > this.len {
+    pub fn location(self, mc: &Mutation<'gc>, offset: u32) -> Option<SyntaxLocation> {
+        if offset as usize > self.byte_len(mc) {
             return None;
         }
-        let starts = this.items();
+        let starts = self.line_starts(mc);
         let line = starts.partition_point(|&start| start <= offset);
         let start = *starts.get(line.checked_sub(1)?)?;
         Some(SyntaxLocation { line: line as u32, column: offset - start + 1 })
@@ -59,22 +76,11 @@ pub struct SyntaxLocation {
     pub column: u32,
 }
 
-#[derive(Clone, Copy, Trace)]
-struct SessionData<'gc> {
-    source: Member<'gc, SyntaxSource<'gc>>,
-    text: Member<'gc, SyntaxText>,
-}
-
-struct SessionRoot;
-impl Rooted for SessionRoot {
-    type Of<'gc> = SessionData<'gc>;
-}
-
 /// Keeps one source and its text alive across steps. Dropping the last clone releases the
-/// text for collection, while surviving spans retain the source metadata.
+/// text for collection, while surviving spans keep the source metadata.
 #[derive(Clone)]
 pub struct SyntaxSession {
-    root: Root<SessionRoot>,
+    root: Root<objects::Session>,
 }
 
 impl SyntaxSession {
@@ -86,22 +92,25 @@ impl SyntaxSession {
         Self::create(mc, Some(name), bytes.as_ref())
     }
 
-    fn create(mc: &Mutation<'_>, name: Option<&str>, text: &[u8]) -> Result<Self, OutOfMemory> {
-        let bytes = SyntaxText::new(mc, text)?;
-        let name = name.map(|name| SyntaxText::new(mc, name).map(|name| Member::new(mc, name))).transpose()?;
-        let source = SyntaxSource { name, text: Weak::new(mc, bytes), len: bytes.len() as u32 };
-        let mut starts = line_starts(text);
-        let source = mc.alloc_inline(source, line_starts(text).count(), |_| starts.next().expect("counted line starts"))?;
-        let root = mc.root::<SessionRoot>(SessionData { source: Member::new(mc, source), text: Member::new(mc, bytes) })?;
-        Ok(Self { root })
+    fn create(mc: &Mutation<'_>, name: Option<&str>, bytes: &[u8]) -> Result<Self, OutOfMemory> {
+        let len = u32::try_from(bytes.len()).map_err(|_| mc.out_of_memory())?;
+        let text = SyntaxText::new(mc, bytes)?;
+        let name = name.map(|name| SyntaxText::new(mc, name)).transpose()?;
+        let lines = mc.blob(line_starts(bytes).count(), |out| {
+            out.iter_mut().zip(line_starts(bytes)).for_each(|(o, start)| *o = start);
+            out.len()
+        })?;
+        let source = objects::SyntaxSource::new(mc, name.map(|n| n.0), Some(text.0), u64::from(len), lines)?;
+        let session = objects::Session::new(mc, Some(source), Some(text.0))?;
+        Ok(Self { root: Root::new(mc, session)? })
     }
 
-    pub fn source<'gc>(&self, mc: &Mutation<'gc>) -> Result<Gc<'gc, SyntaxSource<'gc>>, ForeignRoot> {
-        Ok(mc.fetch(&self.root)?.source.get(mc))
+    pub fn source<'gc>(&self, mc: &Mutation<'gc>) -> Result<SyntaxSource<'gc>, ForeignRoot> {
+        Ok(SyntaxSource(self.root.get(mc)?.source(mc).expect("a session has its source")))
     }
 
-    pub fn text<'gc>(&self, mc: &Mutation<'gc>) -> Result<Gc<'gc, SyntaxText>, ForeignRoot> {
-        Ok(mc.fetch(&self.root)?.text.get(mc))
+    pub fn text<'gc>(&self, mc: &Mutation<'gc>) -> Result<SyntaxText<'gc>, ForeignRoot> {
+        Ok(SyntaxText(self.root.get(mc)?.text(mc).expect("a session has its text")))
     }
 }
 
@@ -114,25 +123,38 @@ fn line_starts(bytes: &[u8]) -> impl Iterator<Item = u32> + '_ {
 
 /// A source range `start..end`, measured in bytes. Keeps the metadata alive, not the text.
 /// A default span has no source.
-#[derive(Clone, Copy, Debug, Default, Trace, Plain)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SyntaxSpan<'gc> {
-    source: Option<Member<'gc, SyntaxSource<'gc>>>,
+    source: Option<SyntaxSource<'gc>>,
     start: u32,
     end: u32,
 }
 
 impl<'gc> SyntaxSpan<'gc> {
     /// Checks `start <= end <= source.byte_len()`.
-    pub fn new(mc: &Mutation<'gc>, source: Gc<'gc, SyntaxSource<'gc>>, start: u32, end: u32) -> Option<Self> {
-        (start <= end && end as usize <= source.byte_len()).then(|| Self { source: Some(Member::new(mc, source)), start, end })
+    #[inline]
+    pub fn new(mc: &Mutation<'gc>, source: SyntaxSource<'gc>, start: u32, end: u32) -> Option<Self> {
+        (start <= end && end as usize <= source.byte_len(mc)).then_some(Self { source: Some(source), start, end })
     }
 
-    pub fn source(self, mc: &Mutation<'gc>) -> Option<Gc<'gc, SyntaxSource<'gc>>> {
-        self.source.map(|source| source.get(mc))
+    fn of(source: Option<Gc<'gc, objects::SyntaxSource>>, word: u64) -> Self {
+        Self { source: source.map(SyntaxSource), start: word as u32, end: (word >> 32) as u32 }
+    }
+
+    fn source_gc(self) -> Option<Gc<'gc, objects::SyntaxSource>> {
+        self.source.map(|s| s.0)
+    }
+
+    fn word(self) -> u64 {
+        u64::from(self.start) | u64::from(self.end) << 32
+    }
+
+    pub fn source(self) -> Option<SyntaxSource<'gc>> {
+        self.source
     }
 
     pub fn location(self, mc: &Mutation<'gc>) -> Option<SyntaxLocation> {
-        SyntaxSource::location(self.source(mc)?, self.start)
+        self.source?.location(mc, self.start)
     }
 
     pub fn start(self) -> u32 {
@@ -145,32 +167,44 @@ impl<'gc> SyntaxSpan<'gc> {
 }
 
 /// A scope ID. Identifiers with the same name can belong to different scopes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Trace, Plain)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SyntaxScope(pub u64);
 
-/// An identifier's scopes, stored inline.
-#[derive(Trace, Plain)]
-#[gc(items = SyntaxScope)]
-pub struct SyntaxContext;
+/// An identifier's scopes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SyntaxContext<'gc>(Gc<'gc, objects::SyntaxContext>);
 
-/// A source location in an expansion's history. `parent` links to the preceding origin.
-#[derive(Trace, Plain)]
-pub struct SyntaxOrigin<'gc> {
-    span: SyntaxSpan<'gc>,
-    parent: Option<Member<'gc, SyntaxOrigin<'gc>>>,
+impl<'gc> SyntaxContext<'gc> {
+    pub fn new(mc: &Mutation<'gc>, scopes: &[SyntaxScope]) -> Result<Self, OutOfMemory> {
+        let context = objects::SyntaxContext::new(mc, scopes.len(), 0)?;
+        let items = context.items(mc);
+        for (i, scope) in scopes.iter().enumerate() {
+            items.set(mc, i, scope.0);
+        }
+        Ok(Self(context))
+    }
+
+    pub fn scopes(self, mc: &Mutation<'gc>) -> impl ExactSizeIterator<Item = SyntaxScope> + use<'gc> {
+        let items = self.0.items(mc);
+        (0..items.len()).map(move |i| SyntaxScope(items.get(i)))
+    }
 }
 
+/// A source location in an expansion's history. `parent` links to the preceding origin.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SyntaxOrigin<'gc>(Gc<'gc, objects::SyntaxOrigin>);
+
 impl<'gc> SyntaxOrigin<'gc> {
-    pub fn new(span: SyntaxSpan<'gc>, parent: Option<Member<'gc, Self>>) -> Self {
-        Self { span, parent }
+    pub fn new(mc: &Mutation<'gc>, span: SyntaxSpan<'gc>, parent: Option<Self>) -> Result<Self, OutOfMemory> {
+        Ok(Self(objects::SyntaxOrigin::new(mc, span.source_gc(), span.word(), parent.map(|p| p.0))?))
     }
 
-    pub fn span(&self) -> SyntaxSpan<'gc> {
-        self.span
+    pub fn span(self, mc: &Mutation<'gc>) -> SyntaxSpan<'gc> {
+        SyntaxSpan::of(self.0.source(mc), self.0.span(mc))
     }
 
-    pub fn parent(&self) -> Option<Member<'gc, Self>> {
-        self.parent
+    pub fn parent(self, mc: &Mutation<'gc>) -> Option<Self> {
+        self.0.parent(mc).map(Self)
     }
 }
 
@@ -200,7 +234,7 @@ pub enum SyntaxKind {
 }
 
 impl SyntaxKind {
-    pub(crate) fn tag(self) -> u32 {
+    fn tag(self) -> u32 {
         match self {
             Self::Literal => 0,
             Self::Identifier => 1,
@@ -213,7 +247,7 @@ impl SyntaxKind {
         }
     }
 
-    pub(crate) fn from_tag(tag: u32) -> Option<Self> {
+    fn from_tag(tag: u32) -> Option<Self> {
         Some(match tag {
             0 => Self::Literal,
             1 => Self::Identifier,
@@ -229,87 +263,78 @@ impl SyntaxKind {
 }
 
 /// Kind, lexical context and expansion origin, shared by syntax nodes.
-#[derive(Trace, Plain)]
-pub struct SyntaxMeta<'gc> {
-    kind: u32,
-    context: Option<Member<'gc, SyntaxContext>>,
-    origin: Option<Member<'gc, SyntaxOrigin<'gc>>>,
-}
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SyntaxMeta<'gc>(Gc<'gc, objects::SyntaxMeta>);
 
 impl<'gc> SyntaxMeta<'gc> {
-    pub fn new(kind: SyntaxKind) -> Self {
-        Self { kind: kind.tag(), context: None, origin: None }
-    }
-
-    pub fn with_context(mut self, context: Member<'gc, SyntaxContext>) -> Self {
-        self.context = Some(context);
-        self
-    }
-
-    pub fn with_origin(mut self, origin: Member<'gc, SyntaxOrigin<'gc>>) -> Self {
-        self.origin = Some(origin);
-        self
+    pub fn new(
+        mc: &Mutation<'gc>,
+        kind: SyntaxKind,
+        context: Option<SyntaxContext<'gc>>,
+        origin: Option<SyntaxOrigin<'gc>>,
+    ) -> Result<Self, OutOfMemory> {
+        Ok(Self(objects::SyntaxMeta::new(mc, kind.tag(), context.map(|c| c.0), origin.map(|o| o.0))?))
     }
 
     /// Returns `None` if the stored tag is invalid.
-    pub fn kind(&self) -> Option<SyntaxKind> {
-        SyntaxKind::from_tag(self.kind)
+    pub fn kind(self, mc: &Mutation<'gc>) -> Option<SyntaxKind> {
+        SyntaxKind::from_tag(self.0.kind(mc))
     }
 
-    pub fn context(&self) -> Option<Member<'gc, SyntaxContext>> {
-        self.context
+    pub fn context(self, mc: &Mutation<'gc>) -> Option<SyntaxContext<'gc>> {
+        self.0.context(mc).map(SyntaxContext)
     }
 
-    pub fn origin(&self) -> Option<Member<'gc, SyntaxOrigin<'gc>>> {
-        self.origin
+    pub fn origin(self, mc: &Mutation<'gc>) -> Option<SyntaxOrigin<'gc>> {
+        self.0.origin(mc).map(SyntaxOrigin)
     }
 }
 
 /// A datum and its span. Absent metadata means a literal without context or origin.
-#[derive(Trace, Plain)]
-pub struct Syntax<'gc> {
-    datum: Value<'gc>,
-    span: SyntaxSpan<'gc>,
-    meta: Option<Member<'gc, SyntaxMeta<'gc>>>,
-}
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Syntax<'gc>(Gc<'gc, objects::Syntax>);
 
 impl<'gc> Syntax<'gc> {
-    pub fn new(datum: Value<'gc>, span: SyntaxSpan<'gc>) -> Self {
-        Self { datum, span, meta: None }
-    }
-
     /// Metadata describes the datum's shape; this does not check that they agree.
-    pub fn with_metadata(mut self, meta: Option<Member<'gc, SyntaxMeta<'gc>>>) -> Self {
-        self.meta = meta;
-        self
+    #[inline]
+    pub fn new(mc: &Mutation<'gc>, datum: Value<'gc>, span: SyntaxSpan<'gc>, meta: Option<SyntaxMeta<'gc>>) -> Result<Self, OutOfMemory> {
+        Ok(Self(objects::Syntax::new(mc, datum, span.source_gc(), span.word(), meta.map(|m| m.0))?))
     }
 
-    pub fn metadata(&self) -> Option<Member<'gc, SyntaxMeta<'gc>>> {
-        self.meta
+    #[inline]
+    pub fn of(v: Value<'gc>) -> Option<Self> {
+        match Data::of(v) {
+            Some(Data::Syntax(s)) => Some(Self(s)),
+            _ => None,
+        }
+    }
+
+    pub fn value(self, mc: &Mutation<'gc>) -> Value<'gc> {
+        Value::object(mc, self.0)
+    }
+
+    pub fn metadata(self, mc: &Mutation<'gc>) -> Option<SyntaxMeta<'gc>> {
+        self.0.meta(mc).map(SyntaxMeta)
     }
 
     /// Returns `None` if the stored tag is invalid.
-    pub fn kind(&self, mc: &Mutation<'gc>) -> Option<SyntaxKind> {
-        self.meta.map_or(Some(SyntaxKind::Literal), |meta| meta.get(mc).kind())
+    pub fn kind(self, mc: &Mutation<'gc>) -> Option<SyntaxKind> {
+        self.metadata(mc).map_or(Some(SyntaxKind::Literal), |meta| meta.kind(mc))
     }
 
-    pub fn datum(&self) -> Value<'gc> {
-        self.datum
+    pub fn datum(self, mc: &Mutation<'gc>) -> Value<'gc> {
+        self.0.datum(mc)
     }
 
-    pub fn span(&self) -> SyntaxSpan<'gc> {
-        self.span
+    pub fn span(self, mc: &Mutation<'gc>) -> SyntaxSpan<'gc> {
+        SyntaxSpan::of(self.0.source(mc), self.0.span(mc))
     }
 
-    pub fn context(&self, mc: &Mutation<'gc>) -> Option<Member<'gc, SyntaxContext>> {
-        self.meta.and_then(|meta| meta.get(mc).context())
+    pub fn context(self, mc: &Mutation<'gc>) -> Option<SyntaxContext<'gc>> {
+        self.metadata(mc)?.context(mc)
     }
 
-    pub fn origin(&self, mc: &Mutation<'gc>) -> Option<Member<'gc, SyntaxOrigin<'gc>>> {
-        self.meta.and_then(|meta| meta.get(mc).origin())
+    pub fn origin(self, mc: &Mutation<'gc>) -> Option<SyntaxOrigin<'gc>> {
+        self.metadata(mc)?.origin(mc)
     }
 }
-
-#[cfg(test)]
-#[path = "tests/syntax.rs"]
-mod tests;

@@ -45,22 +45,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ragwort-gc"
-version = "0.1.0"
-dependencies = [
- "libc",
- "memmap2",
- "ragwort-derive",
-]
-
-[[package]]
-name = "ragwort-gc-prims"
-version = "0.1.0"
-dependencies = [
- "ragwort-gc",
-]
-
-[[package]]
 name = "ragwort-gc-region"
 version = "0.1.0"
 dependencies = [
@@ -74,6 +58,8 @@ version = "0.1.0"
 dependencies = [
  "ragwort-derive",
  "ragwort-gc-region",
+ "ragwort-num",
+ "ragwort-string",
 ]
 
 [[package]]
@@ -90,18 +76,12 @@ dependencies = [
 [[package]]
 name = "ragwort-string"
 version = "0.1.0"
-dependencies = [
- "ragwort-gc-prims",
-]
 
 [[package]]
 name = "ragwort-types"
 version = "0.1.0"
 dependencies = [
- "ragwort-gc",
- "ragwort-gc-prims",
- "ragwort-num",
- "ragwort-string",
+ "ragwort-gc-words",
 ]
 
 [[package]]

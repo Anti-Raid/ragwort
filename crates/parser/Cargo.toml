@@ -9,8 +9,6 @@ ragwort-types = { path = "../types", default-features = false }
 [features]
 default = ["mmap"]
 mmap = ["ragwort-types/mmap"]
-gc-verify = ["ragwort-types/gc-verify"]
-gc-hardened = ["ragwort-types/gc-hardened"]
 
 [lints]
 workspace = true

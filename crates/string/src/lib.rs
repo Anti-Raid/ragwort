@@ -26,7 +26,7 @@ pub use hash::{hash, hash_str};
 pub use intern::{Table, intern, intern_str};
 pub use iter::{Chars, Chunks};
 pub use rope::{concat, concat_all, flatten, substring};
-pub use units::{Units, UnitsMut, Width};
+pub use units::{Packed, PackedMut, Units, UnitsMut, Width};
 
 /// The longest string: a rope can share one string many times over, so length isn't bounded
 /// by memory.
@@ -122,10 +122,7 @@ pub fn empty<H: Host>(h: &H) -> Res<H> {
 pub fn from_str<H: Host>(h: &H, s: &str) -> Res<H> {
     if s.is_ascii() {
         h.charge(s.len() as u64)?;
-        return h.flat(Width::One, s.len(), |u| {
-            let UnitsMut::One(u) = u else { unreachable!("asked for width one") };
-            u.copy_from_slice(s.as_bytes());
-        });
+        return h.flat(Width::One, s.len(), |mut u| u.write(0, Units::One(s.as_bytes())));
     }
     from_chars(h, s.chars())
 }
@@ -212,6 +209,13 @@ pub fn compare<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<Ordering, H::Erro
         let n = la.min(lb);
         return Ok(x.slice(0..n).compare(y.slice(0..n)).then(la.cmp(&lb)));
     }
+    compare_chunks(h, a, b)
+}
+
+/// Kept out of line, so the flat cases above are small enough to inline.
+#[inline(never)]
+fn compare_chunks<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<Ordering, H::Error> {
+    let (la, lb) = (len(h, a), len(h, b));
     let (mut ca, mut cb) = (chunks(h, a), chunks(h, b));
     let (mut x, mut y) = (Units::One(&[]), Units::One(&[]));
     loop {
@@ -244,7 +248,8 @@ pub fn equal<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<bool, H::Error> {
         h.charge(ia.len as u64)?;
         return Ok(x.equal(y));
     }
-    Ok(compare(h, a, b)? == Ordering::Equal)
+    h.charge(ia.len as u64)?;
+    Ok(compare_chunks(h, a, b)? == Ordering::Equal)
 }
 
 /// Whether `s` holds the characters of `t`.
@@ -260,6 +265,13 @@ pub fn equal_str<H: Host>(h: &H, s: H::Str, t: &str) -> Result<bool, H::Error> {
             return Ok(hash::words(bytes) == w && (w.0 | w.1) & hash::HIGH == 0);
         }
         return Ok(bytes == t.as_bytes() && t.is_ascii());
+    }
+    if let Some(Units::Packed(p)) = flat
+        && p.len() == t.len()
+        && p.width() == Width::One
+    {
+        h.charge(t.len() as u64)?;
+        return Ok(p.equal_ascii(t.as_bytes()));
     }
     if info.len > t.len() || info.len < t.len().div_ceil(4) {
         return Ok(false);
@@ -312,13 +324,36 @@ impl<H: Host> fmt::Display for Display<'_, H> {
                 f.write_str(std::str::from_utf8(bytes).expect("ASCII"))?;
                 continue;
             }
-            for c in chunk.chars() {
+            // A block at a time, encoded only if it isn't ASCII.
+            if let Units::Packed(p) = chunk
+                && p.width() == Width::One
+            {
+                let mut block = [0; 64];
+                for from in (0..p.len()).step_by(block.len()) {
+                    let block = &mut block[..(p.len() - from).min(64)];
+                    p.copy_bytes(from, block);
+                    if n + 2 * block.len() > buf.len() {
+                        f.write_str(flush(&buf[..n]))?;
+                        n = 0;
+                    }
+                    if block.is_ascii() {
+                        buf[n..n + block.len()].copy_from_slice(block);
+                        n += block.len();
+                    } else {
+                        block.iter().for_each(|&b| n += char::from(b).encode_utf8(&mut buf[n..]).len());
+                    }
+                }
+                continue;
+            }
+            let mut written = Ok(());
+            chunk.each_char(|c| {
                 if n + 4 > buf.len() {
-                    f.write_str(flush(&buf[..n]))?;
+                    written = written.and(f.write_str(flush(&buf[..n])));
                     n = 0;
                 }
                 n += c.encode_utf8(&mut buf[n..]).len();
-            }
+            });
+            written?;
         }
         f.write_str(flush(&buf[..n]))
     }

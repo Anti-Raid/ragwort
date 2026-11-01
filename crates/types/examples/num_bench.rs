@@ -3,15 +3,9 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use ragwort_gc_prims::GcVec;
-use ragwort_types::gc::{Arena, Gc, Mutation, Rootable, TypeTag, Value};
+use ragwort_types::gc::{Arena, Mutation, Value};
 use ragwort_types::num::bigint::{self, Digits, RWDigits};
-use ragwort_types::num::{Big, Host, Integer, IntView, Nums, int};
-
-struct Ints;
-impl Rootable for Ints {
-    type Root<'gc> = GcVec<'gc, Value<'gc>>;
-}
+use ragwort_types::num::{Big, BigFields, Host, Integer, IntView, Numbers, Nums, int};
 
 /// Keeps each benchmark's best time, since runs interleave and noise only adds.
 #[derive(Default)]
@@ -89,17 +83,17 @@ fn generic_mul<'gc>(h: &Nums<'_, 'gc>, x: Integer<'gc>, y: Integer<'gc>) -> Inte
 /// What a VM would write for multiplying bignums: try fixnums, check both operands' types,
 /// multiply, and keep the result a fixnum if it fits.
 #[inline(never)]
-fn by_hand_mul<'gc>(mc: &Mutation<'gc>, tag: TypeTag<'gc, Big>, x: Value<'gc>, y: Value<'gc>) -> Value<'gc> {
+fn by_hand_mul<'gc>(mc: &Mutation<'gc>, x: Value<'gc>, y: Value<'gc>) -> Value<'gc> {
     if let Some(z) = x.fixnum_mul(y) {
         return z;
     }
-    let (x, y) = (x.downcast_tag(mc, tag).expect("bignum"), y.downcast_tag(mc, tag).expect("bignum"));
-    let negative = x.is_negative() != y.is_negative();
-    let (xd, yd) = (Digits::new(Gc::items(x)), Digits::new(Gc::items(y)));
+    let (Some(Numbers::Big(x)), Some(Numbers::Big(y))) = (Numbers::of(x), Numbers::of(y)) else { panic!("bignums") };
+    let negative = x.negative(mc) != y.negative(mc);
+    let (xd, yd) = (Digits::new(x.digits(mc)), Digits::new(y.digits(mc)));
     let len = xd.len() + yd.len();
     let mut small = None;
-    let z = mc
-        .alloc_inline_with(Big::new(negative), len, 0, |digits| {
+    let digits = mc
+        .blob(len, |digits| {
             bigint::multiply(RWDigits::new(digits), xd, yd);
             let len = Digits::new(digits).normalize().len();
             if len <= 1 {
@@ -108,7 +102,7 @@ fn by_hand_mul<'gc>(mc: &Mutation<'gc>, tag: TypeTag<'gc, Big>, x: Value<'gc>, y
             len
         })
         .expect("alloc");
-    small.unwrap_or_else(|| Value::object(mc, z))
+    small.unwrap_or_else(|| Value::object(mc, Big::new(mc, negative, digits).expect("alloc")))
 }
 
 /// Four digits.
@@ -122,40 +116,40 @@ const MULS: usize = 4_000_000;
 const BATCH: usize = 50_000;
 
 fn main() {
-    let mut arena = Arena::<Ints>::new(256 << 20, |_| Ok(GcVec::new())).expect("arena");
+    let mut arena = Arena::new(256 << 20, 0);
     let mut best = Best::default();
     for _ in 0..9 {
-        arena.mutate(|mc, _| {
-            let h = Nums::new(mc).expect("nums");
+        arena.mutate(|mc| {
+            let h = Nums::new(mc);
             best.time("fixnum add, generic", || assert_eq!(int::to_i64(&h, generic_adds(&h, ADDS)), Some(ADDS)));
             best.time("fixnum add, by hand", || assert_eq!(by_hand_adds(&h, ADDS).as_fixnum(), Some(ADDS)));
             best.time("fixnum add, generic, array operands", || assert_eq!(int::to_i64(&h, array_adds(&h, ADDS)), Some(ADDS)));
-            let x = operands(&h).value().downcast::<Big>(mc).expect("bignum");
-            best.time("4x4 digit mul, digits only", || digit_muls(Gc::items(x), MULS));
-        }).expect("corrupted");
+            let Some(Numbers::Big(x)) = Numbers::of(operands(&h).value()) else { panic!("a bignum") };
+            best.time("4x4 digit mul, digits only", || digit_muls(x.digits(mc), MULS));
+        });
         best.time("4x4 digit bignum mul, generic", || {
             for _ in 0..MULS / BATCH {
-                arena.mutate(|mc, _| {
-                    let h = Nums::new(mc).expect("nums");
+                arena.mutate(|mc| {
+                    let h = Nums::new(mc);
                     let x = operands(&h);
                     for _ in 0..BATCH {
                         black_box(generic_mul(&h, black_box(x), black_box(x)));
                     }
-                }).expect("corrupted");
+                });
                 arena.collect_minor();
             }
         });
         best.time("4x4 digit bignum mul, by hand", || {
             for _ in 0..MULS / BATCH {
-                arena.mutate(|mc, _| {
-                    let h = Nums::new(mc).expect("nums");
+                arena.mutate(|mc| {
+                    let h = Nums::new(mc);
                     let x = operands(&h);
                     assert!(matches!(h.view(x), IntView::Big { .. }));
-                    let (x, tag) = (x.value(), mc.inline_type_tag::<Big>().expect("tag"));
+                    let x = x.value();
                     for _ in 0..BATCH {
-                        black_box(by_hand_mul(mc, tag, black_box(x), black_box(x)));
+                        black_box(by_hand_mul(mc, black_box(x), black_box(x)));
                     }
-                }).expect("corrupted");
+                });
                 arena.collect_minor();
             }
         });

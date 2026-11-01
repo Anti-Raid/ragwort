@@ -6,13 +6,19 @@ use std::collections::HashMap;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use ragwort_types::gc::{Arena, Rootable};
+use ragwort_types::gc::Arena;
 use ragwort_types::string::{Strings, equal_str, from_str, hash_str};
 use ragwort_types::symbol::Symbols;
 
-struct Table;
-impl Rootable for Table {
-    type Root<'gc> = Symbols<'gc>;
+/// An arena whose root 0 holds a symbol table.
+fn new_arena() -> Arena {
+    let mut arena = Arena::new(256 << 20, 1);
+    arena.mutate(|mc| mc.set_root(0, Symbols::with_seed(mc, 1).expect("table").value(mc)));
+    arena
+}
+
+fn table<'gc>(mc: &ragwort_types::gc::Mutation<'gc>) -> Symbols<'gc> {
+    Symbols::of(mc.root(0)).expect("a table in root 0")
 }
 
 const KEYWORDS: &[&str] = &[
@@ -67,11 +73,12 @@ fn time(label: &str, ops: usize, mut run: impl FnMut() -> Duration) {
 fn intern_file(path: &str) {
     let text = std::fs::read_to_string(path).expect("names file");
     let tokens: Vec<&str> = text.lines().collect();
-    let mut arena = Arena::<Table>::new(256 << 20, |_| Ok(Symbols::with_seed(1))).expect("arena");
+    let mut arena = new_arena();
     time(&format!("intern_str, {} names from {path}", tokens.len()), tokens.len(), || {
         arena
-            .mutate_root(|mc, root| {
-                let strings = Strings::new(mc).expect("tags");
+            .mutate(|mc| {
+                let root = table(mc);
+                let strings = Strings::new(mc);
                 for t in &tokens {
                     root.intern_str(&strings, t).expect("intern");
                 }
@@ -81,7 +88,6 @@ fn intern_file(path: &str) {
                 }
                 start.elapsed()
             })
-            .expect("step")
     });
 }
 
@@ -95,33 +101,34 @@ fn main() {
         let names = names(distinct, &mut rng);
         let source = source(&names, TOKENS, &mut rng);
         let tokens: Vec<&str> = source.split(' ').collect();
-        let mut arena = Arena::<Table>::new(256 << 20, |_| Ok(Symbols::with_seed(1))).expect("arena");
+        let mut arena = new_arena();
         arena
-            .mutate_root(|mc, root| {
-                let strings = Strings::new(mc).expect("tags");
+            .mutate(|mc| {
+                let root = table(mc);
+                let strings = Strings::new(mc);
                 for name in &names {
                     root.intern_str(&strings, name).expect("intern");
                 }
-            })
-            .expect("step");
+            });
 
         time(&format!("intern_str hit, {distinct} names"), TOKENS, || {
             arena
-                .mutate_root(|mc, root| {
-                    let strings = Strings::new(mc).expect("tags");
+                .mutate(|mc| {
+                let root = table(mc);
+                    let strings = Strings::new(mc);
                     let start = Instant::now();
                     for t in &tokens {
                         black_box(root.intern_str(&strings, black_box(t)).expect("intern"));
                     }
                     start.elapsed()
                 })
-                .expect("step")
         });
 
         time(&format!("intern hit (Str), {distinct} names"), TOKENS, || {
             arena
-                .mutate_root(|mc, root| {
-                    let strings = Strings::new(mc).expect("tags");
+                .mutate(|mc| {
+                let root = table(mc);
+                    let strings = Strings::new(mc);
                     let strs: Vec<_> = tokens.iter().take(100_000).map(|t| from_str(&strings, t).expect("str")).collect();
                     let start = Instant::now();
                     for _ in 0..TOKENS / strs.len() {
@@ -131,7 +138,6 @@ fn main() {
                     }
                     start.elapsed()
                 })
-                .expect("step")
         });
 
         time(&format!("  hash_str only, {distinct} names"), TOKENS, || {
@@ -144,8 +150,8 @@ fn main() {
 
         time(&format!("  equal_str only, {distinct} names"), TOKENS, || {
             arena
-                .mutate_root(|mc, _| {
-                    let strings = Strings::new(mc).expect("tags");
+                .mutate(|mc| {
+                    let strings = Strings::new(mc);
                     let strs: Vec<_> = tokens.iter().take(100_000).map(|t| from_str(&strings, t).expect("str")).collect();
                     let start = Instant::now();
                     for _ in 0..TOKENS / strs.len() {
@@ -155,7 +161,6 @@ fn main() {
                     }
                     start.elapsed()
                 })
-                .expect("step")
         });
 
         let map: HashMap<&str, usize> = names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
@@ -169,18 +174,18 @@ fn main() {
     }
 
     let long: Vec<String> = (0..1000).map(|i| format!("guild-member-role-permission-cache-{i}")).collect();
-    let mut arena = Arena::<Table>::new(256 << 20, |_| Ok(Symbols::with_seed(1))).expect("arena");
+    let mut arena = new_arena();
     time("intern_str hit, 40-byte names", TOKENS, || {
         arena
-            .mutate_root(|mc, root| {
-                let strings = Strings::new(mc).expect("tags");
+            .mutate(|mc| {
+                let root = table(mc);
+                let strings = Strings::new(mc);
                 let start = Instant::now();
                 for t in long.iter().cycle().take(TOKENS) {
                     black_box(root.intern_str(&strings, black_box(t)).expect("intern"));
                 }
                 start.elapsed()
             })
-            .expect("step")
     });
 
     let text = "ab".repeat(512);
@@ -193,17 +198,17 @@ fn main() {
     });
 
     time("intern_str miss (new names)", 200_000, || {
-        let mut arena = Arena::<Table>::new(256 << 20, |_| Ok(Symbols::with_seed(1))).expect("arena");
+        let mut arena = new_arena();
         let fresh: Vec<String> = (0..200_000).map(|i| format!("name-{i}")).collect();
         arena
-            .mutate_root(|mc, root| {
-                let strings = Strings::new(mc).expect("tags");
+            .mutate(|mc| {
+                let root = table(mc);
+                let strings = Strings::new(mc);
                 let start = Instant::now();
                 for t in &fresh {
                     black_box(root.intern_str(&strings, t).expect("intern"));
                 }
                 start.elapsed()
             })
-            .expect("step")
     });
 }

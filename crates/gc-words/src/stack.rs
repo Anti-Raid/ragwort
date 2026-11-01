@@ -6,6 +6,7 @@ use std::ptr;
 use std::rc::Rc;
 
 use super::raw::Raw;
+use super::slot::Refs;
 use super::{Brand, Desc, Gc, Heap, Items, Mutation, Object, OutOfMemory, Slots, Value, WINDOW, Work};
 
 /// One segment of a [`Stack`]: a run of value slots in the arena. Its one field is set while a
@@ -92,7 +93,7 @@ impl StackRecord {
         let segment = self.segment.get();
         let slots = heap.segment_slots(segment);
         let live = self.live(slots.len());
-        heap.barrier_range(segment as usize + 2 + live.start, &slots[live.clone()], segment);
+        heap.barrier_range(segment as usize + 2 + live.start, &slots[live.clone()], segment, Refs::Values);
         for slot in &slots[live.end..self.written_end(&live, slots.len())] {
             slot.set(Value::VOID.word);
         }
@@ -244,7 +245,7 @@ impl Stack {
         let record = &*self.record;
         let (base, segment) = (record.base.get() as usize, record.segment.get());
         let captured = mc.heap.segment_slots(segment).get(base..at)?;
-        mc.heap.barrier_range(segment as usize + 2 + base, captured, segment);
+        mc.heap.barrier_range(segment as usize + 2 + base, captured, segment, Refs::Values);
         record.base.set(at as u32);
         record.top.set(record.top.get().max(at as u32));
         Some(base..at)

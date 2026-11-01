@@ -4,170 +4,130 @@
 //! makes a new one.
 
 use std::hash::{BuildHasher, RandomState};
-use std::marker::PhantomData;
-
-use ragwort_gc::{Gc, Lock, Member, Plain, Trace, Value, Weak};
 
 use crate::Error;
-use ragwort_gc_prims::GcMap;
-
+use crate::gc::table::{Table as GcTable, WeakObjects};
+use crate::gc::{Gc, Mutation, OutOfMemory, Value};
+use crate::objects::{self, Data, InternedFields, SymFields};
 use crate::string::{self, Str, Strings, Table};
 
 #[cfg(test)]
 #[path = "tests/symbol.rs"]
 mod tests;
 
-/// A symbol's name, a flat string, and the name's hash.
-#[derive(Trace, Plain)]
-pub struct Sym<'gc> {
-    name: Value<'gc>,
-    hash: u64,
-}
-
-/// A [`Sym`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(transparent)]
-pub struct Symbol<'gc>(Value<'gc>);
+pub struct Symbol<'gc>(Gc<'gc, objects::Sym>);
 
 impl<'gc> Symbol<'gc> {
-    pub fn value(self) -> Value<'gc> {
-        self.0
-    }
-}
-
-#[derive(Trace, Plain)]
-struct Slot<'gc> {
-    /// The symbol's hash with the low bit set, or zero for a slot never used. A slot keeps
-    /// its hash after its symbol dies, so probes go on past it, until the table is rebuilt.
-    key: Lock<u64>,
-    symbol: Weak<'gc, Sym<'gc>>,
-}
-
-impl Slot<'_> {
-    fn empty() -> Self {
-        Self { key: Lock::new(0), symbol: Weak::empty() }
-    }
-}
-
-#[derive(Trace, Plain)]
-#[gc(items = Slot<'gc>)]
-struct Slots<'gc>(PhantomData<&'gc ()>);
-
-/// The intern table, whose probing [`string::intern`] does. It belongs in the arena root, or
-/// in an object the root reaches.
-#[derive(Trace, Plain)]
-pub struct Symbols<'gc> {
-    seed: u64,
-    slots: Lock<Option<Member<'gc, Slots<'gc>>>>,
-    /// Slots with a key: live symbols, and dead ones not yet cleared out.
-    used: Lock<u32>,
-}
-
-impl<'gc> Symbols<'gc> {
-    /// A table whose hashes are seeded at random, so which names collide can't be planned.
-    pub fn new() -> Self {
-        Self::with_seed(RandomState::new().hash_one(0u8))
+    #[inline]
+    pub fn of(v: Value<'gc>) -> Option<Self> {
+        match Data::of(v) {
+            Some(Data::Sym(s)) => Some(Self(s)),
+            _ => None,
+        }
     }
 
-    pub fn with_seed(seed: u64) -> Self {
-        Self { seed, slots: Lock::new(None), used: Lock::new(0) }
+    pub fn value(self, mc: &Mutation<'gc>) -> Value<'gc> {
+        Value::object(mc, self.0)
     }
 
-    /// The seed of the hashes the symbols keep.
-    pub fn seed(&self) -> u64 {
-        self.seed
-    }
-
-    pub fn intern(&self, h: &Strings<'_, 'gc>, s: Str<'gc>) -> Result<Symbol<'gc>, Error> {
-        Ok(Symbol(Value::object(h.mc, string::intern(h, &Interner(self), s)?)))
-    }
-
-    /// The symbol named `s`, made without making a string first unless the name is new.
-    pub fn intern_str(&self, h: &Strings<'_, 'gc>, s: &str) -> Result<Symbol<'gc>, Error> {
-        Ok(Symbol(Value::object(h.mc, string::intern_str(h, &Interner(self), s)?)))
-    }
-
-    #[cfg(test)]
-    fn capacity(&self, h: &Strings<'_, 'gc>) -> usize {
-        Interner(self).slots(h).len()
-    }
-}
-
-impl Default for Symbols<'_> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// The table's storage as [`Table`] sees it, kept private so only interning changes it.
-struct Interner<'s, 'gc>(&'s Symbols<'gc>);
-
-impl<'gc> GcMap<Strings<'_, 'gc>> for Interner<'_, 'gc> {
-    type Entry = Gc<'gc, Sym<'gc>>;
-    type Error = Error;
-    type Slot = Slot<'gc>;
-
-    fn slots<'a>(&'a self, h: &'a Strings<'_, 'gc>) -> &'a [Slot<'gc>] {
-        self.0.slots.load(h.mc).map_or(&[], |slots| slots.items())
-    }
-
-    fn replace<'a>(&'a self, h: &'a Strings<'_, 'gc>, len: usize) -> Result<&'a [Slot<'gc>], Error> {
-        let slots = h.mc.alloc_inline(Slots(PhantomData), len, |_| Slot::empty())?;
-        self.0.slots.store(h.mc, Some(slots));
-        Ok(slots.items())
-    }
-
-    fn key(&self, slot: &Slot<'gc>) -> u64 {
-        slot.key.get()
-    }
-
-    fn entry(&self, h: &Strings<'_, 'gc>, slot: &Slot<'gc>) -> Option<Gc<'gc, Sym<'gc>>> {
-        slot.symbol.get(h.mc)
-    }
-
-    fn set(&self, h: &Strings<'_, 'gc>, slot: &Slot<'gc>, key: u64, symbol: Gc<'gc, Sym<'gc>>) {
-        slot.key.set(h.mc, key);
-        slot.symbol.set(h.mc, symbol);
-    }
-
-    fn used(&self) -> usize {
-        self.0.used.get() as usize
-    }
-
-    fn set_used(&self, h: &Strings<'_, 'gc>, used: usize) {
-        self.0.used.set(h.mc, used as u32);
-    }
-}
-
-impl<'gc> Table<Strings<'_, 'gc>> for Interner<'_, 'gc> {
-    fn seed(&self) -> u64 {
-        self.0.seed
-    }
-
-    fn make(&self, h: &Strings<'_, 'gc>, name: Str<'gc>, hash: u64) -> Result<Gc<'gc, Sym<'gc>>, Error> {
-        Ok(h.mc.alloc(Sym { name: name.value(), hash })?)
-    }
-
-    fn name(&self, _: &Strings<'_, 'gc>, symbol: Gc<'gc, Sym<'gc>>) -> Str<'gc> {
-        Str(symbol.name)
-    }
-}
-
-impl<'gc> Strings<'_, 'gc> {
-    pub fn symbol(&self, v: Value<'gc>) -> Option<Symbol<'gc>> {
-        v.downcast_tag(self.mc, self.sym).map(|_| Symbol(v))
-    }
-
-    pub fn name(&self, s: Symbol<'gc>) -> Str<'gc> {
-        Str(self.sym_of(s).name)
+    /// A flat string.
+    pub fn name(self, mc: &Mutation<'gc>) -> Str<'gc> {
+        Strings::new(mc).string(self.0.name(mc)).expect("a symbol's name is a string")
     }
 
     /// The name's hash, with the seed of the table that made the symbol.
-    pub fn symbol_hash(&self, s: Symbol<'gc>) -> u64 {
-        self.sym_of(s).hash
+    pub fn hash(self, mc: &Mutation<'gc>) -> u64 {
+        self.0.hash(mc)
+    }
+}
+
+/// The intern table, whose probing [`string::intern`] does. Keep it in a root, or in an
+/// object a root reaches.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Symbols<'gc>(Gc<'gc, objects::Interned>);
+
+impl<'gc> Symbols<'gc> {
+    /// A table whose hashes are seeded at random, so which names collide can't be planned.
+    pub fn new(mc: &Mutation<'gc>) -> Result<Self, OutOfMemory> {
+        Self::with_seed(mc, RandomState::new().hash_one(0u8))
     }
 
-    fn sym_of(&self, s: Symbol<'gc>) -> Gc<'gc, Sym<'gc>> {
-        s.0.downcast_tag(self.mc, self.sym).expect("a symbol")
+    pub fn with_seed(mc: &Mutation<'gc>, seed: u64) -> Result<Self, OutOfMemory> {
+        let table = GcTable::<WeakObjects<objects::Sym>>::new(mc)?;
+        Ok(Self(objects::Interned::new(mc, seed, Some(table.head()))?))
+    }
+
+    pub fn of(v: Value<'gc>) -> Option<Self> {
+        match Data::of(v) {
+            Some(Data::Interned(t)) => Some(Self(t)),
+            _ => None,
+        }
+    }
+
+    pub fn value(self, mc: &Mutation<'gc>) -> Value<'gc> {
+        Value::object(mc, self.0)
+    }
+
+    /// The seed of the hashes the symbols keep.
+    pub fn seed(self, mc: &Mutation<'gc>) -> u64 {
+        self.0.seed(mc)
+    }
+
+    pub fn intern(self, h: &Strings<'_, 'gc>, s: Str<'gc>) -> Result<Symbol<'gc>, Error> {
+        string::intern(h, &self.interner(h), s).map(Symbol)
+    }
+
+    /// The symbol named `s`, made without making a string first unless the name is new.
+    #[inline]
+    pub fn intern_str(self, h: &Strings<'_, 'gc>, s: &str) -> Result<Symbol<'gc>, Error> {
+        string::intern_str(h, &self.interner(h), s).map(Symbol)
+    }
+
+    #[inline]
+    fn interner<'a>(self, h: &Strings<'a, 'gc>) -> Interner<'a, 'gc> {
+        let mc = h.mutation();
+        let table = GcTable::of(self.0.table(mc).expect("an intern table has its table"));
+        Interner { mc, seed: self.0.seed(mc), table }
+    }
+
+    #[cfg(test)]
+    fn capacity(self, mc: &Mutation<'gc>) -> usize {
+        self.interner(&Strings::new(mc)).table.capacity(mc)
+    }
+}
+
+/// The table as [`Table`] sees it, kept private so only interning changes it.
+struct Interner<'a, 'gc> {
+    mc: &'a Mutation<'gc>,
+    seed: u64,
+    table: GcTable<'gc, WeakObjects<objects::Sym>>,
+}
+
+impl<'gc> Table<Strings<'_, 'gc>> for Interner<'_, 'gc> {
+    type Entry = Gc<'gc, objects::Sym>;
+
+    fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    #[inline]
+    fn find_or_insert(
+        &self,
+        _: &Strings<'_, 'gc>,
+        hash: u64,
+        same: impl Fn(Self::Entry) -> Result<bool, Error>,
+        make: impl FnOnce() -> Result<Self::Entry, Error>,
+    ) -> Result<Self::Entry, Error> {
+        self.table.find_or_insert(self.mc, hash, same, make)
+    }
+
+    fn make(&self, _: &Strings<'_, 'gc>, name: Str<'gc>, hash: u64) -> Result<Self::Entry, Error> {
+        Ok(objects::Sym::new(self.mc, name.value(), hash)?)
+    }
+
+    #[inline]
+    fn name(&self, h: &Strings<'_, 'gc>, symbol: Self::Entry) -> Str<'gc> {
+        h.string(symbol.name(self.mc)).expect("a symbol's name is a string")
     }
 }

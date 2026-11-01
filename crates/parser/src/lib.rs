@@ -13,8 +13,7 @@ mod tests;
 
 pub use error::{ErrorKind, ReadError};
 
-use ragwort_types::gc::{Gc, Member, Mutation, Value};
-use ragwort_types::gc_prims::ScratchVec;
+use ragwort_types::gc::{Mutation, ScratchVec, Value};
 use ragwort_types::pair::Pairs;
 use ragwort_types::string::Strings;
 use ragwort_types::symbol::Symbols;
@@ -54,21 +53,19 @@ enum Tail<'gc> {
     Datum(Value<'gc>),
 }
 
-type Meta<'gc> = Member<'gc, SyntaxMeta<'gc>>;
-
 /// Reads the data in a session's text one at a time, as an iterator. An error ends the text.
 pub struct Reader<'a, 'gc> {
     mc: &'a Mutation<'gc>,
     strings: Strings<'a, 'gc>,
     pairs: Pairs<'a, 'gc>,
-    symbols: &'a Symbols<'gc>,
-    source: Gc<'gc, SyntaxSource<'gc>>,
+    symbols: Symbols<'gc>,
+    source: SyntaxSource<'gc>,
     text: &'gc str,
     at: usize,
     /// The nodes the reader makes have no context or origin, so each kind shares one.
-    identifier: Meta<'gc>,
-    list: Meta<'gc>,
-    quote: Meta<'gc>,
+    identifier: SyntaxMeta<'gc>,
+    list: SyntaxMeta<'gc>,
+    quote: SyntaxMeta<'gc>,
     /// Innermost last. Both count against the arena's budget, so deep nesting can't use
     /// memory past it.
     open: ScratchVec<'gc, Open<'gc>>,
@@ -78,20 +75,20 @@ pub struct Reader<'a, 'gc> {
 
 impl<'a, 'gc> Reader<'a, 'gc> {
     /// A reader of `session`'s text that interns identifiers in `symbols`.
-    pub fn new(mc: &'a Mutation<'gc>, symbols: &'a Symbols<'gc>, session: &SyntaxSession) -> Result<Self, ReadError> {
+    pub fn new(mc: &'a Mutation<'gc>, symbols: Symbols<'gc>, session: &SyntaxSession) -> Result<Self, ReadError> {
         let foreign = |_| ReadError::new(ErrorKind::ForeignSession, 0, 0);
         let source = session.source(mc).map_err(foreign)?;
-        let bytes = session.text(mc).map_err(foreign)?.items();
+        let bytes = session.text(mc).map_err(foreign)?.bytes(mc);
         let text = std::str::from_utf8(bytes).map_err(|e| {
             let at = e.valid_up_to();
             ReadError::new(ErrorKind::InvalidUtf8, at, e.error_len().map_or(bytes.len(), |n| at + n))
         })?;
         let oom = |e| ReadError::new(e, 0, 0);
-        let meta = |kind| Ok(Member::new(mc, mc.alloc(SyntaxMeta::new(kind)).map_err(oom)?));
+        let meta = |kind| SyntaxMeta::new(mc, kind, None, None).map_err(oom);
         Ok(Self {
             mc,
-            strings: Strings::new(mc).map_err(oom)?,
-            pairs: Pairs::new(mc).map_err(oom)?,
+            strings: Strings::new(mc),
+            pairs: Pairs::new(mc),
             symbols,
             source,
             text,
@@ -104,12 +101,12 @@ impl<'a, 'gc> Reader<'a, 'gc> {
         })
     }
 
-    pub fn source(&self) -> Gc<'gc, SyntaxSource<'gc>> {
+    pub fn source(&self) -> SyntaxSource<'gc> {
         self.source
     }
 
     /// The next datum, or `None` once the text is read.
-    pub fn read(&mut self) -> Result<Option<Gc<'gc, Syntax<'gc>>>, ReadError> {
+    pub fn read(&mut self) -> Result<Option<Syntax<'gc>>, ReadError> {
         let read = self.read_datum();
         if read.is_err() {
             self.open.clear();
@@ -119,7 +116,7 @@ impl<'a, 'gc> Reader<'a, 'gc> {
         read
     }
 
-    fn read_datum(&mut self) -> Result<Option<Gc<'gc, Syntax<'gc>>>, ReadError> {
+    fn read_datum(&mut self) -> Result<Option<Syntax<'gc>>, ReadError> {
         loop {
             self.skip_space();
             let start = self.at;
@@ -169,7 +166,7 @@ impl<'a, 'gc> Reader<'a, 'gc> {
     }
 
     /// The identifier from `start` to the reader's position, or `None` for a dot.
-    fn token(&mut self, start: usize) -> Result<Option<Gc<'gc, Syntax<'gc>>>, ReadError> {
+    fn token(&mut self, start: usize) -> Result<Option<Syntax<'gc>>, ReadError> {
         let token = &self.text[start..self.at];
         if token == "." {
             self.dot(start)?;
@@ -179,7 +176,7 @@ impl<'a, 'gc> Reader<'a, 'gc> {
             return Err(ReadError::new(ErrorKind::Unsupported, start, self.at));
         }
         let symbol = self.symbols.intern_str(&self.strings, token).map_err(|e| ReadError::new(e, start, self.at))?;
-        self.node(symbol.value(), self.identifier, start).map(Some)
+        self.node(symbol.value(self.mc), self.identifier, start).map(Some)
     }
 
     fn dot(&mut self, at: usize) -> Result<(), ReadError> {
@@ -194,7 +191,7 @@ impl<'a, 'gc> Reader<'a, 'gc> {
     }
 
     /// The list a `byte` at `start` closes.
-    fn close(&mut self, start: usize, byte: u8) -> Result<Gc<'gc, Syntax<'gc>>, ReadError> {
+    fn close(&mut self, start: usize, byte: u8) -> Result<Syntax<'gc>, ReadError> {
         match self.open.pop() {
             Some(Open::List { start: open, close, first, tail }) if close == byte => {
                 let tail = match tail {
@@ -216,17 +213,17 @@ impl<'a, 'gc> Reader<'a, 'gc> {
     }
 
     /// Hands a datum to the quotes and list it's in, or back if it's in none.
-    fn finish(&mut self, mut node: Gc<'gc, Syntax<'gc>>) -> Result<Option<Gc<'gc, Syntax<'gc>>>, ReadError> {
+    fn finish(&mut self, mut node: Syntax<'gc>) -> Result<Option<Syntax<'gc>>, ReadError> {
         loop {
             match self.open.last_mut() {
                 Some(Open::Quote { start }) => {
                     let start = *start;
                     self.open.pop();
-                    node = self.node(Value::object(self.mc, node), self.quote, start)?;
+                    node = self.node(node.value(self.mc), self.quote, start)?;
                 }
                 Some(Open::List { tail, .. }) => {
-                    let value = Value::object(self.mc, node);
-                    let span = node.span();
+                    let value = node.value(self.mc);
+                    let span = node.span(self.mc);
                     let at = |kind: ErrorKind| ReadError::new(kind, span.start() as usize, span.end() as usize);
                     match *tail {
                         Tail::None => self.items.push(value).map_err(|e| at(e.into()))?,
@@ -241,7 +238,7 @@ impl<'a, 'gc> Reader<'a, 'gc> {
     }
 
     /// The text ran out: an error inside a list or after a quote.
-    fn end(&self) -> Result<Option<Gc<'gc, Syntax<'gc>>>, ReadError> {
+    fn end(&self) -> Result<Option<Syntax<'gc>>, ReadError> {
         match self.open.last() {
             None => Ok(None),
             Some(&Open::List { start, .. }) => Err(ReadError::new(ErrorKind::Unclosed, start, start + 1)),
@@ -250,14 +247,14 @@ impl<'a, 'gc> Reader<'a, 'gc> {
     }
 
     /// A node for `datum`, from `start` to the reader's position.
-    fn node(&self, datum: Value<'gc>, meta: Meta<'gc>, start: usize) -> Result<Gc<'gc, Syntax<'gc>>, ReadError> {
+    fn node(&self, datum: Value<'gc>, meta: SyntaxMeta<'gc>, start: usize) -> Result<Syntax<'gc>, ReadError> {
         let span = SyntaxSpan::new(self.mc, self.source, start as u32, self.at as u32).expect("spans lie in the text");
-        self.mc.alloc(Syntax::new(datum, span).with_metadata(Some(meta))).map_err(|e| ReadError::new(e, start, self.at))
+        Syntax::new(self.mc, datum, span, Some(meta)).map_err(|e| ReadError::new(e, start, self.at))
     }
 }
 
 impl<'gc> Iterator for Reader<'_, 'gc> {
-    type Item = Result<Gc<'gc, Syntax<'gc>>, ReadError>;
+    type Item = Result<Syntax<'gc>, ReadError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.read().transpose()
@@ -265,10 +262,6 @@ impl<'gc> Iterator for Reader<'_, 'gc> {
 }
 
 /// Every datum in `session`'s text.
-pub fn read_all<'gc>(
-    mc: &Mutation<'gc>,
-    symbols: &Symbols<'gc>,
-    session: &SyntaxSession,
-) -> Result<Vec<Gc<'gc, Syntax<'gc>>>, ReadError> {
+pub fn read_all<'gc>(mc: &Mutation<'gc>, symbols: Symbols<'gc>, session: &SyntaxSession) -> Result<Vec<Syntax<'gc>>, ReadError> {
     Reader::new(mc, symbols, session)?.collect()
 }

@@ -669,6 +669,7 @@ fn stale_host_refs_never_read_the_next_value() {
         assert_eq!(stale.to_word(), forgetful.word(mc, 0));
         assert_eq!(admin.id, stale.id, "the slot should have been reused");
         assert!(stale.get(mc).is_none());
+        assert!(!stale.erase().is::<String>(mc) && stale.erase().downcast_ref::<String>(mc).is_none());
         assert_eq!(*admin.get(mc).unwrap(), "admin");
     });
 }

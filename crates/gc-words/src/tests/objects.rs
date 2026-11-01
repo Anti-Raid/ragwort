@@ -15,6 +15,7 @@ objects! {
     struct Vector {} items Value
     struct Bytes { tag: u64 } items u64
     struct Table {} items Ephemeron
+    struct Anything { what: AnyHost }
 }
 
 objects! {
@@ -37,6 +38,7 @@ fn layouts_match_hand_written_descriptions() {
     assert!(same(&Words::DESC, &Desc::of::<Words>(5)));
     assert!(same(&Holder::DESC, &Desc::of::<Holder>(2).weaks(0b01).members(0b10)));
     assert!(same(&Labelled::DESC, &Desc::of::<Labelled>(1).hosts(1)));
+    assert!(same(&Anything::DESC, &Desc::of::<Anything>(1).hosts(1)));
     assert!(same(&Cached::DESC, &Desc::of::<Cached>(4).values(1).ephemerons(0b10)));
     assert!(same(&Vector::DESC, &Desc::of::<Vector>(0).items(Items::Values)));
     assert!(same(&Bytes::DESC, &Desc::of::<Bytes>(1).items(Items::Words)));
@@ -216,7 +218,7 @@ fn kinds_tell_the_group_types_apart() {
         let v = Kind::Node(n).value(mc);
         assert_eq!(v.downcast::<Node>(mc), Some(n));
     });
-    assert_eq!((Kind::BASE, Kind::END, Later::BASE, Later::END), (FIRST_TYPE, FIRST_TYPE + 9, FIRST_TYPE + 9, FIRST_TYPE + 10));
+    assert_eq!((Kind::BASE, Kind::END, Later::BASE, Later::END), (FIRST_TYPE, FIRST_TYPE + 10, FIRST_TYPE + 10, FIRST_TYPE + 11));
 }
 
 /// Types numbered by the arena come down from the top, so they never take a group's numbers.
@@ -271,4 +273,40 @@ fn member_reads_check_the_target_type() {
         node.set_word(mc, 1, pair.to_word());
         node.next(mc);
     });
+}
+
+/// Host values alive in the arena's table.
+fn live_hosts(arena: &Arena) -> usize {
+    arena.meta.hosts.borrow().iter().filter(|s| s.value.is_some()).count()
+}
+
+/// An `AnyHost` field holds a host value of any type and keeps it alive, and each read checks
+/// the type.
+#[test]
+fn any_host_fields_hold_any_type() {
+    let mut arena = Arena::new(1 << 20, 2);
+    arena.mutate(|mc| {
+        let text = Anything::new(mc, Some(mc.host(String::from("hi")).unwrap().erase())).unwrap();
+        let number = Anything::new(mc, Some(mc.host(7i32).unwrap().into())).unwrap();
+        mc.set_root(0, Value::object(mc, text));
+        mc.set_root(1, Value::object(mc, number));
+        Anything::new(mc, Some(mc.host(String::from("gone")).unwrap().erase())).unwrap();
+    });
+    arena.set_evacuate_all(true);
+    arena.collect();
+    assert_eq!(live_hosts(&arena), 2);
+    arena.mutate(|mc| {
+        let read = |i| mc.root(i).downcast::<Anything>(mc).unwrap().what(mc).unwrap();
+        let (text, number) = (read(0), read(1));
+        assert!(text.is::<String>(mc) && !text.is::<i32>(mc));
+        assert_eq!(text.downcast_ref::<String>(mc).as_deref().map(String::as_str), Some("hi"));
+        assert!(text.downcast_ref::<i32>(mc).is_none());
+        assert_eq!(number.downcast::<i32>(mc).map(|h| *h.get(mc).unwrap()), Some(7));
+        assert!(number.downcast::<String>(mc).is_none());
+        assert!(number.assume::<String>().get(mc).is_none(), "a typed read checks the type too");
+        assert_eq!(text.downcast::<String>(mc).map(HostRef::erase), Some(text));
+        mc.root(0).downcast::<Anything>(mc).unwrap().set_what(mc, None);
+    });
+    arena.collect();
+    assert_eq!(live_hosts(&arena), 1);
 }

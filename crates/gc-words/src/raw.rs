@@ -3,10 +3,9 @@
 //! results but is never unsound. A trait in its own module, so a glob import of the crate
 //! doesn't bring in names that clash with generated accessors.
 
-use std::any::Any;
 use std::marker::PhantomData;
 
-use super::{Fields, Gc, HostRef, Item, Mutation, Object, Phase, Slots, Value, WORDS, field_slot, host_parts, items_start, mask};
+use super::{AnyHostRef, Fields, Gc, Item, Mutation, Object, Phase, Slots, Value, WORDS, field_slot, host_parts, items_start, mask};
 
 pub trait Raw<'gc>: Copy {
     /// The word a field declared in `Desc::members` holds.
@@ -34,9 +33,9 @@ pub trait Raw<'gc>: Copy {
     /// Dirties the card, for minor collections to clear the field, but doesn't shade the target.
     fn set_weak<U: Object>(self, mc: &Mutation<'gc>, field: usize, target: Option<Gc<'gc, U>>);
 
-    fn host<U: Any>(self, mc: &Mutation<'gc>, field: usize) -> Option<HostRef<'gc, U>>;
+    fn host(self, mc: &Mutation<'gc>, field: usize) -> Option<AnyHostRef<'gc>>;
 
-    fn set_host<U: Any>(self, mc: &Mutation<'gc>, field: usize, host: HostRef<'gc, U>);
+    fn set_host(self, mc: &Mutation<'gc>, field: usize, host: AnyHostRef<'gc>);
 
     /// The object's first `N` fields. `N` past the declared fields doesn't compile.
     fn fields<const N: usize>(self, mc: &Mutation<'gc>) -> Option<Fields<'gc, N>>;
@@ -117,12 +116,12 @@ impl<'gc, T: Object> Raw<'gc> for Gc<'gc, T> {
     }
 
     #[inline]
-    fn host<U: Any>(self, mc: &Mutation<'gc>, field: usize) -> Option<HostRef<'gc, U>> {
+    fn host(self, mc: &Mutation<'gc>, field: usize) -> Option<AnyHostRef<'gc>> {
         let (id, generation) = host_parts(self.word(mc, field))?;
-        Some(HostRef { id, generation, _marker: PhantomData })
+        Some(AnyHostRef { id, generation, _brand: PhantomData })
     }
 
-    fn set_host<U: Any>(self, mc: &Mutation<'gc>, field: usize, host: HostRef<'gc, U>) {
+    fn set_host(self, mc: &Mutation<'gc>, field: usize, host: AnyHostRef<'gc>) {
         mc.heap.words[field_slot(self, field)].set(host.to_word());
         if mc.heap.m.phase.get() == Phase::Marking && mc.heap.has_bit(self.index as usize, |p| &p.marks) {
             mc.heap.mark_host(host.to_word());
@@ -160,6 +159,6 @@ impl<'gc, T: Object> Raw<'gc> for Gc<'gc, T> {
         let at = items_start(self);
         let heap = mc.heap;
         let words = heap.words.get(at..at + self.len(mc)).unwrap_or(&[]);
-        Slots { words, at, owner: self.index, _marker: PhantomData }
+        Slots { words, region: heap.words, at, owner: self.index, _marker: PhantomData }
     }
 }
