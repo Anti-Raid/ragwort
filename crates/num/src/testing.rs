@@ -360,7 +360,9 @@ impl TestHost {
     pub fn show_real(&self, x: TestReal) -> String {
         match x {
             TestReal::Exact(r) => self.show_rational(r),
-            TestReal::Flonum(f) => format!("fl{:x}", f.to_bits()),
+            // A NaN's sign and payload depend on the CPU (x86 makes 0/0 negative), and ragwort
+            // treats every NaN as the same number.
+            TestReal::Flonum(f) => format!("fl{:x}", if f.is_nan() { f64::NAN } else { f }.to_bits()),
         }
     }
 

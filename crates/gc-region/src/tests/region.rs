@@ -45,7 +45,7 @@ fn odd_ranges_are_harmless() {
 }
 
 /// Memory comes back to the system, so what the process holds drops after a release.
-#[cfg(all(feature = "mmap", any(target_os = "linux", target_vendor = "apple")))]
+#[cfg(all(feature = "mmap", unix))]
 #[test]
 fn release_gives_memory_back() {
     use crate::mmap::held_bytes;

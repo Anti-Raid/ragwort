@@ -1027,6 +1027,7 @@ impl<'gc> AnyHostRef<'gc> {
         } else {
             m.budget.refund(slot.owned - bytes);
         }
+        m.host_bytes.set(m.host_bytes.get() - slot.owned + bytes);
         slot.cost = slot.cost - slot.owned + bytes;
         slot.owned = bytes;
         Ok(())
@@ -1175,6 +1176,8 @@ struct Meta {
     young: Cell<usize>,
     /// Pages holding something as of the last sweep.
     occupied: Cell<usize>,
+    /// Pages charged for: handed out and not given back.
+    committed: Cell<usize>,
     /// Pages before this are swept.
     sweep_cursor: Cell<usize>,
     /// A collection swept everything since free pages were last given back.
@@ -1208,10 +1211,22 @@ struct Meta {
     tables: Cell<usize>,
     /// A cycle slice of this many bytes after every step, for testing barriers.
     stress: Cell<Option<usize>>,
+    /// Bytes of work a running cycle does per byte steps allocate.
+    pace: Cell<usize>,
+    /// Work steps owe the running cycle, done once it reaches `MIN_SLICE`.
+    debt: Cell<usize>,
+    /// Work done so far in this cycle, and what the last one took in all.
+    cycle_work: Cell<usize>,
+    last_work: Cell<usize>,
     collections: Cell<u64>,
     minors: Cell<u64>,
     /// Collections that moved objects, which identity tables rehash after.
     evacuations: Cell<u64>,
+    /// What live host values are charged.
+    host_bytes: Cell<usize>,
+    /// The generation new host slots start at: past what any dropped slot reached, so a stale
+    /// reference to a dropped slot never reads a value made in its place.
+    host_floor: Cell<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -1228,12 +1243,66 @@ fn mask(i: usize) -> usize {
 }
 
 const MIN_THRESHOLD: usize = 64 << 10;
+
+impl Meta {
+    /// The heap's size as pacing sees it: the pages in use, and what live host values and old
+    /// blobs are charged, since only a major collection frees those.
+    fn paced_bytes(&self) -> usize {
+        self.occupied.get() * PAGE * 8 + self.host_bytes.get() + self.blobs.live()
+    }
+
+    /// What a major cycle started now should take: a quarter more than the last one did, or
+    /// before there's been one, tracing every occupied page and sweeping every page in use.
+    fn cycle_work(&self) -> usize {
+        match self.last_work.get() {
+            0 => self.occupied.get() * PAGE * 8 + self.used.get() * SWEEP_COST,
+            last => last + last / 4,
+        }
+    }
+
+    /// What steps can allocate before they draw on the reserve. Committed pages nothing is on
+    /// don't count against it: they're kept for new objects to fill. Objects made since the
+    /// last sweep do, as they fill them.
+    fn room(&self) -> usize {
+        let pages = (self.committed.get() - self.occupied.get().min(self.committed.get())) * PAGE_COST;
+        self.budget.room_past(self.budget.used().saturating_sub(pages) + self.young.get())
+    }
+
+    /// Whether a major cycle has to start now to be done, paced at up to `MAX_PACE`, before the
+    /// room runs out: past that the reserve forces a full collection, one pause as long as the
+    /// whole cycle. Starting as late as that frees as much as a full collection would. A slice's
+    /// worth of room is kept for what the steps in between allocate.
+    fn short_of_room(&self) -> bool {
+        self.room() <= self.cycle_work() / MAX_PACE + MIN_SLICE
+    }
+
+    /// What steps have made: bytes of objects and blobs since the last collection, and host
+    /// values.
+    fn made(&self) -> usize {
+        self.young_bytes() + self.host_bytes.get()
+    }
+
+    /// Bytes of objects and blobs made since the last collection, which a minor one may free.
+    fn young_bytes(&self) -> usize {
+        self.young.get() + self.blobs.young_bytes()
+    }
+}
+
+/// Gives back most of the room a table no longer needs, keeping some so it doesn't regrow at once.
+fn shrink<T>(table: &mut Vec<T>) {
+    if table.capacity() > 4 * table.len() + 64 {
+        table.shrink_to(2 * table.len() + 16);
+    }
+}
 /// What a committed page is charged: its words and its bookkeeping.
 const PAGE_COST: usize = PAGE * 8 + size_of::<Page>();
 /// A page's sweep counts as this many bytes of slice work.
 const SWEEP_COST: usize = PAGE;
 const MIN_SLICE: usize = 64 << 10;
 const STEP_MUL: usize = 2;
+const MAX_PACE: usize = 16;
+/// Dead host values, and dead blobs, freed after a step at most.
+const FREE_BATCH: usize = 1024;
 
 pub struct Arena {
     memory: Region,
@@ -1242,8 +1311,20 @@ pub struct Arena {
 
 impl Arena {
     /// An arena allowed `limit` bytes, with `roots` value slots. The table of pages, made up
-    /// front for twice the limit, isn't charged; the roots are.
+    /// front for twice the limit, isn't charged; the roots are. Objects in the region take at
+    /// most [`REGION`] bytes whatever the limit; blobs and host values can use the rest.
+    ///
+    /// # Panics
+    ///
+    /// If the system won't reserve the region's address space. [`Arena::try_new`] fails then
+    /// instead.
     pub fn new(limit: usize, roots: usize) -> Self {
+        Self::try_new(limit, roots).expect("reserve the arena's memory")
+    }
+
+    /// Like [`Arena::new`], failing if the system won't reserve the region's address space.
+    pub fn try_new(limit: usize, roots: usize) -> Result<Self, OutOfMemory> {
+        let memory = Region::new(WORDS + SLACK).ok_or(OutOfMemory)?;
         // Page 0 holds nothing, so index 0 can mean none. Twice the limit leaves evacuation room
         // to copy everything.
         let pages = (limit / (PAGE * 8)).clamp(1, PAGES / 2 - 1);
@@ -1259,6 +1340,7 @@ impl Arena {
             to_end: Cell::new(0),
             young: Cell::new(0),
             occupied: Cell::new(0),
+            committed: Cell::new(0),
             sweep_cursor: Cell::new(0),
             settle: Cell::new(false),
             nursery: (limit / 8).clamp(64 << 10, 4 << 20),
@@ -1277,10 +1359,16 @@ impl Arena {
             hosts: RefCell::new(Vec::new()),
             free_hosts: RefCell::new(Vec::new()),
             dead_hosts: RefCell::new(Vec::new()),
+            host_bytes: Cell::new(0),
+            host_floor: Cell::new(0),
             blobs: Blobs::new(limit),
             work: RefCell::new(Work::default()),
             tables: Cell::new(0),
             stress: Cell::new(None),
+            pace: Cell::new(STEP_MUL),
+            debt: Cell::new(0),
+            cycle_work: Cell::new(0),
+            last_work: Cell::new(0),
             collections: Cell::new(0),
             minors: Cell::new(0),
             evacuations: Cell::new(0),
@@ -1289,7 +1377,7 @@ impl Arena {
             boxed.set(Some(&Boxed::DESC));
         }
         meta.budget.force(roots * 8);
-        Self { memory: Region::new(WORDS + SLACK).expect("reserve the arena's memory"), meta }
+        Ok(Self { memory, meta })
     }
 
     fn heap(&mut self) -> Heap<'_> {
@@ -1299,12 +1387,19 @@ impl Arena {
 
     /// After every collection entry point: gives back free pages, and runs the destructors of
     /// hosts freed, outside the collector.
-    fn finish(&mut self) {
+    ///
+    /// Frees at most `free` dead host values and as many dead blobs, the rest later: a cycle
+    /// can leave a great many, and freeing them all at once would be a pause of its own.
+    fn finish(&mut self, free: usize) {
         self.settle();
-        let dead = std::mem::take(&mut *self.meta.dead_hosts.borrow_mut());
+        let dead = {
+            let mut dead = self.meta.dead_hosts.borrow_mut();
+            let keep = dead.len().saturating_sub(free);
+            dead.split_off(keep)
+        };
         drop(dead);
         let m = &mut self.meta;
-        m.blobs.free_dead(&m.budget);
+        m.blobs.free_dead(&m.budget, free);
         self.charge_tables();
     }
 
@@ -1361,6 +1456,7 @@ impl Arena {
                     for page in m.pages.get(gone).unwrap_or_default() {
                         page.released.set(true);
                         m.budget.refund(PAGE_COST);
+                        m.committed.set(m.committed.get() - 1);
                     }
                     run = None;
                 }
@@ -1377,9 +1473,12 @@ impl Arena {
         f(&Mutation { heap: self.heap(), _brand: PhantomData })
     }
 
-    /// Like `mutate`, then paces collection: a minor collection once the nursery fills, a major
-    /// cycle once the pages in use after a sweep reach the threshold, twice what the last
-    /// cycle left, and a slice of it after each step, twice what the step allocated.
+    /// Like `mutate`, then paces collection: a minor collection once the nursery fills, and a
+    /// major cycle once the pages in use, with what live host values and blobs are charged, reach
+    /// the threshold, twice what the last cycle left, or sooner if the room left under the reserve
+    /// would run out before the cycle is done. Each step owes the cycle twice what it allocated,
+    /// or more when room is short, paid in slices of at least `MIN_SLICE`. Dead host values and
+    /// blobs are freed a batch after each step.
     ///
     /// If `f` drew on the reserve, a full collection runs instead. If an allocation failed,
     /// even one `f` went on without, the result is dropped, a full collection runs, and the
@@ -1387,7 +1486,7 @@ impl Arena {
     /// there: an interpreter runs the failed instruction again.
     pub fn step<R>(&mut self, f: impl for<'gc> FnOnce(&Mutation<'gc>) -> R) -> Result<R, OutOfMemory> {
         self.meta.budget.clear_failed();
-        let before = self.meta.young.get();
+        let before = self.meta.made();
         let result = self.mutate(f);
         if self.meta.budget.failed() {
             drop(result);
@@ -1398,29 +1497,39 @@ impl Arena {
             self.collect();
             return Ok(result);
         }
-        let allocated = self.meta.young.get().saturating_sub(before);
+        let allocated = self.meta.made().saturating_sub(before);
         if let Some(work) = self.meta.stress.get() {
             self.heap().minor();
             self.heap().start();
             self.heap().work(work);
-            self.finish();
+            self.finish(FREE_BATCH);
             return Ok(result);
         }
         let m = &self.meta;
-        if m.phase.get() == Phase::Idle && m.young.get() >= m.nursery {
-            self.collect_minor();
+        if m.phase.get() == Phase::Idle && m.young_bytes() >= m.nursery {
+            self.heap().minor();
         }
         let m = &self.meta;
-        if m.phase.get() == Phase::Idle && m.occupied.get() * PAGE * 8 >= m.threshold.get() {
-            if m.young.get() > 0 {
-                self.collect_minor();
+        if m.phase.get() == Phase::Idle && (m.paced_bytes() >= m.threshold.get() || m.short_of_room()) {
+            if m.young_bytes() > 0 {
+                self.heap().minor();
             }
             self.heap().start();
+            // Fast enough to be done before the room runs out.
+            let m = &self.meta;
+            m.pace.set(m.cycle_work().div_ceil(m.room().max(1)).max(STEP_MUL));
+            m.debt.set(0);
         }
-        if self.meta.phase.get() != Phase::Idle {
-            self.heap().work(allocated.saturating_mul(STEP_MUL).max(MIN_SLICE));
+        let m = &self.meta;
+        if m.phase.get() != Phase::Idle {
+            let debt = m.debt.get().saturating_add(allocated.saturating_mul(m.pace.get()));
+            m.debt.set(debt);
+            if debt >= MIN_SLICE {
+                m.debt.set(0);
+                self.heap().work(debt);
+            }
         }
-        self.finish();
+        self.finish(FREE_BATCH);
         Ok(result)
     }
 
@@ -1429,21 +1538,22 @@ impl Arena {
         self.heap().work(usize::MAX);
         self.heap().start();
         self.heap().work(usize::MAX);
-        self.finish();
+        self.finish(usize::MAX);
         self.meta.budget.clear_due();
     }
 
     /// Collects young objects only, if no major cycle is running.
     pub fn collect_minor(&mut self) {
         self.heap().minor();
-        self.finish();
+        self.finish(usize::MAX);
     }
 
-    /// Starts a cycle if none is running, then does about `work` bytes of it.
+    /// Starts a cycle if none is running, then does about `work` bytes of it. Like a step, it
+    /// frees only a batch of the dead host values and blobs.
     pub fn collect_slice(&mut self, work: usize) {
         self.heap().start();
         self.heap().work(work);
-        self.finish();
+        self.finish(FREE_BATCH);
     }
 
     pub fn phase(&self) -> Phase {
@@ -1589,7 +1699,17 @@ impl<'gc> Mutation<'gc> {
                 let Some(id) = u32::try_from(hosts.len()).ok().filter(|&id| id < u32::MAX) else {
                     return Err(m.budget.fail().into());
                 };
-                hosts.push(HostSlot { generation: 0, marked: false, cost: 0, owned: 0, value: None });
+                if hosts.len() == hosts.capacity() {
+                    // Charged as it grows, so growing fails as an allocation would.
+                    let more = hosts.capacity().max(16);
+                    m.budget.ensure(cost + more * size_of::<HostSlot>())?;
+                    let before = hosts.capacity();
+                    hosts.reserve_exact(more);
+                    let grown = (hosts.capacity() - before) * size_of::<HostSlot>();
+                    m.budget.force(grown);
+                    m.tables.set(m.tables.get() + grown);
+                }
+                hosts.push(HostSlot { generation: m.host_floor.get(), marked: false, cost: 0, owned: 0, value: None });
                 id
             }
         };
@@ -1599,6 +1719,7 @@ impl<'gc> Mutation<'gc> {
         slot.marked = marked;
         slot.cost = cost;
         slot.owned = 0;
+        m.host_bytes.set(m.host_bytes.get() + cost);
         Ok(HostRef { id, generation: slot.generation, _marker: PhantomData })
     }
 
@@ -1613,8 +1734,14 @@ impl<'gc> Mutation<'gc> {
     /// `value` outside the region, readable as `&'gc T` and never changed: what a blob field of
     /// `Frozen<T>` holds.
     pub fn frozen<T: Any>(&self, value: T) -> Result<FrozenRef<'gc, T>, OutOfMemory> {
+        self.frozen_owning(value, 0)
+    }
+
+    /// Like [`Mutation::frozen`], also charged `bytes` that `value` owns outside the arena, such
+    /// as a string's characters, until it's freed.
+    pub fn frozen_owning<T: Any>(&self, value: T, bytes: usize) -> Result<FrozenRef<'gc, T>, OutOfMemory> {
         let m = self.heap.m;
-        m.blobs.alloc_frozen(&m.budget, false, value).map(FrozenRef::new)
+        m.blobs.alloc_frozen(&m.budget, false, value, bytes).map(FrozenRef::new)
     }
 
     /// Runs allocations the caller can do without, such as growing a buffer by more than it
@@ -1858,6 +1985,7 @@ impl<'a> Heap<'a> {
         let released = pages.iter().filter(|p| p.released.get()).count();
         if released > 0 {
             self.m.budget.charge(released * PAGE_COST)?;
+            self.m.committed.set(self.m.committed.get() + released);
             pages.iter().for_each(|p| p.released.set(false));
         }
         Ok(())
@@ -1887,6 +2015,7 @@ impl<'a> Heap<'a> {
             return Err(self.m.budget.fail());
         }
         self.m.budget.charge(n * PAGE_COST)?;
+        self.m.committed.set(self.m.committed.get() + n);
         self.m.used.set(first + n);
         // Nothing on them is from before the cycle, so a lazy sweep has nothing to do there.
         for p in &self.m.pages[first..first + n] {
@@ -2080,6 +2209,7 @@ impl<'a> Heap<'a> {
         m.to_cursor.set(0);
         m.to_end.set(0);
         m.phase.set(Phase::Marking);
+        m.cycle_work.set(0);
         let mut work = std::mem::take(&mut *m.work.borrow_mut());
         work.fixups.clear();
         work.holders.clear();
@@ -2115,9 +2245,18 @@ impl<'a> Heap<'a> {
             }
             self.m.sweep_cursor.set(cursor);
             if cursor >= self.m.used.get() {
+                self.count_work(budget - left);
                 self.finish_cycle();
+                return;
             }
         }
+        if self.m.phase.get() != Phase::Idle {
+            self.count_work(budget - left);
+        }
+    }
+
+    fn count_work(self, done: usize) {
+        self.m.cycle_work.set(self.m.cycle_work.get().saturating_add(done));
     }
 
     /// Traces gray objects until `budget` bytes are done. Returns the budget left once none
@@ -2144,20 +2283,7 @@ impl<'a> Heap<'a> {
             m.evacuations.set(m.evacuations.get() + 1);
         }
         m.blobs.sweep_all();
-        let mut free = m.free_hosts.borrow_mut();
-        let mut dead = m.dead_hosts.borrow_mut();
-        for (id, host) in m.hosts.borrow_mut().iter_mut().enumerate() {
-            if !host.marked && let Some(value) = host.value.take() {
-                dead.push(value);
-                m.budget.refund(std::mem::take(&mut host.cost));
-                // A slot whose generation would wrap is retired instead.
-                if let Some(next) = host.generation.checked_add(1) {
-                    host.generation = next;
-                    free.push(id as u32);
-                }
-            }
-        }
-        drop((free, dead));
+        self.sweep_hosts();
         for page in &m.pages[..m.used.get()] {
             page.cards.set(0);
             page.evacuating.set(false);
@@ -2173,12 +2299,41 @@ impl<'a> Heap<'a> {
         work.ephemerons.clear();
     }
 
+    /// Frees the host values marking didn't reach, drops the free slots at the end of the table,
+    /// and gives back room the table no longer needs. The free list hands out the lowest ids
+    /// first, so live values gather at the front and the end keeps emptying.
+    fn sweep_hosts(self) {
+        let m = self.m;
+        let mut hosts = m.hosts.borrow_mut();
+        let mut dead = m.dead_hosts.borrow_mut();
+        for host in hosts.iter_mut() {
+            if !host.marked && let Some(value) = host.value.take() {
+                dead.push(value);
+                m.budget.refund(host.cost);
+                m.host_bytes.set(m.host_bytes.get() - std::mem::take(&mut host.cost));
+                // A slot whose generation reaches the last one is retired.
+                host.generation = host.generation.saturating_add(1);
+            }
+        }
+        let free = |h: &HostSlot| h.value.is_none() && h.generation < u32::MAX;
+        let len = hosts.iter().rposition(|h| !free(h)).map_or(0, |i| i + 1);
+        let floor = hosts[len..].iter().map(|h| h.generation).max().unwrap_or(0);
+        m.host_floor.set(m.host_floor.get().max(floor));
+        hosts.truncate(len);
+        shrink(&mut hosts);
+        let mut ids = m.free_hosts.borrow_mut();
+        ids.clear();
+        ids.extend((0..len as u32).rev().filter(|&id| free(&hosts[id as usize])));
+        shrink(&mut ids);
+    }
+
     fn finish_cycle(self) {
         let m = self.m;
         self.count_occupied();
-        let size = m.occupied.get() * PAGE * 8;
+        let size = m.paced_bytes();
         let limit = m.budget.limit();
         m.threshold.set((size * 2).max(MIN_THRESHOLD).min(size + limit.saturating_sub(size) / 2));
+        m.last_work.set(m.cycle_work.get());
         m.phase.set(Phase::Idle);
         m.settle.set(true);
         m.collections.set(m.collections.get() + 1);

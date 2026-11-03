@@ -26,6 +26,8 @@ jobs:
         os: [ubuntu-latest]
         features: ["", "--all-features", "--no-default-features"]
         include:
+          - os: ubuntu-24.04-arm
+            features: ""
           - os: macos-latest
             features: ""
     steps:
@@ -33,6 +35,24 @@ jobs:
       - run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
       - run: cargo clippy --locked --workspace --all-targets ${{ matrix.features }}
       - run: cargo test --locked --workspace ${{ matrix.features }}
+
+  freebsd:
+    name: test (freebsd, default features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          release: "15.1"
+          envs: CARGO_TERM_COLOR RUSTFLAGS
+          prepare: |
+            pkg install -y curl python3
+            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --component clippy
+          run: |
+            . "$HOME/.cargo/env"
+            cargo clippy --locked --workspace --all-targets
+            cargo test --locked --workspace
 
   fuzz:
     name: fuzz the gc

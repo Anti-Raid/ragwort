@@ -47,6 +47,11 @@ impl Budget {
         self.limit
     }
 
+    /// What could be allocated before the reserve if `used` bytes were charged.
+    pub(crate) fn room_past(&self, used: usize) -> usize {
+        self.limit.saturating_sub(self.reserve.get()).saturating_sub(used)
+    }
+
     pub(crate) fn set_reserve(&self, bytes: usize) {
         self.reserve.set(bytes.min(self.limit));
     }

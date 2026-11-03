@@ -202,3 +202,23 @@ impl Host for TestHost {
         reads.get()
     }
 }
+
+/// `text` flat, external, and, if it has two characters or more, as a rope of two flat strings
+/// cut at `cut` and as such a rope flattened.
+pub fn shapes(h: &TestHost, text: &[char], cut: usize) -> Vec<TestStr> {
+    let make = |t: &[char]| from_chars(h, t.iter().copied()).unwrap();
+    let mut out = vec![make(text), h.external(ExternalText::new(text.iter().collect::<String>())).unwrap()];
+    if text.len() >= 2 {
+        let cut = cut.clamp(1, text.len() - 1);
+        for flattened in [false, true] {
+            let (l, r) = (make(&text[..cut]), make(&text[cut..]));
+            let (il, ir) = (crate::info(h, l), crate::info(h, r));
+            let rope = h.rope(l, r, Info { len: il.len + ir.len, width: il.width.max(ir.width), depth: 1 }).unwrap();
+            if flattened {
+                flatten(h, rope).unwrap();
+            }
+            out.push(rope);
+        }
+    }
+    out
+}

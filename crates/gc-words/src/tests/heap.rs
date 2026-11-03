@@ -136,7 +136,7 @@ fn hosts_live_while_referenced() {
         let boxed = mc.root(0).downcast::<Boxed>(mc).unwrap();
         assert_eq!(*boxed.data(mc).unwrap().get(mc).unwrap(), "kept");
     });
-    assert!(arena.meta.hosts.borrow()[1].value.is_none());
+    assert_eq!(arena.hosts(), 1, "the dead value's slot is dropped");
 }
 
 /// A forged reference reads as some other object or none, never out of bounds.

@@ -3,7 +3,7 @@
 //! same text. Strings whose units fit in [`SHORT`] bytes, such as most names, hash in one step.
 
 use crate::units::Unit;
-use crate::{Host, Info, Packed, Units, Width, chunks, summary};
+use crate::{Host, Info, Packed, Units, Width, chunks, flat, summary};
 
 const K0: u64 = 0x243f_6a88_85a3_08d3;
 const K1: u64 = 0x1319_8a2e_0370_7344;
@@ -185,7 +185,17 @@ impl State {
 }
 
 /// Hashes the characters of `s` with `seed`.
+#[inline]
 pub fn hash<H: Host>(h: &H, s: H::Str, seed: u64) -> Result<u64, H::Error> {
+    if let Some(units) = flat(h, s) {
+        h.charge(units.len() as u64)?;
+        return Ok(hash_flat(units, seed));
+    }
+    rope_hash(h, s, seed)
+}
+
+#[inline(never)]
+fn rope_hash<H: Host>(h: &H, s: H::Str, seed: u64) -> Result<u64, H::Error> {
     let (info, flat) = summary(h, s);
     h.charge(info.len as u64)?;
     Ok(match flat {

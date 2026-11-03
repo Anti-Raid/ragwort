@@ -190,6 +190,12 @@ pub(crate) struct Blobs {
     /// Chunks made so far, for charging: counting them would take a pass over the table, after
     /// every step.
     made: Cell<usize>,
+    /// What the blobs that outlived a collection, and weren't found dead since, are charged.
+    /// Young ones are left out: a minor collection frees those.
+    live: Cell<usize>,
+    /// What the first so many young blobs are charged, and how many: `young_bytes` counts on
+    /// from there, so `add` doesn't have to.
+    young_counted: Cell<(usize, usize)>,
 }
 
 impl Blobs {
@@ -206,6 +212,8 @@ impl Blobs {
             dead: RefCell::default(),
             pool: RefCell::new(pool),
             made: Cell::new(0),
+            live: Cell::new(0),
+            young_counted: Cell::new((0, 0)),
         }
     }
 
@@ -269,37 +277,56 @@ impl Blobs {
         }
     }
 
-    /// After a minor collection: blobs made since the last one that nothing marked are dead.
+    /// After a minor collection: blobs made since the last one that nothing marked are dead,
+    /// and the rest are old.
     pub(crate) fn sweep_young(&self) {
         let mut dead = self.dead.borrow_mut();
+        let mut live = self.live.get();
         for id in self.young.borrow_mut().drain(..) {
-            if self.slot(u64::from(id) + 1).is_some_and(|s| !s.marked.get()) {
+            let Some(slot) = self.slot(u64::from(id) + 1) else { continue };
+            if slot.marked.get() {
+                live += slot.cost.get();
+            } else {
                 dead.push(id);
             }
         }
+        self.live.set(live);
+        self.young_counted.set((0, 0));
     }
 
-    /// After a major collection's marking: every unmarked blob is dead.
+    /// After a major collection's marking: every unmarked blob is dead. That includes those a
+    /// minor collection found and `free_dead` hasn't emptied yet, so they're listed again.
     pub(crate) fn sweep_all(&self) {
         let mut dead = self.dead.borrow_mut();
+        dead.clear();
+        let mut live = 0;
         for (c, chunk) in self.chunks.iter().enumerate() {
             let Some(chunk) = chunk.get() else { continue };
             for (i, slot) in chunk.iter().enumerate() {
-                if !slot.marked.get() && slot.data.get().is_some() {
+                if slot.data.get().is_none() {
+                    continue;
+                }
+                if slot.marked.get() {
+                    live += slot.cost.get();
+                } else {
                     dead.push((c * CHUNK + i) as u32);
                 }
             }
         }
+        self.live.set(live);
         self.young.borrow_mut().clear();
+        self.young_counted.set((0, 0));
     }
 
-    /// Empties the dead blobs' slots, between steps, when nothing can be borrowing them.
-    pub(crate) fn free_dead(&mut self, budget: &Budget) {
-        let (free, pool) = (self.free.get_mut(), self.pool.get_mut());
-        if self.dead.get_mut().is_empty() {
+    /// Empties the slots of up to `max` dead blobs, between steps, when nothing can be
+    /// borrowing them.
+    pub(crate) fn free_dead(&mut self, budget: &Budget, max: usize) {
+        let (free, pool, dead) = (self.free.get_mut(), self.pool.get_mut(), self.dead.get_mut());
+        if dead.is_empty() {
             return;
         }
-        for id in self.dead.get_mut().drain(..) {
+        let keep = dead.len().saturating_sub(max);
+        for id in dead.drain(keep..) {
             let slot = self.chunks.get_mut(id as usize / CHUNK).and_then(OnceCell::get_mut).and_then(|c| c.get_mut(id as usize % CHUNK));
             if let Some(slot) = slot
                 && let Some(blob) = slot.data.take()
@@ -316,6 +343,21 @@ impl Blobs {
     #[cfg(test)]
     pub(crate) fn charged(&self) -> usize {
         self.chunks.iter().filter_map(OnceCell::get).flat_map(|c| c.iter()).map(|s| s.cost.get()).sum()
+    }
+
+    pub(crate) fn live(&self) -> usize {
+        self.live.get()
+    }
+
+    /// What the blobs made since the last collection are charged.
+    pub(crate) fn young_bytes(&self) -> usize {
+        let young = self.young.borrow();
+        let (mut bytes, counted) = self.young_counted.get();
+        for &id in &young[counted..] {
+            bytes += self.slot(u64::from(id) + 1).map_or(0, |s| s.cost.get());
+        }
+        self.young_counted.set((bytes, young.len()));
+        bytes
     }
 
     pub(crate) fn count(&self) -> usize {
@@ -365,9 +407,9 @@ impl Blobs {
         self.add(budget, U::wrap(units), kept * size_of::<U>() + BLOB_COST, marked)
     }
 
-    pub(crate) fn alloc_frozen<T: Any>(&self, budget: &Budget, marked: bool, value: T) -> Result<u32, OutOfMemory> {
+    pub(crate) fn alloc_frozen<T: Any>(&self, budget: &Budget, marked: bool, value: T, owned: usize) -> Result<u32, OutOfMemory> {
         budget.count_allocation()?;
-        let cost = size_of::<T>() + BLOB_COST;
+        let cost = (size_of::<T>() + BLOB_COST).saturating_add(owned);
         budget.ensure(cost)?;
         self.add(budget, Blob::Any(Box::new(value)), cost, marked)
     }

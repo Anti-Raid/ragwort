@@ -61,11 +61,12 @@ impl<'a, 'gc> Strings<'a, 'gc> {
     pub fn external(&self, chars: impl External) -> Result<Str<'gc>, Error> {
         let units = chars.units();
         check_external(units)?;
-        if units.len() * units.width().bytes() < COPY_EXTERNAL {
+        let bytes = units.len() * units.width().bytes();
+        if bytes < COPY_EXTERNAL {
             return self.flat(units.width(), units.len(), |mut u| u.copy_from(units));
         }
         let owner: Box<dyn External> = Box::new(chars);
-        let external = Extern::new(self.mc, self.mc.frozen(owner)?)?;
+        let external = Extern::new(self.mc, self.mc.frozen_owning(owner, bytes)?)?;
         Ok(Str(Value::object(self.mc, external)))
     }
 
@@ -101,7 +102,7 @@ impl<'gc> Host for Strings<'_, 'gc> {
     type Str = Str<'gc>;
     type Error = Error;
 
-    #[inline]
+    #[inline(always)]
     fn view(&self, s: Str<'gc>) -> StrView<'_, Str<'gc>> {
         let mc = self.mc;
         match Text::of(s.0) {

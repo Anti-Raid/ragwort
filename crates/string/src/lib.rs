@@ -1,14 +1,16 @@
 //! Immutable strings over any heap. A string is flat, its characters in one array at the
 //! narrowest width that holds them all, one, two or four bytes each, or a rope: a balanced
-//! tree of strings that [`concat`] builds when copying would cost more than it saves. The heap
+//! tree of strings that [`concat()`] builds when copying would cost more than it saves. The heap
 //! implements [`Host`] and the library does the rest, without allocating anywhere else. A
 //! flat string's characters can also live outside the heap, as an [`External`].
 
+mod case;
 mod external;
 mod hash;
 mod intern;
 mod iter;
 mod rope;
+mod search;
 mod units;
 
 #[cfg(test)]
@@ -21,11 +23,13 @@ mod tests;
 use std::cmp::Ordering;
 use std::fmt;
 
+pub use case::{compare_ci, downcase, foldcase, upcase};
 pub use external::{External, ExternalText, check_external};
 pub use hash::{hash, hash_str};
 pub use intern::{Table, intern, intern_str};
 pub use iter::{Chars, Chunks};
 pub use rope::{concat, concat_all, flatten, substring};
+pub use search::{Split, SplitWhitespace, ends_with, find, rfind, split, split_whitespace, splitn, starts_with, trim, trim_end, trim_start};
 pub use units::{Packed, PackedMut, Units, UnitsMut, Width};
 
 /// The longest string: a rope can share one string many times over, so length isn't bounded
@@ -168,11 +172,23 @@ pub fn is_flat<H: Host>(h: &H, s: H::Str) -> bool {
 
 /// The character at `i`, in time proportional to the rope's depth. A rope read this way often
 /// enough is flattened, after which reads take constant time.
-pub fn char_at<H: Host>(h: &H, mut s: H::Str, mut i: usize) -> Result<char, H::Error> {
-    if let StrView::Rope { info, flat: None, .. } = h.view(s)
-        && h.count_read(s).saturating_mul(rope::CHARS_PER_READ) >= info.len as u64
-    {
-        s = flatten(h, s)?;
+#[inline]
+pub fn char_at<H: Host>(h: &H, s: H::Str, i: usize) -> Result<char, H::Error> {
+    match flat(h, s) {
+        Some(u) => u.get(i).ok_or_else(|| StrError::OutOfRange.into()),
+        None => rope_char_at(h, s, i),
+    }
+}
+
+/// Kept out of line, as are the other rope cases, so the flat ones inline small.
+#[inline(never)]
+fn rope_char_at<H: Host>(h: &H, mut s: H::Str, mut i: usize) -> Result<char, H::Error> {
+    match h.view(s) {
+        StrView::Rope { flat: Some(flat), .. } => s = flat,
+        StrView::Rope { info, .. } if h.count_read(s).saturating_mul(rope::CHARS_PER_READ) >= info.len as u64 => {
+            s = flatten(h, s)?;
+        }
+        _ => {}
     }
     loop {
         match h.view(s) {
@@ -198,10 +214,21 @@ pub fn chars<H: Host>(h: &H, s: H::Str) -> Chars<'_, H> {
 }
 
 /// Orders by code point, then by length.
+#[inline]
 pub fn compare<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<Ordering, H::Error> {
     if a == b {
         return Ok(Ordering::Equal);
     }
+    if let (Some(x), Some(y)) = (flat(h, a), flat(h, b)) {
+        let n = x.len().min(y.len());
+        h.charge(n as u64)?;
+        return Ok(x.slice(0..n).compare(y.slice(0..n)).then(x.len().cmp(&y.len())));
+    }
+    rope_compare(h, a, b)
+}
+
+#[inline(never)]
+fn rope_compare<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<Ordering, H::Error> {
     let ((ia, fa), (ib, fb)) = (summary(h, a), summary(h, b));
     let (la, lb) = (ia.len, ib.len);
     h.charge(la.min(lb) as u64)?;
@@ -212,33 +239,48 @@ pub fn compare<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<Ordering, H::Erro
     compare_chunks(h, a, b)
 }
 
-/// Kept out of line, so the flat cases above are small enough to inline.
 #[inline(never)]
 fn compare_chunks<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<Ordering, H::Error> {
-    let (la, lb) = (len(h, a), len(h, b));
-    let (mut ca, mut cb) = (chunks(h, a), chunks(h, b));
+    Ok(compare_runs(chunks(h, a), chunks(h, b)).then(len(h, a).cmp(&len(h, b))))
+}
+
+/// Orders the characters of two runs of chunks by code point, as far as the shorter goes.
+pub(crate) fn compare_runs<'a>(mut ca: impl Iterator<Item = Units<'a>>, mut cb: impl Iterator<Item = Units<'a>>) -> Ordering {
     let (mut x, mut y) = (Units::One(&[]), Units::One(&[]));
     loop {
         while x.is_empty() {
-            let Some(next) = ca.next() else { return Ok(la.cmp(&lb)) };
+            let Some(next) = ca.next() else { return Ordering::Equal };
             x = next;
         }
         while y.is_empty() {
-            let Some(next) = cb.next() else { return Ok(la.cmp(&lb)) };
+            let Some(next) = cb.next() else { return Ordering::Equal };
             y = next;
         }
         let n = x.len().min(y.len());
         match x.slice(0..n).compare(y.slice(0..n)) {
             Ordering::Equal => (x, y) = (x.slice(n..x.len()), y.slice(n..y.len())),
-            order => return Ok(order),
+            order => return order,
         }
     }
 }
 
+#[inline]
 pub fn equal<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<bool, H::Error> {
     if a == b {
         return Ok(true);
     }
+    if let (Some(x), Some(y)) = (flat(h, a), flat(h, b)) {
+        if x.len() != y.len() || x.width() != y.width() {
+            return Ok(false);
+        }
+        h.charge(x.len() as u64)?;
+        return Ok(x.equal(y));
+    }
+    rope_equal(h, a, b)
+}
+
+#[inline(never)]
+fn rope_equal<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<bool, H::Error> {
     let (ia, fa) = summary(h, a);
     let (ib, fb) = summary(h, b);
     if ia.len != ib.len || ia.width != ib.width {
@@ -253,9 +295,30 @@ pub fn equal<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<bool, H::Error> {
 }
 
 /// Whether `s` holds the characters of `t`.
+#[inline]
 pub fn equal_str<H: Host>(h: &H, s: H::Str, t: &str) -> Result<bool, H::Error> {
+    match flat(h, s) {
+        Some(units) => units_equal_str(h, units, t),
+        None => rope_equal_str(h, s, t),
+    }
+}
+
+#[inline(never)]
+fn rope_equal_str<H: Host>(h: &H, s: H::Str, t: &str) -> Result<bool, H::Error> {
     let (info, flat) = summary(h, s);
-    if let Some(Units::One(bytes)) = flat
+    if let Some(units) = flat {
+        return units_equal_str(h, units, t);
+    }
+    if info.len > t.len() || info.len < t.len().div_ceil(4) {
+        return Ok(false);
+    }
+    h.charge(info.len as u64)?;
+    Ok(chars(h, s).eq(t.chars()))
+}
+
+#[inline]
+fn units_equal_str<H: Host>(h: &H, units: Units<'_>, t: &str) -> Result<bool, H::Error> {
+    if let Units::One(bytes) = units
         && bytes.len() == t.len()
     {
         h.charge(t.len() as u64)?;
@@ -266,21 +329,27 @@ pub fn equal_str<H: Host>(h: &H, s: H::Str, t: &str) -> Result<bool, H::Error> {
         }
         return Ok(bytes == t.as_bytes() && t.is_ascii());
     }
-    if let Some(Units::Packed(p)) = flat
+    if let Units::Packed(p) = units
         && p.len() == t.len()
         && p.width() == Width::One
     {
         h.charge(t.len() as u64)?;
         return Ok(p.equal_ascii(t.as_bytes()));
     }
-    if info.len > t.len() || info.len < t.len().div_ceil(4) {
+    if units.len() > t.len() || units.len() < t.len().div_ceil(4) {
         return Ok(false);
     }
-    h.charge(info.len as u64)?;
-    Ok(match flat {
-        Some(units) => units.chars().eq(t.chars()),
-        None => chars(h, s).eq(t.chars()),
-    })
+    h.charge(units.len() as u64)?;
+    Ok(units.chars().eq(t.chars()))
+}
+
+/// The characters of `s`, if it's flat.
+#[inline]
+fn flat<H: Host>(h: &H, s: H::Str) -> Option<Units<'_>> {
+    match h.view(s) {
+        StrView::Flat(u) => Some(u),
+        StrView::Rope { .. } => None,
+    }
 }
 
 /// What [`info`] says of `s`, and the characters of a flat string or of a rope's flat copy,
@@ -297,6 +366,10 @@ fn summary<H: Host>(h: &H, s: H::Str) -> (Info, Option<Units<'_>>) {
 }
 
 pub fn utf8_len<H: Host>(h: &H, s: H::Str) -> Result<usize, H::Error> {
+    if let Some(units) = flat(h, s) {
+        h.charge(units.len() as u64)?;
+        return Ok(units.utf8_len());
+    }
     h.charge(len(h, s) as u64)?;
     Ok(chunks(h, s).map(Units::utf8_len).sum())
 }
@@ -313,52 +386,75 @@ pub struct Display<'h, H: Host> {
 
 impl<H: Host> fmt::Display for Display<'_, H> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut buf = [0; 256];
-        let mut n = 0;
-        for chunk in chunks(self.h, self.s) {
-            if let Units::One(bytes) = chunk
-                && bytes.is_ascii()
-            {
-                f.write_str(flush(&buf[..n]))?;
-                n = 0;
-                f.write_str(std::str::from_utf8(bytes).expect("ASCII"))?;
-                continue;
-            }
-            // A block at a time, encoded only if it isn't ASCII.
-            if let Units::Packed(p) = chunk
-                && p.width() == Width::One
-            {
-                let mut block = [0; 64];
-                for from in (0..p.len()).step_by(block.len()) {
-                    let block = &mut block[..(p.len() - from).min(64)];
-                    p.copy_bytes(from, block);
-                    if n + 2 * block.len() > buf.len() {
-                        f.write_str(flush(&buf[..n]))?;
-                        n = 0;
-                    }
-                    if block.is_ascii() {
-                        buf[n..n + block.len()].copy_from_slice(block);
-                        n += block.len();
-                    } else {
-                        block.iter().for_each(|&b| n += char::from(b).encode_utf8(&mut buf[n..]).len());
-                    }
+        let mut out = Utf8 { f, buf: [0; 256], n: 0 };
+        match flat(self.h, self.s) {
+            Some(units) => out.units(units)?,
+            None => {
+                for chunk in chunks(self.h, self.s) {
+                    out.units(chunk)?;
                 }
-                continue;
             }
-            let mut written = Ok(());
-            chunk.each_char(|c| {
-                if n + 4 > buf.len() {
-                    written = written.and(f.write_str(flush(&buf[..n])));
-                    n = 0;
-                }
-                n += c.encode_utf8(&mut buf[n..]).len();
-            });
-            written?;
         }
-        f.write_str(flush(&buf[..n]))
+        out.flush()
     }
 }
 
-fn flush(encoded: &[u8]) -> &str {
-    std::str::from_utf8(encoded).expect("whole characters")
+/// Characters encoded for a formatter, gathered so they're written a block at a time.
+struct Utf8<'a, 'f> {
+    f: &'a mut fmt::Formatter<'f>,
+    buf: [u8; 256],
+    n: usize,
+}
+
+impl Utf8<'_, '_> {
+    fn flush(&mut self) -> fmt::Result {
+        let n = std::mem::take(&mut self.n);
+        self.f.write_str(std::str::from_utf8(&self.buf[..n]).expect("whole characters"))
+    }
+
+    fn units(&mut self, units: Units<'_>) -> fmt::Result {
+        match units {
+            Units::One(bytes) if bytes.is_ascii() => {
+                self.flush()?;
+                self.f.write_str(std::str::from_utf8(bytes).expect("ASCII"))
+            }
+            // A block at a time: ASCII straight into the buffer, the rest encoded.
+            Units::Packed(p) if p.width() == Width::One => {
+                let ascii = p.is_ascii();
+                for from in (0..p.len()).step_by(64) {
+                    let k = (p.len() - from).min(64);
+                    if self.n + 2 * k > self.buf.len() {
+                        self.flush()?;
+                    }
+                    if ascii {
+                        p.copy_bytes(from, &mut self.buf[self.n..self.n + k]);
+                        self.n += k;
+                        continue;
+                    }
+                    let mut block = [0; 64];
+                    p.copy_bytes(from, &mut block[..k]);
+                    for &b in &block[..k] {
+                        if b < 0x80 {
+                            self.buf[self.n] = b;
+                            self.n += 1;
+                        } else {
+                            self.buf[self.n..self.n + 2].copy_from_slice(&[0xC0 | b >> 6, 0x80 | b & 0x3F]);
+                            self.n += 2;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            _ => {
+                let mut written = Ok(());
+                units.each_char(|c| {
+                    if self.n + 4 > self.buf.len() {
+                        written = written.and(self.flush());
+                    }
+                    self.n += c.encode_utf8(&mut self.buf[self.n..]).len();
+                });
+                written
+            }
+        }
+    }
 }

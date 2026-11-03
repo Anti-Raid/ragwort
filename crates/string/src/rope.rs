@@ -73,7 +73,10 @@ fn sub<H: Host>(h: &H, s: H::Str, start: usize, end: usize) -> Res<H> {
     if start == 0 && end == i.len {
         return Ok(s);
     }
-    let StrView::Rope { left, right, .. } = h.view(s) else { return copy_range(h, s, start, end) };
+    let (left, right) = match h.view(s) {
+        StrView::Flat(units) => return copy_units(h, units.slice(start..end)),
+        StrView::Rope { left, right, .. } => (left, right),
+    };
     if fits(end - start, i.width) {
         return copy_range(h, s, start, end);
     }
@@ -118,6 +121,12 @@ fn copy_range<H: Host>(h: &H, s: H::Str, start: usize, end: usize) -> Res<H> {
             at += run.len();
         }
     })
+}
+
+/// A flat copy of `units`, at the narrowest width that holds them.
+fn copy_units<H: Host>(h: &H, units: Units<'_>) -> Res<H> {
+    h.charge(units.len() as u64)?;
+    h.flat(units.narrowest(), units.len(), |mut out| out.write(0, units))
 }
 
 /// `parts` in one flat string.

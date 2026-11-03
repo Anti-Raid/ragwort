@@ -120,7 +120,7 @@ def shown(v):
     if isinstance(v, tuple):
         return f"cx{shown(v[1])}|{shown(v[2])}"
     if isinstance(v, float):
-        return "fl" + h(struct.unpack("<Q", struct.pack("<d", v))[0])
+        return "fl" + h(struct.unpack("<Q", struct.pack("<d", math.nan if v != v else v))[0])
     return fr(v)
 
 

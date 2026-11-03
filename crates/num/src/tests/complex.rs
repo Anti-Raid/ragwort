@@ -197,13 +197,33 @@ fn racket(h: &TestHost, z: TestNumber) -> String {
     }
 }
 
-/// Examples from Racket's reference, which pin down both exactness and the last digit.
+/// Whether `z` prints as `want` once each of its flonum parts moves by at most an ulp.
+fn within_an_ulp(h: &TestHost, z: TestNumber, want: &str) -> bool {
+    let near = |x: TestReal| match x {
+        TestReal::Flonum(f) if f.is_finite() => vec![x, TestReal::Flonum(f.next_up()), TestReal::Flonum(f.next_down())],
+        _ => vec![x],
+    };
+    match z {
+        TestNumber::Real(x) => near(x).into_iter().any(|x| racket(h, TestNumber::Real(x)) == want),
+        TestNumber::Complex(re, im) => near(re)
+            .into_iter()
+            .any(|re| near(im).into_iter().any(|im| racket(h, TestNumber::Complex(re, im)) == want)),
+    }
+}
+
+/// Examples from Racket's reference, which pin down exactness and, to an ulp, the digits. Like
+/// Racket and Chez, we take `exp`, `sin` and the rest from the system's maths library, and
+/// those differ in the last place: FreeBSD's `exp(1)` is an ulp above macOS's and glibc's.
 #[test]
 fn racket_reference_examples() {
     let h = TestHost::new(64);
     let p = |s| parse(&h, s);
     let pi_half = TestNumber::Real(TestReal::Flonum(std::f64::consts::FRAC_PI_2));
-    let check = |got: Result<TestNumber, TestError>, want: &str, what: &str| assert_eq!(racket(&h, got.unwrap()), want, "{what}");
+    let check = |got: Result<TestNumber, TestError>, want: &str, what: &str| {
+        let got = got.unwrap();
+        let shown = racket(&h, got);
+        assert!(shown == want || within_an_ulp(&h, got, want), "{what}: {shown}, want {want}");
+    };
     check(sqrt(&h, p("4/9")), "2/3", "(sqrt 4/9)");
     check(sqrt(&h, p("2")), "1.4142135623730951", "(sqrt 2)");
     check(sqrt(&h, p("-1")), "+1i", "(sqrt -1)");

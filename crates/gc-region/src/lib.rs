@@ -2,7 +2,8 @@
 //! whose pages can be given back to the system.
 //!
 //! With the `mmap` feature on Unix, it's an anonymous mapping and [`Region::release`] gives
-//! pages back with `madvise`. Otherwise it's a plain allocation and release does nothing.
+//! pages back: with `madvise` on Linux, and elsewhere by mapping fresh pages over them.
+//! Otherwise it's a plain allocation and release does nothing.
 
 use std::cell::Cell;
 use std::ops::Range;

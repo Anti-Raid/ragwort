@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::cmp::Ordering;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -63,6 +64,44 @@ fn strings_live_in_the_arena() {
     });
 }
 
+/// What a bot does to a message, on an external string and a rope over it, and what that makes
+/// survives collections that move it.
+#[test]
+fn text_operations_work_on_every_kind_of_string() {
+    let mut arena = arena(8 << 20);
+    arena.set_evacuate_all(true);
+    let message = format!("  !Ban @someone {} ", "for being rude".repeat(10));
+    let command = message.trim();
+    arena.mutate(|mc| {
+        let h = Strings::new(mc);
+        let s = |t: &str| from_str(&h, t).unwrap();
+        let external = h.external(ExternalText::new(message.clone())).unwrap();
+        let rope = concat(&h, s(&"x".repeat(600)), external).unwrap();
+        assert!(h.is_external(external) && !is_flat(&h, rope));
+        let trimmed = trim(&h, external).unwrap();
+        assert_eq!(display(&h, trimmed).to_string(), command);
+        let words: Vec<_> = split_whitespace(&h, external).map(Result::unwrap).collect();
+        assert_eq!(words.len(), command.split_whitespace().count());
+        assert_eq!(compare_ci(&h, words[0], s("!BAN")), Ok(Ordering::Equal));
+        assert_eq!(starts_with(&h, words[1], s("@")), Ok(true));
+        assert_eq!(find(&h, rope, s("rude"), 0), Ok(command.find("rude").map(|i| i + 600 + 2)));
+        assert_eq!(split(&h, rope, s("rude")).count(), 11);
+        let loud = upcase(&h, rope).unwrap();
+        assert_eq!(ends_with(&h, loud, s("RUDE ")), Ok(true));
+        assert_eq!(equal(&h, foldcase(&h, loud).unwrap(), downcase(&h, rope).unwrap()), Ok(true));
+        for kept in [trimmed, words[1], loud] {
+            root(mc).push(mc, kept.value()).unwrap();
+        }
+    });
+    arena.collect_minor();
+    arena.collect();
+    arena.mutate(|mc| {
+        let h = Strings::new(mc);
+        let got: Vec<String> = (0..3).map(|i| display(&h, h.string(root(mc).get(mc, i).unwrap()).unwrap()).to_string()).collect();
+        assert_eq!(got, [command.to_string(), "@someone".to_string(), format!("{}{}", "X".repeat(600), message.to_uppercase())]);
+    });
+}
+
 /// Strings made and dropped in the young generation go at the next minor collection, and the
 /// kept ones keep their characters.
 #[test]
@@ -95,6 +134,16 @@ fn errors_come_back_as_the_crate_error() {
         let s = from_str(&h, "abc").unwrap();
         assert_eq!(char_at(&h, s, 3), Err(Error::Str(StrError::OutOfRange)));
         assert_eq!(repeat(&h, 'x', 4 << 20), Err(Error::OutOfMemory));
+        // A rope that shares one string many times, too long to flatten here: searching and
+        // splitting it need a flat copy.
+        let mut big = from_str(&h, "word word ").unwrap();
+        for _ in 0..17 {
+            big = concat(&h, big, big).unwrap();
+        }
+        assert_eq!(find(&h, big, s, 0), Err(Error::OutOfMemory));
+        let mut words = split_whitespace(&h, big);
+        assert_eq!(words.next(), Some(Err(Error::OutOfMemory)));
+        assert_eq!(words.next(), None, "an error ends the split");
     });
 }
 

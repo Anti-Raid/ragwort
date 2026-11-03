@@ -3,6 +3,8 @@ use super::*;
 objects! {
     kind Kind;
     struct Pair { car: Value, cdr: Value }
+    struct Owner { text: Host<String> }
+    struct Bytes { data: Blob<u8> }
 }
 
 fn pair<'gc>(mc: &Mutation<'gc>, car: Value<'gc>, cdr: Value<'gc>) -> Result<Value<'gc>, OutOfMemory> {
@@ -216,4 +218,156 @@ fn released_pages_are_refunded() {
     });
     assert!(arena.used() >= peak - (1 << 20), "{} of {peak}", arena.used());
     assert_eq!(arena.peak(), peak.max(arena.used()));
+}
+
+/// An arena with about a megabyte of pairs live in root 1, so pages alone start a cycle only
+/// past a couple of megabytes.
+fn arena_with_live_pages(limit: usize) -> Arena {
+    let mut arena = Arena::new(limit, 2);
+    arena.mutate(|mc| {
+        for _ in 0..40_000 {
+            mc.set_root(1, pair(mc, Value::NIL, mc.root(1)).unwrap());
+        }
+    });
+    arena.collect();
+    arena
+}
+
+/// Host values and old blobs that die count toward starting a major cycle, as pages do, so
+/// they're freed long before the arena nears its limit.
+#[test]
+fn dead_hosts_and_blobs_pace_major_cycles() {
+    let limit = 32 << 20;
+    let mut arena = arena_with_live_pages(limit);
+    for _ in 0..2000 {
+        arena
+            .step(|mc| {
+                for _ in 0..100 {
+                    let text = mc.host(String::new()).unwrap();
+                    text.set_owned_bytes(mc, 200).unwrap();
+                    Owner::new(mc, Some(text)).unwrap();
+                }
+            })
+            .unwrap();
+    }
+    assert!(arena.collections().0 > 0);
+    assert!(arena.peak() < limit / 2, "hosts: peak {} of {limit}", arena.peak());
+
+    let mut arena = arena_with_live_pages(limit);
+    for _ in 0..3000 {
+        // Each blob outlives a step, so a minor collection may make it old before it dies.
+        arena
+            .step(|mc| {
+                let bytes = Bytes::new(mc, mc.blob(10_000, |b: &mut [u8]| b.len()).unwrap()).unwrap();
+                mc.set_root(0, Value::object(mc, bytes));
+            })
+            .unwrap();
+        arena.collect_minor();
+    }
+    assert!(arena.collections().0 > 0);
+    assert!(arena.peak() < limit / 2, "blobs: peak {} of {limit}", arena.peak());
+}
+
+/// With most of the limit live, major cycles still start early enough to finish within the
+/// steps, so the reserve never forces a full collection: one pause the length of a cycle.
+#[test]
+fn a_nearly_full_heap_is_collected_in_slices() {
+    let limit = 8 << 20;
+    let mut arena = Arena::new(limit, 1);
+    arena.mutate(|mc| mc.set_root(0, Value::object(mc, GcVec::<slot::Value>::new(mc).unwrap().head())));
+    let live = 2500;
+    for i in 0..20_000usize {
+        arena
+            .step(|mc| {
+                let table = GcVec::<slot::Value>::of(mc.root(0).downcast(mc).unwrap());
+                let entry = Value::object(mc, Bytes::new(mc, mc.blob(2000, |b: &mut [u8]| b.len()).unwrap()).unwrap());
+                let entry = pair(mc, entry, Value::NIL).unwrap();
+                for _ in 0..4 {
+                    pair(mc, entry, Value::NIL).unwrap();
+                }
+                if table.len(mc) < live {
+                    table.push(mc, entry).unwrap();
+                } else {
+                    table.set(mc, i * 7919 % live, entry);
+                }
+            })
+            .unwrap();
+    }
+    assert!(arena.collections().0 > 5, "{:?}", arena.collections());
+    assert!(arena.peak() <= limit - limit / 16, "peak {} of {limit}: the reserve was drawn on", arena.peak());
+}
+
+/// Blobs count toward a minor collection as objects do, so short-lived blobs that small
+/// objects hold are freed long before the arena nears its limit.
+#[test]
+fn young_blobs_pace_minor_collections() {
+    let limit = 32 << 20;
+    let mut arena = Arena::new(limit, 1);
+    for _ in 0..2000 {
+        arena
+            .step(|mc| {
+                for _ in 0..20 {
+                    Bytes::new(mc, mc.blob(4000, |b: &mut [u8]| b.len()).unwrap()).unwrap();
+                }
+            })
+            .unwrap();
+    }
+    assert!(arena.collections().1 > 0);
+    assert!(arena.peak() < limit / 4, "peak {} of {limit}", arena.peak());
+}
+
+/// Once host values die, the table drops the slots at its end and gives their room back, and
+/// new values take the lowest free ids.
+#[test]
+fn host_tables_shrink_after_their_values_die() {
+    let mut arena = Arena::new(64 << 20, 1);
+    let tables = |arena: &Arena| (arena.meta.hosts.borrow().capacity(), arena.meta.free_hosts.borrow().capacity());
+    arena.mutate(|mc| {
+        for i in 0..100_000 {
+            let owner = Owner::new(mc, Some(mc.host(String::new()).unwrap())).unwrap();
+            if i == 500 {
+                mc.set_root(0, Value::object(mc, owner));
+            }
+        }
+    });
+    arena.collect();
+    assert_eq!(arena.hosts(), 501, "the live value at 500 keeps the slots before it");
+    assert!(tables(&arena).0 < 2000 && tables(&arena).1 < 2000, "{:?}", tables(&arena));
+    arena.mutate(|mc| assert_eq!(mc.host(0u8).unwrap().id, 0, "the lowest free id first"));
+    arena.mutate(|mc| mc.set_root(0, Value::NIL));
+    arena.collect();
+    assert_eq!(arena.hosts(), 0);
+    assert!(tables(&arena).0 <= 64 && tables(&arena).1 <= 64, "{:?}", tables(&arena));
+}
+
+/// A slot dropped from the table and made again starts past the generations it had, so a stale
+/// reference to it reads nothing.
+#[test]
+fn dropped_host_slots_never_reuse_a_generation() {
+    let mut arena = Arena::new(1 << 20, 1);
+    let stale = arena.mutate(|mc| {
+        let host = mc.host(String::from("old")).unwrap();
+        (host.id, host.generation)
+    });
+    arena.collect();
+    assert_eq!(arena.hosts(), 0);
+    arena.mutate(|mc| {
+        let fresh = mc.host(String::from("new")).unwrap();
+        assert_eq!(fresh.id, stale.0);
+        assert!(fresh.generation > stale.1);
+        let stale = HostRef::<String> { id: stale.0, generation: stale.1, _marker: PhantomData };
+        assert!(stale.get(mc).is_none());
+    });
+}
+
+/// The host table is charged as it grows, so growing it can't take the arena past its limit.
+/// Across these limits, the table's last growth lands on both sides of it.
+#[test]
+fn host_tables_grow_within_the_limit() {
+    for limit in (512..1024).step_by(32).map(|k| k << 10) {
+        let mut arena = Arena::new(limit, 1);
+        let made = arena.mutate(|mc| (0..).take_while(|_| mc.host(()).is_ok()).count());
+        assert!(made > 1000);
+        assert!(arena.peak() <= limit, "peak {} of {limit}", arena.peak());
+    }
 }

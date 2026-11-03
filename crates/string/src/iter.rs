@@ -25,6 +25,12 @@ impl<'h, H: Host> Chunks<'h, H> {
     }
 }
 
+impl<H: Host> Clone for Chunks<'_, H> {
+    fn clone(&self) -> Self {
+        Self { stack: self.stack, ..*self }
+    }
+}
+
 impl<'h, H: Host> Iterator for Chunks<'h, H> {
     type Item = Units<'h>;
 
@@ -71,6 +77,12 @@ pub struct Chars<'h, H: Host> {
 impl<'h, H: Host> Chars<'h, H> {
     pub(crate) fn new(chunks: Chunks<'h, H>) -> Self {
         Self { chunks, run: Units::One(&[]), at: 0 }
+    }
+}
+
+impl<H: Host> Clone for Chars<'_, H> {
+    fn clone(&self) -> Self {
+        Self { chunks: self.chunks.clone(), ..*self }
     }
 }
 

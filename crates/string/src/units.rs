@@ -149,6 +149,14 @@ impl<'a> Packed<'a> {
         ((self.words[j >> log].get() >> shift) & self.width.mask()) as u32
     }
 
+    /// Unit `i` of one-byte units.
+    #[inline]
+    pub(crate) fn byte(self, i: usize) -> u32 {
+        debug_assert!(self.width == Width::One);
+        let j = self.skip as usize + i;
+        u32::from((self.words[j >> 3].get() >> ((j & 7) * 8)) as u8)
+    }
+
     #[inline]
     pub(crate) fn slice(self, range: Range<usize>) -> Self {
         assert!(range.start <= range.end && range.end <= self.len, "range {range:?} out of {}", self.len);
@@ -178,12 +186,26 @@ impl<'a> Packed<'a> {
     }
 
     /// The units' bytes from unit `from`, as many as fill `out`.
+    #[inline]
     pub(crate) fn copy_bytes(self, from: usize, out: &mut [u8]) {
         let at = self.byte_start() + from * self.width.bytes();
-        for (k, chunk) in out.chunks_mut(8).enumerate() {
-            let v = read_bytes(self.words, at + 8 * k, chunk.len());
-            chunk.copy_from_slice(&v.to_le_bytes()[..chunk.len()]);
+        let (whole, tail) = out.as_chunks_mut::<8>();
+        for (k, chunk) in whole.iter_mut().enumerate() {
+            *chunk = read_bytes(self.words, at + 8 * k, 8).to_le_bytes();
         }
+        if !tail.is_empty() {
+            let v = read_bytes(self.words, at + 8 * whole.len(), tail.len());
+            for (i, b) in tail.iter_mut().enumerate() {
+                *b = (v >> (8 * i)) as u8;
+            }
+        }
+    }
+
+    /// Whether these are one-byte units, all of them ASCII.
+    pub(crate) fn is_ascii(self) -> bool {
+        let n = self.len;
+        self.width == Width::One
+            && (0..n.div_ceil(8)).fold(0, |seen, k| seen | self.word_at(k, (n - 8 * k).min(8))) & crate::hash::HIGH == 0
     }
 
     /// The `k`th 8 bytes of the units' bytes, or the `n` there are if fewer.
@@ -193,6 +215,23 @@ impl<'a> Packed<'a> {
             0 if n == 8 => self.words[k].get(),
             _ => read_bytes(self.words, self.byte_start() + 8 * k, n),
         }
+    }
+
+    /// Orders two runs of the same length and width by code point, a word at a time, each word
+    /// passed through `map` first. Units pack lowest first, so the lowest differing bit is in
+    /// the first differing unit.
+    #[inline]
+    pub(crate) fn compare_by(self, other: Packed<'_>, map: impl Fn(u64) -> u64) -> Ordering {
+        let (bytes, bits) = (self.len * self.width.bytes(), self.width.bits());
+        for at in (0..bytes).step_by(8) {
+            let n = (bytes - at).min(8);
+            let (x, y) = (map(self.word_at(at / 8, n)), map(other.word_at(at / 8, n)));
+            if x != y {
+                let shift = (x ^ y).trailing_zeros() / bits * bits;
+                return (x >> shift & self.width.mask()).cmp(&(y >> shift & self.width.mask()));
+            }
+        }
+        Ordering::Equal
     }
 
     #[inline]
@@ -483,6 +522,7 @@ impl<'a> Units<'a> {
             (Self::One(a), Units::One(b)) => a.cmp(b),
             (Self::Two(a), Units::Two(b)) => a.cmp(b),
             (Self::Four(a), Units::Four(b)) => a.cmp(b),
+            (Self::Packed(a), Units::Packed(b)) if a.width == b.width => a.compare_by(b, |w| w),
             _ => (0..self.len()).map(|i| self.code(i).cmp(&other.code(i))).find(|o| o.is_ne()).unwrap_or(Ordering::Equal),
         }
     }
@@ -509,7 +549,10 @@ impl<'a> Units<'a> {
     pub(crate) fn utf8_len(self) -> usize {
         match self {
             Self::One(s) => s.len() + s.iter().filter(|&&b| b >= 0x80).count(),
-            Self::Packed(p) if p.width == Width::One => p.len() + (0..p.len()).filter(|&i| p.code(i) >= 0x80).count(),
+            Self::Packed(p) if p.width == Width::One => {
+                let n = p.len();
+                n + (0..n.div_ceil(8)).map(|k| (p.word_at(k, (n - 8 * k).min(8)) & crate::hash::HIGH).count_ones() as usize).sum::<usize>()
+            }
             _ => self.chars().map(char::len_utf8).sum(),
         }
     }
@@ -522,6 +565,16 @@ impl UnitsMut<'_> {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Fills one-byte units from little-endian words, eight to a word, the last word's extra
+    /// bytes dropped.
+    pub(crate) fn write_words(&mut self, words: impl Iterator<Item = u64>) {
+        match self {
+            UnitsMut::Packed(p) if p.width == Width::One => p.words.iter().zip(words).for_each(|(w, v)| w.set(v)),
+            UnitsMut::One(s) => s.chunks_mut(8).zip(words).for_each(|(chunk, v)| chunk.copy_from_slice(&v.to_le_bytes()[..chunk.len()])),
+            _ => panic!("writing bytes to wider units"),
+        }
     }
 
     /// Fills these units from `src`, which is as long and no wider.

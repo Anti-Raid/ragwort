@@ -14,7 +14,9 @@ pub(crate) struct Backing {
 impl Backing {
     pub(crate) fn new(len: usize) -> Option<Self> {
         let bytes = len.checked_mul(8)?.max(8);
-        let map = MmapRaw::from(MmapOptions::new().len(bytes).map_anon().ok()?);
+        // Most of the region is never touched, so it reserves no swap for it, which lets many
+        // regions exist where the system counts what's committed.
+        let map = MmapRaw::from(MmapOptions::new().len(bytes).no_reserve_swap().map_anon().ok()?);
         Some(Self { map, len })
     }
 
@@ -41,19 +43,19 @@ impl Backing {
     }
 
     /// Frees the pages now, leaving zeroed ones in their place. Returns whether it did.
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn free_pages(&mut self, offset: usize, len: usize) -> bool {
         // SAFETY: `&mut self` means no view of the words is alive. The pages stay mapped and
         // read back as zero, or as they were if the advice fails; `u64`s either way.
         unsafe { self.map.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, offset, len) }.is_ok()
     }
 
-    /// macOS keeps anonymous pages after `DontNeed`, and pages marked reusable need another
-    /// call before they're written again, so fresh zeroed pages are mapped over them instead.
-    #[cfg(target_vendor = "apple")]
+    /// Outside Linux, `DontNeed` needn't free the pages: macOS and the BSDs keep anonymous
+    /// pages after it. So fresh zeroed pages are mapped over them instead, as wasmtime does.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     fn free_pages(&mut self, offset: usize, len: usize) -> bool {
         let at = self.map.as_mut_ptr().wrapping_add(offset);
-        let flags = libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED;
+        let flags = libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED | MAP_NORESERVE;
         // SAFETY: `&mut self` means no view of the words is alive, and the range is whole OS
         // pages inside the mapping, replaced by zeroed pages with the same access.
         let mapped = unsafe { libc::mmap(at.cast(), len, libc::PROT_READ | libc::PROT_WRITE, flags, -1, 0) };
@@ -70,6 +72,20 @@ impl Backing {
     }
 }
 
+/// Where the system has it, so pages mapped over released ones reserve no swap either, like the
+/// rest of the region.
+#[cfg(any(target_vendor = "apple", target_os = "netbsd", target_os = "solaris", target_os = "illumos"))]
+const MAP_NORESERVE: libc::c_int = libc::MAP_NORESERVE;
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "netbsd",
+    target_os = "solaris",
+    target_os = "illumos"
+)))]
+const MAP_NORESERVE: libc::c_int = 0;
+
 fn os_page() -> Option<usize> {
     static PAGE: OnceLock<Option<usize>> = OnceLock::new();
     *PAGE.get_or_init(|| {
@@ -80,7 +96,8 @@ fn os_page() -> Option<usize> {
 }
 
 /// Bytes the process holds as the system counts them: the physical footprint on macOS, which
-/// leaves out pages marked reusable, and the resident set elsewhere.
+/// leaves out pages marked reusable, and the resident set elsewhere, which the BSDs give
+/// through `ps` as they needn't mount `/proc`.
 #[cfg(test)]
 pub(crate) fn held_bytes() -> usize {
     #[cfg(target_vendor = "apple")]
@@ -94,10 +111,17 @@ pub(crate) fn held_bytes() -> usize {
         // SAFETY: the call succeeded, so it filled the struct in, and it was zeroed before.
         unsafe { info.assume_init() }.ri_phys_footprint as usize
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let statm = std::fs::read_to_string("/proc/self/statm").expect("read statm");
         let pages: usize = statm.split_whitespace().nth(1).and_then(|n| n.parse().ok()).expect("statm");
         pages * os_page().expect("page size")
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    {
+        let pid = std::process::id().to_string();
+        let ps = std::process::Command::new("ps").args(["-o", "rss=", "-p", &pid]).output().expect("run ps");
+        let kib: usize = String::from_utf8_lossy(&ps.stdout).trim().parse().expect("ps rss");
+        kib << 10
     }
 }
