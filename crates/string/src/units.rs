@@ -70,6 +70,7 @@ pub enum Units<'a> {
     Two(&'a [u16]),
     Four(&'a [u32]),
     Packed(Packed<'a>),
+    Inline(Inline),
 }
 
 /// Room for a new flat string's characters.
@@ -90,6 +91,14 @@ pub struct Packed<'a> {
     /// Units to pass over in the first word.
     skip: u8,
     width: Width,
+}
+
+/// Up to eight one-byte units in one word, the first lowest, which the host keeps in the string's
+/// handle rather than in memory. Bytes past the last unit are zero.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Inline {
+    word: u64,
+    len: u8,
 }
 
 /// Room for a new flat string's characters, packed as [`Packed`] reads them, in words the host
@@ -291,6 +300,40 @@ impl<'a> Packed<'a> {
     }
 }
 
+impl Inline {
+    /// The first `len` bytes of `word`, up to eight.
+    #[inline]
+    pub fn new(word: u64, len: usize) -> Self {
+        let len = len.min(8);
+        Self { word: word & u64::MAX.checked_shr(64 - 8 * len as u32).unwrap_or(0), len: len as u8 }
+    }
+
+    #[inline]
+    pub fn len(self) -> usize {
+        self.len as usize
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    pub fn word(self) -> u64 {
+        self.word
+    }
+
+    #[inline]
+    fn code(self, i: usize) -> u32 {
+        u32::from((self.word >> (8 * i)) as u8)
+    }
+
+    #[inline]
+    fn slice(self, range: Range<usize>) -> Self {
+        assert!(range.start <= range.end && range.end <= self.len(), "range {range:?} out of {}", self.len);
+        Self::new(self.word.checked_shr(8 * range.start as u32).unwrap_or(0), range.len())
+    }
+}
+
 impl<'a> PackedMut<'a> {
     /// Room for `len` units in `words`, or as many as they hold.
     #[inline]
@@ -321,6 +364,8 @@ impl<'a> PackedMut<'a> {
             Units::Two(s) => self.widen(at, s.len(), |i| s[i] as u32),
             Units::Four(s) => self.widen(at, s.len(), |i| s[i]),
             Units::Packed(s) => self.widen(at, s.len, |i| s.code(i)),
+            Units::Inline(s) if self.width == Width::One => self.copy(at, s.len(), |i, k| s.word >> (8 * i) & u64::MAX >> (64 - 8 * k)),
+            Units::Inline(s) => self.widen(at, s.len(), |i| s.code(i)),
         }
     }
 
@@ -363,6 +408,7 @@ macro_rules! each {
             Units::Two($s) => $e,
             Units::Four($s) => $e,
             Units::Packed($p) => $packed,
+            Units::Inline($p) => $packed,
         }
     };
 }
@@ -466,6 +512,7 @@ impl<'a> Units<'a> {
             Self::Two(_) => Width::Two,
             Self::Four(_) => Width::Four,
             Self::Packed(p) => p.width,
+            Self::Inline(_) => Width::One,
         }
     }
 
@@ -476,6 +523,7 @@ impl<'a> Units<'a> {
             Self::Two(s) => s.get(i).map(|&u| to_char(u as u32)),
             Self::Four(s) => s.get(i).map(|&u| to_char(u)),
             Self::Packed(p) => (i < p.len()).then(|| to_char(p.code(i))),
+            Self::Inline(p) => (i < p.len()).then(|| char::from(p.code(i) as u8)),
         }
     }
 
@@ -486,6 +534,23 @@ impl<'a> Units<'a> {
             Self::Two(s) => Self::Two(&s[range]),
             Self::Four(s) => Self::Four(&s[range]),
             Self::Packed(p) => Self::Packed(p.slice(range)),
+            Self::Inline(p) => Self::Inline(p.slice(range)),
+        }
+    }
+
+    /// These units, inline ones moved into `cell` so they read as packed words, as the host's
+    /// stored ones do.
+    #[inline]
+    pub(crate) fn anchored<'b>(self, cell: &'b Cell<u64>) -> Units<'b>
+    where
+        'a: 'b,
+    {
+        match self {
+            Self::Inline(p) => {
+                cell.set(p.word);
+                Units::Packed(Packed::new(std::slice::from_ref(cell), p.len(), Width::One))
+            }
+            units => units,
         }
     }
 
@@ -498,6 +563,7 @@ impl<'a> Units<'a> {
     pub(crate) fn each_char(self, mut f: impl FnMut(char)) {
         match self {
             Self::Packed(p) => p.each_code(|c| f(to_char(c))),
+            Self::Inline(p) => (0..p.len()).for_each(|i| f(char::from(p.code(i) as u8))),
             _ => self.chars().for_each(f),
         }
     }
@@ -518,28 +584,34 @@ impl<'a> Units<'a> {
     /// Orders two runs of the same length by code point.
     pub(crate) fn compare(self, other: Units<'_>) -> Ordering {
         debug_assert_eq!(self.len(), other.len());
-        match (self, other) {
-            (Self::One(a), Units::One(b)) => a.cmp(b),
-            (Self::Two(a), Units::Two(b)) => a.cmp(b),
-            (Self::Four(a), Units::Four(b)) => a.cmp(b),
-            (Self::Packed(a), Units::Packed(b)) if a.width == b.width => a.compare_by(b, |w| w),
-            _ => (0..self.len()).map(|i| self.code(i).cmp(&other.code(i))).find(|o| o.is_ne()).unwrap_or(Ordering::Equal),
+        let (x, y) = (Cell::new(0), Cell::new(0));
+        let (this, other) = (self.anchored(&x), other.anchored(&y));
+        match (this, other) {
+            (Units::One(a), Units::One(b)) => a.cmp(b),
+            (Units::Two(a), Units::Two(b)) => a.cmp(b),
+            (Units::Four(a), Units::Four(b)) => a.cmp(b),
+            (Units::Packed(a), Units::Packed(b)) if a.width == b.width => a.compare_by(b, |w| w),
+            _ => (0..this.len()).map(|i| this.code(i).cmp(&other.code(i))).find(|o| o.is_ne()).unwrap_or(Ordering::Equal),
         }
     }
 
     /// Whether these are the same characters, given both are at their narrowest width.
     #[inline]
     pub(crate) fn equal(self, other: Units<'_>) -> bool {
-        match (self, other) {
-            (Self::One(a), Units::One(b)) if a.len() <= crate::hash::SHORT => {
+        if let (Self::Inline(a), Units::Inline(b)) = (self, other) {
+            return a == b;
+        }
+        let (x, y) = (Cell::new(0), Cell::new(0));
+        match (self.anchored(&x), other.anchored(&y)) {
+            (Units::One(a), Units::One(b)) if a.len() <= crate::hash::SHORT => {
                 a.len() == b.len() && crate::hash::words(a) == crate::hash::words(b)
             }
-            (Self::One(a), Units::One(b)) => a == b,
-            (Self::Two(a), Units::Two(b)) => a == b,
-            (Self::Four(a), Units::Four(b)) => a == b,
-            (Self::Packed(a), Units::Packed(b)) => a.equal(b),
-            (Self::Packed(a), Units::One(b)) => a.equal_bytes(b),
-            (Self::One(a), Units::Packed(b)) => b.equal_bytes(a),
+            (Units::One(a), Units::One(b)) => a == b,
+            (Units::Two(a), Units::Two(b)) => a == b,
+            (Units::Four(a), Units::Four(b)) => a == b,
+            (Units::Packed(a), Units::Packed(b)) => a.equal(b),
+            (Units::Packed(a), Units::One(b)) => a.equal_bytes(b),
+            (Units::One(a), Units::Packed(b)) => b.equal_bytes(a),
             (a, b) if a.width() == b.width() && a.len() == b.len() => (0..a.len()).all(|i| a.code(i) == b.code(i)),
             _ => false,
         }
@@ -553,6 +625,7 @@ impl<'a> Units<'a> {
                 let n = p.len();
                 n + (0..n.div_ceil(8)).map(|k| (p.word_at(k, (n - 8 * k).min(8)) & crate::hash::HIGH).count_ones() as usize).sum::<usize>()
             }
+            Self::Inline(p) => p.len() + (p.word & crate::hash::HIGH).count_ones() as usize,
             _ => self.chars().map(char::len_utf8).sum(),
         }
     }
@@ -601,6 +674,7 @@ impl UnitsMut<'_> {
             (UnitsMut::Four(d), Units::Four(s)) => d[at..end].copy_from_slice(s),
             (UnitsMut::Packed(d), s) => d.write(at, s),
             (d, Units::Packed(s)) => (0..s.len()).for_each(|i| d.put(at + i, s.code(i))),
+            (d, Units::Inline(s)) => (0..s.len()).for_each(|i| d.put(at + i, s.code(i))),
             (d, s) => each_mut!(d, d => each!(s, s => convert(s, &mut d[at..end]), _p => unreachable!("packed above")), _p => unreachable!("packed above")),
         }
     }

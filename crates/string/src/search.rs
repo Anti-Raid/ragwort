@@ -3,6 +3,7 @@
 //! whatever the text, and no memory beyond a few counters. Searches and scans are charged for
 //! the characters they pass over once they're done.
 
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::ops::Range;
 
@@ -71,6 +72,8 @@ fn find_units<H: Host, const BACK: bool>(h: &H, text: Units<'_>, pattern: Units<
 /// their ends, so the first match found is the last.
 #[inline]
 fn search<const BACK: bool>(text: Units<'_>, pattern: Units<'_>) -> Option<usize> {
+    let cell = Cell::new(0);
+    let text = text.anchored(&cell);
     let (n, m) = (text.len(), pattern.len());
     let at = move |i: usize| if BACK { n - 1 - i } else { i };
     let found = match m {

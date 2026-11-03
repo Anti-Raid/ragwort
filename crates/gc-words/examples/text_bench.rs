@@ -26,10 +26,19 @@ fn main() {
             best.time("equal 64 chars x 5M", || assert_eq!(equal_flat(&h, 5_000_000), 5_000_000));
             best.time("char_at x 20M", || assert!(char_reads(&h, 20_000_000) > 0));
             best.time("hash 29 chars x 10M", || assert!(hashes(&h, 10_000_000) != 1));
+            best.time("equal short x 20M", || assert_eq!(equal_short(&h, 20_000_000), 5_000_000));
+            best.time("hash short x 20M", || assert!(hash_short(&h, 20_000_000) != 1));
+            best.time("find short word x 5M", || assert!(find_short(&h, 5_000_000) > 0));
         });
         best.time("reply concat + display x 500K", || {
             for _ in 0..500_000 / BATCH {
                 arena.mutate(|mc| assert!(replies(&Strings::new(mc), BATCH) > 0));
+                arena.collect_minor();
+            }
+        });
+        best.time("split command x 1M", || {
+            for _ in 0..1_000_000 / BATCH {
+                arena.mutate(|mc| assert_eq!(split_commands(&Strings::new(mc), BATCH), 5 * BATCH));
                 arena.collect_minor();
             }
         });

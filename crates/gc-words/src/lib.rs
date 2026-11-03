@@ -246,6 +246,9 @@ pub const WINDOW: usize = 256;
 const TAG: u64 = 0b1111;
 const OBJECT: u64 = 0b0001;
 const CONSTANT: u64 = 0b1101;
+/// A string of [`strings::INLINE_CHARS`] Latin-1 characters or fewer: the length in the next
+/// four bits, then a byte for each character, the first lowest.
+const INLINE_STRING: u64 = 0b0101;
 /// Inline flonums end in 11: a double with two redundant exponent bits dropped.
 const FLONUM: u64 = 0b11;
 /// The special doubles take the words of the lowest few inline ones, ±1.7272337110188889e-77
@@ -495,7 +498,8 @@ pub trait Object: 'static {
     const DESC: Desc;
 }
 
-/// A value in one word: a fixnum shifted left by one, an object's index and type, or a constant.
+/// A value in one word: a fixnum shifted left by one, an object's index and type, a short string,
+/// or a constant.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Value<'gc> {
     word: u64,
@@ -626,6 +630,28 @@ impl<'gc> Value<'gc> {
     #[inline]
     pub fn object_parts(self) -> Option<(u16, u32)> {
         (self.word & TAG == OBJECT).then_some(((self.word >> 16 & TYPE_BITS) as u16, (self.word >> 32) as u32))
+    }
+
+    /// The value, if it refers to no object.
+    #[inline]
+    pub fn immediate(self) -> Option<Immediate> {
+        (self.word & TAG != OBJECT).then_some(Immediate(self.word))
+    }
+}
+
+/// A value that refers to no object, such as a fixnum, an inline flonum or `#t`. It holds no
+/// brand: no collection changes it, so it can be kept outside the arena.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Immediate(u64);
+
+impl Immediate {
+    #[inline]
+    pub fn value<'gc>(self) -> Value<'gc> {
+        Value::from_bits(self.0)
+    }
+
+    pub fn to_bits(self) -> u64 {
+        self.0
     }
 }
 

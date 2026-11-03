@@ -446,6 +446,11 @@ fn flonums_round_trip_and_survive_moves() {
         for v in [fixnum(3), Value::NIL, Value::FALSE, Value::BROKEN] {
             assert!(!v.is_flonum() && v.as_flonum(mc).is_none());
         }
+        for v in [fixnum(7), Value::inline_flonum(1.5).unwrap(), Value::NIL, Value::TRUE, Value::VOID] {
+            assert_eq!(v.immediate().map(Immediate::value), Some(v));
+        }
+        assert_eq!(Value::flonum(mc, 1e300).unwrap().immediate(), None);
+        assert_eq!(Value::object(mc, other).immediate(), None);
     });
     let check = |arena: &mut Arena| {
         arena.mutate(|mc| {

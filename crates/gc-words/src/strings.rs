@@ -1,12 +1,15 @@
-//! Strings in the arena, for `ragwort-string`: flat strings as [`Str8`], [`Str16`] or [`Str32`]
-//! objects, by their widest character, with the characters packed into their items; ropes as [`Rope`]
+//! Strings in the arena, for `ragwort-string`: flat strings of up to [`INLINE_CHARS`] Latin-1
+//! characters in the value word; longer ones as [`Str8`], [`Str16`] or [`Str32`] objects, by
+//! their widest character, with the characters packed into their items; ropes as [`Rope`]
 //! objects; and flat strings whose characters the program running the arena owns, as
 //! [`Extern`] objects.
 
 pub use ragwort_string::*;
 
+use std::cell::Cell;
+
 pub use crate::Error;
-use crate::{Mutation, Value};
+use crate::{INLINE_STRING, Mutation, TAG, Value};
 
 #[cfg(test)]
 #[path = "tests/strings.rs"]
@@ -31,6 +34,27 @@ crate::objects! {
 
 /// Shorter externals are copied: keeping them outside costs more than their characters.
 const COPY_EXTERNAL: usize = 64;
+
+/// Strings of up to this many Latin-1 characters live in the value word, so making one
+/// allocates nothing, and equal ones are the same value.
+pub const INLINE_CHARS: usize = 7;
+
+#[inline]
+fn is_inline(v: Value<'_>) -> bool {
+    v.to_bits() & TAG == INLINE_STRING
+}
+
+/// The value of a string of `len` characters, whose bytes are `chars`'s, the rest zero.
+#[inline]
+fn inline_value<'gc>(chars: u64, len: usize) -> Value<'gc> {
+    Value::from_bits(chars << 8 | (len as u64) << 4 | INLINE_STRING)
+}
+
+#[inline]
+fn inline_units(v: Value<'_>) -> Inline {
+    let word = v.to_bits();
+    Inline::new(word >> 8, (word >> 4 & 0xF) as usize)
+}
 
 /// A flat string, a [`Rope`] or an [`Extern`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -77,7 +101,7 @@ impl<'a, 'gc> Strings<'a, 'gc> {
     /// `v` as a string, if it is one: read from the type number `v` carries.
     #[inline]
     pub fn string(&self, v: Value<'gc>) -> Option<Str<'gc>> {
-        Text::of(v).map(|_| Str(v))
+        (is_inline(v) || Text::of(v).is_some()).then_some(Str(v))
     }
 }
 
@@ -109,11 +133,17 @@ impl<'gc> Host for Strings<'_, 'gc> {
             Some(Text::Str8(x)) => StrView::Flat(Units::Packed(Packed::new(x.items(mc).words(), x.chars(mc) as usize, Width::One))),
             Some(Text::Str16(x)) => StrView::Flat(Units::Packed(Packed::new(x.items(mc).words(), x.chars(mc) as usize, Width::Two))),
             Some(Text::Str32(x)) => StrView::Flat(Units::Packed(Packed::new(x.items(mc).words(), x.chars(mc) as usize, Width::Four))),
+            None => StrView::Flat(Units::Inline(inline_units(s.0))),
             _ => self.view_rest(s),
         }
     }
 
     fn flat(&self, width: Width, len: usize, init: impl FnOnce(UnitsMut<'_>)) -> Result<Str<'gc>, Error> {
+        if width == Width::One && len <= INLINE_CHARS {
+            let word = [Cell::new(0)];
+            init(UnitsMut::Packed(PackedMut::new(&word, len, width)));
+            return Ok(Str(inline_value(Inline::new(word[0].get(), len).word(), len)));
+        }
         let mc = self.mc;
         let (chars, words) = (len as u64, len.div_ceil(width.per_word()));
         let (v, items) = match width {

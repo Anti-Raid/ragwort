@@ -30,7 +30,7 @@ pub use intern::{Table, intern, intern_str};
 pub use iter::{Chars, Chunks};
 pub use rope::{concat, concat_all, flatten, substring};
 pub use search::{Split, SplitWhitespace, ends_with, find, rfind, split, split_whitespace, splitn, starts_with, trim, trim_end, trim_start};
-pub use units::{Packed, PackedMut, Units, UnitsMut, Width};
+pub use units::{Inline, Packed, PackedMut, Units, UnitsMut, Width};
 
 /// The longest string: a rope can share one string many times over, so length isn't bounded
 /// by memory.
@@ -318,6 +318,13 @@ fn rope_equal_str<H: Host>(h: &H, s: H::Str, t: &str) -> Result<bool, H::Error> 
 
 #[inline]
 fn units_equal_str<H: Host>(h: &H, units: Units<'_>, t: &str) -> Result<bool, H::Error> {
+    if let Units::Inline(p) = units
+        && p.len() == t.len()
+    {
+        h.charge(t.len() as u64)?;
+        let w = units::Unit::pack(t.as_bytes());
+        return Ok(w == p.word() && w & hash::HIGH == 0);
+    }
     if let Units::One(bytes) = units
         && bytes.len() == t.len()
     {
@@ -412,6 +419,20 @@ impl Utf8<'_, '_> {
         self.f.write_str(std::str::from_utf8(&self.buf[..n]).expect("whole characters"))
     }
 
+    /// Latin-1 bytes encoded into the buffer, which has room for them.
+    #[inline]
+    fn latin1(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if b < 0x80 {
+                self.buf[self.n] = b;
+                self.n += 1;
+            } else {
+                self.buf[self.n..self.n + 2].copy_from_slice(&[0xC0 | b >> 6, 0x80 | b & 0x3F]);
+                self.n += 2;
+            }
+        }
+    }
+
     fn units(&mut self, units: Units<'_>) -> fmt::Result {
         match units {
             Units::One(bytes) if bytes.is_ascii() => {
@@ -433,16 +454,15 @@ impl Utf8<'_, '_> {
                     }
                     let mut block = [0; 64];
                     p.copy_bytes(from, &mut block[..k]);
-                    for &b in &block[..k] {
-                        if b < 0x80 {
-                            self.buf[self.n] = b;
-                            self.n += 1;
-                        } else {
-                            self.buf[self.n..self.n + 2].copy_from_slice(&[0xC0 | b >> 6, 0x80 | b & 0x3F]);
-                            self.n += 2;
-                        }
-                    }
+                    self.latin1(&block[..k]);
                 }
+                Ok(())
+            }
+            Units::Inline(p) => {
+                if self.n + 2 * p.len() > self.buf.len() {
+                    self.flush()?;
+                }
+                self.latin1(&p.word().to_le_bytes()[..p.len()]);
                 Ok(())
             }
             _ => {

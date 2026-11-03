@@ -4,6 +4,7 @@
 //! uppercase of the lowercase, except that dotless `ı` stays as it is and Cherokee folds to
 //! uppercase.
 
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::char::{ToLowercase, ToUppercase};
 use std::iter::FlatMap;
@@ -33,7 +34,8 @@ pub fn compare_ci<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<Ordering, H::E
         return Ok(Ordering::Equal);
     }
     h.charge((len(h, a) + len(h, b)) as u64)?;
-    if let (Some(Units::Packed(x)), Some(Units::Packed(y))) = (flat(h, a), flat(h, b))
+    let (x, y) = (Cell::new(0), Cell::new(0));
+    if let (Some(Units::Packed(x)), Some(Units::Packed(y))) = (flat(h, a).map(|u| u.anchored(&x)), flat(h, b).map(|u| u.anchored(&y)))
         && x.is_ascii()
         && y.is_ascii()
     {
@@ -104,7 +106,8 @@ impl Case {
 /// `s` mapped, or `s` itself if that changes nothing.
 fn map_case<H: Host>(h: &H, s: H::Str, case: Case) -> Res<H> {
     h.charge(len(h, s) as u64)?;
-    if let Some(Units::Packed(p)) = flat(h, s)
+    let cell = Cell::new(0);
+    if let Some(Units::Packed(p)) = flat(h, s).map(|u| u.anchored(&cell))
         && p.is_ascii()
     {
         let n = p.len();

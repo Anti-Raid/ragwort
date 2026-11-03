@@ -4,7 +4,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use ragwort_num::{Host as NumHost, int};
-use ragwort_string::{Host, char_at, concat, display, equal, from_str, hash, len};
+use ragwort_string::{Host, char_at, concat, display, equal, find, from_str, hash, len, split};
 
 /// Keeps each benchmark's best time, since runs interleave and noise only adds.
 #[derive(Default)]
@@ -73,6 +73,34 @@ pub fn replies<H: Host>(h: &H, n: usize) -> usize {
         write!(out, "{}", display(h, s)).ok().expect("write");
     }
     out.len()
+}
+
+/// Short strings compared, as a bot matches a command's name against the ones it knows.
+#[inline(never)]
+pub fn equal_short<H: Host>(h: &H, n: usize) -> usize {
+    let names = ["!help", "!ping", "!ban", "!kick"].map(|s| from_str(h, s).ok().expect("alloc"));
+    let got = from_str(h, "!ban").ok().expect("alloc");
+    (0..n).filter(|&i| equal(h, black_box(got), black_box(names[i & 3])).ok().expect("equal")).count()
+}
+
+#[inline(never)]
+pub fn hash_short<H: Host>(h: &H, n: usize) -> u64 {
+    let s = from_str(h, "!ping").ok().expect("alloc");
+    (0..n).fold(0, |acc, i| acc ^ hash(h, black_box(s), i as u64).ok().expect("hash"))
+}
+
+/// A command split into its arguments, most of them short.
+#[inline(never)]
+pub fn split_commands<H: Host>(h: &H, n: usize) -> usize {
+    let (s, space) = (from_str(h, "!ban user42 7d spam links").ok().expect("alloc"), from_str(h, " ").ok().expect("alloc"));
+    (0..n).map(|_| split(h, black_box(s), space).filter(|p| black_box(p.is_ok())).count()).sum()
+}
+
+/// A short word looked for in a message.
+#[inline(never)]
+pub fn find_short<H: Host>(h: &H, n: usize) -> usize {
+    let (s, word) = (from_str(h, MESSAGES[2]).ok().expect("alloc"), from_str(h, "nothing").ok().expect("alloc"));
+    (0..n).filter_map(|_| find(h, black_box(s), black_box(word), 0).ok().expect("find")).sum()
 }
 
 /// Four-digit bignums multiplied, the results dropped.

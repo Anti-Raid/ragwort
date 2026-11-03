@@ -102,6 +102,72 @@ fn text_operations_work_on_every_kind_of_string() {
     });
 }
 
+/// Latin-1 strings of up to seven characters are values, not objects: making one allocates
+/// nothing, equal ones are the same value, and they read as any other flat string does.
+#[test]
+fn short_strings_live_in_the_word() {
+    let mut arena = arena(8 << 20);
+    arena.set_evacuate_all(true);
+    let texts = ["", "a", "!ping", "café", "1234567", "ÿÿÿÿÿÿÿ"];
+    arena.fail_after(Some(0));
+    arena.mutate(|mc| {
+        let h = Strings::new(mc);
+        for &t in &texts {
+            let v = from_str(&h, t).unwrap();
+            assert!(v.value().immediate().is_some(), "{t:?}");
+            assert_eq!(v, from_str(&h, t).unwrap(), "equal ones are the same value");
+            assert_eq!((display(&h, v).to_string(), len(&h, v)), (t.to_string(), t.chars().count()));
+            assert_eq!(hash(&h, v, 9), Ok(hash_str(t, 9)), "{t:?}");
+            assert_eq!(utf8_len(&h, v), Ok(t.len()));
+        }
+        assert_eq!(from_str(&h, "12345678"), Err(Error::OutOfMemory), "the first allocation is the one that fails");
+    });
+    arena.fail_after(None);
+    arena.mutate(|mc| {
+        let h = Strings::new(mc);
+        let s = |t: &str| from_str(&h, t).unwrap();
+        for &t in &texts {
+            root(mc).push(mc, s(t).value()).unwrap();
+        }
+        for t in ["12345678", "Ā", "日本"] {
+            assert!(s(t).value().immediate().is_none(), "{t:?}");
+        }
+        let long = s(&format!("!ban user42 7d spam {}", "and links ".repeat(300)));
+        let words: Vec<_> = split(&h, long, s(" ")).take(4).map(Result::unwrap).collect();
+        assert_eq!(words, ["!ban", "user42", "7d", "spam"].map(s), "pieces of a longer string");
+        assert_eq!(substring(&h, long, 5, 11), Ok(s("user42")));
+        assert_eq!(concat(&h, s("ab"), s("cd")), Ok(s("abcd")));
+        assert!(concat(&h, s("abcd"), s("efgh")).unwrap().value().immediate().is_none());
+        assert_eq!(find(&h, long, s("links"), 0), Ok(Some(24)));
+        assert_eq!(find(&h, s("!ping"), s("in"), 0), Ok(Some(2)));
+        assert_eq!(rfind(&h, s("abcabc"), s("b"), 6), Ok(Some(4)));
+        assert_eq!(starts_with(&h, long, s("!ban u")), Ok(true));
+        assert_eq!(upcase(&h, s("café")), Ok(s("CAFÉ")));
+        assert_eq!(compare_ci(&h, s("!BAN"), words[0]), Ok(Ordering::Equal));
+        assert_eq!(compare(&h, s("abc"), substring(&h, long, 5, 9).unwrap()), Ok(Ordering::Less));
+        assert_eq!(equal_str(&h, s("café"), "café"), Ok(true));
+        assert_eq!(char_at(&h, s("café"), 3), Ok('é'));
+        let rope = concat(&h, long, s("!")).unwrap();
+        let text = format!("{}!", display(&h, long));
+        assert!(!is_flat(&h, rope));
+        assert_eq!(display(&h, rope).to_string(), text);
+        assert_eq!(hash(&h, rope, 3), Ok(hash_str(&text, 3)));
+        assert_eq!(equal(&h, rope, flatten(&h, rope).unwrap()), Ok(true));
+        assert_eq!(ends_with(&h, rope, s("links !")), Ok(true));
+        root(mc).push(mc, rope.value()).unwrap();
+    });
+    arena.collect();
+    arena.collect();
+    arena.mutate(|mc| {
+        let h = Strings::new(mc);
+        for (i, t) in texts.iter().enumerate() {
+            assert_eq!(h.string(root(mc).get(mc, i).unwrap()), Some(from_str(&h, t).unwrap()));
+        }
+        let rope = h.string(root(mc).get(mc, texts.len()).unwrap()).unwrap();
+        assert_eq!(ends_with(&h, rope, from_str(&h, "links !").unwrap()), Ok(true));
+    });
+}
+
 /// Strings made and dropped in the young generation go at the next minor collection, and the
 /// kept ones keep their characters.
 #[test]

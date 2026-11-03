@@ -38,7 +38,14 @@ pub fn intern<H: Host, T: Table<H>>(h: &H, table: &T, s: H::Str) -> Result<T::En
 #[inline]
 pub fn intern_str<H: Host, T: Table<H>>(h: &H, table: &T, s: &str) -> Result<T::Entry, H::Error> {
     let hash = hash_str(s, table.seed());
-    table.find_or_insert(h, probe_hash(hash), |entry| equal_str(h, table.name(h, entry), s), || table.make(h, from_str(h, s)?, hash))
+    table.find_or_insert(h, probe_hash(hash), |entry| named(h, table, entry, s), || table.make(h, from_str(h, s)?, hash))
+}
+
+/// Whether `entry` is named `s`. Kept out of the probe: inlined, its setup for `s` would run on
+/// every call, before any entry is compared.
+#[inline(never)]
+fn named<H: Host, T: Table<H>>(h: &H, table: &T, entry: T::Entry, s: &str) -> Result<bool, H::Error> {
+    equal_str(h, table.name(h, entry), s)
 }
 
 fn probe_hash(hash: u64) -> u64 {

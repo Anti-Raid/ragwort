@@ -2,6 +2,8 @@
 //! packed into words, so every shape of a string hashes the same, and so does a `&str` of the
 //! same text. Strings whose units fit in [`SHORT`] bytes, such as most names, hash in one step.
 
+use std::cell::Cell;
+
 use crate::units::Unit;
 use crate::{Host, Info, Packed, Units, Width, chunks, flat, summary};
 
@@ -97,11 +99,13 @@ impl State {
 
     #[inline]
     fn units(&mut self, u: Units<'_>) {
-        match u {
+        let cell = Cell::new(0);
+        match u.anchored(&cell) {
             Units::One(s) => self.run(s),
             Units::Two(s) => self.run(s),
             Units::Four(s) => self.run(s),
             Units::Packed(p) => self.packed(p),
+            Units::Inline(_) => unreachable!("anchored"),
         }
     }
 
@@ -217,6 +221,7 @@ fn hash_flat(units: Units<'_>, seed: u64) -> u64 {
     let n = len * width.bytes();
     match units {
         Units::One(b) => return short(words(b), seed, len, width),
+        Units::Inline(p) => return short(words(&p.word().to_le_bytes()[..len]), seed, len, width),
         Units::Packed(p) => p.copy_bytes(0, &mut buf[..n]),
         _ => _ = gather(&mut buf, 0, codes(units), width),
     }
