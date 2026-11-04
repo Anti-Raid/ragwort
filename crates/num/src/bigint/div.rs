@@ -10,10 +10,10 @@ pub fn divide_single(mut q: Option<RWDigits<'_>>, x: Digits<'_>, y: Digit) -> Di
     assert!(y != 0, "division by zero");
     let mut rem: Digit = 0;
     for i in (0..x.len()).rev() {
-        let t = (rem as TwoDigits) << DIGIT_BITS | x[i] as TwoDigits;
+        let t = (rem as TwoDigits) << DIGIT_BITS | x.at(i) as TwoDigits;
         rem = (t % y as TwoDigits) as Digit;
         if let Some(q) = &mut q {
-            q[i] = (t / y as TwoDigits) as Digit;
+            q.set(i, (t / y as TwoDigits) as Digit);
         }
     }
     if let Some(mut q) = q {
@@ -48,10 +48,10 @@ pub fn divide(
         return;
     }
     if y.len() == 1 {
-        let rem = divide_single(q, x, y[0]);
+        let rem = divide_single(q, x, y.at(0));
         if let Some(mut r) = r {
             r.clear();
-            r[0] = rem;
+            r.set(0, rem);
         }
         return;
     }
@@ -72,15 +72,16 @@ fn divide_schoolbook(
     // Shift so the divisor's top bit is set, which keeps each quotient guess within 2.
     let s = y.msd().leading_zeros() as usize;
     shift_into(v.reborrow(), y, s);
-    u[x.len()] = shift_into(u.reborrow(), x, s);
-    let (top, next) = (v[n - 1] as TwoDigits, v[n - 2] as TwoDigits);
+    let top_bits = shift_into(u.reborrow(), x, s);
+    u.set(x.len(), top_bits);
+    let (top, next) = (v.at(n - 1) as TwoDigits, v.at(n - 2) as TwoDigits);
     if let Some(q) = &mut q {
         q.offset(m + 1).clear();
     }
     for j in (0..=m).rev() {
-        let num = (u[j + n] as TwoDigits) << DIGIT_BITS | u[j + n - 1] as TwoDigits;
+        let num = (u.at(j + n) as TwoDigits) << DIGIT_BITS | u.at(j + n - 1) as TwoDigits;
         let (mut qhat, mut rhat) = (num / top, num % top);
-        while qhat >> DIGIT_BITS != 0 || qhat * next > (rhat << DIGIT_BITS | u[j + n - 2] as TwoDigits) {
+        while qhat >> DIGIT_BITS != 0 || qhat * next > (rhat << DIGIT_BITS | u.at(j + n - 2) as TwoDigits) {
             qhat -= 1;
             rhat += top;
             if rhat >> DIGIT_BITS != 0 {
@@ -90,23 +91,22 @@ fn divide_schoolbook(
         // u[j..=j + n] -= qhat * v
         let (mut carry, mut borrow) = (0 as Digit, 0 as Digit);
         for i in 0..n {
-            let p = qhat * v[i] as TwoDigits + carry as TwoDigits;
+            let p = qhat * v.at(i) as TwoDigits + carry as TwoDigits;
             carry = (p >> DIGIT_BITS) as Digit;
-            (u[i + j], borrow) = digit_sub(u[i + j], p as Digit, borrow);
+            borrow = u.put(i + j, digit_sub(u.at(i + j), p as Digit, borrow));
         }
-        let negative;
-        (u[j + n], negative) = digit_sub(u[j + n], carry, borrow);
+        let negative = u.put(j + n, digit_sub(u.at(j + n), carry, borrow));
         if negative != 0 {
             // The guess was one too big, which is rare: add the divisor back.
             qhat -= 1;
             let mut c = 0;
             for i in 0..n {
-                (u[i + j], c) = digit_add(u[i + j], v[i], c);
+                c = u.put(i + j, digit_add(u.at(i + j), v.at(i), c));
             }
-            u[j + n] = u[j + n].wrapping_add(c);
+            u.set(j + n, u.at(j + n).wrapping_add(c));
         }
         if let Some(q) = &mut q {
-            q[j] = qhat as Digit;
+            q.set(j, qhat as Digit);
         }
     }
     if let Some(mut r) = r {
@@ -123,8 +123,8 @@ fn shift_into(mut z: RWDigits<'_>, x: Digits<'_>, s: usize) -> Digit {
     }
     let mut carry = 0;
     for i in 0..x.len() {
-        z[i] = x[i] << s | carry;
-        carry = x[i] >> (DIGIT_BITS - s);
+        z.set(i, x.at(i) << s | carry);
+        carry = x.at(i) >> (DIGIT_BITS - s);
     }
     carry
 }

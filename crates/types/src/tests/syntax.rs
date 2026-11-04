@@ -171,5 +171,5 @@ fn line_metadata_obeys_the_arena_limit() {
         assert!(SyntaxSession::new(mc, "\n".repeat(32 << 10)).is_err());
     });
     arena.collect();
-    assert_eq!((arena.objects(), arena.blobs()), (0, 0));
+    assert_eq!((arena.objects(), arena.frozen_values()), (0, 0));
 }

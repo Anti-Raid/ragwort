@@ -12,6 +12,7 @@ mod iter;
 mod rope;
 mod search;
 mod units;
+mod word;
 
 #[cfg(test)]
 #[path = "tests/support.rs"]
@@ -230,11 +231,10 @@ pub fn compare<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<Ordering, H::Erro
 #[inline(never)]
 fn rope_compare<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<Ordering, H::Error> {
     let ((ia, fa), (ib, fb)) = (summary(h, a), summary(h, b));
-    let (la, lb) = (ia.len, ib.len);
-    h.charge(la.min(lb) as u64)?;
+    let n = ia.len.min(ib.len);
+    h.charge(n as u64)?;
     if let (Some(x), Some(y)) = (fa, fb) {
-        let n = la.min(lb);
-        return Ok(x.slice(0..n).compare(y.slice(0..n)).then(la.cmp(&lb)));
+        return Ok(x.slice(0..n).compare(y.slice(0..n)).then(ia.len.cmp(&ib.len)));
     }
     compare_chunks(h, a, b)
 }
@@ -286,11 +286,10 @@ fn rope_equal<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<bool, H::Error> {
     if ia.len != ib.len || ia.width != ib.width {
         return Ok(false);
     }
+    h.charge(ia.len as u64)?;
     if let (Some(x), Some(y)) = (fa, fb) {
-        h.charge(ia.len as u64)?;
         return Ok(x.equal(y));
     }
-    h.charge(ia.len as u64)?;
     Ok(compare_chunks(h, a, b)? == Ordering::Equal)
 }
 
@@ -318,27 +317,23 @@ fn rope_equal_str<H: Host>(h: &H, s: H::Str, t: &str) -> Result<bool, H::Error> 
 
 #[inline]
 fn units_equal_str<H: Host>(h: &H, units: Units<'_>, t: &str) -> Result<bool, H::Error> {
+    // As many characters as `t` has bytes match only if `t` is ASCII: Latin-1 isn't UTF-8 past
+    // it. A test for each kind rather than a match: names mix kinds, and a jump table guesses
+    // worse.
     if let Units::Inline(p) = units
         && p.len() == t.len()
     {
         h.charge(t.len() as u64)?;
-        let w = units::Unit::pack(t.as_bytes());
-        return Ok(w == p.word() && w & hash::HIGH == 0);
+        return Ok(p.equal_ascii(t.as_bytes()));
     }
     if let Units::One(bytes) = units
         && bytes.len() == t.len()
     {
         h.charge(t.len() as u64)?;
-        // Equal bytes are equal characters only if they're ASCII: Latin-1 isn't UTF-8 past it.
-        if t.len() <= hash::SHORT {
-            let w = hash::words(t.as_bytes());
-            return Ok(hash::words(bytes) == w && (w.0 | w.1) & hash::HIGH == 0);
-        }
-        return Ok(bytes == t.as_bytes() && t.is_ascii());
+        return Ok(word::equal_ascii(bytes, t.as_bytes()));
     }
     if let Units::Packed(p) = units
         && p.len() == t.len()
-        && p.width() == Width::One
     {
         h.charge(t.len() as u64)?;
         return Ok(p.equal_ascii(t.as_bytes()));
@@ -462,7 +457,7 @@ impl Utf8<'_, '_> {
                 if self.n + 2 * p.len() > self.buf.len() {
                     self.flush()?;
                 }
-                self.latin1(&p.word().to_le_bytes()[..p.len()]);
+                self.latin1(&p.bytes()[..p.len()]);
                 Ok(())
             }
             _ => {

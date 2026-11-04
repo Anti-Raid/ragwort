@@ -39,7 +39,7 @@ pub fn to_string(x: Digits<'_>, radix: u32, mut scratch: RWDigits<'_>, out: &mut
     let mut len = x.len();
     while len > 0 {
         let mut rem = divide_in_place(scratch.slice(0, len), power);
-        while len > 0 && scratch[len - 1] == 0 {
+        while len > 0 && scratch.at(len - 1) == 0 {
             len -= 1;
         }
         // Every chunk but the most significant has all its characters, leading zeros too.
@@ -58,8 +58,8 @@ pub fn to_string(x: Digits<'_>, radix: u32, mut scratch: RWDigits<'_>, out: &mut
 fn divide_in_place(mut z: RWDigits<'_>, d: Digit) -> Digit {
     let mut rem: Digit = 0;
     for i in (0..z.len()).rev() {
-        let t = (rem as TwoDigits) << DIGIT_BITS | z[i] as TwoDigits;
-        z[i] = (t / d as TwoDigits) as Digit;
+        let t = (rem as TwoDigits) << DIGIT_BITS | z.at(i) as TwoDigits;
+        z.set(i, (t / d as TwoDigits) as Digit);
         rem = (t % d as TwoDigits) as Digit;
     }
     rem
@@ -96,7 +96,7 @@ pub fn from_string(mut z: RWDigits<'_>, text: &[u8], radix: u32) -> Option<()> {
         }
         let carry = multiply_add_in_place(z.slice(0, len), scale, value);
         if carry != 0 {
-            z[len] = carry;
+            z.set(len, carry);
             len += 1;
         }
     }

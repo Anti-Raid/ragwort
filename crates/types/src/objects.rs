@@ -1,11 +1,11 @@
 //! The objects behind the views the other modules give out. They're private to the crate, so
 //! only those views change them: pairs and literal vectors stay as they were made.
 
-use ragwort_gc_words::table::TableHead;
+use crate::gc::table::TableHead;
 
-ragwort_gc_words::objects! {
-    /// Every object this crate makes. Strings and numbers are `ragwort-gc-words`' own.
-    pub(crate) kind Data;
+crate::gc::objects! {
+    /// Every object this crate makes. Strings and numbers are in their own groups.
+    pub(crate) kind Data after crate::num::Numbers;
 
     /// A symbol: its name, a flat string, and the name's hash.
     pub(crate) struct Sym { name: Value, hash: u64 }
@@ -16,10 +16,10 @@ ragwort_gc_words::objects! {
     pub(crate) struct Vector {} items Value
     pub(crate) struct ImmutableVector {} items Value
     /// Source bytes, in no particular encoding.
-    pub(crate) struct SyntaxText { bytes: Blob<u8> }
+    pub(crate) struct SyntaxText { bytes: Frozen<Box<[u8]>> }
     /// A source's name, its text while a session keeps it, its length, and the byte offset of
     /// each line's start, from zero.
-    pub(crate) struct SyntaxSource { name: Member<SyntaxText>, text: Weak<SyntaxText>, size: u64, lines: Blob<u32> }
+    pub(crate) struct SyntaxSource { name: Member<SyntaxText>, text: Weak<SyntaxText>, size: u64, lines: Frozen<Box<[u32]>> }
     /// What a session keeps alive: the source, and its text.
     pub(crate) struct Session { source: Member<SyntaxSource>, text: Member<SyntaxText> }
     /// An identifier's scopes.

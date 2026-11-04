@@ -8,7 +8,7 @@ ragwort's heap is a 64MB region of 64-bit words, and every reference into it is 
 
 ## GC
 
-See ``crates/gc-words`` for ragwort's GC. Internally uses a incremental tristate mark-sweep gc with generations (because scheme code tends to be full of short-lived allocations so most objects will likely fall into young generation), and evacuates fragmented pages.
+See ``crates/types/src/gc`` for ragwort's GC. Internally uses a incremental tristate mark-sweep gc with generations (because scheme code tends to be full of short-lived allocations so most objects will likely fall into young generation), and evacuates fragmented pages.
 
 ## Stack
 

@@ -160,9 +160,7 @@ impl Host for TestHost {
     fn flat(&self, width: Width, len: usize, init: impl FnOnce(UnitsMut<'_>)) -> Result<TestStr, TestError> {
         self.flats.set(self.flats.get() + 1);
         if self.flats.get() % 3 == 1 && width == Width::One && len <= 8 {
-            let word = [Cell::new(0)];
-            init(UnitsMut::Packed(PackedMut::new(&word, len, width)));
-            return Ok(self.push(Node::Inline(Inline::new(word[0].get(), len))));
+            return Ok(self.push(Node::Inline(Inline::filled(len, init))));
         }
         if self.flats.get().is_multiple_of(3) {
             let words: Box<[Cell<u64>]> = (0..len.div_ceil(width.per_word())).map(|_| Cell::new(0)).collect();

@@ -93,8 +93,7 @@ impl<'a> Signed<'a> {
         match view {
             IntView::Small(n) => {
                 buf[0] = n.unsigned_abs();
-                let buf: &'a [Digit; 1] = buf;
-                Self { negative: n < 0, digits: Digits::new(buf).normalize() }
+                Self { negative: n < 0, digits: Digits::of_mut(buf).normalize() }
             }
             IntView::Big { negative, digits } => {
                 debug_assert_eq!(digits.normalize().len(), digits.len(), "big integers have no high zero digits");
@@ -118,7 +117,7 @@ fn make<H: Host>(h: &H, negative: bool, len: usize, init: impl FnOnce(RWDigits<'
     if len <= STACK {
         let mut buf = [0; STACK];
         init(RWDigits::new(&mut buf[..len]));
-        return from_digits(h, negative, Digits::new(&buf[..len]));
+        return from_digits(h, negative, Digits::of_mut(&mut buf[..len]));
     }
     // A long result can still come out short, as when subtracting nearly equal numbers.
     let (mut short, mut kept) = (None, 0);
@@ -161,8 +160,8 @@ fn to_small(negative: bool, digits: Digits<'_>) -> Option<i64> {
     debug_assert_eq!(digits.normalize().len(), digits.len());
     match digits.len() {
         0 => Some(0),
-        1 if negative => (digits[0] <= 1 << 63).then(|| (digits[0] as i64).wrapping_neg()),
-        1 => i64::try_from(digits[0]).ok(),
+        1 if negative => (digits.at(0) <= 1 << 63).then(|| (digits.at(0) as i64).wrapping_neg()),
+        1 => i64::try_from(digits.at(0)).ok(),
         _ => None,
     }
 }
@@ -184,7 +183,7 @@ pub fn from_digits<H: Host>(h: &H, negative: bool, digits: Digits<'_>) -> Res<H>
 pub fn from_i64<H: Host>(h: &H, n: i64) -> Res<H> {
     match h.small(n) {
         Some(x) => Ok(x),
-        None => from_digits(h, n < 0, Digits::new(&[n.unsigned_abs()])),
+        None => from_digits(h, n < 0, Digits::of_mut(&mut [n.unsigned_abs()])),
     }
 }
 
@@ -192,7 +191,7 @@ pub fn from_i64<H: Host>(h: &H, n: i64) -> Res<H> {
 pub fn from_u64<H: Host>(h: &H, n: u64) -> Res<H> {
     match i64::try_from(n).ok().and_then(|n| h.small(n)) {
         Some(x) => Ok(x),
-        None => from_digits(h, false, Digits::new(&[n])),
+        None => from_digits(h, false, Digits::of_mut(&mut [n])),
     }
 }
 
@@ -204,7 +203,7 @@ pub fn from_i128<H: Host>(h: &H, n: i128) -> Res<H> {
         return Ok(x);
     }
     let m = n.unsigned_abs();
-    from_digits(h, n < 0, Digits::new(&[m as Digit, (m >> DIGIT_BITS) as Digit]))
+    from_digits(h, n < 0, Digits::of_mut(&mut [m as Digit, (m >> DIGIT_BITS) as Digit]))
 }
 
 pub fn to_i64<H: Host>(h: &H, x: H::Int) -> Option<i64> {
@@ -223,7 +222,7 @@ pub fn from_integral_f64<H: Host>(h: &H, f: f64) -> Res<H> {
     let bits = f.to_bits();
     let mantissa = bits & ((1 << 52) - 1) | 1 << 52;
     let shift = ((bits >> 52) & 0x7ff) as usize - 1075;
-    make_long(h, f < 0.0, shift / DIGIT_BITS + 2, |z| bigint::left_shift(z, Digits::new(&[mantissa]), shift))
+    make_long(h, f < 0.0, shift / DIGIT_BITS + 2, |z| bigint::left_shift(z, Digits::of_mut(&mut [mantissa]), shift))
 }
 
 /// The nearest double, ties to even.
@@ -264,7 +263,7 @@ pub fn hash<H: Host, S: Hasher>(h: &H, x: H::Int, state: &mut S) {
             Some(n) => state.write_i64(n),
             None => {
                 for i in 0..digits.len() {
-                    state.write_u64(digits[i]);
+                    state.write_u64(digits.at(i));
                 }
                 state.write_u8(negative as u8);
                 state.write_usize(digits.len());
@@ -421,7 +420,7 @@ pub fn divide<H: Host>(
     }
 
     if yd.len() == 1 {
-        let d = yd[0];
+        let d = yd.at(0);
         let mut rem = 0;
         let q = if want_q {
             Some(make(h, q_negative, xd.len(), |mut z| {
@@ -436,8 +435,8 @@ pub fn divide<H: Host>(
         };
         let r = match (want_r, adjust && rem != 0) {
             (false, _) => None,
-            (true, true) => Some(from_digits(h, ys.negative, Digits::new(&[d - rem]))?),
-            (true, false) => Some(from_digits(h, xs.negative, Digits::new(&[rem]))?),
+            (true, true) => Some(from_digits(h, ys.negative, Digits::of_mut(&mut [d - rem]))?),
+            (true, false) => Some(from_digits(h, xs.negative, Digits::of_mut(&mut [rem]))?),
         };
         return Ok((q, r));
     }
@@ -451,19 +450,19 @@ pub fn divide<H: Host>(
     let (r, scratch) = rest.split_at_mut(r_len);
     let q_out = want_q.then(|| RWDigits::new(&mut q[..q_len - 1]));
     bigint::divide(q_out, Some(RWDigits::new(r)), xd, yd, RWDigits::new(scratch));
-    let adjust = adjust && !Digits::new(r).is_zero();
+    let adjust = adjust && !Digits::of_mut(r).is_zero();
     let q = if want_q {
         if adjust {
             bigint::add_digit(RWDigits::new(q), 1);
         }
-        Some(from_digits(h, q_negative, Digits::new(q))?)
+        Some(from_digits(h, q_negative, Digits::of_mut(q))?)
     } else {
         None
     };
     let r = match (want_r, adjust) {
         (false, _) => None,
-        (true, true) => Some(make(h, ys.negative, r_len, |z| bigint::subtract(z, yd, Digits::new(r)))?),
-        (true, false) => Some(from_digits(h, xs.negative, Digits::new(r))?),
+        (true, true) => Some(make(h, ys.negative, r_len, |z| bigint::subtract(z, yd, Digits::of_mut(r)))?),
+        (true, false) => Some(from_digits(h, xs.negative, Digits::of_mut(r))?),
     };
     Ok((q, r))
 }
@@ -521,19 +520,19 @@ pub fn gcd<H: Host>(h: &H, x: H::Int, y: H::Int) -> Res<H> {
     // Euclid's algorithm, rotating three buffers: a, b, then a mod b.
     let len = x.len() + 1;
     h.scratch(3 * len + bigint::divide_scratch(x, y))?;
-    let (mut a, mut b, mut r) = (x.as_slice().to_vec(), y.as_slice().to_vec(), vec![0; len]);
+    let (mut a, mut b, mut r) = (x.iter().collect::<Vec<_>>(), y.iter().collect::<Vec<_>>(), vec![0; len]);
     let mut scratch = vec![0; bigint::divide_scratch(x, y)];
     loop {
-        let (ad, bd) = (Digits::new(&a).normalize(), Digits::new(&b).normalize());
+        let (ad, bd) = (Digits::of_mut(&mut a).normalize(), Digits::of_mut(&mut b).normalize());
         if bd.is_zero() {
             return from_digits(h, false, ad);
         }
         if ad.len() == 1 {
-            return from_u64(h, gcd_u64(ad[0], bd.get(0)));
+            return from_u64(h, gcd_u64(ad.at(0), bd.get(0)));
         }
         h.charge(bigint::divide_cost(ad, bd))?;
-        let (an, bn) = (ad.len(), bd.len());
-        bigint::divide(None, Some(RWDigits::new(&mut r[..bn])), Digits::new(&a[..an]), Digits::new(&b[..bn]), RWDigits::new(&mut scratch));
+        let bn = bd.len();
+        bigint::divide(None, Some(RWDigits::new(&mut r[..bn])), ad, bd, RWDigits::new(&mut scratch));
         r[bn..].fill(0);
         std::mem::swap(&mut a, &mut b);
         std::mem::swap(&mut b, &mut r);

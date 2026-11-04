@@ -3,7 +3,7 @@
 //! Syntax spans keep their source's metadata. A [`SyntaxSession`] separately keeps the source
 //! bytes alive; dropping its last clone allows the text to be collected.
 
-use crate::gc::{ForeignRoot, Gc, Mutation, OutOfMemory, Root, Value};
+use crate::gc::{ForeignRoot, FrozenRef, Gc, Mutation, OutOfMemory, Root, Value};
 use crate::objects::{
     self, Data, SessionFields, SyntaxContextFields, SyntaxFields, SyntaxMetaFields, SyntaxOriginFields, SyntaxSourceFields,
     SyntaxTextFields,
@@ -20,15 +20,12 @@ pub struct SyntaxText<'gc>(Gc<'gc, objects::SyntaxText>);
 impl<'gc> SyntaxText<'gc> {
     pub fn new(mc: &Mutation<'gc>, bytes: impl AsRef<[u8]>) -> Result<Self, OutOfMemory> {
         let bytes = bytes.as_ref();
-        let blob = mc.blob(bytes.len(), |b| {
-            b.copy_from_slice(bytes);
-            b.len()
-        })?;
-        Ok(Self(objects::SyntaxText::new(mc, blob)?))
+        let copy = frozen_slice(mc, bytes.len(), |out| out.copy_from_slice(bytes))?;
+        Ok(Self(objects::SyntaxText::new(mc, copy)?))
     }
 
     pub fn bytes(self, mc: &Mutation<'gc>) -> &'gc [u8] {
-        self.0.bytes(mc)
+        self.0.bytes(mc).map_or(&[], |b| b)
     }
 }
 
@@ -54,7 +51,7 @@ impl<'gc> SyntaxSource<'gc> {
 
     /// Each line's first byte offset, from zero.
     pub fn line_starts(self, mc: &Mutation<'gc>) -> &'gc [u32] {
-        self.0.lines(mc)
+        self.0.lines(mc).map_or(&[], |l| l)
     }
 
     /// Looks up a byte offset, including EOF. Works after the text is collected.
@@ -96,10 +93,7 @@ impl SyntaxSession {
         let len = u32::try_from(bytes.len()).map_err(|_| mc.out_of_memory())?;
         let text = SyntaxText::new(mc, bytes)?;
         let name = name.map(|name| SyntaxText::new(mc, name)).transpose()?;
-        let lines = mc.blob(line_starts(bytes).count(), |out| {
-            out.iter_mut().zip(line_starts(bytes)).for_each(|(o, start)| *o = start);
-            out.len()
-        })?;
+        let lines = frozen_slice(mc, line_starts(bytes).count(), |out| out.iter_mut().zip(line_starts(bytes)).for_each(|(o, start)| *o = start))?;
         let source = objects::SyntaxSource::new(mc, name.map(|n| n.0), Some(text.0), u64::from(len), lines)?;
         let session = objects::Session::new(mc, Some(source), Some(text.0))?;
         Ok(Self { root: Root::new(mc, session)? })
@@ -112,6 +106,20 @@ impl SyntaxSession {
     pub fn text<'gc>(&self, mc: &Mutation<'gc>) -> Result<SyntaxText<'gc>, ForeignRoot> {
         Ok(SyntaxText(self.root.get(mc)?.text(mc).expect("a session has its text")))
     }
+}
+
+/// `len` zeroed items that `fill` sets, frozen and charged their size, failing as an allocation
+/// would rather than aborting when the system has no room for them.
+fn frozen_slice<'gc, T: Copy + Default + 'static>(
+    mc: &Mutation<'gc>,
+    len: usize,
+    fill: impl FnOnce(&mut [T]),
+) -> Result<FrozenRef<'gc, Box<[T]>>, OutOfMemory> {
+    let mut items = Vec::new();
+    items.try_reserve_exact(len).map_err(|_| mc.out_of_memory())?;
+    items.resize(len, T::default());
+    fill(&mut items);
+    mc.frozen_owning(items.into_boxed_slice(), len * size_of::<T>())
 }
 
 fn line_starts(bytes: &[u8]) -> impl Iterator<Item = u32> + '_ {

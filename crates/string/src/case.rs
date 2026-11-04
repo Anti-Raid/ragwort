@@ -9,6 +9,7 @@ use std::cmp::Ordering;
 use std::char::{ToLowercase, ToUppercase};
 use std::iter::FlatMap;
 
+use crate::word::{HIGH, ONES};
 use crate::{Host, Res, Units, Width, chars, flat, from_chars, len};
 
 #[cfg(test)]
@@ -34,8 +35,9 @@ pub fn compare_ci<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<Ordering, H::E
         return Ok(Ordering::Equal);
     }
     h.charge((len(h, a) + len(h, b)) as u64)?;
-    let (x, y) = (Cell::new(0), Cell::new(0));
-    if let (Some(Units::Packed(x)), Some(Units::Packed(y))) = (flat(h, a).map(|u| u.anchored(&x)), flat(h, b).map(|u| u.anchored(&y)))
+    let (cell_a, cell_b) = (Cell::new(0), Cell::new(0));
+    let (x, y) = (flat(h, a).map(|u| u.anchored(&cell_a)), flat(h, b).map(|u| u.anchored(&cell_b)));
+    if let (Some(Units::Packed(x)), Some(Units::Packed(y))) = (x, y)
         && x.is_ascii()
         && y.is_ascii()
     {
@@ -92,14 +94,13 @@ impl Case {
     /// Maps eight ASCII bytes at once: those from `lo` to `hi` flip their 0x20 bit. The bytes
     /// are all below 0x80, so adding to them never carries from one to the next.
     fn ascii(self, w: u64) -> u64 {
-        const ONES: u64 = 0x0101_0101_0101_0101;
         let (lo, hi) = match self {
             Self::Upper => (b'a', b'z'),
             Self::Lower | Self::Fold => (b'A', b'Z'),
         };
         let from_lo = w + ONES * u64::from(0x80 - lo);
         let past_hi = w + ONES * u64::from(0x7F - hi);
-        w ^ (from_lo & !past_hi & crate::hash::HIGH) >> 2
+        w ^ (from_lo & !past_hi & HIGH) >> 2
     }
 }
 
@@ -110,12 +111,11 @@ fn map_case<H: Host>(h: &H, s: H::Str, case: Case) -> Res<H> {
     if let Some(Units::Packed(p)) = flat(h, s).map(|u| u.anchored(&cell))
         && p.is_ascii()
     {
-        let n = p.len();
-        let words = (0..n.div_ceil(8)).map(|k| p.word_at(k, (n - 8 * k).min(8)));
+        let words = p.byte_words();
         if words.clone().all(|w| case.ascii(w) == w) {
             return Ok(s);
         }
-        return h.flat(Width::One, n, |mut out| out.write_words(words.map(|w| case.ascii(w))));
+        return h.flat(Width::One, p.len(), |mut out| out.write_words(words.map(|w| case.ascii(w))));
     }
     if chars(h, s).all(|c| case.map(c).eq([c])) {
         return Ok(s);

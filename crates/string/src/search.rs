@@ -7,6 +7,7 @@ use std::cell::Cell;
 use std::cmp::Ordering;
 use std::ops::Range;
 
+use crate::word::{HIGH, ONES, low_bytes};
 use crate::{Chunks, Host, Res, StrError, Units, Width, chunks, compare_runs, flat, flatten, info, len, substring};
 
 #[cfg(test)]
@@ -79,8 +80,8 @@ fn search<const BACK: bool>(text: Units<'_>, pattern: Units<'_>) -> Option<usize
     let found = match m {
         0 => return Some(if BACK { n } else { 0 }),
         1 => return find_code::<BACK>(text, pattern.code(0)),
-        2..=SHORT => {
-            let mut buf = [0; SHORT];
+        2..=COPIED_PATTERN => {
+            let mut buf = [0; COPIED_PATTERN];
             buf.iter_mut().zip(0..m).for_each(|(b, i)| *b = pattern.code(if BACK { m - 1 - i } else { i }));
             let p = &buf[..m];
             match text {
@@ -95,7 +96,6 @@ fn search<const BACK: bool>(text: Units<'_>, pattern: Units<'_>) -> Option<usize
 
 /// Where the code `c` first occurs in `text`, or last if `BACK`.
 fn find_code<const BACK: bool>(text: Units<'_>, c: u32) -> Option<usize> {
-    const ONES: u64 = 0x0101_0101_0101_0101;
     match text {
         Units::One(s) if BACK => s.iter().rposition(|&u| u32::from(u) == c),
         Units::One(s) => s.iter().position(|&u| u32::from(u) == c),
@@ -108,12 +108,12 @@ fn find_code<const BACK: bool>(text: Units<'_>, c: u32) -> Option<usize> {
                 // high bit of the lowest zero byte first, so that one is exact; backwards, every
                 // one has to be, so adding 0x7F to the low bits marks each byte that isn't zero.
                 let mut zero = if BACK {
-                    !(((x & !crate::hash::HIGH) + !crate::hash::HIGH) | x) & crate::hash::HIGH
+                    !(((x & !HIGH) + !HIGH) | x) & HIGH
                 } else {
-                    x.wrapping_sub(ONES) & !x & crate::hash::HIGH
+                    x.wrapping_sub(ONES) & !x & HIGH
                 };
                 if bytes < 8 {
-                    zero &= (1 << (8 * bytes)) - 1;
+                    zero &= low_bytes(bytes);
                 }
                 zero
             };
@@ -130,7 +130,7 @@ fn find_code<const BACK: bool>(text: Units<'_>, c: u32) -> Option<usize> {
 }
 
 /// Patterns this long or shorter are copied out to search for.
-const SHORT: usize = 64;
+const COPIED_PATTERN: usize = 64;
 
 /// Where the pattern of `m` characters, two or more, that `p` gives first occurs in the `n`
 /// characters `t` gives. The pattern is cut where its two halves can't both line up with a

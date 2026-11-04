@@ -1,9 +1,10 @@
 //! The generic integer layer against the same work written for the arena by hand.
 
+use std::cell::Cell;
 use std::hint::black_box;
 use std::time::Instant;
 
-use ragwort_types::gc::{Arena, Mutation, Value};
+use ragwort_types::gc::{Arena, Gc, Mutation, Value};
 use ragwort_types::num::bigint::{self, Digits, RWDigits};
 use ragwort_types::num::{Big, BigFields, Host, Integer, IntView, Numbers, Nums, int};
 
@@ -45,7 +46,7 @@ fn array_adds<'gc>(h: &Nums<'_, 'gc>, n: i64) -> Integer<'gc> {
 
 /// Only the digit work of a 4x4 multiply, into a buffer on the stack.
 #[inline(never)]
-fn digit_muls(x: &[u64], n: usize) {
+fn digit_muls(x: &[Cell<u64>], n: usize) {
     let mut z = [0u64; 8];
     for _ in 0..n {
         bigint::multiply(RWDigits::new(black_box(&mut z)), Digits::new(black_box(x)), Digits::new(black_box(x)));
@@ -89,20 +90,20 @@ fn by_hand_mul<'gc>(mc: &Mutation<'gc>, x: Value<'gc>, y: Value<'gc>) -> Value<'
     }
     let (Some(Numbers::Big(x)), Some(Numbers::Big(y))) = (Numbers::of(x), Numbers::of(y)) else { panic!("bignums") };
     let negative = x.negative(mc) != y.negative(mc);
-    let (xd, yd) = (Digits::new(x.digits(mc)), Digits::new(y.digits(mc)));
+    let digits = |x: Gc<'gc, Big>| Digits::new(&x.items(mc).words()[..x.digits(mc) as usize]);
+    let (xd, yd) = (digits(x), digits(y));
     let len = xd.len() + yd.len();
-    let mut small = None;
-    let digits = mc
-        .blob(len, |digits| {
-            bigint::multiply(RWDigits::new(digits), xd, yd);
-            let len = Digits::new(digits).normalize().len();
-            if len <= 1 {
-                small = Value::fixnum(if negative { (digits[0] as i64).wrapping_neg() } else { digits[0] as i64 });
-            }
-            len
-        })
-        .expect("alloc");
-    small.unwrap_or_else(|| Value::object(mc, Big::new(mc, negative, digits).expect("alloc")))
+    let z = mc.alloc_zeroed::<Big, 2>([u64::from(negative), 0], len).expect("alloc");
+    bigint::multiply(RWDigits::of_cells(z.items(mc).words()), xd, yd);
+    let kept = digits(z).normalize().len();
+    let low = z.items(mc).words()[0].get();
+    if kept <= 1
+        && let Some(small) = Value::fixnum(if negative { (low as i64).wrapping_neg() } else { low as i64 })
+    {
+        return small;
+    }
+    z.set_digits(mc, kept as u64);
+    Value::object(mc, z)
 }
 
 /// Four digits.
@@ -125,7 +126,7 @@ fn main() {
             best.time("fixnum add, by hand", || assert_eq!(by_hand_adds(&h, ADDS).as_fixnum(), Some(ADDS)));
             best.time("fixnum add, generic, array operands", || assert_eq!(int::to_i64(&h, array_adds(&h, ADDS)), Some(ADDS)));
             let Some(Numbers::Big(x)) = Numbers::of(operands(&h).value()) else { panic!("a bignum") };
-            best.time("4x4 digit mul, digits only", || digit_muls(x.digits(mc), MULS));
+            best.time("4x4 digit mul, digits only", || digit_muls(&x.items(mc).words()[..x.digits(mc) as usize], MULS));
         });
         best.time("4x4 digit bignum mul, generic", || {
             for _ in 0..MULS / BATCH {

@@ -1,7 +1,9 @@
 use std::cmp::Ordering;
 
 use super::*;
-use crate::testing::{Oracle, ROUNDS, Rng, hex, signed};
+use std::cell::Cell;
+
+use crate::testing::{Oracle, ROUNDS, Rng, cells, hex, signed};
 
 #[test]
 fn addition_subtraction_and_comparison() {
@@ -11,13 +13,13 @@ fn addition_subtraction_and_comparison() {
         let (x, y) = (Digits::new(&x), Digits::new(&y));
         let mut z = vec![7; x.len().max(y.len()) + 3];
         add(RWDigits::new(&mut z), x, y);
-        oracle.case("add", &[hex(x), hex(y)], hex(Digits::new(&z)));
+        oracle.case("add", &[hex(x), hex(y)], hex(Digits::of_mut(&mut z)));
         let order = compare(x, y);
         oracle.case("cmp", &[hex(x), hex(y)], (order as i8).to_string());
         let (big, small) = if order == Ordering::Less { (y, x) } else { (x, y) };
         let mut z = vec![7; big.len() + 2];
         subtract(RWDigits::new(&mut z), big, small);
-        oracle.case("sub", &[hex(big), hex(small)], hex(Digits::new(&z)));
+        oracle.case("sub", &[hex(big), hex(small)], hex(Digits::of_mut(&mut z)));
     }
     oracle.check();
 }
@@ -31,11 +33,11 @@ fn signed_addition_and_subtraction() {
         let (xn, yn) = (rng.bool(), rng.bool());
         let mut z = vec![7; x.len().max(y.len()) + 1];
         let negative = add_signed(RWDigits::new(&mut z), x, xn, y, yn);
-        assert!(!(negative && Digits::new(&z).is_zero()), "negative zero");
-        oracle.case("add", &[signed(x, xn), signed(y, yn)], signed(Digits::new(&z), negative));
+        assert!(!(negative && Digits::of_mut(&mut z).is_zero()), "negative zero");
+        oracle.case("add", &[signed(x, xn), signed(y, yn)], signed(Digits::of_mut(&mut z), negative));
         let negative = subtract_signed(RWDigits::new(&mut z), x, xn, y, yn);
-        assert!(!(negative && Digits::new(&z).is_zero()), "negative zero");
-        oracle.case("sub", &[signed(x, xn), signed(y, yn)], signed(Digits::new(&z), negative));
+        assert!(!(negative && Digits::of_mut(&mut z).is_zero()), "negative zero");
+        oracle.case("sub", &[signed(x, xn), signed(y, yn)], signed(Digits::of_mut(&mut z), negative));
     }
     oracle.check();
 }
@@ -48,7 +50,7 @@ fn multiplication() {
         let (x, y) = (Digits::new(&x), Digits::new(&y));
         let mut z = vec![7; x.len() + y.len() + 1];
         multiply(RWDigits::new(&mut z), x, y);
-        oracle.case("mul", &[hex(x), hex(y)], hex(Digits::new(&z)));
+        oracle.case("mul", &[hex(x), hex(y)], hex(Digits::of_mut(&mut z)));
     }
     oracle.check();
 }
@@ -65,14 +67,14 @@ fn division() {
                 let m = rng.nonzero(2);
                 let mut x = vec![0; y.len() + m.len()];
                 multiply(RWDigits::new(&mut x), Digits::new(&y), Digits::new(&m));
-                let x = Digits::new(&x).normalize();
+                let x = Digits::of_mut(&mut x).normalize();
                 let mut s = vec![0; x.len() + 1];
                 if rng.bool() {
                     add_one(RWDigits::new(&mut s), x);
                 } else {
                     subtract_one(RWDigits::new(&mut s), x);
                 }
-                s
+                cells(&s)
             }
         };
         let (x, y) = (Digits::new(&x).normalize(), Digits::new(&y));
@@ -80,7 +82,7 @@ fn division() {
         let mut r = vec![7; y.len()];
         let mut scratch = vec![7; divide_scratch(x, y)];
         divide(Some(RWDigits::new(&mut q)), Some(RWDigits::new(&mut r)), x, y, RWDigits::new(&mut scratch));
-        let ours = format!("{} {}", hex(Digits::new(&q)), hex(Digits::new(&r)));
+        let ours = format!("{} {}", hex(Digits::of_mut(&mut q)), hex(Digits::of_mut(&mut r)));
         oracle.case("divrem", &[hex(x), hex(y)], ours);
         let mut only_r = vec![7; y.len()];
         divide(None, Some(RWDigits::new(&mut only_r)), x, y, RWDigits::new(&mut scratch));
@@ -99,10 +101,10 @@ fn shifts() {
         let args = [hex(x), format!("{shift:x}")];
         let mut z = vec![7; x.len() + shift / DIGIT_BITS + 1];
         left_shift(RWDigits::new(&mut z), x, shift);
-        oracle.case("shl", &args, hex(Digits::new(&z)));
+        oracle.case("shl", &args, hex(Digits::of_mut(&mut z)));
         let mut z = vec![7; x.len()];
         right_shift(RWDigits::new(&mut z), x, shift);
-        oracle.case("shr", &args, hex(Digits::new(&z)));
+        oracle.case("shr", &args, hex(Digits::of_mut(&mut z)));
         oracle.case("lost", &args, (shifts_out_ones(x, shift) as u8).to_string());
     }
     oracle.check();
@@ -127,7 +129,7 @@ fn bitwise_operations_are_twos_complement() {
                 let (op, len) = fns[case];
                 let mut z = vec![7; len(x, y)];
                 op(RWDigits::new(&mut z), x, y);
-                let ours = signed(Digits::new(&z), negative(xn, yn));
+                let ours = signed(Digits::of_mut(&mut z), negative(xn, yn));
                 oracle.case(name, &[signed(x, xn), signed(y, yn)], ours);
             }
         }
@@ -138,7 +140,7 @@ fn bitwise_operations_are_twos_complement() {
 #[test]
 fn conversion_to_doubles_rounds_to_nearest_even() {
     let (mut rng, mut oracle) = (Rng(7), Oracle::default());
-    let mut case = |x: &[Digit]| {
+    let mut case = |x: &[Cell<Digit>]| {
         let x = Digits::new(x);
         oracle.case("f64", &[hex(x)], format!("{:x}", to_f64(x).to_bits()));
     };
@@ -154,7 +156,7 @@ fn conversion_to_doubles_rounds_to_nearest_even() {
     edges.push([vec![0; 15], vec![Digit::MAX << 11]].concat());
     edges.push([vec![0; 16], vec![1]].concat());
     for x in &edges {
-        case(x);
+        case(&cells(x));
     }
     for _ in 0..ROUNDS {
         case(&rng.digits(18));
@@ -176,9 +178,9 @@ fn strings_in_every_radix() {
         oracle.case("radix", &[hex(x), format!("{radix:x}")], text.to_owned());
         let mut back = vec![7; from_string_len(text.len(), radix)];
         from_string(RWDigits::new(&mut back), text.as_bytes(), radix).unwrap();
-        assert_eq!(hex(Digits::new(&back)), hex(x));
+        assert_eq!(hex(Digits::of_mut(&mut back)), hex(x));
         from_string(RWDigits::new(&mut back), text.to_uppercase().as_bytes(), radix).unwrap();
-        assert_eq!(hex(Digits::new(&back)), hex(x));
+        assert_eq!(hex(Digits::of_mut(&mut back)), hex(x));
     }
     let mut z = vec![0; 4];
     assert!(from_string(RWDigits::new(&mut z), b"12a", 10).is_none());

@@ -1,0 +1,224 @@
+//! Chez Scheme's segmented stack: the live frames on the current segment, and under them, the
+//! chain of [`Frames`] records that hold the rest of the continuation.
+//!
+//! The frame at the stack's `base` has the [`Link::BOTTOM`] link, so returning from it
+//! underflows into the record on top of the chain. Making a record is a cut of the stack, not
+//! a copy, and no record is written again, so a continuation can be resumed any number of
+//! times. A record no continuation holds is one-shot, and is resumed in place, as Chez resumes
+//! one-shot continuations; any other is copied back a chunk at a time.
+//!
+//! Marks are Chez's continuation attachments: a list in the task, which each record keeps as it
+//! was when it was made, and puts back when it's resumed, so marks set since are dropped.
+
+use ragwort_types::gc::raw::Raw;
+use ragwort_types::gc::{Frame, Gc, Mutation, Segment, Stack, Value, WINDOW};
+use ragwort_types::pair::{Pair, Pairs};
+
+use crate::Fault;
+use crate::frame::{self, Link};
+use crate::objects::{Frames, FramesFields, Task, TaskFields};
+
+/// The most slots of a record copied back onto the stack at once. The top frame is always
+/// copied whole; a deep continuation comes back a chunk at a time, as its frames return.
+pub const CHUNK: usize = 1024;
+
+/// Where the inner loop goes on: the frame at `fp`, at instruction `pc`.
+pub(crate) struct Resume {
+    pub(crate) fp: usize,
+    pub(crate) pc: usize,
+}
+
+/// A task's stack and the records under it.
+pub(crate) struct Segments<'a, 'gc> {
+    pub(crate) mc: &'a Mutation<'gc>,
+    pub(crate) stack: &'a mut Stack,
+    pub(crate) task: Gc<'gc, Task>,
+    /// How many slots a new segment has.
+    pub(crate) size: usize,
+}
+
+impl<'gc> Segments<'_, 'gc> {
+    /// Hands the live frames below `end` to a one-shot record on the chain, as Chez reifies a
+    /// continuation; the frame at `end` would have had `link`. If there are none, the frame at
+    /// `end` is the bottom one already, and the chain is its continuation as it is.
+    pub(crate) fn reify(&mut self, end: usize, link: Link) -> Result<(), Fault> {
+        let start = self.stack.base();
+        if end <= start {
+            return Ok(());
+        }
+        let segment = self.stack.segment(self.mc);
+        self.stack.capture(self.mc, end).ok_or(Fault::Malformed)?;
+        self.push(segment, start, end, link, false)
+    }
+
+    /// Moves the frame at `fp`, with the slots up to `end` it holds a call in, to another
+    /// segment, where it's the bottom frame, as Chez does when a segment overflows. The frames
+    /// under it go to a one-shot record that owns the rest of this segment. `need` is how many
+    /// slots it takes from `fp` on. Returns where the frame is now.
+    pub(crate) fn overflow(&mut self, fp: usize, end: usize, need: usize) -> Result<usize, Fault> {
+        let mc = self.mc;
+        let (start, old) = (self.stack.base(), self.stack.segment(mc));
+        let link = frame::link_of(mc, self.frame(fp)?)?;
+        self.stack.set_top(end);
+        self.move_to(need)?;
+        if fp > start {
+            self.push(old, start, fp, link, true)?;
+        }
+        let at = self.stack.base();
+        if !self.stack.write(mc, at, old.slots(mc).slice(fp..end).ok_or(Fault::Malformed)?) {
+            return Err(Fault::Malformed);
+        }
+        frame::set_link(mc, self.frame(at)?, Link::BOTTOM)?;
+        Ok(at)
+    }
+
+    /// Resumes the record on top of the chain, as Chez's `dounderflow` does, putting its marks
+    /// back. A one-shot record is taken back in place; any other is split if it's deep, and its
+    /// top frames copied to the stack. Returns `None` if the chain is empty.
+    pub(crate) fn underflow(&mut self) -> Result<Option<Resume>, Fault> {
+        let (mc, task) = (self.mc, self.task);
+        let head = task.chain(mc);
+        if head == Value::FALSE {
+            return Ok(None);
+        }
+        let record = head.downcast::<Frames>(mc).ok_or(Fault::Malformed)?;
+        let segment = record.segment(mc).ok_or(Fault::Malformed)?;
+        let (start, end) = (record.start(mc) as usize, record.end(mc) as usize);
+        let link = Link::of(record.link(mc)).ok_or(Fault::Malformed)?;
+        let below = |at: usize, base: u8| at.checked_sub(usize::from(base)).filter(|&b| b >= start && base > 0).ok_or(Fault::Malformed);
+        let top = below(end, link.base)?;
+        task.set_attachments(mc, record.attachments(mc));
+        if record.one_shot(mc) {
+            let current = self.stack.segment(mc);
+            if segment == current && end == self.stack.base() {
+                if !self.stack.reclaim(mc, start) {
+                    return Err(Fault::Malformed);
+                }
+                task.set_chain(mc, record.next(mc));
+                return Ok(Some(Resume { fp: top, pc: link.pc }));
+            }
+            if segment != current && record.owns(mc) {
+                let base = self.stack.base();
+                self.stack.set_top(base);
+                task.set_spare(mc, Some(current));
+                task.set_spare_base(mc, slot(base)?);
+                if !self.stack.resume(mc, segment, start) {
+                    return Err(Fault::Malformed);
+                }
+                task.set_chain(mc, record.next(mc));
+                return Ok(Some(Resume { fp: top, pc: link.pc }));
+            }
+        }
+        let slots = segment.slots(mc);
+        if end > slots.len() {
+            return Err(Fault::Malformed);
+        }
+        let mut split = top;
+        while split > start {
+            let under = below(split, frame::link_at(mc, slots, split)?.base)?;
+            if end - under > CHUNK {
+                break;
+            }
+            split = under;
+        }
+        let rest = if split > start {
+            let link = frame::link_at(mc, slots, split)?.value().ok_or(Fault::Malformed)?;
+            let (start, split, attachments, one_shot) = (slot(start)?, slot(split)?, record.attachments(mc), record.one_shot(mc));
+            Value::object(mc, Frames::new(mc, Some(segment), start, split, link, attachments, one_shot, false, record.next(mc))?)
+        } else {
+            record.next(mc)
+        };
+        let at = self.bottom(end - split)?;
+        if !self.stack.write(mc, at, slots.slice(split..end).ok_or(Fault::Malformed)?) {
+            return Err(Fault::Malformed);
+        }
+        frame::set_link(mc, self.frame(at)?, Link::BOTTOM)?;
+        task.set_chain(mc, rest);
+        Ok(Some(Resume { fp: at + (top - split), pc: link.pc }))
+    }
+
+    /// Where a bottom frame goes with `len` slots under it: at the stack's base, or on another
+    /// segment if this one has no room.
+    pub(crate) fn bottom(&mut self, len: usize) -> Result<usize, Fault> {
+        let base = self.stack.base();
+        if base + len + WINDOW <= self.stack.segment(self.mc).len(self.mc) {
+            return Ok(base);
+        }
+        self.stack.set_top(base);
+        self.move_to(len + WINDOW)?;
+        Ok(self.stack.base())
+    }
+
+    /// Sets the mark for `key` on the frame at the bottom of the stack, as Chez sets an
+    /// attachment: the frame's own marks are the ones above those its continuation puts back,
+    /// and one for `key` among them is replaced rather than pushed, so a loop that sets one in
+    /// tail position stays in constant space.
+    pub(crate) fn set_mark(&self, key: Value<'gc>, value: Value<'gc>) -> Result<(), Fault> {
+        let (mc, task) = (self.mc, self.task);
+        let restored = task.chain(mc).downcast::<Frames>(mc).map_or(Value::NIL, |r| r.attachments(mc));
+        let (pairs, mut at, mut own) = (Pairs::new(mc), task.attachments(mc), Vec::new());
+        while at != restored {
+            let cell = Pair::of(at).ok_or(Fault::Malformed)?;
+            own.push(Pair::of(cell.head(mc)).ok_or(Fault::Malformed)?);
+            at = cell.tail(mc);
+        }
+        let mut marks = task.attachments(mc);
+        if own.iter().any(|mark| mark.head(mc) == key) {
+            marks = restored;
+            for mark in own.into_iter().rev() {
+                let value = if mark.head(mc) == key { value } else { mark.tail(mc) };
+                marks = pairs.cons(pairs.cons(mark.head(mc), value)?.value(mc), marks)?.value(mc);
+            }
+        } else {
+            marks = pairs.cons(pairs.cons(key, value)?.value(mc), marks)?.value(mc);
+        }
+        task.set_attachments(mc, marks);
+        Ok(())
+    }
+
+    pub(crate) fn frame(&self, fp: usize) -> Result<Frame<'_, 'gc>, Fault> {
+        self.stack.frame(self.mc, fp).ok_or(Fault::Malformed)
+    }
+
+    /// Moves the stack to the spare segment, if it has `need` slots past its base, or a new one.
+    fn move_to(&mut self, need: usize) -> Result<(), Fault> {
+        let (mc, task) = (self.mc, self.task);
+        if let Some(spare) = task.spare(mc) {
+            task.set_spare(mc, None);
+            let base = task.spare_base(mc) as usize;
+            if base + need <= spare.len(mc) && self.stack.resume(mc, spare, base) {
+                return Ok(());
+            }
+        }
+        if need > self.size {
+            return Err(Fault::Malformed);
+        }
+        self.stack.switch(mc, Segment::new(mc, self.size)?);
+        Ok(())
+    }
+
+    fn push(&self, segment: Gc<'gc, Segment>, start: usize, end: usize, link: Link, owns: bool) -> Result<(), Fault> {
+        let (mc, task) = (self.mc, self.task);
+        let (start, end, link) = (slot(start)?, slot(end)?, link.value().ok_or(Fault::Malformed)?);
+        let record = Frames::new(mc, Some(segment), start, end, link, task.attachments(mc), true, owns, task.chain(mc))?;
+        task.set_chain(mc, Value::object(mc, record));
+        Ok(())
+    }
+}
+
+/// Makes the records of `chain` multi-shot, as a continuation that holds them needs: they're
+/// copied when resumed from then on, not taken back in place. One-shot records are only ever on
+/// top of a chain, as in Chez, so this stops at the first that isn't.
+pub(crate) fn promote<'gc>(mc: &Mutation<'gc>, mut chain: Value<'gc>) {
+    while let Some(record) = chain.downcast::<Frames>(mc) {
+        if !record.one_shot(mc) {
+            break;
+        }
+        record.set_one_shot(mc, false);
+        chain = record.next(mc);
+    }
+}
+
+fn slot(n: usize) -> Result<u32, Fault> {
+    u32::try_from(n).map_err(|_| Fault::Malformed)
+}

@@ -6,9 +6,9 @@ use super::{Digit, Digits, RWDigits, digit_mul_add};
 pub fn multiply_single(mut z: RWDigits<'_>, x: Digits<'_>, y: Digit) {
     let mut carry = 0;
     for i in 0..x.len() {
-        (z[i], carry) = digit_mul_add(x[i], y, 0, carry);
+        carry = z.put(i, digit_mul_add(x.at(i), y, 0, carry));
     }
-    z[x.len()] = carry;
+    z.set(x.len(), carry);
     z.offset(x.len() + 1).clear();
 }
 
@@ -16,7 +16,7 @@ pub fn multiply_single(mut z: RWDigits<'_>, x: Digits<'_>, y: Digit) {
 pub fn multiply_add_in_place(mut z: RWDigits<'_>, m: Digit, add: Digit) -> Digit {
     let mut carry = add;
     for i in 0..z.len() {
-        (z[i], carry) = digit_mul_add(z[i], m, 0, carry);
+        carry = z.put(i, digit_mul_add(z.at(i), m, 0, carry));
     }
     carry
 }
@@ -29,19 +29,19 @@ pub fn multiply_schoolbook(mut z: RWDigits<'_>, x: Digits<'_>, y: Digits<'_>) {
     }
     let mut carry = 0;
     for j in 0..y.len() {
-        (z[j], carry) = digit_mul_add(x[0], y[j], 0, carry);
+        carry = z.put(j, digit_mul_add(x.at(0), y.at(j), 0, carry));
     }
-    z[y.len()] = carry;
+    z.set(y.len(), carry);
     for i in 1..x.len() {
-        let xi = x[i];
+        let xi = x.at(i);
         let mut carry = 0;
         if xi != 0 {
             for j in 0..y.len() {
-                (z[i + j], carry) = digit_mul_add(xi, y[j], z[i + j], carry);
+                carry = z.put(i + j, digit_mul_add(xi, y.at(j), z.at(i + j), carry));
             }
         }
         // The rows so far fit below digit `i + y.len()`, so the carry is all of it.
-        z[i + y.len()] = carry;
+        z.set(i + y.len(), carry);
     }
     z.offset(x.len() + y.len()).clear();
 }
@@ -50,10 +50,10 @@ pub fn multiply_schoolbook(mut z: RWDigits<'_>, x: Digits<'_>, y: Digits<'_>) {
 pub fn multiply(z: RWDigits<'_>, x: Digits<'_>, y: Digits<'_>) {
     let (x, y) = (x.normalize(), y.normalize());
     if y.len() == 1 {
-        return multiply_single(z, x, y[0]);
+        return multiply_single(z, x, y.at(0));
     }
     if x.len() == 1 {
-        return multiply_single(z, y, x[0]);
+        return multiply_single(z, y, x.at(0));
     }
     multiply_schoolbook(z, x, y);
 }

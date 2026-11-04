@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use crate::bigint::Digits;
 use crate::int::*;
-use crate::testing::{Oracle, ROUNDS, Rng, TestError, TestHost, TestInt, WIDTHS, hex_i64};
+use crate::testing::{Oracle, ROUNDS, Rng, TestError, TestHost, TestInt, WIDTHS, cells, hex_i64};
 
 fn binary(oracle_op: &str, seed: u64, max_len: usize, op: fn(&TestHost, TestInt, TestInt) -> Result<TestInt, TestError>) {
     let (mut rng, mut oracle) = (Rng(seed), Oracle::default());
@@ -162,7 +162,7 @@ fn equal_integers_hash_the_same_however_they_are_held() {
                 let mut digits = vec![digit; len];
                 digits.push(1);
                 if values.insert((negative, digits.clone())) {
-                    let x = from_digits(h, negative, Digits::new(&digits)).unwrap();
+                    let x = from_digits(h, negative, Digits::new(&cells(&digits))).unwrap();
                     assert!(hashes.insert(hash_of(h, x)), "{negative} {digits:?}");
                 }
             }

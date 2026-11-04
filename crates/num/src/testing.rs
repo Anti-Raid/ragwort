@@ -32,7 +32,7 @@ impl Rng {
     }
 
     /// Up to `max_len` digits that often sit at the edges: all ones, zero, a lone top bit.
-    pub fn digits(&mut self, max_len: usize) -> Vec<Digit> {
+    pub fn digits(&mut self, max_len: usize) -> Vec<Cell<Digit>> {
         let len = self.below(max_len as u64 + 1) as usize;
         let mut x: Vec<Digit> = (0..len)
             .map(|_| match self.below(6) {
@@ -48,10 +48,10 @@ impl Rng {
         {
             *top = self.u64().max(1);
         }
-        x
+        cells(&x)
     }
 
-    pub fn nonzero(&mut self, max_len: usize) -> Vec<Digit> {
+    pub fn nonzero(&mut self, max_len: usize) -> Vec<Cell<Digit>> {
         loop {
             let x = self.digits(max_len);
             if !x.is_empty() {
@@ -61,11 +61,16 @@ impl Rng {
     }
 }
 
+/// `x` as cells, for [`Digits::new`].
+pub fn cells(x: &[Digit]) -> Vec<Cell<Digit>> {
+    x.iter().copied().map(Cell::new).collect()
+}
+
 pub fn hex(x: Digits<'_>) -> String {
     let x = x.normalize();
     let mut s = format!("{:x}", x.msd());
     for i in (0..x.len().saturating_sub(1)).rev() {
-        write!(s, "{:016x}", x[i]).unwrap();
+        write!(s, "{:016x}", x.at(i)).unwrap();
     }
     s
 }
@@ -130,13 +135,18 @@ impl From<NumError> for TestError {
     }
 }
 
+/// Digits as a host lends them to be written.
+type Cells = Box<[Cell<Digit>]>;
+
 /// Holds small integers in `bits` bits, so narrow hosts take the big paths more often. Big
-/// ones go in cells that are set once, so views can borrow them while more are added.
+/// ones are written in place, as an arena's are, into cells that are set once, so views can
+/// borrow them while more are added.
 pub struct TestHost {
     bits: u32,
-    bigs: Box<[OnceCell<Box<[Digit]>>]>,
-    /// How many digits each big integer was made from, before it kept fewer.
-    reserved: Box<[Cell<usize>]>,
+    /// Each big integer's digits, all it was made from.
+    bigs: Box<[OnceCell<Cells>]>,
+    /// How many of them each kept.
+    kept: Box<[Cell<usize>]>,
     used: Cell<usize>,
 }
 
@@ -145,11 +155,11 @@ pub const CAPACITY: usize = if cfg!(miri) { 1 << 12 } else { 1 << 16 };
 impl TestHost {
     pub fn new(bits: u32) -> Self {
         let bigs = (0..CAPACITY).map(|_| OnceCell::new()).collect();
-        Self { bits, bigs, reserved: (0..CAPACITY).map(|_| Cell::new(0)).collect(), used: Cell::new(0) }
+        Self { bits, bigs, kept: (0..CAPACITY).map(|_| Cell::new(0)).collect(), used: Cell::new(0) }
     }
 
-    pub fn digits(&self, at: usize) -> &[Digit] {
-        self.bigs[at].get().expect("made by this host")
+    pub fn digits(&self, at: usize) -> &[Cell<Digit>] {
+        &self.bigs[at].get().expect("made by this host")[..self.kept[at].get()]
     }
 }
 
@@ -173,13 +183,12 @@ impl Host for TestHost {
         if len > 1 << 12 {
             return Err(TestError::TooBig);
         }
-        let mut digits = vec![0; len];
-        let kept = init(RWDigits::new(&mut digits));
-        digits.truncate(kept);
         let at = self.used.get();
-        self.bigs.get(at).expect("test host is full").set(digits.into_boxed_slice()).expect("cells are set once");
-        self.reserved[at].set(len);
+        let slot = self.bigs.get(at).expect("test host is full");
+        slot.set(cells(&vec![0; len]).into_boxed_slice()).expect("cells are set once");
         self.used.set(at + 1);
+        let kept = init(RWDigits::of_cells(slot.get().expect("just set"))).min(len);
+        self.kept[at].set(kept);
         Ok(TestInt::Big { negative, at })
     }
 }
@@ -192,15 +201,16 @@ pub fn hex_i64(n: i64) -> String {
 }
 
 impl TestHost {
-    /// Asserts the result is normalized and holds no more than twice its digits, and shows it
-    /// as Python reads it.
+    /// Asserts the result is normalized, was made from no more than twice its digits, all zero
+    /// past them, and shows it as Python reads it.
     pub fn show(&self, x: TestInt) -> String {
         if let TestInt::Big { negative, at } = x {
             let digits = self.digits(at);
-            assert!(!digits.is_empty() && *digits.last().unwrap() != 0, "big zero or high zero digits");
-            let reserved = self.reserved[at].get();
-            assert!(reserved <= 2 * digits.len(), "{} digits kept of {reserved}", digits.len());
-            let value = (digits.len() == 1).then(|| if negative { (digits[0] as i64).wrapping_neg() } else { digits[0] as i64 });
+            assert!(!digits.is_empty() && digits.last().unwrap().get() != 0, "big zero or high zero digits");
+            let all = self.bigs[at].get().expect("made by this host");
+            assert!(all.len() <= 2 * digits.len(), "{} digits kept of {}", digits.len(), all.len());
+            assert!(all[digits.len()..].iter().all(|d| d.get() == 0), "digits left past those kept");
+            let value = (digits.len() == 1).then(|| if negative { (digits[0].get() as i64).wrapping_neg() } else { digits[0].get() as i64 });
             let small = value.filter(|&v| (v < 0) == negative && v != 0).and_then(|v| self.small(v));
             assert!(small.is_none(), "{x:?} should be small");
         }

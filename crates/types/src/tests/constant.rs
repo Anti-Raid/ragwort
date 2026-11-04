@@ -153,7 +153,7 @@ fn constants_keep_their_slots_as_objects_move() {
         let done = pool.finish(mc).unwrap();
         assert_eq!(done.len(mc), pool.len());
         for (text, &c) in &seen {
-            assert_eq!(&describe(mc, done.get(mc, c.index() as usize).unwrap()), text);
+            assert_eq!(&describe(mc, done.get(mc, c.index()).unwrap()), text);
         }
     });
 }

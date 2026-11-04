@@ -27,6 +27,35 @@ impl Const {
     }
 }
 
+/// A finished pool, as code reads it: an immutable vector, indexed by `u32` as instructions name
+/// constants.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Constants<'gc>(ImmutableVector<'gc>);
+
+impl<'gc> Constants<'gc> {
+    #[inline]
+    pub fn of(v: Value<'gc>) -> Option<Self> {
+        ImmutableVector::of(v).map(Self)
+    }
+
+    pub fn value(self, mc: &Mutation<'gc>) -> Value<'gc> {
+        self.0.value(mc)
+    }
+
+    pub fn len(self, mc: &Mutation<'gc>) -> usize {
+        self.0.len(mc)
+    }
+
+    pub fn is_empty(self, mc: &Mutation<'gc>) -> bool {
+        self.0.is_empty(mc)
+    }
+
+    #[inline]
+    pub fn get(self, mc: &Mutation<'gc>, index: u32) -> Option<Value<'gc>> {
+        self.0.get(mc, index as usize)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Constant {
     Immediate(Immediate),
@@ -78,23 +107,34 @@ impl ConstPool {
         if let Some(i) = v.immediate() {
             return Ok(Constant::Immediate(i));
         }
-        let items = self.items(mc);
-        let content = content(mc, v);
-        let hash = content.map(|c| self.hash(mc, c)).transpose()?;
-        if let (Some(c), Some(hash)) = (content, hash) {
-            let mut at = self.heads.get(&hash).copied();
-            while let Some(i) = at {
-                let old = items.get(mc, i as usize).expect("a pool has the constants it named");
-                if same(mc, c, old)? {
-                    return Ok(Constant::Pooled(Const(i)));
+        let hash = match content(mc, v) {
+            Some(c) => {
+                let hash = self.hash(mc, c)?;
+                if let Some(old) = self.find(mc, c, hash)? {
+                    return Ok(Constant::Pooled(old));
                 }
-                at = self.older[i as usize];
+                Some(hash)
             }
-        }
+            None => None,
+        };
         let index = u32::try_from(self.len()).map_err(|_| mc.out_of_memory())?;
-        items.push(mc, v)?;
+        self.items(mc).push(mc, v)?;
         self.older.push(hash.and_then(|hash| self.heads.insert(hash, index)));
         Ok(Constant::Pooled(Const(index)))
+    }
+
+    /// The constant with this hash that's the same as `c`, if there's one.
+    fn find<'gc>(&self, mc: &Mutation<'gc>, c: Content<'gc>, hash: u64) -> Result<Option<Const>, Error> {
+        let items = self.items(mc);
+        let mut at = self.heads.get(&hash).copied();
+        while let Some(i) = at {
+            let old = items.get(mc, i as usize).expect("a pool has the constants it named");
+            if same(mc, c, old)? {
+                return Ok(Some(Const(i)));
+            }
+            at = self.older[i as usize];
+        }
+        Ok(None)
     }
 
     /// The constant, if `c` is from this pool.
@@ -103,9 +143,9 @@ impl ConstPool {
     }
 
     /// The constants as they are now, in a vector the unit's code shares.
-    pub fn finish<'gc>(&self, mc: &Mutation<'gc>) -> Result<ImmutableVector<'gc>, Error> {
+    pub fn finish<'gc>(&self, mc: &Mutation<'gc>) -> Result<Constants<'gc>, Error> {
         let items = self.items(mc).items(mc);
-        Ok(Vectors::new(mc).immutable_with(self.len(), |i| items.map_or(Value::NIL, |s| s.get(i)))?)
+        Ok(Constants(Vectors::new(mc).immutable_with(self.len(), |i| items.map_or(Value::NIL, |s| s.get(i)))?))
     }
 
     fn hash<'gc>(&self, mc: &Mutation<'gc>, c: Content<'gc>) -> Result<u64, Error> {

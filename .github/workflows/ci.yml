@@ -61,7 +61,7 @@ jobs:
     env:
       # New seeds every run. A failure prints its seed, which reruns alone with RAGWORT_FUZZ_SEED.
       RAGWORT_FUZZ_FIRST: ${{ github.run_number }}000000
-      FUZZ: cargo test --locked --release -p ragwort-gc-words --lib model_fuzz
+      FUZZ: cargo test --locked --release -p ragwort-types --lib model_fuzz
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal && rustup default stable

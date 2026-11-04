@@ -18,7 +18,7 @@ pub use mul::*;
 pub use string::*;
 pub use vector::*;
 
-use std::ops::{Index, IndexMut};
+use std::cell::Cell;
 
 pub type Digit = u64;
 /// Holds the product of two digits plus two more.
@@ -46,16 +46,22 @@ pub fn digit_mul_add(a: Digit, b: Digit, add: Digit, carry: Digit) -> (Digit, Di
     (t as Digit, (t >> DIGIT_BITS) as Digit)
 }
 
-/// A read-only view of digits.
+/// A read-only view of digits, in cells so a host can lend the words it keeps them in.
 #[derive(Clone, Copy, Debug)]
 pub struct Digits<'a> {
-    digits: &'a [Digit],
+    digits: &'a [Cell<Digit>],
 }
 
 impl<'a> Digits<'a> {
     #[inline]
-    pub fn new(digits: &'a [Digit]) -> Self {
+    pub fn new(digits: &'a [Cell<Digit>]) -> Self {
         Self { digits }
+    }
+
+    /// A view of digits this borrows mutably, so nothing else changes them meanwhile.
+    #[inline]
+    pub fn of_mut(digits: &'a mut [Digit]) -> Self {
+        Self { digits: Cell::from_mut(digits).as_slice_of_cells() }
     }
 
     #[inline]
@@ -71,25 +77,31 @@ impl<'a> Digits<'a> {
     /// Without high zero digits.
     #[inline]
     pub fn normalize(self) -> Self {
-        let len = self.digits.iter().rposition(|&d| d != 0).map_or(0, |i| i + 1);
+        let len = self.digits.iter().rposition(|d| d.get() != 0).map_or(0, |i| i + 1);
         Self { digits: &self.digits[..len] }
     }
 
     #[inline]
     pub fn is_zero(self) -> bool {
-        self.digits.iter().all(|&d| d == 0)
+        self.digits.iter().all(|d| d.get() == 0)
     }
 
     /// The most significant digit, or 0 if there are none.
     #[inline]
     pub fn msd(self) -> Digit {
-        self.digits.last().copied().unwrap_or(0)
+        self.digits.last().map_or(0, Cell::get)
     }
 
     /// Digit `i`, or 0 past the end.
     #[inline]
     pub fn get(self, i: usize) -> Digit {
-        self.digits.get(i).copied().unwrap_or(0)
+        self.digits.get(i).map_or(0, Cell::get)
+    }
+
+    /// Digit `i`, which must be there.
+    #[inline]
+    pub fn at(self, i: usize) -> Digit {
+        self.digits[i].get()
     }
 
     /// Up to `len` digits from `offset`, as many as there are.
@@ -100,8 +112,8 @@ impl<'a> Digits<'a> {
     }
 
     #[inline]
-    pub fn as_slice(self) -> &'a [Digit] {
-        self.digits
+    pub fn iter(self) -> impl DoubleEndedIterator<Item = Digit> + 'a {
+        self.digits.iter().map(Cell::get)
     }
 
     #[inline]
@@ -111,24 +123,22 @@ impl<'a> Digits<'a> {
     }
 }
 
-impl Index<usize> for Digits<'_> {
-    type Output = Digit;
-
-    #[inline]
-    fn index(&self, i: usize) -> &Digit {
-        &self.digits[i]
-    }
-}
-
-/// A writable view of digits.
+/// A writable view of digits, in cells so a host can lend the words it keeps them in. Like a
+/// `&mut`, it's the only view of its digits while it lives.
 #[derive(Debug)]
 pub struct RWDigits<'a> {
-    digits: &'a mut [Digit],
+    digits: &'a [Cell<Digit>],
 }
 
 impl<'a> RWDigits<'a> {
     #[inline]
     pub fn new(digits: &'a mut [Digit]) -> Self {
+        Self { digits: Cell::from_mut(digits).as_slice_of_cells() }
+    }
+
+    /// Digits a host keeps in cells, which nothing else may read or write while this lives.
+    #[inline]
+    pub fn of_cells(digits: &'a [Cell<Digit>]) -> Self {
         Self { digits }
     }
 
@@ -142,9 +152,28 @@ impl<'a> RWDigits<'a> {
         self.digits.is_empty()
     }
 
+    /// Digit `i`, which must be there.
+    #[inline]
+    pub fn at(&self, i: usize) -> Digit {
+        self.digits[i].get()
+    }
+
+    #[inline]
+    pub fn set(&mut self, i: usize, d: Digit) {
+        self.digits[i].set(d);
+    }
+
+    /// Sets digit `i` to the first of `pair`, and returns the second: what a digit operation
+    /// carries or borrows.
+    #[inline]
+    pub fn put(&mut self, i: usize, (d, carry): (Digit, Digit)) -> Digit {
+        self.digits[i].set(d);
+        carry
+    }
+
     #[inline]
     pub fn read(&self) -> Digits<'_> {
-        Digits { digits: self.digits }
+        Digits::new(self.digits)
     }
 
     #[inline]
@@ -157,54 +186,38 @@ impl<'a> RWDigits<'a> {
     pub fn slice(&mut self, offset: usize, len: usize) -> RWDigits<'_> {
         let start = offset.min(self.len());
         let end = (start + len).min(self.len());
-        RWDigits { digits: &mut self.digits[start..end] }
+        RWDigits { digits: &self.digits[start..end] }
     }
 
     #[inline]
     pub fn offset(&mut self, offset: usize) -> RWDigits<'_> {
         let start = offset.min(self.len());
-        RWDigits { digits: &mut self.digits[start..] }
+        RWDigits { digits: &self.digits[start..] }
     }
 
     /// The first `len` digits, keeping the borrow.
     #[inline]
     pub fn truncate(self, len: usize) -> RWDigits<'a> {
         let len = len.min(self.digits.len());
-        RWDigits { digits: &mut self.digits[..len] }
+        RWDigits { digits: &self.digits[..len] }
     }
 
     /// Splits into the first `mid` digits and the rest.
     #[inline]
     pub fn split(self, mid: usize) -> (RWDigits<'a>, RWDigits<'a>) {
-        let (a, b) = self.digits.split_at_mut(mid.min(self.digits.len()));
+        let (a, b) = self.digits.split_at(mid.min(self.digits.len()));
         (RWDigits { digits: a }, RWDigits { digits: b })
     }
 
     #[inline]
     pub fn clear(&mut self) {
-        self.digits.fill(0);
+        self.digits.iter().for_each(|d| d.set(0));
     }
 
     #[inline]
     pub fn copy_from(&mut self, x: Digits<'_>) {
         let n = x.len().min(self.len());
-        self.digits[..n].copy_from_slice(&x.as_slice()[..n]);
-        self.digits[n..].fill(0);
-    }
-}
-
-impl Index<usize> for RWDigits<'_> {
-    type Output = Digit;
-
-    #[inline]
-    fn index(&self, i: usize) -> &Digit {
-        &self.digits[i]
-    }
-}
-
-impl IndexMut<usize> for RWDigits<'_> {
-    #[inline]
-    fn index_mut(&mut self, i: usize) -> &mut Digit {
-        &mut self.digits[i]
+        self.digits[..n].iter().zip(x.iter()).for_each(|(d, x)| d.set(x));
+        self.digits[n..].iter().for_each(|d| d.set(0));
     }
 }

@@ -53,21 +53,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "ragwort-gc-words"
-version = "0.1.0"
-dependencies = [
- "ragwort-derive",
- "ragwort-gc-region",
- "ragwort-num",
- "ragwort-string",
-]
-
-[[package]]
 name = "ragwort-num"
 version = "0.1.0"
 
 [[package]]
-name = "ragwort-parser"
+name = "ragwort-reader"
 version = "0.1.0"
 dependencies = [
  "ragwort-types",
@@ -81,7 +71,17 @@ version = "0.1.0"
 name = "ragwort-types"
 version = "0.1.0"
 dependencies = [
- "ragwort-gc-words",
+ "ragwort-derive",
+ "ragwort-gc-region",
+ "ragwort-num",
+ "ragwort-string",
+]
+
+[[package]]
+name = "ragwort-vm"
+version = "0.1.0"
+dependencies = [
+ "ragwort-types",
 ]
 
 [[package]]

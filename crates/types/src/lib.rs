@@ -1,11 +1,13 @@
-//! Ragwort's data types in the arena: numbers, strings, symbols, pairs, vectors and syntax, and
-//! the compiler's constant pools. The arena is `ragwort-gc-words`, which holds the strings and
-//! numbers itself; this crate adds the rest, as views of objects only it can change.
+//! Ragwort's data in the arena: the collector, in [`gc`], and the types it holds: numbers,
+//! strings, symbols, pairs, vectors and syntax, and the compiler's constant pools. Pairs,
+//! symbols, vectors and syntax are views of objects only this crate can change.
 
-pub use ragwort_gc_words as gc;
-pub use ragwort_gc_words::Error;
+extern crate self as ragwort_types;
+
+pub use gc::Error;
 
 pub mod constant;
+pub mod gc;
 pub mod num;
 mod objects;
 pub mod pair;
