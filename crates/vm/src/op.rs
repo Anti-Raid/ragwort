@@ -1,67 +1,85 @@
 //! The instruction set. Registers are `u8`s, slots of the current frame's window; jumps are
 //! relative to the instruction after them.
 
-use ragwort_types::Error;
+use ragwort_types::{Error, named};
 use ragwort_types::gc::{Frame, Mutation, OutOfMemory, Slots, Value};
 use ragwort_types::constant::Constants;
 use ragwort_types::num::NumError;
 use ragwort_types::string::StrError;
 
-use crate::objects::{self, BytecodeFields, ClosureFields};
+use crate::objects::{self, BytecodeFields, ClosureFields, SpillFields};
+use crate::machine::list;
 use crate::{Intrinsic, Request};
 
 #[cfg(test)]
 #[path = "tests/op.rs"]
 mod tests;
 
-/// One instruction. Every variant fits in 8 bytes: an opcode, registers, and up to a 32-bit
-/// index or offset.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Op {
-    /// Move contents of register `src` to `dst`
-    Move { dst: u8, src: u8 },
-    /// Loads constant `index` of the constant pool
-    LoadConst { dst: u8, index: u32 },
-    /// Jump to offset `offset`
-    Jump { offset: i32 },
-    /// Jumps to offset `offset` if register `test` holds `#f`.
-    JumpIfFalse { test: u8, offset: i32 },
-    /// Calls the procedure in register `base` with the `args` registers after it, in a frame
-    /// starting at `base`, as laid out in [`crate::frame`]: the callee's frame overlaps its
-    /// caller's, so the arguments are already where it reads them. Anything the caller needs
-    /// after the call is below `base`, which must be past the caller's link.
-    Call { base: u8, args: u8 },
-    /// Calls the procedure in register `base` with the `args` registers after it, moved down
-    /// into the current frame. The frame's link stays, so the callee returns to this frame's
-    /// caller.
-    TailCall { base: u8, args: u8 },
-    /// Sets the accumulator to register `src` and returns it, one value, to the caller the frame
-    /// names.
-    Return { src: u8 },
-    /// Copies the accumulator, where a call leaves its result, to `dst`.
-    MoveAcc { dst: u8 },
-    /// Loads upvalue `index` of the current closure. Upvalues are copied in when a closure is
-    /// made, so an assigned variable is captured as a box, which the box intrinsics read and write.
-    LoadUpvalue { dst: u8, index: u32 },
-    /// Makes `count` closures, of the code in constants `code..code + count`, into registers
-    /// `dst..dst + count`, then fills each one's upvalues from its code's capture list. All are
-    /// made before any is filled, so closures that refer to each other, as a `letrec` of lambdas
-    /// makes, capture each other as registers.
-    NewClosure { dst: u8, count: u8, code: u32 },
-    /// Runs `intrinsic` on the `args` registers from `base`, leaving its result in the
-    /// accumulator as a call does, and goes on. The compiler emits it for a primitive that can't
-    /// have been rebound, so an intrinsic can take fast paths, such as adding fixnums in place.
-    CallIntrinsic { base: u8, args: u8, intrinsic: Intrinsic },
-    /// Runs `intrinsic` like `CallIntrinsic`, then returns its result. A built-in used as a value
-    /// is a closure whose code is just this.
-    TailCallIntrinsic { base: u8, args: u8, intrinsic: Intrinsic },
-    /// Has the run loop carry out `request` on the `args` registers from `base`. One that calls a
-    /// procedure, as `call/cc` does, goes on here when it returns, so `base` must be past the
-    /// frame's link, as a call's is.
-    CallRequest { base: u8, args: u8, request: Request },
-    /// Like `CallRequest`, but a procedure the request calls takes this frame's place, so it
-    /// returns to this frame's caller, as `(call/cc f)` in tail position needs.
-    TailCallRequest { base: u8, args: u8, request: Request },
+named! {
+    /// One instruction. Every variant fits in 8 bytes: an opcode, registers, and up to a 32-bit
+    /// index or offset.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Op {
+        /// Move contents of register `src` to `dst`
+        Move { dst: u8, src: u8 } = "move",
+        /// Loads constant `index` of the constant pool
+        LoadConst { dst: u8, index: u32 } = "load-const",
+        /// Jump to offset `offset`
+        Jump { offset: i32 } = "jump",
+        /// Jumps to offset `offset` if register `test` holds `#f`.
+        JumpIfFalse { test: u8, offset: i32 } = "jump-if-false",
+        /// Calls the procedure in register `base` with the `args` registers after it, in a frame
+        /// starting at `base`, as laid out in [`crate::frame`]: the callee's frame overlaps its
+        /// caller's, so the arguments are already where it reads them. Anything the caller needs
+        /// after the call is below `base`, which must be past the caller's link.
+        Call { base: u8, args: u8 } = "call",
+        /// Calls the procedure in register `base` with the `args` registers after it, moved down
+        /// into the current frame. The frame's link stays, so the callee returns to this frame's
+        /// caller.
+        TailCall { base: u8, args: u8 } = "tail-call",
+        /// Sets the accumulator to register `src` and returns it, one value, to the caller the frame
+        /// names.
+        Return { src: u8 } = "return",
+        /// Copies the accumulator, where a call leaves its result, to `dst`.
+        MoveAcc { dst: u8 } = "move-acc",
+        /// Loads upvalue `index` of the current closure. Upvalues are copied in when a closure is
+        /// made, so an assigned variable is captured as a box, which the box intrinsics read and write.
+        LoadUpvalue { dst: u8, index: u32 } = "load-upvalue",
+        /// Makes `count` closures, of the code in constants `code..code + count`, into registers
+        /// `dst..dst + count`, then fills each one's upvalues from its code's capture list. All are
+        /// made before any is filled, so closures that refer to each other, as a `letrec` of lambdas
+        /// makes, capture each other as registers.
+        NewClosure { dst: u8, count: u8, code: u32 } = "new-closure",
+        /// Runs `intrinsic` on the `args` registers from `base`, leaving its result in the
+        /// accumulator as a call does, and goes on. The compiler emits it for a primitive that can't
+        /// have been rebound, so an intrinsic can take fast paths, such as adding fixnums in place.
+        CallIntrinsic { base: u8, args: u8, intrinsic: Intrinsic } = "call-intrinsic",
+        /// Runs `intrinsic` like `CallIntrinsic`, then returns its result. A built-in used as a value
+        /// is a closure whose code is just this.
+        TailCallIntrinsic { base: u8, args: u8, intrinsic: Intrinsic } = "tail-call-intrinsic",
+        /// Has the run loop carry out `request` on the `args` registers from `base`. One that calls a
+        /// procedure, as `call/cc` does, goes on here when it returns, so `base` must be past the
+        /// frame's link, as a call's is.
+        CallRequest { base: u8, args: u8, request: Request } = "call-request",
+        /// Like `CallRequest`, but a procedure the request calls takes this frame's place, so it
+        /// returns to this frame's caller, as `(call/cc f)` in tail position needs.
+        TailCallRequest { base: u8, args: u8, request: Request } = "tail-call-request",
+        /// Runs `intrinsic` like `CallIntrinsic`, but the last of the `args` registers holds a list of
+        /// the arguments after the others, as many as it takes, past the 255 registers can hold.
+        ApplyIntrinsic { base: u8, args: u8, intrinsic: Intrinsic } = "apply-intrinsic",
+        /// Carries out `request` like `CallRequest`, with the last of the `args` registers a list of
+        /// the arguments after the others.
+        ApplyRequest { base: u8, args: u8, request: Request } = "apply-request",
+        /// `ApplyRequest` in tail position, as `TailCallRequest` is `CallRequest`'s.
+        TailApplyRequest { base: u8, args: u8, request: Request } = "tail-apply-request",
+        /// Makes a [`Spill`](crate::objects::Spill) of `count` slots, all void, in `dst`. Code that
+        /// needs more registers than a frame has makes one as it starts.
+        NewSpill { dst: u8, count: u32 } = "new-spill",
+        /// Loads slot `slot` of the spill in register `spill`.
+        LoadSpill { dst: u8, spill: u8, slot: u32 } = "load-spill",
+        /// Stores register `src` in slot `slot` of the spill in register `spill`.
+        StoreSpill { src: u8, spill: u8, slot: u32 } = "store-spill",
+    }
 }
 
 const _: () = assert!(size_of::<Op>() == 8);
@@ -74,6 +92,8 @@ pub enum Capture {
     Register(u8),
     /// An upvalue of the closure making it.
     Upvalue(u32),
+    /// Slot `slot` of the spill in register `spill` of the frame making it.
+    Spill { spill: u8, slot: u32 },
 }
 
 /// What an instruction runs against.
@@ -130,8 +150,10 @@ pub enum Control {
     /// All the *many* Call insts
     Call { base: u8, args: u8 },
     TailCall { base: u8, args: u8 },
-    CallRequest { base: u8, args: u8, request: Request },
-    TailCallRequest { base: u8, args: u8, request: Request },
+    /// A request on the `args` registers from `base`, the last of them a list of more if
+    /// `spread`.
+    CallRequest { base: u8, args: u8, request: Request, spread: bool },
+    TailCallRequest { base: u8, args: u8, request: Request, spread: bool },
     /// Back to the caller, with the accumulator.
     Return,
 }
@@ -147,12 +169,18 @@ pub enum Fault {
     OutOfMemory,
     /// An intrinsic got an argument it doesn't take, such as `car` of a non-pair.
     WrongType,
+    /// An index past the end of what it indexes, or negative.
+    OutOfRange,
+    /// A write to something that can't change, such as a literal.
+    Immutable,
     /// A procedure was called with a number of arguments it doesn't take.
     Arity,
     /// A call of something that isn't a procedure.
     NotProcedure,
     /// An abort or capture to a prompt tag with no prompt.
     NoPrompt,
+    /// A reference to, or `set!` of, a global that isn't defined.
+    Unbound,
     /// A run of a machine whose task already finished.
     Finished,
     /// The machine's fuel ran out, which finishes its task.
@@ -241,6 +269,7 @@ impl Op {
                                 }
                                 cx.upvalues.get(u)
                             }
+                            Capture::Spill { spill, slot } => spilled(mc, frame, spill, slot)?.get(slot as usize),
                         };
                         upvalues.set(mc, j, value);
                     }
@@ -250,21 +279,56 @@ impl Op {
                 if usize::from(base) + usize::from(args) > 256 || intrinsic.arity().is_some_and(|n| n != args) {
                     return Err(Fault::Malformed);
                 }
-                cx.acc = intrinsic.run(mc, frame, base, args, &mut cx.fuel)?;
+                cx.acc = intrinsic.exec(mc, frame, base, args, &mut cx.fuel)?;
                 if matches!(self, Op::TailCallIntrinsic { .. }) {
                     return Ok(Control::Return);
                 }
             }
             Op::CallRequest { base, args, request } | Op::TailCallRequest { base, args, request } => {
-                if usize::from(base) + usize::from(args) > 256 || !request.takes(args) {
+                if usize::from(base) + usize::from(args) > 256 || !request.takes(usize::from(args)) {
                     return Err(Fault::Malformed);
                 }
                 return Ok(match self {
-                    Op::CallRequest { .. } => Control::CallRequest { base, args, request },
-                    _ => Control::TailCallRequest { base, args, request },
+                    Op::CallRequest { .. } => Control::CallRequest { base, args, request, spread: false },
+                    _ => Control::TailCallRequest { base, args, request, spread: false },
                 });
             }
+            Op::ApplyIntrinsic { base, args, intrinsic } => {
+                if args == 0 || usize::from(base) + usize::from(args) > 256 {
+                    return Err(Fault::Malformed);
+                }
+                let mut values: Vec<_> = (0..args - 1).map(|i| frame.get(base + i)).collect();
+                values.extend(list(mc, frame.get(base + args - 1))?);
+                cx.acc = intrinsic.run(mc, &values, &mut cx.fuel)?;
+            }
+            Op::ApplyRequest { base, args, request } | Op::TailApplyRequest { base, args, request } => {
+                if args == 0 || usize::from(base) + usize::from(args) > 256 {
+                    return Err(Fault::Malformed);
+                }
+                return Ok(match self {
+                    Op::ApplyRequest { .. } => Control::CallRequest { base, args, request, spread: true },
+                    _ => Control::TailCallRequest { base, args, request, spread: true },
+                });
+            }
+            Op::NewSpill { dst, count } => {
+                frame.set(dst, Value::object(mc, objects::Spill::new(mc, count as usize, Value::VOID)?));
+                if mc.step_due() {
+                    cx.fuel.pause();
+                }
+            }
+            Op::LoadSpill { dst, spill, slot } => frame.set(dst, spilled(mc, frame, spill, slot)?.get(slot as usize)),
+            Op::StoreSpill { src, spill, slot } => spilled(mc, frame, spill, slot)?.set(mc, slot as usize, frame.get(src)),
         }
         Ok(Control::Next)
     }
+}
+
+/// The slots of the spill in register `spill`, which has a slot `slot`.
+#[inline]
+fn spilled<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, spill: u8, slot: u32) -> Result<Slots<'gc>, Fault> {
+    let slots = frame.get(spill).downcast::<objects::Spill>(mc).ok_or(Fault::Malformed)?.items(mc);
+    if slot as usize >= slots.len() {
+        return Err(Fault::Malformed);
+    }
+    Ok(slots)
 }

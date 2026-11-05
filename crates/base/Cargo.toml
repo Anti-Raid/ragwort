@@ -1,0 +1,18 @@
+[package]
+name = "ragwort-base"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ragwort-types = { path = "../types", default-features = false }
+ragwort-reader = { path = "../reader", default-features = false }
+ragwort-vm = { path = "../vm", default-features = false }
+ragwort-compiler = { path = "../compiler", default-features = false }
+ragwort-native = { path = "../native", default-features = false }
+
+[features]
+default = ["mmap"]
+mmap = ["ragwort-types/mmap", "ragwort-reader/mmap", "ragwort-vm/mmap", "ragwort-compiler/mmap", "ragwort-native/mmap"]
+
+[lints]
+workspace = true

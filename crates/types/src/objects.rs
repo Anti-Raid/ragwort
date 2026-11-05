@@ -15,6 +15,9 @@ crate::gc::objects! {
     pub(crate) struct Pair { head: Value, tail: Value, length: u64 }
     pub(crate) struct Vector {} items Value
     pub(crate) struct ImmutableVector {} items Value
+    /// `bytes` bytes, eight to a word, the first lowest.
+    pub(crate) struct Bytevector { bytes: u64 } items u64
+    pub(crate) struct ImmutableBytevector { bytes: u64 } items u64
     /// Source bytes, in no particular encoding.
     pub(crate) struct SyntaxText { bytes: Frozen<Box<[u8]>> }
     /// A source's name, its text while a session keeps it, its length, and the byte offset of

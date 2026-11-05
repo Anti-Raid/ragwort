@@ -7,38 +7,41 @@
 //! handler are the prelude's, written in terms of them.
 
 use ragwort_types::gc::Value;
+use ragwort_types::named;
 
 use crate::Fault;
 use crate::machine::{Outer, Then, list};
 use crate::prompts::{self, tag_of};
 
-#[repr(u16)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Request {
-    /// `(apply f x ... list)`: calls `f` with the `x`s, then the elements of `list`: as many as
-    /// fill `f`'s required parameters, the rest as its rest list, so a list of any length fits.
-    /// The inner loop makes it a call itself, as it's already laid out as one.
-    Apply,
-    /// `(with-mark key value f arg ...)`: calls `f` with the `arg`s, with a mark of `value`
-    /// for `key` on its continuation. In tail position, it replaces the frame's mark for
-    /// `key`, if it has one, so a loop that sets a mark stays in constant space.
-    WithMark,
-    /// `(mark-value key default)`: the value of the nearest mark for `key`, or `default`.
-    MarkValue,
-    /// `(call-with-prompt tag handler f arg ...)`: calls `f` with the `arg`s under a prompt for
-    /// `tag`, which an abort to it calls `handler` in place of.
-    CallWithPrompt,
-    /// `(abort tag value ...)`: drops the continuation up to the nearest prompt for `tag`, and
-    /// the prompt, and calls its handler with the values in their place.
-    Abort,
-    /// `(capture tag f)`: calls `f` with the composable continuation up to the nearest prompt
-    /// for `tag`, a procedure that goes on with it on top of the continuation it's called in.
-    Capture,
+named! {
+    #[repr(u16)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Request {
+        /// `(apply f x ... list)`: calls `f` with the `x`s, then the elements of `list`: as many as
+        /// fill `f`'s required parameters, the rest as its rest list, so a list of any length fits.
+        /// The inner loop makes it a call itself, as it's already laid out as one.
+        Apply = "apply",
+        /// `(with-mark key value f arg ...)`: calls `f` with the `arg`s, with a mark of `value`
+        /// for `key` on its continuation. In tail position, it replaces the frame's mark for
+        /// `key`, if it has one, so a loop that sets a mark stays in constant space.
+        WithMark = "with-mark",
+        /// `(mark-value key default)`: the value of the nearest mark for `key`, or `default`.
+        MarkValue = "mark-value",
+        /// `(call-with-prompt tag handler f arg ...)`: calls `f` with the `arg`s under a prompt for
+        /// `tag`, which an abort to it calls `handler` in place of.
+        CallWithPrompt = "call-with-prompt",
+        /// `(abort tag value ...)`: drops the continuation up to the nearest prompt for `tag`, and
+        /// the prompt, and calls its handler with the values in their place.
+        Abort = "abort",
+        /// `(capture tag f)`: calls `f` with the composable continuation up to the nearest prompt
+        /// for `tag`, a procedure that goes on with it on top of the continuation it's called in.
+        Capture = "capture",
+    }
 }
 
 impl Request {
     /// Whether it takes `args` arguments. Bytecode that passes another number is malformed.
-    pub fn takes(self, args: u8) -> bool {
+    pub fn takes(self, args: usize) -> bool {
         let (least, most) = match self {
             Request::Apply => (2, None),
             Request::WithMark | Request::CallWithPrompt => (3, None),

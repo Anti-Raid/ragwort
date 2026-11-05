@@ -36,6 +36,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ragwort-base"
+version = "0.1.0"
+dependencies = [
+ "ragwort-compiler",
+ "ragwort-native",
+ "ragwort-reader",
+ "ragwort-types",
+ "ragwort-vm",
+]
+
+[[package]]
+name = "ragwort-compiler"
+version = "0.1.0"
+dependencies = [
+ "ragwort-types",
+ "ragwort-vm",
+]
+
+[[package]]
 name = "ragwort-derive"
 version = "0.1.0"
 dependencies = [
@@ -50,6 +69,16 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "memmap2",
+]
+
+[[package]]
+name = "ragwort-native"
+version = "0.1.0"
+dependencies = [
+ "ragwort-compiler",
+ "ragwort-reader",
+ "ragwort-types",
+ "ragwort-vm",
 ]
 
 [[package]]

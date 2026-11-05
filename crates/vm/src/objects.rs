@@ -24,6 +24,9 @@ objects! {
     pub struct Closure { code: Member<Bytecode> } items Value
     /// An assigned variable, shared by the closures that capture it.
     pub struct Box { value: Value }
+    /// A global variable: its name, for messages, and its value once it's `defined`. Code holds
+    /// the ones it uses as constants.
+    pub struct Global { name: Value, value: Value, defined: bool }
     /// Frames handed to a continuation, as Chez's continuation objects hold them: slots
     /// `start..end` of `segment`, which the stack no longer writes. They end where the frame
     /// above them would start, and `link` is that frame's link, where the top one goes on.
@@ -73,4 +76,7 @@ objects! {
     /// What `(values ...)` makes of other than one value: an object like any other, which the
     /// `values` intrinsics take apart.
     pub struct MultiValue {} items Value
+    /// What a frame's code keeps past its registers, which `NewSpill` makes and `LoadSpill` and
+    /// `StoreSpill` read and write. Each slot holds one value for one stretch of the code.
+    pub struct Spill {} items Value
 }

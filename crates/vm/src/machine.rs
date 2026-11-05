@@ -1,6 +1,6 @@
 
 use ragwort_types::gc::{Gc, Mutation, Root, Segment, Stack, Value, WINDOW};
-use ragwort_types::pair::Pair;
+use ragwort_types::pair::{Pair, Pairs};
 
 use crate::frame::{self, ARGS, CLOSURE, Link};
 use crate::intrinsic::values;
@@ -158,7 +158,7 @@ impl<'a, 'gc> Outer<'a, 'gc> {
             Exit::Overflow { callee, argc, rest } => self.overflow(callee, argc, rest).map(|()| None),
             Exit::Underflow => self.resume(),
             Exit::Call { base, argc, rest, tail } => self.call(base, argc, rest, tail),
-            Exit::Request { base, args, request, tail } => self.request(base, args, request, tail),
+            Exit::Request { base, args, request, spread, tail } => self.request(base, args, request, spread, tail),
         };
         match step {
             Err(fault) if !fault.is_fatal() => self.fault(fault),
@@ -181,9 +181,16 @@ impl<'a, 'gc> Outer<'a, 'gc> {
     }
 
     /// Carries out `request` on the `args` registers from `base`.
-    fn request(&mut self, base: u8, args: u8, request: Request, tail: bool) -> Step<'gc> {
+    fn request(&mut self, base: u8, args: u8, request: Request, spread: bool, tail: bool) -> Step<'gc> {
         let frame = self.segments.frame(self.regs.fp)?;
-        let args: Vec<_> = (0..args).map(|i| frame.get(base + i)).collect();
+        let mut args: Vec<_> = (0..args).map(|i| frame.get(base + i)).collect();
+        if spread {
+            let more = args.pop().ok_or(Fault::Malformed)?;
+            args.extend(list(self.mc(), more)?);
+            if !request.takes(args.len()) {
+                return Err(Fault::Arity);
+            }
+        }
         if request.keeps() {
             self.keep(base, tail)?;
         }
@@ -265,14 +272,17 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         }
     }
 
-    /// Calls the closure `procedure` with `args` in a frame at the bottom of the stack.
+    /// Calls the closure `procedure` with `args` in a frame at the bottom of the stack. Those
+    /// that don't fit in its registers go in as a list, which binding takes the rest from.
     fn start(&mut self, procedure: Value<'gc>, args: &[Value<'gc>]) -> Result<(), Fault> {
-        let argc = u8::try_from(args.len()).ok().filter(|&n| usize::from(n) <= MAX_ARGS).ok_or(Fault::Arity)?;
+        let (fit, over) = args.split_at(args.len().min(MAX_ARGS));
+        let rest = Pairs::new(self.mc()).list(over)?;
         let fp = self.segments.bottom(0)?;
         let frame = self.segments.frame(fp)?;
         frame.set(CLOSURE, procedure);
-        (ARGS..).zip(args).for_each(|(r, &arg)| frame.set(r, arg));
-        self.enter(fp, argc, Value::NIL, Link::BOTTOM)
+        (ARGS..).zip(fit).for_each(|(r, &arg)| frame.set(r, arg));
+        let argc = u8::try_from(fit.len()).expect("MAX_ARGS is less than 256");
+        self.enter(fp, argc, rest, Link::BOTTOM)
     }
 
     /// Enters the closure in the frame at `fp`, with `argc` arguments and the list `rest` after
@@ -281,7 +291,9 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         let mc = self.mc();
         let frame = self.segments.frame(fp)?;
         let closure = frame.get(CLOSURE).downcast::<Closure>(mc).ok_or(Fault::NotProcedure)?;
-        bind(mc, frame, closure.code(mc).ok_or(Fault::Malformed)?.arity(mc), argc, rest)?;
+        // The outer loop sees for itself when the step is due.
+        let mut fuel = Fuel { run: 0, rest: 0 };
+        bind(mc, frame, closure.code(mc).ok_or(Fault::Malformed)?.arity(mc), argc, rest, &mut fuel)?;
         frame::set_link(mc, frame, link)?;
         (self.regs.fp, self.regs.pc) = (fp, 0);
         Ok(())

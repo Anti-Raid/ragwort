@@ -845,3 +845,16 @@ fn dirty_cards_of_large_objects() {
     });
 }
 
+
+#[test]
+fn characters_are_constants_apart_from_the_others() {
+    for c in ['\0', 'a', 'λ', '\u{10FFFF}'] {
+        let v = Value::char(c);
+        assert_eq!(v.as_char(), Some(c));
+        assert!(v.as_fixnum().is_none());
+    }
+    for v in [Value::TRUE, Value::FALSE, Value::NIL, Value::VOID, Value::fixnum(97).unwrap()] {
+        assert_eq!(v.as_char(), None);
+    }
+    assert_ne!(Value::char('a'), Value::char('b'));
+}

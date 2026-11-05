@@ -1,0 +1,15 @@
+[package]
+name = "ragwort-compiler"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ragwort-types = { path = "../types", default-features = false }
+ragwort-vm = { path = "../vm", default-features = false }
+
+[features]
+default = ["mmap"]
+mmap = ["ragwort-types/mmap", "ragwort-vm/mmap"]
+
+[lints]
+workspace = true

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher, RandomState};
 
+use ragwort_types::bytevector::AnyBytevector;
 use ragwort_types::gc::{Gc, Mutation, Value};
 use ragwort_types::num::{Nums, complex};
 use ragwort_types::pair::Pair;
@@ -31,10 +32,10 @@ pub(crate) fn eqv<'gc>(mc: &Mutation<'gc>, a: Value<'gc>, b: Value<'gc>) -> bool
     }
 }
 
-/// `equal?`: [`eqv?`](eqv), or strings of the same characters, or pairs, vectors or boxes whose
-/// contents are `equal?`. A vector's mutability doesn't matter, as in Racket. Also returns how
-/// many values it compared, a string counting as one, or faults with [`Fault::OutOfFuel`] once
-/// that's past `most`.
+/// `equal?`: [`eqv?`](eqv), or strings of the same characters, or bytevectors of the same
+/// bytes, or pairs, vectors or boxes whose contents are `equal?`. A vector's mutability doesn't
+/// matter, as in Racket. Also returns how many values it compared, a string or bytevector
+/// counting as one, or faults with [`Fault::OutOfFuel`] once that's past `most`.
 pub(crate) fn equal<'gc>(mc: &Mutation<'gc>, a: Value<'gc>, b: Value<'gc>, most: u64) -> Result<(bool, u64), Fault> {
     let (strings, vectors) = (Strings::new(mc), Vectors::new(mc));
     let (mut next, mut todo, mut phases) = (Some((a, b)), Vec::new(), Phases::new());
@@ -59,6 +60,12 @@ pub(crate) fn equal<'gc>(mc: &Mutation<'gc>, a: Value<'gc>, b: Value<'gc>, most:
         }
         if let (Some(s), Some(t)) = (strings.string(a), strings.string(b)) {
             if !string::equal(&strings, s, t)? {
+                return Ok((false, compared));
+            }
+            continue;
+        }
+        if let (Some(x), Some(y)) = (AnyBytevector::of(a), AnyBytevector::of(b)) {
+            if !x.same_bytes(mc, y) {
                 return Ok((false, compared));
             }
             continue;

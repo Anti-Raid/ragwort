@@ -1,4 +1,4 @@
-use ragwort_types::gc::{Arena, Segment, Value};
+use ragwort_types::gc::{Arena, Mutation, Segment, Value};
 use ragwort_types::pair::{Pair, Pairs};
 use ragwort_types::string::{self, Strings};
 use ragwort_types::constant::Constants;
@@ -41,7 +41,7 @@ fn steps_run_against_the_frame() {
 
         assert_eq!(Op::Call { base: 8, args: 2 }.step(&mut cx), Ok(Control::Call { base: 8, args: 2 }));
         let request = Op::TailCallRequest { base: 8, args: 1, request: Request::Abort };
-        assert_eq!(request.step(&mut cx), Ok(Control::TailCallRequest { base: 8, args: 1, request: Request::Abort }));
+        assert_eq!(request.step(&mut cx), Ok(Control::TailCallRequest { base: 8, args: 1, request: Request::Abort, spread: false }));
     });
 }
 
@@ -321,6 +321,8 @@ fn values_are_an_object() {
         call(cx, 30, 2, Intrinsic::ValuesRef).unwrap();
         assert_eq!(cx.acc, fix(12));
         frame.set(31, fix(3));
+        assert_eq!(call(cx, 30, 2, Intrinsic::ValuesRef), Err(Fault::OutOfRange));
+        frame.set(31, Value::NIL);
         assert_eq!(call(cx, 30, 2, Intrinsic::ValuesRef), Err(Fault::WrongType));
 
         // One value is itself, and none is an empty object.
@@ -331,5 +333,93 @@ fn values_are_an_object() {
         assert_eq!(call(cx, 20, 1, Intrinsic::ValuesLength), Err(Fault::WrongType));
         call(cx, 20, 0, Intrinsic::Values).unwrap();
         assert_eq!(cx.acc.downcast::<objects::MultiValue>(mc).map(|v| v.items(mc).len()), Some(0));
+    });
+}
+
+#[test]
+fn every_built_in_is_listed_once_by_name() {
+    assert!(crate::Intrinsic::ALL.iter().enumerate().all(|(k, &i)| i as usize == k));
+    assert!(crate::Request::ALL.iter().enumerate().all(|(k, &r)| r as usize == k));
+    let mut names: Vec<_> = crate::Intrinsic::ALL.iter().map(|i| i.name()).chain(crate::Request::ALL.iter().map(|r| r.name())).collect();
+    names.sort_unstable();
+    let len = names.len();
+    names.dedup();
+    assert_eq!(names.len(), len);
+    assert!(crate::Intrinsic::ALL.iter().all(|&i| i.name().parse() == Ok(i)));
+    assert!(crate::Request::ALL.iter().all(|&r| r.name().parse() == Ok(r)));
+    assert_eq!("frob".parse::<crate::Intrinsic>(), Err(ragwort_types::UnknownName));
+    assert_eq!(Op::Return { src: 0 }.name(), "return");
+    assert_eq!(Op::TailCallRequest { base: 0, args: 0, request: crate::Request::Abort }.name(), "tail-call-request");
+}
+
+#[test]
+fn intrinsics_run_without_a_frame() {
+    let mut arena = Arena::new(1 << 20, 0);
+    arena.mutate(|mc| {
+        let mut fuel = Fuel { run: u64::MAX, rest: 0 };
+        let fix = |n| Value::fixnum(n).unwrap();
+        assert_eq!(Intrinsic::Add.run(mc, &[fix(1), fix(2), fix(3)], &mut fuel), Ok(fix(6)));
+        assert_eq!(Intrinsic::Add.run(mc, &[], &mut fuel), Ok(fix(0)));
+        let list = Pairs::new(mc).list(&[fix(1), fix(2)]).unwrap();
+        assert_eq!(Intrinsic::Car.run(mc, &[list], &mut fuel), Ok(fix(1)));
+        assert_eq!(Intrinsic::Car.run(mc, &[fix(1)], &mut fuel), Err(Fault::WrongType));
+        assert_eq!(Intrinsic::Car.run(mc, &[list, list], &mut fuel), Err(Fault::Arity));
+        assert_eq!(Intrinsic::Add.run(mc, &[fix(1); 256], &mut fuel), Ok(fix(256)));
+        assert_eq!(Intrinsic::Add.run(mc, &[fix(1); 1000], &mut fuel), Ok(fix(1000)));
+    });
+}
+
+#[test]
+fn every_cxr_follows_its_name_from_the_last_letter() {
+    let mut arena = Arena::new(1 << 20, 0);
+    arena.mutate(|mc| {
+        let mut fuel = Fuel { run: u64::MAX, rest: 0 };
+        let pairs = Pairs::new(mc);
+        // A tree four deep, each leaf the path to it, written as `c...r` would read it.
+        fn tree<'gc>(mc: &Mutation<'gc>, path: String, depth: usize) -> Value<'gc> {
+            if depth == 0 {
+                return string::from_str(&Strings::new(mc), &path).unwrap().value();
+            }
+            let head = tree(mc, format!("a{path}"), depth - 1);
+            let tail = tree(mc, format!("d{path}"), depth - 1);
+            Pairs::new(mc).cons(head, tail).unwrap().value(mc)
+        }
+        let strings = Strings::new(mc);
+        let cxrs: Vec<_> = Intrinsic::ALL.iter().filter(|i| matches!(i.name().as_bytes(), [b'c', middle @ .., b'r'] if !middle.is_empty() && middle.iter().all(|&b| b == b'a' || b == b'd'))).collect();
+        assert_eq!(cxrs.len(), 2 + 4 + 8 + 16);
+        for cxr in cxrs {
+            let path = &cxr.name()[1..cxr.name().len() - 1];
+            let x = tree(mc, String::new(), path.len());
+            let got = cxr.run(mc, &[x], &mut fuel).unwrap();
+            assert!(string::equal_str(&strings, strings.string(got).unwrap(), path).unwrap(), "{}", cxr.name());
+        }
+        assert_eq!(Intrinsic::Cadddr.run(mc, &[pairs.list(&[fix(1), fix(2)]).unwrap()], &mut fuel), Err(Fault::WrongType));
+    });
+}
+
+#[test]
+fn booleans_void_and_bytevectors() {
+    let mut arena = Arena::new(1 << 20, 0);
+    arena.mutate(|mc| {
+        let mut fuel = Fuel { run: u64::MAX, rest: 0 };
+        assert_eq!(Intrinsic::IsBoolean.run(mc, &[Value::FALSE], &mut fuel), Ok(Value::TRUE));
+        assert_eq!(Intrinsic::IsBoolean.run(mc, &[Value::NIL], &mut fuel), Ok(Value::FALSE));
+        assert_eq!(Intrinsic::Void.run(mc, &[], &mut fuel), Ok(Value::VOID));
+        assert_eq!(Intrinsic::Void.run(mc, &[fix(1), fix(2)], &mut fuel), Ok(Value::VOID));
+        let h = ragwort_types::bytevector::Bytevectors::new(mc);
+        let bytes = h.from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap().value(mc);
+        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(8)], &mut fuel), Ok(fix(9)));
+        assert_eq!(Intrinsic::BytevectorSet.run(mc, &[bytes, fix(8), fix(255)], &mut fuel), Ok(Value::VOID));
+        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(8)], &mut fuel), Ok(fix(255)));
+        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(7)], &mut fuel), Ok(fix(8)));
+        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(9)], &mut fuel), Err(Fault::OutOfRange));
+        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(-1)], &mut fuel), Err(Fault::OutOfRange));
+        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, Value::NIL], &mut fuel), Err(Fault::WrongType));
+        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[fix(0), fix(0)], &mut fuel), Err(Fault::WrongType));
+        assert_eq!(Intrinsic::BytevectorSet.run(mc, &[bytes, fix(0), fix(256)], &mut fuel), Err(Fault::WrongType));
+        assert_eq!(Intrinsic::BytevectorSet.run(mc, &[bytes, fix(9), fix(0)], &mut fuel), Err(Fault::OutOfRange));
+        let literal = h.immutable_from_slice(&[1]).unwrap().value(mc);
+        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[literal, fix(0)], &mut fuel), Ok(fix(1)));
+        assert_eq!(Intrinsic::BytevectorSet.run(mc, &[literal, fix(0), fix(2)], &mut fuel), Err(Fault::Immutable));
     });
 }

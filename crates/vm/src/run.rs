@@ -7,7 +7,7 @@ use ragwort_types::constant::Constants;
 use ragwort_types::gc::{Frame, Gc, Mutation, Slots, Stack, Value, WINDOW};
 use ragwort_types::pair::{Pair, Pairs};
 
-use crate::frame::{self, ARGS, CLOSURE, Link};
+use crate::frame::{self, ARGS, CLOSURE, Link, MAX_PARAMS};
 use crate::op::Fuel;
 use crate::objects::{BytecodeFields, Closure, ClosureFields};
 use crate::{Context, Control, Fault, Op, Request};
@@ -32,7 +32,8 @@ pub(crate) enum Exit<'gc> {
     /// A call of something other than a closure, in register `base`, with the `argc`
     /// registers after it and the elements of `rest` as its arguments.
     Call { base: u8, argc: u8, rest: Value<'gc>, tail: bool },
-    Request { base: u8, args: u8, request: Request, tail: bool },
+    /// A request on the `args` registers from `base`, the last a list of more if `spread`.
+    Request { base: u8, args: u8, request: Request, spread: bool, tail: bool },
 }
 
 impl From<Fault> for Exit<'_> {
@@ -120,13 +121,13 @@ impl<'s, 'gc> Run<'s, 'gc> {
                     self.charge()?;
                     self.tail_call(Call::new(base, args))?;
                 }
-                Control::CallRequest { base, args, request } => {
+                Control::CallRequest { base, args, request, spread } => {
                     self.charge()?;
-                    self.request(base, args, request, false)?;
+                    self.request(base, args, request, spread, false)?;
                 }
-                Control::TailCallRequest { base, args, request } => {
+                Control::TailCallRequest { base, args, request, spread } => {
                     self.charge()?;
-                    self.request(base, args, request, true)?;
+                    self.request(base, args, request, spread, true)?;
                 }
             }
         }
@@ -185,7 +186,7 @@ impl<'s, 'gc> Run<'s, 'gc> {
     #[inline(always)]
     fn enter(&mut self, frame: Frame<'s, 'gc>, fp: usize, closure: Gc<'gc, Closure>, call: Call<'gc>, link: Value<'gc>) -> Result<(), Exit<'gc>> {
         let mc = self.cx.mc;
-        bind(mc, frame, closure.code(mc).ok_or(Fault::Malformed)?.arity(mc), call.argc, call.rest)?;
+        bind(mc, frame, closure.code(mc).ok_or(Fault::Malformed)?.arity(mc), call.argc, call.rest, &mut self.cx.fuel)?;
         (self.ops, self.cx.constants, self.cx.upvalues, self.link) = load(mc, closure)?;
         frame.set(self.link, link);
         (self.cx.frame, self.fp, self.pc) = (frame, fp, 0);
@@ -212,12 +213,12 @@ impl<'s, 'gc> Run<'s, 'gc> {
     /// Makes `apply` a call, as it's laid out as one, with the list to spread last. The outer
     /// loop carries out the other requests.
     #[inline(always)]
-    fn request(&mut self, base: u8, args: u8, request: Request, tail: bool) -> Result<(), Exit<'gc>> {
+    fn request(&mut self, base: u8, args: u8, request: Request, spread: bool, tail: bool) -> Result<(), Exit<'gc>> {
         let frame = self.cx.frame;
         let call = match request {
             // (apply f x ... list) is already laid out as a call at `base`, with the list spread.
-            Request::Apply => Call { base, argc: args - 2, rest: frame.get(base + args - 1) },
-            _ => return Err(Exit::Request { base, args, request, tail }),
+            Request::Apply if !spread => Call { base, argc: args - 2, rest: frame.get(base + args - 1) },
+            _ => return Err(Exit::Request { base, args, request, spread, tail }),
         };
         if tail { self.tail_call(call) } else { self.call(call) }
     }
@@ -237,22 +238,30 @@ fn fits(call: Call<'_>) -> Result<(), Fault> {
 fn load<'gc>(mc: &Mutation<'gc>, closure: Gc<'gc, Closure>) -> Result<(&'gc [Op], Constants<'gc>, Slots<'gc>, u8), Fault> {
     let code = closure.code(mc).ok_or(Fault::Malformed)?;
     let ops = code.ops(mc).ok_or(Fault::Malformed)?;
-    let link = frame::link_slot(code.arity(mc)).ok_or(Fault::Malformed)?;
+    let link = frame::link_slot(code.arity(mc));
     Ok((ops, Constants::of(code.constants(mc)).ok_or(Fault::Malformed)?, closure.items(mc), link))
 }
 
 /// Binds `argc` arguments, in the registers from [`ARGS`], then the elements of the list `rest`,
-/// to the parameters of code that takes `arity`.
+/// to the parameters of code that takes `arity`. If the list it makes of the rest makes the step
+/// due, the run pauses at its next call or jump.
 #[inline(always)]
-pub(crate) fn bind<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, argc: u8, rest: Value<'gc>) -> Result<(), Fault> {
-    if arity == i64::from(argc) && rest == Value::NIL {
+pub(crate) fn bind<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, argc: u8, rest: Value<'gc>, fuel: &mut Fuel) -> Result<(), Fault> {
+    if arity == i64::from(argc) && argc <= MAX_PARAMS && rest == Value::NIL {
         return Ok(());
     }
-    bind_slow(mc, frame, arity, argc, rest)
+    bind_slow(mc, frame, arity, argc, rest)?;
+    if mc.step_due() {
+        fuel.pause();
+    }
+    Ok(())
 }
 
 #[inline(never)]
 fn bind_slow<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, mut argc: u8, mut rest: Value<'gc>) -> Result<(), Fault> {
+    if arity.unsigned_abs() > u64::from(MAX_PARAMS) {
+        return bind_spread(mc, frame, arity, argc, rest);
+    }
     let variadic = arity < 0;
     let required = if variadic { -(arity + 1) } else { arity };
     let required = u8::try_from(required)
@@ -276,5 +285,36 @@ fn bind_slow<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, mut arg
         rest = pairs.cons(frame.get(ARGS + i), rest)?.value(mc);
     }
     frame.set(ARGS + required, rest);
+    Ok(())
+}
+
+/// Binds as [`bind`] does, for code with more parameters than [`MAX_PARAMS`]: the first
+/// `MAX_PARAMS - 1` arguments in their registers, then a list of the others in the last.
+#[inline(never)]
+fn bind_spread<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, mut argc: u8, mut rest: Value<'gc>) -> Result<(), Fault> {
+    let variadic = arity < 0;
+    let slots = arity.unsigned_abs();
+    let keep = MAX_PARAMS - 1;
+    while argc < keep {
+        let pair = Pair::of(rest).ok_or(if rest == Value::NIL { Fault::Arity } else { Fault::WrongType })?;
+        frame.set(ARGS + argc, pair.head(mc));
+        (rest, argc) = (pair.tail(mc), argc + 1);
+    }
+    let pairs = Pairs::new(mc);
+    for i in (keep..argc).rev() {
+        rest = pairs.cons(frame.get(ARGS + i), rest)?.value(mc);
+    }
+    let (mut count, mut tail) = (0u64, rest);
+    while let Some(pair) = Pair::of(tail) {
+        (count, tail) = (count + 1, pair.tail(mc));
+    }
+    if tail != Value::NIL {
+        return Err(Fault::WrongType);
+    }
+    let required = slots - u64::from(variadic) - u64::from(keep);
+    if count < required || (!variadic && count > required) {
+        return Err(Fault::Arity);
+    }
+    frame.set(ARGS + keep, rest);
     Ok(())
 }

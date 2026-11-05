@@ -238,6 +238,8 @@ pub const WINDOW: usize = 256;
 pub(crate) const TAG: u64 = 0b1111;
 const OBJECT: u64 = 0b0001;
 const CONSTANT: u64 = 0b1101;
+/// The bit of a constant's id that makes it a character.
+const CHAR: u64 = 1 << 31;
 /// A string of [`crate::string::INLINE_CHARS`] Latin-1 characters or fewer: the length in the next
 /// four bits, then a byte for each character, the first lowest.
 pub(crate) const INLINE_STRING: u64 = 0b0101;
@@ -509,6 +511,21 @@ impl<'gc> Value<'gc> {
 
     const fn constant(id: u64) -> Self {
         Self::from_bits(id << 32 | CONSTANT)
+    }
+
+    /// A character: a constant whose id has its top bit set, the code point below it.
+    #[inline]
+    pub const fn char(c: char) -> Self {
+        Self::constant(CHAR | c as u64)
+    }
+
+    #[inline]
+    pub fn as_char(self) -> Option<char> {
+        let id = self.word >> 32;
+        if self.word & 0xFFFF_FFFF != CONSTANT || id & CHAR == 0 {
+            return None;
+        }
+        char::from_u32((id & !CHAR) as u32)
     }
 
     /// Any word is a valid value. One that names no object reads as some other object or none.

@@ -8,10 +8,15 @@ pub const CLOSURE: u8 = 0;
 /// The first argument.
 pub const ARGS: u8 = 1;
 
-/// Where the link is in a frame of code that takes `arity`, as `Bytecode` encodes it, or `None`
-/// if that's past the window.
-pub fn link_slot(arity: i64) -> Option<u8> {
-    u8::try_from(arity.unsigned_abs().checked_add(1)?).ok()
+/// How many registers a frame keeps its parameters in, from [`ARGS`]. Code that takes more, its
+/// rest list counted as one, gets the first `MAX_PARAMS - 1` of its arguments in registers and
+/// a list of the others in the last, which the VM checks has as many as it takes.
+pub const MAX_PARAMS: u8 = 64;
+
+/// Where the link is in a frame of code that takes `arity`, as `Bytecode` encodes it: after its
+/// parameters' registers.
+pub fn link_slot(arity: i64) -> u8 {
+    ARGS + arity.unsigned_abs().min(u64::from(MAX_PARAMS)) as u8
 }
 
 /// Where a frame returns to: its caller goes on at `pc`, in its frame `base` slots below this
@@ -44,7 +49,7 @@ impl Link {
 
 /// Where the link is in a frame of `closure`.
 pub(crate) fn link_slot_of<'gc>(mc: &Mutation<'gc>, closure: Gc<'gc, Closure>) -> Result<u8, Fault> {
-    closure.code(mc).and_then(|code| link_slot(code.arity(mc))).ok_or(Fault::Malformed)
+    closure.code(mc).map(|code| link_slot(code.arity(mc))).ok_or(Fault::Malformed)
 }
 
 /// The link of the frame at `fp` of a record's slots.

@@ -10,15 +10,29 @@ pub enum ErrorKind {
     UnexpectedClose,
     /// A list closed with the other bracket. It opened at byte `open`.
     Mismatched { open: u32 },
-    /// The text ended inside the list that opened here.
+    /// The text ended inside the list, string, `|`-quoted identifier or block comment that
+    /// opened here.
     Unclosed,
-    /// A `'` with no datum after it.
+    /// A quote, quasiquote, unquote, `#;` datum comment or `#n=` label with no datum after it.
     EmptyQuote,
     /// A `.` that doesn't sit between a list's items and exactly one last datum.
     BadDot,
-    /// Syntax the reader doesn't read yet: numbers, strings, `#` forms, quasiquote and
-    /// unquote, `|` and braces.
+    /// Syntax the reader doesn't read: braces, and `#` forms other than those R7RS has.
     Unsupported,
+    /// A token that starts as a number does but isn't one, such as `1x` or `1/0`.
+    BadNumber,
+    /// A `#\` character name that isn't one.
+    BadChar,
+    /// A backslash in a string or `|`-quoted identifier that doesn't start an escape.
+    BadEscape,
+    /// A bytevector item that isn't an exact integer from 0 to 255.
+    BadByte,
+    /// A `#n#` with no `#n=` before it in the same top-level datum.
+    UnknownLabel,
+    /// A `#n#` inside the datum `#n=` labels, which would make it a cycle.
+    CyclicLabel,
+    /// A second `#n=` of one `n` in one top-level datum.
+    DuplicateLabel,
     /// The text isn't UTF-8 from here.
     InvalidUtf8,
     /// The session belongs to another arena.
@@ -64,10 +78,17 @@ impl fmt::Display for ReadError {
         let what = match self.kind {
             ErrorKind::UnexpectedClose => "a closing bracket with no list open",
             ErrorKind::Mismatched { .. } => "a list closed with the wrong bracket",
-            ErrorKind::Unclosed => "a list that's never closed",
-            ErrorKind::EmptyQuote => "a quote with nothing after it",
+            ErrorKind::Unclosed => "a list, string or comment that's never closed",
+            ErrorKind::EmptyQuote => "a quote or datum comment with nothing after it",
             ErrorKind::BadDot => "a misplaced dot",
             ErrorKind::Unsupported => "syntax the reader doesn't support yet",
+            ErrorKind::BadNumber => "a malformed number",
+            ErrorKind::BadChar => "an unknown character name",
+            ErrorKind::BadEscape => "an unknown escape",
+            ErrorKind::BadByte => "a bytevector item that isn't a byte",
+            ErrorKind::UnknownLabel => "a datum label used before it's defined",
+            ErrorKind::CyclicLabel => "a datum label used inside the datum it labels",
+            ErrorKind::DuplicateLabel => "a datum label defined twice",
             ErrorKind::InvalidUtf8 => "text that isn't UTF-8",
             ErrorKind::ForeignSession => "a session from another arena",
             ErrorKind::Arena(Error::OutOfMemory) => "running out of memory",

@@ -1,4 +1,6 @@
 use ragwort_types::gc::Arena;
+use ragwort_types::bytevector::Bytevectors;
+use ragwort_types::num::{Nums, Real, complex, rational, real};
 use ragwort_types::string::display;
 use ragwort_types::symbol::Symbol;
 use ragwort_types::syntax::SyntaxLocation;
@@ -22,7 +24,21 @@ fn show<'gc>(mc: &Mutation<'gc>, node: Syntax<'gc>) -> String {
     let pairs = Pairs::new(mc);
     match node.kind(mc).unwrap() {
         SyntaxKind::Identifier => display(&strings, Symbol::of(node.datum(mc)).unwrap().name(mc)).to_string(),
-        SyntaxKind::Abbreviation(Abbreviation::Quote) => format!("'{}", show(mc, Syntax::of(node.datum(mc)).unwrap())),
+        SyntaxKind::Abbreviation(a) => {
+            let prefix = match a {
+                Abbreviation::Quote => "'",
+                Abbreviation::Quasiquote => "`",
+                Abbreviation::Unquote => ",",
+                Abbreviation::UnquoteSplicing => ",@",
+            };
+            format!("{prefix}{}", show(mc, Syntax::of(node.datum(mc)).unwrap()))
+        }
+        SyntaxKind::Literal => literal(mc, node.datum(mc)),
+        SyntaxKind::Vector => {
+            let v = Vectors::new(mc).vector(node.datum(mc)).unwrap();
+            let items: Vec<_> = (0..v.len(mc)).map(|i| show(mc, Syntax::of(v.get(mc, i).unwrap()).unwrap())).collect();
+            format!("#({})", items.join(" "))
+        }
         SyntaxKind::List => {
             let mut out = Vec::new();
             let mut rest = node.datum(mc);
@@ -35,7 +51,40 @@ fn show<'gc>(mc: &Mutation<'gc>, node: Syntax<'gc>) -> String {
             }
             format!("({})", out.join(" "))
         }
-        kind => panic!("the reader made a {kind:?} node"),
+    }
+}
+
+fn literal<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> String {
+    let (strings, nums) = (Strings::new(mc), Nums::new(mc));
+    if let Some(c) = v.as_char() {
+        return format!("#\\{c}");
+    }
+    if let Some(s) = strings.string(v) {
+        return format!("{:?}", display(&strings, s).to_string());
+    }
+    if let Some(b) = Bytevectors::new(mc).bytevector(v) {
+        return format!("#u8({})", b.to_vec(mc).iter().map(u8::to_string).collect::<Vec<_>>().join(" "));
+    }
+    match v {
+        Value::TRUE => "#t".into(),
+        Value::FALSE => "#f".into(),
+        _ => {
+            let z = nums.number(v).unwrap();
+            let re = show_real(mc, complex::real_part(&nums, z));
+            if complex::is_real(&nums, z) {
+                return re;
+            }
+            let im = show_real(mc, complex::imag_part(&nums, z).unwrap());
+            format!("{re}{}{im}i", if im.starts_with('-') { "" } else { "+" })
+        }
+    }
+}
+
+fn show_real<'gc>(mc: &Mutation<'gc>, x: Real<'gc>) -> String {
+    let nums = Nums::new(mc);
+    match real::is_exact(&nums, x) {
+        true => rational::to_string(&nums, nums.rational(x.value()).unwrap(), 10).unwrap(),
+        false => format!("{:?}", real::to_f64(&nums, x).unwrap()),
     }
 }
 
@@ -126,10 +175,49 @@ fn malformed_text_is_an_error_where_it_goes_wrong() {
     assert_eq!(error("(a . b c)"), (ErrorKind::BadDot, 7, 8));
     assert_eq!(error("(a . b . c)"), (ErrorKind::BadDot, 7, 8));
     assert_eq!(error("'. a"), (ErrorKind::BadDot, 1, 2));
-    let unsupported = [("42", 0, 2), ("(a -5)", 3, 5), (".5", 0, 2), ("\"s\"", 0, 1), ("#t", 0, 1), ("`a", 0, 1)];
-    for (text, start, end) in unsupported.into_iter().chain([(",a", 0, 1), ("{a}", 0, 1), ("|a|", 0, 1)]) {
+    for (text, start, end) in [("{a}", 0, 1), ("#&a", 0, 3), ("#!eof", 0, 5)] {
         assert_eq!(error(text), (ErrorKind::Unsupported, start, end), "{text}");
     }
+    assert_eq!(error("#(a . b)"), (ErrorKind::BadDot, 4, 5));
+    assert_eq!(error("#;"), (ErrorKind::EmptyQuote, 0, 2));
+    assert_eq!(error("`"), (ErrorKind::EmptyQuote, 0, 1));
+    assert_eq!(error("#| a |# #| b"), (ErrorKind::Unclosed, 8, 10));
+    for (text, start, end) in [("1x", 0, 2), ("(a 1/0)", 3, 6), ("#xZZ", 0, 4), ("-1.5.2", 0, 6), ("1e", 0, 2), ("#e#e1", 0, 5)] {
+        assert_eq!(error(text), (ErrorKind::BadNumber, start, end), "{text}");
+    }
+    assert_eq!(error(r"#\foo"), (ErrorKind::BadChar, 0, 5));
+    assert_eq!(error(r"#\xZZ"), (ErrorKind::BadChar, 0, 5));
+    assert_eq!(error("\"abc"), (ErrorKind::Unclosed, 0, 1));
+    assert_eq!(error(r#""a\qb""#), (ErrorKind::BadEscape, 2, 4));
+    assert_eq!(error(r#""\x41""#), (ErrorKind::BadEscape, 1, 5));
+}
+
+#[test]
+fn reads_booleans_numbers_strings_and_characters() {
+    assert_eq!(read("#t #f #true #false").unwrap(), ["#t", "#f", "#t", "#f"]);
+    let numbers = "42 -5 +7 0 1/2 -6/4 #x-ff #XFF #b101 #o17 #d10 1.5 -.5 .5 1e3 1.5E-1 #e1.5 #e1e2 #i1/2 #x#e10 +inf.0 -inf.0";
+    let read_as = [
+        "42", "-5", "7", "0", "1/2", "-3/2", "-255", "255", "5", "15", "10", "1.5", "-0.5", "0.5", "1000.0", "0.15", "3/2",
+        "100", "0.5", "16", "inf", "-inf",
+    ];
+    assert_eq!(read(numbers).unwrap(), read_as);
+    let big = "123456789012345678901234567890 -1/123456789012345678901";
+    assert_eq!(read(big).unwrap(), ["123456789012345678901234567890", "-1/123456789012345678901"]);
+    assert_eq!(read("+nan.0").unwrap(), ["NaN"]);
+    assert_eq!(read("+ - ... +a -> a1 1+").unwrap_err().kind, ErrorKind::BadNumber);
+    assert_eq!(read("+ - ... +a -> a1").unwrap(), ["+", "-", "...", "+a", "->", "a1"]);
+    let strings = "\"a\\nb\" \"\\x41;\\t\" \"q\\\"\\\\\" \"λ\" \"line \\   \n       continued\" \"\"";
+    assert_eq!(read(strings).unwrap(), [r#""a\nb""#, r#""A\t""#, r#""q\"\\""#, r#""λ""#, r#""line continued""#, r#""""#]);
+    let chars = r"#\a #\space #\newline #\x41 #\λ #\( #\) #\x #\nul";
+    assert_eq!(read(chars).unwrap(), ["#\\a", "#\\ ", "#\\\n", "#\\A", "#\\λ", "#\\(", "#\\)", "#\\x", "#\\\0"]);
+}
+
+#[test]
+fn reads_vectors_quasiquotes_and_comments() {
+    assert_eq!(read("#(a 1 (b #(c))) #()").unwrap(), ["#(a 1 (b #(c)))", "#()"]);
+    assert_eq!(read("`(a ,b ,@c) ,,d").unwrap(), ["`(a ,b ,@c)", ",,d"]);
+    assert_eq!(read("a #| x #| nested |# y |# b").unwrap(), ["a", "b"]);
+    assert_eq!(read("(a #;b c) #;(d e) f '#;g h #; #;i j k").unwrap(), ["(a c)", "f", "'h", "k"]);
 }
 
 #[test]
@@ -205,4 +293,114 @@ fn read_syntax_survives_collection() {
             assert_eq!(first(mc, node), first(mc, again));
             assert_eq!(first(mc, node), symbols(mc).intern_str(&strings, "define").unwrap().value(mc));
         });
+}
+
+/// R7RS lets case differ in everything but identifiers and character names.
+#[test]
+fn booleans_prefixes_and_infinities_ignore_case() {
+    assert_eq!(read("#T #TRUE #False #X1A #E1.5 1E2").unwrap(), ["#t", "#t", "#f", "26", "3/2", "100.0"]);
+    assert_eq!(read("+INF.0 -Inf.0 +NaN.0").unwrap(), ["inf", "-inf", "NaN"]);
+    assert_eq!(error(r"#\SPACE"), (ErrorKind::BadChar, 0, 7));
+}
+
+/// `\` then spaces or tabs, one line ending of any kind, and more spaces or tabs.
+#[test]
+fn line_continuations_take_one_line_ending() {
+    for ending in ["\n", "\r\n", "\r"] {
+        let text = format!("\"a\\  {ending}\t  b\"");
+        assert_eq!(read(&text).unwrap(), [r#""ab""#], "{ending:?}");
+    }
+    assert_eq!(read("\"a\\\n\nb\"").unwrap(), [r#""a\nb""#]);
+    assert_eq!(read("\"a\\\r\n\r\nb\"").unwrap(), [r#""a\r\nb""#]);
+    // The first `\r` ends the line, so the rest stays.
+    assert_eq!(read("\"a\\ \r \r\nb\"").unwrap(), [r#""a\r\nb""#]);
+    assert_eq!(error("\"a\\  b\""), (ErrorKind::BadEscape, 2, 4));
+    assert_eq!(error("\"a\\  "), (ErrorKind::Unclosed, 0, 1));
+}
+
+#[test]
+fn a_dangling_prefix_is_an_error_across_all_of_it() {
+    assert_eq!(error("(a ,@)"), (ErrorKind::EmptyQuote, 3, 5));
+    assert_eq!(error("(a #;)"), (ErrorKind::EmptyQuote, 3, 5));
+    assert_eq!(error(",@"), (ErrorKind::EmptyQuote, 0, 2));
+    assert_eq!(error("(a . #;b)"), (ErrorKind::BadDot, 3, 4));
+}
+
+#[test]
+fn reads_complex_numbers() {
+    let numbers = "1+2i 1-2i +i -i 1+i 3/4-1/2i +2i -2.5i #e1.5+2i #x10+ai 1e2+1e1i #i1+2i 1@0 +inf.0i -nan.0+i";
+    let read_as = [
+        "1+2i", "1-2i", "0+1i", "0-1i", "1+1i", "3/4-1/2i", "0+2i", "0-2.5i", "3/2+2i", "16+10i", "100.0+10.0i", "1.0+2.0i",
+        // Polar goes through floats, and an inexact part makes the other inexact, as in Racket.
+        "1.0", "0+infi", "NaN+1.0i",
+    ];
+    assert_eq!(read(numbers).unwrap(), read_as);
+    // Starting as a number does but not ending as one is an error; `+inf.0x` and `+in` are names.
+    assert_eq!(read("+inf.0x +in +ix").unwrap(), ["+inf.0x", "+in", "+ix"]);
+    for (text, end) in [("1+2", 3), ("2i", 2), ("1+2j", 4), ("1@", 2), ("1e+2i", 5), ("1+2i+3i", 7)] {
+        assert_eq!(error(text), (ErrorKind::BadNumber, 0, end), "{text}");
+    }
+}
+
+#[test]
+fn reads_quoted_identifiers() {
+    assert_eq!(read(r"|foo bar| || |a\x41;\|\\| |(x)| a|b|c").unwrap(), ["foo bar", "", r"aA|\", "(x)", "a", "b", "c"]);
+    assert_eq!(error("|abc"), (ErrorKind::Unclosed, 0, 1));
+    assert_eq!(error(r"|a\qb|"), (ErrorKind::BadEscape, 2, 4));
+    // Line continuations are only for strings.
+    assert_eq!(error("|a\\\nb|"), (ErrorKind::BadEscape, 2, 4));
+    let mut arena = arena();
+    arena.mutate(|mc| {
+        let session = SyntaxSession::new(mc, "|abc| abc").unwrap();
+        let nodes = read_all(mc, symbols(mc), &session).unwrap();
+        assert_eq!(nodes[0].datum(mc), nodes[1].datum(mc));
+        assert_eq!(nodes[0].kind(mc), Some(SyntaxKind::Identifier));
+    });
+}
+
+#[test]
+fn reads_bytevectors() {
+    assert_eq!(read("#u8(1 2 255) #U8() #u8(#xff 0)").unwrap(), ["#u8(1 2 255)", "#u8()", "#u8(255 0)"]);
+    assert_eq!(error("#u8(1 256)"), (ErrorKind::BadByte, 6, 9));
+    assert_eq!(error("#u8(1 -1)"), (ErrorKind::BadByte, 6, 8));
+    assert_eq!(error("#u8(a)"), (ErrorKind::BadByte, 4, 5));
+    assert_eq!(error("#u8(1.0)"), (ErrorKind::BadByte, 4, 7));
+    assert_eq!(error("#u8((1))"), (ErrorKind::BadByte, 4, 7));
+    assert_eq!(error("#u8(1 . 2)"), (ErrorKind::BadDot, 6, 7));
+    assert_eq!(error("#u8(1 2"), (ErrorKind::Unclosed, 0, 1));
+    let mut arena = arena();
+    arena.mutate(|mc| {
+        let session = SyntaxSession::new(mc, "#u8(7)").unwrap();
+        let node = read_all(mc, symbols(mc), &session).unwrap()[0];
+        assert_eq!(node.kind(mc), Some(SyntaxKind::Literal));
+        assert!(!Bytevectors::new(mc).bytevector(node.datum(mc)).unwrap().is_mutable());
+    });
+}
+
+#[test]
+fn datum_labels_share_what_they_label() {
+    assert_eq!(read("(#0=(a b) #0# #1=c . #1#)").unwrap(), ["((a b) (a b) c . c)"]);
+    assert_eq!(read("#0='x").unwrap(), ["'x"]);
+    let mut arena = arena();
+    arena.mutate(|mc| {
+        let session = SyntaxSession::new(mc, "(#7=(a) #7#)").unwrap();
+        let node = read_all(mc, symbols(mc), &session).unwrap()[0];
+        let items: Vec<_> = Pairs::new(mc).elements(node.datum(mc)).collect();
+        assert_eq!(items[0], items[1]);
+    });
+    assert_eq!(error("#0=(a . #0#)"), (ErrorKind::CyclicLabel, 8, 11));
+    assert_eq!(error("(#1#)"), (ErrorKind::UnknownLabel, 1, 4));
+    assert_eq!(error("(#0=a #0=b)"), (ErrorKind::DuplicateLabel, 6, 9));
+    // A label is only in its top-level datum.
+    assert_eq!(error("#0=a #0#"), (ErrorKind::UnknownLabel, 5, 8));
+    assert_eq!(error("(#0=)"), (ErrorKind::EmptyQuote, 1, 4));
+    assert_eq!(error("#0="), (ErrorKind::EmptyQuote, 0, 3));
+    assert_eq!(error("#99999999999999999999999#"), (ErrorKind::UnknownLabel, 0, 25));
+}
+
+#[test]
+fn fold_case_lowers_identifiers_and_character_names() {
+    let text = r"#!fold-case ABC Straße |XyZ| #\SPACE #\A #T #!no-fold-case ABC";
+    assert_eq!(read(text).unwrap(), ["abc", "straße", "XyZ", "#\\ ", "#\\A", "#t", "ABC"]);
+    assert_eq!(read("#!FOLD-CASE A").unwrap(), ["a"]);
 }
