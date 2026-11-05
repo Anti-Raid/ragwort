@@ -9,8 +9,12 @@ use super::raw::Raw;
 use super::slot::Refs;
 use super::{Brand, Desc, Gc, Heap, Items, Mutation, Object, OutOfMemory, Slots, Value, WINDOW, Work};
 
-/// One segment of a [`Stack`]: a run of value slots in the arena. Its one field is set while a
-/// stack uses it.
+/// Set in a segment's field word while a stack uses it; the low 32 bits are the end of its
+/// ordinary arena slots (`0..base` while unparked, `0..top` once retired).
+const ATTACHED: u64 = 1 << 32;
+
+/// One segment of a [`Stack`]: a run of value slots in the arena. Its one field holds
+/// [`ATTACHED`] while a stack uses it, and in its low 32 bits, where its ordinary arena slots end.
 pub struct Segment;
 
 impl Object for Segment {
@@ -51,23 +55,48 @@ impl StackRecord {
         (self.written.get() as usize).min(len).max(live.end)
     }
 
+    fn set_ordinary(&self, heap: Heap<'_>, end: usize, attached: bool) {
+        if let Some(word) = heap.words.get(self.segment.get() as usize + 1) {
+            let flag = if attached { ATTACHED } else { 0 };
+            word.set(flag | u64::from(end.try_into().unwrap_or(u32::MAX)));
+        }
+    }
+
     /// Marks the segment, traces the live slots as roots, and voids those above `top`, which
     /// were written without a barrier and are dead.
-    pub(crate) fn trace(&self, heap: Heap<'_>, work: &mut Work) {
+    pub(crate) fn trace(&self, heap: Heap<'_>, work: &mut Work, dropped: bool) {
         let segment = self.segment.get();
         heap.mark(segment, work);
         if self.parked.get() {
+            if dropped {
+                let end = heap.words.get(segment as usize + 1).map_or(0, |w| w.get() as u32 as usize);
+                self.set_ordinary(heap, end, false);
+            }
             return;
         }
         let slots = heap.segment_slots(segment);
         let live = self.live(slots.len());
-        for slot in &slots[live.clone()] {
-            heap.visit(slot, work);
+        let evacuating = dropped && heap.m.evacuating.get();
+        for (k, slot) in slots[live.clone()].iter().enumerate() {
+            let word = slot.get();
+            if word & super::TAG == super::OBJECT {
+                let target = (word >> 32) as u32;
+                heap.mark(target, work);
+                if evacuating && heap.in_evacuation(target) {
+                    work.fixups.push((segment, (2 + live.start + k) as u32));
+                }
+            }
         }
         for slot in &slots[live.end..self.written_end(&live, slots.len())] {
             slot.set(Value::VOID.word);
         }
         self.written.set(live.end as u32);
+        if dropped {
+            self.set_ordinary(heap, live.end, false);
+            self.parked.set(true);
+        } else {
+            self.set_ordinary(heap, live.start, true);
+        }
     }
 
     /// After evacuation: follows the segment if it moved, and fixes the live slots, which may
@@ -97,6 +126,8 @@ impl StackRecord {
         for slot in &slots[live.end..self.written_end(&live, slots.len())] {
             slot.set(Value::VOID.word);
         }
+        self.written.set(live.end as u32);
+        self.set_ordinary(heap, live.end, true);
     }
 }
 
@@ -110,9 +141,9 @@ impl<'a> Heap<'a> {
     }
 }
 
-/// Marks `segment` as used by the stack with `record`. Panics if another live stack uses it.
-fn attach<'gc>(mc: &Mutation<'gc>, segment: Gc<'gc, Segment>, record: &StackRecord) {
-    if segment.word(mc, 0) != 0 {
+/// Retires any dropped stack still on `segment`, or panics if another live stack uses it.
+fn ensure_free<'gc>(mc: &Mutation<'gc>, segment: Gc<'gc, Segment>, record: &StackRecord) {
+    if segment.word(mc, 0) & ATTACHED != 0 {
         let stacks = mc.heap.m.stacks.borrow();
         for other in stacks.iter().filter(|s| s.segment.get() == segment.index && !ptr::eq(&***s, record)) {
             assert!(Rc::strong_count(other) == 1, "segment is already in use by another stack");
@@ -122,7 +153,13 @@ fn attach<'gc>(mc: &Mutation<'gc>, segment: Gc<'gc, Segment>, record: &StackReco
             other.parked.set(true);
         }
     }
-    segment.set_word(mc, 0, 1);
+}
+
+/// Marks `segment` as used by the stack with `record`, loading its retired high-water mark.
+fn attach<'gc>(mc: &Mutation<'gc>, segment: Gc<'gc, Segment>, record: &StackRecord) {
+    ensure_free(mc, segment, record);
+    record.written.set(segment.word(mc, 0) as u32);
+    segment.set_word(mc, 0, ATTACHED);
 }
 
 /// A VM stack made of [`Segment`]s, as in Chez Scheme. Frames on it are written without a
@@ -210,7 +247,9 @@ impl Stack {
         if record.written.get() < end as u32 {
             record.written.set(end as u32);
         }
-        record.parked.set(false);
+        if record.parked.replace(false) {
+            record.set_ordinary(mc.heap, record.base.get() as usize, true);
+        }
         Some(slots)
     }
 
@@ -250,6 +289,9 @@ impl Stack {
         mc.heap.barrier_range(segment as usize + 2 + base, captured, segment, Refs::Values);
         record.base.set(at as u32);
         record.top.set(record.top.get().max(at as u32));
+        if !record.parked.get() {
+            record.set_ordinary(mc.heap, at, true);
+        }
         Some(base..at)
     }
 
@@ -259,11 +301,14 @@ impl Stack {
     pub fn reclaim(&mut self, mc: &Mutation<'_>, at: usize) -> bool {
         self.check(mc);
         let record = &*self.record;
-        if at > record.base.get() as usize {
+        let old_base = record.base.get();
+        if at > old_base as usize {
             return false;
         }
+        record.written.set(record.written.get().max(old_base));
         record.base.set(at as u32);
         record.parked.set(false);
+        record.set_ordinary(mc.heap, at, true);
         true
     }
 
@@ -276,6 +321,7 @@ impl Stack {
         }
         self.switch(mc, segment);
         self.record.base.set(base as u32);
+        self.record.set_ordinary(mc.heap, base, true);
         true
     }
 
@@ -284,11 +330,12 @@ impl Stack {
     /// stack uses the segment.
     pub fn switch<'gc>(&mut self, mc: &Mutation<'gc>, segment: Gc<'gc, Segment>) {
         let old = self.segment(mc);
-        attach(mc, segment, &self.record);
+        ensure_free(mc, segment, &self.record);
         self.record.retire(mc.heap);
         if old != segment {
-            old.set_word(mc, 0, 0);
+            old.set_word(mc, 0, old.word(mc, 0) & !ATTACHED);
         }
+        attach(mc, segment, &self.record);
         let record = &*self.record;
         record.segment.set(segment.index);
         record.base.set(0);

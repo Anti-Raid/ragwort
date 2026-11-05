@@ -32,13 +32,13 @@
 (%define-global cddadr (%lambda (x) (%intrinsic cddadr x)))
 (%define-global cdddar (%lambda (x) (%intrinsic cdddar x)))
 (%define-global cddddr (%lambda (x) (%intrinsic cddddr x)))
-(%define-global null? (%lambda (x) (%intrinsic null? x)))
-(%define-global pair? (%lambda (x) (%intrinsic pair? x)))
 (%define-global eq? (%lambda (a b) (%intrinsic eq? a b)))
 (%define-global eqv? (%lambda (a b) (%intrinsic eqv? a b)))
 (%define-global equal? (%lambda (a b) (%intrinsic equal? a b)))
-(%define-global not (%lambda (x) (%if x #f #t)))
+(%define-global not (%lambda (x) (%intrinsic not x)))
 (%define-global boolean? (%lambda (x) (%intrinsic boolean? x)))
+(%define-global procedure? (%lambda (x) (%intrinsic procedure? x)))
+(%define-global continuation? (%lambda (x) (%intrinsic continuation? x)))
 (%define-global void (%lambda args (%intrinsic void)))
 
 (%define-global box (%lambda (x) (%intrinsic box x)))
@@ -60,60 +60,61 @@
 (%define-global apply (%lambda (f . args) (%apply-intrinsic apply f args)))
 (%define-global values (%lambda xs (%apply-intrinsic values xs)))
 (%define-global call-with-values
-  (%letrec ((spread (%lambda (v i n)
-                      (%if (%intrinsic eqv? i n)
-                           '()
-                           (%intrinsic cons (%intrinsic values-ref v i) (%app spread v (%intrinsic + i 1) n))))))
-    (%lambda (producer consumer)
-      (%let ((v (%app producer)))
-        (%if (%intrinsic values? v)
-             (%intrinsic apply consumer (%app spread v 0 (%intrinsic values-length v)))
-             (%app consumer v))))))
+  (%lambda (producer consumer)
+    (%intrinsic apply-values consumer (%app producer))))
 
+(%define-global default-continuation-prompt-tag (%lambda () (%intrinsic default-continuation-prompt-tag)))
+(%define-global make-continuation-prompt-tag (%lambda args (%apply-intrinsic make-continuation-prompt-tag args)))
+(%define-global abort-current-continuation (%lambda (tag . args) (%apply-intrinsic abort tag args)))
+(%define-global call-with-composable-continuation
+  (%lambda (f . more)
+    (%if (%intrinsic null? more)
+         (%intrinsic capture (%intrinsic default-continuation-prompt-tag) f)
+         (%if (%intrinsic null? (%intrinsic cdr more))
+              (%intrinsic capture (%intrinsic car more) f)
+              (%intrinsic apply call-with-composable-continuation '())))))
+(%define-global call-with-continuation-prompt
+  (%letrec ((handler (%lambda (thunk)
+                       (%intrinsic call-with-prompt (%intrinsic default-continuation-prompt-tag) handler thunk))))
+    (%lambda (proc . more)
+      (%if (%intrinsic null? more)
+           (%intrinsic call-with-prompt (%intrinsic default-continuation-prompt-tag) handler proc)
+           (%let ((tag (%intrinsic car more)) (rest (%intrinsic cdr more)))
+             (%if (%intrinsic null? rest)
+                  (%intrinsic call-with-prompt tag handler proc)
+                  (%let ((h (%intrinsic car rest)) (args (%intrinsic cdr rest)))
+                    (%apply-intrinsic call-with-prompt tag h proc args))))))))
+(%define-global call/cc
+  (%lambda (f)
+    (%intrinsic capture (%intrinsic default-continuation-prompt-tag)
+      (%lambda (k)
+        (%app f (%lambda args
+                  (%intrinsic abort (%intrinsic default-continuation-prompt-tag)
+                    (%lambda () (%intrinsic apply k args)))))))))
+(%define-global call-with-current-continuation
+  (%lambda (f)
+    (%intrinsic capture (%intrinsic default-continuation-prompt-tag)
+      (%lambda (k)
+        (%app f (%lambda args
+                  (%intrinsic abort (%intrinsic default-continuation-prompt-tag)
+                    (%lambda () (%intrinsic apply k args)))))))))
+
+(%define-global null? (%lambda (x) (%intrinsic null? x)))
+(%define-global pair? (%lambda (x) (%intrinsic pair? x)))
 (%define-global list (%lambda xs xs))
-(%define-global list?
-  (%letrec ((loop (%lambda (x) (%if (%intrinsic null? x) #t (%if (%intrinsic pair? x) (%app loop (%intrinsic cdr x)) #f)))))
-    (%lambda (x) (%app loop x))))
-(%define-global length
-  (%letrec ((loop (%lambda (xs n) (%if (%intrinsic null? xs) n (%app loop (%intrinsic cdr xs) (%intrinsic + n 1))))))
-    (%lambda (xs) (%app loop xs 0))))
-(%define-global reverse
-  (%letrec ((loop (%lambda (xs acc)
-                    (%if (%intrinsic null? xs) acc (%app loop (%intrinsic cdr xs) (%intrinsic cons (%intrinsic car xs) acc))))))
-    (%lambda (xs) (%app loop xs '()))))
-(%define-global append
-  (%letrec ((two (%lambda (xs ys)
-                   (%if (%intrinsic null? xs) ys (%intrinsic cons (%intrinsic car xs) (%app two (%intrinsic cdr xs) ys)))))
-            (all (%lambda (lists)
-                   (%if (%intrinsic null? lists)
-                        '()
-                        (%if (%intrinsic null? (%intrinsic cdr lists))
-                             (%intrinsic car lists)
-                             (%app two (%intrinsic car lists) (%app all (%intrinsic cdr lists))))))))
-    (%lambda lists (%app all lists))))
-(%define-global list-tail
-  (%letrec ((loop (%lambda (xs k) (%if (%intrinsic eqv? k 0) xs (%app loop (%intrinsic cdr xs) (%intrinsic + k -1))))))
-    (%lambda (xs k) (%app loop xs k))))
-(%define-global list-ref (%lambda (xs k) (%intrinsic car (%app list-tail xs k))))
+(%define-global list? (%lambda (x) (%intrinsic list? x)))
+(%define-global length (%lambda (xs) (%intrinsic length xs)))
+(%define-global reverse (%lambda (xs) (%intrinsic reverse xs)))
+(%define-global append (%lambda lists (%apply-intrinsic append lists)))
+(%define-global list-tail (%lambda (xs k) (%intrinsic list-tail xs k)))
+(%define-global list-ref (%lambda (xs k) (%intrinsic list-ref xs k)))
 
-(%define-global memq
-  (%letrec ((loop (%lambda (x xs) (%if (%intrinsic null? xs) #f (%if (%intrinsic eq? x (%intrinsic car xs)) xs (%app loop x (%intrinsic cdr xs)))))))
-    (%lambda (x xs) (%app loop x xs))))
-(%define-global memv
-  (%letrec ((loop (%lambda (x xs) (%if (%intrinsic null? xs) #f (%if (%intrinsic eqv? x (%intrinsic car xs)) xs (%app loop x (%intrinsic cdr xs)))))))
-    (%lambda (x xs) (%app loop x xs))))
-(%define-global member
-  (%letrec ((loop (%lambda (x xs) (%if (%intrinsic null? xs) #f (%if (%intrinsic equal? x (%intrinsic car xs)) xs (%app loop x (%intrinsic cdr xs)))))))
-    (%lambda (x xs) (%app loop x xs))))
-(%define-global assq
-  (%letrec ((loop (%lambda (x xs) (%if (%intrinsic null? xs) #f (%if (%intrinsic eq? x (%intrinsic car (%intrinsic car xs))) (%intrinsic car xs) (%app loop x (%intrinsic cdr xs)))))))
-    (%lambda (x xs) (%app loop x xs))))
-(%define-global assv
-  (%letrec ((loop (%lambda (x xs) (%if (%intrinsic null? xs) #f (%if (%intrinsic eqv? x (%intrinsic car (%intrinsic car xs))) (%intrinsic car xs) (%app loop x (%intrinsic cdr xs)))))))
-    (%lambda (x xs) (%app loop x xs))))
-(%define-global assoc
-  (%letrec ((loop (%lambda (x xs) (%if (%intrinsic null? xs) #f (%if (%intrinsic equal? x (%intrinsic car (%intrinsic car xs))) (%intrinsic car xs) (%app loop x (%intrinsic cdr xs)))))))
-    (%lambda (x xs) (%app loop x xs))))
+(%define-global memq (%lambda (x xs) (%intrinsic memq x xs)))
+(%define-global memv (%lambda (x xs) (%intrinsic memv x xs)))
+(%define-global member (%lambda (x xs) (%intrinsic member x xs)))
+(%define-global assq (%lambda (x xs) (%intrinsic assq x xs)))
+(%define-global assv (%lambda (x xs) (%intrinsic assv x xs)))
+(%define-global assoc (%lambda (x xs) (%intrinsic assoc x xs)))
 
 (%define-global map
   (%letrec ((map1 (%lambda (f xs)

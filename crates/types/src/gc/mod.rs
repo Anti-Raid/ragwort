@@ -2406,7 +2406,7 @@ impl<'a> Heap<'a> {
         }
         let mut stacks = self.m.stacks.borrow_mut();
         for stack in stacks.iter() {
-            stack.trace(self, work);
+            stack.trace(self, work, Rc::strong_count(stack) == 1);
         }
         // A dropped stack, traced once more for what it wrote, is done with.
         let before = stacks.len();
@@ -2651,8 +2651,9 @@ impl<'a> Heap<'a> {
         if desc.items != Items::None {
             let len = (header >> 32) as usize;
             size += len;
+            let traced = self.traced_items(i, header, desc);
             let start = desc.fields as usize;
-            let slots = || self.words.get(i + 1 + start..i + 1 + start + len).unwrap_or(&[]).iter().enumerate();
+            let slots = || self.words.get(i + 1 + start..i + 1 + start + traced).unwrap_or(&[]).iter().enumerate();
             if items && desc.items == Items::Values {
                 for (j, slot) in slots() {
                     let word = slot.get();
@@ -2672,6 +2673,18 @@ impl<'a> Heap<'a> {
             }
         }
         size
+    }
+
+    /// How many items of the object at `i` are ordinary arena memory: for a [`Segment`], those
+    /// below the active stack's `base` (or `top` once retired).
+    #[inline]
+    fn traced_items(self, i: usize, header: u64, desc: &'static Desc) -> usize {
+        let len = (header >> 32) as usize;
+        if desc.number == Segment::DESC.number {
+            self.words.get(i + 1).map_or(0, |w| (w.get() as u32 as usize).min(len))
+        } else {
+            len
+        }
     }
 
     /// Moves the marked objects off the pages being evacuated, then fixes every reference
@@ -2858,7 +2871,8 @@ impl<'a> Heap<'a> {
             self.trace_parts(i, work, false);
         }
         let items = i + 1 + desc.fields as usize;
-        let (from, to) = (card.start.max(items), card.end.min(items + (header >> 32) as usize));
+        let traced = self.traced_items(i, header, desc);
+        let (from, to) = (card.start.max(items), card.end.min(items + traced));
         let slots = self.words.get(from..to).unwrap_or(&[]);
         match refs {
             Refs::Values => slots.iter().for_each(|slot| self.visit(slot, work)),

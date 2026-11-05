@@ -225,17 +225,14 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         }
     }
 
-    /// Expands `form`'s macro uses until it's a definition, a `begin`, or some other expression.
-    fn head(&mut self, mut form: Stx) -> Result<Head, ExpandError> {
-        loop {
-            let View::List(items, None) = self.tree.view(form)? else { return Ok(Head::Expr(form)) };
-            let Some(&head) = items.first().filter(|&&head| self.is_id(head)) else { return Ok(Head::Expr(form)) };
-            match self.resolve(head)? {
-                Binding::Keyword(Keyword::Macro(m)) => form = self.transform(m, form)?,
-                Binding::Keyword(Keyword::Form(Form::Define)) => return Ok(Head::Define(form)),
-                Binding::Keyword(Keyword::Form(Form::Begin)) => return Ok(Head::Begin(items[1..].to_vec())),
-                _ => return Ok(Head::Expr(form)),
-            }
+    /// Whether `form` is a definition, a `begin`, or some other expression.
+    fn head(&mut self, form: Stx) -> Result<Head, ExpandError> {
+        let View::List(items, None) = self.tree.view(form)? else { return Ok(Head::Expr(form)) };
+        let Some(&head) = items.first().filter(|&&head| self.is_id(head)) else { return Ok(Head::Expr(form)) };
+        match self.resolve(head)? {
+            Binding::Keyword(Keyword::Form(Form::Define)) => Ok(Head::Define(form)),
+            Binding::Keyword(Keyword::Form(Form::Begin)) => Ok(Head::Begin(items[1..].to_vec())),
+            _ => Ok(Head::Expr(form)),
         }
     }
 
@@ -436,7 +433,8 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     fn reference(&mut self, id: Stx) -> Result<Core<'gc>, ExpandError> {
         let place = match self.resolve(id)? {
             Binding::Local(var) => Place::Local(var),
-            Binding::Global(cell) | Binding::Import(cell) => Place::Global(cell),
+            Binding::Global(cell) => Place::Global(cell),
+            Binding::Import(cell) => Place::Import(cell),
             Binding::Free { base } => Place::Global(self.cell(self.tree.symbol(id).expect("an identifier"), base)?),
             Binding::Keyword(_) => return Err(self.error(ExpandErrorKind::BadSyntax, id)),
         };

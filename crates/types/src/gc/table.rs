@@ -323,6 +323,7 @@ impl<'gc, K: Kind> Table<'gc, K> {
                     Some(_) => {}
                     None => free = free.or(Some(i)),
                 },
+                _ if free.is_none() && K::entry(mc, buf, i).is_none() => free = Some(i),
                 _ => {}
             }
             i = (i + 1) & mask;

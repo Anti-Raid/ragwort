@@ -555,3 +555,59 @@ fn stack_allocation_obeys_failure_injection_without_attaching() {
     arena.collect();
     assert_eq!(frame_values(&mut arena, &stack, 0, 1), [Some(7)]);
 }
+
+/// Slots written while marking and left above `top` before the segment is popped from the gray
+/// stack are not traced by incremental `drain`.
+#[test]
+fn dead_slots_written_while_marking_are_not_traced_by_drain() {
+    let mut arena = arena();
+    let stack = new_stack(&mut arena, 512);
+    let handle = arena.mutate(|mc| {
+        mc.set_root(0, Value::VOID);
+        let inner = Pair::new(mc, num(mc, 1), Value::NIL).unwrap();
+        let outer = Pair::new(mc, Value::object(mc, inner), Value::NIL).unwrap();
+        Root::new(mc, outer).unwrap()
+    });
+    arena.collect();
+    // Root handles are marked after stacks, so a 1-byte slice pops `outer` (marking `inner`,
+    // without tracing `inner` yet) and leaves both `inner` and the segment on `work.gray`.
+    arena.collect_slice(1);
+    assert_eq!(arena.phase(), Phase::Marking);
+    let seg = segment_index(&mut arena, &stack);
+    assert!(arena.meta.work.borrow().gray.contains(&seg));
+    let target = arena.mutate(|mc| {
+        let outer = handle.get(mc).unwrap();
+        let inner = outer.car(mc).downcast::<Pair>(mc).unwrap();
+        let old = inner.car(mc);
+        inner.set_car(mc, Value::VOID);
+        stack.frame(mc, 0).unwrap().set(20, old);
+        old.downcast::<Num>(mc).unwrap().index
+    });
+    stack.set_top(0);
+    assert!(!is_marked(&mut arena, target));
+    arena.collect_slice(usize::MAX);
+    assert_eq!(arena.phase(), Phase::Idle);
+    assert!(!is_marked(&mut arena, target), "drain traced a dead slot above top");
+}
+
+/// Leaving a segment, collecting on another segment with a low `top`, and resuming the first
+/// segment still voids its old frames when `top` drops below where it was retired.
+#[test]
+fn resuming_a_segment_keeps_its_retired_written_bound() {
+    let mut arena = arena();
+    let mut stack = new_stack(&mut arena, 512);
+    fill(&mut arena, &stack, 0, 20, 100);
+    stack.set_top(20);
+    arena.mutate(|mc| stack.switch(mc, Segment::new(mc, 512).unwrap()));
+    stack.set_top(2);
+    arena.collect();
+    arena.mutate(|mc| {
+        let first = mc.root(0).downcast::<Segment>(mc).unwrap();
+        assert!(stack.resume(mc, first, 0));
+    });
+    stack.set_top(5);
+    arena.collect();
+    let values = rooted_segment(&mut arena, 0..20);
+    assert_eq!(values[..5], expected(5, 100)[..]);
+    assert!(values[5..].iter().all(Option::is_none), "slots 5..20 were not voided after resume");
+}

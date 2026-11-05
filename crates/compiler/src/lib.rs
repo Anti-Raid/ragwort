@@ -1,76 +1,148 @@
-//! The compiler: core forms, as lowering will make them from ragwort, to the VM's bytecode.
+//! A Chez-style micropass compiler from [`Core`] forms to [` ragwort_vm`]'s [`Bytecode`].
 //!
-//! It doesn't optimize yet. A local variable lives in a register of its frame, unless a lambda
-//! captures it: then it's boxed where it's bound, and closures share the box, whether or not
-//! anything assigns it. Globals are [`Global`] cells, kept in the module's constants.
+//! Each pass either simplifies within an intermediate representation or reduces the grammar by
+//! eliminating forms:
+//! 1. [`lower`]: validates [`Core`] and lowers `DefineGlobal`, `Place::Global`, and
+//!    `Place::Import` to explicit intrinsics and constants, producing [`ir::L1`].
+//! 2. [`letrec`]: Waddell–Sarkar–Dybvig `letrec` / `letrec*` fixing (`L1 -> L2`), replacing
+//!    `Letrec` with `Let`, `Fix` (SCCs of unassigned mutually recursive lambdas), `Seq`, and `Set`.
+//! 3. [`cp0`]: source-level optimizer (`L2 -> L2`) performing copy/constant propagation, prelude
+//!    procedure call lowering, pure intrinsic constant folding, beta-reduction, local procedure
+//!    inlining, conditional simplification, and dead-binding elimination.
+//! 4. [`assign`]: assignment conversion (`L2 -> L3`), rewriting only mutated (`Set`) variables into
+//!    explicit `MakeBox` / `Unbox` / `SetBox` intrinsics so all variables in [`ir::L3`] are
+//!    immutable.
+//! 5. [`closure`]: closure conversion (`L3 -> L4`), resolving lexical references into
+//!    [`ir::VarRef::Local`] vs [`ir::VarRef::Upvalue`] and computing each closure's capture table.
+//! 6. [`codegen`]: scoped virtual register allocation and bytecode emission (`L4 -> Closure`).
 
-mod analyze;
-mod compile;
+mod assign;
+mod closure;
+mod codegen;
+mod cp0;
+pub mod ir;
+mod letrec;
+mod lower;
 
 #[cfg(test)]
 #[path = "tests/compile.rs"]
 mod tests;
 
-pub use compile::{CompileError, compile};
+use std::fmt;
 
-use ragwort_types::gc::{Gc, Value};
+use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Value};
 use ragwort_vm::objects::Global;
 use ragwort_vm::{Intrinsic, Request};
 
-/// A local variable. Lowering numbers each binding apart, so no two binders in what's compiled
-/// share one.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// A local variable, numbered by the expander so no two bindings share one.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct Var(pub u32);
 
-/// What a reference or a `%set!` names.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Place<'gc> {
     Local(Var),
     Global(Gc<'gc, Global>),
+    /// A global of the prelude's, which code outside the prelude cannot assign or redefine.
+    Import(Gc<'gc, Global>),
 }
 
-/// What [`Core::Intrinsic`] calls: an intrinsic, which runs in place, or a request, which the
-/// VM's outer loop carries out.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Prim {
     Intrinsic(Intrinsic),
     Request(Request),
 }
 
-#[derive(Debug)]
+/// A function parameterization and body parameterized over an IR expression type `E`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Func<E> {
+    /// Distinguishes this lambda from every other in the expression being compiled.
+    pub id: u32,
+    pub params: Vec<Var>,
+    /// Receives the arguments past `params` as a list, if any.
+    pub rest: Option<Var>,
+    pub body: Box<E>,
+}
+
+/// A lambda expression in [`Core`].
+pub type Lambda<'gc> = Func<Core<'gc>>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Core<'gc> {
-    /// `(%quote datum)`: the value, from the module's constants.
     Quote(Value<'gc>),
-    /// The value of a variable.
     Ref(Place<'gc>),
-    /// `(%if test then else)`.
     If(Box<Core<'gc>>, Box<Core<'gc>>, Box<Core<'gc>>),
-    /// `(%let ((var init) ...) body)`: the inits, in order, then the body with the variables
-    /// bound to them. Sequencing is a `Let` of a variable nothing reads.
+    /// Parallel bindings: none of the `Var`s are in scope in the right-hand sides.
     Let(Vec<(Var, Core<'gc>)>, Box<Core<'gc>>),
-    /// `(%letrec ((var init) ...) body)`: the variables bound, to void, then the inits run in
-    /// order and assigned to them, then the body.
+    /// Recursive bindings (`letrec` / `letrec*`): all of the `Var`s are in scope in the
+    /// right-hand sides and the body.
     Letrec(Vec<(Var, Core<'gc>)>, Box<Core<'gc>>),
-    /// `(%set! place value)`, which returns void.
+    /// Evaluates to void.
     Set(Place<'gc>, Box<Core<'gc>>),
-    /// `(%define-global global value)`, which returns void.
+    /// Sets the [`Global`] and marks it defined, evaluating to void.
     DefineGlobal(Gc<'gc, Global>, Box<Core<'gc>>),
-    /// `(%app f arg ...)`.
     App(Box<Core<'gc>>, Vec<Core<'gc>>),
     Lambda(Lambda<'gc>),
-    /// `(%intrinsic name arg ...)`: a call of a built-in, with as many arguments as it takes.
     Intrinsic(Prim, Vec<Core<'gc>>),
-    /// `(%apply-intrinsic name arg ... list)`: an `Intrinsic` whose last argument is a list of
-    /// more. A built-in that takes a fixed number checks it as it runs.
+    /// Like `Intrinsic`, with the last argument a list of the rest, as `apply` takes them.
     ApplyIntrinsic(Prim, Vec<Core<'gc>>),
 }
 
-/// `(%lambda (param ... . rest) body)`. Lowering numbers each lambda apart, as it does variables,
-/// so what the compiler finds out about one is kept by its `id`.
-#[derive(Debug)]
-pub struct Lambda<'gc> {
-    pub id: u32,
-    pub params: Vec<Var>,
-    pub rest: Option<Var>,
-    pub body: Box<Core<'gc>>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompileError {
+    /// A [`Var`] used where no enclosing binding bound it.
+    Unbound(Var),
+    /// A [`Var`] bound more than once.
+    Rebound(Var),
+    /// Two [`Lambda`]s with the same `id`.
+    SameLambda(u32),
+    /// A [`Core::Intrinsic`] with a number of arguments the [`Prim`] doesn't take.
+    Arity(Prim),
+    /// More constants than a [`u32`] index can name.
+    TooManyConstants,
+    /// More parameters or spilled locals than a [`u32`] can count.
+    TooManyRegisters,
+    /// Expressions nested more than 1024 deep.
+    TooDeep,
+    OutOfMemory,
+}
+
+impl From<OutOfMemory> for CompileError {
+    fn from(_: OutOfMemory) -> Self {
+        Self::OutOfMemory
+    }
+}
+
+impl From<ragwort_types::Error> for CompileError {
+    fn from(_: ragwort_types::Error) -> Self {
+        Self::OutOfMemory
+    }
+}
+
+impl fmt::Display for CompileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unbound(v) => write!(f, "unbound variable {}", v.0),
+            Self::Rebound(v) => write!(f, "variable {} bound more than once", v.0),
+            Self::SameLambda(id) => write!(f, "lambda {id} appears more than once"),
+            Self::Arity(Prim::Intrinsic(i)) => write!(f, "wrong number of arguments to {}", i.name()),
+            Self::Arity(Prim::Request(r)) => write!(f, "wrong number of arguments to {}", r.name()),
+            Self::TooManyConstants => write!(f, "more than 2^32 constants"),
+            Self::TooManyRegisters => write!(f, "more than 2^32 locals"),
+            Self::TooDeep => write!(f, "expressions nested too deeply"),
+            Self::OutOfMemory => write!(f, "out of memory"),
+        }
+    }
+}
+
+impl std::error::Error for CompileError {}
+
+/// Compiles `core` through the micropass pipeline into a [`Closure`](ragwort_vm::objects::Closure)
+/// of no arguments, ready to pass to [`ragwort_vm::Machine::new`].
+pub fn compile<'gc>(mc: &Mutation<'gc>, core: &Core<'gc>) -> Result<Value<'gc>, CompileError> {
+    let (l1, supply) = lower::lower_globals(mc, core)?;
+    let (l2, supply) = letrec::fix_letrec(l1, supply);
+    let (l2, supply) = cp0::optimize(mc, l2, supply);
+    let (l3, _) = assign::assignment_convert(l2, supply);
+    let l4 = closure::closure_convert(&l3);
+    codegen::emit(mc, &l4)
 }

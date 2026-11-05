@@ -137,6 +137,9 @@ fn bodies_bind_their_definitions_as_letrec_star() {
     assert_eq!(eval("(define x 'global) (define (f) (define x 'local) x) (list (f) x)"), "(local global)");
     assert_eq!(eval("(let () (begin (define a 1) (define b 2)) (+ a b))"), "3");
     assert_eq!(eval("(let () (define a 1) (set! a 5) (define b a) b)"), "5");
+    // A definition of a macro's name shadows the macro across the whole body or load.
+    assert_eq!(eval("(let ((f #f)) (set! f (lambda () (when))) (define (when) 99) (f))"), "99");
+    assert_eq!(eval_in(&mut arena(), "(let () (when) (define (when) 99) (when))"), Ok(Err(Fault::NotProcedure)));
 }
 
 #[test]
@@ -197,10 +200,79 @@ fn prelude_procedures() {
     assert_eq!(eval("(map (lambda (x) (cons x x)) '(1 2))"), "((1 . 1) (2 . 2))");
     assert_eq!(eval("(let ((b (box '()))) (for-each (lambda (x) (set-box! b (cons x (unbox b)))) '(1 2 3)) (unbox b))"), "(3 2 1)");
     assert_eq!(eval("(call-with-values (lambda () (values 1 2 3)) list)"), "(1 2 3)");
+    assert_eq!(eval("(call-with-values (lambda () (values 10 20)) (lambda (a b) (+ a b)))"), "30");
+    assert_eq!(eval("(call-with-values (lambda () (values)) (lambda () 'none))"), "none");
     assert_eq!(eval("(call-with-values (lambda () 1) list)"), "(1)");
+    assert_eq!(eval("(+ 1 (call/cc (lambda (k) (+ 100 (k 5)))))"), "6");
+    assert_eq!(eval("(call-with-current-continuation (lambda (k) (k 42)))"), "42");
+    assert_eq!(
+        eval("(let ((n (box 0)) (kb (box #f))) (let ((v (call/cc (lambda (k) (set-box! kb k) 0)))) (set-box! n (+ (unbox n) 1)) (if (eq? (unbox n) 3) v ((unbox kb) (+ v 10)))))"),
+        "20"
+    );
+    assert_eq!(eval("(call-with-values (lambda () (call/cc (lambda (k) (k 1 2 3)))) list)"), "(1 2 3)");
+    let pausable = "
+        (let ()
+          (define out '())
+          (define (emit x) (set! out (cons x out)))
+          (define ret-point-k #f)
+          (define run-pausable
+            (lambda (proc)
+              (call/cc
+                (lambda (k)
+                  (set! ret-point-k k)
+                  (let ((res (proc)))
+                    (ret-point-k res))))))
+          (define resume
+            (lambda ()
+              (call/cc
+                (lambda (k)
+                  (let ((goto ret-point-k))
+                    (set! ret-point-k k)
+                    (goto (void)))))))
+          (define pause
+            (lambda ()
+              (call/cc
+                (lambda (k)
+                  (let ((goto ret-point-k))
+                    (set! ret-point-k k)
+                    (goto (void)))))))
+          (run-pausable
+            (lambda ()
+              (emit 1)
+              (pause)
+              (emit 3)
+              (pause)
+              (emit 5)
+              (pause)
+              (emit 7)))
+          (emit 2)
+          (resume)
+          (emit 4)
+          (resume)
+          (emit 6)
+          (resume)
+          (emit 8)
+          (emit 9)
+          (reverse out))
+    ";
+    assert_eq!(eval(pausable), "(1 2 3 4 5 6 7 8 9)");
+    assert_eq!(eval_in(&mut arena(), "(apply + (values 1 2))"), Ok(Err(Fault::WrongType)));
+    assert_eq!(eval_in(&mut arena(), "(call-with-values (lambda () (values 1 2)) (lambda (a) a))"), Ok(Err(Fault::Arity)));
     assert_eq!(eval("(list (length '(1 2 3)) (reverse '(1 2 3)) (append '(1) '(2 3) '() '(4 . 5)))"), "(3 (3 2 1) (1 2 3 4 . 5))");
     assert_eq!(eval("(list (list-tail '(1 2 3) 1) (list-ref '(1 2 3) 2) (memq 'c '(a b c d)) (assv 2 '((1 . a) (2 . b))))"), "((2 3) 3 (c d) (2 . b))");
     assert_eq!(eval("(list (not #f) (not 1) (list? '(1)) (list? '(1 . 2)) (boolean? #f) (equal? '(1 (2)) '(1 (2))))"), "(#t #f #t #f #t #t)");
+    assert_eq!(eval("(list (list-tail '(a b . c) 2) (list-ref '(a b . c) 1))"), "(c b)");
+    assert_eq!(eval("(list (append) (append 'x) (append '(1 2) '()))"), "(() x (1 2))");
+    assert_eq!(eval("(list (member '(2) '((1) (2) (3))) (assq 'b '((a . 1) (b . 2))) (assoc '(k) '(((j) . 1) ((k) . 2))))"), "(((2) (3)) (b . 2) ((k) . 2))");
+    assert_eq!(eval_in(&mut arena(), "(reverse '(1 . 2))"), Ok(Err(Fault::WrongType)));
+    assert_eq!(eval_in(&mut arena(), "(memq 'b '(a . c))"), Ok(Err(Fault::WrongType)));
+    assert_eq!(eval_in(&mut arena(), "(assq 'b '(1))"), Ok(Err(Fault::WrongType)));
+    assert_eq!(eval_in(&mut arena(), "(append '(1 . 2) '())"), Ok(Err(Fault::WrongType)));
+    assert_eq!(eval_in(&mut arena(), "(length '(1 . 2))"), Ok(Err(Fault::WrongType)));
+    assert_eq!(eval_in(&mut arena(), "(list-tail '(1 2) 3)"), Ok(Err(Fault::OutOfRange)));
+    assert_eq!(eval_in(&mut arena(), "(list-tail '(1 2) -1)"), Ok(Err(Fault::OutOfRange)));
+    assert_eq!(eval_in(&mut arena(), "(list-ref '(1 2) 2)"), Ok(Err(Fault::OutOfRange)));
+    assert_eq!(eval_in(&mut arena(), "(list-ref '(1 . 2) 1)"), Ok(Err(Fault::WrongType)));
     assert_eq!(eval_in(&mut arena(), "(car '())"), Ok(Err(Fault::WrongType)));
     assert_eq!(eval_in(&mut arena(), "(apply car '(1 2))"), Ok(Err(Fault::Arity)));
 }
@@ -318,4 +390,155 @@ fn mutable_bytevectors() {
     assert_eq!(eval_in(&mut arena(), "(make-bytevector 2 256)"), Ok(Err(Fault::WrongType)));
     assert_eq!(eval_in(&mut arena(), "(make-bytevector 2 0 0)"), Ok(Err(Fault::Arity)));
     assert_eq!(eval_in(&mut arena(), "(bytevector-length '())"), Ok(Err(Fault::WrongType)));
+}
+
+#[test]
+fn procedure_and_continuation_predicates() {
+    assert_eq!(
+        eval("(list (procedure? (lambda (x) x))
+                    (procedure? car)
+                    (procedure? +)
+                    (procedure? call/cc)
+                    (procedure? procedure?)
+                    (procedure? continuation?)
+                    (procedure? 42)
+                    (procedure? '())
+                    (procedure? #t)
+                    (procedure? '(1 . 2)))"),
+        "(#t #t #t #t #t #t #f #f #f #f)"
+    );
+    assert_eq!(
+        eval("(list (continuation? (lambda (x) x))
+                    (continuation? car)
+                    (continuation? +)
+                    (continuation? 42)
+                    (continuation? '()))"),
+        "(#f #f #f #f #f)"
+    );
+    // `call-with-composable-continuation` reifies a raw `Continuation` object, which is both
+    // `continuation?` and `procedure?`; `call/cc` wraps it in an aborting lambda (`procedure?` only).
+    assert_eq!(
+        eval("(call-with-composable-continuation (lambda (k) (list (procedure? k) (continuation? k))))"),
+        "(#t #t)"
+    );
+    assert_eq!(
+        eval("(call/cc (lambda (k) (list (procedure? k) (continuation? k))))"),
+        "(#t #f)"
+    );
+    // Dominating `continuation?` / `procedure?` branch facts in `cp0`.
+    let classify = "
+        (define (classify x)
+          (if (continuation? x)
+              (list 'cont (procedure? x) (if x 'truthy 'falsy) (pair? x))
+              (if (procedure? x)
+                  (list 'proc (continuation? x) (if x 'truthy 'falsy) (null? x))
+                  (list 'other (continuation? x) (procedure? x)))))
+        (list (call-with-composable-continuation classify)
+              (classify (lambda () 1))
+              (classify 99))
+    ";
+    assert_eq!(eval(classify), "((cont #t truthy #f) (proc #f truthy #f) (other #f #f))");
+}
+
+#[test]
+fn compiler_micropass_stress_cases() {
+    // 1. Contified loop where the loop parameter `f` is replaced each iteration by a new closure
+    //    capturing both the old `f` and `n` (tests `NewClosure` destination vs. capture register hazard).
+    let wrap_loop = "
+        (let loop ((f (lambda (x) x)) (n 5))
+          (if (eqv? n 0)
+              (f 10)
+              (loop (lambda (x) (f (+ x n))) (- n 1))))
+    ";
+    assert_eq!(eval(wrap_loop), "25");
+
+    // 2. Contified loop collecting closures that capture per-iteration immutable and `set!`-mutated
+    //    loop variables, verifying each closure gets its own iteration's binding/box.
+    let per_iter_closures = "
+        (let ()
+          (define immut-fns
+            (let loop ((i 0) (acc '()))
+              (if (eqv? i 4)
+                  (reverse acc)
+                  (loop (+ i 1) (cons (lambda () i) acc)))))
+          (define mut-fns
+            (let loop ((i 1) (acc '()))
+              (if (eqv? i 5)
+                  (reverse acc)
+                  (let ((next (+ i 1)))
+                    (set! i (* i 10))
+                    (loop next (cons (lambda () i) acc))))))
+          (list (map (lambda (f) (f)) immut-fns)
+                (map (lambda (f) (f)) mut-fns)))
+    ";
+    assert_eq!(eval(per_iter_closures), "((0 1 2 3) (10 20 30 40))");
+
+    // 3. Nested contified loops: outer loop recurring with the result of an inner contified loop,
+    //    plus a 3-deep nested loop computing a triangular sum.
+    let nested_loops = "
+        (let outer ((i 6) (total 0))
+          (if (eqv? i 0)
+              total
+              (outer (- i 1)
+                     (let mid ((j i) (acc total))
+                       (if (eqv? j 0)
+                           acc
+                           (mid (- j 1)
+                                (let inner ((k j) (s acc))
+                                  (if (eqv? k 0)
+                                      s
+                                      (inner (- k 1) (+ s k))))))))))
+    ";
+    assert_eq!(eval(nested_loops), "126");
+
+    // 4. Multi-parameter permutation/rotation in a contified loop (tests parallel-move cycle breaking
+    //    in `L4::Recur`).
+    let permute_loop = "
+        (let loop ((a 1) (b 2) (c 3) (d 4) (n 5))
+          (if (eqv? n 0)
+              (list a b c d)
+              (loop b c d (+ a (* b 2) (* c 3) (* d 4)) (- n 1))))
+    ";
+    assert_eq!(eval(permute_loop), "(140 661 3128 14805)");
+
+    // 5. Complex `letrec*` with mixed pure values, side-effecting initializers, non-recursive
+    //    helpers, single-recursive `SelfClosure` functions (returning closures that capture
+    //    `SelfClosure`), contified loops, and mutually recursive `Fix` groups.
+    let complex_letrec = "
+        (let ()
+          (define log '())
+          (define (record! tag val)
+            (set! log (cons (cons tag val) log))
+            val)
+          (define base (record! 'base 10))
+          (define (scale x) (* x base))
+          (define bumped (record! 'bumped (scale 3)))
+          (define (stream n)
+            (cons (+ n base) (lambda () (stream (- n 1)))))
+          (define (take-stream s k)
+            (if (eqv? k 0)
+                '()
+                (cons (car s) (take-stream ((cdr s)) (- k 1)))))
+          (define (even-sum n acc)
+            (if (eqv? n 0) acc (odd-sum (- n 1) (+ acc n))))
+          (define (odd-sum n acc)
+            (if (eqv? n 0) acc (even-sum (- n 1) (+ acc (* n 2)))))
+          (list (take-stream (stream 3) 4)
+                bumped
+                (even-sum 6 0)
+                (reverse log)))
+    ";
+    assert_eq!(eval(complex_letrec), "((13 12 11 10) 30 30 ((base . 10) (bumped . 30)))");
+
+    // 6. Deep `cxr` store-to-load forwarding on impure `cons` / `list` chains preserves exact
+    //    left-to-right side-effect ordering while eliminating intermediate pair allocations.
+    let cxr_effects = "
+        (let ((trace '()))
+          (define (step! x)
+            (set! trace (cons x trace))
+            (* x 10))
+          (let ((picked (cadddr (list (step! 1) (step! 2) (step! 3) (step! 4) (step! 5)))))
+            (list picked (reverse trace))))
+    ";
+    assert_eq!(eval(cxr_effects), "(40 (1 2 3 4 5))");
 }

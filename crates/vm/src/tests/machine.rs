@@ -147,18 +147,18 @@ const SUM: &[Op] = &[
     Op::LoadConst { dst: 3, index: 0 },
     Op::Move { dst: 4, src: 1 },
     Op::CallIntrinsic { base: 3, args: 2, intrinsic: Eq },
-    Op::MoveAcc { dst: 5 },
+    Op::LoadAcc { dst: 5 },
     Op::JumpIfFalse { test: 5, offset: 1 },
     Op::Return { src: 3 },
     Op::LoadConst { dst: 4, index: 1 },
     Op::Move { dst: 3, src: 1 },
     Op::CallIntrinsic { base: 3, args: 2, intrinsic: Add },
-    Op::MoveAcc { dst: 9 },
+    Op::LoadAcc { dst: 9 },
     Op::Move { dst: 8, src: 0 },
     Op::Call { base: 8, args: 1 },
-    Op::MoveAcc { dst: 4 },
+    Op::LoadAcc { dst: 4 },
     Op::CallIntrinsic { base: 3, args: 2, intrinsic: Add },
-    Op::MoveAcc { dst: 3 },
+    Op::LoadAcc { dst: 3 },
     Op::Return { src: 3 },
 ];
 
@@ -200,22 +200,22 @@ fn runs_pause_so_the_arena_can_collect() {
         Op::LoadConst { dst: 4, index: 0 },
         Op::Move { dst: 5, src: 1 },
         Op::CallIntrinsic { base: 4, args: 2, intrinsic: Eq },
-        Op::MoveAcc { dst: 6 },
+        Op::LoadAcc { dst: 6 },
         Op::JumpIfFalse { test: 6, offset: 1 },
         Op::Return { src: 2 },
         Op::Move { dst: 4, src: 2 },
         Op::LoadConst { dst: 5, index: 1 },
         Op::CallIntrinsic { base: 4, args: 2, intrinsic: Add },
-        Op::MoveAcc { dst: 4 },
+        Op::LoadAcc { dst: 4 },
         Op::Move { dst: 5, src: 1 },
         Op::CallIntrinsic { base: 4, args: 2, intrinsic: Cons },
-        Op::MoveAcc { dst: 4 },
+        Op::LoadAcc { dst: 4 },
         Op::CallIntrinsic { base: 4, args: 1, intrinsic: Car },
-        Op::MoveAcc { dst: 7 },
+        Op::LoadAcc { dst: 7 },
         Op::Move { dst: 4, src: 1 },
         Op::LoadConst { dst: 5, index: 2 },
         Op::CallIntrinsic { base: 4, args: 2, intrinsic: Add },
-        Op::MoveAcc { dst: 6 },
+        Op::LoadAcc { dst: 6 },
         Op::Move { dst: 5, src: 0 },
         Op::TailCall { base: 5, args: 2 },
     ];
@@ -243,7 +243,7 @@ fn rest_arguments_and_apply() {
         Op::Move { dst: 6, src: 2 },
         Op::Move { dst: 7, src: 3 },
         Op::CallRequest { base: 5, args: 3, request: Request::Apply },
-        Op::MoveAcc { dst: 5 },
+        Op::LoadAcc { dst: 5 },
         Op::Return { src: 5 },
     ];
     let apply: Func<'_> = (3, &[], &apply);
@@ -288,10 +288,10 @@ fn multiple_values_are_an_object() {
     let add = &[
         Op::NewClosure { dst: 5, count: 1, code: 5 },
         Op::Call { base: 5, args: 0 },
-        Op::MoveAcc { dst: 2 },
+        Op::LoadAcc { dst: 2 },
         Op::LoadConst { dst: 3, index: 0 },
         Op::CallIntrinsic { base: 2, args: 2, intrinsic: Add },
-        Op::MoveAcc { dst: 2 },
+        Op::LoadAcc { dst: 2 },
         Op::Return { src: 2 },
     ];
     assert_eq!(call(&constants, &funcs(add), &[]), Err(Fault::WrongType));
@@ -300,18 +300,18 @@ fn multiple_values_are_an_object() {
     let apart = &[
         Op::NewClosure { dst: 5, count: 1, code: 5 },
         Op::Call { base: 5, args: 0 },
-        Op::MoveAcc { dst: 2 },
+        Op::LoadAcc { dst: 2 },
         Op::CallIntrinsic { base: 2, args: 1, intrinsic: IsValues },
-        Op::MoveAcc { dst: 3 },
+        Op::LoadAcc { dst: 3 },
         Op::JumpIfFalse { test: 3, offset: 9 },
         Op::CallIntrinsic { base: 2, args: 1, intrinsic: ValuesLength },
-        Op::MoveAcc { dst: 4 },
+        Op::LoadAcc { dst: 4 },
         Op::Move { dst: 5, src: 2 },
         Op::LoadConst { dst: 6, index: 3 },
         Op::CallIntrinsic { base: 5, args: 2, intrinsic: ValuesRef },
-        Op::MoveAcc { dst: 5 },
+        Op::LoadAcc { dst: 5 },
         Op::CallIntrinsic { base: 4, args: 2, intrinsic: Add },
-        Op::MoveAcc { dst: 4 },
+        Op::LoadAcc { dst: 4 },
         Op::Return { src: 4 },
         Op::Return { src: 2 },
     ];
@@ -368,10 +368,10 @@ fn prelude<'gc>(mc: &Mutation<'gc>) -> (Value<'gc>, Vec<Value<'gc>>) {
         Op::LoadConst { dst: 4, index: 1 },
         Op::LoadConst { dst: 5, index: 2 },
         Op::CallRequest { base: 4, args: 2, request: Request::MarkValue },
-        Op::MoveAcc { dst: 6 },
+        Op::LoadAcc { dst: 6 },
         Op::Move { dst: 5, src: 1 },
         Op::CallIntrinsic { base: 5, args: 2, intrinsic: Cons },
-        Op::MoveAcc { dst: 5 },
+        Op::LoadAcc { dst: 5 },
         Op::LoadConst { dst: 4, index: 1 },
         Op::Move { dst: 6, src: 2 },
         Op::TailCallRequest { base: 4, args: 3, request: Request::WithMark },
@@ -383,17 +383,17 @@ fn prelude<'gc>(mc: &Mutation<'gc>) -> (Value<'gc>, Vec<Value<'gc>>) {
             Op::LoadConst { dst: 3, index: 1 },
             Op::LoadConst { dst: 4, index: 2 },
             Op::CallRequest { base: 3, args: 2, request: Request::MarkValue },
-            Op::MoveAcc { dst: 3 },
+            Op::LoadAcc { dst: 3 },
             Op::CallIntrinsic { base: 3, args: 1, intrinsic: IsNull },
-            Op::MoveAcc { dst: 4 },
+            Op::LoadAcc { dst: 4 },
             Op::JumpIfFalse { test: 4, offset: 3 },
             Op::LoadConst { dst: 4, index: 0 },
             Op::NewClosure { dst: 5, count: 1, code: 13 },
             Op::TailCallRequest { base: 4, args: 2, request: Request::Abort },
             Op::CallIntrinsic { base: 3, args: 1, intrinsic: Car },
-            Op::MoveAcc { dst: 7 },
+            Op::LoadAcc { dst: 7 },
             Op::CallIntrinsic { base: 3, args: 1, intrinsic: Cdr },
-            Op::MoveAcc { dst: 5 },
+            Op::LoadAcc { dst: 5 },
             Op::NewClosure { dst: 6, count: 1, code: thunk },
             Op::LoadConst { dst: 4, index: 1 },
             Op::TailCallRequest { base: 4, args: 3, request: Request::WithMark },
@@ -462,10 +462,10 @@ fn prompts_take_aborts() {
         Op::LoadConst { dst: 3, index: 0 },
         Op::NewClosure { dst: 4, count: 2, code: 6 },
         Op::CallRequest { base: 3, args: 3, request: Request::CallWithPrompt },
-        Op::MoveAcc { dst: 3 },
+        Op::LoadAcc { dst: 3 },
         Op::LoadConst { dst: 2, index: 1 },
         Op::CallIntrinsic { base: 2, args: 2, intrinsic: Add },
-        Op::MoveAcc { dst: 2 },
+        Op::LoadAcc { dst: 2 },
         Op::Return { src: 2 },
     ];
     let handler = [Op::TailCallIntrinsic { base: 1, args: 2, intrinsic: Add }];
@@ -474,10 +474,10 @@ fn prompts_take_aborts() {
         Op::LoadConst { dst: 4, index: 2 },
         Op::LoadConst { dst: 5, index: 3 },
         Op::CallRequest { base: 3, args: 3, request: Request::Abort },
-        Op::MoveAcc { dst: 3 },
+        Op::LoadAcc { dst: 3 },
         Op::LoadConst { dst: 2, index: 4 },
         Op::CallIntrinsic { base: 2, args: 2, intrinsic: Add },
-        Op::MoveAcc { dst: 2 },
+        Op::LoadAcc { dst: 2 },
         Op::Return { src: 2 },
     ];
     let constants = [TAG, 1000, 5, 2, 1];
@@ -490,7 +490,7 @@ fn prompts_take_aborts() {
     // An abort to a tag with no prompt faults, and one to something that isn't a tag.
     let fresh = [
         Op::CallIntrinsic { base: 3, args: 0, intrinsic: MakePromptTag },
-        Op::MoveAcc { dst: 3 },
+        Op::LoadAcc { dst: 3 },
         Op::CallRequest { base: 3, args: 1, request: Request::Abort },
     ];
     assert_eq!(with(&fresh), Err(Fault::NoPrompt));
@@ -504,10 +504,10 @@ fn composable_continuations_go_on_where_theyre_called() {
         Op::LoadConst { dst: 3, index: 0 },
         Op::NewClosure { dst: 4, count: 2, code: 7 },
         Op::CallRequest { base: 3, args: 3, request: Request::CallWithPrompt },
-        Op::MoveAcc { dst: 3 },
+        Op::LoadAcc { dst: 3 },
         Op::LoadConst { dst: 2, index: 1 },
         Op::CallIntrinsic { base: 2, args: 2, intrinsic: Add },
-        Op::MoveAcc { dst: 2 },
+        Op::LoadAcc { dst: 2 },
         Op::Return { src: 2 },
     ];
     let handler = [Op::LoadConst { dst: 3, index: 5 }, Op::Return { src: 3 }];
@@ -515,23 +515,23 @@ fn composable_continuations_go_on_where_theyre_called() {
         Op::LoadConst { dst: 3, index: 0 },
         Op::NewClosure { dst: 4, count: 1, code: 9 },
         Op::CallRequest { base: 3, args: 2, request: Request::Capture },
-        Op::MoveAcc { dst: 3 },
+        Op::LoadAcc { dst: 3 },
         Op::LoadConst { dst: 2, index: 2 },
         Op::CallIntrinsic { base: 2, args: 2, intrinsic: Add },
-        Op::MoveAcc { dst: 2 },
+        Op::LoadAcc { dst: 2 },
         Op::Return { src: 2 },
     ];
     let twice = [
         Op::Move { dst: 4, src: 1 },
         Op::LoadConst { dst: 5, index: 2 },
         Op::Call { base: 4, args: 1 },
-        Op::MoveAcc { dst: 3 },
+        Op::LoadAcc { dst: 3 },
         Op::Move { dst: 5, src: 1 },
         Op::LoadConst { dst: 6, index: 3 },
         Op::Call { base: 5, args: 1 },
-        Op::MoveAcc { dst: 4 },
+        Op::LoadAcc { dst: 4 },
         Op::CallIntrinsic { base: 3, args: 2, intrinsic: Add },
-        Op::MoveAcc { dst: 3 },
+        Op::LoadAcc { dst: 3 },
         Op::Return { src: 3 },
     ];
     let constants = [TAG, 1000, 1, 2, 10, 0];
@@ -547,18 +547,18 @@ fn composable_continuations_go_on_where_theyre_called() {
     let main = [
         Op::LoadConst { dst: 2, index: 5 },
         Op::CallIntrinsic { base: 2, args: 1, intrinsic: MakeBox },
-        Op::MoveAcc { dst: 2 },
+        Op::LoadAcc { dst: 2 },
         Op::LoadConst { dst: 3, index: 0 },
         Op::NewClosure { dst: 4, count: 2, code: 7 },
         Op::CallRequest { base: 3, args: 3, request: Request::CallWithPrompt },
-        Op::MoveAcc { dst: 3 },
+        Op::LoadAcc { dst: 3 },
         Op::CallIntrinsic { base: 2, args: 1, intrinsic: Unbox },
-        Op::MoveAcc { dst: 4 },
+        Op::LoadAcc { dst: 4 },
         Op::LoadConst { dst: 5, index: 4 },
         Op::Call { base: 4, args: 1 },
-        Op::MoveAcc { dst: 4 },
+        Op::LoadAcc { dst: 4 },
         Op::CallIntrinsic { base: 3, args: 2, intrinsic: Add },
-        Op::MoveAcc { dst: 3 },
+        Op::LoadAcc { dst: 3 },
         Op::Return { src: 3 },
     ];
     let keep = [
@@ -581,11 +581,11 @@ fn marks_are_dropped_on_return_and_replaced_in_tail_position() {
         Op::LoadConst { dst: 4, index: 1 },
         Op::NewClosure { dst: 5, count: 1, code: 6 },
         Op::CallRequest { base: 3, args: 3, request: Request::WithMark },
-        Op::MoveAcc { dst: 2 },
+        Op::LoadAcc { dst: 2 },
         Op::LoadConst { dst: 3, index: 0 },
         Op::LoadConst { dst: 4, index: 2 },
         Op::CallRequest { base: 3, args: 2, request: Request::MarkValue },
-        Op::MoveAcc { dst: 3 },
+        Op::LoadAcc { dst: 3 },
         Op::TailCallIntrinsic { base: 2, args: 2, intrinsic: Values },
     ];
     let get = [Op::LoadConst { dst: 2, index: 0 }, Op::LoadConst { dst: 3, index: 2 }, Op::TailCallRequest { base: 2, args: 2, request: Request::MarkValue }];
@@ -602,7 +602,7 @@ fn marks_are_dropped_on_return_and_replaced_in_tail_position() {
     ];
     let inner = [
         Op::CallIntrinsic { base: 2, args: 0, intrinsic: MakePromptTag },
-        Op::MoveAcc { dst: 2 },
+        Op::LoadAcc { dst: 2 },
         Op::NewClosure { dst: 3, count: 2, code: 7 },
         Op::TailCallRequest { base: 2, args: 3, request: Request::CallWithPrompt },
     ];
@@ -617,7 +617,7 @@ fn marks_are_dropped_on_return_and_replaced_in_tail_position() {
         Op::LoadConst { dst: 3, index: 2 },
         Op::Move { dst: 4, src: 1 },
         Op::CallIntrinsic { base: 3, args: 2, intrinsic: Eq },
-        Op::MoveAcc { dst: 5 },
+        Op::LoadAcc { dst: 5 },
         Op::JumpIfFalse { test: 5, offset: 3 },
         Op::LoadConst { dst: 3, index: 0 },
         Op::LoadConst { dst: 4, index: 2 },
@@ -632,7 +632,7 @@ fn marks_are_dropped_on_return_and_replaced_in_tail_position() {
         Op::LoadUpvalue { dst: 4, index: 1 },
         Op::LoadConst { dst: 5, index: 4 },
         Op::CallIntrinsic { base: 4, args: 2, intrinsic: Add },
-        Op::MoveAcc { dst: 3 },
+        Op::LoadAcc { dst: 3 },
         Op::TailCall { base: 2, args: 1 },
     ];
     let mut arena = Arena::new(1 << 20, 0);
@@ -652,7 +652,7 @@ fn deep_continuations_come_back_in_chunks() {
         Op::LoadConst { dst: 3, index: 0 },
         Op::Move { dst: 4, src: 1 },
         Op::CallIntrinsic { base: 3, args: 2, intrinsic: Eq },
-        Op::MoveAcc { dst: 5 },
+        Op::LoadAcc { dst: 5 },
         Op::JumpIfFalse { test: 5, offset: 3 },
         Op::LoadConst { dst: 6, index: 6 },
         Op::NewClosure { dst: 7, count: 1, code: 10 },
@@ -660,12 +660,12 @@ fn deep_continuations_come_back_in_chunks() {
         Op::LoadConst { dst: 4, index: 1 },
         Op::Move { dst: 3, src: 1 },
         Op::CallIntrinsic { base: 3, args: 2, intrinsic: Add },
-        Op::MoveAcc { dst: 9 },
+        Op::LoadAcc { dst: 9 },
         Op::Move { dst: 8, src: 0 },
         Op::Call { base: 8, args: 1 },
-        Op::MoveAcc { dst: 4 },
+        Op::LoadAcc { dst: 4 },
         Op::CallIntrinsic { base: 3, args: 2, intrinsic: Add },
-        Op::MoveAcc { dst: 3 },
+        Op::LoadAcc { dst: 3 },
         Op::Return { src: 3 },
     ];
     let keep = [
@@ -678,29 +678,29 @@ fn deep_continuations_come_back_in_chunks() {
     let main = [
         Op::LoadConst { dst: 2, index: 2 },
         Op::CallIntrinsic { base: 2, args: 1, intrinsic: MakeBox },
-        Op::MoveAcc { dst: 3 },
+        Op::LoadAcc { dst: 3 },
         Op::LoadConst { dst: 2, index: 0 },
         Op::CallIntrinsic { base: 2, args: 1, intrinsic: MakeBox },
-        Op::MoveAcc { dst: 4 },
+        Op::LoadAcc { dst: 4 },
         Op::LoadConst { dst: 7, index: 6 },
         Op::NewClosure { dst: 8, count: 2, code: 8 },
         Op::LoadConst { dst: 10, index: 3 },
         Op::CallRequest { base: 7, args: 4, request: Request::CallWithPrompt },
-        Op::MoveAcc { dst: 2 },
+        Op::LoadAcc { dst: 2 },
         Op::CallIntrinsic { base: 4, args: 1, intrinsic: Unbox },
-        Op::MoveAcc { dst: 5 },
+        Op::LoadAcc { dst: 5 },
         Op::LoadConst { dst: 6, index: 4 },
         Op::CallIntrinsic { base: 5, args: 2, intrinsic: Add },
-        Op::MoveAcc { dst: 6 },
+        Op::LoadAcc { dst: 6 },
         Op::Move { dst: 5, src: 4 },
         Op::CallIntrinsic { base: 5, args: 2, intrinsic: SetBox },
         Op::Move { dst: 5, src: 6 },
         Op::LoadConst { dst: 6, index: 4 },
         Op::CallIntrinsic { base: 5, args: 2, intrinsic: Eq },
-        Op::MoveAcc { dst: 5 },
+        Op::LoadAcc { dst: 5 },
         Op::JumpIfFalse { test: 5, offset: 4 },
         Op::CallIntrinsic { base: 3, args: 1, intrinsic: Unbox },
-        Op::MoveAcc { dst: 7 },
+        Op::LoadAcc { dst: 7 },
         Op::LoadConst { dst: 8, index: 5 },
         Op::TailCall { base: 7, args: 1 },
         Op::Return { src: 2 },
@@ -725,20 +725,20 @@ fn call_cc_from_the_prelude() {
         Op::LoadUpvalue { dst: 4, index: CALL_CC },
         Op::NewClosure { dst: 5, count: 1, code: 4 },
         Op::Call { base: 4, args: 1 },
-        Op::MoveAcc { dst: 3 },
+        Op::LoadAcc { dst: 3 },
         Op::LoadConst { dst: 2, index: 0 },
         Op::CallIntrinsic { base: 2, args: 2, intrinsic: Add },
-        Op::MoveAcc { dst: 2 },
+        Op::LoadAcc { dst: 2 },
         Op::Return { src: 2 },
     ];
     let f = [
         Op::LoadConst { dst: 6, index: 1 },
         Op::Move { dst: 5, src: 1 },
         Op::Call { base: 5, args: 1 },
-        Op::MoveAcc { dst: 4 },
+        Op::LoadAcc { dst: 4 },
         Op::LoadConst { dst: 3, index: 2 },
         Op::CallIntrinsic { base: 3, args: 2, intrinsic: Add },
-        Op::MoveAcc { dst: 3 },
+        Op::LoadAcc { dst: 3 },
         Op::Return { src: 3 },
     ];
     assert_eq!(prelude_call(&[1, 5, 100], &[(0, &[], &main), (1, &[], &f)]), [6]);
@@ -750,33 +750,33 @@ fn call_cc_from_the_prelude() {
     let reenter = [
         Op::LoadConst { dst: 2, index: 0 },
         Op::CallIntrinsic { base: 2, args: 1, intrinsic: MakeBox },
-        Op::MoveAcc { dst: 3 },
+        Op::LoadAcc { dst: 3 },
         Op::LoadConst { dst: 2, index: 1 },
         Op::CallIntrinsic { base: 2, args: 1, intrinsic: MakeBox },
-        Op::MoveAcc { dst: 4 },
+        Op::LoadAcc { dst: 4 },
         Op::LoadUpvalue { dst: 6, index: CALL_CC },
         Op::NewClosure { dst: 7, count: 1, code: 6 },
         Op::Call { base: 6, args: 1 },
-        Op::MoveAcc { dst: 5 },
+        Op::LoadAcc { dst: 5 },
         Op::CallIntrinsic { base: 3, args: 1, intrinsic: Unbox },
-        Op::MoveAcc { dst: 8 },
+        Op::LoadAcc { dst: 8 },
         Op::LoadConst { dst: 9, index: 2 },
         Op::CallIntrinsic { base: 8, args: 2, intrinsic: Add },
-        Op::MoveAcc { dst: 9 },
+        Op::LoadAcc { dst: 9 },
         Op::Move { dst: 8, src: 3 },
         Op::CallIntrinsic { base: 8, args: 2, intrinsic: SetBox },
         Op::Move { dst: 8, src: 9 },
         Op::LoadConst { dst: 9, index: 3 },
         Op::CallIntrinsic { base: 8, args: 2, intrinsic: Eq },
-        Op::MoveAcc { dst: 8 },
+        Op::LoadAcc { dst: 8 },
         Op::JumpIfFalse { test: 8, offset: 1 },
         Op::Return { src: 5 },
         Op::Move { dst: 8, src: 5 },
         Op::LoadConst { dst: 9, index: 4 },
         Op::CallIntrinsic { base: 8, args: 2, intrinsic: Add },
-        Op::MoveAcc { dst: 12 },
+        Op::LoadAcc { dst: 12 },
         Op::CallIntrinsic { base: 4, args: 1, intrinsic: Unbox },
-        Op::MoveAcc { dst: 11 },
+        Op::LoadAcc { dst: 11 },
         Op::TailCall { base: 11, args: 1 },
     ];
     let keep = [
@@ -797,10 +797,10 @@ fn exceptions_from_the_prelude() {
         Op::LoadUpvalue { dst: 4, index: WITH_HANDLER },
         Op::NewClosure { dst: 5, count: 2, code: 5 },
         Op::Call { base: 4, args: 2 },
-        Op::MoveAcc { dst: 3 },
+        Op::LoadAcc { dst: 3 },
         Op::LoadConst { dst: 2, index: 3 },
         Op::CallIntrinsic { base: 2, args: 2, intrinsic: Add },
-        Op::MoveAcc { dst: 2 },
+        Op::LoadAcc { dst: 2 },
         Op::Return { src: 2 },
     ];
     let handler = [Op::Move { dst: 3, src: 1 }, Op::LoadConst { dst: 4, index: 1 }, Op::TailCallIntrinsic { base: 3, args: 2, intrinsic: Add }];
@@ -808,10 +808,10 @@ fn exceptions_from_the_prelude() {
         Op::LoadUpvalue { dst: 4, index: 0 },
         Op::LoadConst { dst: 5, index: 0 },
         Op::Call { base: 4, args: 1 },
-        Op::MoveAcc { dst: 3 },
+        Op::LoadAcc { dst: 3 },
         Op::LoadConst { dst: 2, index: 2 },
         Op::CallIntrinsic { base: 2, args: 2, intrinsic: Add },
-        Op::MoveAcc { dst: 2 },
+        Op::LoadAcc { dst: 2 },
         Op::Return { src: 2 },
     ];
     let funcs = [(0, &[][..], &main[..]), (1, &[], &handler), (0, &[Upvalue(RAISE_CONTINUABLE)], &thunk)];
@@ -827,33 +827,33 @@ fn exceptions_from_the_prelude() {
         Op::LoadUpvalue { dst: 3, index: 0 },
         Op::NewClosure { dst: 4, count: 2, code: 6 },
         Op::Call { base: 3, args: 2 },
-        Op::MoveAcc { dst: 3 },
+        Op::LoadAcc { dst: 3 },
         Op::LoadConst { dst: 2, index: 1 },
         Op::CallIntrinsic { base: 2, args: 2, intrinsic: Add },
-        Op::MoveAcc { dst: 2 },
+        Op::LoadAcc { dst: 2 },
         Op::Return { src: 2 },
     ];
     let inner = [
         Op::Move { dst: 4, src: 1 },
         Op::LoadConst { dst: 5, index: 1 },
         Op::CallIntrinsic { base: 4, args: 2, intrinsic: Add },
-        Op::MoveAcc { dst: 5 },
+        Op::LoadAcc { dst: 5 },
         Op::LoadUpvalue { dst: 4, index: 0 },
         Op::Call { base: 4, args: 1 },
-        Op::MoveAcc { dst: 4 },
+        Op::LoadAcc { dst: 4 },
         Op::LoadConst { dst: 3, index: 1 },
         Op::CallIntrinsic { base: 3, args: 2, intrinsic: Add },
-        Op::MoveAcc { dst: 3 },
+        Op::LoadAcc { dst: 3 },
         Op::Return { src: 3 },
     ];
     let inner_thunk = [
         Op::LoadUpvalue { dst: 3, index: 0 },
         Op::LoadConst { dst: 4, index: 2 },
         Op::Call { base: 3, args: 1 },
-        Op::MoveAcc { dst: 3 },
+        Op::LoadAcc { dst: 3 },
         Op::LoadConst { dst: 2, index: 1 },
         Op::CallIntrinsic { base: 2, args: 2, intrinsic: Add },
-        Op::MoveAcc { dst: 2 },
+        Op::LoadAcc { dst: 2 },
         Op::Return { src: 2 },
     ];
     let funcs = [
@@ -924,6 +924,24 @@ fn faults_go_to_the_fault_procedure() {
         let Outcome::Raised(value) = to_end(mc, &mut machine).unwrap() else { panic!() };
         assert_eq!(fault(mc, value), Fault::NotProcedure);
     });
+
+    // A fault in a nested frame calls the fault procedure in place of the faulting frame,
+    // keeping its caller on the active segment so returning from the handler resumes the caller.
+    let caller = [
+        Op::NewClosure { dst: 3, count: 1, code: 4 },
+        Op::Call { base: 3, args: 0 },
+        Op::LoadAcc { dst: 3 },
+        Op::LoadConst { dst: 2, index: 1 },
+        Op::TailCallIntrinsic { base: 2, args: 2, intrinsic: Add },
+    ];
+    let handler = [Op::LoadConst { dst: 3, index: 2 }, Op::Return { src: 3 }];
+    arena.mutate(|mc| {
+        let constants = table(mc, &[5, 10, 32]);
+        let codes = module(mc, &constants, &[(0, &[], &caller), (0, &[], &main), (1, &[], &handler)]);
+        let mut machine = Machine::new(mc, MIN_SEGMENT, closure(mc, codes[0]), &[]).unwrap();
+        machine.set_fault(mc, closure(mc, codes[2]));
+        assert_eq!(to_end(mc, &mut machine).unwrap(), Outcome::Done(fix(42)));
+    });
 }
 
 #[test]
@@ -933,7 +951,7 @@ fn equal_spends_fuel_as_it_goes() {
         Op::LoadConst { dst: 2, index: 0 },
         Op::LoadConst { dst: 3, index: 1 },
         Op::CallIntrinsic { base: 2, args: 2, intrinsic: crate::Intrinsic::Equal },
-        Op::MoveAcc { dst: 4 },
+        Op::LoadAcc { dst: 4 },
         Op::Jump { offset: 0 },
         Op::Return { src: 4 },
     ];

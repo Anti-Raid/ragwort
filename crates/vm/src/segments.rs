@@ -57,18 +57,25 @@ impl<'gc> Segments<'_, 'gc> {
     /// slots it takes from `fp` on. Returns where the frame is now.
     pub(crate) fn overflow(&mut self, fp: usize, end: usize, need: usize) -> Result<usize, Fault> {
         let mc = self.mc;
+        let len = end.checked_sub(fp).filter(|&n| n <= WINDOW).ok_or(Fault::Malformed)?;
         let (start, old) = (self.stack.base(), self.stack.segment(mc));
-        let link = frame::link_of(mc, self.frame(fp)?)?;
-        self.stack.set_top(end);
+        let caller = self.frame(fp)?;
+        let link = frame::link_of(mc, caller)?;
+        let mut moved = [Value::VOID; WINDOW];
+        for (i, slot) in moved[..len].iter_mut().enumerate() {
+            *slot = caller.get(i as u8);
+        }
+        self.stack.set_top(fp);
         self.move_to(need)?;
         if fp > start {
             self.push(old, start, fp, link, true)?;
         }
         let at = self.stack.base();
-        if !self.stack.write(mc, at, old.slots(mc).slice(fp..end).ok_or(Fault::Malformed)?) {
-            return Err(Fault::Malformed);
+        let dst = self.frame(at)?;
+        for (i, &val) in moved[..len].iter().enumerate() {
+            dst.set(i as u8, val);
         }
-        frame::set_link(mc, self.frame(at)?, Link::BOTTOM)?;
+        frame::set_link(mc, dst, Link::BOTTOM)?;
         Ok(at)
     }
 

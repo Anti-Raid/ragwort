@@ -36,7 +36,7 @@ fn steps_run_against_the_frame() {
         assert_eq!(frame.get(3), Value::TRUE);
 
         assert_eq!(Op::Return { src: 0 }.step(&mut cx), Ok(Control::Return));
-        Op::MoveAcc { dst: 7 }.step(&mut cx).unwrap();
+        Op::LoadAcc { dst: 7 }.step(&mut cx).unwrap();
         assert_eq!((cx.acc, frame.get(7)), (fix(7), fix(7)));
 
         assert_eq!(Op::Call { base: 8, args: 2 }.step(&mut cx), Ok(Control::Call { base: 8, args: 2 }));

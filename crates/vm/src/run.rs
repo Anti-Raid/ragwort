@@ -9,7 +9,7 @@ use ragwort_types::pair::{Pair, Pairs};
 
 use crate::frame::{self, ARGS, CLOSURE, Link, MAX_PARAMS};
 use crate::op::Fuel;
-use crate::objects::{BytecodeFields, Closure, ClosureFields};
+use crate::objects::{BytecodeFields, Closure, ClosureFields, MultiValue, MultiValueFields};
 use crate::{Context, Control, Fault, Op, Request};
 
 /// The most arguments a call passes: they and the link after them fill the frame.
@@ -210,14 +210,28 @@ impl<'s, 'gc> Run<'s, 'gc> {
         Ok(())
     }
 
-    /// Makes `apply` a call, as it's laid out as one, with the list to spread last. The outer
-    /// loop carries out the other requests.
+    /// Makes `apply` or `apply-values` a call, as it's laid out as one, with the list or
+    /// [`MultiValue`] to spread last. The outer loop carries out the other requests.
     #[inline(always)]
     fn request(&mut self, base: u8, args: u8, request: Request, spread: bool, tail: bool) -> Result<(), Exit<'gc>> {
         let frame = self.cx.frame;
         let call = match request {
             // (apply f x ... list) is already laid out as a call at `base`, with the list spread.
-            Request::Apply if !spread => Call { base, argc: args - 2, rest: frame.get(base + args - 1) },
+            Request::Apply if !spread => {
+                let rest = frame.get(base + args - 1);
+                if rest.downcast::<MultiValue>(self.cx.mc).is_some() {
+                    return Err(Fault::WrongType.into());
+                }
+                Call { base, argc: args - 2, rest }
+            }
+            Request::ApplyValues if !spread => {
+                let v = frame.get(base + 1);
+                if v.downcast::<MultiValue>(self.cx.mc).is_some() {
+                    Call { base, argc: 0, rest: v }
+                } else {
+                    Call { base, argc: 1, rest: Value::NIL }
+                }
+            }
             _ => return Err(Exit::Request { base, args, request, spread, tail }),
         };
         if tail { self.tail_call(call) } else { self.call(call) }
@@ -259,6 +273,9 @@ pub(crate) fn bind<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, a
 
 #[inline(never)]
 fn bind_slow<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, mut argc: u8, mut rest: Value<'gc>) -> Result<(), Fault> {
+    if let Some(mv) = rest.downcast::<MultiValue>(mc) {
+        return bind_values(mc, frame, arity, argc, mv);
+    }
     if arity.unsigned_abs() > u64::from(MAX_PARAMS) {
         return bind_spread(mc, frame, arity, argc, rest);
     }
@@ -316,5 +333,41 @@ fn bind_spread<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, mut a
         return Err(Fault::Arity);
     }
     frame.set(ARGS + keep, rest);
+    Ok(())
+}
+
+/// Binds as [`bind`] does when `rest` is a [`MultiValue`] from `apply-values`.
+fn bind_values<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, mut argc: u8, mv: Gc<'gc, MultiValue>) -> Result<(), Fault> {
+    let items = mv.items(mc);
+    if arity.unsigned_abs() > u64::from(MAX_PARAMS) {
+        let rest = Pairs::new(mc).list_with_tail((0..items.len()).map(|i| items.get(i)), Value::NIL)?;
+        return bind_spread(mc, frame, arity, argc, rest);
+    }
+    let variadic = arity < 0;
+    let required = if variadic { -(arity + 1) } else { arity };
+    let required = u8::try_from(required)
+        .ok()
+        .filter(|&n| usize::from(n) + usize::from(variadic) <= MAX_ARGS)
+        .ok_or(Fault::Malformed)?;
+    let mut idx = 0;
+    while argc < required {
+        if idx >= items.len() {
+            return Err(Fault::Arity);
+        }
+        frame.set(ARGS + argc, items.get(idx));
+        (idx, argc) = (idx + 1, argc + 1);
+    }
+    if !variadic {
+        if argc > required || idx < items.len() {
+            return Err(Fault::Arity);
+        }
+        return Ok(());
+    }
+    let pairs = Pairs::new(mc);
+    let mut rest = pairs.list_with_tail((idx..items.len()).map(|i| items.get(i)), Value::NIL)?;
+    for i in (required..argc).rev() {
+        rest = pairs.cons(frame.get(ARGS + i), rest)?.value(mc);
+    }
+    frame.set(ARGS + required, rest);
     Ok(())
 }

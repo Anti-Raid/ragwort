@@ -13,7 +13,7 @@ mod tests;
 pub struct Pair<'gc>(Gc<'gc, objects::Pair>);
 
 impl<'gc> Pair<'gc> {
-    #[inline]
+    #[inline(always)]
     pub fn of(v: Value<'gc>) -> Option<Self> {
         match Data::of(v) {
             Some(Data::Pair(p)) => Some(Self(p)),
@@ -21,23 +21,24 @@ impl<'gc> Pair<'gc> {
         }
     }
 
+    #[inline(always)]
     pub fn value(self, mc: &Mutation<'gc>) -> Value<'gc> {
         Value::object(mc, self.0)
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn head(self, mc: &Mutation<'gc>) -> Value<'gc> {
         self.0.head(mc)
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn tail(self, mc: &Mutation<'gc>) -> Value<'gc> {
         self.0.tail(mc)
     }
 
     /// The length of the list this pair starts, unless its pairs end in something other than
     /// `()`.
-    #[inline]
+    #[inline(always)]
     pub fn list_len(self, mc: &Mutation<'gc>) -> Option<u64> {
         Some(self.0.length(mc)).filter(|&n| n != 0)
     }
@@ -50,15 +51,17 @@ pub struct Pairs<'a, 'gc> {
 }
 
 impl<'a, 'gc> Pairs<'a, 'gc> {
+    #[inline(always)]
     pub fn new(mc: &'a Mutation<'gc>) -> Self {
         Self { mc }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn pair(&self, v: Value<'gc>) -> Option<Pair<'gc>> {
         Pair::of(v)
     }
 
+    #[inline(always)]
     pub fn cons(&self, head: Value<'gc>, tail: Value<'gc>) -> Result<Pair<'gc>, OutOfMemory> {
         let len = self.list_len(tail).map_or(0, |n| n.saturating_add(1));
         Ok(Pair(objects::Pair::new(self.mc, head, tail, len)?))
@@ -84,7 +87,7 @@ impl<'a, 'gc> Pairs<'a, 'gc> {
     }
 
     /// The length of `v` if it's a list: `()` or a pair whose pairs end in `()`.
-    #[inline]
+    #[inline(always)]
     pub fn list_len(&self, v: Value<'gc>) -> Option<u64> {
         match Pair::of(v) {
             Some(p) => p.list_len(self.mc),
@@ -92,6 +95,7 @@ impl<'a, 'gc> Pairs<'a, 'gc> {
         }
     }
 
+    #[inline(always)]
     pub fn is_list(&self, v: Value<'gc>) -> bool {
         self.list_len(v).is_some()
     }

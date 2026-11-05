@@ -230,7 +230,7 @@ pub(crate) fn expand(input: TokenStream) -> syn::Result<TokenStream> {
         impl<'gc> #kind<'gc> {
             /// Which of the group's types `value` refers to, from the type number it carries, or
             /// `None` for any other value.
-            #[inline]
+            #[inline(always)]
             pub fn of(value: #w::Value<'gc>) -> ::core::option::Option<Self> {
                 let (ty, index) = value.object_parts()?;
                 match ty.wrapping_sub(Self::BASE) {
@@ -239,7 +239,7 @@ pub(crate) fn expand(input: TokenStream) -> syn::Result<TokenStream> {
                 }
             }
 
-            #[inline]
+            #[inline(always)]
             pub fn value(self, mc: &#w::Mutation<'gc>) -> #w::Value<'gc> {
                 match self {
                     #(Self::#names(gc) => #w::Value::object(mc, gc),)*
@@ -360,12 +360,12 @@ fn expand_object(object: &Object, kind: &Ident, number: &Literal) -> syn::Result
 
         impl<'gc> #fields_trait<'gc> for #w::Gc<'gc, #name> {
             #(
-                #[inline]
+                #[inline(always)]
                 fn #field_names(self, mc: &#w::Mutation<'gc>) -> #outs {
                     self.get(mc, #name::#consts)
                 }
 
-                #[inline]
+                #[inline(always)]
                 fn #setters(self, mc: &#w::Mutation<'gc>, value: #inputs) {
                     self.set(mc, #name::#consts, value);
                 }

@@ -15,6 +15,11 @@ use crate::Fault;
 use crate::objects::{Continuation, ContinuationFields, Prompt, PromptFields, Tag, Task, TaskFields};
 use crate::segments::promote;
 
+/// The default continuation prompt tag.
+pub(crate) const fn default_tag<'gc>() -> Value<'gc> {
+    Value::from_bits(4 << 32 | 0b1101)
+}
+
 /// Puts the current continuation in a prompt for `tag`, with `handler` for aborts to it, and
 /// starts an empty one.
 pub(crate) fn push<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, tag: Value<'gc>, handler: Value<'gc>) -> Result<(), Fault> {
@@ -35,21 +40,42 @@ pub(crate) fn pop<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>) -> Result<bool, 
 }
 
 /// Drops the continuation up to the nearest prompt for `tag`, and the prompt, so it goes on
-/// with that prompt's continuation. Returns the prompt's handler.
-pub(crate) fn abort<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, tag: Value<'gc>) -> Result<Value<'gc>, Fault> {
-    let found = find(mc, task, tag)?;
-    restore(mc, task, found.prompt);
-    task.set_prompts(mc, found.under);
-    Ok(found.prompt.handler(mc))
+/// with that prompt's continuation. Returns the prompt's handler, or `None` for the implicit
+/// default prompt at the bottom of the stack.
+pub(crate) fn abort<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, tag: Value<'gc>) -> Result<Option<Value<'gc>>, Fault> {
+    match find(mc, task, tag)? {
+        Some(found) => {
+            restore(mc, task, found.prompt);
+            task.set_prompts(mc, found.under);
+            Ok(Some(found.prompt.handler(mc)))
+        }
+        None => {
+            task.set_chain(mc, Value::FALSE);
+            task.set_attachments(mc, Value::NIL);
+            task.set_prompts(mc, Value::NIL);
+            Ok(None)
+        }
+    }
 }
 
 /// The composable continuation up to the nearest prompt for `tag`. What it holds is only ever
 /// copied from then on.
 pub(crate) fn capture<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, tag: Value<'gc>) -> Result<Value<'gc>, Fault> {
-    let above = find(mc, task, tag)?.above;
+    let prompts = match find(mc, task, tag)? {
+        Some(found) => {
+            found.above.iter().for_each(|p| promote(mc, p.chain(mc)));
+            list(mc, &found.above, Value::NIL)?
+        }
+        None => {
+            let mut at = task.prompts(mc);
+            while let Some(cell) = Pair::of(at) {
+                promote(mc, prompt(mc, cell.head(mc))?.chain(mc));
+                at = cell.tail(mc);
+            }
+            task.prompts(mc)
+        }
+    };
     promote(mc, task.chain(mc));
-    above.iter().for_each(|p| promote(mc, p.chain(mc)));
-    let prompts = list(mc, &above, Value::NIL)?;
     Ok(Value::object(mc, Continuation::new(mc, task.chain(mc), prompts)?))
 }
 
@@ -99,7 +125,11 @@ pub(crate) fn mark<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, key: Value<'gc>
 
 /// `value`, if it's a prompt tag.
 pub(crate) fn tag_of<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Result<Value<'gc>, Fault> {
-    value.downcast::<Tag>(mc).map(|_| value).ok_or(Fault::WrongType)
+    if value == default_tag() || value.downcast::<Tag>(mc).is_some() {
+        Ok(value)
+    } else {
+        Err(Fault::WrongType)
+    }
 }
 
 /// The nearest prompt for a tag, the ones above it, and the list under it.
@@ -109,16 +139,19 @@ struct Found<'gc> {
     under: Value<'gc>,
 }
 
-fn find<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, tag: Value<'gc>) -> Result<Found<'gc>, Fault> {
+fn find<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, tag: Value<'gc>) -> Result<Option<Found<'gc>>, Fault> {
     let mut above = Vec::new();
     let mut at = task.prompts(mc);
     while let Some(cell) = Pair::of(at) {
         let prompt = prompt(mc, cell.head(mc))?;
         if prompt.tag(mc) == tag {
-            return Ok(Found { above, prompt, under: cell.tail(mc) });
+            return Ok(Some(Found { above, prompt, under: cell.tail(mc) }));
         }
         above.push(prompt);
         at = cell.tail(mc);
+    }
+    if tag == default_tag() {
+        return Ok(None);
     }
     Err(Fault::NoPrompt)
 }

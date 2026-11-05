@@ -37,11 +37,10 @@ named! {
         /// into the current frame. The frame's link stays, so the callee returns to this frame's
         /// caller.
         TailCall { base: u8, args: u8 } = "tail-call",
-        /// Sets the accumulator to register `src` and returns it, one value, to the caller the frame
-        /// names.
+        /// Sets the accumulator to register `src` and returns it
         Return { src: u8 } = "return",
-        /// Copies the accumulator, where a call leaves its result, to `dst`.
-        MoveAcc { dst: u8 } = "move-acc",
+        /// Loads the accumulator, where a call leaves its result, into `dst`.
+        LoadAcc { dst: u8 } = "load-acc",
         /// Loads upvalue `index` of the current closure. Upvalues are copied in when a closure is
         /// made, so an assigned variable is captured as a box, which the box intrinsics read and write.
         LoadUpvalue { dst: u8, index: u32 } = "load-upvalue",
@@ -235,7 +234,7 @@ impl Op {
                 cx.acc = frame.get(src);
                 return Ok(Control::Return);
             }
-            Op::MoveAcc { dst } => frame.set(dst, cx.acc),
+            Op::LoadAcc { dst } => frame.set(dst, cx.acc),
             Op::LoadUpvalue { dst, index } => {
                 let index = index as usize;
                 if index >= cx.upvalues.len() {

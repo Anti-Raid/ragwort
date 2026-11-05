@@ -303,3 +303,20 @@ fn the_wrong_kind_is_empty() {
         assert_eq!(wrong.get(mc, hash(1, u64::MAX), |_| Ok::<_, OutOfMemory>(true)), Ok(None));
     });
 }
+
+/// Removing an entry leaves a dead slot that the next insertion passing it reuses, even when
+/// the new entry's 64-bit hash differs in its upper bits.
+#[test]
+fn dead_entries_are_reused_by_colliding_hashes() {
+    let mut arena = Arena::new(4 << 20, 1);
+    arena.mutate(|mc| {
+        let t = Map::new(mc).unwrap();
+        for i in 0..20 {
+            let h = (i as u64) << 32 | 3;
+            t.insert(mc, h, |k| Ok::<_, OutOfMemory>(k == fix(i)), fix(i), fix(i)).unwrap();
+            assert_eq!(t.capacity(mc), 8, "reused tombstones should keep capacity at MIN_SLOTS");
+            let removed = t.remove(mc, h, |(k, _)| Ok::<_, OutOfMemory>(k == fix(i))).unwrap();
+            assert_eq!(removed, Some((fix(i), fix(i))));
+        }
+    });
+}

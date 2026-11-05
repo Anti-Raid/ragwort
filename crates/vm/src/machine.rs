@@ -4,7 +4,7 @@ use ragwort_types::pair::{Pair, Pairs};
 
 use crate::frame::{self, ARGS, CLOSURE, Link};
 use crate::intrinsic::values;
-use crate::objects::{BytecodeFields, Closure, ClosureFields, Condition, Continuation, Task, TaskFields};
+use crate::objects::{BytecodeFields, Closure, ClosureFields, Condition, Continuation, MultiValue, MultiValueFields, Task, TaskFields};
 use crate::run::{self, Exit, MAX_ARGS, Regs, bind};
 use crate::segments::{CHUNK, Resume, Segments};
 use crate::{Fault, Fuel, Request, prompts};
@@ -166,13 +166,19 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         }
     }
 
-    /// Calls the fault procedure with a condition for `fault`, in place of the frames above the
-    /// chain. A fault in calling it ends the run.
+    /// Calls the fault procedure with a condition for `fault`, in place of the frame that
+    /// faulted. A fault in calling it ends the run.
     fn fault(&mut self, fault: Fault) -> Step<'gc> {
         let mc = self.mc();
         let (handler, raised) = (self.task().fault(mc), condition(mc, fault, Value::VOID, Value::NIL)?);
         if handler == Value::FALSE {
             return Ok(Some(Outcome::Raised(raised)));
+        }
+        if self.regs.fp > self.segments.stack.base()
+            && let Ok(frame) = self.segments.frame(self.regs.fp)
+            && let Ok(link) = frame::link_of(mc, frame)
+        {
+            let _ = self.segments.reify(self.regs.fp, link);
         }
         match self.then(Then::Call(handler, vec![raised])) {
             Err(fault) if !fault.is_fatal() => Ok(Some(Outcome::Raised(condition(mc, fault, Value::VOID, Value::NIL)?))),
@@ -199,12 +205,18 @@ impl<'a, 'gc> Outer<'a, 'gc> {
     }
 
     /// Carries out a call of something other than a closure, in register `base`, with the
-    /// `argc` registers after it and the elements of the list `rest` as its arguments.
+    /// `argc` registers after it and the elements of `rest` as its arguments.
     fn call(&mut self, base: u8, argc: u8, rest: Value<'gc>, tail: bool) -> Step<'gc> {
         let frame = self.segments.frame(self.regs.fp)?;
         let procedure = frame.get(base);
         let mut args: Vec<_> = (1..=argc).map(|i| frame.get(base + i)).collect();
-        args.extend(list(self.mc(), rest)?);
+        let mc = self.mc();
+        if let Some(mv) = rest.downcast::<MultiValue>(mc) {
+            let items = mv.items(mc);
+            args.extend((0..items.len()).map(|i| items.get(i)));
+        } else {
+            args.extend(list(mc, rest)?);
+        }
         self.keep(base, tail)?;
         self.then(Then::Call(procedure, args))
     }
@@ -254,6 +266,7 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         let base = callee - self.regs.fp;
         let link = Link { pc: self.regs.pc, base: u8::try_from(base).map_err(|_| Fault::Malformed)? };
         let fp = self.segments.overflow(self.regs.fp, callee + 1 + usize::from(argc), base + WINDOW)?;
+        self.regs.fp = fp;
         self.enter(fp + base, argc, rest, link)
     }
 

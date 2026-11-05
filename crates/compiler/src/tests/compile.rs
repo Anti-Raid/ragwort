@@ -1,10 +1,11 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use ragwort_types::constant::Constants;
 use ragwort_types::gc::{Arena, Gc, Mutation, Value};
 use ragwort_types::pair::{Pair, Pairs};
-use ragwort_vm::Intrinsic::{Add, Car, Cons, Eq, MakePromptTag};
-use ragwort_vm::objects::{Condition, ConditionFields, Global};
-use ragwort_vm::{Fault, Intrinsic, MIN_SEGMENT, Machine, Outcome, Request};
+use ragwort_vm::Intrinsic::{Add, Car, Cons, Eq, MakeBox, MakePromptTag, Not, SetBox, Unbox};
+use ragwort_vm::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Condition, ConditionFields, Global};
+use ragwort_vm::{Fault, Intrinsic, MIN_SEGMENT, Machine, Op, Outcome, Request};
 
 use super::*;
 
@@ -291,6 +292,17 @@ fn big_frames_spill() {
         }),
         Ok(301)
     );
+    // Non-constant spilled bindings (cannot be constant-folded away by cp0), plus a spilled Fix group.
+    assert_eq!(
+        number(|_| {
+            let boxes: Vec<(u32, Core)> = (0..250).map(|v| (v, prim(MakeBox, vec![q(i64::from(v))]))).collect();
+            let even = lambda(&[302], None, when(eq(var(302), q(0)), prim(Unbox, vec![var(249)]), app(var(301), vec![add(var(302), q(-1))])));
+            let odd = lambda(&[303], None, when(eq(var(303), q(0)), prim(Unbox, vec![var(0)]), app(var(300), vec![add(var(303), q(-1))])));
+            let body = letrec(vec![(300, even), (301, odd)], add(prim(Unbox, vec![var(100)]), app(var(300), vec![q(4)])));
+            let_(boxes, body)
+        }),
+        Ok(349)
+    );
 }
 
 #[test]
@@ -333,4 +345,233 @@ fn requests_take_any_number_of_arguments() {
             |mc, result| assert_eq!(items(mc, result.unwrap()), (0..300).collect::<Vec<_>>()),
         );
     }
+}
+
+/// Collects every instruction across a compiled thunk and all nested [`Bytecode`] / [`Closure`]
+/// objects in its constant pool.
+fn all_ops<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Vec<Op> {
+    let closure = thunk.downcast::<Closure>(mc).unwrap();
+    let code = closure.code(mc).unwrap();
+    let mut ops = code.ops(mc).unwrap().to_vec();
+    if let Some(cs) = Constants::of(code.constants(mc)) {
+        for i in 0..cs.len(mc) as u32 {
+            let v = cs.get(mc, i).unwrap();
+            let sub = v
+                .downcast::<Bytecode>(mc)
+                .or_else(|| v.downcast::<Closure>(mc).and_then(|c| c.code(mc)));
+            if let Some(bc) = sub {
+                ops.extend_from_slice(bc.ops(mc).unwrap());
+            }
+        }
+    }
+    ops
+}
+
+fn has_box_op(ops: &[Op]) -> bool {
+    ops.iter().any(|op| {
+        matches!(
+            op,
+            Op::CallIntrinsic { intrinsic: MakeBox | Unbox | SetBox, .. }
+                | Op::TailCallIntrinsic { intrinsic: MakeBox | Unbox | SetBox, .. }
+                | Op::ApplyIntrinsic { intrinsic: MakeBox | Unbox | SetBox, .. }
+        )
+    })
+}
+
+#[test]
+fn micropass_optimizations() {
+    let mut arena = Arena::new(1 << 24, 0);
+    arena.mutate(|mc| {
+        // 1. Unmutated captured variables are never boxed (`assign` pass only boxes `Set` vars).
+        let unmutated_capture = lambda(&[0], None, lambda(&[], None, var(0)));
+        let thunk = compile(mc, &unmutated_capture).unwrap();
+        let ops = all_ops(mc, thunk);
+        assert!(!has_box_op(&ops), "immutable captured variable should not be boxed: {ops:?}");
+
+        // 2. Mutually recursive `letrec` lambdas compile to a single `Op::NewClosure { count: 2 }`
+        //    with zero heap boxes (`letrec` fixing pass).
+        let even = lambda(&[2], None, when(eq(var(2), q(0)), Core::Quote(Value::TRUE), app(var(1), vec![add(var(2), q(-1))])));
+        let odd = lambda(&[3], None, when(eq(var(3), q(0)), Core::Quote(Value::FALSE), app(var(0), vec![add(var(3), q(-1))])));
+        let mutual = letrec(vec![(0, even), (1, odd)], app(var(0), vec![q(10)]));
+        let thunk = compile(mc, &mutual).unwrap();
+        let ops = all_ops(mc, thunk);
+        assert!(!has_box_op(&ops), "mutually recursive lambdas should not be boxed: {ops:?}");
+        assert!(ops.iter().any(|op| matches!(op, Op::NewClosure { count: 2, .. })), "expected batch NewClosure(count: 2): {ops:?}");
+
+        // 3. `cp0` folds constants, inlines local helpers, and eliminates `not` in `if` tests.
+        //    (let ((inc (lambda (x) (+ x 1)))) (if (not (eq? (inc 41) 42)) 0 (inc 99))) -> 100
+        let inc = lambda(&[1], None, add(var(1), q(1)));
+        let test = prim(Not, vec![eq(app(var(0), vec![q(41)]), q(42))]);
+        let folded = let_(vec![(0, inc)], when(test, q(0), app(var(0), vec![q(99)])));
+        let thunk = compile(mc, &folded).unwrap();
+        let ops = all_ops(mc, thunk);
+        assert_eq!(ops.len(), 2, "expected constant-folded [LoadConst, Return], got {ops:?}");
+        assert!(matches!(ops.as_slice(), [Op::LoadConst { .. }, Op::Return { .. }]));
+
+        // 4. `Place::Import` of a defined prelude wrapper lowers to a direct intrinsic and folds.
+        let add_fn = compile(mc, &lambda(&[], Some(0), Core::ApplyIntrinsic(Prim::Intrinsic(Add), vec![var(0)]))).unwrap();
+        let mut machine = Machine::new(mc, MIN_SEGMENT, add_fn, &[]).unwrap();
+        let Outcome::Done(add_closure) = machine.run(mc).unwrap() else { panic!() };
+        let import_add = Global::new(mc, Value::VOID, add_closure, true).unwrap();
+        let call_import = app(Core::Ref(Place::Import(import_add)), vec![var(0), q(1)]);
+        let outer = lambda(&[0], None, call_import);
+        let thunk = compile(mc, &outer).unwrap();
+        let ops = all_ops(mc, thunk);
+        assert!(
+            ops.iter().any(|op| matches!(op, Op::TailCallIntrinsic { intrinsic: Add, args: 2, .. })),
+            "expected imported `+` call to lower to TailCallIntrinsic(Add): {ops:?}"
+        );
+
+        // 5. Store-to-load forwarding on `cadr`/`cons` and `unbox`/`box` eliminates allocations.
+        //    (lambda (x y) (+ (cadr (cons x (cons y '()))) (unbox (box 1)))) -> (lambda (x y) (+ y 1))
+        let cadr_cons = prim(Intrinsic::Cadr, vec![prim(Cons, vec![var(0), prim(Cons, vec![var(1), Core::Quote(Value::NIL)])])]);
+        let unbox_box = prim(Unbox, vec![prim(MakeBox, vec![q(1)])]);
+        let forwarded = lambda(&[0, 1], None, add(cadr_cons, unbox_box));
+        let thunk = compile(mc, &forwarded).unwrap();
+        let ops = all_ops(mc, thunk);
+        assert!(!has_box_op(&ops), "expected (unbox (box 1)) to fold away: {ops:?}");
+        assert!(
+            !ops.iter().any(|op| matches!(op, Op::CallIntrinsic { intrinsic: Cons | Intrinsic::Cadr, .. })),
+            "expected (cadr (cons x (cons y '()))) to forward without Cons/Cadr: {ops:?}"
+        );
+
+        // 6. Tail-recursive local loop contifies into an in-frame backward `Jump` with zero closures.
+        let looping = lambda(&[1, 2], None, when(eq(var(1), q(0)), var(2), app(var(0), vec![add(var(1), q(-1)), add(var(2), var(1))])));
+        let loop_expr = letrec(vec![(0, looping)], app(var(0), vec![q(10), q(0)]));
+        let thunk = compile(mc, &loop_expr).unwrap();
+        let ops = all_ops(mc, thunk);
+        assert!(
+            !ops.iter().any(|op| matches!(op, Op::NewClosure { .. } | Op::TailCall { .. } | Op::Call { .. })),
+            "expected tail-recursive loop to contify without closures or calls: {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op, Op::Jump { offset } if *offset < 0)),
+            "expected backward Jump in contified loop: {ops:?}"
+        );
+    });
+
+    // 7. `Let` dead-binding elimination and `car`/`cons` forwarding preserve left-to-right side-effect order.
+    //    (let ((x 1)) ((lambda (a b) a) x (set! x 2))) -> 1 (not 2!)
+    assert_eq!(
+        number(|_| {
+            let fst = lambda(&[1, 2], None, var(1));
+            let_(vec![(0, q(1))], app(fst, vec![var(0), set(0, q(2))]))
+        }),
+        Ok(1)
+    );
+    //    (let ((x 1)) (+ (car (cons (begin (set! x (+ x 1)) x) (set! x 100))) x)) -> 2 + 100 = 102
+    assert_eq!(
+        number(|_| {
+            let head = seq(1, set(0, add(var(0), q(1))), var(0));
+            let tail = set(0, q(100));
+            let_(vec![(0, q(1))], add(prim(Car, vec![prim(Cons, vec![head, tail])]), var(0)))
+        }),
+        Ok(102)
+    );
+
+    // 8. `procedure?` and `continuation?` fold on lambdas and dominating predicate branches.
+    arena.mutate(|mc| {
+        // (procedure? (lambda (x) x)) -> #t
+        let proc_lam = prim(Intrinsic::IsProcedure, vec![lambda(&[0], None, var(0))]);
+        let thunk = compile(mc, &proc_lam).unwrap();
+        let ops = all_ops(mc, thunk);
+        assert_eq!(ops.len(), 2, "expected (procedure? (lambda ...)) to fold to #t: {ops:?}");
+
+        // (continuation? (lambda (x) x)) -> #f
+        let cont_lam = prim(Intrinsic::IsContinuation, vec![lambda(&[0], None, var(0))]);
+        let thunk = compile(mc, &cont_lam).unwrap();
+        let ops = all_ops(mc, thunk);
+        assert_eq!(ops.len(), 2, "expected (continuation? (lambda ...)) to fold to #f: {ops:?}");
+
+        // Dominating `continuation?` implies `procedure?` (#t) and truthiness in `then`,
+        // and dominating `procedure?` (#f) implies `continuation?` (#f) in `other`:
+        // (lambda (x)
+        //   (if (continuation? x)
+        //       (if (procedure? x) (if x 1 2) 3)
+        //       (if (procedure? x) 4 (if (continuation? x) 5 6))))
+        // -> (lambda (x) (if (continuation? x) 1 (if (procedure? x) 4 6)))
+        let inner_then = when(prim(Intrinsic::IsProcedure, vec![var(0)]), when(var(0), q(1), q(2)), q(3));
+        let inner_else = when(
+            prim(Intrinsic::IsProcedure, vec![var(0)]),
+            q(4),
+            when(prim(Intrinsic::IsContinuation, vec![var(0)]), q(5), q(6)),
+        );
+        let dom = lambda(&[0], None, when(prim(Intrinsic::IsContinuation, vec![var(0)]), inner_then, inner_else));
+        let thunk = compile(mc, &dom).unwrap();
+        let ops = all_ops(mc, thunk);
+        let pred_calls = ops
+            .iter()
+            .filter(|op| matches!(op, Op::CallIntrinsic { intrinsic: Intrinsic::IsProcedure | Intrinsic::IsContinuation, .. }))
+            .count();
+        assert_eq!(pred_calls, 2, "expected redundant dominating predicate checks to fold away: {ops:?}");
+    });
+
+    // 9. Nested contified loops compile with zero closures and zero calls (two backward `Jump`s).
+    arena.mutate(|mc| {
+        // (letrec ((outer (lambda (i total)
+        //                   (if (eq? i 0)
+        //                       total
+        //                       (outer (+ i -1)
+        //                              (letrec ((inner (lambda (j acc)
+        //                                                (if (eq? j 0)
+        //                                                    acc
+        //                                                    (inner (+ j -1) (+ acc j))))))
+        //                                (inner i total)))))))
+        //   (outer 10 0))
+        let inner_fn = lambda(
+            &[3, 4],
+            None,
+            when(eq(var(3), q(0)), var(4), app(var(2), vec![add(var(3), q(-1)), add(var(4), var(3))])),
+        );
+        let inner_loop = letrec(vec![(2, inner_fn)], app(var(2), vec![var(1), var(5)]));
+        let outer_fn = lambda(
+            &[1, 5],
+            None,
+            when(eq(var(1), q(0)), var(5), app(var(0), vec![add(var(1), q(-1)), inner_loop])),
+        );
+        let nested_loops = letrec(vec![(0, outer_fn)], app(var(0), vec![q(10), q(0)]));
+        let thunk = compile(mc, &nested_loops).unwrap();
+        let ops = all_ops(mc, thunk);
+        assert!(
+            !ops.iter().any(|op| matches!(op, Op::NewClosure { .. } | Op::Call { .. } | Op::TailCall { .. })),
+            "expected nested tail loops to contify with zero closures/calls: {ops:?}"
+        );
+        let back_jumps = ops.iter().filter(|op| matches!(op, Op::Jump { offset } if *offset < 0)).count();
+        assert_eq!(back_jumps, 2, "expected 2 backward Jumps for nested contified loops: {ops:?}");
+        let mut machine = Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap();
+        let Outcome::Done(val) = machine.run(mc).unwrap() else { panic!() };
+        assert_eq!(val.as_fixnum(), Some(220));
+    });
+
+    // 10. Spilled frame (>256 live variables) containing a contified loop whose body reads both
+    //     register-resident and spill-slot-resident outer variables.
+    assert_eq!(
+        number(|_| {
+            // Bind 260 non-foldable variables `v_0 .. v_259` via `(unbox (box 1))`? Wait: `cp0`
+            // folds `(unbox (box 1))`! Use `(car (cdr (list 0 1)))`? `cp0` folds that too!
+            // Use `MakeBox(1)` for 260 distinct live boxes and unbox the first and last inside a
+            // contified loop!
+            let binds: Vec<_> = (0..260u32)
+                .map(|i| (i, prim(MakeBox, vec![q(1)])))
+                .collect();
+            let sum_boxes = prim(Add, (0..260u32).map(|i| prim(Unbox, vec![var(i)])).collect());
+            let loop_var = 300;
+            let iter_var = 301;
+            let acc_var = 302;
+            let loop_fn = lambda(
+                &[iter_var, acc_var],
+                None,
+                when(
+                    eq(var(iter_var), q(0)),
+                    var(acc_var),
+                    app(
+                        var(loop_var),
+                        vec![add(var(iter_var), q(-1)), add(var(acc_var), sum_boxes)],
+                    ),
+                ),
+            );
+            let_(binds, letrec(vec![(loop_var, loop_fn)], app(var(loop_var), vec![q(3), q(0)])))
+        }),
+        Ok(260 * 3)
+    );
 }

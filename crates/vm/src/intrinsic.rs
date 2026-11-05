@@ -4,18 +4,18 @@
 
 use ragwort_types::Error;
 use ragwort_types::bytevector::{AnyBytevector, Bytevectors};
-use ragwort_types::gc::{Frame, Mutation, Value};
+use ragwort_types::gc::{Frame, Mutation, ScratchVec, Value};
 use ragwort_types::named;
 use ragwort_types::num::{Number, Nums, complex};
 use ragwort_types::pair::{Pair, Pairs};
 
 use crate::op::Fuel;
-use crate::{Fault, equal};
+use crate::{Fault, equal, prompts};
 use crate::objects::{self, BoxFields, Condition, Global, GlobalFields, MultiValue, MultiValueFields, Tag};
 
 named! {
     #[repr(u16)]
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub enum Intrinsic {
         /// `+`: fixnums are added in place, anything else by the generic add.
         Add = "+",
@@ -74,8 +74,34 @@ named! {
         IsNull = "null?",
         /// `pair?`.
         IsPair = "pair?",
+        /// `list?`: whether `x` is `()` or a chain of pairs ending in `()`, in constant time.
+        IsList = "list?",
+        /// `(length xs)`: the length of the proper list `xs`, in constant time.
+        Length = "length",
+        /// `(list-tail xs k)`.
+        ListTail = "list-tail",
+        /// `(list-ref xs k)`.
+        ListRef = "list-ref",
+        /// `(reverse xs)`.
+        Reverse = "reverse",
+        /// `(append list ... [obj])`.
+        Append = "append",
+        /// `(memq x xs)`.
+        Memq = "memq",
+        /// `(memv x xs)`.
+        Memv = "memv",
+        /// `(member x xs)`.
+        Member = "member",
+        /// `(assq x xs)`.
+        Assq = "assq",
+        /// `(assv x xs)`.
+        Assv = "assv",
+        /// `(assoc x xs)`.
+        Assoc = "assoc",
         /// `box?`.
         IsBox = "box?",
+        /// `not`: `#t` if `x` is `#f`, `#f` otherwise.
+        Not = "not",
         /// `boolean?`.
         IsBoolean = "boolean?",
         /// `(void x ...)`: void, whatever it's given.
@@ -96,6 +122,8 @@ named! {
         Unbox = "unbox",
         /// `(set-box! b x)`: sets the contents of the box `b` to `x` returning void.
         SetBox = "set-box!",
+        /// `(default-continuation-prompt-tag)`.
+        DefaultPromptTag = "default-continuation-prompt-tag",
         /// `(make-continuation-prompt-tag [name])`.
         MakePromptTag = "make-continuation-prompt-tag",
         /// `(values x ...)`: `x` alone, or any other number of values as a [`MultiValue`].
@@ -115,6 +143,10 @@ named! {
         /// `(make-error message irritant ...)`: a `Condition` of [`Fault::Error`], which the
         /// prelude's `error` raises.
         MakeError = "make-error",
+        /// `procedure?`: whether `x` is a [`objects::Closure`] or [`objects::Continuation`].
+        IsProcedure = "procedure?",
+        /// `continuation?`: whether `x` is a composable [`objects::Continuation`].
+        IsContinuation = "continuation?",
     }
 }
 
@@ -122,17 +154,220 @@ impl Intrinsic {
     /// How many arguments it takes, or `None` for any number.
     pub fn arity(self) -> Option<u8> {
         match self {
-            Intrinsic::Add | Intrinsic::Sub | Intrinsic::Mul | Intrinsic::Div => None,
+            Intrinsic::Add | Intrinsic::Sub | Intrinsic::Mul | Intrinsic::Div | Intrinsic::Append => None,
             Intrinsic::MakePromptTag | Intrinsic::Values | Intrinsic::MakeError | Intrinsic::Void | Intrinsic::MakeBytevector => None,
-            Intrinsic::IsBytevector | Intrinsic::BytevectorLength => Some(1),
-            Intrinsic::Car | Intrinsic::Cdr | Intrinsic::IsNull | Intrinsic::IsPair | Intrinsic::IsBox | Intrinsic::MakeBox | Intrinsic::Unbox => Some(1),
-            Intrinsic::IsValues | Intrinsic::ValuesLength | Intrinsic::GlobalRef | Intrinsic::IsBoolean => Some(1),
+            Intrinsic::DefaultPromptTag => Some(0),
+            Intrinsic::IsBytevector | Intrinsic::BytevectorLength | Intrinsic::IsProcedure | Intrinsic::IsContinuation => Some(1),
+            Intrinsic::Car | Intrinsic::Cdr | Intrinsic::IsNull | Intrinsic::IsPair | Intrinsic::IsList | Intrinsic::Length | Intrinsic::Reverse | Intrinsic::IsBox | Intrinsic::MakeBox | Intrinsic::Unbox => Some(1),
+            Intrinsic::IsValues | Intrinsic::ValuesLength | Intrinsic::GlobalRef | Intrinsic::Not | Intrinsic::IsBoolean => Some(1),
             Intrinsic::Caar | Intrinsic::Cadr | Intrinsic::Cdar | Intrinsic::Cddr | Intrinsic::Caaar | Intrinsic::Caadr | Intrinsic::Cadar | Intrinsic::Caddr | Intrinsic::Cdaar | Intrinsic::Cdadr | Intrinsic::Cddar | Intrinsic::Cdddr | Intrinsic::Caaaar | Intrinsic::Caaadr | Intrinsic::Caadar | Intrinsic::Caaddr | Intrinsic::Cadaar | Intrinsic::Cadadr | Intrinsic::Caddar | Intrinsic::Cadddr | Intrinsic::Cdaaar | Intrinsic::Cdaadr | Intrinsic::Cdadar | Intrinsic::Cdaddr | Intrinsic::Cddaar | Intrinsic::Cddadr | Intrinsic::Cdddar | Intrinsic::Cddddr => Some(1),
-            Intrinsic::BytevectorRef => Some(2),
+            Intrinsic::BytevectorRef | Intrinsic::ListTail | Intrinsic::ListRef | Intrinsic::Memq | Intrinsic::Memv | Intrinsic::Member | Intrinsic::Assq | Intrinsic::Assv | Intrinsic::Assoc => Some(2),
             Intrinsic::BytevectorSet => Some(3),
             Intrinsic::GlobalSet | Intrinsic::DefineGlobal => Some(2),
             Intrinsic::Cons | Intrinsic::Eq | Intrinsic::Eqv | Intrinsic::Equal | Intrinsic::SetBox | Intrinsic::ValuesRef => Some(2),
         }
+    }
+
+    /// Whether a call on constant arguments has no side effects, reads no mutable state, and
+    /// allocates no fresh identity-bearing objects, so a compiler can evaluate it at compile time
+    /// via [`Intrinsic::run`].
+    pub const fn is_pure_foldable(self) -> bool {
+        use Intrinsic::*;
+        matches!(
+            self,
+            Add | Sub
+                | Mul
+                | Div
+                | Car
+                | Cdr
+                | Caar
+                | Cadr
+                | Cdar
+                | Cddr
+                | Caaar
+                | Caadr
+                | Cadar
+                | Caddr
+                | Cdaar
+                | Cdadr
+                | Cddar
+                | Cdddr
+                | Caaaar
+                | Caaadr
+                | Caadar
+                | Caaddr
+                | Cadaar
+                | Cadadr
+                | Caddar
+                | Cadddr
+                | Cdaaar
+                | Cdaadr
+                | Cdadar
+                | Cdaddr
+                | Cddaar
+                | Cddadr
+                | Cdddar
+                | Cddddr
+                | Eq
+                | Eqv
+                | Equal
+                | IsNull
+                | IsPair
+                | IsList
+                | Length
+                | ListTail
+                | ListRef
+                | Memq
+                | Memv
+                | Member
+                | Assq
+                | Assv
+                | Assoc
+                | IsBox
+                | Not
+                | IsBoolean
+                | Void
+                | IsBytevector
+                | BytevectorLength
+                | BytevectorRef
+                | DefaultPromptTag
+                | IsValues
+                | ValuesLength
+                | ValuesRef
+                | IsProcedure
+                | IsContinuation
+        )
+    }
+
+    /// Whether a direct call with valid arity cannot fault and has no side effects, so it can be
+    /// dropped in an effect context once its arguments have been evaluated for their effects.
+    pub const fn is_discardable(self) -> bool {
+        use Intrinsic::*;
+        matches!(
+            self,
+            Cons | MakeBox
+                | Eq
+                | Eqv
+                | IsNull
+                | IsPair
+                | IsList
+                | IsBox
+                | Not
+                | IsBoolean
+                | Void
+                | IsBytevector
+                | DefaultPromptTag
+                | Values
+                | IsValues
+                | IsProcedure
+                | IsContinuation
+        )
+    }
+
+    /// Whether `self` is a 1-argument type predicate.
+    pub const fn is_type_predicate(self) -> bool {
+        use Intrinsic::*;
+        matches!(
+            self,
+            IsNull
+                | IsPair
+                | IsBoolean
+                | IsBox
+                | IsBytevector
+                | IsList
+                | IsValues
+                | IsProcedure
+                | IsContinuation
+        )
+    }
+
+    /// Whether no value can satisfy both `self` and `other`.
+    pub fn is_disjoint_predicate(self, other: Self) -> bool {
+        use Intrinsic::*;
+        if self == other {
+            return false;
+        }
+        !matches!(
+            (self, other),
+            (IsList, IsNull | IsPair)
+                | (IsNull | IsPair, IsList)
+                | (IsProcedure, IsContinuation)
+                | (IsContinuation, IsProcedure)
+        )
+    }
+
+    /// Whether any normal return value of `self` is guaranteed not to be `#f`.
+    pub const fn is_always_truthy(self) -> bool {
+        use Intrinsic::*;
+        matches!(
+            self,
+            Add | Sub
+                | Mul
+                | Div
+                | Cons
+                | Length
+                | Reverse
+                | Void
+                | MakeBytevector
+                | BytevectorLength
+                | BytevectorRef
+                | MakeBox
+                | DefaultPromptTag
+                | MakePromptTag
+                | ValuesLength
+                | GlobalSet
+                | DefineGlobal
+                | BytevectorSet
+                | SetBox
+                | MakeError
+        )
+    }
+
+    /// Whether a 2-argument call of `self` is commutative (`f(a, b) == f(b, a)`).
+    pub const fn is_commutative_binary(self) -> bool {
+        use Intrinsic::*;
+        matches!(self, Add | Mul | Eq | Eqv | Equal)
+    }
+
+    /// Decomposes `car`..`cddddr` into `(first_is_car, remaining_cxr)`.
+    ///
+    /// For instance, `Cadr` (`(car (cdr x))`) returns `Some((false, Some(Car)))`: take `cdr`
+    /// first (`false`), then apply `Car`.
+    pub const fn cxr_step(self) -> Option<(bool, Option<Intrinsic>)> {
+        use Intrinsic::*;
+        Some(match self {
+            Car => (true, None),
+            Cdr => (false, None),
+            Caar => (true, Some(Car)),
+            Cadr => (false, Some(Car)),
+            Cdar => (true, Some(Cdr)),
+            Cddr => (false, Some(Cdr)),
+            Caaar => (true, Some(Caar)),
+            Caadr => (false, Some(Caar)),
+            Cadar => (true, Some(Cadr)),
+            Caddr => (false, Some(Cadr)),
+            Cdaar => (true, Some(Cdar)),
+            Cdadr => (false, Some(Cdar)),
+            Cddar => (true, Some(Cddr)),
+            Cdddr => (false, Some(Cddr)),
+            Caaaar => (true, Some(Caaar)),
+            Caaadr => (false, Some(Caaar)),
+            Caadar => (true, Some(Caadr)),
+            Caaddr => (false, Some(Caadr)),
+            Cadaar => (true, Some(Cadar)),
+            Cadadr => (false, Some(Cadar)),
+            Caddar => (true, Some(Caddr)),
+            Cadddr => (false, Some(Caddr)),
+            Cdaaar => (true, Some(Cdaar)),
+            Cdaadr => (false, Some(Cdaar)),
+            Cdadar => (true, Some(Cdadr)),
+            Cdaddr => (false, Some(Cdadr)),
+            Cddaar => (true, Some(Cddar)),
+            Cddadr => (false, Some(Cddar)),
+            Cdddar => (true, Some(Cdddr)),
+            Cddddr => (false, Some(Cdddr)),
+            _ => return None,
+        })
     }
 
     /// Runs it on `args`, as the VM does on registers, but without a frame: for a compiler folding
@@ -170,17 +405,36 @@ impl Intrinsic {
                 arith(mc, fuel, first, (rest..args).map(&arg), fixnum_div, |h, a, b| complex::div(h, a, b))?
             }
             Intrinsic::Cons => made(mc, fuel, Pairs::new(mc).cons(arg(0), arg(1))?.value(mc)),
-            Intrinsic::Car => Pair::of(arg(0)).ok_or(Fault::WrongType)?.head(mc),
-            Intrinsic::Cdr => Pair::of(arg(0)).ok_or(Fault::WrongType)?.tail(mc),
-            Intrinsic::Caar | Intrinsic::Cadr | Intrinsic::Cdar | Intrinsic::Cddr | Intrinsic::Caaar | Intrinsic::Caadr | Intrinsic::Cadar | Intrinsic::Caddr | Intrinsic::Cdaar | Intrinsic::Cdadr | Intrinsic::Cddar | Intrinsic::Cdddr | Intrinsic::Caaaar | Intrinsic::Caaadr | Intrinsic::Caadar | Intrinsic::Caaddr | Intrinsic::Cadaar | Intrinsic::Cadadr | Intrinsic::Caddar | Intrinsic::Cadddr | Intrinsic::Cdaaar | Intrinsic::Cdaadr | Intrinsic::Cdadar | Intrinsic::Cdaddr | Intrinsic::Cddaar | Intrinsic::Cddadr | Intrinsic::Cdddar | Intrinsic::Cddddr => {
-                let path = self.name().as_bytes();
-                let mut x = arg(0);
-                for &step in path[1..path.len() - 1].iter().rev() {
-                    let pair = Pair::of(x).ok_or(Fault::WrongType)?;
-                    x = if step == b'a' { pair.head(mc) } else { pair.tail(mc) };
-                }
-                x
-            }
+            Intrinsic::Car => car(mc, arg(0))?,
+            Intrinsic::Cdr => cdr(mc, arg(0))?,
+            Intrinsic::Caar => car(mc, car(mc, arg(0))?)?,
+            Intrinsic::Cadr => car(mc, cdr(mc, arg(0))?)?,
+            Intrinsic::Cdar => cdr(mc, car(mc, arg(0))?)?,
+            Intrinsic::Cddr => cdr(mc, cdr(mc, arg(0))?)?,
+            Intrinsic::Caaar => car(mc, car(mc, car(mc, arg(0))?)?)?,
+            Intrinsic::Caadr => car(mc, car(mc, cdr(mc, arg(0))?)?)?,
+            Intrinsic::Cadar => car(mc, cdr(mc, car(mc, arg(0))?)?)?,
+            Intrinsic::Caddr => car(mc, cdr(mc, cdr(mc, arg(0))?)?)?,
+            Intrinsic::Cdaar => cdr(mc, car(mc, car(mc, arg(0))?)?)?,
+            Intrinsic::Cdadr => cdr(mc, car(mc, cdr(mc, arg(0))?)?)?,
+            Intrinsic::Cddar => cdr(mc, cdr(mc, car(mc, arg(0))?)?)?,
+            Intrinsic::Cdddr => cdr(mc, cdr(mc, cdr(mc, arg(0))?)?)?,
+            Intrinsic::Caaaar => car(mc, car(mc, car(mc, car(mc, arg(0))?)?)?)?,
+            Intrinsic::Caaadr => car(mc, car(mc, car(mc, cdr(mc, arg(0))?)?)?)?,
+            Intrinsic::Caadar => car(mc, car(mc, cdr(mc, car(mc, arg(0))?)?)?)?,
+            Intrinsic::Caaddr => car(mc, car(mc, cdr(mc, cdr(mc, arg(0))?)?)?)?,
+            Intrinsic::Cadaar => car(mc, cdr(mc, car(mc, car(mc, arg(0))?)?)?)?,
+            Intrinsic::Cadadr => car(mc, cdr(mc, car(mc, cdr(mc, arg(0))?)?)?)?,
+            Intrinsic::Caddar => car(mc, cdr(mc, cdr(mc, car(mc, arg(0))?)?)?)?,
+            Intrinsic::Cadddr => car(mc, cdr(mc, cdr(mc, cdr(mc, arg(0))?)?)?)?,
+            Intrinsic::Cdaaar => cdr(mc, car(mc, car(mc, car(mc, arg(0))?)?)?)?,
+            Intrinsic::Cdaadr => cdr(mc, car(mc, car(mc, cdr(mc, arg(0))?)?)?)?,
+            Intrinsic::Cdadar => cdr(mc, car(mc, cdr(mc, car(mc, arg(0))?)?)?)?,
+            Intrinsic::Cdaddr => cdr(mc, car(mc, cdr(mc, cdr(mc, arg(0))?)?)?)?,
+            Intrinsic::Cddaar => cdr(mc, cdr(mc, car(mc, car(mc, arg(0))?)?)?)?,
+            Intrinsic::Cddadr => cdr(mc, cdr(mc, car(mc, cdr(mc, arg(0))?)?)?)?,
+            Intrinsic::Cdddar => cdr(mc, cdr(mc, cdr(mc, car(mc, arg(0))?)?)?)?,
+            Intrinsic::Cddddr => cdr(mc, cdr(mc, cdr(mc, cdr(mc, arg(0))?)?)?)?,
             Intrinsic::Eq => boolean(arg(0) == arg(1)),
             Intrinsic::Eqv => boolean(equal::eqv(mc, arg(0), arg(1))),
             Intrinsic::Equal => {
@@ -191,7 +445,23 @@ impl Intrinsic {
             }
             Intrinsic::IsNull => boolean(arg(0) == Value::NIL),
             Intrinsic::IsPair => boolean(Pair::of(arg(0)).is_some()),
+            Intrinsic::IsList => boolean(Pairs::new(mc).is_list(arg(0))),
+            Intrinsic::Length => {
+                let len = Pairs::new(mc).list_len(arg(0)).ok_or(Fault::WrongType)?;
+                i64::try_from(len).ok().and_then(Value::fixnum).ok_or(Fault::OutOfRange)?
+            }
+            Intrinsic::ListTail => list_tail(mc, arg(0), index(arg(1))?, false, fuel)?,
+            Intrinsic::ListRef => {
+                let tail = list_tail(mc, arg(0), index(arg(1))?, true, fuel)?;
+                Pair::of(tail).ok_or(Fault::WrongType)?.head(mc)
+            }
+            Intrinsic::Reverse => reverse(mc, arg(0), fuel)?,
+            Intrinsic::Append => append(mc, (0..args).map(arg), fuel)?,
+            Intrinsic::Memq | Intrinsic::Memv | Intrinsic::Member | Intrinsic::Assq | Intrinsic::Assv | Intrinsic::Assoc => {
+                find(mc, self, arg(0), arg(1), fuel)?
+            }
             Intrinsic::IsBox => boolean(arg(0).downcast::<objects::Box>(mc).is_some()),
+            Intrinsic::Not => boolean(arg(0) == Value::FALSE),
             Intrinsic::IsBoolean => boolean(arg(0) == Value::TRUE || arg(0) == Value::FALSE),
             Intrinsic::Void => Value::VOID,
             Intrinsic::IsBytevector => boolean(AnyBytevector::of(arg(0)).is_some()),
@@ -227,6 +497,7 @@ impl Intrinsic {
                 arg(0).downcast::<objects::Box>(mc).ok_or(Fault::WrongType)?.set_value(mc, arg(1));
                 Value::VOID
             }
+            Intrinsic::DefaultPromptTag => prompts::default_tag(),
             Intrinsic::MakePromptTag => match args {
                 0 => made(mc, fuel, Value::object(mc, Tag::new(mc, Value::VOID)?)),
                 1 => made(mc, fuel, Value::object(mc, Tag::new(mc, arg(0))?)),
@@ -271,8 +542,23 @@ impl Intrinsic {
                 }
                 made(mc, fuel, Value::object(mc, Condition::new(mc, mc.frozen(Fault::Error)?, arg(0), irritants)?))
             }
+            Intrinsic::IsProcedure => boolean(
+                arg(0).downcast::<objects::Closure>(mc).is_some()
+                    || arg(0).downcast::<objects::Continuation>(mc).is_some(),
+            ),
+            Intrinsic::IsContinuation => boolean(arg(0).downcast::<objects::Continuation>(mc).is_some()),
         })
     }
+}
+
+#[inline(always)]
+fn car<'gc>(mc: &Mutation<'gc>, x: Value<'gc>) -> Result<Value<'gc>, Fault> {
+    Ok(Pair::of(x).ok_or(Fault::WrongType)?.head(mc))
+}
+
+#[inline(always)]
+fn cdr<'gc>(mc: &Mutation<'gc>, x: Value<'gc>) -> Result<Value<'gc>, Fault> {
+    Ok(Pair::of(x).ok_or(Fault::WrongType)?.tail(mc))
 }
 
 fn fixnum<'gc>(n: i64) -> Value<'gc> {
@@ -308,6 +594,110 @@ fn arith<'gc>(
         };
     }
     Ok(acc)
+}
+
+/// `(reverse xs)`: a new list with the elements of proper list `xs` in reverse order.
+fn reverse<'gc>(mc: &Mutation<'gc>, xs: Value<'gc>, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
+    let pairs = Pairs::new(mc);
+    let len = pairs.list_len(xs).ok_or(Fault::WrongType)?;
+    if len == 0 {
+        return Ok(Value::NIL);
+    }
+    fuel.spend(len / equal::PER_FUEL)?;
+    let mut acc = Value::NIL;
+    for item in pairs.elements(xs) {
+        acc = pairs.cons(item, acc)?.value(mc);
+    }
+    Ok(made(mc, fuel, acc))
+}
+
+/// `memq`, `memv`, `member`, `assq`, `assv` and `assoc`.
+fn find<'gc>(mc: &Mutation<'gc>, kind: Intrinsic, x: Value<'gc>, mut xs: Value<'gc>, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
+    let assoc = matches!(kind, Intrinsic::Assq | Intrinsic::Assv | Intrinsic::Assoc);
+    let mut steps = 0u64;
+    while xs != Value::NIL {
+        let pair = Pair::of(xs).ok_or(Fault::WrongType)?;
+        let item = pair.head(mc);
+        let candidate = if assoc { Pair::of(item).ok_or(Fault::WrongType)?.head(mc) } else { item };
+        let prev = steps / equal::PER_FUEL;
+        let matched = match kind {
+            Intrinsic::Memq | Intrinsic::Assq => {
+                steps += 1;
+                x == candidate
+            }
+            Intrinsic::Memv | Intrinsic::Assv => {
+                steps += 1;
+                equal::eqv(mc, x, candidate)
+            }
+            _ => {
+                let most = fuel
+                    .left()
+                    .saturating_add(1)
+                    .saturating_mul(equal::PER_FUEL)
+                    .saturating_sub(steps % equal::PER_FUEL)
+                    .saturating_sub(1);
+                let (same, compared) = equal::equal(mc, x, candidate, most)?;
+                steps = steps.saturating_add(compared);
+                same
+            }
+        };
+        fuel.spend(steps / equal::PER_FUEL - prev)?;
+        if matched {
+            return Ok(if assoc { item } else { xs });
+        }
+        xs = pair.tail(mc);
+    }
+    Ok(Value::FALSE)
+}
+
+/// `(append list ... [obj])`: copies each proper list before the last non-empty argument onto
+/// the tail. Since pairs are immutable, trailing `'()` arguments after a proper list need no copy.
+fn append<'gc>(mc: &Mutation<'gc>, args: impl ExactSizeIterator<Item = Value<'gc>>, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
+    let pairs = Pairs::new(mc);
+    let mut lists = ScratchVec::new(mc);
+    let len = args.len();
+    for (i, v) in args.enumerate() {
+        if i + 1 < len && !pairs.is_list(v) {
+            return Err(Fault::WrongType);
+        }
+        lists.push(v)?;
+    }
+    let Some(mut last) = len.checked_sub(1) else { return Ok(Value::NIL) };
+    while last > 0 && lists[last] == Value::NIL {
+        last -= 1;
+    }
+    let tail = lists[last];
+    let total: u64 = (0..last).map(|i| pairs.list_len(lists[i]).unwrap_or(0)).sum();
+    if total == 0 {
+        return Ok(tail);
+    }
+    fuel.spend(total / equal::PER_FUEL)?;
+    let mut items = ScratchVec::new(mc);
+    for &list in &lists[..last] {
+        for item in pairs.elements(list) {
+            items.push(item)?;
+        }
+    }
+    Ok(made(mc, fuel, pairs.list_with_tail(items.iter().copied(), tail)?))
+}
+
+/// The tail of `xs` after `k` pairs, faulting if `need_pair` and that tail isn't a pair.
+fn list_tail<'gc>(mc: &Mutation<'gc>, mut xs: Value<'gc>, k: usize, need_pair: bool, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
+    if let Some(len) = Pairs::new(mc).list_len(xs) {
+        let max = if need_pair { len } else { len.saturating_add(1) };
+        if k as u64 >= max {
+            return Err(Fault::OutOfRange);
+        }
+    }
+    fuel.spend(k as u64 / equal::PER_FUEL)?;
+    for _ in 0..k {
+        let pair = Pair::of(xs).ok_or(if xs == Value::NIL { Fault::OutOfRange } else { Fault::WrongType })?;
+        xs = pair.tail(mc);
+    }
+    if need_pair && Pair::of(xs).is_none() {
+        return Err(if xs == Value::NIL { Fault::OutOfRange } else { Fault::WrongType });
+    }
+    Ok(xs)
 }
 
 /// A byte: a fixnum from 0 to 255, or [`Fault::WrongType`].
