@@ -187,7 +187,9 @@ impl<'gc> Segments<'_, 'gc> {
         self.stack.frame(self.mc, fp).ok_or(Fault::Malformed)
     }
 
-    /// Moves the stack to the spare segment, if it has `need` slots past its base, or a new one.
+    /// Moves the stack to the spare segment, if it has `need` slots past its base, or a new one,
+    /// twice the size of the one it's on, up to the task's `size`, as a coroutine's stack starts
+    /// small.
     fn move_to(&mut self, need: usize) -> Result<(), Fault> {
         let (mc, task) = (self.mc, self.task);
         if let Some(spare) = task.spare(mc) {
@@ -200,7 +202,8 @@ impl<'gc> Segments<'_, 'gc> {
         if need > self.size {
             return Err(Fault::Malformed);
         }
-        self.stack.switch(mc, Segment::new(mc, self.size)?);
+        let len = self.stack.segment(mc).len(mc).saturating_mul(2).clamp(need, self.size);
+        self.stack.switch(mc, Segment::new(mc, len)?);
         Ok(())
     }
 

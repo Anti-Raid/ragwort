@@ -10,6 +10,7 @@ use ragwort_types::gc::Value;
 use ragwort_types::named;
 
 use crate::Fault;
+use crate::intrinsic::values;
 use crate::machine::{Outer, Then, list};
 use crate::objects::{MultiValue, MultiValueFields};
 use crate::prompts::{self, tag_of};
@@ -40,6 +41,21 @@ named! {
         /// `(capture tag f)`: calls `f` with the composable continuation up to the nearest prompt
         /// for `tag`, a procedure that goes on with it on top of the continuation it's called in.
         Capture = "capture",
+        /// `(co/resume co arg ...)`: runs the pending coroutine `co` until it yields, finishes or
+        /// fails. It starts by calling its procedure with the `arg`s, or goes on from its last
+        /// yield, which returns them. Returns what it yields or returns; if it fails, the same
+        /// condition is raised here.
+        Resume = "co/resume",
+        /// `(co/try-resume co arg ...)`: `co/resume`, but returns `#t` and then what it yields or
+        /// returns, or if it fails, `#f` and the condition.
+        TryResume = "co/try-resume",
+        /// `(co/yield v ...)`: suspends the running coroutine, so the `co/resume` that ran it
+        /// returns the `v`s. In a machine's own task, it ends the run with
+        /// [`Outcome::Yielded`](crate::Outcome::Yielded). Returns the values it's resumed with.
+        Yield = "co/yield",
+        /// `(co/running)`: the running coroutine, or in a machine's own task, that task, which
+        /// is running until the machine finishes, and never pending, so nothing can resume it.
+        Running = "co/running",
     }
 }
 
@@ -50,7 +66,9 @@ impl Request {
             Request::Apply => (2, None),
             Request::WithMark | Request::CallWithPrompt => (3, None),
             Request::ApplyValues | Request::MarkValue | Request::Capture => (2, Some(2)),
-            Request::Abort => (1, None),
+            Request::Abort | Request::Resume | Request::TryResume => (1, None),
+            Request::Yield => (0, None),
+            Request::Running => (0, Some(0)),
         };
         args >= least && most.is_none_or(|most| args <= most)
     }
@@ -99,6 +117,9 @@ impl Request {
                 let k = prompts::capture(mc, task, tag_of(mc, args[0])?)?;
                 Then::Call(args[1], vec![k])
             }
+            Request::Resume | Request::TryResume => Then::Resume(args[0], args[1..].to_vec(), self == Request::TryResume),
+            Request::Yield => Then::Yield(values(mc, args.iter().copied())?),
+            Request::Running => Then::Return(Value::object(mc, task)),
         })
     }
 }

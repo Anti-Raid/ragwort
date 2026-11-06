@@ -55,6 +55,7 @@ fn eval_in(arena: &mut Arena, text: &str) -> Result<Result<String, Fault>, Error
             last = loop {
                 match machine.run(mc).unwrap() {
                     Outcome::Paused => {}
+                    Outcome::Yielded(_) => panic!("yielded"),
                     Outcome::Done(value) => break value,
                     Outcome::Raised(raised) => return Ok(Err(*raised.downcast::<Condition>(mc).unwrap().fault(mc).unwrap())),
                 }

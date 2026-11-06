@@ -34,6 +34,7 @@ fn run<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Value<'gc> {
     loop {
         match machine.run(mc).expect("run") {
             Outcome::Paused => {}
+            Outcome::Yielded(_) => panic!("yielded"),
             Outcome::Done(value) => return value,
             Outcome::Raised(_) => panic!("raised"),
         }
@@ -104,4 +105,12 @@ fn main() {
     let per = |d: Duration| d.as_secs_f64() * 1e9 / N as f64;
     println!("countdown through the prelude: {:.1} ns per iteration", per(time(&base, false, true)));
     println!("countdown on intrinsics:       {:.1} ns per iteration", per(time(&native, true, true)));
+
+    let switch = format!(
+        "(define co (make-coroutine (lambda () (let loop ((i 0)) (co/yield i) (loop (+ i 1))))))
+         (define (drain n) (if (eqv? n 0) 0 (begin (co/resume co) (drain (+ n -1))))) (drain {N})"
+    );
+    println!("coroutine resume and yield:    {:.1} ns per round trip", per(time(&switch, false, true)));
+    let spawn = format!("(define (spawn n) (if (eqv? n 0) 0 (begin (co/resume (make-coroutine (lambda () n))) (spawn (+ n -1))))) (spawn {})", N / 100);
+    println!("make and finish a coroutine:   {:.1} ns each", per(time(&spawn, false, true)) * 100.0);
 }

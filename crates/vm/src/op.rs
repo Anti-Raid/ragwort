@@ -202,6 +202,9 @@ pub enum Fault {
     OutOfFuel,
     /// What `make-error` makes a condition of.
     Error,
+    /// A resume of a coroutine that isn't pending: one that's running, or that has finished
+    /// or failed.
+    NotPending,
     Num(NumError),
     Str(StrError),
 }

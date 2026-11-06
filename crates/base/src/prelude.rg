@@ -110,6 +110,15 @@
                   (%intrinsic abort (%intrinsic default-continuation-prompt-tag)
                     (%lambda () (%intrinsic apply k args)))))))))
 
+(%define-global make-coroutine (%lambda (f) (%intrinsic make-coroutine f)))
+(%define-global coroutine? (%lambda (x) (%intrinsic coroutine? x)))
+(%define-global co/resume (%lambda (co . args) (%apply-intrinsic co/resume co args)))
+(%define-global co/try-resume (%lambda (co . args) (%apply-intrinsic co/try-resume co args)))
+(%define-global co/yield (%lambda args (%apply-intrinsic co/yield args)))
+(%define-global co/running (%lambda () (%intrinsic co/running)))
+(%define-global co/status
+  (%lambda (co) (%intrinsic vector-ref #(pending running finished error) (%intrinsic coroutine-state co))))
+
 (%define-global null? (%lambda (x) (%intrinsic null? x)))
 (%define-global pair? (%lambda (x) (%intrinsic pair? x)))
 (%define-global list (%lambda xs xs))

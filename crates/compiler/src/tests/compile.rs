@@ -83,6 +83,7 @@ fn eval(build: impl for<'gc> FnOnce(&Mutation<'gc>) -> Core<'gc>, check: impl fo
         let result = loop {
             match machine.run(mc).unwrap() {
                 Outcome::Paused => {}
+                Outcome::Yielded(_) => panic!("yielded"),
                 Outcome::Done(value) => break Ok(value),
                 Outcome::Raised(raised) => break Err(*raised.downcast::<Condition>(mc).unwrap().fault(mc).unwrap()),
             }

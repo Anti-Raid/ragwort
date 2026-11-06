@@ -60,10 +60,16 @@ objects! {
     /// An error object: `fault` says what went wrong, and for [`Fault::Error`], `message` and
     /// `irritants` are what `error` was called with.
     pub struct Condition { fault: Frozen<Fault>, message: Value, irritants: Value }
-    /// What a [`crate::Machine`] keeps in the arena: the accumulator between runs, the chain
-    /// of records under its stack, its marks, as a list of `(key . value)` pairs, the list of
-    /// prompts the chain runs under, and the procedure VM faults are passed to. `spare` is a
-    /// segment the stack left, which an overflow takes from `spare_base` up.
+    /// A coroutine, and what a [`crate::Machine`] keeps of the one it runs in the arena: the
+    /// accumulator between runs, the chain of records under its stack, its marks, as a list of
+    /// `(key . value)` pairs, the list of prompts the chain runs under, and the procedure VM
+    /// faults are passed to, or `#f` to pass them to its `resumer`. `spare` is a segment the
+    /// stack left, which an overflow takes from `spare_base` up.
+    ///
+    /// `body` is the procedure it starts with, until it does. `resumer` is the task that resumed
+    /// it, and `resumed` the one it's resuming, if any. While it's suspended, its frames are on
+    /// `segment` from `base` up. `state` says whether it's pending, running, finished or
+    /// failed, and `protected` that it was resumed by `co/try-resume`.
     pub struct Task {
         acc: Value,
         chain: Value,
@@ -72,6 +78,13 @@ objects! {
         fault: Value,
         spare: Member<Segment>,
         spare_base: u32,
+        body: Value,
+        resumer: Value,
+        resumed: Value,
+        segment: Member<Segment>,
+        base: u32,
+        state: u32,
+        protected: bool,
     }
     /// What `(values ...)` makes of other than one value: an object like any other, which the
     /// `values` intrinsics take apart.

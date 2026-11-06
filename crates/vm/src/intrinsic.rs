@@ -11,8 +11,8 @@ use ragwort_types::pair::{Pair, Pairs};
 use ragwort_types::vector::{AnyVector, Vectors};
 
 use crate::op::Fuel;
-use crate::{Fault, equal, prompts};
-use crate::objects::{self, BoxFields, Condition, Global, GlobalFields, MultiValue, MultiValueFields, Tag};
+use crate::{Fault, coroutine, equal, prompts};
+use crate::objects::{self, BoxFields, Condition, Global, GlobalFields, MultiValue, MultiValueFields, Tag, TaskFields};
 
 named! {
     #[repr(u16)]
@@ -164,6 +164,13 @@ named! {
         IsProcedure = "procedure?",
         /// `continuation?`: whether `x` is a composable [`objects::Continuation`].
         IsContinuation = "continuation?",
+        /// `(make-coroutine f)`: a pending coroutine that the first `co/resume` of it starts by
+        /// calling the procedure `f`.
+        MakeCoroutine = "make-coroutine",
+        /// `coroutine?`.
+        IsCoroutine = "coroutine?",
+        /// `(coroutine-state co)`: 0 if `co` is pending, 1 running, 2 finished and 3 failed.
+        CoroutineState = "coroutine-state",
     }
 }
 
@@ -179,6 +186,7 @@ impl Intrinsic {
             Intrinsic::VectorSet => Some(3),
             Intrinsic::DefaultPromptTag => Some(0),
             Intrinsic::IsBytevector | Intrinsic::BytevectorLength | Intrinsic::IsProcedure | Intrinsic::IsContinuation => Some(1),
+            Intrinsic::MakeCoroutine | Intrinsic::IsCoroutine | Intrinsic::CoroutineState => Some(1),
             Intrinsic::Car | Intrinsic::Cdr | Intrinsic::IsNull | Intrinsic::IsPair | Intrinsic::IsList | Intrinsic::Length | Intrinsic::Reverse | Intrinsic::IsBox | Intrinsic::MakeBox | Intrinsic::Unbox => Some(1),
             Intrinsic::IsValues | Intrinsic::ValuesLength | Intrinsic::GlobalRef | Intrinsic::Not | Intrinsic::IsBoolean => Some(1),
             Intrinsic::Caar | Intrinsic::Cadr | Intrinsic::Cdar | Intrinsic::Cddr | Intrinsic::Caaar | Intrinsic::Caadr | Intrinsic::Cadar | Intrinsic::Caddr | Intrinsic::Cdaar | Intrinsic::Cdadr | Intrinsic::Cddar | Intrinsic::Cdddr | Intrinsic::Caaaar | Intrinsic::Caaadr | Intrinsic::Caadar | Intrinsic::Caaddr | Intrinsic::Cadaar | Intrinsic::Cadadr | Intrinsic::Caddar | Intrinsic::Cadddr | Intrinsic::Cdaaar | Intrinsic::Cdaadr | Intrinsic::Cdadar | Intrinsic::Cdaddr | Intrinsic::Cddaar | Intrinsic::Cddadr | Intrinsic::Cdddar | Intrinsic::Cddddr => Some(1),
@@ -260,6 +268,7 @@ impl Intrinsic {
                 | ValuesRef
                 | IsProcedure
                 | IsContinuation
+                | IsCoroutine
         )
     }
 
@@ -287,6 +296,7 @@ impl Intrinsic {
                 | IsValues
                 | IsProcedure
                 | IsContinuation
+                | IsCoroutine
         )
     }
 
@@ -305,6 +315,7 @@ impl Intrinsic {
                 | IsValues
                 | IsProcedure
                 | IsContinuation
+                | IsCoroutine
         )
     }
 
@@ -353,6 +364,8 @@ impl Intrinsic {
                 | BytevectorSet
                 | SetBox
                 | MakeError
+                | MakeCoroutine
+                | CoroutineState
         )
     }
 
@@ -649,6 +662,18 @@ impl Intrinsic {
                     || arg(0).downcast::<objects::Continuation>(mc).is_some(),
             ),
             Intrinsic::IsContinuation => boolean(arg(0).downcast::<objects::Continuation>(mc).is_some()),
+            Intrinsic::MakeCoroutine => {
+                let body = arg(0);
+                if body.downcast::<objects::Closure>(mc).is_none() && body.downcast::<objects::Continuation>(mc).is_none() {
+                    return Err(Fault::WrongType);
+                }
+                made(mc, fuel, Value::object(mc, coroutine::new(mc, body)?))
+            }
+            Intrinsic::IsCoroutine => boolean(coroutine::of(mc, arg(0)).is_some()),
+            Intrinsic::CoroutineState => {
+                let co = coroutine::of(mc, arg(0)).ok_or(Fault::WrongType)?;
+                Value::fixnum(i64::from(co.state(mc))).expect("states are fixnums")
+            }
         })
     }
 }

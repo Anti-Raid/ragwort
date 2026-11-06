@@ -91,7 +91,7 @@ fn run<'gc>(mc: &Mutation<'gc>, code: Gc<'gc, Bytecode>, args: &[Value<'gc>]) ->
     let values = match to_end(mc, &mut machine)? {
         Outcome::Done(value) => spread(mc, value),
         Outcome::Raised(raised) => return Err(fault(mc, raised)),
-        Outcome::Paused => unreachable!(),
+        Outcome::Paused | Outcome::Yielded(_) => unreachable!(),
     };
     let digits = |v: Value<'gc>| items(mc, v).iter().fold(0, |a, &n| a * 10 + n);
     Ok(values.iter().map(|&v| if Pair::of(v).is_some() { digits(v) } else { v.as_fixnum().unwrap() }).collect())
@@ -106,6 +106,7 @@ fn finish(arena: &mut Arena, mut machine: Machine) -> Result<(Vec<i64>, usize), 
                 Outcome::Done(value) => Some(fixnums(mc, value)),
                 Outcome::Raised(raised) => return Err(fault(mc, raised)),
                 Outcome::Paused => None,
+                Outcome::Yielded(_) => unreachable!(),
             })
         })??;
         if let Some(values) = done {
@@ -126,7 +127,7 @@ fn call(constants: &[i64], funcs: &[Func<'_>], args: &[i64]) -> Result<Vec<i64>,
         match to_end(mc, &mut machine)? {
             Outcome::Done(value) => Ok(fixnums(mc, value)),
             Outcome::Raised(raised) => Err(fault(mc, raised)),
-            Outcome::Paused => unreachable!(),
+            Outcome::Paused | Outcome::Yielded(_) => unreachable!(),
         }
     })
 }

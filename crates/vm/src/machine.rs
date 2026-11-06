@@ -7,7 +7,7 @@ use crate::intrinsic::values;
 use crate::objects::{BytecodeFields, Closure, ClosureFields, Condition, Continuation, MultiValue, MultiValueFields, Task, TaskFields};
 use crate::run::{self, Exit, MAX_ARGS, Regs, bind};
 use crate::segments::{CHUNK, Resume, Segments};
-use crate::{Fault, Fuel, Request, prompts};
+use crate::{Fault, Fuel, Request, coroutine, prompts};
 
 #[cfg(test)]
 #[path = "tests/machine.rs"]
@@ -28,6 +28,9 @@ pub enum Outcome<'gc> {
     /// A VM fault, as a `Condition`, with no fault procedure to take it, or one that couldn't
     /// be called.
     Raised(Value<'gc>),
+    /// The task yielded these values, as one: `co/yield` in it, not in a coroutine it resumed.
+    /// [`Machine::resume`] goes on with it.
+    Yielded(Value<'gc>),
 }
 
 /// A task: a procedure call run on its own stack. It holds no brand, so it lives outside the
@@ -40,6 +43,8 @@ pub struct Machine {
     segment: usize,
     fuel: u64,
     finished: bool,
+    /// Whether the task yielded, and the next run goes on from the yield.
+    yielded: bool,
 }
 
 impl Machine {
@@ -48,10 +53,10 @@ impl Machine {
     pub fn new<'gc>(mc: &Mutation<'gc>, segment: usize, procedure: Value<'gc>, args: &[Value<'gc>]) -> Result<Self, Fault> {
         let segment = segment.max(MIN_SEGMENT);
         let mut stack = mc.stack(Segment::new(mc, segment)?)?;
-        let task = Task::new(mc, Value::VOID, Value::FALSE, Value::NIL, Value::NIL, Value::FALSE, None, 0)?;
+        let task = coroutine::root(mc)?;
         let mut regs = Regs { fp: 0, pc: 0, acc: Value::VOID };
         Outer::new(mc, &mut stack, task, &mut regs, segment).start(procedure, args)?;
-        let mut machine = Machine { stack, task: Root::new(mc, task)?, fp: 0, pc: 0, segment, fuel: u64::MAX, finished: false };
+        let mut machine = Machine { stack, task: Root::new(mc, task)?, fp: 0, pc: 0, segment, fuel: u64::MAX, finished: false, yielded: false };
         machine.save(mc, task, &regs);
         Ok(machine)
     }
@@ -74,25 +79,42 @@ impl Machine {
         self.fuel
     }
 
-    /// Runs until the task finishes or its fuel runs out, or until it has made enough that the
-    /// step should end so the collector can keep up, as [`Mutation::step_due`] says: then it
-    /// pauses at its next call or jump, and the next run goes on from there. Running it again
-    /// once it's finished faults with [`Fault::Finished`].
+    /// Runs until the task finishes, yields or its fuel runs out, or until it has made enough
+    /// that the step should end so the collector can keep up, as [`Mutation::step_due`] says:
+    /// then it pauses at its next call or jump, and the next run goes on from there. After a
+    /// yield, it goes on as [`Machine::resume`] with no values does. Running it again once it's
+    /// finished faults with [`Fault::Finished`].
     pub fn run<'gc>(&mut self, mc: &Mutation<'gc>) -> Result<Outcome<'gc>, Fault> {
         if self.finished {
             return Err(Fault::Finished);
         }
-        let task = self.task.get(mc).expect("a machine runs in its own arena");
+        let mut task = coroutine::current(mc, self.task.get(mc).expect("a machine runs in its own arena"));
         let mut regs = Regs { fp: self.fp, pc: self.pc, acc: task.acc(mc) };
         let mut fuel = Fuel { run: self.fuel, rest: 0 };
-        let outcome = match self.drive(mc, task, &mut regs, &mut fuel) {
+        let outcome = match self.drive(mc, &mut task, &mut regs, &mut fuel) {
             Ok(Outcome::Paused) if fuel.left() == 0 => Err(Fault::OutOfFuel),
             outcome => outcome,
         };
         self.fuel = fuel.left();
         self.finished = matches!(outcome, Ok(Outcome::Done(_) | Outcome::Raised(_)) | Err(Fault::OutOfFuel));
+        self.yielded = matches!(outcome, Ok(Outcome::Yielded(_)));
+        if self.finished {
+            let state = if matches!(outcome, Ok(Outcome::Done(_))) { coroutine::FINISHED } else { coroutine::FAILED };
+            self.task.get(mc).expect("a machine runs in its own arena").set_state(mc, state);
+        }
         self.save(mc, task, &regs);
         outcome
+    }
+
+    /// Goes on with a task that yielded, as [`Machine::run`] does, with its `co/yield` returning
+    /// `args`. Faults with [`Fault::NotPending`] if it isn't waiting on a yield.
+    pub fn resume<'gc>(&mut self, mc: &Mutation<'gc>, args: &[Value<'gc>]) -> Result<Outcome<'gc>, Fault> {
+        if !self.yielded {
+            return Err(if self.finished { Fault::Finished } else { Fault::NotPending });
+        }
+        let task = self.task.get(mc).expect("a machine runs in its own arena");
+        task.set_acc(mc, values(mc, args.iter().copied())?);
+        self.run(mc)
     }
 
     /// Keeps what the next run needs where a collection finds it.
@@ -104,11 +126,22 @@ impl Machine {
     }
 
     /// Runs the inner loop, and carries out what it stops for, until the task ends or the run's
-    /// fuel runs out.
-    fn drive<'gc>(&mut self, mc: &Mutation<'gc>, task: Gc<'gc, Task>, regs: &mut Regs<'gc>, fuel: &mut Fuel) -> Result<Outcome<'gc>, Fault> {
+    /// fuel runs out. `task` is the running one, which switching coroutines changes.
+    fn drive<'gc>(&mut self, mc: &Mutation<'gc>, task: &mut Gc<'gc, Task>, regs: &mut Regs<'gc>, fuel: &mut Fuel) -> Result<Outcome<'gc>, Fault> {
+        if std::mem::take(&mut self.yielded) {
+            let mut outer = Outer::new(mc, &mut self.stack, *task, regs, self.segment);
+            let step = outer.resume();
+            *task = outer.task();
+            if let Some(outcome) = step? {
+                return Ok(outcome);
+            }
+        }
         loop {
             let exit = run::exec(mc, &self.stack, regs, fuel);
-            if let Some(outcome) = Outer::new(mc, &mut self.stack, task, regs, self.segment).exit(exit)? {
+            let mut outer = Outer::new(mc, &mut self.stack, *task, regs, self.segment);
+            let step = outer.exit(exit);
+            *task = outer.task();
+            if let Some(outcome) = step? {
                 return Ok(outcome);
             }
             if mc.step_due() {
@@ -127,13 +160,17 @@ pub(crate) enum Then<'gc> {
     Call(Value<'gc>, Vec<Value<'gc>>),
     /// The value, returned to the current continuation.
     Return(Value<'gc>),
+    /// A resume of the coroutine with the values, by `co/try-resume` if it's `true`.
+    Resume(Value<'gc>, Vec<Value<'gc>>, bool),
+    /// A yield of the value, as one, from the running coroutine.
+    Yield(Value<'gc>),
 }
 
 /// The outer loop's state, between two stretches of the inner loop: the stack, and the
 /// registers the inner loop goes on with.
 pub(crate) struct Outer<'a, 'gc> {
     pub(crate) segments: Segments<'a, 'gc>,
-    regs: &'a mut Regs<'gc>,
+    pub(crate) regs: &'a mut Regs<'gc>,
 }
 
 impl<'a, 'gc> Outer<'a, 'gc> {
@@ -167,14 +204,28 @@ impl<'a, 'gc> Outer<'a, 'gc> {
     }
 
     /// Calls the fault procedure with a condition for `fault`, in place of the frame that
-    /// faulted. A fault in calling it ends the run.
+    /// faulted. A fault in calling it ends the run. A coroutine with none fails, and the
+    /// condition goes on to what resumed it: raised at its `co/resume`, or returned from its
+    /// `co/try-resume`.
     fn fault(&mut self, fault: Fault) -> Step<'gc> {
         let mc = self.mc();
-        let (handler, raised) = (self.task().fault(mc), condition(mc, fault, Value::VOID, Value::NIL)?);
-        if handler == Value::FALSE {
-            return Ok(Some(Outcome::Raised(raised)));
-        }
-        if self.regs.fp > self.segments.stack.base()
+        let raised = condition(mc, fault, Value::VOID, Value::NIL)?;
+        let mut failed = false;
+        let handler = loop {
+            let task = self.task();
+            let handler = task.fault(mc);
+            if handler != Value::FALSE {
+                break handler;
+            }
+            let Some(to) = coroutine::of(mc, task.resumer(mc)) else { return Ok(Some(Outcome::Raised(raised))) };
+            self.end(task, coroutine::FAILED, to)?;
+            if task.protected(mc) {
+                return self.then(Then::Return(coroutine::flagged(mc, Value::FALSE, raised)?));
+            }
+            failed = true;
+        };
+        if !failed
+            && self.regs.fp > self.segments.stack.base()
             && let Ok(frame) = self.segments.frame(self.regs.fp)
             && let Ok(link) = frame::link_of(mc, frame)
         {
@@ -221,13 +272,15 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         self.then(Then::Call(procedure, args))
     }
 
-    fn then(&mut self, then: Then<'gc>) -> Step<'gc> {
+    pub(crate) fn then(&mut self, then: Then<'gc>) -> Step<'gc> {
         match then {
             Then::Call(procedure, args) => self.apply(procedure, &args),
             Then::Return(value) => {
                 self.regs.acc = value;
                 self.resume()
             }
+            Then::Resume(co, args, protected) => self.resume_coroutine(co, &args, protected),
+            Then::Yield(values) => self.yield_coroutine(values),
         }
     }
 
@@ -271,16 +324,23 @@ impl<'a, 'gc> Outer<'a, 'gc> {
     }
 
     /// Goes back to the continuation with the value in the accumulator: the records under the
-    /// stack, then the prompts'. If none is left, the task is done, and that's its value.
-    fn resume(&mut self) -> Step<'gc> {
-        let (mc, task) = (self.mc(), self.task());
+    /// stack, then the prompts'. If none is left, the task is done, and that's its value: a
+    /// coroutine's goes back to what resumed it.
+    pub(crate) fn resume(&mut self) -> Step<'gc> {
+        let mc = self.mc();
         loop {
             if let Some(Resume { fp, pc }) = self.segments.underflow()? {
                 (self.regs.fp, self.regs.pc) = (fp, pc);
                 return Ok(None);
             }
-            if !prompts::pop(mc, task)? {
-                return Ok(Some(Outcome::Done(self.regs.acc)));
+            let task = self.task();
+            if prompts::pop(mc, task)? {
+                continue;
+            }
+            let Some(to) = coroutine::of(mc, task.resumer(mc)) else { return Ok(Some(Outcome::Done(self.regs.acc))) };
+            self.end(task, coroutine::FINISHED, to)?;
+            if task.protected(mc) {
+                self.regs.acc = coroutine::flagged(mc, Value::TRUE, self.regs.acc)?;
             }
         }
     }

@@ -30,6 +30,7 @@ fn run<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Result<Value<'gc>, Fault> 
     loop {
         match machine.run(mc).unwrap() {
             Outcome::Paused => {}
+            Outcome::Yielded(_) => panic!("yielded"),
             Outcome::Done(value) => return Ok(value),
             Outcome::Raised(raised) => return Err(*raised.downcast::<Condition>(mc).unwrap().fault(mc).unwrap()),
         }
@@ -605,4 +606,184 @@ fn compiler_micropass_stress_cases() {
     assert_eq!(eval_in(&mut arena(), "(define (inc x) (+ x 1)) (inc 'a)"), Ok(Err(Fault::WrongType)));
     assert_eq!(eval_in(&mut arena(), "(sub1 \"s\")"), Ok(Err(Fault::WrongType)));
     assert_eq!(eval_in(&mut arena(), "(add1 1 2)"), Ok(Err(Fault::Arity)));
+}
+
+#[test]
+fn coroutines_resume_and_yield_values_both_ways() {
+    let round_trip = "(define co (make-coroutine (lambda (a b)
+                                (let* ((c (co/yield (+ a b))) (d (co/yield (* c 2)))) (list a b c d)))))
+                      (let* ((s0 (co/status co)) (y0 (co/resume co 1 2)) (s1 (co/status co)) (y1 (co/resume co 10))
+                             (y2 (co/resume co 'x)) (s2 (co/status co)))
+                        (list s0 y0 s1 y1 y2 s2 (coroutine? co) (coroutine? car)))";
+    assert_eq!(eval(round_trip), "(pending 3 pending 20 (1 2 10 x) finished #t #f)");
+    assert_eq!(eval("(define co (make-coroutine (lambda () (co/status co)))) (co/resume co)"), "running");
+    assert_eq!(eval("(call-with-values (lambda () (co/resume (make-coroutine (lambda () (co/yield 1 2))))) list)"), "(1 2)");
+    assert_eq!(eval("(call-with-values (lambda () (co/resume (make-coroutine (lambda () (co/yield))))) list)"), "()");
+    let back = "(define co (make-coroutine (lambda () (call-with-values (lambda () (co/yield)) list))))
+                (co/resume co) (co/resume co 1 2 3)";
+    assert_eq!(eval(back), "(1 2 3)");
+}
+
+#[test]
+fn co_running_is_the_innermost_running_coroutine() {
+    assert_eq!(eval("(let ((top (co/running))) (list (eq? top (co/running)) (coroutine? top) (co/status top)))"), "(#t #t running)");
+    let nested = "(define inner (make-coroutine (lambda () (eq? (co/running) inner))))
+                  (define outer (make-coroutine (lambda ()
+                                  (let* ((a (eq? (co/running) outer)) (b (co/resume inner)) (c (eq? (co/running) outer)))
+                                    (list a b c (eq? (co/running) inner))))))
+                  (let* ((top (co/running)) (r (co/resume outer))) (append r (list (eq? top (co/running)))))";
+    assert_eq!(eval(nested), "(#t #t #t #f #t)");
+    // A machine's own task is never pending, so it can't be resumed from inside.
+    assert_eq!(eval_in(&mut arena(), "(co/resume (co/running))"), Ok(Err(Fault::NotPending)));
+    let from_inside = "(define top (co/running)) (co/resume (make-coroutine (lambda () (co/resume top))))";
+    assert_eq!(eval_in(&mut arena(), from_inside), Ok(Err(Fault::NotPending)));
+    // Each top-level form runs in a machine of its own, which has finished by the next.
+    assert_eq!(eval("(define top (co/running)) (co/status top)"), "finished");
+}
+
+#[test]
+fn a_yield_goes_to_what_resumed_the_coroutine() {
+    let nested = "(define inner (make-coroutine (lambda () (co/yield 'i1) 'i-done)))
+                  (define outer (make-coroutine (lambda ()
+                                  (let* ((a (co/resume inner)) (s (co/status outer)) (b (co/yield a)) (c (co/resume inner)))
+                                    (list s b c (co/status inner))))))
+                  (let* ((first (co/resume outer)) (rest (co/resume outer 'sent))) (list first rest (co/status outer)))";
+    assert_eq!(eval(nested), "(i1 (running sent i-done finished) finished)");
+    let walk = "(define (walk n) (if (eqv? n 0) 0 (begin (co/yield n) (+ 1 (walk (- n 1))))))
+                (define co (make-coroutine (lambda () (walk 20000))))
+                (let loop ((sum 0))
+                  (let ((v (co/resume co)))
+                    (if (eq? (co/status co) 'finished) (list sum v) (loop (+ sum v)))))";
+    assert_eq!(eval(walk), "(200010000 20000)");
+    let many = "(define cos (let loop ((i 0) (acc '()))
+                              (if (eqv? i 200) acc (loop (+ i 1) (cons (make-coroutine (lambda () (co/yield i) (* i 2))) acc)))))
+                (define (each f xs) (if (null? xs) '() (cons (f (car xs)) (each f (cdr xs)))))
+                (each co/resume cos)
+                (let ((done (each co/resume cos))) (list (car done) (length done)))";
+    assert_eq!(eval(many), "(398 200)");
+}
+
+#[test]
+fn coroutines_keep_their_own_prompts_and_continuations() {
+    assert_eq!(eval("(co/resume (make-coroutine (lambda () (+ 1 (call/cc (lambda (k) (k 41)))))))"), "42");
+    let prompt = "(define co (make-coroutine (lambda () (call-with-continuation-prompt (lambda () (+ 1 (co/yield 'in)))))))
+                  (list (co/resume co) (co/resume co 5) (co/status co))";
+    assert_eq!(eval(prompt), "(in 6 finished)");
+    let escape = "(define co (make-coroutine (lambda () (call/cc (lambda (k) (co/yield 'a) (k 'escaped) 'not)))))
+                  (list (co/resume co) (co/resume co))";
+    assert_eq!(eval(escape), "(a escaped)");
+}
+
+#[test]
+fn a_failing_coroutine_raises_where_it_was_resumed_unless_protected() {
+    assert_eq!(eval_in(&mut arena(), "(co/resume (make-coroutine (lambda () (car 1))))"), Ok(Err(Fault::WrongType)));
+    let caught = "(define co (make-coroutine (lambda () (co/yield 1) (car 1))))
+                  (define (try) (call-with-values (lambda () (co/try-resume co)) list))
+                  (let* ((a (try)) (b (try)) (s (co/status co))) (list a (car b) s))";
+    assert_eq!(eval(caught), "((#t 1) #f error)");
+    let done = "(call-with-values (lambda () (co/try-resume (make-coroutine (lambda (x) (co/yield x (+ x 1)))) 5)) list)";
+    assert_eq!(eval(done), "(#t 5 6)");
+    assert_eq!(eval("(call-with-values (lambda () (co/try-resume (make-coroutine (lambda () 'end)))) list)"), "(#t end)");
+    // Its failure goes on through a coroutine that resumed it unprotected, which fails too.
+    let through = "(define inner (make-coroutine (lambda () (car 1))))
+                   (define outer (make-coroutine (lambda () (co/resume inner) 'unreached)))
+                   (let ((r (call-with-values (lambda () (co/try-resume outer)) list))) (list (car r) (co/status inner) (co/status outer)))";
+    assert_eq!(eval(through), "(#f error error)");
+    let finished = "(define co (make-coroutine (lambda () 1))) (co/resume co) (co/resume co)";
+    assert_eq!(eval_in(&mut arena(), finished), Ok(Err(Fault::NotPending)));
+    assert_eq!(eval_in(&mut arena(), "(define co (make-coroutine (lambda () (co/resume co)))) (co/resume co)"), Ok(Err(Fault::NotPending)));
+    let cycle = "(define a (make-coroutine (lambda () (co/resume b))))
+                 (define b (make-coroutine (lambda () (co/resume a))))
+                 (co/resume a)";
+    assert_eq!(eval_in(&mut arena(), cycle), Ok(Err(Fault::NotPending)));
+    assert_eq!(eval_in(&mut arena(), "(co/resume 5)"), Ok(Err(Fault::WrongType)));
+    assert_eq!(eval_in(&mut arena(), "(make-coroutine 5)"), Ok(Err(Fault::WrongType)));
+    assert_eq!(eval_in(&mut arena(), "(co/status car)"), Ok(Err(Fault::WrongType)));
+}
+
+/// The one thunk `text` loads as, in a machine.
+fn machine(arena: &mut Arena, text: &str) -> Machine {
+    arena.mutate(|mc| {
+        let symbols = Symbols::of(mc.root(0)).unwrap();
+        let (globals, base) = (Globals::of(mc, mc.root(1)).unwrap(), Globals::of(mc, mc.root(2)).unwrap());
+        let session = SyntaxSession::new(mc, text).unwrap();
+        let thunks = load(mc, symbols, globals, base, &session).unwrap();
+        let [thunk] = thunks.as_slice() else { panic!("one form") };
+        Machine::new(mc, MIN_SEGMENT, *thunk, &[]).unwrap()
+    })
+}
+
+fn show_outcome<'gc>(mc: &Mutation<'gc>, outcome: Result<Outcome<'gc>, Fault>) -> String {
+    match outcome {
+        Ok(Outcome::Yielded(v)) => format!("yielded {}", show(mc, v)),
+        Ok(Outcome::Done(v)) => format!("done {}", show(mc, v)),
+        other => format!("{other:?}"),
+    }
+}
+
+#[test]
+fn the_host_resumes_a_machine_that_yields() {
+    let mut arena = arena();
+    let text = "(let ((co (make-coroutine (lambda (x) (co/yield (list x 'a)) (co/yield (vector x 'b)) (list 'done x)))))
+                  (let* ((a (co/yield (co/resume co 1))) (b (co/yield (vector->list (co/resume co)))) (c (co/resume co)))
+                    (list a b c)))";
+    let mut machine = machine(&mut arena, text);
+    assert_eq!(arena.mutate(|mc| show_outcome(mc, machine.resume(mc, &[]))), "Err(NotPending)");
+    assert_eq!(arena.mutate(|mc| show_outcome(mc, machine.run(mc))), "yielded (1 a)");
+    // What the coroutines hold stays alive while they wait.
+    arena.collect();
+    assert_eq!(arena.mutate(|mc| show_outcome(mc, machine.resume(mc, &[Value::fixnum(10).unwrap()]))), "yielded (1 b)");
+    arena.collect();
+    assert_eq!(arena.mutate(|mc| show_outcome(mc, machine.resume(mc, &[Value::fixnum(20).unwrap()]))), "done (10 20 (done 1))");
+    assert_eq!(arena.mutate(|mc| show_outcome(mc, machine.resume(mc, &[]))), "Err(Finished)");
+    // Plain `run` goes on from a yield with no values.
+    let mut machine = self::machine(&mut arena, "(call-with-values (lambda () (co/yield 'x)) list)");
+    assert_eq!(arena.mutate(|mc| show_outcome(mc, machine.run(mc))), "yielded x");
+    assert_eq!(arena.mutate(|mc| show_outcome(mc, machine.run(mc))), "done ()");
+}
+
+#[test]
+fn coroutines_survive_collections_between_steps() {
+    let mut arena = arena();
+    let text = "(let ((gen (make-coroutine (lambda ()
+                             (let loop ((i 0)) (if (eqv? i 30000) 'end (begin (co/yield (list i (vector i))) (loop (+ i 1)))))))))
+                  (let loop ((sum 0) (kept '()))
+                    (let ((v (co/resume gen)))
+                      (if (eq? v 'end)
+                          (list sum (length kept) (vector-ref (cadr (car kept)) 0))
+                          (loop (+ sum (car v)) (if (eqv? (car v) 29999) (cons v kept) kept))))))";
+    let mut machine = machine(&mut arena, text);
+    let mut runs = 0;
+    let done = loop {
+        runs += 1;
+        if runs % 64 == 0 {
+            arena.collect();
+        }
+        let outcome = arena.step(|mc| match machine.run(mc).unwrap() {
+            Outcome::Paused => None,
+            Outcome::Done(v) => Some(show(mc, v)),
+            other => panic!("{other:?}"),
+        });
+        if let Some(done) = outcome.unwrap() {
+            break done;
+        }
+    };
+    assert_eq!(done, "(449985000 1 29999)");
+    assert!(runs > 1, "expected the run to pause for collections");
+}
+
+#[test]
+fn a_suspended_coroutine_keeps_little_memory() {
+    let kept = |body: &str| {
+        let mut arena = arena();
+        let text = format!("(define keep (let loop ((i 0) (acc '())) (if (eqv? i 200) acc (loop (+ i 1) (cons {body} acc)))))");
+        eval_in(&mut arena, &text).unwrap().unwrap();
+        arena.collect();
+        arena.collect();
+        arena.used()
+    };
+    let closures = kept("(lambda () i)");
+    let suspended = kept("(let ((c (make-coroutine (lambda () (co/yield i) i)))) (co/resume c) c)");
+    let each = (suspended - closures) / 200;
+    assert!(each < 4096, "{each} bytes per suspended coroutine");
 }
