@@ -6,14 +6,20 @@
 //! from hands its frames to its chain, keeps where its stack's live part starts, and the stack
 //! moves to the other side's segment, whose chain then goes on in place. Nothing is copied.
 //!
+//! A suspended coroutine needs no room past its frames, so a yield copies them to a segment of
+//! their own size when nothing else holds the segment they were on, which then goes to the
+//! resumer as its spare: the next coroutine it resumes runs there, and the frames of one that
+//! was copied are copied back as it returns into them.
+//!
 //! A machine's own task is a coroutine too, which nothing in the arena resumed: a yield in it
 //! ends the run, and the machine is resumed from the host.
 
+use ragwort_types::gc::raw::Raw;
 use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Segment, Value, WINDOW};
 
 use crate::intrinsic::values;
 use crate::machine::{Outer, Step, Then};
-use crate::objects::{MultiValue, MultiValueFields, Task, TaskFields};
+use crate::objects::{Frames, FramesFields, MultiValue, MultiValueFields, Task, TaskFields};
 use crate::{Fault, Outcome};
 
 /// The slots of a coroutine's first segment: a frame's window, and room past it for calls from
@@ -53,6 +59,14 @@ pub(crate) fn current<'gc>(mc: &Mutation<'gc>, root: Gc<'gc, Task>) -> Gc<'gc, T
     task
 }
 
+/// Makes `segment`, which nothing holds, `task`'s spare, unless it has one.
+fn give<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, segment: Gc<'gc, Segment>) {
+    if task.spare(mc).is_none() {
+        task.set_spare(mc, Some(segment));
+        task.set_spare_base(mc, 0);
+    }
+}
+
 /// `flag`, then `values`, as one value: what `co/try-resume` returns.
 pub(crate) fn flagged<'gc>(mc: &Mutation<'gc>, flag: Value<'gc>, values_: Value<'gc>) -> Result<Value<'gc>, Fault> {
     let mut all = vec![flag];
@@ -82,13 +96,17 @@ impl<'gc> Outer<'_, 'gc> {
         co.set_state(mc, RUNNING);
         co.set_protected(mc, protected);
         let body = co.body(mc);
-        if body == Value::FALSE {
+        if body == Value::FALSE && co.segment(mc).is_some() {
             self.enter_task(co)?;
             return self.then(Then::Return(values(mc, args.iter().copied())?));
         }
-        co.set_body(mc, Value::FALSE);
-        self.segments.stack.switch(mc, Segment::new(mc, FIRST_SEGMENT)?);
+        let segment = self.free_segment(from)?;
+        self.segments.stack.switch(mc, segment);
         self.segments.task = co;
+        if body == Value::FALSE {
+            return self.then(Then::Return(values(mc, args.iter().copied())?));
+        }
+        co.set_body(mc, Value::FALSE);
         self.then(Then::Call(body, args.to_vec()))
     }
 
@@ -106,7 +124,11 @@ impl<'gc> Outer<'_, 'gc> {
         from.set_spare(mc, None);
         from.set_state(mc, PENDING);
         from.set_resumer(mc, Value::FALSE);
+        let freed = self.compact(from)?;
         self.back(to)?;
+        if let Some(segment) = freed {
+            give(mc, to, segment);
+        }
         let yielded = if from.protected(mc) { flagged(mc, Value::TRUE, yielded)? } else { yielded };
         self.then(Then::Return(yielded))
     }
@@ -116,14 +138,68 @@ impl<'gc> Outer<'_, 'gc> {
     pub(crate) fn end(&mut self, task: Gc<'gc, Task>, state: u32, to: Gc<'gc, Task>) -> Result<(), Fault> {
         let mc = self.mc();
         let stack = &self.segments.stack;
-        stack.set_top(stack.base());
+        let base = stack.base();
+        stack.set_top(base);
+        // With nothing below its base, nothing holds the segment.
+        let freed = (base == 0).then(|| stack.segment(mc));
         task.set_state(mc, state);
         task.set_resumer(mc, Value::FALSE);
         task.set_chain(mc, Value::FALSE);
         task.set_attachments(mc, Value::NIL);
         task.set_prompts(mc, Value::NIL);
         task.set_spare(mc, None);
-        self.back(to)
+        self.back(to)?;
+        if let Some(segment) = freed {
+            give(mc, to, segment);
+        }
+        Ok(())
+    }
+
+    /// Copies the frames of `task`, which is suspending, to a segment of their own size, if its
+    /// chain's records hold all the stack's segment has below its base and no continuation
+    /// holds them, and returns that segment, which is then free. Only a few frames are copied,
+    /// a window's worth, as a yield from deeper would copy them each time: their segment is
+    /// mostly theirs anyway.
+    fn compact(&mut self, task: Gc<'gc, Task>) -> Result<Option<Gc<'gc, Segment>>, Fault> {
+        let mc = self.mc();
+        let (segment, base) = (self.segments.stack.segment(mc), self.segments.stack.base());
+        if base > WINDOW {
+            return Ok(None);
+        }
+        let (mut run, mut chain, mut end) = (Vec::new(), task.chain(mc), base);
+        while end > 0 {
+            let Some(record) = chain.downcast::<Frames>(mc) else { return Ok(None) };
+            if record.segment(mc) != Some(segment) || !record.one_shot(mc) || record.owns(mc) || record.end(mc) as usize != end {
+                return Ok(None);
+            }
+            end = record.start(mc) as usize;
+            chain = record.next(mc);
+            run.push(record);
+        }
+        if base > 0 {
+            let copy = Segment::new(mc, base)?;
+            let frames = segment.slots(mc).slice(0..base).ok_or(Fault::Malformed)?;
+            copy.slots(mc).copy_from(mc, frames);
+            frames.fill(mc, Value::VOID);
+            run.iter().for_each(|record| record.set_segment(mc, Some(copy)));
+        }
+        task.set_segment(mc, None);
+        Ok(Some(segment))
+    }
+
+    /// A segment for a coroutine `from` resumes to run on: its spare, if that's free and big
+    /// enough, or a new one.
+    fn free_segment(&self, from: Gc<'gc, Task>) -> Result<Gc<'gc, Segment>, Fault> {
+        let mc = self.mc();
+        if let Some(spare) = from.spare(mc)
+            && from.spare_base(mc) == 0
+            && spare.len(mc) >= FIRST_SEGMENT
+            && spare != self.segments.stack.segment(mc)
+        {
+            from.set_spare(mc, None);
+            return Ok(spare);
+        }
+        Ok(Segment::new(mc, FIRST_SEGMENT)?)
     }
 
     /// Keeps where the running task's frames are, for when it's resumed: none are live past

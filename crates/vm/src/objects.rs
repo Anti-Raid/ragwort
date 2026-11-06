@@ -68,7 +68,7 @@ objects! {
     ///
     /// `body` is the procedure it starts with, until it does. `resumer` is the task that resumed
     /// it, and `resumed` the one it's resuming, if any. While it's suspended, its frames are on
-    /// `segment` from `base` up. `state` says whether it's pending, running, finished or
+    /// `segment` from `base` up, or if it has none, its chain holds them all. `state` says whether it's pending, running, finished or
     /// failed, and `protected` that it was resumed by `co/try-resume`.
     pub struct Task {
         acc: Value,

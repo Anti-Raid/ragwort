@@ -675,6 +675,36 @@ fn coroutines_keep_their_own_prompts_and_continuations() {
 }
 
 #[test]
+fn suspended_frames_survive_being_moved_and_shared() {
+    // A continuation captured in the coroutine, called again after each yield, with other
+    // coroutines run in between on whatever segments are free.
+    let again = "(define co (make-coroutine (lambda ()
+                   (let ((i 0))
+                     (let ((k (call/cc (lambda (k) k))))
+                       (set! i (+ i 1))
+                       (co/yield i)
+                       (if (eqv? i 3) 'done (k k)))))))
+                 (define (scribble) (co/resume (make-coroutine (lambda () (let f ((d 20)) (if (eqv? d 0) 0 (+ 1 (f (- d 1)))))))))
+                 (let* ((a (co/resume co)) (b (scribble)) (c (co/resume co)) (d (scribble)) (e (co/resume co)) (f (scribble)))
+                   (list a b c d e f (co/resume co)))";
+    assert_eq!(eval(again), "(1 20 2 20 3 20 done)");
+    // One generator resumed in turn from the top and from inside another coroutine, so the
+    // segment it leaves goes to each.
+    let turns = "(define gen (make-coroutine (lambda () (let loop ((i 0)) (co/yield i) (loop (+ i 1))))))
+                 (define other (make-coroutine (lambda () (let loop () (co/yield (co/resume gen)) (loop)))))
+                 (let loop ((n 0) (top #t) (acc '()))
+                   (if (eqv? n 6) (reverse acc) (loop (+ n 1) (not top) (cons (if top (co/resume gen) (co/resume other)) acc))))";
+    assert_eq!(eval(turns), "(0 1 2 3 4 5)");
+    // Frames over a prompt, and under marks, yielded from at a few depths.
+    let deep = "(define (down d) (if (eqv? d 0) (co/yield 'bottom) (list d (down (- d 1)))))
+                (define co (make-coroutine (lambda ()
+                             (list (down 3) (call-with-continuation-prompt (lambda () (down 2))) (down 30)))))
+                (let* ((a (co/resume co)) (b (co/resume co 'x)) (c (co/resume co 'y)) (d (co/resume co 'z)))
+                  (list a b c (car d) (cadr d) (co/status co)))";
+    assert_eq!(eval(deep), "(bottom bottom bottom (3 (2 (1 x))) (2 (1 y)) finished)");
+}
+
+#[test]
 fn a_failing_coroutine_raises_where_it_was_resumed_unless_protected() {
     assert_eq!(eval_in(&mut arena(), "(co/resume (make-coroutine (lambda () (car 1))))"), Ok(Err(Fault::WrongType)));
     let caught = "(define co (make-coroutine (lambda () (co/yield 1) (car 1))))
@@ -785,5 +815,5 @@ fn a_suspended_coroutine_keeps_little_memory() {
     let closures = kept("(lambda () i)");
     let suspended = kept("(let ((c (make-coroutine (lambda () (co/yield i) i)))) (co/resume c) c)");
     let each = (suspended - closures) / 200;
-    assert!(each < 2048, "{each} bytes per suspended coroutine");
+    assert!(each < 512, "{each} bytes per suspended coroutine");
 }
