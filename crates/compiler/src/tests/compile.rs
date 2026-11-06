@@ -372,6 +372,8 @@ fn has_box_op(ops: &[Op]) -> bool {
         matches!(
             op,
             Op::CallIntrinsic { intrinsic: MakeBox | Unbox | SetBox, .. }
+                | Op::CallIntrinsic1 { intrinsic: MakeBox | Unbox | SetBox, .. }
+                | Op::CallIntrinsic2 { intrinsic: MakeBox | Unbox | SetBox, .. }
                 | Op::TailCallIntrinsic { intrinsic: MakeBox | Unbox | SetBox, .. }
                 | Op::ApplyIntrinsic { intrinsic: MakeBox | Unbox | SetBox, .. }
         )
@@ -408,19 +410,80 @@ fn micropass_optimizations() {
         assert_eq!(ops.len(), 2, "expected constant-folded [LoadConst, Return], got {ops:?}");
         assert!(matches!(ops.as_slice(), [Op::LoadConst { .. }, Op::Return { .. }]));
 
-        // 4. `Place::Import` of a defined prelude wrapper lowers to a direct intrinsic and folds.
+        // 4. `Place::Import` of a defined prelude wrapper lowers to a direct intrinsic, and
+        //    `(+ x 1)` then compiles to `AddImm`.
         let add_fn = compile(mc, &lambda(&[], Some(0), Core::ApplyIntrinsic(Prim::Intrinsic(Add), vec![var(0)]))).unwrap();
         let mut machine = Machine::new(mc, MIN_SEGMENT, add_fn, &[]).unwrap();
         let Outcome::Done(add_closure) = machine.run(mc).unwrap() else { panic!() };
         let import_add = Global::new(mc, Value::VOID, add_closure, true).unwrap();
         let call_import = app(Core::Ref(Place::Import(import_add)), vec![var(0), q(1)]);
-        let outer = lambda(&[0], None, call_import);
-        let thunk = compile(mc, &outer).unwrap();
+        let thunk = compile(mc, &lambda(&[0], None, call_import)).unwrap();
         let ops = all_ops(mc, thunk);
         assert!(
-            ops.iter().any(|op| matches!(op, Op::TailCallIntrinsic { intrinsic: Add, args: 2, .. })),
-            "expected imported `+` call to lower to TailCallIntrinsic(Add): {ops:?}"
+            matches!(ops.as_slice(), [.., Op::AddImm { dst, a: 1, imm: 1 }, Op::Return { src }] if dst == src),
+            "expected imported `(+ x 1)` to compile to AddImm: {ops:?}"
         );
+
+        // 4a. An imported `add1`-style wrapper, `(lambda (z) (+ z 1))`, compiles to
+        //     `[AddImm, Return]`, which `cp0` recognizes and inlines into its callers.
+        let add1_fn = compile(mc, &lambda(&[0], None, add(var(0), q(1)))).unwrap();
+        let mut machine = Machine::new(mc, MIN_SEGMENT, add1_fn, &[]).unwrap();
+        let Outcome::Done(add1_closure) = machine.run(mc).unwrap() else { panic!() };
+        let add1_ops = add1_closure.downcast::<Closure>(mc).unwrap().code(mc).unwrap().ops(mc).unwrap().to_vec();
+        assert!(matches!(add1_ops.as_slice(), [Op::AddImm { a: 1, imm: 1, .. }, Op::Return { .. }]), "{add1_ops:?}");
+        let import_add1 = Global::new(mc, Value::VOID, add1_closure, true).unwrap();
+        // (lambda (x) (add1 (add1 x))) -> two AddImms, no calls.
+        let twice = app(Core::Ref(Place::Import(import_add1)), vec![app(Core::Ref(Place::Import(import_add1)), vec![var(0)])]);
+        let thunk = compile(mc, &lambda(&[0], None, twice)).unwrap();
+        let ops = all_ops(mc, thunk);
+        assert!(!ops.iter().any(|op| matches!(op, Op::Call { .. } | Op::TailCall { .. })), "expected add1 to inline: {ops:?}");
+        assert_eq!(ops.iter().filter(|op| matches!(op, Op::AddImm { imm: 1, .. })).count(), 2, "{ops:?}");
+
+        // 4b. `(+ x k)`, `(+ k x)` and `(- x k)` with an `i16` fixnum `k` compile to `AddImm`;
+        //     anything else stays a call of `+` or `-`.
+        for (expr, imm) in [
+            (add(var(0), q(1)), 1),
+            (add(q(1), var(0)), 1),
+            (prim(Intrinsic::Sub, vec![var(0), q(1)]), -1),
+            (prim(Intrinsic::Sub, vec![var(0), q(-1)]), 1),
+            (add(var(0), q(2)), 2),
+            (prim(Intrinsic::Sub, vec![var(0), q(2)]), -2),
+            (add(var(0), q(i64::from(i16::MAX))), i16::MAX),
+            (prim(Intrinsic::Sub, vec![var(0), q(i64::from(i16::MAX))]), -i16::MAX),
+            (add(var(0), q(i64::from(i16::MIN))), i16::MIN),
+        ] {
+            let thunk = compile(mc, &lambda(&[0], None, expr)).unwrap();
+            let ops = all_ops(mc, thunk);
+            assert!(
+                ops.iter().any(|op| matches!(op, Op::AddImm { imm: i, .. } if *i == imm)),
+                "expected AddImm({imm}): {ops:?}"
+            );
+        }
+        for (expr, want) in [
+            (add(var(0), q(i64::from(i16::MAX) + 1)), Add),
+            (prim(Intrinsic::Sub, vec![var(0), q(i64::from(i16::MIN))]), Add),
+            (prim(Intrinsic::Sub, vec![q(1), var(0)]), Intrinsic::Sub),
+            (prim(Intrinsic::Sub, vec![var(0), q(0)]), Intrinsic::Sub),
+            (add(var(0), var(0)), Add),
+        ] {
+            let thunk = compile(mc, &lambda(&[0], None, expr)).unwrap();
+            let ops = all_ops(mc, thunk);
+            assert!(!ops.iter().any(|op| matches!(op, Op::AddImm { .. })), "expected no AddImm: {ops:?}");
+            assert!(
+                ops.iter().any(|op| matches!(op, Op::TailCallIntrinsic { intrinsic, .. } if *intrinsic == want)),
+                "expected TailCallIntrinsic({want:?}): {ops:?}"
+            );
+        }
+
+        // 4c. A leading effect floats out of an intrinsic's first argument, so the constant behind
+        //     it counts: `(+ (begin (f) 1) x)` compiles to `AddImm`, `(+ (begin (f) 2) 3)` to 5.
+        let effect_first = add(seq(9, app(var(1), vec![]), q(1)), var(0));
+        let ops = all_ops(mc, compile(mc, &lambda(&[0, 1], None, effect_first)).unwrap());
+        assert!(ops.iter().any(|op| matches!(op, Op::AddImm { imm: 1, .. })), "expected AddImm: {ops:?}");
+        assert!(!ops.iter().any(|op| matches!(op, Op::TailCallIntrinsic { intrinsic: Add, .. })), "{ops:?}");
+        let folds = add(seq(9, app(var(1), vec![]), q(2)), q(3));
+        let ops = all_ops(mc, compile(mc, &lambda(&[0, 1], None, folds)).unwrap());
+        assert!(!ops.iter().any(|op| matches!(op, Op::AddImm { .. } | Op::TailCallIntrinsic { intrinsic: Add, .. })), "{ops:?}");
 
         // 5. Store-to-load forwarding on `cadr`/`cons` and `unbox`/`box` eliminates allocations.
         //    (lambda (x y) (+ (cadr (cons x (cons y '()))) (unbox (box 1)))) -> (lambda (x y) (+ y 1))
@@ -431,7 +494,12 @@ fn micropass_optimizations() {
         let ops = all_ops(mc, thunk);
         assert!(!has_box_op(&ops), "expected (unbox (box 1)) to fold away: {ops:?}");
         assert!(
-            !ops.iter().any(|op| matches!(op, Op::CallIntrinsic { intrinsic: Cons | Intrinsic::Cadr, .. })),
+            !ops.iter().any(|op| matches!(
+                op,
+                Op::CallIntrinsic { intrinsic: Cons | Intrinsic::Cadr, .. }
+                    | Op::CallIntrinsic1 { intrinsic: Cons | Intrinsic::Cadr, .. }
+                    | Op::CallIntrinsic2 { intrinsic: Cons | Intrinsic::Cadr, .. }
+            )),
             "expected (cadr (cons x (cons y '()))) to forward without Cons/Cadr: {ops:?}"
         );
 
@@ -501,9 +569,53 @@ fn micropass_optimizations() {
         let ops = all_ops(mc, thunk);
         let pred_calls = ops
             .iter()
-            .filter(|op| matches!(op, Op::CallIntrinsic { intrinsic: Intrinsic::IsProcedure | Intrinsic::IsContinuation, .. }))
+            .filter(|op| {
+                matches!(
+                    op,
+                    Op::CallIntrinsic { intrinsic: Intrinsic::IsProcedure | Intrinsic::IsContinuation, .. }
+                        | Op::CallIntrinsic1 { intrinsic: Intrinsic::IsProcedure | Intrinsic::IsContinuation, .. }
+                        | Op::BranchIntrinsic1 { intrinsic: Intrinsic::IsProcedure | Intrinsic::IsContinuation, .. }
+                )
+            })
             .count();
         assert_eq!(pred_calls, 2, "expected redundant dominating predicate checks to fold away: {ops:?}");
+
+        // 8b. Fused `BranchIntrinsic1`, `CallIntrinsic1`/`2`, and branch inversion compile a
+        //     list-length loop body to 4 instructions with zero `Move`s or `LoadAcc`s.
+        let list_len_loop = lambda(
+            &[0, 1],
+            None,
+            letrec(
+                vec![(
+                    2,
+                    lambda(
+                        &[3, 4],
+                        None,
+                        when(
+                            prim(Intrinsic::IsNull, vec![var(3)]),
+                            var(4),
+                            app(var(2), vec![prim(Intrinsic::Cdr, vec![var(3)]), add(var(4), var(1))]),
+                        ),
+                    ),
+                )],
+                app(var(2), vec![var(0), q(0)]),
+            ),
+        );
+        let thunk = compile(mc, &list_len_loop).unwrap();
+        let ops = all_ops(mc, thunk);
+        assert!(
+            ops.windows(5).any(|w| matches!(
+                w,
+                [
+                    Op::BranchIntrinsic1 { intrinsic: Intrinsic::IsNull, branch_if: true, offset: 3, .. },
+                    Op::CallIntrinsic1 { intrinsic: Intrinsic::Cdr, .. },
+                    Op::CallIntrinsic2 { intrinsic: Add, .. },
+                    Op::Jump { offset: -4 },
+                    Op::Return { .. },
+                ]
+            )),
+            "expected 4-instruction tight loop body followed by Return: {ops:?}"
+        );
     });
 
     // 9. Nested contified loops compile with zero closures and zero calls (two backward `Jump`s).
@@ -574,4 +686,77 @@ fn micropass_optimizations() {
         }),
         Ok(260 * 3)
     );
+
+    // 11. A fused branch whose target is past an `i16` offset recompiles with `JumpIfFalse`.
+    //     ((lambda (x f) (if (null? x) (+ (f) (f) ... 12000 times) 0)) '() (lambda () 1)) -> 12000
+    assert_eq!(
+        number(|_| {
+            let calls = (0..12_000).map(|_| app(var(1), vec![])).collect();
+            let far = lambda(&[0, 1], None, when(prim(Intrinsic::IsNull, vec![var(0)]), prim(Add, calls), q(0)));
+            app(far, vec![Core::Quote(Value::NIL), lambda(&[], None, q(1))])
+        }),
+        Ok(12_000)
+    );
+
+    // 12. The literal list-length loop:
+    //     (lambda (list) (let loop ((xs list) (len 0)) (if (null? xs) len (loop (cdr xs) (+ len 1)))))
+    arena.mutate(|mc| {
+        let body = lambda(
+            &[3, 4],
+            None,
+            when(
+                prim(Intrinsic::IsNull, vec![var(3)]),
+                var(4),
+                app(var(2), vec![prim(Intrinsic::Cdr, vec![var(3)]), add(var(4), q(1))]),
+            ),
+        );
+        let length = lambda(&[0], None, letrec(vec![(2, body)], app(var(2), vec![var(0), q(0)])));
+        let thunk = compile(mc, &length).unwrap();
+        let ops = all_ops(mc, thunk);
+        // The whole loop: fused `null?` test, `cdr` in place, `(+ len 1)` as `AddImm` in place, back-edge.
+        assert!(
+            ops.windows(5).any(|w| matches!(
+                w,
+                [
+                    Op::BranchIntrinsic1 { a: xs, intrinsic: Intrinsic::IsNull, branch_if: true, offset: 3 },
+                    Op::CallIntrinsic1 { dst: xs2, a: xs3, intrinsic: Intrinsic::Cdr },
+                    Op::AddImm { dst: len, a: len2, imm: 1 },
+                    Op::Jump { offset: -4 },
+                    Op::Return { src: len3 },
+                ] if xs == xs2 && xs == xs3 && len == len2 && len == len3
+            )),
+            "expected the 4-instruction list-length loop: {ops:?}"
+        );
+
+        // And it counts: run the compiled `length` on lists of 0, 1, and 1000 elements.
+        let mut machine = Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap();
+        let Outcome::Done(length) = machine.run(mc).unwrap() else { panic!() };
+        let pairs = Pairs::new(mc);
+        for n in [0, 1, 1000] {
+            let list = pairs.list(&(0..n).map(fix).collect::<Vec<_>>()).unwrap();
+            let mut machine = Machine::new(mc, MIN_SEGMENT, length, &[list]).unwrap();
+            let Outcome::Done(len) = machine.run(mc).unwrap() else { panic!() };
+            assert_eq!(len.as_fixnum(), Some(n));
+        }
+    });
+}
+
+#[test]
+fn only_imports_that_just_spread_into_an_intrinsic_inline_as_it() {
+    let mut arena = Arena::new(1 << 24, 0);
+    arena.mutate(|mc| {
+        let run = |thunk| match Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap().run(mc).unwrap() {
+            Outcome::Done(value) => value,
+            _ => panic!(),
+        };
+        let spread = |i| Core::ApplyIntrinsic(Prim::Intrinsic(i), vec![var(0)]);
+        // `(lambda xs (+ . xs))` inlines; `(lambda xs (not (+ . xs)))` and `(lambda xs (car (cons . xs)))`
+        // do more with the result than return it, so they must not.
+        for (body, want) in [(spread(Add), fix(7)), (prim(Not, vec![spread(Add)]), Value::FALSE), (prim(Car, vec![spread(Cons)]), fix(3))] {
+            let closure = run(compile(mc, &lambda(&[], Some(0), body)).unwrap());
+            for defined in [Place::Import(Global::new(mc, Value::VOID, closure, true).unwrap()), Place::Global(Global::new(mc, Value::VOID, closure, true).unwrap())] {
+                assert_eq!(run(compile(mc, &app(Core::Ref(defined), vec![q(3), q(4)])).unwrap()), want);
+            }
+        }
+    });
 }

@@ -56,6 +56,8 @@
 (%define-global - (%lambda xs (%apply-intrinsic - xs)))
 (%define-global * (%lambda xs (%apply-intrinsic * xs)))
 (%define-global / (%lambda xs (%apply-intrinsic / xs)))
+(%define-global add1 (%lambda (z) (%intrinsic + z 1)))
+(%define-global sub1 (%lambda (z) (%intrinsic + z -1)))
 
 (%define-global apply (%lambda (f . args) (%apply-intrinsic apply f args)))
 (%define-global values (%lambda xs (%apply-intrinsic values xs)))

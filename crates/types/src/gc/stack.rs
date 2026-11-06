@@ -14,7 +14,7 @@ use super::{Brand, Desc, Gc, Heap, Items, Mutation, Object, OutOfMemory, Slots, 
 const ATTACHED: u64 = 1 << 32;
 
 /// One segment of a [`Stack`]: a run of value slots in the arena. Its one field holds
-/// [`ATTACHED`] while a stack uses it, and in its low 32 bits, where its ordinary arena slots end.
+/// `ATTACHED` while a stack uses it, and in its low 32 bits, where its ordinary arena slots end.
 pub struct Segment;
 
 impl Object for Segment {

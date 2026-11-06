@@ -43,10 +43,13 @@ pub(crate) fn emit<'gc>(mc: &Mutation<'gc>, l4: &L4<'gc>) -> Result<Value<'gc>, 
     Ok(Value::object(mc, Closure::new(mc, Some(code), 0, Value::VOID)?))
 }
 
-/// Why compiling a function stopped: a real [`CompileError`], or `Spill` when `reg()` first
-/// crosses [`LIMIT`] so the function is recompiled once with a spill register reserved.
+/// Why compiling a function stopped: a real [`CompileError`], `Spill` when `reg()` first
+/// crosses [`LIMIT`] so the function is recompiled once with a spill register reserved, or
+/// `FarBranch` when a fused branch's target is past an `i16` offset, so the function is
+/// recompiled with plain `JumpIfFalse`s.
 enum Stop {
     Spill,
+    FarBranch,
     Error(CompileError),
 }
 
@@ -95,28 +98,32 @@ impl<'a, 'gc> Module<'a, 'gc> {
         captures: &[Capture],
         body: &L4<'gc>,
     ) -> Result<Gc<'gc, Bytecode>, CompileError> {
-        let spill = lambda.is_some_and(|id| self.spills.contains(&id));
+        let mut spill = lambda.is_some_and(|id| self.spills.contains(&id));
+        let mut near = true;
         let (constants, codes) = (self.constants.len(), self.codes.len());
-        match self.attempt(spill, params, rest, captures, body) {
-            Ok(code) => return Ok(code),
-            Err(Stop::Error(e)) => return Err(e),
-            Err(Stop::Spill) => {}
-        }
-        for constant in self.constants.drain(constants..) {
-            self.index.remove(&constant.to_bits());
-        }
-        self.codes.truncate(codes);
-        self.spills.extend(lambda);
-        match self.attempt(true, params, rest, captures, body) {
-            Ok(code) => Ok(code),
-            Err(Stop::Error(e)) => Err(e),
-            Err(Stop::Spill) => unreachable!("a function with a spill never runs out of registers"),
+        loop {
+            match self.attempt(spill, near, params, rest, captures, body) {
+                Ok(code) => return Ok(code),
+                Err(Stop::Error(e)) => return Err(e),
+                Err(Stop::Spill) if !spill => {
+                    spill = true;
+                    self.spills.extend(lambda);
+                }
+                Err(Stop::Spill) => unreachable!("a function with a spill never runs out of registers"),
+                Err(Stop::FarBranch) if near => near = false,
+                Err(Stop::FarBranch) => unreachable!("without fused branches every jump has an i32 offset"),
+            }
+            for constant in self.constants.drain(constants..) {
+                self.index.remove(&constant.to_bits());
+            }
+            self.codes.truncate(codes);
         }
     }
 
     fn attempt(
         &mut self,
         spill: bool,
+        near: bool,
         params: &[Var],
         rest: Option<Var>,
         captures: &[Capture],
@@ -134,6 +141,7 @@ impl<'a, 'gc> Module<'a, 'gc> {
             spill: None,
             slots: Vec::new(),
             spilled: 0,
+            near,
         };
         if spill {
             f.spill = Some(link + 1);
@@ -149,8 +157,8 @@ impl<'a, 'gc> Module<'a, 'gc> {
             let list = ARGS + MAX_PARAMS - 1;
             for &v in &params[keep..] {
                 let r = f.reg()?;
-                f.emit_intrinsic(Intrinsic::Car, list, 1, Want::Reg(r));
-                f.emit_intrinsic(Intrinsic::Cdr, list, 1, Want::Reg(u32::from(list)));
+                f.write(r, |dst| Op::CallIntrinsic1 { dst, a: list, intrinsic: Intrinsic::Car });
+                f.ops.push(Op::CallIntrinsic1 { dst: list, a: list, intrinsic: Intrinsic::Cdr });
                 f.env.insert(v, r);
             }
             f.env.extend(rest.map(|v| (v, u32::from(list))));
@@ -178,6 +186,9 @@ struct Compiler<'m, 'a, 'gc> {
     spill: Option<u8>,
     slots: Vec<u32>,
     spilled: u32,
+    /// Whether to fuse 1- and 2-argument intrinsic tests into `BranchIntrinsic*`, whose offsets
+    /// are `i16`s.
+    near: bool,
 }
 
 impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
@@ -202,17 +213,30 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
                 self.done(u32::from(CLOSURE), want);
             }
             L4::If(test, then, other) => {
-                let t = self.reg()?;
-                self.expr(test, Want::Reg(t))?;
-                self.next = mark;
-                let test_reg = self.read(t);
-
-                let to_other = self.jump(Op::JumpIfFalse { test: test_reg, offset: 0 });
-                self.expr(then, want)?;
-                let to_end = matches!(want, Want::Reg(_)).then(|| self.jump(Op::Jump { offset: 0 }));
-                self.land(to_other);
-                self.expr(other, want)?;
-                to_end.into_iter().for_each(|j| self.land(j));
+                // If `other` is the loop back-edge (`L4::Recur`) and `then` is the loop exit,
+                // invert a 1- or 2-arg intrinsic branch so the hot loop body falls through and
+                // the exit sits after the backward jump.
+                let invert = self.near
+                    && l4_always_recurs(other)
+                    && !l4_always_recurs(then)
+                    && matches!(
+                        test.as_ref(),
+                        L4::Intrinsic(Prim::Intrinsic(_), args) if (1..=2).contains(&args.len())
+                    );
+                let (fallthrough, target) = if invert {
+                    (other.as_ref(), then.as_ref())
+                } else {
+                    (then.as_ref(), other.as_ref())
+                };
+                let to_target = self.branch(test, invert, mark)?;
+                self.expr(fallthrough, want)?;
+                let to_end = (matches!(want, Want::Reg(_)) && !l4_always_recurs(fallthrough))
+                    .then(|| self.jump(Op::Jump { offset: 0 }));
+                self.land(to_target)?;
+                self.expr(target, want)?;
+                if let Some(j) = to_end {
+                    self.land(j)?;
+                }
             }
             L4::Seq(a, b) => {
                 let t = self.reg()?;
@@ -315,26 +339,7 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
             }
             L4::Recur(id, args) => {
                 let (loop_pc, params) = self.loops.get(id).cloned().ok_or(CompileError::Unbound(*id))?;
-                let mut pending = Vec::new();
-                for (i, arg) in args.iter().enumerate() {
-                    let (param_var, param_reg) = params[i];
-                    if *arg == L4::Ref(VarRef::Local(param_var)) {
-                        continue;
-                    }
-                    let read_later = args[i + 1..].iter().any(|later| l4_reads_local(later, param_var));
-                    let clobbers_self = l4_reads_local(arg, param_var)
-                        && !matches!(arg, L4::Intrinsic(_, _) | L4::ApplyIntrinsic(_, _) | L4::App(_, _));
-                    if !read_later && !clobbers_self {
-                        self.expr(arg, Want::Reg(param_reg))?;
-                    } else {
-                        let t = self.reg()?;
-                        self.expr(arg, Want::Reg(t))?;
-                        pending.push((param_reg, t));
-                    }
-                }
-                for (dst, src) in pending {
-                    self.copy(dst, src);
-                }
+                self.emit_recur(&params, args)?;
                 let next_pc = self.ops.len() + 1;
                 let offset = i32::try_from(loop_pc as isize - next_pc as isize)
                     .expect("functions are shorter than 2^31 ops");
@@ -377,7 +382,52 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
                 let argc = self.args(args)?;
                 self.call(base, argc, want)?;
             }
+            L4::Intrinsic(Prim::Intrinsic(Intrinsic::Add), args)
+                if let [x, L4::Quote(k)] = args.as_slice()
+                    && let Some(imm) = k.as_fixnum().and_then(|k| i16::try_from(k).ok()) =>
+            {
+                let v = self.arg_vreg(x)?;
+                let a = self.arg_reg(v, 0);
+                let t = self.into(want)?;
+                self.write(t, |dst| Op::AddImm { dst, a, imm });
+                if let Want::Tail = want {
+                    let src = self.read(t);
+                    self.ops.push(Op::Return { src });
+                }
+            }
             L4::Intrinsic(prim, args) => {
+                if let (Prim::Intrinsic(intrinsic), Want::Reg(dst)) = (*prim, want) {
+                    match args.as_slice() {
+                        [a0] => {
+                            let v0 = self.arg_vreg(a0)?;
+                            let a = self.arg_reg(v0, 0);
+                            self.write(dst, |dst| Op::CallIntrinsic1 { dst, a, intrinsic });
+                            self.next = mark;
+                            return Ok(());
+                        }
+                        [a0, a1] => {
+                            let v0 = self.arg_vreg(a0)?;
+                            let v1 = self.arg_vreg(a1)?;
+                            let a = self.arg_reg(v0, 0);
+                            let b = self.arg_reg(v1, 1);
+                            self.write(dst, |dst| Op::CallIntrinsic2 { dst, a, b, intrinsic });
+                            self.next = mark;
+                            return Ok(());
+                        }
+                        [a0, a1, a2] => {
+                            let v0 = self.arg_vreg(a0)?;
+                            let v1 = self.arg_vreg(a1)?;
+                            let v2 = self.arg_vreg(a2)?;
+                            let a = self.arg_reg(v0, 0);
+                            let b = self.arg_reg(v1, 1);
+                            let c = self.arg_reg(v2, 2);
+                            self.write(dst, |dst| Op::CallIntrinsic3 { dst, a, b, c, intrinsic });
+                            self.next = mark;
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                }
                 let argc = args.len();
                 let base = self.layout_prim_args(*prim, args)?;
                 match *prim {
@@ -614,12 +664,188 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
         }
         for i in (0..n as u32).rev() {
             self.fetch(base + i, SCRATCH);
-            self.ops.extend([
-                Op::CallIntrinsic { base: SCRATCH, args: 2, intrinsic: Intrinsic::Cons },
-                Op::LoadAcc { dst: list },
-            ]);
+            self.ops.push(Op::CallIntrinsic2 { dst: list, a: SCRATCH, b: list, intrinsic: Intrinsic::Cons });
         }
         Ok(list)
+    }
+
+    fn branch(&mut self, test: &L4<'gc>, branch_if: bool, mark: VReg) -> Result<usize, Stop> {
+        if self.near
+            && let L4::Intrinsic(Prim::Intrinsic(intrinsic), args) = test
+        {
+            match args.as_slice() {
+                [a0] => {
+                    let v0 = self.arg_vreg(a0)?;
+                    let a = self.arg_reg(v0, 0);
+                    self.next = mark;
+                    return Ok(self.jump(Op::BranchIntrinsic1 { a, intrinsic: *intrinsic, branch_if, offset: 0 }));
+                }
+                [a0, a1] => {
+                    let v0 = self.arg_vreg(a0)?;
+                    let v1 = self.arg_vreg(a1)?;
+                    let a = self.arg_reg(v0, 0);
+                    let b = self.arg_reg(v1, 1);
+                    self.next = mark;
+                    return Ok(self.jump(Op::BranchIntrinsic2 { a, b, intrinsic: *intrinsic, branch_if, offset: 0 }));
+                }
+                _ => {}
+            }
+        }
+        debug_assert!(!branch_if, "JumpIfFalse only branches on false");
+        let t = self.reg()?;
+        self.expr(test, Want::Reg(t))?;
+        self.next = mark;
+        let test_reg = self.read(t);
+        Ok(self.jump(Op::JumpIfFalse { test: test_reg, offset: 0 }))
+    }
+
+    fn arg_vreg(&mut self, arg: &L4<'gc>) -> Result<VReg, Stop> {
+        match arg {
+            L4::Ref(VarRef::Local(v)) => Ok(self.loc(*v)?),
+            L4::Ref(VarRef::SelfClosure) => Ok(u32::from(CLOSURE)),
+            _ => {
+                let r = self.reg()?;
+                self.expr(arg, Want::Reg(r))?;
+                Ok(r)
+            }
+        }
+    }
+
+    fn arg_reg(&mut self, v: VReg, scratch_offset: u8) -> u8 {
+        match self.spot(v) {
+            Spot::Reg(r) => r,
+            Spot::Slot(slot) => {
+                let dst = SCRATCH + scratch_offset;
+                let spill = self.spill_reg();
+                self.ops.push(Op::LoadSpill { dst, spill, slot });
+                dst
+            }
+        }
+    }
+
+    fn emit_recur(&mut self, params: &[(Var, VReg)], args: &[L4<'gc>]) -> Result<(), Stop> {
+        let n = args.len();
+        let mut pending: Vec<(VReg, VReg)> = Vec::new();
+        let mut can_fuse = false;
+
+        if args.iter().all(l4_is_reorderable) {
+            let mut done = vec![false; n];
+            for i in 0..n {
+                if args[i] == L4::Ref(VarRef::Local(params[i].0)) {
+                    done[i] = true;
+                }
+            }
+            loop {
+                // 1. Evaluate any argument whose target parameter is not read by any remaining
+                //    undone argument directly into its parameter register.
+                let mut progressed = false;
+                for i in 0..n {
+                    if done[i] {
+                        continue;
+                    }
+                    let (param_var, param_reg) = params[i];
+                    let read_by_other = (0..n).any(|j| !done[j] && j != i && l4_reads_local(&args[j], param_var));
+                    if !read_by_other && !l4_clobbers_self(&args[i], param_var) {
+                        if let L4::Ref(VarRef::Local(src_var)) = args[i] {
+                            let src_reg = self.loc(src_var)?;
+                            self.copy_fused(param_reg, src_reg, &mut can_fuse);
+                        } else {
+                            self.expr(&args[i], Want::Reg(param_reg))?;
+                            can_fuse = false;
+                        }
+                        done[i] = true;
+                        progressed = true;
+                    }
+                }
+                if progressed {
+                    continue;
+                }
+                if done.iter().all(|&d| d) {
+                    break;
+                }
+                // 2. Direct 2-register swap cycle `(p_i <- p_j, p_j <- p_i)` with no temp register.
+                let mut swapped = false;
+                for i in 0..n {
+                    if done[i] {
+                        continue;
+                    }
+                    if let L4::Ref(VarRef::Local(vj)) = args[i]
+                        && let Some(j) = (i + 1..n).find(|&j| !done[j] && params[j].0 == vj)
+                        && args[j] == L4::Ref(VarRef::Local(params[i].0))
+                        && !(0..n).any(|k| !done[k] && k != i && k != j && (l4_reads_local(&args[k], params[i].0) || l4_reads_local(&args[k], params[j].0)))
+                        && let (Spot::Reg(ri), Spot::Reg(rj)) = (self.spot(params[i].1), self.spot(params[j].1))
+                    {
+                        self.ops.push(Op::Move2 { dst1: ri, src1: rj, dst2: rj, src2: ri });
+                        can_fuse = false;
+                        done[i] = true;
+                        done[j] = true;
+                        swapped = true;
+                        break;
+                    }
+                }
+                if swapped {
+                    continue;
+                }
+                // 3. Break a dependency cycle by evaluating one undone argument into a fresh temp
+                //    register (preferring a non-`Ref` expression so no extra `Move` is needed).
+                let pick = (0..n)
+                    .find(|&i| !done[i] && !matches!(args[i], L4::Ref(VarRef::Local(_))))
+                    .or_else(|| (0..n).find(|&i| !done[i]))
+                    .expect("checked at least one undone arg");
+                let t = self.reg()?;
+                self.expr(&args[pick], Want::Reg(t))?;
+                can_fuse = false;
+                pending.push((params[pick].1, t));
+                done[pick] = true;
+            }
+        } else {
+            for (i, arg) in args.iter().enumerate() {
+                let (param_var, param_reg) = params[i];
+                if *arg == L4::Ref(VarRef::Local(param_var)) {
+                    continue;
+                }
+                let read_later = args[i + 1..].iter().any(|later| l4_reads_local(later, param_var));
+                if !read_later && !l4_clobbers_self(arg, param_var) {
+                    if let L4::Ref(VarRef::Local(src_var)) = *arg {
+                        let src_reg = self.loc(src_var)?;
+                        self.copy_fused(param_reg, src_reg, &mut can_fuse);
+                    } else {
+                        self.expr(arg, Want::Reg(param_reg))?;
+                        can_fuse = false;
+                    }
+                } else {
+                    let t = self.reg()?;
+                    self.expr(arg, Want::Reg(t))?;
+                    can_fuse = false;
+                    pending.push((param_reg, t));
+                }
+            }
+        }
+
+        for (dst, src) in pending {
+            self.copy_fused(dst, src, &mut can_fuse);
+        }
+        Ok(())
+    }
+
+    fn copy_fused(&mut self, dst: VReg, src: VReg, can_fuse: &mut bool) {
+        if dst == src {
+            return;
+        }
+        if *can_fuse
+            && let (Spot::Reg(d2), Spot::Reg(s2)) = (self.spot(dst), self.spot(src))
+            && let Some(Op::Move { dst: d1, src: s1 }) = self.ops.last().copied()
+            && d1 != d2
+            && s2 != d1
+        {
+            if let Some(last) = self.ops.last_mut() {
+                *last = Op::Move2 { dst1: d1, src1: s1, dst2: d2, src2: s2 };
+            }
+            *can_fuse = false;
+            return;
+        }
+        self.copy(dst, src);
+        *can_fuse = matches!((self.spot(dst), self.spot(src)), (Spot::Reg(_), Spot::Reg(_)));
     }
 
     fn load(&mut self, dst: VReg, value: Value<'gc>) -> Result<(), Stop> {
@@ -730,12 +956,61 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
         self.ops.len() - 1
     }
 
-    fn land(&mut self, at: usize) {
-        let offset = i32::try_from(self.ops.len() - at - 1).expect("functions are shorter than 2^31 ops");
+    fn land(&mut self, at: usize) -> Result<(), Stop> {
+        let rel = self.ops.len() - at - 1;
         match &mut self.ops[at] {
-            Op::Jump { offset: o } | Op::JumpIfFalse { offset: o, .. } => *o = offset,
+            Op::Jump { offset: o } | Op::JumpIfFalse { offset: o, .. } => {
+                *o = i32::try_from(rel).expect("functions are shorter than 2^31 ops");
+            }
+            Op::BranchIntrinsic1 { offset: o, .. } | Op::BranchIntrinsic2 { offset: o, .. } => {
+                *o = i16::try_from(rel).map_err(|_| Stop::FarBranch)?;
+            }
             _ => unreachable!("only jumps are landed"),
         }
+        Ok(())
+    }
+}
+
+fn l4_always_recurs<'gc>(expr: &L4<'gc>) -> bool {
+    match expr {
+        L4::Recur(_, _) => true,
+        L4::Seq(_, b) | L4::Let(_, b) | L4::Fix(_, b) => l4_always_recurs(b),
+        L4::If(_, then, other) => l4_always_recurs(then) && l4_always_recurs(other),
+        _ => false,
+    }
+}
+
+fn l4_clobbers_self<'gc>(arg: &L4<'gc>, param_var: Var) -> bool {
+    l4_reads_local(arg, param_var)
+        && !matches!(arg, L4::Intrinsic(_, _) | L4::ApplyIntrinsic(_, _) | L4::App(_, _))
+}
+
+fn l4_is_reorderable<'gc>(expr: &L4<'gc>) -> bool {
+    match expr {
+        L4::Quote(_) | L4::Ref(_) | L4::Lambda(_) => true,
+        L4::If(a, b, c) => l4_is_reorderable(a) && l4_is_reorderable(b) && l4_is_reorderable(c),
+        L4::Seq(a, b) => l4_is_reorderable(a) && l4_is_reorderable(b),
+        L4::Let(binds, body) => {
+            binds.iter().all(|(_, init)| l4_is_reorderable(init)) && l4_is_reorderable(body)
+        }
+        L4::Intrinsic(Prim::Intrinsic(i), args) => {
+            (i.is_discardable()
+                || matches!(
+                    i,
+                    Intrinsic::Add
+                        | Intrinsic::Sub
+                        | Intrinsic::Mul
+                        | Intrinsic::Car
+                        | Intrinsic::Cdr
+                        | Intrinsic::Caar
+                        | Intrinsic::Cadr
+                        | Intrinsic::Cdar
+                        | Intrinsic::Cddr
+                        | Intrinsic::Unbox
+                ))
+                && args.iter().all(l4_is_reorderable)
+        }
+        _ => false,
     }
 }
 

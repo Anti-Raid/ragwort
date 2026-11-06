@@ -22,12 +22,18 @@ named! {
     pub enum Op {
         /// Move contents of register `src` to `dst`
         Move { dst: u8, src: u8 } = "move",
+        /// Moves `(src1, src2)` to `(dst1, dst2)` in parallel.
+        Move2 { dst1: u8, src1: u8, dst2: u8, src2: u8 } = "move2",
         /// Loads constant `index` of the constant pool
         LoadConst { dst: u8, index: u32 } = "load-const",
         /// Jump to offset `offset`
         Jump { offset: i32 } = "jump",
         /// Jumps to offset `offset` if register `test` holds `#f`.
         JumpIfFalse { test: u8, offset: i32 } = "jump-if-false",
+        /// Runs 1-argument `intrinsic` on register `a` and jumps to `offset` if `(result != #f) == branch_if`.
+        BranchIntrinsic1 { a: u8, intrinsic: Intrinsic, branch_if: bool, offset: i16 } = "branch-intrinsic1",
+        /// Runs 2-argument `intrinsic` on registers `(a, b)` and jumps to `offset` if `(result != #f) == branch_if`.
+        BranchIntrinsic2 { a: u8, b: u8, intrinsic: Intrinsic, branch_if: bool, offset: i16 } = "branch-intrinsic2",
         /// Calls the procedure in register `base` with the `args` registers after it, in a frame
         /// starting at `base`, as laid out in [`crate::frame`]: the callee's frame overlaps its
         /// caller's, so the arguments are already where it reads them. Anything the caller needs
@@ -53,6 +59,16 @@ named! {
         /// accumulator as a call does, and goes on. The compiler emits it for a primitive that can't
         /// have been rebound, so an intrinsic can take fast paths, such as adding fixnums in place.
         CallIntrinsic { base: u8, args: u8, intrinsic: Intrinsic } = "call-intrinsic",
+        /// Runs 1-argument `intrinsic` on register `a` and stores its result in `dst`.
+        CallIntrinsic1 { dst: u8, a: u8, intrinsic: Intrinsic } = "call-intrinsic1",
+        /// Runs 2-argument `intrinsic` on registers `(a, b)` and stores its result in `dst`.
+        CallIntrinsic2 { dst: u8, a: u8, b: u8, intrinsic: Intrinsic } = "call-intrinsic2",
+        /// Adds the constant `imm` to register `a` and stores the sum in `dst`: fixnums in place,
+        /// anything else by the generic add, as `(+ a imm)`. The compiler emits it for `(+ x k)`
+        /// and `(- x k)` with a small fixnum `k`, so the constant needs no register.
+        AddImm { dst: u8, a: u8, imm: i16 } = "add-imm",
+        /// Runs 3-argument `intrinsic` on registers `(a, b, c)` and stores its result in `dst`.
+        CallIntrinsic3 { dst: u8, a: u8, b: u8, c: u8, intrinsic: Intrinsic } = "call-intrinsic3",
         /// Runs `intrinsic` like `CallIntrinsic`, then returns its result. A built-in used as a value
         /// is a closure whose code is just this.
         TailCallIntrinsic { base: u8, args: u8, intrinsic: Intrinsic } = "tail-call-intrinsic",
@@ -221,11 +237,34 @@ impl Op {
         let (mc, frame) = (cx.mc, cx.frame);
         match self {
             Op::Move { dst, src } => frame.set(dst, frame.get(src)),
+            Op::Move2 { dst1, src1, dst2, src2 } => {
+                let (v1, v2) = (frame.get(src1), frame.get(src2));
+                frame.set(dst1, v1);
+                frame.set(dst2, v2);
+            }
             Op::LoadConst { dst, index } => frame.set(dst, cx.constants.get(mc, index).ok_or(Fault::Malformed)?),
             Op::Jump { offset } => return Ok(Control::Jump(offset)),
             Op::JumpIfFalse { test, offset } => {
                 if frame.get(test) == Value::FALSE {
                     return Ok(Control::Jump(offset));
+                }
+            }
+            Op::BranchIntrinsic1 { a, intrinsic, branch_if, offset } => {
+                if intrinsic.arity().is_some_and(|n| n != 1) {
+                    return Err(Fault::Malformed);
+                }
+                let val = intrinsic.exec1(mc, frame, a, &mut cx.fuel)?;
+                if (val != Value::FALSE) == branch_if {
+                    return Ok(Control::Jump(i32::from(offset)));
+                }
+            }
+            Op::BranchIntrinsic2 { a, b, intrinsic, branch_if, offset } => {
+                if intrinsic.arity().is_some_and(|n| n != 2) {
+                    return Err(Fault::Malformed);
+                }
+                let val = intrinsic.exec2(mc, frame, a, b, &mut cx.fuel)?;
+                if (val != Value::FALSE) == branch_if {
+                    return Ok(Control::Jump(i32::from(offset)));
                 }
             }
             Op::Call { base, args } => return Ok(Control::Call { base, args }),
@@ -282,6 +321,35 @@ impl Op {
                 if matches!(self, Op::TailCallIntrinsic { .. }) {
                     return Ok(Control::Return);
                 }
+            }
+            Op::CallIntrinsic1 { dst, a, intrinsic } => {
+                if intrinsic.arity().is_some_and(|n| n != 1) {
+                    return Err(Fault::Malformed);
+                }
+                let val = intrinsic.exec1(mc, frame, a, &mut cx.fuel)?;
+                frame.set(dst, val);
+            }
+            Op::CallIntrinsic2 { dst, a, b, intrinsic } => {
+                if intrinsic.arity().is_some_and(|n| n != 2) {
+                    return Err(Fault::Malformed);
+                }
+                let val = intrinsic.exec2(mc, frame, a, b, &mut cx.fuel)?;
+                frame.set(dst, val);
+            }
+            Op::AddImm { dst, a, imm } => {
+                let (x, k) = (frame.get(a), Value::fixnum(i64::from(imm)).ok_or(Fault::Malformed)?);
+                let sum = match x.fixnum_add(k) {
+                    Some(sum) => sum,
+                    None => Intrinsic::Add.run(mc, &[x, k], &mut cx.fuel)?,
+                };
+                frame.set(dst, sum);
+            }
+            Op::CallIntrinsic3 { dst, a, b, c, intrinsic } => {
+                if intrinsic.arity().is_some_and(|n| n != 3) {
+                    return Err(Fault::Malformed);
+                }
+                let val = intrinsic.exec3(mc, frame, a, b, c, &mut cx.fuel)?;
+                frame.set(dst, val);
             }
             Op::CallRequest { base, args, request } | Op::TailCallRequest { base, args, request } => {
                 if usize::from(base) + usize::from(args) > 256 || !request.takes(usize::from(args)) {

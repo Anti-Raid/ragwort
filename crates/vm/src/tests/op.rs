@@ -12,6 +12,13 @@ fn fix<'gc>(n: i64) -> Value<'gc> {
     Value::fixnum(n).unwrap()
 }
 
+/// `op.step(cx)` out of line: `step` inlines every intrinsic's body, and a debug build gives each
+/// inlined copy its own stack, so a test that steps many ops inline overflows the thread's stack.
+#[inline(never)]
+fn step<'gc>(op: Op, cx: &mut Context<'_, 'gc>) -> Result<Control, Fault> {
+    op.step(cx)
+}
+
 #[test]
 fn steps_run_against_the_frame() {
     let mut arena = Arena::new(1 << 20, 0);
@@ -23,25 +30,69 @@ fn steps_run_against_the_frame() {
         let upvalues = vectors.from_slice(&[Value::TRUE]).unwrap().items(mc);
         let mut cx = Context { mc, frame, constants, upvalues, acc: Value::VOID, fuel: Fuel { run: u64::MAX, rest: 0 } };
 
-        assert_eq!(Op::LoadConst { dst: 0, index: 0 }.step(&mut cx), Ok(Control::Next));
-        assert_eq!(Op::Move { dst: 1, src: 0 }.step(&mut cx), Ok(Control::Next));
+        assert_eq!(step(Op::LoadConst { dst: 0, index: 0 }, &mut cx), Ok(Control::Next));
+        assert_eq!(step(Op::Move { dst: 1, src: 0 }, &mut cx), Ok(Control::Next));
         assert_eq!(frame.get(1), fix(7));
+        frame.set(2, fix(9));
+        assert_eq!(step(Op::Move2 { dst1: 1, src1: 2, dst2: 2, src2: 1 }, &mut cx), Ok(Control::Next));
+        assert_eq!((frame.get(1), frame.get(2)), (fix(9), fix(7)));
+        assert_eq!(step(Op::Move { dst: 1, src: 0 }, &mut cx), Ok(Control::Next));
 
         frame.set(2, Value::FALSE);
-        assert_eq!(Op::JumpIfFalse { test: 1, offset: 5 }.step(&mut cx), Ok(Control::Next));
-        assert_eq!(Op::JumpIfFalse { test: 2, offset: -3 }.step(&mut cx), Ok(Control::Jump(-3)));
-        assert_eq!(Op::Jump { offset: 9 }.step(&mut cx), Ok(Control::Jump(9)));
+        assert_eq!(step(Op::JumpIfFalse { test: 1, offset: 5 }, &mut cx), Ok(Control::Next));
+        assert_eq!(step(Op::JumpIfFalse { test: 2, offset: -3 }, &mut cx), Ok(Control::Jump(-3)));
+        assert_eq!(step(Op::Jump { offset: 9 }, &mut cx), Ok(Control::Jump(9)));
+        assert_eq!(
+            step(Op::BranchIntrinsic1 { a: 2, intrinsic: Intrinsic::IsBoolean, branch_if: true, offset: 4 }, &mut cx),
+            Ok(Control::Jump(4))
+        );
+        assert_eq!(
+            step(Op::BranchIntrinsic1 { a: 2, intrinsic: Intrinsic::IsBoolean, branch_if: false, offset: 4 }, &mut cx),
+            Ok(Control::Next)
+        );
+        assert_eq!(
+            step(Op::BranchIntrinsic2 { a: 0, b: 1, intrinsic: Intrinsic::Eq, branch_if: true, offset: -2 }, &mut cx),
+            Ok(Control::Jump(-2))
+        );
+        assert_eq!(
+            step(Op::CallIntrinsic2 { dst: 4, a: 0, b: 1, intrinsic: Intrinsic::Add }, &mut cx),
+            Ok(Control::Next)
+        );
+        assert_eq!(frame.get(4), fix(14));
+        assert_eq!(
+            step(Op::CallIntrinsic1 { dst: 5, a: 4, intrinsic: Intrinsic::Sub }, &mut cx),
+            Ok(Control::Next)
+        );
+        assert_eq!(frame.get(5), fix(-14));
+        assert_eq!(
+            step(Op::CallIntrinsic3 { dst: 6, a: 0, b: 1, c: 4, intrinsic: Intrinsic::Add }, &mut cx),
+            Ok(Control::Next)
+        );
+        assert_eq!(frame.get(6), fix(28));
+        // `AddImm`: fixnums in place, past the fixnum edge by the generic add, and faulting on
+        // non-numbers.
+        assert_eq!(step(Op::AddImm { dst: 7, a: 4, imm: -20 }, &mut cx), Ok(Control::Next));
+        assert_eq!(frame.get(7), fix(-6));
+        assert_eq!(step(Op::AddImm { dst: 7, a: 7, imm: i16::MAX }, &mut cx), Ok(Control::Next));
+        assert_eq!(frame.get(7), fix(i64::from(i16::MAX) - 6));
+        frame.set(8, fix(Value::MAX_FIXNUM));
+        assert_eq!(step(Op::AddImm { dst: 9, a: 8, imm: 1 }, &mut cx), Ok(Control::Next));
+        assert!(frame.get(9).as_fixnum().is_none() && ragwort_types::num::Nums::new(mc).number(frame.get(9)).is_some());
+        assert_eq!(step(Op::AddImm { dst: 9, a: 9, imm: -1 }, &mut cx), Ok(Control::Next));
+        assert_eq!(frame.get(9), fix(Value::MAX_FIXNUM));
+        frame.set(10, Value::TRUE);
+        assert_eq!(step(Op::AddImm { dst: 11, a: 10, imm: 1 }, &mut cx), Err(Fault::WrongType));
 
-        Op::LoadUpvalue { dst: 3, index: 0 }.step(&mut cx).unwrap();
+        step(Op::LoadUpvalue { dst: 3, index: 0 }, &mut cx).unwrap();
         assert_eq!(frame.get(3), Value::TRUE);
 
-        assert_eq!(Op::Return { src: 0 }.step(&mut cx), Ok(Control::Return));
-        Op::LoadAcc { dst: 7 }.step(&mut cx).unwrap();
+        assert_eq!(step(Op::Return { src: 0 }, &mut cx), Ok(Control::Return));
+        step(Op::LoadAcc { dst: 7 }, &mut cx).unwrap();
         assert_eq!((cx.acc, frame.get(7)), (fix(7), fix(7)));
 
-        assert_eq!(Op::Call { base: 8, args: 2 }.step(&mut cx), Ok(Control::Call { base: 8, args: 2 }));
+        assert_eq!(step(Op::Call { base: 8, args: 2 }, &mut cx), Ok(Control::Call { base: 8, args: 2 }));
         let request = Op::TailCallRequest { base: 8, args: 1, request: Request::Abort };
-        assert_eq!(request.step(&mut cx), Ok(Control::TailCallRequest { base: 8, args: 1, request: Request::Abort, spread: false }));
+        assert_eq!(step(request, &mut cx), Ok(Control::TailCallRequest { base: 8, args: 1, request: Request::Abort, spread: false }));
     });
 }
 
@@ -60,9 +111,14 @@ fn malformed_bytecode_faults() {
             Op::CallRequest { base: 1, args: 1, request: Request::MarkValue },
             Op::TailCallRequest { base: 1, args: 3, request: Request::Capture },
             Op::CallRequest { base: 1, args: 1, request: Request::Apply },
+            Op::CallIntrinsic1 { dst: 1, a: 0, intrinsic: Intrinsic::Cons },
+            Op::CallIntrinsic2 { dst: 1, a: 0, b: 0, intrinsic: Intrinsic::Car },
+            Op::CallIntrinsic3 { dst: 1, a: 0, b: 0, c: 0, intrinsic: Intrinsic::Cons },
+            Op::BranchIntrinsic1 { a: 0, intrinsic: Intrinsic::Cons, branch_if: true, offset: 1 },
+            Op::BranchIntrinsic2 { a: 0, b: 0, intrinsic: Intrinsic::Car, branch_if: true, offset: 1 },
         ];
         for op in [Op::LoadConst { dst: 1, index: 0 }, Op::LoadUpvalue { dst: 1, index: 0 }].into_iter().chain(requests) {
-            assert_eq!(op.step(&mut cx), Err(Fault::Malformed), "{op:?}");
+            assert_eq!(step(op, &mut cx), Err(Fault::Malformed), "{op:?}");
         }
     });
 }
@@ -89,7 +145,7 @@ fn closures_capture_registers_upvalues_and_each_other() {
         let mut cx = Context { mc, frame, constants, upvalues, acc: Value::VOID, fuel: Fuel { run: u64::MAX, rest: 0 } };
 
         frame.set(0, fix(5));
-        assert_eq!(Op::NewClosure { dst: 1, count: 2, code: 1 }.step(&mut cx), Ok(Control::Next));
+        assert_eq!(step(Op::NewClosure { dst: 1, count: 2, code: 1 }, &mut cx), Ok(Control::Next));
         let items = |r: u8| {
             let upvalues = frame.get(r).downcast::<objects::Closure>(mc).unwrap().items(mc);
             (0..upvalues.len()).map(|i| upvalues.get(i)).collect::<Vec<_>>()
@@ -103,7 +159,7 @@ fn closures_capture_registers_upvalues_and_each_other() {
             Op::NewClosure { dst: 255, count: 2, code: 1 },
             Op::NewClosure { dst: 1, count: 2, code: u32::MAX },
         ] {
-            assert_eq!(op.step(&mut cx), Err(Fault::Malformed), "{op:?}");
+            assert_eq!(step(op, &mut cx), Err(Fault::Malformed), "{op:?}");
         }
     });
 }

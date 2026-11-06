@@ -2,7 +2,7 @@
 //!
 //! Each pass either transforms an IR within the same grammar (`cp0: L2 -> L2`) or reduces the
 //! grammar by eliminating forms:
-//! - [`Core`] (`L0`): input from the expander/lowerer.
+//! - [`Core`](crate::Core) (`L0`): input from the expander/lowerer.
 //! - [`L1`]: globals (`DefineGlobal`, `Place::Global`, `Place::Import`) lowered to intrinsics and
 //!   constants; all variables are lexical [`Var`]s.
 //! - [`L2`]: `Letrec` eliminated via Waddell–Sarkar–Dybvig fixing in favor of `Let`, `Fix`

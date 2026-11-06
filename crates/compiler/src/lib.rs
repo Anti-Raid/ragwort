@@ -1,20 +1,20 @@
-//! A Chez-style micropass compiler from [`Core`] forms to [` ragwort_vm`]'s [`Bytecode`].
+//! A Chez-style micropass compiler from [`Core`] forms to [`ragwort_vm`]'s [`Bytecode`](ragwort_vm::objects::Bytecode).
 //!
 //! Each pass either simplifies within an intermediate representation or reduces the grammar by
 //! eliminating forms:
-//! 1. [`lower`]: validates [`Core`] and lowers `DefineGlobal`, `Place::Global`, and
+//! 1. `lower`: validates [`Core`] and lowers `DefineGlobal`, `Place::Global`, and
 //!    `Place::Import` to explicit intrinsics and constants, producing [`ir::L1`].
-//! 2. [`letrec`]: Waddell–Sarkar–Dybvig `letrec` / `letrec*` fixing (`L1 -> L2`), replacing
+//! 2. `letrec`: Waddell–Sarkar–Dybvig `letrec` / `letrec*` fixing (`L1 -> L2`), replacing
 //!    `Letrec` with `Let`, `Fix` (SCCs of unassigned mutually recursive lambdas), `Seq`, and `Set`.
-//! 3. [`cp0`]: source-level optimizer (`L2 -> L2`) performing copy/constant propagation, prelude
+//! 3. `cp0`: source-level optimizer (`L2 -> L2`) performing copy/constant propagation, prelude
 //!    procedure call lowering, pure intrinsic constant folding, beta-reduction, local procedure
 //!    inlining, conditional simplification, and dead-binding elimination.
-//! 4. [`assign`]: assignment conversion (`L2 -> L3`), rewriting only mutated (`Set`) variables into
+//! 4. `assign`: assignment conversion (`L2 -> L3`), rewriting only mutated (`Set`) variables into
 //!    explicit `MakeBox` / `Unbox` / `SetBox` intrinsics so all variables in [`ir::L3`] are
 //!    immutable.
-//! 5. [`closure`]: closure conversion (`L3 -> L4`), resolving lexical references into
+//! 5. `closure`: closure conversion (`L3 -> L4`), resolving lexical references into
 //!    [`ir::VarRef::Local`] vs [`ir::VarRef::Upvalue`] and computing each closure's capture table.
-//! 6. [`codegen`]: scoped virtual register allocation and bytecode emission (`L4 -> Closure`).
+//! 6. `codegen`: scoped virtual register allocation and bytecode emission (`L4 -> Closure`).
 
 mod assign;
 mod closure;

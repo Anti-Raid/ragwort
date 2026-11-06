@@ -33,6 +33,7 @@ pub(crate) fn optimize<'gc>(mc: &Mutation<'gc>, expr: L2<'gc>, supply: Supply) -
     let mut pass = Cp0 {
         mc,
         supply,
+        uses: count_uses(&expr),
         used,
         assigned,
         subst: HashMap::new(),
@@ -46,6 +47,14 @@ pub(crate) fn optimize<'gc>(mc: &Mutation<'gc>, expr: L2<'gc>, supply: Supply) -
     (out, pass.supply)
 }
 
+/// A branch of an `if`: source still to optimize, or an `if` whose test is already optimized,
+/// as splitting `(if (if a b #f) ...)` makes, so `b` isn't optimized twice.
+#[derive(Clone)]
+enum Arm<'gc> {
+    Raw(L2<'gc>),
+    If(L2<'gc>, Box<Arm<'gc>>, Box<Arm<'gc>>),
+}
+
 #[derive(Clone, Copy)]
 enum Subst<'gc> {
     Quote(Value<'gc>),
@@ -55,6 +64,9 @@ enum Subst<'gc> {
 struct Cp0<'a, 'gc> {
     mc: &'a Mutation<'gc>,
     supply: Supply,
+    /// How each variable of the input is used. Variables are unique, so these are also its uses
+    /// in the body of the one binding form that binds it.
+    uses: HashMap<Var, UseStats>,
     used: HashSet<Var>,
     assigned: HashSet<Var>,
     subst: HashMap<Var, Subst<'gc>>,
@@ -80,14 +92,14 @@ impl<'gc> Cp0<'_, 'gc> {
             },
             L2::If(test, then, other) => {
                 let test = self.expr(*test);
-                self.simplify_if(test, *then, *other)
+                self.simplify_if(test, Arm::Raw(*then), Arm::Raw(*other))
             }
             L2::Seq(a, b) => {
                 let a = self.expr(*a);
                 let b = self.expr(*b);
                 L2::seq(a, b)
             }
-            L2::Let(binds, body) => self.opt_let(binds, *body),
+            L2::Let(binds, body) => self.opt_let(binds, false, *body),
             L2::Fix(binds, body) => self.opt_fix(binds, *body),
             L2::Set(v, value) => {
                 let value = self.expr(*value);
@@ -100,11 +112,7 @@ impl<'gc> Cp0<'_, 'gc> {
                 }
                 L2::Set(target, Box::new(value))
             }
-            L2::App(f, args) => {
-                let f = self.expr(*f);
-                let args: Vec<L2<'gc>> = args.into_iter().map(|a| self.expr(a)).collect();
-                self.opt_app(f, args)
-            }
+            L2::App(f, args) => self.app(*f, args),
             L2::Lambda(f) => L2::Lambda(self.opt_func(f)),
             L2::Intrinsic(prim, args) => {
                 let args: Vec<L2<'gc>> = args.into_iter().map(|a| self.expr(a)).collect();
@@ -121,21 +129,29 @@ impl<'gc> Cp0<'_, 'gc> {
         Func { id: f.id, params: f.params, rest: f.rest, body: Box::new(self.expr(*f.body)) }
     }
 
-    fn simplify_if(&mut self, test: L2<'gc>, then: L2<'gc>, other: L2<'gc>) -> L2<'gc> {
+    fn arm(&mut self, arm: Arm<'gc>) -> L2<'gc> {
+        match arm {
+            Arm::Raw(e) => self.expr(e),
+            Arm::If(test, then, other) => self.simplify_if(test, *then, *other),
+        }
+    }
+
+    /// `(if test then other)` with `test` already optimized.
+    fn simplify_if(&mut self, test: L2<'gc>, then: Arm<'gc>, other: Arm<'gc>) -> L2<'gc> {
         match test {
             // (if #f then other) -> other; (if <non-#f-const> then other) -> then
             L2::Quote(v) => {
                 if v == Value::FALSE {
-                    self.expr(other)
+                    self.arm(other)
                 } else {
-                    self.expr(then)
+                    self.arm(then)
                 }
             }
             // Known truthy variable from an enclosing dominating `if` test.
-            L2::Ref(v) if self.truthy_vars.contains(&v) => self.expr(then),
+            L2::Ref(v) if self.truthy_vars.contains(&v) => self.arm(then),
             // Any expression guaranteed never to evaluate to `#f`.
             test if test.is_always_truthy() => {
-                let then = self.expr(then);
+                let then = self.arm(then);
                 L2::seq(test, then)
             }
             // (if (not x) then other) -> (if x other then)
@@ -150,20 +166,20 @@ impl<'gc> Cp0<'_, 'gc> {
             }
             // Short-circuit `and` in test position: (if (if a b #f) then other) -> (if a (if b then other) other)
             // when `other` is a constant or variable reference (no code duplication).
-            L2::If(a, b, c) if matches!(*c, L2::Quote(Value::FALSE)) && matches!(other, L2::Quote(_) | L2::Ref(_)) => {
-                let inner_if = L2::If(b, Box::new(then), Box::new(other.clone()));
+            L2::If(a, b, c) if matches!(*c, L2::Quote(Value::FALSE)) && matches!(other, Arm::Raw(L2::Quote(_) | L2::Ref(_))) => {
+                let inner_if = Arm::If(*b, Box::new(then), Box::new(other.clone()));
                 self.simplify_if(*a, inner_if, other)
             }
             // Dominating variable test: in `then`, `v` is truthy; in `other`, `v` is `#f`.
             L2::Ref(v) if !self.assigned.contains(&v) => {
                 let newly_truthy = self.truthy_vars.insert(v);
-                let then = self.expr(then);
+                let then = self.arm(then);
                 if newly_truthy {
                     self.truthy_vars.remove(&v);
                 }
 
                 let prev_subst = self.subst.insert(v, Subst::Quote(Value::FALSE));
-                let other = self.expr(other);
+                let other = self.arm(other);
                 match prev_subst {
                     Some(prev) => _ = self.subst.insert(v, prev),
                     None => _ = self.subst.remove(&v),
@@ -185,7 +201,7 @@ impl<'gc> Cp0<'_, 'gc> {
                 let prev_fact = self.pred_facts.insert((pred, v), true);
                 let newly_truthy = (pred != Intrinsic::IsBoolean) && self.truthy_vars.insert(v);
                 let prev_subst = (pred == Intrinsic::IsNull).then(|| self.subst.insert(v, Subst::Quote(Value::NIL))).flatten();
-                let then = self.expr(then);
+                let then = self.arm(then);
                 if newly_truthy {
                     self.truthy_vars.remove(&v);
                 }
@@ -196,7 +212,7 @@ impl<'gc> Cp0<'_, 'gc> {
                     }
                 }
                 self.pred_facts.insert((pred, v), false);
-                let other = self.expr(other);
+                let other = self.arm(other);
                 match prev_fact {
                     Some(prev) => _ = self.pred_facts.insert((pred, v), prev),
                     None => _ = self.pred_facts.remove(&(pred, v)),
@@ -209,8 +225,8 @@ impl<'gc> Cp0<'_, 'gc> {
                 }
             }
             test => {
-                let then = self.expr(then);
-                let other = self.expr(other);
+                let then = self.arm(then);
+                let other = self.arm(other);
                 if then == other && matches!(then, L2::Quote(_) | L2::Ref(_)) {
                     L2::seq(test, then)
                 } else {
@@ -220,13 +236,31 @@ impl<'gc> Cp0<'_, 'gc> {
         }
     }
 
-    fn opt_let(&mut self, binds: Vec<(Var, L2<'gc>)>, body: L2<'gc>) -> L2<'gc> {
+    /// `(let binds body)`, the inits already optimized if `done`.
+    fn opt_let(&mut self, binds: Vec<(Var, L2<'gc>)>, done: bool, body: L2<'gc>) -> L2<'gc> {
         let mut kept: Vec<(Var, L2<'gc>)> = Vec::with_capacity(binds.len());
-        let mut counts: Option<HashMap<Var, UseStats>> = None;
 
         for (v, init) in binds {
-            let init = self.expr(init);
-            if !self.assigned.contains(&v) {
+            let unassigned = !self.assigned.contains(&v);
+            // A lambda from source that's never used goes; one called once stays source until
+            // it's inlined at that call, so its body is optimized once, there. A variable cp0 made
+            // itself isn't counted, so it's neither.
+            if unassigned
+                && !done
+                && let L2::Lambda(func) = &init
+                && let Some(&stats) = self.uses.get(&v)
+            {
+                if stats.total == 0 {
+                    continue;
+                }
+                if stats.total == 1 && stats.valid_calls == 1 && func_takes(func, stats.call_arity) {
+                    let L2::Lambda(func) = init else { unreachable!() };
+                    self.single_use.insert(v, func);
+                    continue;
+                }
+            }
+            let init = if done { init } else { self.expr(init) };
+            if unassigned {
                 match init {
                     L2::Quote(val) => {
                         self.subst.insert(v, Subst::Quote(val));
@@ -236,23 +270,8 @@ impl<'gc> Cp0<'_, 'gc> {
                         self.subst.insert(v, Subst::Var(u));
                         continue;
                     }
-                    L2::Lambda(func) => {
-                        let map = counts.get_or_insert_with(|| count_uses(&body));
-                        let stats = map.get(&v).copied().unwrap_or_default();
-                        if stats.total == 0 {
-                            continue;
-                        }
-                        if stats.total == 1 && stats.valid_calls == 1 && func_takes(&func, stats.call_arity) {
-                            self.single_use.insert(v, func);
-                            continue;
-                        }
-                        if self.inline_depth < 4
-                            && is_small_inlinable(&func, &self.assigned)
-                        {
-                            self.small_funcs.insert(v, func.clone());
-                        }
-                        kept.push((v, L2::Lambda(func)));
-                        continue;
+                    L2::Lambda(ref func) if self.inline_depth < 4 && is_small_inlinable(func, &self.assigned) => {
+                        self.small_funcs.insert(v, func.clone());
                     }
                     _ => {}
                 }
@@ -290,9 +309,37 @@ impl<'gc> Cp0<'_, 'gc> {
         }
     }
 
+    /// A call from source. Binding forms around the operator float out first, so a lambda they
+    /// end in is applied directly: `((let (...) f) x) -> (let (...) (f x))`. The bindings and
+    /// effects still come before `f` and `x`, and every variable is unique, so nothing is
+    /// captured. A lambda applied directly or called once is inlined with its body and
+    /// arguments still source, so each is optimized once.
+    fn app(&mut self, f: L2<'gc>, args: Vec<L2<'gc>>) -> L2<'gc> {
+        match f {
+            L2::Seq(a, b) => return self.expr(L2::Seq(a, Box::new(L2::App(b, args)))),
+            L2::Let(binds, body) => return self.expr(L2::Let(binds, Box::new(L2::App(body, args)))),
+            L2::Fix(binds, body) => return self.expr(L2::Fix(binds, Box::new(L2::App(body, args)))),
+            L2::Lambda(func) if func_takes(&func, args.len()) => return self.beta_reduce(func, args, false),
+            _ => {}
+        }
+        let f = self.expr(f);
+        if let L2::Ref(v) = f
+            && let Some(func) = self.single_use.remove(&v)
+        {
+            if func_takes(&func, args.len()) {
+                return self.beta_reduce(func, args, false);
+            }
+            let func = self.opt_func(func);
+            let args = args.into_iter().map(|a| self.expr(a)).collect();
+            return L2::App(Box::new(L2::Lambda(func)), args);
+        }
+        let args = args.into_iter().map(|a| self.expr(a)).collect();
+        self.opt_app(f, args)
+    }
+
+    /// A call whose operator and arguments are already optimized.
     fn opt_app(&mut self, f: L2<'gc>, args: Vec<L2<'gc>>) -> L2<'gc> {
-        // 0. Float `Seq`, `Let`, and `Fix` out of operator position:
-        //    `((fix ((loop ...)) loop) 10 0)` -> `(fix ((loop ...)) (loop 10 0))`
+        // Binding forms an inlined operator ended up in float out, as in `app`.
         match f {
             L2::Seq(a, b) => {
                 let call = self.opt_app(*b, args);
@@ -309,35 +356,31 @@ impl<'gc> Cp0<'_, 'gc> {
             _ => {}
         }
 
-        // 1. Direct beta-reduction: ((lambda (x ...) body) arg ...)
-        if let L2::Lambda(ref func) = f
-            && func_takes(func, args.len())
-        {
-            let L2::Lambda(func) = f else { unreachable!() };
-            return self.beta_reduce(func, args);
-        }
-
-        // 2. Single-use or small local lambda inlining: (f arg ...)
-        if let L2::Ref(v) = f {
-            if let Some(func) = self.single_use.remove(&v) {
-                if func_takes(&func, args.len()) {
-                    return self.beta_reduce(func, args);
-                }
+        // An optimized lambda applied directly binds its parameters around its body as it is,
+        // rather than optimizing the body again.
+        if let L2::Lambda(func) = f {
+            if !func_takes(&func, args.len()) {
                 return L2::App(Box::new(L2::Lambda(func)), args);
             }
-            if self.inline_depth < 4
-                && let Some(func) = self.small_funcs.get(&v).cloned()
-                && func_takes(&func, args.len())
-            {
-                let renamed = alpha_rename(&func, &mut self.supply);
-                self.inline_depth += 1;
-                let out = self.beta_reduce(renamed, args);
-                self.inline_depth -= 1;
-                return out;
-            }
+            let (binds, body) = self.bind_params(func, args, true);
+            return Self::finish_let(binds, body);
         }
 
-        // 3. Known prelude/imported closure call lowering: (Quote(<Closure>) arg ...)
+        // A small local lambda is copied in at each call, with its parameters renamed, and the
+        // copy optimized again with the arguments it's given.
+        if let L2::Ref(v) = f
+            && self.inline_depth < 4
+            && let Some(func) = self.small_funcs.get(&v).cloned()
+            && func_takes(&func, args.len())
+        {
+            let renamed = alpha_rename(&func, &mut self.supply);
+            self.inline_depth += 1;
+            let out = self.beta_reduce(renamed, args, true);
+            self.inline_depth -= 1;
+            return out;
+        }
+
+        // Known prelude/imported closure call lowering: (Quote(<Closure>) arg ...)
         if let L2::Quote(val) = f
             && let Some(lowered) = self.lower_closure_call(val, &args)
         {
@@ -347,23 +390,24 @@ impl<'gc> Cp0<'_, 'gc> {
         L2::App(Box::new(f), args)
     }
 
-    fn beta_reduce(&mut self, func: Func<L2<'gc>>, mut args: Vec<L2<'gc>>) -> L2<'gc> {
-        match func.rest {
-            None => {
-                let binds: Vec<(Var, L2<'gc>)> = func.params.into_iter().zip(args).collect();
-                self.opt_let(binds, *func.body)
-            }
-            Some(rest_var) => {
-                let fixed_len = func.params.len();
-                let rest_args = args.split_off(fixed_len);
-                let rest_list = rest_args.into_iter().rfold(L2::Quote(Value::NIL), |acc, item| {
-                    self.opt_intrinsic(Prim::Intrinsic(Intrinsic::Cons), vec![item, acc])
-                });
-                let mut binds: Vec<(Var, L2<'gc>)> = func.params.into_iter().zip(args).collect();
-                binds.push((rest_var, rest_list));
-                self.opt_let(binds, *func.body)
-            }
-        }
+    /// `func`'s parameters bound to `args` (already optimized if `done`), and its body.
+    fn bind_params(&mut self, func: Func<L2<'gc>>, mut args: Vec<L2<'gc>>, done: bool) -> (Vec<(Var, L2<'gc>)>, L2<'gc>) {
+        let rest = func.rest.map(|rest| {
+            let list = args.split_off(func.params.len()).into_iter().rfold(L2::Quote(Value::NIL), |acc, item| {
+                let cons = Prim::Intrinsic(Intrinsic::Cons);
+                if done { self.opt_intrinsic(cons, vec![item, acc]) } else { L2::Intrinsic(cons, vec![item, acc]) }
+            });
+            (rest, list)
+        });
+        let binds = func.params.into_iter().zip(args).chain(rest).collect();
+        (binds, *func.body)
+    }
+
+    /// `func` applied to `args` (already optimized if `done`), inlined: its body is optimized
+    /// with its parameters bound.
+    fn beta_reduce(&mut self, func: Func<L2<'gc>>, args: Vec<L2<'gc>>, done: bool) -> L2<'gc> {
+        let (binds, body) = self.bind_params(func, args, done);
+        self.opt_let(binds, done, body)
     }
 
     /// Inspects a constant 0-capture [`Closure`] (such as an imported prelude procedure) and
@@ -394,6 +438,11 @@ impl<'gc> Cp0<'_, 'gc> {
                 {
                     return Some(L2::Intrinsic(Prim::Request(request), args.to_vec()));
                 }
+                // `add1`/`sub1`-style wrappers: (%lambda (z) (%intrinsic + z k))
+                [Op::AddImm { dst, a, imm }, Op::Return { src }] if a == base && dst == src && args.len() == 1 => {
+                    let k = L2::Quote(Value::fixnum(i64::from(imm))?);
+                    return Some(self.opt_intrinsic(Prim::Intrinsic(Intrinsic::Add), vec![args[0].clone(), k]));
+                }
                 [Op::LoadConst { dst: d1, index }, Op::Return { src: d2 }] if d1 == d2 => {
                     let cs = Constants::of(code.constants(mc))?;
                     let c = cs.get(mc, index)?;
@@ -409,9 +458,9 @@ impl<'gc> Cp0<'_, 'gc> {
         }
         let (base, rest) = strip_arg_moves(ops, req + 1)?;
         match *rest {
-            [Op::ApplyIntrinsic { base: b, args: m, intrinsic }, ..]
+            [Op::ApplyIntrinsic { base: b, args: m, intrinsic }, Op::LoadAcc { dst }, Op::Return { src }]
                 if b == base
-                    && rest.len() <= 3
+                    && dst == src
                     && usize::from(m) == req + 1
                     && intrinsic.arity().is_none_or(|a| usize::from(a) == args.len()) =>
             {
@@ -447,10 +496,12 @@ impl<'gc> Cp0<'_, 'gc> {
             return L2::Intrinsic(prim, args);
         };
 
-        // Float leading `Seq` out of single-argument intrinsics: `(car (seq e x)) -> (seq e (car x))`
-        if args.len() == 1 && matches!(args[0], L2::Seq(_, _)) {
-            let Some(L2::Seq(prefix, inner)) = args.pop() else { unreachable!() };
-            let out = self.opt_intrinsic(prim, vec![*inner]);
+        // Float a leading `Seq` out of the first argument, which runs before the rest anyway:
+        // `(f (seq e x) y ...) -> (seq e (f x y ...))`, so the rules below see `x` itself.
+        if let Some(L2::Seq(_, _)) = args.first() {
+            let L2::Seq(prefix, inner) = args.remove(0) else { unreachable!() };
+            args.insert(0, *inner);
+            let out = self.opt_intrinsic(prim, args);
             return L2::seq(*prefix, out);
         }
 
@@ -471,6 +522,27 @@ impl<'gc> Cp0<'_, 'gc> {
             let mut fuel = Fuel { run: u64::MAX, rest: u64::MAX };
             if let Ok(val) = intrinsic.run(self.mc, &values, &mut fuel) {
                 return L2::Quote(val);
+            }
+        }
+
+        // 1b. Constant offsets have one form, `(+ x k)`: `(+ k x)` puts the constant second and
+        //     `(- x k)` negates it, so codegen only looks for one shape for `Op::AddImm`. The
+        //     constant is pure, so moving it keeps evaluation order, and `x` faults the same.
+        //     `(- x 0)` stays: it keeps `-0.0`, where `(+ x 0)` makes it `0.0`.
+        if matches!(intrinsic, Intrinsic::Add | Intrinsic::Sub) && args.len() == 2 {
+            let constant = |e: &L2<'gc>| match e {
+                L2::Quote(v) => v.as_fixnum(),
+                _ => None,
+            };
+            if intrinsic == Intrinsic::Add && constant(&args[0]).is_some() && constant(&args[1]).is_none() {
+                args.swap(0, 1);
+                return L2::Intrinsic(prim, args);
+            }
+            if intrinsic == Intrinsic::Sub
+                && let Some(neg) = constant(&args[1]).filter(|&k| k != 0).and_then(i64::checked_neg).and_then(Value::fixnum)
+            {
+                args[1] = L2::Quote(neg);
+                return L2::Intrinsic(Prim::Intrinsic(Intrinsic::Add), args);
             }
         }
 

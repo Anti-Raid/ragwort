@@ -388,6 +388,24 @@ impl Intrinsic {
         self.apply(mc, |i| frame.get(base + i as u8), usize::from(args), fuel)
     }
 
+    /// Runs a 1-argument intrinsic on register `a`, which the caller has checked it takes.
+    #[inline(always)]
+    pub(crate) fn exec1<'gc>(self, mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, a: u8, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
+        self.apply(mc, |_| frame.get(a), 1, fuel)
+    }
+
+    /// Runs a 2-argument intrinsic on registers `(a, b)`, which the caller has checked it takes.
+    #[inline(always)]
+    pub(crate) fn exec2<'gc>(self, mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, a: u8, b: u8, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
+        self.apply(mc, |i| frame.get(if i == 0 { a } else { b }), 2, fuel)
+    }
+
+    /// Runs a 3-argument intrinsic on registers `(a, b, c)`, which the caller has checked it takes.
+    #[inline(always)]
+    pub(crate) fn exec3<'gc>(self, mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, a: u8, b: u8, c: u8, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
+        self.apply(mc, |i| frame.get([a, b, c][i]), 3, fuel)
+    }
+
     /// Runs it on the `args` values `arg` reads, as many as it takes.
     #[inline(always)]
     fn apply<'gc>(self, mc: &Mutation<'gc>, arg: impl Fn(usize) -> Value<'gc>, args: usize, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {

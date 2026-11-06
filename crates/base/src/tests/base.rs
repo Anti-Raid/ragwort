@@ -541,4 +541,47 @@ fn compiler_micropass_stress_cases() {
             (list picked (reverse trace))))
     ";
     assert_eq!(eval(cxr_effects), "(40 (1 2 3 4 5))");
+
+    // 7. The list-length loop (fused `null?` branch, in-place `cdr` and `+`), on short and long lists.
+    let length_loop = "
+        (define (len-of list)
+          (let loop ((xs list) (len 0))
+            (if (null? xs)
+                len
+                (loop (cdr xs) (+ len 1)))))
+        (define (iota n)
+          (let loop ((i n) (acc '()))
+            (if (eqv? i 0) acc (loop (- i 1) (cons i acc)))))
+        (list (len-of '()) (len-of '(a)) (len-of '(a b c)) (len-of (iota 100000)))
+    ";
+    assert_eq!(eval(length_loop), "(0 1 3 100000)");
+    // A non-list still faults where `cdr` reaches the improper tail.
+    assert_eq!(
+        eval_in(&mut arena(), "(let loop ((xs '(1 2 . 3)) (len 0)) (if (null? xs) len (loop (cdr xs) (+ len 1))))"),
+        Ok(Err(Fault::WrongType))
+    );
+
+    // 8. `add1`/`sub1`, and the `(+ x 1)` / `(- x 1)` they're rewritten from, across the numeric
+    //    tower: past the fixnum edge, on flonums and ratios, and faulting on non-numbers.
+    assert_eq!(eval("(list (add1 41) (sub1 43) (add1 -1) (sub1 0) (map add1 '(1 2 3)) (map sub1 '(1 2 3)))"), "(42 42 0 -1 (2 3 4) (0 1 2))");
+    assert_eq!(
+        eval("(define (inc x) (+ x 1)) (define (dec x) (- x 1))
+              (list (eqv? (inc 4611686018427387903) 4611686018427387904)
+                    (eqv? (dec -4611686018427387904) -4611686018427387905)
+                    (eqv? (dec (inc 4611686018427387903)) 4611686018427387903)
+                    (eqv? (inc 1.5) 2.5) (eqv? (dec 1/2) -1/2)
+                    (eqv? (add1 4611686018427387903) (inc 4611686018427387903)))"),
+        "(#t #t #t #t #t #t)"
+    );
+    assert_eq!(eval("(define (keep x) (- x 0)) (list (eqv? (keep -0.0) -0.0) (eqv? (- -0.0 0) -0.0))"), "(#t #t)");
+    // A leading effect in the first argument still runs first, and once.
+    assert_eq!(
+        eval("(define t '()) (define (note x) (set! t (cons x t)) x)
+              (define (f x) (list (+ (begin (note 'a) 1) x) (+ (begin (note 'b) 2) 3) (+ (begin (note 'c) x) (note 1))))
+              (list (f 5) (reverse t))"),
+        "((6 5 6) (a b c 1))"
+    );
+    assert_eq!(eval_in(&mut arena(), "(define (inc x) (+ x 1)) (inc 'a)"), Ok(Err(Fault::WrongType)));
+    assert_eq!(eval_in(&mut arena(), "(sub1 \"s\")"), Ok(Err(Fault::WrongType)));
+    assert_eq!(eval_in(&mut arena(), "(add1 1 2)"), Ok(Err(Fault::Arity)));
 }
