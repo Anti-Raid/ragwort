@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ragwort_types::gc::{Gc, Mutation, Value};
+use ragwort_types::gc::{Gc, Mutation, Value, WINDOW};
 use ragwort_types::vector::Vectors;
 use ragwort_vm::frame::{self, ARGS, CLOSURE, MAX_PARAMS};
 use ragwort_vm::objects::{Bytecode, BytecodeFields, Closure};
@@ -21,11 +21,12 @@ use crate::{CompileError, Prim, Var};
 /// frame's spill object.
 type VReg = u32;
 
+/// How many scratch registers there are, the last of a frame's, so how many values a call made
+/// in them can take.
+const STAGE: usize = WINDOW / 4;
 /// The first scratch register: those below are a function's own.
-const LIMIT: VReg = 224;
+const LIMIT: VReg = (WINDOW - STAGE) as VReg;
 const SCRATCH: u8 = LIMIT as u8;
-/// How many scratch registers there are, so how many values a call made in them can take.
-const STAGE: usize = 256 - LIMIT as usize;
 
 pub(crate) fn emit<'gc>(mc: &Mutation<'gc>, l4: &L4<'gc>) -> Result<Value<'gc>, CompileError> {
     let mut module = Module {
@@ -647,7 +648,7 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
         if base as usize + n <= LIMIT as usize {
             return base as u8;
         }
-        for (i, to) in (0..n as u32).zip(SCRATCH..) {
+        for (i, to) in (0..n as u32).zip(SCRATCH..=u8::MAX) {
             self.fetch(base + i, to);
         }
         SCRATCH

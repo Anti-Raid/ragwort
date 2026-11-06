@@ -2,7 +2,7 @@
 //! relative to the instruction after them.
 
 use ragwort_types::{Error, named};
-use ragwort_types::gc::{Frame, Mutation, OutOfMemory, Slots, Value};
+use ragwort_types::gc::{Frame, Mutation, OutOfMemory, Slots, Value, WINDOW};
 use ragwort_types::constant::Constants;
 use ragwort_types::num::NumError;
 use ragwort_types::string::StrError;
@@ -80,7 +80,7 @@ named! {
         /// returns to this frame's caller, as `(call/cc f)` in tail position needs.
         TailCallRequest { base: u8, args: u8, request: Request } = "tail-call-request",
         /// Runs `intrinsic` like `CallIntrinsic`, but the last of the `args` registers holds a list of
-        /// the arguments after the others, as many as it takes, past the 255 registers can hold.
+        /// the arguments after the others, as many as it takes, past what a frame's registers hold.
         ApplyIntrinsic { base: u8, args: u8, intrinsic: Intrinsic } = "apply-intrinsic",
         /// Carries out `request` like `CallRequest`, with the last of the `args` registers a list of
         /// the arguments after the others.
@@ -285,7 +285,7 @@ impl Op {
                 frame.set(dst, cx.upvalues.get(index));
             }
             Op::NewClosure { dst, count, code } => {
-                if usize::from(dst) + usize::from(count) > usize::from(u8::MAX) + 1 {
+                if usize::from(dst) + usize::from(count) > WINDOW {
                     return Err(Fault::Malformed);
                 }
                 for i in 0..count {
@@ -317,7 +317,7 @@ impl Op {
                 }
             }
             Op::CallIntrinsic { base, args, intrinsic } | Op::TailCallIntrinsic { base, args, intrinsic } => {
-                if usize::from(base) + usize::from(args) > 256 || intrinsic.arity().is_some_and(|n| n != args) {
+                if usize::from(base) + usize::from(args) > WINDOW || intrinsic.arity().is_some_and(|n| n != args) {
                     return Err(Fault::Malformed);
                 }
                 cx.acc = intrinsic.exec(mc, frame, base, args, &mut cx.fuel)?;
@@ -355,7 +355,7 @@ impl Op {
                 frame.set(dst, val);
             }
             Op::CallRequest { base, args, request } | Op::TailCallRequest { base, args, request } => {
-                if usize::from(base) + usize::from(args) > 256 || !request.takes(usize::from(args)) {
+                if usize::from(base) + usize::from(args) > WINDOW || !request.takes(usize::from(args)) {
                     return Err(Fault::Malformed);
                 }
                 return Ok(match self {
@@ -364,7 +364,7 @@ impl Op {
                 });
             }
             Op::ApplyIntrinsic { base, args, intrinsic } => {
-                if args == 0 || usize::from(base) + usize::from(args) > 256 {
+                if args == 0 || usize::from(base) + usize::from(args) > WINDOW {
                     return Err(Fault::Malformed);
                 }
                 let mut values: Vec<_> = (0..args - 1).map(|i| frame.get(base + i)).collect();
@@ -372,7 +372,7 @@ impl Op {
                 cx.acc = intrinsic.run(mc, &values, &mut cx.fuel)?;
             }
             Op::ApplyRequest { base, args, request } | Op::TailApplyRequest { base, args, request } => {
-                if args == 0 || usize::from(base) + usize::from(args) > 256 {
+                if args == 0 || usize::from(base) + usize::from(args) > WINDOW {
                     return Err(Fault::Malformed);
                 }
                 return Ok(match self {

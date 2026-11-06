@@ -785,5 +785,5 @@ fn a_suspended_coroutine_keeps_little_memory() {
     let closures = kept("(lambda () i)");
     let suspended = kept("(let ((c (make-coroutine (lambda () (co/yield i) i)))) (co/resume c) c)");
     let each = (suspended - closures) / 200;
-    assert!(each < 4096, "{each} bytes per suspended coroutine");
+    assert!(each < 2048, "{each} bytes per suspended coroutine");
 }

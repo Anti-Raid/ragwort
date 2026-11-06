@@ -354,7 +354,7 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         let frame = self.segments.frame(fp)?;
         frame.set(CLOSURE, procedure);
         (ARGS..).zip(fit).for_each(|(r, &arg)| frame.set(r, arg));
-        let argc = u8::try_from(fit.len()).expect("MAX_ARGS is less than 256");
+        let argc = u8::try_from(fit.len()).expect("MAX_ARGS is less than a register window");
         self.enter(fp, argc, rest, Link::BOTTOM)
     }
 

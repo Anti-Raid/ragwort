@@ -1,4 +1,4 @@
-use ragwort_types::gc::Arena;
+use ragwort_types::gc::{Arena, WINDOW};
 use ragwort_types::pair::Pair;
 use ragwort_types::string::display;
 use ragwort_vm::objects::{Condition, ConditionFields};
@@ -168,7 +168,7 @@ fn bad_forms_point_at_themselves() {
 fn apply_takes_lists_longer_than_a_frame() {
     let list = |n| format!("'({})", vec!["a"; n].join(" "));
     let count = |text: &str| text.matches('a').count();
-    for n in [253, 254, 255, 256, 1000] {
+    for n in [WINDOW - 3, WINDOW - 2, WINDOW - 1, WINDOW, 1000] {
         assert_eq!(count(&eval(&format!("(%intrinsic apply (%lambda xs xs) {})", list(n)))), n);
         assert_eq!(count(&eval(&format!("(%intrinsic apply (%lambda (x y . r) r) {})", list(n)))), n - 2);
         assert_eq!(count(&eval(&format!("(%intrinsic apply (%lambda xs xs) 'a 'a {})", list(n)))), n + 2);

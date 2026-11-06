@@ -233,7 +233,11 @@ const PAGES: usize = WORDS / PAGE;
 /// bounds check.
 const SLACK: usize = 128;
 const LINES: usize = PAGE / LINE;
-pub const WINDOW: usize = 256;
+/// How many registers a frame has: the slots a [`Frame`] or [`Window`] sees from its start. Every
+/// register limit of the VM and compiler follows from it. A register is a byte, taken modulo
+/// `WINDOW`, so no access needs a bounds check.
+pub const WINDOW: usize = 64;
+const _: () = assert!(WINDOW.is_power_of_two() && WINDOW >= 32 && WINDOW <= 256);
 
 pub(crate) const TAG: u64 = 0b1111;
 const OBJECT: u64 = 0b0001;
@@ -934,7 +938,8 @@ impl<'gc, S: Item> Slots<'gc, S> {
 }
 
 impl<'gc> Slots<'gc> {
-    /// The first `WINDOW` items, indexed by a byte so no access needs a bounds check.
+    /// The first `WINDOW` items, indexed by a byte modulo `WINDOW` so no access needs a bounds
+    /// check.
     pub fn window(self) -> Option<Window<'gc>> {
         Some(Window { slots: self.words.first_chunk()?, at: self.at, owner: self.owner, _brand: PhantomData })
     }
@@ -951,13 +956,14 @@ pub struct Window<'gc> {
 impl<'gc> Window<'gc> {
     #[inline]
     pub fn get(self, r: u8) -> Value<'gc> {
-        Value::from_bits(self.slots[r as usize].get())
+        Value::from_bits(self.slots[usize::from(r) % WINDOW].get())
     }
 
     #[inline]
     pub fn set(self, mc: &Mutation<'gc>, r: u8, value: Value<'gc>) {
-        self.slots[r as usize].set(value.word);
-        mc.heap.barrier(self.at + r as usize, self.owner, value.word);
+        let r = usize::from(r) % WINDOW;
+        self.slots[r].set(value.word);
+        mc.heap.barrier(self.at + r, self.owner, value.word);
     }
 }
 

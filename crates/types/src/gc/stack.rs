@@ -399,11 +399,11 @@ pub struct Frame<'s, 'gc> {
 impl<'gc> Frame<'_, 'gc> {
     #[inline]
     pub fn get(self, r: u8) -> Value<'gc> {
-        Value::from_bits(self.slots[r as usize].get())
+        Value::from_bits(self.slots[usize::from(r) % WINDOW].get())
     }
 
     #[inline]
     pub fn set(self, r: u8, value: Value<'gc>) {
-        self.slots[r as usize].set(value.word);
+        self.slots[usize::from(r) % WINDOW].set(value.word);
     }
 }

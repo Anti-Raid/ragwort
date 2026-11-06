@@ -1,9 +1,10 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use ragwort_types::constant::Constants;
-use ragwort_types::gc::{Arena, Gc, Mutation, Value};
+use ragwort_types::gc::{Arena, Gc, Mutation, Value, WINDOW};
 use ragwort_types::pair::{Pair, Pairs};
 use ragwort_vm::Intrinsic::{Add, Car, Cons, Eq, MakeBox, MakePromptTag, Not, SetBox, Unbox};
+use ragwort_vm::frame::MAX_PARAMS;
 use ragwort_vm::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Condition, ConditionFields, Global};
 use ragwort_vm::{Fault, Intrinsic, MIN_SEGMENT, Machine, Op, Outcome, Request};
 
@@ -306,9 +307,36 @@ fn big_frames_spill() {
     );
 }
 
+/// Calls of `argc` values made with `live` boxes held across them, around where the frame's own
+/// registers end and its scratch ones, which stage calls, begin.
+#[test]
+fn calls_around_the_last_registers() {
+    let stage = WINDOW as u32 / 4;
+    for live in WINDOW as u32 / 2..WINDOW as u32 + 8 {
+        for argc in [1, stage - 1, stage, stage + 1] {
+            eval(
+                move |_| {
+                    let boxes = (0..live).map(|v| (v, prim(MakeBox, vec![q(i64::from(v))]))).collect();
+                    let (f, rest, r) = (live, live + 1, live + 2);
+                    let args = (0..argc).map(|i| prim(Unbox, vec![var(i % live)])).collect();
+                    let sum = prim(Add, (0..live).map(|v| prim(Unbox, vec![var(v)])).collect());
+                    let body = let_(vec![(r, app(var(f), args))], prim(Cons, vec![sum, var(r)]));
+                    let_(boxes, let_(vec![(f, lambda(&[], Some(rest), var(rest)))], body))
+                },
+                move |mc, result| {
+                    let mut want = vec![i64::from(live * (live - 1) / 2)];
+                    want.extend((0..argc).map(|i| i64::from(i % live)));
+                    assert_eq!(items(mc, result.unwrap()), want, "{live} live, {argc} arguments");
+                },
+            );
+        }
+    }
+}
+
 #[test]
 fn lambdas_take_more_parameters_than_registers() {
-    for n in [63u32, 64, 65, 100, 300] {
+    let max = u32::from(MAX_PARAMS);
+    for n in [max - 1, max, max + 1, 100, 300] {
         let (mid, last) = (n / 2, n - 1);
         let sum = move |args: i64| number(move |_| app(lambda(&ids(n), None, prim(Add, vec![var(0), var(mid), var(last)])), nums(args)));
         assert_eq!(sum(i64::from(n)), Ok(i64::from(mid + last)), "{n} parameters");

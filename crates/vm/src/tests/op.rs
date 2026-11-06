@@ -217,14 +217,14 @@ fn intrinsics_run_in_place() {
         assert_eq!(cx.acc, Value::TRUE);
 
         call(cx, 10, 1, Intrinsic::MakeBox).unwrap();
-        frame.set(40, cx.acc);
-        frame.set(41, Value::TRUE);
-        call(cx, 40, 2, Intrinsic::SetBox).unwrap();
+        frame.set(25, cx.acc);
+        frame.set(26, Value::TRUE);
+        call(cx, 25, 2, Intrinsic::SetBox).unwrap();
         assert_eq!(cx.acc, Value::VOID);
-        call(cx, 40, 1, Intrinsic::Unbox).unwrap();
+        call(cx, 25, 1, Intrinsic::Unbox).unwrap();
         assert_eq!(cx.acc, Value::TRUE);
-        assert_eq!(call(cx, 41, 1, Intrinsic::Unbox), Err(Fault::WrongType));
-        assert_eq!(call(cx, 41, 2, Intrinsic::SetBox), Err(Fault::WrongType));
+        assert_eq!(call(cx, 26, 1, Intrinsic::Unbox), Err(Fault::WrongType));
+        assert_eq!(call(cx, 26, 2, Intrinsic::SetBox), Err(Fault::WrongType));
 
         let tail = Op::TailCallIntrinsic { base: 10, args: 2, intrinsic: Intrinsic::Add };
         assert_eq!(tail.step(cx), Ok(Control::Return));
@@ -240,9 +240,9 @@ fn equality_goes_as_deep_as_it_should() {
     with_frame(|cx| {
         let (mc, frame) = (cx.mc, cx.frame);
         let test = |cx: &mut Context<'_, '_>, intrinsic, a, b| {
-            frame.set(50, a);
-            frame.set(51, b);
-            Op::CallIntrinsic { base: 50, args: 2, intrinsic }.step(cx).unwrap();
+            frame.set(27, a);
+            frame.set(28, b);
+            Op::CallIntrinsic { base: 27, args: 2, intrinsic }.step(cx).unwrap();
             cx.acc == Value::TRUE
         };
         let (eqv, equal) = (Intrinsic::Eqv, Intrinsic::Equal);
@@ -347,16 +347,16 @@ fn equality_goes_as_deep_as_it_should() {
         test(cx, equal, vector(&items), vector(&items));
         assert_eq!(cx.fuel, Fuel { run: 0, rest: 13 });
         cx.fuel = Fuel { run: 3, rest: 6 };
-        frame.set(50, vector(&items));
-        frame.set(51, vector(&items));
-        assert_eq!(Op::CallIntrinsic { base: 50, args: 2, intrinsic: equal }.step(cx), Err(Fault::OutOfFuel));
+        frame.set(27, vector(&items));
+        frame.set(28, vector(&items));
+        assert_eq!(Op::CallIntrinsic { base: 27, args: 2, intrinsic: equal }.step(cx), Err(Fault::OutOfFuel));
         cx.fuel = Fuel { run: u64::MAX, rest: 0 };
 
-        frame.set(60, boxed(fix(1)));
-        frame.set(61, list(&[]));
-        Op::CallIntrinsic { base: 60, args: 1, intrinsic: Intrinsic::IsBox }.step(cx).unwrap();
+        frame.set(29, boxed(fix(1)));
+        frame.set(30, list(&[]));
+        Op::CallIntrinsic { base: 29, args: 1, intrinsic: Intrinsic::IsBox }.step(cx).unwrap();
         assert_eq!(cx.acc, Value::TRUE);
-        Op::CallIntrinsic { base: 61, args: 1, intrinsic: Intrinsic::IsBox }.step(cx).unwrap();
+        Op::CallIntrinsic { base: 30, args: 1, intrinsic: Intrinsic::IsBox }.step(cx).unwrap();
         assert_eq!(cx.acc, Value::FALSE);
     });
 }

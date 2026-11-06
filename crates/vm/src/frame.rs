@@ -1,4 +1,4 @@
-use ragwort_types::gc::{Frame, Gc, Mutation, Slots, Value};
+use ragwort_types::gc::{Frame, Gc, Mutation, Slots, Value, WINDOW};
 
 use crate::Fault;
 use crate::objects::{BytecodeFields, Closure, ClosureFields};
@@ -11,7 +11,7 @@ pub const ARGS: u8 = 1;
 /// How many registers a frame keeps its parameters in, from [`ARGS`]. Code that takes more, its
 /// rest list counted as one, gets the first `MAX_PARAMS - 1` of its arguments in registers and
 /// a list of the others in the last, which the VM checks has as many as it takes.
-pub const MAX_PARAMS: u8 = 64;
+pub const MAX_PARAMS: u8 = (WINDOW / 4) as u8;
 
 /// Where the link is in a frame of code that takes `arity`, as `Bytecode` encodes it: after its
 /// parameters' registers.
