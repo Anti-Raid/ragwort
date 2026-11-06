@@ -43,7 +43,7 @@ pub(crate) fn optimize<'gc>(mc: &Mutation<'gc>, expr: L2<'gc>, supply: Supply) -
         small_funcs: HashMap::new(),
         inline_depth: 0,
     };
-    let out = pass.expr(expr);
+    let out = crate::letrec::prune(pass.expr(expr));
     (out, pass.supply)
 }
 
@@ -288,8 +288,9 @@ impl<'gc> Cp0<'_, 'gc> {
         Self::finish_let(kept, body)
     }
 
+    /// Unused bindings are left to [`prune`](crate::letrec::prune), which finds them all in one walk.
     fn finish_let(kept: Vec<(Var, L2<'gc>)>, body: L2<'gc>) -> L2<'gc> {
-        crate::letrec::simplify_let(kept, body)
+        if kept.is_empty() { body } else { L2::Let(kept, Box::new(body)) }
     }
 
     fn opt_fix(&mut self, binds: Vec<(Var, Func<L2<'gc>>)>, body: L2<'gc>) -> L2<'gc> {
@@ -299,14 +300,7 @@ impl<'gc> Cp0<'_, 'gc> {
     }
 
     fn finish_fix(binds: Vec<(Var, Func<L2<'gc>>)>, body: L2<'gc>) -> L2<'gc> {
-        let mut used = HashSet::new();
-        let mut assigned = HashSet::new();
-        collect_usage(&body, &mut used, &mut assigned);
-        if binds.iter().any(|(v, _)| used.contains(v) || assigned.contains(v)) {
-            L2::Fix(binds, Box::new(body))
-        } else {
-            body
-        }
+        if binds.is_empty() { body } else { L2::Fix(binds, Box::new(body)) }
     }
 
     /// A call from source. Binding forms around the operator float out first, so a lambda they

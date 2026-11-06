@@ -2,7 +2,7 @@
 //! such changes pending until it's taken apart, so a macro step doesn't copy what it's given.
 
 use std::collections::HashMap;
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 
 use ragwort_types::gc::{Charge, Mutation, OutOfMemory};
 
@@ -50,16 +50,88 @@ impl Op {
     }
 }
 
-/// Values interned as small numbers, each with its memory charged to the arena's budget.
+/// The expander's tables, keyed by numbers it hands out itself: scopes, interned sets of them,
+/// and symbols' words.
+pub(crate) type Map<K, V> = HashMap<K, V, Seeded>;
+
+/// Hashes by a folded multiply, which spreads every bit of a word over all of them and is far
+/// cheaper than std's default on the long scope sets of deeply nested code. The seed is picked
+/// per table, so the code being expanded can't line its keys up to collide.
+#[derive(Clone, Copy)]
+pub(crate) struct Seeded(u64);
+
+impl Default for Seeded {
+    fn default() -> Self {
+        Seeded(RandomState::new().hash_one(0_u64))
+    }
+}
+
+impl BuildHasher for Seeded {
+    type Hasher = Folded;
+
+    fn build_hasher(&self) -> Folded {
+        Folded(self.0)
+    }
+}
+
+pub(crate) struct Folded(u64);
+
+impl Hasher for Folded {
+    fn write(&mut self, bytes: &[u8]) {
+        let (words, rest) = bytes.as_chunks::<8>();
+        for &word in words {
+            self.write_u64(u64::from_le_bytes(word));
+        }
+        if !rest.is_empty() {
+            let mut last = [0; 8];
+            last[..rest.len()].copy_from_slice(rest);
+            self.write_u64(u64::from_le_bytes(last));
+        }
+    }
+
+    fn write_u8(&mut self, n: u8) {
+        self.write_u64(u64::from(n));
+    }
+
+    fn write_u32(&mut self, n: u32) {
+        self.write_u64(u64::from(n));
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        let m = u128::from(self.0 ^ n) * 0x9E37_79B9_7F4A_7C15;
+        self.0 = (m >> 64) as u64 ^ m as u64;
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Values interned as small numbers, each with its memory charged to the arena's budget. They're
+/// found by their hash, so each is stored and hashed once, and growing the table moves only
+/// numbers.
 struct Interned<T: Eq + Hash + Clone> {
     all: Vec<Box<[T]>>,
-    ids: HashMap<Box<[T]>, u32>,
+    /// The last value interned with each hash; `same[id]` is the one before it with that hash.
+    by_hash: Map<u64, u32>,
+    same: Vec<u32>,
+    hasher: Seeded,
 }
+
+const NO_MORE: u32 = u32::MAX;
 
 impl<T: Eq + Hash + Clone> Interned<T> {
     fn new() -> Self {
-        let empty: Box<[T]> = Box::new([]);
-        Self { all: vec![empty.clone()], ids: HashMap::from([(empty, 0)]) }
+        let mut interned = Self { all: Vec::new(), by_hash: Map::default(), same: Vec::new(), hasher: Seeded::default() };
+        let hash = interned.hasher.hash_one(&[] as &[T]);
+        interned.all.push(Box::new([]));
+        interned.same.push(NO_MORE);
+        interned.by_hash.insert(hash, 0);
+        interned
     }
 
     fn get(&self, id: u32) -> &[T] {
@@ -67,14 +139,20 @@ impl<T: Eq + Hash + Clone> Interned<T> {
     }
 
     fn intern(&mut self, charge: &mut Charge<'_>, items: Vec<T>) -> Result<u32, OutOfMemory> {
-        if let Some(&id) = self.ids.get(items.as_slice()) {
-            return Ok(id);
+        let hash = self.hasher.hash_one(items.as_slice());
+        let first = self.by_hash.get(&hash).copied().unwrap_or(NO_MORE);
+        let mut id = first;
+        while id != NO_MORE {
+            if *self.all[id as usize] == *items {
+                return Ok(id);
+            }
+            id = self.same[id as usize];
         }
-        charge.grow(2 * size_of_val(items.as_slice()) + 64)?;
-        let id = u32::try_from(self.all.len()).map_err(|_| OutOfMemory)?;
-        let items = items.into_boxed_slice();
-        self.all.push(items.clone());
-        self.ids.insert(items, id);
+        charge.grow(size_of_val(items.as_slice()) + 48)?;
+        let id = u32::try_from(self.all.len()).ok().filter(|&id| id != NO_MORE).ok_or(OutOfMemory)?;
+        self.all.push(items.into_boxed_slice());
+        self.same.push(first);
+        self.by_hash.insert(hash, id);
         Ok(id)
     }
 }
@@ -83,14 +161,14 @@ pub(crate) struct Scopes<'gc> {
     charge: Charge<'gc>,
     sets: Interned<Scope>,
     ops: Interned<(Scope, Op)>,
-    applied: HashMap<(Set, Ops), Set>,
-    composed: HashMap<(Ops, Ops), Ops>,
+    applied: Map<(Set, Ops), Set>,
+    composed: Map<(Ops, Ops), Ops>,
     next: Scope,
 }
 
 impl<'gc> Scopes<'gc> {
     pub(crate) fn new(mc: &Mutation<'gc>) -> Self {
-        Self { charge: mc.charge(), sets: Interned::new(), ops: Interned::new(), applied: HashMap::new(), composed: HashMap::new(), next: BASE + 1 }
+        Self { charge: mc.charge(), sets: Interned::new(), ops: Interned::new(), applied: Map::default(), composed: Map::default(), next: BASE + 1 }
     }
 
     pub(crate) fn charge(&mut self, bytes: usize) -> Result<(), OutOfMemory> {
@@ -136,16 +214,24 @@ impl<'gc> Scopes<'gc> {
         if let Some(&ops) = self.composed.get(&(first, then)) {
             return Ok(ops);
         }
-        let mut merged: Vec<(Scope, Op)> = self.ops.get(first.0).to_vec();
-        for &(scope, op) in self.ops.get(then.0) {
-            match merged.binary_search_by_key(&scope, |&(s, _)| s) {
-                Ok(i) => match op.after(Some(merged[i].1)) {
-                    Some(op) => merged[i].1 = op,
-                    None => _ = merged.remove(i),
-                },
-                Err(i) => merged.insert(i, (scope, op)),
+        let (a, b) = (self.ops.get(first.0), self.ops.get(then.0));
+        let mut merged: Vec<(Scope, Op)> = Vec::with_capacity(a.len() + b.len());
+        let (mut i, mut j) = (0, 0);
+        while i < a.len() && j < b.len() {
+            let ((x, earlier), (y, later)) = (a[i], b[j]);
+            if x < y {
+                merged.push(a[i]);
+                i += 1;
+            } else if y < x {
+                merged.push(b[j]);
+                j += 1;
+            } else {
+                merged.extend(later.after(Some(earlier)).map(|op| (x, op)));
+                (i, j) = (i + 1, j + 1);
             }
         }
+        merged.extend_from_slice(&a[i..]);
+        merged.extend_from_slice(&b[j..]);
         let ops = Ops(self.ops.intern(&mut self.charge, merged)?);
         self.charge.grow(32)?;
         self.composed.insert((first, then), ops);
@@ -160,14 +246,30 @@ impl<'gc> Scopes<'gc> {
         if let Some(&applied) = self.applied.get(&(set, ops)) {
             return Ok(applied);
         }
-        let mut scopes = self.scopes(set).to_vec();
-        for &(scope, op) in self.ops.get(ops.0) {
-            match (scopes.binary_search(&scope), op) {
-                (Ok(i), Op::Remove | Op::Flip) => _ = scopes.remove(i),
-                (Err(i), Op::Add | Op::Flip) => scopes.insert(i, scope),
-                _ => {}
+        let (have, changes) = (self.scopes(set), self.ops.get(ops.0));
+        let mut scopes = Vec::with_capacity(have.len() + changes.len());
+        let (mut i, mut j) = (0, 0);
+        // A scope the set has stays unless removed or flipped; one it lacks comes in if added or
+        // flipped.
+        while i < have.len() && j < changes.len() {
+            let (x, (y, op)) = (have[i], changes[j]);
+            if x < y {
+                scopes.push(x);
+                i += 1;
+            } else if y < x {
+                if op != Op::Remove {
+                    scopes.push(y);
+                }
+                j += 1;
+            } else {
+                if op == Op::Add {
+                    scopes.push(x);
+                }
+                (i, j) = (i + 1, j + 1);
             }
         }
+        scopes.extend_from_slice(&have[i..]);
+        scopes.extend(changes[j..].iter().filter(|&&(_, op)| op != Op::Remove).map(|&(y, _)| y));
         let applied = Set(self.sets.intern(&mut self.charge, scopes)?);
         self.charge.grow(32)?;
         self.applied.insert((set, ops), applied);

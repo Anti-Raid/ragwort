@@ -50,7 +50,8 @@ pub enum ExpandErrorKind {
     Immutable,
     /// An identifier that two bindings could be, neither of whose scopes include the other's.
     Ambiguous,
-    /// Syntax the expander doesn't support yet: defining macros, and unquoting in a vector.
+    /// Syntax the expander doesn't support yet: defining macros, `syntax` and its kin, and
+    /// unquoting in a vector.
     Unsupported,
     /// Expressions nested more than 256 deep, or data more than 1024.
     TooDeep,

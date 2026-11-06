@@ -216,13 +216,28 @@ impl<'gc> SyntaxOrigin<'gc> {
     }
 }
 
-/// Reader shorthand for quotation and unquotation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Abbreviation {
-    Quote,
-    Quasiquote,
-    Unquote,
-    UnquoteSplicing,
+crate::named! {
+    /// Reader shorthand for quotation and unquotation, of data and of syntax, named for the form
+    /// each stands for.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Abbreviation {
+        /// `'`
+        Quote = "quote",
+        /// `` ` ``
+        Quasiquote = "quasiquote",
+        /// `,`
+        Unquote = "unquote",
+        /// `,@`
+        UnquoteSplicing = "unquote-splicing",
+        /// `#'`
+        Syntax = "syntax",
+        /// `` #` ``
+        Quasisyntax = "quasisyntax",
+        /// `#,`
+        Unsyntax = "unsyntax",
+        /// `#,@`
+        UnsyntaxSplicing = "unsyntax-splicing",
+    }
 }
 
 /// The shape of a reader datum.
@@ -252,6 +267,10 @@ impl SyntaxKind {
             Self::Abbreviation(Abbreviation::Quasiquote) => 5,
             Self::Abbreviation(Abbreviation::Unquote) => 6,
             Self::Abbreviation(Abbreviation::UnquoteSplicing) => 7,
+            Self::Abbreviation(Abbreviation::Syntax) => 8,
+            Self::Abbreviation(Abbreviation::Quasisyntax) => 9,
+            Self::Abbreviation(Abbreviation::Unsyntax) => 10,
+            Self::Abbreviation(Abbreviation::UnsyntaxSplicing) => 11,
         }
     }
 
@@ -265,6 +284,10 @@ impl SyntaxKind {
             5 => Self::Abbreviation(Abbreviation::Quasiquote),
             6 => Self::Abbreviation(Abbreviation::Unquote),
             7 => Self::Abbreviation(Abbreviation::UnquoteSplicing),
+            8 => Self::Abbreviation(Abbreviation::Syntax),
+            9 => Self::Abbreviation(Abbreviation::Quasisyntax),
+            10 => Self::Abbreviation(Abbreviation::Unsyntax),
+            11 => Self::Abbreviation(Abbreviation::UnsyntaxSplicing),
             _ => return None,
         })
     }

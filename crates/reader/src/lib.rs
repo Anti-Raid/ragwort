@@ -106,8 +106,8 @@ pub struct Reader<'a, 'gc> {
     literal: SyntaxMeta<'gc>,
     list: SyntaxMeta<'gc>,
     vector: SyntaxMeta<'gc>,
-    /// Quote, quasiquote, unquote and unquote-splicing.
-    abbreviations: [SyntaxMeta<'gc>; 4],
+    /// Each [`Abbreviation`]'s metadata, in order.
+    abbreviations: Vec<SyntaxMeta<'gc>>,
     /// Innermost last. Both count against the arena's budget, so deep nesting can't use
     /// memory past it.
     open: ScratchVec<'gc, Open<'gc>>,
@@ -145,12 +145,7 @@ impl<'a, 'gc> Reader<'a, 'gc> {
             literal: meta(SyntaxKind::Literal)?,
             list: meta(SyntaxKind::List)?,
             vector: meta(SyntaxKind::Vector)?,
-            abbreviations: [
-                abbreviation(Abbreviation::Quote)?,
-                abbreviation(Abbreviation::Quasiquote)?,
-                abbreviation(Abbreviation::Unquote)?,
-                abbreviation(Abbreviation::UnquoteSplicing)?,
-            ],
+            abbreviations: Abbreviation::ALL.iter().map(|&a| abbreviation(a)).collect::<Result<_, _>>()?,
             open: ScratchVec::new(mc),
             items: ScratchVec::new(mc),
             labels: HashMap::new(),
@@ -187,16 +182,7 @@ impl<'a, 'gc> Reader<'a, 'gc> {
                     continue;
                 }
                 b'\'' | b'`' | b',' => {
-                    let which = match byte {
-                        b'\'' => 0,
-                        b'`' => 1,
-                        _ if self.text.as_bytes().get(self.at) == Some(&b'@') => {
-                            self.at += 1;
-                            3
-                        }
-                        _ => 2,
-                    };
-                    self.push(Open::Prefix { start, end: self.at, meta: self.abbreviations[which] }, start)?;
+                    self.prefix(start, byte, [Abbreviation::Quote, Abbreviation::Quasiquote, Abbreviation::Unquote, Abbreviation::UnquoteSplicing])?;
                     continue;
                 }
                 b')' | b']' => self.close(start, byte)?,
@@ -273,8 +259,28 @@ impl<'a, 'gc> Reader<'a, 'gc> {
 
     /// What follows a `#` at `start`: a vector's or bytevector's opening, a datum comment, a
     /// label or a use of one, a directive, a character, a boolean or a number with prefixes.
+    /// Opens the abbreviation `byte` starts: one of `'`, `` ` ``, `,` or `,@`, which stand for
+    /// `which`'s four, in that order.
+    fn prefix(&mut self, start: usize, byte: u8, which: [Abbreviation; 4]) -> Result<(), ReadError> {
+        let a = match byte {
+            b'\'' => which[0],
+            b'`' => which[1],
+            _ if self.text.as_bytes().get(self.at) == Some(&b'@') => {
+                self.at += 1;
+                which[3]
+            }
+            _ => which[2],
+        };
+        self.push(Open::Prefix { start, end: self.at, meta: self.abbreviations[a as usize] }, start)
+    }
+
     fn hash(&mut self, start: usize) -> Result<Option<Syntax<'gc>>, ReadError> {
         let rest = &self.text.as_bytes()[self.at..];
+        if let [byte @ (b'\'' | b'`' | b','), ..] = *rest {
+            self.at += 1;
+            self.prefix(start, byte, [Abbreviation::Syntax, Abbreviation::Quasisyntax, Abbreviation::Unsyntax, Abbreviation::UnsyntaxSplicing])?;
+            return Ok(None);
+        }
         let shape = match rest {
             [b'(', ..] => Some((Shape::Vector, 1)),
             [b'u' | b'U', b'8', b'(', ..] => Some((Shape::Bytevector, 3)),

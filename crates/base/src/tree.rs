@@ -61,12 +61,12 @@ pub(crate) struct Tree<'a, 'gc> {
     nodes: ScratchVec<'gc, Node<'gc>>,
     kids: ScratchVec<'gc, Stx>,
     pub(crate) scopes: Scopes<'gc>,
-    /// The symbols the reader's abbreviations stand for.
-    abbreviations: [Symbol<'gc>; 4],
+    /// The symbols each of the reader's abbreviations stands for, in order.
+    abbreviations: Vec<Symbol<'gc>>,
 }
 
 impl<'a, 'gc> Tree<'a, 'gc> {
-    pub(crate) fn new(mc: &'a Mutation<'gc>, abbreviations: [Symbol<'gc>; 4]) -> Self {
+    pub(crate) fn new(mc: &'a Mutation<'gc>, abbreviations: Vec<Symbol<'gc>>) -> Self {
         Self { mc, nodes: ScratchVec::new(mc), kids: ScratchVec::new(mc), scopes: Scopes::new(mc), abbreviations }
     }
 

@@ -317,6 +317,8 @@ fn bad_syntax_points_at_itself() {
     assert_eq!(error("(set! car 1)"), (Immutable, "car"));
     assert_eq!(error("(set! if 1)"), (BadSyntax, "if"));
     assert_eq!(error("(define-syntax m 1)"), (Unsupported, "(define-syntax m 1)"));
+    assert_eq!(error("(car #'x)"), (Unsupported, "#'x"));
+    assert_eq!(error("(car '(a #`(b #,c)) (syntax d))"), (Unsupported, "(syntax d)"));
     assert_eq!(error("(cond (else 1) (#t 2))"), (BadSyntax, "(else 1)"));
     assert_eq!(error("(let ((x)) x)"), (BadSyntax, "(x)"));
     assert_eq!(error("()"), (BadSyntax, "()"));
@@ -390,6 +392,25 @@ fn mutable_bytevectors() {
     assert_eq!(eval_in(&mut arena(), "(make-bytevector 2 256)"), Ok(Err(Fault::WrongType)));
     assert_eq!(eval_in(&mut arena(), "(make-bytevector 2 0 0)"), Ok(Err(Fault::Arity)));
     assert_eq!(eval_in(&mut arena(), "(bytevector-length '())"), Ok(Err(Fault::WrongType)));
+}
+
+#[test]
+fn mutable_vectors() {
+    let fill = "(let ((v (make-vector 3 'a)))
+                  (vector-set! v 1 'b)
+                  (list (vector? v) (vector-length v) (vector-ref v 0) (vector-ref v 1) (vector->list v)))";
+    assert_eq!(eval(fill), "(#t 3 a b (a b a))");
+    assert_eq!(eval("(vector->list (make-vector 2))"), "(0 0)");
+    assert_eq!(eval("(let ((v (vector 1 'x \"s\"))) (vector-set! v 0 v) (list (eq? (vector-ref v 0) v) (vector-ref v 1)))"), "(#t x)");
+    assert_eq!(eval("(list (vector->list (vector)) (vector-length #()) (vector-ref #(1 #(2)) 0) (vector->list (list->vector '(1 2 3))))"), "(() 0 1 (1 2 3))");
+    assert_eq!(eval("(list (vector? #(1)) (vector? (vector)) (vector? '(1)) (vector? #u8(1)) (equal? (vector 1 2) #(1 2)))"), "(#t #t #f #f #t)");
+    assert_eq!(eval_in(&mut arena(), "(vector-set! #(1 2) 0 3)"), Ok(Err(Fault::Immutable)));
+    assert_eq!(eval_in(&mut arena(), "(vector-ref (vector 1) 1)"), Ok(Err(Fault::OutOfRange)));
+    assert_eq!(eval_in(&mut arena(), "(vector-set! (vector 1) -1 0)"), Ok(Err(Fault::OutOfRange)));
+    assert_eq!(eval_in(&mut arena(), "(vector-ref '(1) 0)"), Ok(Err(Fault::WrongType)));
+    assert_eq!(eval_in(&mut arena(), "(list->vector '(1 . 2))"), Ok(Err(Fault::WrongType)));
+    assert_eq!(eval_in(&mut arena(), "(make-vector -1)"), Ok(Err(Fault::OutOfRange)));
+    assert_eq!(eval_in(&mut arena(), "(make-vector 1 0 0)"), Ok(Err(Fault::Arity)));
 }
 
 #[test]

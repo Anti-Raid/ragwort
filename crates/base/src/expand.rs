@@ -4,17 +4,16 @@
 //! is told apart from what it was given. An identifier means the binding of its name whose
 //! scopes are the most of its own.
 
-use std::collections::HashMap;
 
 use ragwort_compiler::{Core, Lambda, Place, Var};
 use ragwort_native::Globals;
 use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Value};
 use ragwort_types::string::Strings;
 use ragwort_types::symbol::{Symbol, Symbols};
-use ragwort_types::syntax::Syntax;
+use ragwort_types::syntax::{Abbreviation, Syntax};
 use ragwort_vm::objects::{Global, GlobalFields};
 
-use crate::scope::{BASE, Op, Scope, Set, TOP};
+use crate::scope::{BASE, Map, Op, Scope, Set, TOP};
 use crate::tree::{Stx, Tree, TreeError, View};
 use crate::{ExpandError, ExpandErrorKind};
 
@@ -35,7 +34,7 @@ pub(crate) enum Form {
     Begin,
     Let,
     Letrec,
-    /// Defining macros, which needs `syntax-rules` or `syntax-case`.
+    /// Defining macros and making syntax, which need `syntax-rules` or `syntax-case`.
     Macros,
 }
 
@@ -71,7 +70,7 @@ pub(crate) enum Keyword {
     Aux(Aux),
 }
 
-const KEYWORDS: [(&str, Keyword); 26] = [
+const KEYWORDS: [(&str, Keyword); 30] = [
     ("quote", Keyword::Form(Form::Quote)),
     ("if", Keyword::Form(Form::If)),
     ("lambda", Keyword::Form(Form::Lambda)),
@@ -85,6 +84,10 @@ const KEYWORDS: [(&str, Keyword); 26] = [
     ("let-syntax", Keyword::Form(Form::Macros)),
     ("letrec-syntax", Keyword::Form(Form::Macros)),
     ("syntax-rules", Keyword::Form(Form::Macros)),
+    ("syntax", Keyword::Form(Form::Macros)),
+    ("quasisyntax", Keyword::Form(Form::Macros)),
+    ("unsyntax", Keyword::Form(Form::Macros)),
+    ("unsyntax-splicing", Keyword::Form(Form::Macros)),
     ("let*", Keyword::Macro(Macro::LetStar)),
     ("and", Keyword::Macro(Macro::And)),
     ("or", Keyword::Macro(Macro::Or)),
@@ -129,15 +132,18 @@ pub(crate) struct Expander<'a, 'gc> {
     strings: Strings<'a, 'gc>,
     symbols: Symbols<'gc>,
     pub(crate) tree: Tree<'a, 'gc>,
-    keywords: HashMap<u64, Keyword>,
+    keywords: Map<u64, Keyword>,
     globals: Globals<'gc>,
     prelude: Globals<'gc>,
     /// The globals of each table, by their names' words.
-    user_cells: HashMap<u64, Gc<'gc, Global>>,
-    base_cells: HashMap<u64, Gc<'gc, Global>>,
+    user_cells: Map<u64, Gc<'gc, Global>>,
+    base_cells: Map<u64, Gc<'gc, Global>>,
     /// The bindings made in this load, with the scopes each was made in, by the newest of those
     /// scopes and the name's word. An identifier's bindings are under its own scopes.
-    bindings: HashMap<(Scope, u64), Vec<(Set, Binding<'gc>)>>,
+    bindings: Map<(Scope, u64), Vec<(Set, Binding<'gc>)>>,
+    /// The scopes `bindings` has bindings of each name's word under, so a name bound in fewer
+    /// places than an identifier has scopes is looked up from its side.
+    bound_in: Map<u64, Vec<Scope>>,
     top: Set,
     base: Set,
     vars: u32,
@@ -154,7 +160,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let strings = Strings::new(mc);
         let intern = |name: &str| symbols.intern_str(&strings, name);
         let keywords = KEYWORDS.iter().map(|&(name, k)| Ok((key(intern(name)?, mc), k))).collect::<Result<_, ragwort_types::Error>>()?;
-        let abbreviations = [intern("quote")?, intern("quasiquote")?, intern("unquote")?, intern("unquote-splicing")?];
+        let abbreviations = Abbreviation::ALL.iter().map(|a| intern(a.name())).collect::<Result<_, _>>()?;
         let mut tree = Tree::new(mc, abbreviations);
         let top = tree.scopes.set(vec![TOP])?;
         let base = tree.scopes.set(vec![BASE])?;
@@ -169,7 +175,8 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             prelude,
             user_cells: cells(globals),
             base_cells: cells(prelude),
-            bindings: HashMap::new(),
+            bindings: Map::default(),
+            bound_in: Map::default(),
             top,
             base,
             vars: 0,
@@ -295,8 +302,14 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let set = self.tree.scopes_of(id)?;
         let k = key(symbol, self.mc);
         let scopes = &self.tree.scopes;
+        // A binding visible to `id` is under one of `id`'s scopes, so look up whichever list
+        // is shorter: `id`'s scopes, or those the name is bound under that are among them.
+        let bound_in = self.bound_in.get(&k).map_or(&[][..], Vec::as_slice);
+        let own = scopes.scopes(set);
+        let (bound_in, own) = if bound_in.len() < own.len() { (bound_in, &[][..]) } else { (&[][..], own) };
         let candidates = || {
-            let lists = scopes.scopes(set).iter().filter_map(|&scope| self.bindings.get(&(scope, k)));
+            let under = bound_in.iter().filter(|&&scope| scopes.contains(set, scope)).chain(own);
+            let lists = under.filter_map(|&scope| self.bindings.get(&(scope, k)));
             lists.flatten().filter(|&&(s, _)| scopes.subset(s, set))
         };
         let mut best: Option<(Set, Binding<'gc>)> = None;
@@ -329,7 +342,13 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let set = self.tree.scopes_of(id)?;
         self.tree.scopes.charge(size_of::<(Set, Binding)>())?;
         let newest = self.tree.scopes.scopes(set).last().copied().unwrap_or(TOP);
-        self.bindings.entry((newest, key(symbol, self.mc))).or_default().push((set, binding));
+        let k = key(symbol, self.mc);
+        let under = self.bindings.entry((newest, k)).or_default();
+        if under.is_empty() {
+            self.tree.scopes.charge(size_of::<Scope>())?;
+            self.bound_in.entry(k).or_default().push(newest);
+        }
+        under.push((set, binding));
         Ok(())
     }
 

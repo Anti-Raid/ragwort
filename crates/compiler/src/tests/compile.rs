@@ -760,3 +760,63 @@ fn only_imports_that_just_spread_into_an_intrinsic_inline_as_it() {
         }
     });
 }
+
+/// How many ops call `intrinsic`, in any form.
+fn calls(ops: &[Op], intrinsic: Intrinsic) -> usize {
+    ops.iter()
+        .filter(|op| match **op {
+            Op::CallIntrinsic { intrinsic: i, .. }
+            | Op::CallIntrinsic1 { intrinsic: i, .. }
+            | Op::CallIntrinsic2 { intrinsic: i, .. }
+            | Op::CallIntrinsic3 { intrinsic: i, .. }
+            | Op::TailCallIntrinsic { intrinsic: i, .. }
+            | Op::ApplyIntrinsic { intrinsic: i, .. }
+            | Op::BranchIntrinsic1 { intrinsic: i, .. }
+            | Op::BranchIntrinsic2 { intrinsic: i, .. } => i == intrinsic,
+            _ => false,
+        })
+        .count()
+}
+
+/// A vector literal of `xs`.
+fn constant<'gc>(mc: &Mutation<'gc>, xs: &[i64]) -> Core<'gc> {
+    let items: Vec<_> = xs.iter().map(|&x| fix(x)).collect();
+    Core::Quote(ragwort_types::vector::Vectors::new(mc).immutable_from_slice(&items).unwrap().value(mc))
+}
+
+/// Whether `core` compiles to just loading a constant.
+fn folds<'gc>(mc: &Mutation<'gc>, core: Core<'gc>) -> bool {
+    matches!(all_ops(mc, compile(mc, &core).unwrap()).as_slice(), [Op::LoadConst { .. }, Op::Return { .. }])
+}
+
+#[test]
+fn reads_of_constant_vectors_fold() {
+    use Intrinsic::{IsPair, IsVector, MakeVectorOf, VectorLength, VectorRef};
+    let mut arena = Arena::new(1 << 24, 0);
+    arena.mutate(|mc| {
+        assert!(folds(mc, prim(VectorRef, vec![constant(mc, &[1, 2]), q(1)])));
+        assert!(folds(mc, prim(VectorLength, vec![constant(mc, &[1, 2, 3])])));
+        assert!(folds(mc, prim(IsVector, vec![constant(mc, &[])])));
+        assert!(folds(mc, prim(IsVector, vec![q(1)])));
+
+        // An index past the end is left to fault when it runs.
+        let past = all_ops(mc, compile(mc, &prim(VectorRef, vec![constant(mc, &[1]), q(1)])).unwrap());
+        assert_eq!(calls(&past, VectorRef), 1, "{past:?}");
+
+        // A vector `vector` makes can change, so reading one isn't folded.
+        let made = prim(VectorRef, vec![prim(MakeVectorOf, vec![q(1), q(2)]), q(0)]);
+        let ops = all_ops(mc, compile(mc, &made).unwrap());
+        assert_eq!(calls(&ops, VectorRef), 1, "{ops:?}");
+
+        // Under `(pair? x)`, `(vector? x)` is false, and under `(vector? x)`, it's true:
+        // (lambda (x) (if (pair? x) (vector? x) (if (vector? x) (vector? x) 0))) has one test left.
+        let is = |i: Intrinsic| prim(i, vec![var(0)]);
+        let tests = when(is(IsPair), is(IsVector), when(is(IsVector), is(IsVector), q(0)));
+        let ops = all_ops(mc, compile(mc, &lambda(&[0], None, tests)).unwrap());
+        assert_eq!(calls(&ops, IsVector), 1, "{ops:?}");
+    });
+    assert_eq!(number(|mc| prim(VectorRef, vec![constant(mc, &[1, 2]), q(1)])), Ok(2));
+    assert_eq!(number(|mc| prim(VectorLength, vec![constant(mc, &[1, 2, 3])])), Ok(3));
+    assert_eq!(number(|mc| prim(VectorRef, vec![constant(mc, &[1]), q(1)])), Err(Fault::OutOfRange));
+    eval(|mc| prim(IsVector, vec![constant(mc, &[])]), |_, v| assert_eq!(v, Ok(Value::TRUE)));
+}

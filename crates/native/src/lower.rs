@@ -102,9 +102,9 @@ pub struct Lowerer<'a, 'gc> {
     /// The forms and the built-ins, by their names' words.
     forms: HashMap<u64, Form>,
     prims: HashMap<u64, Prim>,
-    /// `quote`, `quasiquote`, `unquote` and `unquote-splicing`, for what the abbreviations read
+    /// The symbols each [`Abbreviation`] stands for, in order, for what they read
     /// as in a quoted datum.
-    abbreviations: [Value<'gc>; 4],
+    abbreviations: Vec<Value<'gc>>,
     /// The locals in scope of each name, innermost last.
     scope: HashMap<u64, Vec<Var>>,
     vars: u32,
@@ -128,12 +128,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             cells,
             forms,
             prims,
-            abbreviations: [
-                symbols.intern_str(&strings, "quote")?.value(mc),
-                symbols.intern_str(&strings, "quasiquote")?.value(mc),
-                symbols.intern_str(&strings, "unquote")?.value(mc),
-                symbols.intern_str(&strings, "unquote-splicing")?.value(mc),
-            ],
+            abbreviations: Abbreviation::ALL.iter().map(|a| Ok(symbols.intern_str(&strings, a.name())?.value(mc))).collect::<Result<_, ragwort_types::Error>>()?,
             scope: HashMap::new(),
             vars: 0,
             lambdas: 0,
@@ -280,12 +275,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         let datum = match node.kind(self.mc) {
             Some(SyntaxKind::Identifier | SyntaxKind::Literal) => node.datum(self.mc),
             Some(SyntaxKind::Abbreviation(a)) => {
-                let name = match a {
-                    Abbreviation::Quote => self.abbreviations[0],
-                    Abbreviation::Quasiquote => self.abbreviations[1],
-                    Abbreviation::Unquote => self.abbreviations[2],
-                    Abbreviation::UnquoteSplicing => self.abbreviations[3],
-                };
+                let name = self.abbreviations[a as usize];
                 let inner = self.datum(self.inner(node)?)?;
                 self.pairs.list(&[name, inner]).map_err(|e| oom(self, e))?
             }

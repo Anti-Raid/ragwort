@@ -30,6 +30,10 @@ fn show<'gc>(mc: &Mutation<'gc>, node: Syntax<'gc>) -> String {
                 Abbreviation::Quasiquote => "`",
                 Abbreviation::Unquote => ",",
                 Abbreviation::UnquoteSplicing => ",@",
+                Abbreviation::Syntax => "#'",
+                Abbreviation::Quasisyntax => "#`",
+                Abbreviation::Unsyntax => "#,",
+                Abbreviation::UnsyntaxSplicing => "#,@",
             };
             format!("{prefix}{}", show(mc, Syntax::of(node.datum(mc)).unwrap()))
         }
@@ -216,6 +220,7 @@ fn reads_booleans_numbers_strings_and_characters() {
 fn reads_vectors_quasiquotes_and_comments() {
     assert_eq!(read("#(a 1 (b #(c))) #()").unwrap(), ["#(a 1 (b #(c)))", "#()"]);
     assert_eq!(read("`(a ,b ,@c) ,,d").unwrap(), ["`(a ,b ,@c)", ",,d"]);
+    assert_eq!(read("#'x #'(a b) #`(a #,b #,@c) #,#'d").unwrap(), ["#'x", "#'(a b)", "#`(a #,b #,@c)", "#,#'d"]);
     assert_eq!(read("a #| x #| nested |# y |# b").unwrap(), ["a", "b"]);
     assert_eq!(read("(a #;b c) #;(d e) f '#;g h #; #;i j k").unwrap(), ["(a c)", "f", "'h", "k"]);
 }
@@ -321,6 +326,8 @@ fn line_continuations_take_one_line_ending() {
 #[test]
 fn a_dangling_prefix_is_an_error_across_all_of_it() {
     assert_eq!(error("(a ,@)"), (ErrorKind::EmptyQuote, 3, 5));
+    assert_eq!(error("(a #,@)"), (ErrorKind::EmptyQuote, 3, 6));
+    assert_eq!(error("#'"), (ErrorKind::EmptyQuote, 0, 2));
     assert_eq!(error("(a #;)"), (ErrorKind::EmptyQuote, 3, 5));
     assert_eq!(error(",@"), (ErrorKind::EmptyQuote, 0, 2));
     assert_eq!(error("(a . #;b)"), (ErrorKind::BadDot, 3, 4));

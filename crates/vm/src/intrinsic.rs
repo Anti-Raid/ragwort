@@ -8,6 +8,7 @@ use ragwort_types::gc::{Frame, Mutation, ScratchVec, Value};
 use ragwort_types::named;
 use ragwort_types::num::{Number, Nums, complex};
 use ragwort_types::pair::{Pair, Pairs};
+use ragwort_types::vector::{AnyVector, Vectors};
 
 use crate::op::Fuel;
 use crate::{Fault, equal, prompts};
@@ -116,6 +117,22 @@ named! {
         BytevectorRef = "bytevector-u8-ref",
         /// `(bytevector-u8-set! bv k byte)` of a mutable bytevector, returning void.
         BytevectorSet = "bytevector-u8-set!",
+        /// `vector?`.
+        IsVector = "vector?",
+        /// `(make-vector k [fill])`: a mutable vector of `k` copies of `fill`, or of 0.
+        MakeVector = "make-vector",
+        /// `(vector x ...)`: a mutable vector of the `x`s.
+        MakeVectorOf = "vector",
+        /// `(vector-length v)`.
+        VectorLength = "vector-length",
+        /// `(vector-ref v k)`.
+        VectorRef = "vector-ref",
+        /// `(vector-set! v k x)` of a mutable vector, returning void.
+        VectorSet = "vector-set!",
+        /// `(vector->list v)`: a new list of `v`'s elements.
+        VectorToList = "vector->list",
+        /// `(list->vector xs)`: a mutable vector of the proper list `xs`'s elements.
+        ListToVector = "list->vector",
         /// `(box x)`: create a new box holding `x` returning the newly created box
         MakeBox = "box",
         /// `(unbox b)`: returns the contents of the box `b`
@@ -156,6 +173,10 @@ impl Intrinsic {
         match self {
             Intrinsic::Add | Intrinsic::Sub | Intrinsic::Mul | Intrinsic::Div | Intrinsic::Append => None,
             Intrinsic::MakePromptTag | Intrinsic::Values | Intrinsic::MakeError | Intrinsic::Void | Intrinsic::MakeBytevector => None,
+            Intrinsic::MakeVector | Intrinsic::MakeVectorOf => None,
+            Intrinsic::IsVector | Intrinsic::VectorLength | Intrinsic::VectorToList | Intrinsic::ListToVector => Some(1),
+            Intrinsic::VectorRef => Some(2),
+            Intrinsic::VectorSet => Some(3),
             Intrinsic::DefaultPromptTag => Some(0),
             Intrinsic::IsBytevector | Intrinsic::BytevectorLength | Intrinsic::IsProcedure | Intrinsic::IsContinuation => Some(1),
             Intrinsic::Car | Intrinsic::Cdr | Intrinsic::IsNull | Intrinsic::IsPair | Intrinsic::IsList | Intrinsic::Length | Intrinsic::Reverse | Intrinsic::IsBox | Intrinsic::MakeBox | Intrinsic::Unbox => Some(1),
@@ -230,6 +251,9 @@ impl Intrinsic {
                 | IsBytevector
                 | BytevectorLength
                 | BytevectorRef
+                | IsVector
+                | VectorLength
+                | VectorRef
                 | DefaultPromptTag
                 | IsValues
                 | ValuesLength
@@ -256,6 +280,8 @@ impl Intrinsic {
                 | IsBoolean
                 | Void
                 | IsBytevector
+                | IsVector
+                | MakeVectorOf
                 | DefaultPromptTag
                 | Values
                 | IsValues
@@ -274,6 +300,7 @@ impl Intrinsic {
                 | IsBoolean
                 | IsBox
                 | IsBytevector
+                | IsVector
                 | IsList
                 | IsValues
                 | IsProcedure
@@ -311,6 +338,12 @@ impl Intrinsic {
                 | MakeBytevector
                 | BytevectorLength
                 | BytevectorRef
+                | MakeVector
+                | MakeVectorOf
+                | VectorLength
+                | VectorSet
+                | VectorToList
+                | ListToVector
                 | MakeBox
                 | DefaultPromptTag
                 | MakePromptTag
@@ -508,6 +541,57 @@ impl Intrinsic {
                     return Err(Fault::OutOfRange);
                 }
                 Value::VOID
+            }
+            Intrinsic::IsVector => boolean(AnyVector::of(arg(0)).is_some()),
+            Intrinsic::MakeVector => {
+                let fill = match args {
+                    1 => fixnum(0),
+                    2 => arg(1),
+                    _ => return Err(Fault::Arity),
+                };
+                let len = index(arg(0))?;
+                fuel.spend(len as u64 / equal::PER_FUEL)?;
+                made(mc, fuel, Vectors::new(mc).make(len, fill)?.value(mc))
+            }
+            Intrinsic::MakeVectorOf => {
+                let vector = Vectors::new(mc).make(args, Value::VOID)?;
+                let items = vector.items(mc);
+                (0..args).for_each(|i| items.set(mc, i, arg(i)));
+                made(mc, fuel, vector.value(mc))
+            }
+            Intrinsic::VectorLength => {
+                let len = AnyVector::of(arg(0)).ok_or(Fault::WrongType)?.len(mc);
+                Value::fixnum(len as i64).expect("lengths are fixnums")
+            }
+            Intrinsic::VectorRef => AnyVector::of(arg(0)).ok_or(Fault::WrongType)?.get(mc, index(arg(1))?).ok_or(Fault::OutOfRange)?,
+            Intrinsic::VectorSet => {
+                let AnyVector::Mutable(vector) = AnyVector::of(arg(0)).ok_or(Fault::WrongType)? else { return Err(Fault::Immutable) };
+                let (items, k) = (vector.items(mc), index(arg(1))?);
+                if k >= items.len() {
+                    return Err(Fault::OutOfRange);
+                }
+                items.set(mc, k, arg(2));
+                Value::VOID
+            }
+            Intrinsic::VectorToList => {
+                let vector = AnyVector::of(arg(0)).ok_or(Fault::WrongType)?;
+                let len = vector.len(mc);
+                fuel.spend(len as u64 / equal::PER_FUEL)?;
+                let pairs = Pairs::new(mc);
+                let mut list = Value::NIL;
+                for i in (0..len).rev() {
+                    list = pairs.cons(vector.get(mc, i).expect("in range"), list)?.value(mc);
+                }
+                made(mc, fuel, list)
+            }
+            Intrinsic::ListToVector => {
+                let pairs = Pairs::new(mc);
+                let len = pairs.list_len(arg(0)).ok_or(Fault::WrongType)?;
+                fuel.spend(len / equal::PER_FUEL)?;
+                let vector = Vectors::new(mc).make(usize::try_from(len).map_err(|_| Fault::OutOfMemory)?, Value::VOID)?;
+                let items = vector.items(mc);
+                pairs.elements(arg(0)).enumerate().for_each(|(i, x)| items.set(mc, i, x));
+                made(mc, fuel, vector.value(mc))
             }
             Intrinsic::MakeBox => made(mc, fuel, Value::object(mc, objects::Box::new(mc, arg(0))?)),
             Intrinsic::Unbox => arg(0).downcast::<objects::Box>(mc).ok_or(Fault::WrongType)?.value(mc),

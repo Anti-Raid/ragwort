@@ -52,6 +52,15 @@
 (%define-global bytevector-u8-ref (%lambda (bv k) (%intrinsic bytevector-u8-ref bv k)))
 (%define-global bytevector-u8-set! (%lambda (bv k byte) (%intrinsic bytevector-u8-set! bv k byte)))
 
+(%define-global vector? (%lambda (x) (%intrinsic vector? x)))
+(%define-global make-vector (%lambda (k . fill) (%apply-intrinsic make-vector k fill)))
+(%define-global vector (%lambda xs (%apply-intrinsic vector xs)))
+(%define-global vector-length (%lambda (v) (%intrinsic vector-length v)))
+(%define-global vector-ref (%lambda (v k) (%intrinsic vector-ref v k)))
+(%define-global vector-set! (%lambda (v k x) (%intrinsic vector-set! v k x)))
+(%define-global vector->list (%lambda (v) (%intrinsic vector->list v)))
+(%define-global list->vector (%lambda (xs) (%intrinsic list->vector xs)))
+
 (%define-global + (%lambda xs (%apply-intrinsic + xs)))
 (%define-global - (%lambda xs (%apply-intrinsic - xs)))
 (%define-global * (%lambda xs (%apply-intrinsic * xs)))
