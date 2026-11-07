@@ -8,11 +8,12 @@ use ragwort_types::gc::{Frame, Mutation, ScratchVec, Value};
 use ragwort_types::named;
 use ragwort_types::num::{Number, Nums, complex};
 use ragwort_types::pair::{Pair, Pairs};
+use ragwort_types::string::{self, Strings};
 use ragwort_types::vector::{AnyVector, Vectors};
 
 use crate::op::Fuel;
 use crate::{Fault, coroutine, equal, prompts};
-use crate::objects::{self, BoxFields, Condition, Global, GlobalFields, MultiValue, MultiValueFields, Tag, TaskFields};
+use crate::objects::{self, BoxFields, Condition, ConditionFields, Global, GlobalFields, MultiValue, MultiValueFields, Tag, TaskFields};
 
 named! {
     #[repr(u16)]
@@ -162,7 +163,7 @@ named! {
         MakeError = "make-error",
         /// `procedure?`: whether `x` is a [`objects::Closure`] or [`objects::Continuation`].
         IsProcedure = "procedure?",
-        /// `continuation?`: whether `x` is a composable [`objects::Continuation`].
+        /// `continuation?`: whether `x` is a [`objects::Continuation`], composable or not.
         IsContinuation = "continuation?",
         /// `(make-coroutine f)`: a pending coroutine that the first `co/resume` of it starts by
         /// calling the procedure `f`.
@@ -171,6 +172,15 @@ named! {
         IsCoroutine = "coroutine?",
         /// `(coroutine-state co)`: 0 if `co` is pending, 1 running, 2 finished and 3 failed.
         CoroutineState = "coroutine-state",
+        /// `error-object?`: whether `x` is a `Condition`, as `make-error` and VM faults make.
+        IsErrorObject = "error-object?",
+        /// `(error-object-message c)`: what `error` was given, or for a VM fault, its kind in
+        /// words.
+        ErrorObjectMessage = "error-object-message",
+        /// `(error-object-irritants c)`.
+        ErrorObjectIrritants = "error-object-irritants",
+        /// `(error-object-kind c)`: which of [`Fault::KINDS`] the condition is, as a fixnum.
+        ErrorObjectKind = "error-object-kind",
     }
 }
 
@@ -185,6 +195,8 @@ impl Intrinsic {
             Intrinsic::VectorRef => Some(2),
             Intrinsic::VectorSet => Some(3),
             Intrinsic::DefaultPromptTag => Some(0),
+            Intrinsic::IsErrorObject => Some(1),
+            Intrinsic::ErrorObjectMessage | Intrinsic::ErrorObjectIrritants | Intrinsic::ErrorObjectKind => Some(1),
             Intrinsic::IsBytevector | Intrinsic::BytevectorLength | Intrinsic::IsProcedure | Intrinsic::IsContinuation => Some(1),
             Intrinsic::MakeCoroutine | Intrinsic::IsCoroutine | Intrinsic::CoroutineState => Some(1),
             Intrinsic::Car | Intrinsic::Cdr | Intrinsic::IsNull | Intrinsic::IsPair | Intrinsic::IsList | Intrinsic::Length | Intrinsic::Reverse | Intrinsic::IsBox | Intrinsic::MakeBox | Intrinsic::Unbox => Some(1),
@@ -269,6 +281,7 @@ impl Intrinsic {
                 | IsProcedure
                 | IsContinuation
                 | IsCoroutine
+                | IsErrorObject
         )
     }
 
@@ -297,6 +310,7 @@ impl Intrinsic {
                 | IsProcedure
                 | IsContinuation
                 | IsCoroutine
+                | IsErrorObject
         )
     }
 
@@ -316,6 +330,7 @@ impl Intrinsic {
                 | IsProcedure
                 | IsContinuation
                 | IsCoroutine
+                | IsErrorObject
         )
     }
 
@@ -366,6 +381,9 @@ impl Intrinsic {
                 | MakeError
                 | MakeCoroutine
                 | CoroutineState
+                | ErrorObjectMessage
+                | ErrorObjectIrritants
+                | ErrorObjectKind
         )
     }
 
@@ -674,6 +692,23 @@ impl Intrinsic {
                 let co = coroutine::of(mc, arg(0)).ok_or(Fault::WrongType)?;
                 Value::fixnum(i64::from(co.state(mc))).expect("states are fixnums")
             }
+            Intrinsic::IsErrorObject => boolean(arg(0).downcast::<Condition>(mc).is_some()),
+            Intrinsic::ErrorObjectMessage => {
+                let c = arg(0).downcast::<Condition>(mc).ok_or(Fault::WrongType)?;
+                match c.message(mc) {
+                    Value::VOID => {
+                        let kind = c.fault(mc).ok_or(Fault::Malformed)?.kind();
+                        let words = Fault::KINDS[kind].replace('-', " ");
+                        made(mc, fuel, string::from_str(&Strings::new(mc), &words)?.value())
+                    }
+                    message => message,
+                }
+            }
+            Intrinsic::ErrorObjectIrritants => arg(0).downcast::<Condition>(mc).ok_or(Fault::WrongType)?.irritants(mc),
+            Intrinsic::ErrorObjectKind => {
+                let c = arg(0).downcast::<Condition>(mc).ok_or(Fault::WrongType)?;
+                Value::fixnum(c.fault(mc).ok_or(Fault::Malformed)?.kind() as i64).expect("kinds are fixnums")
+            }
         })
     }
 }
@@ -841,7 +876,7 @@ fn index(v: Value<'_>) -> Result<usize, Fault> {
 /// `value`, just made. If making it has made the step due, the run pauses at its next call or
 /// jump, so the step can end and the collector keep up.
 #[inline(always)]
-fn made<'gc>(mc: &Mutation<'gc>, fuel: &mut Fuel, value: Value<'gc>) -> Value<'gc> {
+pub(crate) fn made<'gc>(mc: &Mutation<'gc>, fuel: &mut Fuel, value: Value<'gc>) -> Value<'gc> {
     if mc.step_due() {
         fuel.pause();
     }

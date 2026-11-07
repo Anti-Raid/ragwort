@@ -3,9 +3,9 @@ use ragwort_types::pair::{Pair, Pairs};
 use ragwort_types::vector::Vectors;
 
 use super::*;
-use crate::Intrinsic::{Add, Car, Cdr, Cons, Eq, IsNull, IsValues, MakeBox, MakePromptTag, SetBox, Unbox, Values, ValuesLength, ValuesRef};
+use crate::Intrinsic::{Add, Car, Cons, Eq, IsValues, MakeBox, MakePromptTag, SetBox, Unbox, Values, ValuesLength, ValuesRef};
 use crate::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Condition, ConditionFields, MultiValue, MultiValueFields, Tag};
-use crate::{Capture, Fault, Op, Request};
+use crate::{Capture, Fault, Op, Read, Request};
 
 fn fix<'gc>(n: i64) -> Value<'gc> {
     Value::fixnum(n).unwrap()
@@ -328,17 +328,13 @@ const CALL_CC: u32 = 0;
 const WITH_HANDLER: u32 = 1;
 const RAISE_CONTINUABLE: u32 = 2;
 const RAISE: u32 = 3;
-/// What the prelude's `raise` raises when a handler returns.
-const RETURNED: i64 = -7;
-
 /// What this VM leaves to native ragwort, written out in bytecode: a prompt with Racket's
-/// default handler, which calls the thunk an abort passes under the prompt again, `call/cc`
-/// in terms of it, and exceptions, whose handlers are a mark. Returns `run`, which calls a
-/// thunk under the prompt, and the upvalues of a test's function 0.
+/// default handler, which calls the thunk an abort passes under the prompt again, `call/cc` in
+/// terms of it, and wrappers of the exception requests. Returns `run`, which calls a thunk under
+/// the prompt, and the upvalues of a test's function 0.
 fn prelude<'gc>(mc: &Mutation<'gc>) -> (Value<'gc>, Vec<Value<'gc>>) {
     let tag = Value::object(mc, Tag::new(mc, Value::VOID).unwrap());
-    let key = Value::object(mc, Tag::new(mc, Value::VOID).unwrap());
-    // Constants 0..4 are the tag, the handlers' key, '() and RETURNED; function i is 4 + i.
+    // Constant 0 is the tag; function i is 1 + i.
     let default_handler = [
         Op::LoadConst { dst: 3, index: 0 },
         Op::Move { dst: 4, src: 0 },
@@ -347,72 +343,32 @@ fn prelude<'gc>(mc: &Mutation<'gc>) -> (Value<'gc>, Vec<Value<'gc>>) {
     ];
     let run = [
         Op::LoadConst { dst: 3, index: 0 },
-        Op::NewClosure { dst: 4, count: 1, code: 4 },
+        Op::NewClosure { dst: 4, count: 1, code: 1 },
         Op::Move { dst: 5, src: 1 },
         Op::TailCallRequest { base: 3, args: 3, request: Request::CallWithPrompt },
     ];
     // (call/cc f): (capture tag (lambda (k) (f (lambda (v) (abort tag (lambda () (k v)))))))
     let call_cc = [
         Op::LoadConst { dst: 3, index: 0 },
-        Op::NewClosure { dst: 4, count: 1, code: 7 },
+        Op::NewClosure { dst: 4, count: 1, code: 4 },
         Op::TailCallRequest { base: 3, args: 2, request: Request::Capture },
     ];
-    let receiver = [Op::NewClosure { dst: 4, count: 1, code: 8 }, Op::LoadUpvalue { dst: 3, index: 0 }, Op::TailCall { base: 3, args: 1 }];
+    let receiver = [Op::NewClosure { dst: 4, count: 1, code: 5 }, Op::LoadUpvalue { dst: 3, index: 0 }, Op::TailCall { base: 3, args: 1 }];
     let escape = [
         Op::LoadConst { dst: 3, index: 0 },
-        Op::NewClosure { dst: 4, count: 1, code: 9 },
+        Op::NewClosure { dst: 4, count: 1, code: 6 },
         Op::TailCallRequest { base: 3, args: 2, request: Request::Abort },
     ];
     let call_upvalue = [Op::LoadUpvalue { dst: 2, index: 0 }, Op::LoadUpvalue { dst: 3, index: 1 }, Op::TailCall { base: 2, args: 1 }];
-    // (with-exception-handler h thunk): (with-mark key (cons h (mark-value key '())) thunk)
     let with_handler = [
-        Op::LoadConst { dst: 4, index: 1 },
-        Op::LoadConst { dst: 5, index: 2 },
-        Op::CallRequest { base: 4, args: 2, request: Request::MarkValue },
-        Op::LoadAcc { dst: 6 },
-        Op::Move { dst: 5, src: 1 },
-        Op::CallIntrinsic { base: 5, args: 2, intrinsic: Cons },
-        Op::LoadAcc { dst: 5 },
-        Op::LoadConst { dst: 4, index: 1 },
-        Op::Move { dst: 6, src: 2 },
-        Op::TailCallRequest { base: 4, args: 3, request: Request::WithMark },
+        Op::Move { dst: 4, src: 1 },
+        Op::Move { dst: 5, src: 2 },
+        Op::TailCallRequest { base: 4, args: 2, request: Request::WithHandler },
     ];
-    // (let ((hs (mark-value key '())))
-    //   (if (null? hs) (abort tag (lambda () obj)) (with-mark key (cdr hs) (lambda () ...))))
-    let raising = |thunk| {
-        [
-            Op::LoadConst { dst: 3, index: 1 },
-            Op::LoadConst { dst: 4, index: 2 },
-            Op::CallRequest { base: 3, args: 2, request: Request::MarkValue },
-            Op::LoadAcc { dst: 3 },
-            Op::CallIntrinsic { base: 3, args: 1, intrinsic: IsNull },
-            Op::LoadAcc { dst: 4 },
-            Op::JumpIfFalse { test: 4, offset: 3 },
-            Op::LoadConst { dst: 4, index: 0 },
-            Op::NewClosure { dst: 5, count: 1, code: 13 },
-            Op::TailCallRequest { base: 4, args: 2, request: Request::Abort },
-            Op::CallIntrinsic { base: 3, args: 1, intrinsic: Car },
-            Op::LoadAcc { dst: 7 },
-            Op::CallIntrinsic { base: 3, args: 1, intrinsic: Cdr },
-            Op::LoadAcc { dst: 5 },
-            Op::NewClosure { dst: 6, count: 1, code: thunk },
-            Op::LoadConst { dst: 4, index: 1 },
-            Op::TailCallRequest { base: 4, args: 3, request: Request::WithMark },
-        ]
-    };
-    let (raise_continuable, raise) = (raising(12), raising(15));
-    let constant = [Op::LoadUpvalue { dst: 2, index: 0 }, Op::Return { src: 2 }];
-    // (lambda () (h obj) (raise RETURNED))
-    let raise_thunk = [
-        Op::LoadUpvalue { dst: 3, index: 0 },
-        Op::LoadUpvalue { dst: 4, index: 1 },
-        Op::Call { base: 3, args: 1 },
-        Op::LoadUpvalue { dst: 2, index: 2 },
-        Op::LoadConst { dst: 3, index: 3 },
-        Op::TailCall { base: 2, args: 1 },
-    ];
+    let raising = |request| [Op::Move { dst: 3, src: 1 }, Op::TailCallRequest { base: 3, args: 1, request }];
+    let (raise_continuable, raise) = (raising(Request::RaiseContinuable), raising(Request::Raise));
     use Capture::{Register, Upvalue};
-    let funcs: [Func<'_>; 12] = [
+    let funcs: [Func<'_>; 9] = [
         (1, &[], &default_handler),
         (1, &[], &run),
         (1, &[], &call_cc),
@@ -421,14 +377,21 @@ fn prelude<'gc>(mc: &Mutation<'gc>) -> (Value<'gc>, Vec<Value<'gc>>) {
         (0, &[Upvalue(0), Register(1)], &call_upvalue),
         (2, &[], &with_handler),
         (1, &[], &raise_continuable),
-        (0, &[Register(7), Register(1)], &call_upvalue),
-        (0, &[Register(1)], &constant),
         (1, &[], &raise),
-        (0, &[Register(7), Register(1), Register(0)], &raise_thunk),
     ];
-    let codes = module(mc, &[tag, key, Value::NIL, fix(RETURNED)], &funcs);
+    let codes = module(mc, &[tag], &funcs);
     let close = |i: usize| closure(mc, codes[i]);
-    (close(1), vec![close(2), close(6), close(7), close(10), tag])
+    (close(1), vec![close(2), close(6), close(7), close(8), tag])
+}
+
+/// `thunk`, called with `handler` as what a raise calls.
+fn with_raise_handler<'gc>(mc: &Mutation<'gc>, handler: Value<'gc>, thunk: Value<'gc>) -> Value<'gc> {
+    let code = [
+        Op::LoadConst { dst: 2, index: 0 },
+        Op::LoadConst { dst: 3, index: 1 },
+        Op::TailCallRequest { base: 2, args: 2, request: Request::WithHandler },
+    ];
+    closure(mc, module(mc, &[handler, thunk], &[(0, &[], &code)])[0])
 }
 
 /// Runs function 0 of a module under the prelude's prompt, with the prelude's procedures as its
@@ -442,7 +405,6 @@ fn prelude_outcome(constants: &[i64], funcs: &[Func<'_>], check: impl for<'gc> F
         let main = Closure::new(mc, Some(codes[0]), upvalues.len(), Value::VOID).unwrap();
         upvalues.iter().enumerate().for_each(|(i, &v)| main.items(mc).set(mc, i, v));
         let mut machine = Machine::new(mc, MIN_SEGMENT, run, &[Value::object(mc, main)]).unwrap();
-        machine.set_fault(mc, upvalues[RAISE as usize]);
         check(mc, to_end(mc, &mut machine).unwrap());
     });
 }
@@ -585,11 +547,11 @@ fn marks_are_dropped_on_return_and_replaced_in_tail_position() {
         Op::LoadAcc { dst: 2 },
         Op::LoadConst { dst: 3, index: 0 },
         Op::LoadConst { dst: 4, index: 2 },
-        Op::CallRequest { base: 3, args: 2, request: Request::MarkValue },
+        Op::CallRead { base: 3, args: 2, read: Read::MarkValue },
         Op::LoadAcc { dst: 3 },
         Op::TailCallIntrinsic { base: 2, args: 2, intrinsic: Values },
     ];
-    let get = [Op::LoadConst { dst: 2, index: 0 }, Op::LoadConst { dst: 3, index: 2 }, Op::TailCallRequest { base: 2, args: 2, request: Request::MarkValue }];
+    let get = [Op::LoadConst { dst: 2, index: 0 }, Op::LoadConst { dst: 3, index: 2 }, Op::TailCallRead { base: 2, args: 2, read: Read::MarkValue }];
     let constants = [TAG, 1, 0, 100_000, -1];
     assert_eq!(call(&constants, &[(0, &[], &main), (0, &[], &get)], &[]), Ok(vec![1, 0]));
 
@@ -622,7 +584,7 @@ fn marks_are_dropped_on_return_and_replaced_in_tail_position() {
         Op::JumpIfFalse { test: 5, offset: 3 },
         Op::LoadConst { dst: 3, index: 0 },
         Op::LoadConst { dst: 4, index: 2 },
-        Op::TailCallRequest { base: 3, args: 2, request: Request::MarkValue },
+        Op::TailCallRead { base: 3, args: 2, read: Read::MarkValue },
         Op::LoadConst { dst: 3, index: 0 },
         Op::Move { dst: 4, src: 1 },
         Op::NewClosure { dst: 5, count: 1, code: 7 },
@@ -885,7 +847,10 @@ fn exceptions_from_the_prelude() {
         (1, &[], &returns),
         (0, &[Upvalue(1)], &raise),
     ];
-    assert_eq!(prelude_call(&[0, 5], &funcs), [RETURNED]);
+    prelude_outcome(&[0, 5], &funcs, |mc, outcome| {
+        let Outcome::Done(value) = outcome else { panic!("{outcome:?}") };
+        assert_eq!(fault(mc, value), Fault::Error);
+    });
 
     // (call/cc (lambda (k) (with-exception-handler k (lambda () (car 5))))): VM faults go to
     // the prelude's raise.
@@ -902,32 +867,32 @@ fn exceptions_from_the_prelude() {
         assert_eq!(fault(mc, value), Fault::WrongType);
     });
 
-    // (raise 5) with no handler aborts to the prelude's prompt.
+    // (raise 5) with no handler ends the run with it.
     let main = [Op::LoadUpvalue { dst: 2, index: RAISE }, Op::LoadConst { dst: 3, index: 0 }, Op::TailCall { base: 2, args: 1 }];
-    assert_eq!(prelude_call(&[5], &[(0, &[], &main)]), [5]);
+    prelude_outcome(&[5], &[(0, &[], &main)], |_, outcome| assert_eq!(outcome, Outcome::Raised(fix(5))));
 }
 
 #[test]
-fn faults_go_to_the_fault_procedure() {
-    // (car 5), with no fault procedure.
+fn faults_go_to_the_raise_handler() {
+    // (car 5), with no handler.
     let main = [Op::LoadConst { dst: 2, index: 0 }, Op::TailCallIntrinsic { base: 2, args: 1, intrinsic: Car }];
     outcome(&[5], &[(0, &[], &main)], |mc, outcome| {
         let Outcome::Raised(value) = outcome else { panic!("{outcome:?}") };
         assert_eq!(fault(mc, value), Fault::WrongType);
     });
 
-    // A fault procedure that isn't one ends the run with that fault.
+    // A handler that isn't a procedure ends the run with that fault.
     let mut arena = Arena::new(1 << 20, 0);
     arena.mutate(|mc| {
         let constants = table(mc, &[5]);
-        let mut machine = Machine::new(mc, MIN_SEGMENT, closure(mc, module(mc, &constants, &[(0, &[], &main)])[0]), &[]).unwrap();
-        machine.set_fault(mc, fix(3));
+        let thunk = with_raise_handler(mc, fix(3), closure(mc, module(mc, &constants, &[(0, &[], &main)])[0]));
+        let mut machine = Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap();
         let Outcome::Raised(value) = to_end(mc, &mut machine).unwrap() else { panic!() };
         assert_eq!(fault(mc, value), Fault::NotProcedure);
     });
 
-    // A fault in a nested frame calls the fault procedure in place of the faulting frame,
-    // keeping its caller on the active segment so returning from the handler resumes the caller.
+    // A fault in a nested frame calls the handler in place of the faulting frame. Faults can't go
+    // on, so a handler that returns raises an error with the fault's condition in its place.
     let caller = [
         Op::NewClosure { dst: 3, count: 1, code: 4 },
         Op::Call { base: 3, args: 0 },
@@ -935,13 +900,16 @@ fn faults_go_to_the_fault_procedure() {
         Op::LoadConst { dst: 2, index: 1 },
         Op::TailCallIntrinsic { base: 2, args: 2, intrinsic: Add },
     ];
-    let handler = [Op::LoadConst { dst: 3, index: 2 }, Op::Return { src: 3 }];
+    let handler = [Op::LoadConst { dst: 4, index: 2 }, Op::Return { src: 4 }];
     arena.mutate(|mc| {
         let constants = table(mc, &[5, 10, 32]);
         let codes = module(mc, &constants, &[(0, &[], &caller), (0, &[], &main), (1, &[], &handler)]);
-        let mut machine = Machine::new(mc, MIN_SEGMENT, closure(mc, codes[0]), &[]).unwrap();
-        machine.set_fault(mc, closure(mc, codes[2]));
-        assert_eq!(to_end(mc, &mut machine).unwrap(), Outcome::Done(fix(42)));
+        let thunk = with_raise_handler(mc, closure(mc, codes[2]), closure(mc, codes[0]));
+        let mut machine = Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap();
+        let Outcome::Raised(value) = to_end(mc, &mut machine).unwrap() else { panic!() };
+        assert_eq!(fault(mc, value), Fault::Error);
+        let irritants = value.downcast::<Condition>(mc).unwrap().irritants(mc);
+        assert_eq!(fault(mc, Pair::of(irritants).unwrap().head(mc)), Fault::WrongType);
     });
 }
 

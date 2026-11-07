@@ -6,7 +6,7 @@ use ragwort_types::pair::{Pair, Pairs};
 use ragwort_vm::Intrinsic::{Add, Car, Cons, Eq, MakeBox, MakePromptTag, Not, SetBox, Unbox};
 use ragwort_vm::frame::MAX_PARAMS;
 use ragwort_vm::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Condition, ConditionFields, Global};
-use ragwort_vm::{Fault, Intrinsic, MIN_SEGMENT, Machine, Op, Outcome, Request};
+use ragwort_vm::{Fault, Intrinsic, MIN_SEGMENT, Machine, Op, Outcome, Read, Request};
 
 use super::*;
 
@@ -848,4 +848,32 @@ fn reads_of_constant_vectors_fold() {
     assert_eq!(number(|mc| prim(VectorLength, vec![constant(mc, &[1, 2, 3])])), Ok(3));
     assert_eq!(number(|mc| prim(VectorRef, vec![constant(mc, &[1]), q(1)])), Err(Fault::OutOfRange));
     eval(|mc| prim(IsVector, vec![constant(mc, &[])]), |_, v| assert_eq!(v, Ok(Value::TRUE)));
+}
+
+fn read<'gc>(r: Read, args: Vec<Core<'gc>>) -> Core<'gc> {
+    Core::Intrinsic(Prim::Read(r), args)
+}
+
+fn ops<'gc>(mc: &Mutation<'gc>, core: Core<'gc>) -> Vec<Op> {
+    all_ops(mc, compile(mc, &core).unwrap())
+}
+
+#[test]
+fn reads_get_register_forms_and_unused_ones_go() {
+    let mut arena = Arena::new(1 << 22, 0);
+    arena.mutate(|mc| {
+        let ops = |core| ops(mc, core);
+        let tail = ops(lambda(&[0], None, read(Read::MarkValue, vec![var(0), q(0)])));
+        assert!(tail.iter().any(|op| matches!(op, Op::TailCallRead { args: 2, read: Read::MarkValue, .. })), "{tail:?}");
+        let used = ops(lambda(&[0], None, prim(Cons, vec![read(Read::MarkValue, vec![var(0), q(0)]), read(Read::Running, vec![])])));
+        assert!(used.iter().any(|op| matches!(op, Op::Read2 { read: Read::MarkValue, .. })), "{used:?}");
+        assert!(used.iter().any(|op| matches!(op, Op::CallRead { args: 0, read: Read::Running, .. })), "{used:?}");
+        let unused = ops(lambda(&[0], None, let_(vec![(1, read(Read::MarkValue, vec![var(0), q(0)]))], q(1))));
+        assert!(!unused.iter().any(|op| matches!(op, Op::Read2 { .. } | Op::CallRead { .. })), "{unused:?}");
+        // One that can fault stays.
+        let faulting = ops(lambda(&[0], None, let_(vec![(1, read(Read::FrameMarks, vec![var(0), q(0), var(0)]))], q(1))));
+        assert!(faulting.iter().any(|op| matches!(op, Op::CallRead { args: 3, read: Read::FrameMarks, .. })), "{faulting:?}");
+    });
+    assert_eq!(error(|_| read(Read::MarkValue, vec![q(1)])), CompileError::Arity(Prim::Read(Read::MarkValue)));
+    assert_eq!(error(|_| Core::ApplyIntrinsic(Prim::Read(Read::Running), vec![q(1)])), CompileError::Arity(Prim::Read(Read::Running)));
 }

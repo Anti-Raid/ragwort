@@ -1,11 +1,13 @@
 
-use ragwort_types::gc::{Gc, Mutation, Root, Segment, Stack, Value, WINDOW};
+use ragwort_types::gc::raw::Raw;
+use ragwort_types::gc::{Gc, Mutation, Root, Segment, Slots, Stack, Value, WINDOW};
 use ragwort_types::pair::{Pair, Pairs};
 
-use crate::frame::{self, ARGS, CLOSURE, Link};
+use crate::args::Args;
+use crate::frame::{self, CLOSURE, Link};
 use crate::intrinsic::values;
-use crate::objects::{BytecodeFields, Closure, ClosureFields, Condition, Continuation, MultiValue, MultiValueFields, Task, TaskFields};
-use crate::run::{self, Exit, MAX_ARGS, Regs, bind};
+use crate::objects::{BytecodeFields, Closure, ClosureFields, Condition, Continuation, Native, NativeFields, Task, TaskFields};
+use crate::run::{self, Exit, Regs, bind};
 use crate::segments::{CHUNK, Resume, Segments};
 use crate::{Fault, Fuel, Request, coroutine, prompts};
 
@@ -25,8 +27,8 @@ pub enum Outcome<'gc> {
     Done(Value<'gc>),
     /// It made enough that the step should end, and goes on with the next run.
     Paused,
-    /// A VM fault, as a `Condition`, with no fault procedure to take it, or one that couldn't
-    /// be called.
+    /// What was raised with no handler to take it, once the task's `dynamic-wind` `after`s
+    /// have run: for a VM fault, a `Condition`.
     Raised(Value<'gc>),
     /// The task yielded these values, as one: `co/yield` in it, not in a coroutine it resumed.
     /// [`Machine::resume`] goes on with it.
@@ -55,17 +57,16 @@ impl Machine {
         let mut stack = mc.stack(Segment::new(mc, segment)?)?;
         let task = coroutine::root(mc)?;
         let mut regs = Regs { fp: 0, pc: 0, acc: Value::VOID };
+        let args = match *args {
+            [] => Args::none(),
+            [a] => Args::one(a),
+            [a, b] => Args::two(a, b),
+            _ => Args::list(Pairs::new(mc).list(args)?),
+        };
         Outer::new(mc, &mut stack, task, &mut regs, segment).start(procedure, args)?;
         let mut machine = Machine { stack, task: Root::new(mc, task)?, fp: 0, pc: 0, segment, fuel: u64::MAX, finished: false, yielded: false };
         machine.save(mc, task, &regs);
         Ok(machine)
-    }
-
-    /// Has VM faults call `procedure` with a `Condition`, in place of the frames that faulted,
-    /// as the prelude's `raise` would be. Without one, a fault ends the run with
-    /// [`Outcome::Raised`].
-    pub fn set_fault<'gc>(&self, mc: &Mutation<'gc>, procedure: Value<'gc>) {
-        self.task.get(mc).expect("a machine runs in its own arena").set_fault(mc, procedure);
     }
 
     /// Sets how much fuel the task has left in all, unlimited at first. Calls and jumps spend
@@ -137,7 +138,7 @@ impl Machine {
             }
         }
         loop {
-            let exit = run::exec(mc, &self.stack, regs, fuel);
+            let exit = run::exec(mc, &self.stack, *task, regs, fuel);
             let mut outer = Outer::new(mc, &mut self.stack, *task, regs, self.segment);
             let step = outer.exit(exit);
             *task = outer.task();
@@ -156,12 +157,16 @@ pub(crate) type Step<'gc> = Result<Option<Outcome<'gc>>, Fault>;
 
 /// What a request leads to, once it has done what it does to the continuation.
 pub(crate) enum Then<'gc> {
-    /// A call of the procedure with the values, which returns to the current continuation.
-    Call(Value<'gc>, Vec<Value<'gc>>),
+    /// A call of the procedure with the arguments, which returns to the current continuation.
+    Call(Value<'gc>, Args<'gc>),
     /// The value, returned to the current continuation.
     Return(Value<'gc>),
-    /// A resume of the coroutine with the values, by `co/try-resume` if it's `true`.
-    Resume(Value<'gc>, Vec<Value<'gc>>, bool),
+    /// A resume of the coroutine with the arguments.
+    Resume(Value<'gc>, Args<'gc>),
+    /// The value, raised, and whether the raise goes on with what the handler returns.
+    Raise(Value<'gc>, bool),
+    /// The value, raised with no handler to take it, and whether the `after`s have run.
+    Uncaught(Value<'gc>, bool),
     /// A yield of the value, as one, from the running coroutine.
     Yield(Value<'gc>),
 }
@@ -186,10 +191,10 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         self.segments.task
     }
 
-    /// Carries out what the inner loop stopped for. A fault that isn't fatal goes to the fault
-    /// procedure, as a `Condition`.
+    /// Carries out what the inner loop stopped for. A fault that isn't fatal is raised, as a
+    /// `Condition`, as is one in calling the handler, which is then outside the handlers.
     fn exit(&mut self, exit: Exit<'gc>) -> Step<'gc> {
-        let step = match exit {
+        let mut step = match exit {
             Exit::Paused => return Ok(Some(Outcome::Paused)),
             Exit::Fault(fault) => Err(fault),
             Exit::Overflow { callee, argc, rest } => self.overflow(callee, argc, rest).map(|()| None),
@@ -197,100 +202,102 @@ impl<'a, 'gc> Outer<'a, 'gc> {
             Exit::Call { base, argc, rest, tail } => self.call(base, argc, rest, tail),
             Exit::Request { base, args, request, spread, tail } => self.request(base, args, request, spread, tail),
         };
-        match step {
-            Err(fault) if !fault.is_fatal() => self.fault(fault),
-            step => step,
+        while let Err(fault) = step
+            && !fault.is_fatal()
+        {
+            step = self.fault(fault);
         }
+        step
     }
 
-    /// Calls the fault procedure with a condition for `fault`, in place of the frame that
-    /// faulted. A fault in calling it ends the run. A coroutine with none fails, and the
-    /// condition goes on to what resumed it: raised at its `co/resume`, or returned from its
-    /// `co/try-resume`.
+    /// Raises a condition for `fault`, in place of the frame that faulted.
     fn fault(&mut self, fault: Fault) -> Step<'gc> {
         let mc = self.mc();
         let raised = condition(mc, fault, Value::VOID, Value::NIL)?;
-        let mut failed = false;
-        let handler = loop {
-            let task = self.task();
-            let handler = task.fault(mc);
-            if handler != Value::FALSE {
-                break handler;
-            }
-            let Some(to) = coroutine::of(mc, task.resumer(mc)) else { return Ok(Some(Outcome::Raised(raised))) };
-            self.end(task, coroutine::FAILED, to)?;
-            if task.protected(mc) {
-                return self.then(Then::Return(coroutine::flagged(mc, Value::FALSE, raised)?));
-            }
-            failed = true;
-        };
-        if !failed
-            && self.regs.fp > self.segments.stack.base()
+        if self.regs.fp > self.segments.stack.base()
             && let Ok(frame) = self.segments.frame(self.regs.fp)
             && let Ok(link) = frame::link_of(mc, frame)
         {
             let _ = self.segments.reify(self.regs.fp, link);
         }
-        match self.then(Then::Call(handler, vec![raised])) {
-            Err(fault) if !fault.is_fatal() => Ok(Some(Outcome::Raised(condition(mc, fault, Value::VOID, Value::NIL)?))),
-            step => step,
-        }
+        self.raise(raised, false)
     }
 
-    /// Carries out `request` on the `args` registers from `base`.
+    /// Raises `obj`, as `raise` does, or `raise-continuable` if it's `continuable`.
+    fn raise(&mut self, obj: Value<'gc>, continuable: bool) -> Step<'gc> {
+        let then = self.raising(obj, continuable)?;
+        self.then(then)
+    }
+
+    /// What `obj`, raised with no handler, leads to: the task's `after`s run, unless `unwound`
+    /// says they have, and then a coroutine fails, and `obj` is raised again where it was
+    /// resumed, and a machine's own task ends with it.
+    fn uncaught(&mut self, obj: Value<'gc>, unwound: bool) -> Step<'gc> {
+        let mc = self.mc();
+        let task = self.task();
+        if !unwound {
+            let then = self.unwind_all(obj)?;
+            return self.then(then);
+        }
+        let Some(to) = coroutine::of(mc, task.resumer(mc)) else { return Ok(Some(Outcome::Raised(obj))) };
+        self.end(task, coroutine::FAILED, to)?;
+        self.raise(obj, false)
+    }
+
+    /// Carries out `request` on the `args` registers from `base`, the last a list of more if
+    /// it's a `spread`. They stay where they are, past what's kept.
     fn request(&mut self, base: u8, args: u8, request: Request, spread: bool, tail: bool) -> Step<'gc> {
-        let frame = self.segments.frame(self.regs.fp)?;
-        let mut args: Vec<_> = (0..args).map(|i| frame.get(base + i)).collect();
+        let mut args = Args::slots(self.registers(base, args)?, Value::NIL);
         if spread {
-            let more = args.pop().ok_or(Fault::Malformed)?;
-            args.extend(list(self.mc(), more)?);
-            if !request.takes(args.len()) {
+            args = args.spread_last(self.mc())?;
+            if !request.takes(args.len(self.mc())?) {
                 return Err(Fault::Arity);
             }
         }
-        if request.keeps() {
-            self.keep(base, tail)?;
-        }
-        let then = request.run(self, &args)?;
+        self.keep(base, tail)?;
+        let then = request.run(self, args)?;
         self.then(then)
     }
 
     /// Carries out a call of something other than a closure, in register `base`, with the
     /// `argc` registers after it and the elements of `rest` as its arguments.
     fn call(&mut self, base: u8, argc: u8, rest: Value<'gc>, tail: bool) -> Step<'gc> {
-        let frame = self.segments.frame(self.regs.fp)?;
-        let procedure = frame.get(base);
-        let mut args: Vec<_> = (1..=argc).map(|i| frame.get(base + i)).collect();
-        let mc = self.mc();
-        if let Some(mv) = rest.downcast::<MultiValue>(mc) {
-            let items = mv.items(mc);
-            args.extend((0..items.len()).map(|i| items.get(i)));
-        } else {
-            args.extend(list(mc, rest)?);
-        }
+        let slots = self.registers(base, argc + 1)?;
+        let args = Args::slots(slots.slice(1..slots.len()).ok_or(Fault::Malformed)?, rest);
         self.keep(base, tail)?;
-        self.then(Then::Call(procedure, args))
+        self.then(Then::Call(slots.get(0), args))
+    }
+
+    /// The `n` registers of the current frame from `base`.
+    fn registers(&self, base: u8, n: u8) -> Result<Slots<'gc>, Fault> {
+        let (mc, at) = (self.mc(), self.regs.fp + usize::from(base));
+        if usize::from(base) + usize::from(n) > WINDOW {
+            return Err(Fault::Malformed);
+        }
+        self.segments.stack.segment(mc).slots(mc).slice(at..at + usize::from(n)).ok_or(Fault::Malformed)
     }
 
     pub(crate) fn then(&mut self, then: Then<'gc>) -> Step<'gc> {
         match then {
-            Then::Call(procedure, args) => self.apply(procedure, &args),
+            Then::Call(procedure, args) => self.apply(procedure, args),
             Then::Return(value) => {
                 self.regs.acc = value;
                 self.resume()
             }
-            Then::Resume(co, args, protected) => self.resume_coroutine(co, &args, protected),
+            Then::Resume(co, args) => self.resume_coroutine(co, args),
+            Then::Raise(obj, continuable) => self.raise(obj, continuable),
+            Then::Uncaught(obj, unwound) => self.uncaught(obj, unwound),
             Then::Yield(values) => self.yield_coroutine(values),
         }
     }
 
     /// Calls `procedure` with `args`. A closure gets a frame at the bottom of the stack; a
-    /// continuation goes on on top of the current one, and gets the values.
-    fn apply(&mut self, procedure: Value<'gc>, args: &[Value<'gc>]) -> Step<'gc> {
-        let (mc, task) = (self.mc(), self.task());
-        if let Some(k) = procedure.downcast::<Continuation>(mc) {
-            prompts::compose(mc, task, k)?;
-            return self.then(Then::Return(values(mc, args.iter().copied())?));
+    /// continuation goes on, and gets the values, once the winders it leaves and enters have
+    /// run.
+    fn apply(&mut self, procedure: Value<'gc>, args: Args<'gc>) -> Step<'gc> {
+        if let Some(k) = procedure.downcast::<Continuation>(self.mc()) {
+            let then = self.go_to(k, args)?;
+            return self.then(then);
         }
         self.start(procedure, args)?;
         Ok(None)
@@ -299,7 +306,7 @@ impl<'a, 'gc> Outer<'a, 'gc> {
     /// Hands the frames under the continuation of the current call or request to the chain. A
     /// tail call's continuation is the current frame's caller; any other's is the instruction
     /// after it, whose `base` must be past the frame's link, as a call's is.
-    fn keep(&mut self, base: u8, tail: bool) -> Result<(), Fault> {
+    pub(crate) fn keep(&mut self, base: u8, tail: bool) -> Result<(), Fault> {
         let (mc, fp) = (self.mc(), self.regs.fp);
         let frame = self.segments.frame(fp)?;
         let closure = frame.get(CLOSURE).downcast::<Closure>(mc).ok_or(Fault::Malformed)?;
@@ -325,10 +332,22 @@ impl<'a, 'gc> Outer<'a, 'gc> {
 
     /// Goes back to the continuation with the value in the accumulator: the records under the
     /// stack, then the prompts'. If none is left, the task is done, and that's its value: a
-    /// coroutine's goes back to what resumed it.
+    /// coroutine's goes back to what resumed it. A [`Native`] record goes on as its kind says.
     pub(crate) fn resume(&mut self) -> Step<'gc> {
         let mc = self.mc();
         loop {
+            let task = self.task();
+            if let Some(native) = task.chain(mc).downcast::<Native>(mc) {
+                task.set_chain(mc, native.next(mc));
+                task.set_attachments(mc, native.attachments(mc));
+                match self.native(native)? {
+                    Then::Return(value) => {
+                        self.regs.acc = value;
+                        continue;
+                    }
+                    then => return self.then(then),
+                }
+            }
             if let Some(Resume { fp, pc }) = self.segments.underflow()? {
                 (self.regs.fp, self.regs.pc) = (fp, pc);
                 return Ok(None);
@@ -339,23 +358,23 @@ impl<'a, 'gc> Outer<'a, 'gc> {
             }
             let Some(to) = coroutine::of(mc, task.resumer(mc)) else { return Ok(Some(Outcome::Done(self.regs.acc))) };
             self.end(task, coroutine::FINISHED, to)?;
-            if task.protected(mc) {
-                self.regs.acc = coroutine::flagged(mc, Value::TRUE, self.regs.acc)?;
-            }
         }
     }
 
-    /// Calls the closure `procedure` with `args` in a frame at the bottom of the stack. Those
-    /// that don't fit in its registers go in as a list, which binding takes the rest from.
-    fn start(&mut self, procedure: Value<'gc>, args: &[Value<'gc>]) -> Result<(), Fault> {
-        let (fit, over) = args.split_at(args.len().min(MAX_ARGS));
-        let rest = Pairs::new(self.mc()).list(over)?;
-        let fp = self.segments.bottom(0)?;
-        let frame = self.segments.frame(fp)?;
+    /// Calls the closure `procedure` with `args` in a frame at the bottom of the stack, which
+    /// binding takes those past its held ones from.
+    fn start(&mut self, procedure: Value<'gc>, mut args: Args<'gc>) -> Result<(), Fault> {
+        let mc = self.mc();
+        let fp = if self.segments.fits(0) {
+            self.segments.stack.base()
+        } else {
+            args = args.detach(mc)?;
+            self.segments.bottom(0)?
+        };
+        let (stack, frame) = (&*self.segments.stack, self.segments.frame(fp)?);
+        let argc = args.write(mc, stack, frame, fp)?;
         frame.set(CLOSURE, procedure);
-        (ARGS..).zip(fit).for_each(|(r, &arg)| frame.set(r, arg));
-        let argc = u8::try_from(fit.len()).expect("MAX_ARGS is less than a register window");
-        self.enter(fp, argc, rest, Link::BOTTOM)
+        self.enter(fp, argc, args.rest, Link::BOTTOM)
     }
 
     /// Enters the closure in the frame at `fp`, with `argc` arguments and the list `rest` after

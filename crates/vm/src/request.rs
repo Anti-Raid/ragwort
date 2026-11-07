@@ -1,18 +1,19 @@
 //! A [`Request`] calls a procedure or changes the continuation, so the outer loop carries it
-//! out. It reads its arguments out of the frame, keeps the continuation it returns to if
-//! [`Request::keeps`] says so, then runs, and what it leads to is a [`Then`].
+//! out. It reads its arguments out of the frame, keeps the continuation it returns to, then
+//! runs, and what it leads to is a [`Then`]. What only reads the continuation's marks is a
+//! [`Read`](crate::Read), which the inner loop runs.
 //!
-//! These are only what the prelude can't write itself: marks, prompts and composable
-//! continuations, as Racket has them. `call/cc`, exceptions, the default prompt tag and its
-//! handler are the prelude's, written in terms of them.
+//! These are marks, prompts and continuations, as Racket has them, exceptions and
+//! `dynamic-wind`, which the VM runs between calls of Scheme code, and switching coroutines. The default prompt
+//! tag's handler is the prelude's.
 
 use ragwort_types::gc::Value;
 use ragwort_types::named;
 
 use crate::Fault;
-use crate::intrinsic::values;
-use crate::machine::{Outer, Then, list};
-use crate::objects::{MultiValue, MultiValueFields};
+use crate::args::Args;
+use crate::machine::{Outer, Then};
+use crate::objects::{Continuation, MultiValue};
 use crate::prompts::{self, tag_of};
 
 named! {
@@ -30,32 +31,52 @@ named! {
         /// for `key` on its continuation. In tail position, it replaces the frame's mark for
         /// `key`, if it has one, so a loop that sets a mark stays in constant space.
         WithMark = "with-mark",
-        /// `(mark-value key default)`: the value of the nearest mark for `key`, or `default`.
-        MarkValue = "mark-value",
         /// `(call-with-prompt tag handler f arg ...)`: calls `f` with the `arg`s under a prompt for
         /// `tag`, which an abort to it calls `handler` in place of.
         CallWithPrompt = "call-with-prompt",
-        /// `(abort tag value ...)`: drops the continuation up to the nearest prompt for `tag`, and
-        /// the prompt, and calls its handler with the values in their place.
+        /// `(abort tag value ...)`: runs the `after`s of the winders up to the nearest prompt for
+        /// `tag`, then drops the continuation up to it, and the prompt, and calls its handler with
+        /// the values in their place, as `abort-current-continuation` does.
         Abort = "abort",
         /// `(capture tag f)`: calls `f` with the composable continuation up to the nearest prompt
         /// for `tag`, a procedure that goes on with it on top of the continuation it's called in.
         Capture = "capture",
+        /// `(compose k v ...)`: goes on with the continuation `k` on top of this one, returning
+        /// the `v`s to it, without the `before`s of its winders that calling it runs.
+        Compose = "compose",
+        /// `(call/cc f)`: calls `f` with the escape continuation up to the nearest default prompt,
+        /// which goes on in place of the continuation it's called in, up to the nearest default
+        /// prompt, once the winders it leaves and enters have run.
+        CallCc = "call/cc",
+        /// `(dynamic-wind before thunk after)`: calls `before`, then `thunk` inside a winder of
+        /// them, then `after`, and returns what `thunk` did. A jump out of the thunk runs the
+        /// `after`, and one into it the `before`.
+        DynamicWind = "dynamic-wind",
+        /// `(with-exception-handler handler thunk)`: calls `thunk` with `handler` innermost on
+        /// the handler stack.
+        WithHandler = "with-exception-handler",
+        /// `(raise obj)`: calls the innermost handler with `obj` and the handler stack outside
+        /// it. If it returns, an error is raised there in its place. A raise with no handler runs
+        /// the task's `after`s: then a coroutine fails, and `obj` is raised again where it was
+        /// resumed, and a machine's own task ends with [`Outcome::Raised`](crate::Outcome::Raised).
+        Raise = "raise",
+        /// `(raise-continuable obj)`: as `raise`, but returns what the handler does.
+        RaiseContinuable = "raise-continuable",
+        /// `(guard thunk handler)`: calls `thunk`, and if it raises, goes back here, running the
+        /// `after`s on the way, and calls `handler` with what was raised in place of `thunk`.
+        Guard = "guard",
         /// `(co/resume co arg ...)`: runs the pending coroutine `co` until it yields, finishes or
         /// fails. It starts by calling its procedure with the `arg`s, or goes on from its last
         /// yield, which returns them. Returns what it yields or returns; if it fails, the same
         /// condition is raised here.
         Resume = "co/resume",
-        /// `(co/try-resume co arg ...)`: `co/resume`, but returns `#t` and then what it yields or
-        /// returns, or if it fails, `#f` and the condition.
+        /// `(co/try-resume co arg ...)`: as `co/resume`, but returns `#t` and what that does, or
+        /// `#f` and what it raises.
         TryResume = "co/try-resume",
         /// `(co/yield v ...)`: suspends the running coroutine, so the `co/resume` that ran it
         /// returns the `v`s. In a machine's own task, it ends the run with
         /// [`Outcome::Yielded`](crate::Outcome::Yielded). Returns the values it's resumed with.
         Yield = "co/yield",
-        /// `(co/running)`: the running coroutine, or in a machine's own task, that task, which
-        /// is running until the machine finishes, and never pending, so nothing can resume it.
-        Running = "co/running",
     }
 }
 
@@ -65,61 +86,60 @@ impl Request {
         let (least, most) = match self {
             Request::Apply => (2, None),
             Request::WithMark | Request::CallWithPrompt => (3, None),
-            Request::ApplyValues | Request::MarkValue | Request::Capture => (2, Some(2)),
-            Request::Abort | Request::Resume | Request::TryResume => (1, None),
+            Request::ApplyValues | Request::Capture | Request::WithHandler | Request::Guard => (2, Some(2)),
+            Request::CallCc | Request::Raise | Request::RaiseContinuable => (1, Some(1)),
+            Request::DynamicWind => (3, Some(3)),
+            Request::Abort | Request::Resume | Request::TryResume | Request::Compose => (1, None),
             Request::Yield => (0, None),
-            Request::Running => (0, Some(0)),
         };
         args >= least && most.is_none_or(|most| args <= most)
     }
 
-    /// Whether what it leads to returns to the instruction after it, or for a tail request, to
-    /// the frame's caller. An abort drops the continuation instead.
-    pub(crate) fn keeps(self) -> bool {
-        self != Request::Abort
-    }
-
     /// Runs it on `args`, as many as it [takes](Request::takes).
-    pub(crate) fn run<'gc>(self, outer: &mut Outer<'_, 'gc>, args: &[Value<'gc>]) -> Result<Then<'gc>, Fault> {
+    pub(crate) fn run<'gc>(self, outer: &mut Outer<'_, 'gc>, args: Args<'gc>) -> Result<Then<'gc>, Fault> {
         let (mc, task) = (outer.mc(), outer.task());
+        let arg = |i| args.get(mc, i);
         Ok(match self {
-            Request::Apply => {
-                let (&spread, before) = args[1..].split_last().ok_or(Fault::Malformed)?;
-                Then::Call(args[0], before.iter().copied().chain(list(mc, spread)?).collect())
-            }
+            Request::Apply => Then::Call(arg(0)?, args.tail(mc, 1)?.spread_last(mc)?),
             Request::ApplyValues => {
-                let values = match args[1].downcast::<MultiValue>(mc) {
-                    Some(mv) => {
-                        let items = mv.items(mc);
-                        (0..items.len()).map(|i| items.get(i)).collect()
-                    }
-                    None => vec![args[1]],
-                };
-                Then::Call(args[0], values)
+                let v = arg(1)?;
+                Then::Call(arg(0)?, if v.downcast::<MultiValue>(mc).is_some() { Args::list(v) } else { Args::one(v) })
             }
             Request::WithMark => {
-                outer.segments.set_mark(args[0], args[1])?;
-                Then::Call(args[2], args[3..].to_vec())
+                outer.segments.set_mark(arg(0)?, arg(1)?)?;
+                Then::Call(arg(2)?, args.tail(mc, 3)?)
             }
-            Request::MarkValue => Then::Return(prompts::mark(mc, task, args[0], args[1])?),
             Request::CallWithPrompt => {
-                prompts::push(mc, task, tag_of(mc, args[0])?, args[1])?;
-                Then::Call(args[2], args[3..].to_vec())
+                prompts::push(mc, task, tag_of(mc, arg(0)?)?, arg(1)?)?;
+                Then::Call(arg(2)?, args.tail(mc, 3)?)
             }
-            Request::Abort => match prompts::abort(mc, task, tag_of(mc, args[0])?)? {
-                Some(handler) => Then::Call(handler, args[1..].to_vec()),
-                None => {
-                    let (&thunk, rest) = args[1..].split_first().ok_or(Fault::Arity)?;
-                    Then::Call(thunk, rest.to_vec())
-                }
-            },
+            Request::Abort => outer.abort(tag_of(mc, arg(0)?)?, args.tail(mc, 1)?)?,
             Request::Capture => {
-                let k = prompts::capture(mc, task, tag_of(mc, args[0])?)?;
-                Then::Call(args[1], vec![k])
+                let k = prompts::capture(mc, task, tag_of(mc, arg(0)?)?, false)?;
+                Then::Call(arg(1)?, Args::one(k))
             }
-            Request::Resume | Request::TryResume => Then::Resume(args[0], args[1..].to_vec(), self == Request::TryResume),
-            Request::Yield => Then::Yield(values(mc, args.iter().copied())?),
-            Request::Running => Then::Return(Value::object(mc, task)),
+            Request::CallCc => {
+                let k = prompts::capture(mc, task, prompts::default_tag(), true)?;
+                Then::Call(arg(0)?, Args::one(k))
+            }
+            Request::Compose => {
+                prompts::compose(mc, task, arg(0)?.downcast::<Continuation>(mc).ok_or(Fault::WrongType)?)?;
+                Then::Return(args.tail(mc, 1)?.values(mc)?)
+            }
+            Request::DynamicWind => outer.dynamic_wind(arg(0)?, arg(1)?, arg(2)?)?,
+            Request::WithHandler => outer.with_handler(arg(0)?, arg(1)?)?,
+            Request::Raise => Then::Raise(arg(0)?, false),
+            Request::RaiseContinuable => Then::Raise(arg(0)?, true),
+            Request::Guard => {
+                outer.guard(arg(1)?, false)?;
+                Then::Call(arg(0)?, Args::none())
+            }
+            Request::Resume => Then::Resume(arg(0)?, args.tail(mc, 1)?),
+            Request::TryResume => {
+                outer.guard(Value::FALSE, true)?;
+                Then::Resume(arg(0)?, args.tail(mc, 1)?)
+            }
+            Request::Yield => Then::Yield(args.values(mc)?),
         })
     }
 }

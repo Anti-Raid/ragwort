@@ -9,7 +9,7 @@ use ragwort_types::pair::{Pair, Pairs};
 
 use crate::frame::{self, ARGS, CLOSURE, Link, MAX_PARAMS};
 use crate::op::Fuel;
-use crate::objects::{BytecodeFields, Closure, ClosureFields, MultiValue, MultiValueFields};
+use crate::objects::{BytecodeFields, Closure, ClosureFields, MultiValue, MultiValueFields, Task};
 use crate::{Context, Control, Fault, Op, Request};
 
 /// The most arguments a call passes: they and the link after them fill the frame.
@@ -47,8 +47,8 @@ impl From<Fault> for Exit<'_> {
 /// It and [`Run::go`] are inlined into the machine's loop: compiled as a function of their own,
 /// the loop's registers spilled on every instruction, and calls took twice as long.
 #[inline(always)]
-pub(crate) fn exec<'s, 'gc>(mc: &'s Mutation<'gc>, stack: &'s Stack, regs: &mut Regs<'gc>, fuel: &mut Fuel) -> Exit<'gc> {
-    let mut run = match Run::new(mc, stack, regs, *fuel) {
+pub(crate) fn exec<'s, 'gc>(mc: &'s Mutation<'gc>, stack: &'s Stack, task: Gc<'gc, Task>, regs: &mut Regs<'gc>, fuel: &mut Fuel) -> Exit<'gc> {
+    let mut run = match Run::new(mc, stack, task, regs, *fuel) {
         Ok(run) => run,
         Err(fault) => return Exit::Fault(fault),
     };
@@ -87,11 +87,11 @@ struct Run<'s, 'gc> {
 }
 
 impl<'s, 'gc> Run<'s, 'gc> {
-    fn new(mc: &'s Mutation<'gc>, stack: &'s Stack, regs: &Regs<'gc>, fuel: Fuel) -> Result<Self, Fault> {
+    fn new(mc: &'s Mutation<'gc>, stack: &'s Stack, task: Gc<'gc, Task>, regs: &Regs<'gc>, fuel: Fuel) -> Result<Self, Fault> {
         let frame = stack.frame(mc, regs.fp).ok_or(Fault::Malformed)?;
         let (ops, constants, upvalues, link) = load(mc, frame.get(CLOSURE).downcast::<Closure>(mc).ok_or(Fault::Malformed)?)?;
         Ok(Run {
-            cx: Context { mc, frame, constants, upvalues, acc: regs.acc, fuel },
+            cx: Context { mc, task, frame, constants, upvalues, acc: regs.acc, fuel },
             stack,
             ops,
             pc: regs.pc,

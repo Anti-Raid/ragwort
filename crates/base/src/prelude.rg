@@ -76,7 +76,6 @@
 
 (%define-global default-continuation-prompt-tag (%lambda () (%intrinsic default-continuation-prompt-tag)))
 (%define-global make-continuation-prompt-tag (%lambda args (%apply-intrinsic make-continuation-prompt-tag args)))
-(%define-global abort-current-continuation (%lambda (tag . args) (%apply-intrinsic abort tag args)))
 (%define-global call-with-composable-continuation
   (%lambda (f . more)
     (%if (%intrinsic null? more)
@@ -95,20 +94,29 @@
                   (%intrinsic call-with-prompt tag handler proc)
                   (%let ((h (%intrinsic car rest)) (args (%intrinsic cdr rest)))
                     (%apply-intrinsic call-with-prompt tag h proc args))))))))
-(%define-global call/cc
-  (%lambda (f)
-    (%intrinsic capture (%intrinsic default-continuation-prompt-tag)
-      (%lambda (k)
-        (%app f (%lambda args
-                  (%intrinsic abort (%intrinsic default-continuation-prompt-tag)
-                    (%lambda () (%intrinsic apply k args)))))))))
-(%define-global call-with-current-continuation
-  (%lambda (f)
-    (%intrinsic capture (%intrinsic default-continuation-prompt-tag)
-      (%lambda (k)
-        (%app f (%lambda args
-                  (%intrinsic abort (%intrinsic default-continuation-prompt-tag)
-                    (%lambda () (%intrinsic apply k args)))))))))
+
+; dynamic-wind, call/cc and exceptions, as R7RS has them, are the VM's: a jump out of or
+; into a winder's extent runs its after or before, and VM faults are raised as error objects.
+(%define-global dynamic-wind (%lambda (before thunk after) (%intrinsic dynamic-wind before thunk after)))
+(%define-global abort-current-continuation (%lambda (tag . args) (%apply-intrinsic abort tag args)))
+(%define-global call/cc (%lambda (f) (%intrinsic call/cc f)))
+(%define-global call-with-current-continuation (%lambda (f) (%intrinsic call/cc f)))
+
+(%define-global with-exception-handler (%lambda (handler thunk) (%intrinsic with-exception-handler handler thunk)))
+(%define-global raise (%lambda (obj) (%intrinsic raise obj)))
+(%define-global raise-continuable (%lambda (obj) (%intrinsic raise-continuable obj)))
+(%define-global error (%lambda (message . irritants) (%intrinsic raise (%apply-intrinsic make-error message irritants))))
+(%define-global error-object? (%lambda (x) (%intrinsic error-object? x)))
+(%define-global error-object-message (%lambda (c) (%intrinsic error-object-message c)))
+(%define-global error-object-irritants (%lambda (c) (%intrinsic error-object-irritants c)))
+(%define-global error-object-kind
+  (%lambda (c)
+    (%intrinsic vector-ref
+      #(malformed out-of-memory wrong-type out-of-range immutable arity not-procedure no-prompt unbound finished
+        out-of-fuel error not-pending divide-by-zero no-exact-value not-integer too-long)
+      (%intrinsic error-object-kind c))))
+; What `guard` expands to: `thunk`, and if it raises, `handler` in its place, with what it raised.
+(%define-global %guard (%lambda (thunk handler) (%intrinsic guard thunk handler)))
 
 (%define-global make-coroutine (%lambda (f) (%intrinsic make-coroutine f)))
 (%define-global coroutine? (%lambda (x) (%intrinsic coroutine? x)))

@@ -11,7 +11,7 @@ use ragwort_types::symbol::Symbols;
 use ragwort_types::vector::Vectors;
 use ragwort_types::syntax::{Abbreviation, Syntax, SyntaxKind};
 use ragwort_vm::objects::{Global, GlobalFields};
-use ragwort_vm::{Intrinsic, Request};
+use ragwort_vm::{Intrinsic, Read, Request};
 
 use crate::Globals;
 
@@ -118,8 +118,9 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         let word = |name: &str| symbols.intern_str(&strings, name).map(|s| s.value(mc).to_bits());
         let forms = FORMS.iter().map(|&(name, form)| Ok((word(name)?, form))).collect::<Result<_, Error>>()?;
         let intrinsics = Intrinsic::ALL.iter().map(|&i| (i.name(), Prim::Intrinsic(i)));
+        let reads = Read::ALL.iter().map(|&r| (r.name(), Prim::Read(r)));
         let requests = Request::ALL.iter().map(|&r| (r.name(), Prim::Request(r)));
-        let prims = intrinsics.chain(requests).map(|(name, prim)| Ok((word(name)?, prim))).collect::<Result<_, Error>>()?;
+        let prims = intrinsics.chain(reads).chain(requests).map(|(name, prim)| Ok((word(name)?, prim))).collect::<Result<_, Error>>()?;
         let cells = globals.iter(mc).map(|g| (g.name(mc).to_bits(), g)).collect();
         Ok(Self {
             mc,
@@ -243,6 +244,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         }
         let takes = match prim {
             Prim::Intrinsic(i) => i.arity().is_none_or(|arity| usize::from(arity) == args.len()),
+            Prim::Read(r) => usize::from(r.arity()) == args.len(),
             Prim::Request(r) => r.takes(args.len()),
         };
         if !takes {

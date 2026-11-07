@@ -64,6 +64,7 @@ impl<'gc> Expander<'_, 'gc> {
             (Macro::Cond, clauses) => self.cond(stx, clauses),
             (Macro::Case, &[key, ref clauses @ ..]) => self.case(stx, key, clauses),
             (Macro::Do, &[specs, end, ref commands @ ..]) => self.do_loop(stx, specs, end, commands),
+            (Macro::Guard, &[spec, ref body @ ..]) if !body.is_empty() => self.guard(stx, spec, body),
             (Macro::Quasiquote, &[template]) => match self.quasi(template, 0)? {
                 Some(built) => Ok(built),
                 None => self.quoted(template, stx),
@@ -150,6 +151,35 @@ impl<'gc> Expander<'_, 'gc> {
                 self.build(clause, "if", &[&[test, body, more]])
             }
         }
+    }
+
+    /// `(%guard (lambda () body ...) (lambda (var) (cond clause ... (else (raise-continuable
+    /// var)))))`, the `else` only if the clauses have none: the prelude's `%guard` calls the
+    /// handler once it has left the body, so the clauses run in the guard's context.
+    fn guard(&mut self, stx: Stx, spec: Stx, body: &[Stx]) -> Result<Stx, ExpandError> {
+        let parts = self.proper(spec)?;
+        let Some((&var, clauses)) = parts.split_first().filter(|(var, _)| self.is_id(**var)) else {
+            return Err(self.error(ExpandErrorKind::BadSyntax, spec));
+        };
+        let mut clauses = clauses.to_vec();
+        let has_else = match clauses.last() {
+            Some(&last) => match self.proper(last)?.first() {
+                Some(&head) => self.is_aux(head, Aux::Else)?,
+                None => false,
+            },
+            None => false,
+        };
+        if !has_else {
+            let otherwise = self.introduce("else", stx)?;
+            let again = self.build(stx, "raise-continuable", &[&[var]])?;
+            clauses.push(self.list(&[otherwise, again], stx)?);
+        }
+        let none = self.list(&[], stx)?;
+        let thunk = self.build(stx, "lambda", &[&[none], body])?;
+        let cond = self.build(stx, "cond", &[&clauses])?;
+        let formals = self.list(&[var], stx)?;
+        let handler = self.build(stx, "lambda", &[&[formals, cond]])?;
+        self.build(stx, "%guard", &[&[thunk, handler]])
     }
 
     /// `(let ((t key)) (cond ((memv t '(datum ...)) body ...) ...))`, with `=> f` as `(f t)`.

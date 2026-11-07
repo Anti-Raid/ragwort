@@ -78,6 +78,7 @@ impl<'gc> L2<'gc> {
             L2::Let(binds, body) => binds.iter().all(|(_, init)| init.is_pure()) && body.is_pure(),
             L2::Fix(_, body) => body.is_pure(),
             L2::Intrinsic(Prim::Intrinsic(i), args) => i.is_discardable() && args.iter().all(Self::is_pure),
+            L2::Intrinsic(Prim::Read(r), args) => r.is_discardable() && args.iter().all(Self::is_pure),
             L2::Set(_, _) | L2::App(_, _) | L2::Intrinsic(_, _) | L2::ApplyIntrinsic(_, _) => false,
         }
     }
@@ -88,6 +89,7 @@ impl<'gc> L2<'gc> {
             L2::Quote(v) => *v != Value::FALSE,
             L2::Lambda(_) | L2::Set(_, _) => true,
             L2::Intrinsic(Prim::Intrinsic(i), _) => i.is_always_truthy(),
+            L2::Intrinsic(Prim::Read(r), _) => r.is_always_truthy(),
             L2::Seq(_, b) | L2::Let(_, b) | L2::Fix(_, b) => b.is_always_truthy(),
             L2::If(_, b, c) => b.is_always_truthy() && c.is_always_truthy(),
             L2::Ref(_) | L2::App(_, _) | L2::Intrinsic(_, _) | L2::ApplyIntrinsic(_, _) => false,
@@ -104,6 +106,7 @@ impl<'gc> L2<'gc> {
             L2::Intrinsic(Prim::Intrinsic(i), args) if i.is_discardable() => {
                 args.into_iter().rfold(second, |acc, a| Self::seq(a, acc))
             }
+            L2::Intrinsic(Prim::Read(r), args) if r.is_discardable() => args.into_iter().rfold(second, |acc, a| Self::seq(a, acc)),
             L2::If(test, then, other) if then.is_pure() && other.is_pure() => Self::seq(*test, second),
             first => L2::Seq(Box::new(first), Box::new(second)),
         }

@@ -26,15 +26,38 @@ fn arena() -> Arena {
 }
 
 fn run<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Result<Value<'gc>, Fault> {
+    run_raising(mc, thunk).map_err(|raised| *raised.downcast::<Condition>(mc).expect("a condition").fault(mc).unwrap())
+}
+
+/// The thunk's value, or what it raised that nothing caught.
+fn run_raising<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Result<Value<'gc>, Value<'gc>> {
     let mut machine = Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap();
     loop {
         match machine.run(mc).unwrap() {
             Outcome::Paused => {}
             Outcome::Yielded(_) => panic!("yielded"),
             Outcome::Done(value) => return Ok(value),
-            Outcome::Raised(raised) => return Err(*raised.downcast::<Condition>(mc).unwrap().fault(mc).unwrap()),
+            Outcome::Raised(raised) => return Err(raised),
         }
     }
+}
+
+fn raised_text<'gc>(mc: &Mutation<'gc>, raised: Value<'gc>) -> String {
+    match raised.downcast::<Condition>(mc) {
+        Some(c) => format!("{:?} {}", c.fault(mc), show(mc, c.irritants(mc))),
+        None => show(mc, raised),
+    }
+}
+
+/// What the one form `text` raised that nothing caught, written out.
+fn uncaught(text: &str) -> String {
+    arena().mutate(|mc| {
+        let symbols = Symbols::of(mc.root(0)).unwrap();
+        let (globals, base) = (Globals::of(mc, mc.root(1)).unwrap(), Globals::of(mc, mc.root(2)).unwrap());
+        let session = SyntaxSession::new(mc, text).unwrap();
+        let [thunk] = load(mc, symbols, globals, base, &session).unwrap()[..] else { panic!("one form") };
+        show(mc, run_raising(mc, thunk).expect_err("raised"))
+    })
 }
 
 fn show<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> String {
@@ -437,16 +460,12 @@ fn procedure_and_continuation_predicates() {
                     (continuation? '()))"),
         "(#f #f #f #f #f)"
     );
-    // `call-with-composable-continuation` reifies a raw `Continuation` object, which is both
-    // `continuation?` and `procedure?`; `call/cc` wraps it in an aborting lambda (`procedure?` only).
+    // Both kinds of continuation are `Continuation` objects, `continuation?` and `procedure?`.
     assert_eq!(
         eval("(call-with-composable-continuation (lambda (k) (list (procedure? k) (continuation? k))))"),
         "(#t #t)"
     );
-    assert_eq!(
-        eval("(call/cc (lambda (k) (list (procedure? k) (continuation? k))))"),
-        "(#t #f)"
-    );
+    assert_eq!(eval("(call/cc (lambda (k) (list (procedure? k) (continuation? k))))"), "(#t #t)");
     // Dominating `continuation?` / `procedure?` branch facts in `cp0`.
     let classify = "
         (define (classify x)
@@ -816,4 +835,163 @@ fn a_suspended_coroutine_keeps_little_memory() {
     let suspended = kept("(let ((c (make-coroutine (lambda () (co/yield i) i)))) (co/resume c) c)");
     let each = (suspended - closures) / 200;
     assert!(each < 512, "{each} bytes per suspended coroutine");
+}
+
+#[test]
+fn handlers_run_in_the_raise_under_the_handlers_outside_them() {
+    assert_eq!(eval("(with-exception-handler (lambda (e) (* e 10)) (lambda () (+ 1 (raise-continuable 5))))"), "51");
+    let nested = "(with-exception-handler (lambda (e) (list 'outer e))
+                    (lambda () (with-exception-handler (lambda (e) (raise-continuable (list 'inner e)))
+                                 (lambda () (raise-continuable 1)))))";
+    assert_eq!(eval(nested), "(outer (inner 1))");
+    // A handler of a `raise` that returns raises an error under the handlers outside it.
+    let returned = "(guard (e ((error-object? e) (list (error-object-message e) (error-object-irritants e))))
+                      (with-exception-handler (lambda (e) 'ignored) (lambda () (raise 'boom))))";
+    assert_eq!(eval(returned), r#"("exception handler returned" (boom))"#);
+    // One that isn't a procedure is a fault, raised under the handlers outside it.
+    assert_eq!(eval("(guard (e (#t (error-object-kind e))) (with-exception-handler 5 (lambda () (raise 'x))))"), "not-procedure");
+    assert_eq!(uncaught("(raise 'nobody)"), "nobody");
+    assert_eq!(uncaught("(with-exception-handler (lambda (e) (raise (list 'again e))) (lambda () (raise 1)))"), "(again 1)");
+}
+
+#[test]
+fn guard_takes_what_its_clauses_match_and_raises_the_rest_again() {
+    assert_eq!(eval("(guard (e (#t (list 'caught e))) (raise 'oops))"), "(caught oops)");
+    assert_eq!(eval("(guard (e ((assq 'a e) => cdr) ((assq 'b e))) (raise (list (cons 'a 42))))"), "42");
+    assert_eq!(eval("(guard (e ((assq 'a e) => cdr) ((assq 'b e))) (raise (list (cons 'b 23))))"), "(b . 23)");
+    assert_eq!(eval("(guard (e ((eq? e 'x) 'no) (else (list 'else e))) (raise 'y))"), "(else y)");
+    assert_eq!(eval("(guard (e (#t (list 'outer e))) (guard (e ((eq? e 'other) 'no)) (raise 'x)))"), "(outer x)");
+    // No clause matches: raised again, continuably, from the guard.
+    assert_eq!(eval("(with-exception-handler (lambda (e) 42) (lambda () (+ 1 (guard (e ((eq? e 'other) 'no)) (raise 'x)))))"), "43");
+    assert_eq!(eval("(guard (e (#t 'caught)) (define x 1) (+ x 1))"), "2");
+    assert_eq!(eval("(let ((e 'outer)) (guard (e (#f e)) e))"), "outer");
+    assert_eq!(error("(guard (1 (#t 2)) 3)").0, BadSyntax);
+    assert_eq!(error("(guard (e (#t 2)))").0, BadSyntax);
+}
+
+#[test]
+fn vm_faults_and_errors_are_error_objects() {
+    let caught = |body: &str| {
+        eval(&format!(
+            "(guard (e ((error-object? e) (list (error-object-kind e) (error-object-message e) (error-object-irritants e)))) {body})"
+        ))
+    };
+    assert_eq!(caught("(car 1)"), r#"(wrong-type "wrong type" ())"#);
+    assert_eq!(caught("(vector-ref (vector 1) 5)"), r#"(out-of-range "out of range" ())"#);
+    assert_eq!(caught("(/ 1 0)"), r#"(divide-by-zero "divide by zero" ())"#);
+    assert_eq!(caught("(error \"bad thing\" 1 'two)"), r#"(error "bad thing" (1 two))"#);
+    assert_eq!(caught("((lambda (x) x))"), r#"(arity "arity" ())"#);
+    assert_eq!(eval("(list (error-object? 1) (guard (e (#t (error-object? e))) (car '())))"), "(#f #t)");
+    assert_eq!(eval_in(&mut arena(), "(error \"no one\")"), Ok(Err(Fault::Error)));
+    // The prelude names the kinds in the VM's order.
+    let names = PRELUDE.split("#(malformed").nth(1).and_then(|rest| rest.split(')').next()).unwrap();
+    let names: Vec<&str> = std::iter::once("malformed").chain(names.split_whitespace()).collect();
+    assert_eq!(names, Fault::KINDS);
+}
+
+#[test]
+fn winders_run_on_the_way_in_and_out() {
+    let log = "(define log '()) (define (note x) (set! log (cons x log)))";
+    let wind = |body: &str| eval(&format!("{log} (let ((r {body})) (list r (reverse log)))"));
+    assert_eq!(wind("(dynamic-wind (lambda () (note 'in)) (lambda () (note 'during) 'v) (lambda () (note 'out)))"), "(v (in during out))");
+    let values = "(call-with-values (lambda () (dynamic-wind (lambda () 0) (lambda () (values 1 2)) (lambda () 3))) list)";
+    assert_eq!(eval(values), "(1 2)");
+    let escape = "(call/cc (lambda (k) (dynamic-wind (lambda () (note 'in)) (lambda () (k 'escaped) (note 'not)) (lambda () (note 'out)))))";
+    assert_eq!(wind(escape), "(escaped (in out))");
+    let inside = "(dynamic-wind (lambda () (note 'in)) (lambda () (call/cc (lambda (k) (note 'jump) (k 1)))) (lambda () (note 'out)))";
+    assert_eq!(wind(inside), "(1 (in jump out))");
+    let nested = "(call-with-continuation-prompt
+                    (lambda ()
+                      (dynamic-wind (lambda () (note 'a-in))
+                                    (lambda () (dynamic-wind (lambda () (note 'b-in))
+                                                             (lambda () (abort-current-continuation (default-continuation-prompt-tag) (lambda () 'aborted)))
+                                                             (lambda () (note 'b-out))))
+                                    (lambda () (note 'a-out)))))";
+    assert_eq!(wind(nested), "(aborted (a-in b-in b-out a-out))");
+    // R7RS's example: a continuation captured inside, called from outside, goes back in.
+    let again = "(let ((path '()) (c #f))
+                   (let ((add (lambda (s) (set! path (cons s path)))))
+                     (dynamic-wind (lambda () (add 'connect))
+                                   (lambda () (add (call/cc (lambda (c0) (set! c c0) 'talk1))))
+                                   (lambda () (add 'disconnect)))
+                     (if (eqv? (length path) 3) (c 'talk2) (reverse path))))";
+    assert_eq!(eval(again), "(connect talk1 disconnect connect talk2 disconnect)");
+    // A composable continuation runs the befores of the winders it holds.
+    let mut arena = arena();
+    let capture = format!(
+        "{log} (define k #f)
+         (call-with-continuation-prompt
+           (lambda () (dynamic-wind (lambda () (note 'in))
+                                    (lambda () (call-with-composable-continuation (lambda (c) (set! k c) 0)))
+                                    (lambda () (note 'out)))))"
+    );
+    assert_eq!(eval_in(&mut arena, &capture), Ok(Ok("0".into())));
+    assert_eq!(eval_in(&mut arena, "(list (+ 1 (k 5)) (reverse log))"), Ok(Ok("(6 (in out in out))".into())));
+    // A guard leaving the extent runs the afters, before its clauses.
+    let guarded = "(guard (e (#t (note (list 'caught e)) 'g))
+                     (dynamic-wind (lambda () (note 'in)) (lambda () (raise 'x)) (lambda () (note 'out))))";
+    assert_eq!(wind(guarded), "(g (in out (caught x)))");
+}
+
+#[test]
+fn errors_no_handler_takes_run_the_afters_first() {
+    let mut arena = arena();
+    let log = "(define log '()) (define (note x) (set! log (cons x log)))";
+    let failing = format!("{log} (dynamic-wind (lambda () (note 'in)) (lambda () (dynamic-wind (lambda () (note 'in2)) (lambda () (car 1)) (lambda () (note 'out2)))) (lambda () (note 'out)))");
+    assert_eq!(eval_in(&mut arena, &failing), Ok(Err(Fault::WrongType)));
+    assert_eq!(eval_in(&mut arena, "(reverse log)"), Ok(Ok("(in in2 out2 out)".into())));
+    // In a coroutine, a yield runs none, and a failure runs them before it's raised again
+    // where the coroutine was resumed.
+    let co = format!(
+        "{log} (define co (make-coroutine (lambda () (dynamic-wind (lambda () (note 'in)) (lambda () (co/yield 1) (car 1)) (lambda () (note 'out))))))
+         (let* ((first (co/resume co)) (seen (reverse log))
+                (second (guard (e (#t (list 'caught (error-object-kind e) (co/status co) (reverse log)))) (co/resume co))))
+           (list first seen second))"
+    );
+    assert_eq!(eval(&co), "(1 (in) (caught wrong-type error (in out)))");
+    let inside = "(co/resume (make-coroutine (lambda () (guard (e (#t (list 'inside e))) (raise 'x)))))";
+    assert_eq!(eval(inside), "(inside x)");
+    // co/try-resume returns what a resume of a coroutine that isn't pending raises.
+    let done = "(define co (make-coroutine (lambda () 1))) (co/resume co)
+                (call-with-values (lambda () (co/try-resume co)) (lambda (ok e) (list ok (error-object-kind e))))";
+    assert_eq!(eval(done), "(#f not-pending)");
+    let values = "(call-with-values (lambda () (co/try-resume (make-coroutine (lambda () (values 1 2))))) list)";
+    assert_eq!(eval(values), "(#t 1 2)");
+}
+
+#[test]
+fn raising_in_a_loop_runs_in_constant_space() {
+    let mut arena = arena();
+    let text = "(let ((log 0))
+                  (let loop ((i 0) (sum 0))
+                    (if (eqv? i 20000)
+                        (list sum log)
+                        (loop (+ i 1)
+                              (+ sum (guard (e ((null? e) 0) ((pair? e) (car e)))
+                                       (dynamic-wind (lambda () #f)
+                                                     (lambda () (+ (with-exception-handler (lambda (e) 1) (lambda () (raise-continuable i)))
+                                                                   (raise (list (vector-ref (vector 1) 0)))))
+                                                     (lambda () (set! log (+ log 1))))))))))";
+    let mut machine = machine(&mut arena, text);
+    let (mut runs, mut live) = (0, Vec::new());
+    let done = loop {
+        runs += 1;
+        if runs % 8 == 0 {
+            arena.collect();
+            live.push(arena.used());
+        }
+        let outcome = arena.step(|mc| match machine.run(mc).unwrap() {
+            Outcome::Paused => None,
+            Outcome::Done(v) => Some(show(mc, v)),
+            Outcome::Raised(r) => panic!("{}", raised_text(mc, r)),
+            other => panic!("{other:?}"),
+        });
+        if let Some(done) = outcome.unwrap() {
+            break done;
+        }
+    };
+    assert_eq!(done, "(20000 20000)");
+    let (first, second) = live.split_at(live.len() / 2);
+    assert!(second.len() > 4, "expected the run to pause for collections");
+    assert!(second.iter().max() <= first.iter().max(), "live memory grows: {live:?}");
 }

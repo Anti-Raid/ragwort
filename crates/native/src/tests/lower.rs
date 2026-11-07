@@ -2,7 +2,7 @@ use ragwort_types::gc::{Arena, WINDOW};
 use ragwort_types::pair::Pair;
 use ragwort_types::string::display;
 use ragwort_vm::objects::{Condition, ConditionFields};
-use ragwort_vm::{Fault, MIN_SEGMENT, Machine, Outcome};
+use ragwort_vm::{Fault, Intrinsic, MIN_SEGMENT, Machine, Outcome, Read, Request};
 
 use super::*;
 use crate::LowerErrorKind::*;
@@ -139,6 +139,55 @@ fn requests_are_intrinsics_too() {
                       (%lambda (v) (%intrinsic cons 'aborted v))
                       (%lambda () (%intrinsic cons 'not (%intrinsic abort tag 'x)))))";
     assert_eq!(eval(prompt), "(aborted . x)");
+}
+
+#[test]
+fn requests_pass_on_their_arguments_from_where_they_are() {
+    // At some depth, what with-mark calls doesn't fit on the segment its arguments are on.
+    let deep = "(%define-global go
+                  (%lambda (n)
+                    (%if (%intrinsic eqv? n 0)
+                         0
+                         (%intrinsic + (%intrinsic with-mark 'k n (%lambda (a b c) (%intrinsic + a (%intrinsic + b c))) n 1 2)
+                                       (%app go (%intrinsic + n -1))))))
+                (%app go 2000)";
+    assert_eq!(eval(deep), "2007000");
+    assert_eq!(eval("(%apply-intrinsic apply (%lambda xs xs) 1 '(2 (3 4)))"), "(1 2 3 4)");
+    assert_eq!(eval("(%intrinsic apply (%lambda (a b c) (%intrinsic cons a (%intrinsic cons b c))) '(1 2 3))"), "(1 2 . 3)");
+    let long = "(%letrec ((up (%lambda (n xs) (%if (%intrinsic eqv? n 0) xs (%app up (%intrinsic + n -1) (%intrinsic cons n xs))))))
+                  (%intrinsic length (%intrinsic apply (%lambda xs xs) (%app up 100 '()))))";
+    assert_eq!(eval(long), "100");
+    let co = "(%intrinsic co/resume (%intrinsic make-coroutine (%lambda (a b c) (%intrinsic cons a (%intrinsic cons b c)))) 1 2 3)";
+    assert_eq!(eval(co), "(1 2 . 3)");
+}
+
+#[test]
+fn reads_see_the_marks_where_they_run() {
+    let k = "(%define-global k (%intrinsic make-continuation-prompt-tag))";
+    // Read in a frame and used in a closure run under another mark: the frame's value.
+    let outer = "(%intrinsic with-mark k 5
+                   (%lambda () (%let ((h (%intrinsic mark-value k 0))) (%intrinsic with-mark k 1 (%lambda () h)))))";
+    assert_eq!(eval(&format!("{k} {outer}")), "5");
+    // Read in a closure run under another mark: that mark's value, inlined or not.
+    let inner = "(%let ((f (%lambda () (%intrinsic mark-value k 0))))
+                   (%intrinsic cons (%intrinsic with-mark k 1 f) (%intrinsic with-mark k 2 (%lambda () (%app f)))))";
+    assert_eq!(eval(&format!("{k} {inner}")), "(1 . 2)");
+    let all = "(%intrinsic with-mark k 'a
+                 (%lambda () (%intrinsic cons (%intrinsic frame-mark k 0) (%intrinsic frame-marks k 0 #f))))";
+    assert_eq!(eval(&format!("{k} {all}")), "(a a)");
+    let spread = eval_in(&mut arena(), "(%apply-intrinsic mark-value 'k '(0))");
+    assert!(format!("{spread:?}").contains("Arity(Read(MarkValue))"), "{spread:?}");
+}
+
+#[test]
+fn intrinsics_reads_and_requests_have_different_names() {
+    let mut names: Vec<&str> = Intrinsic::ALL.iter().map(|i| i.name()).collect();
+    names.extend(Read::ALL.iter().map(|r| r.name()));
+    names.extend(Request::ALL.iter().map(|r| r.name()));
+    let count = names.len();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), count);
 }
 
 #[test]

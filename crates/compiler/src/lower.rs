@@ -74,6 +74,7 @@ impl<'gc> Lower<'_, 'gc> {
             Core::Intrinsic(prim, args) => {
                 let takes = match *prim {
                     Prim::Intrinsic(i) => i.arity().is_none_or(|n| usize::from(n) == args.len()),
+                    Prim::Read(r) => usize::from(r.arity()) == args.len(),
                     Prim::Request(r) => r.takes(args.len()),
                 };
                 if !takes {
@@ -82,7 +83,8 @@ impl<'gc> Lower<'_, 'gc> {
                 L1::Intrinsic(*prim, self.exprs(args)?)
             }
             Core::ApplyIntrinsic(prim, args) => {
-                if args.is_empty() {
+                // A read takes a fixed number of arguments, so its prelude wrapper spreads them.
+                if args.is_empty() || matches!(prim, Prim::Read(_)) {
                     return Err(CompileError::Arity(*prim));
                 }
                 L1::ApplyIntrinsic(*prim, self.exprs(args)?)

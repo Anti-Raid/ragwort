@@ -54,28 +54,41 @@ objects! {
     /// A continuation prompt tag. `name` is what `make-continuation-prompt-tag` was given, or
     /// void.
     pub struct Tag { name: Value }
-    /// A composable continuation, which is called like a procedure: the records of `chain` and
-    /// the prompts in the list `prompts`, up to a prompt it doesn't include.
-    pub struct Continuation { chain: Value, prompts: Value }
+    /// A continuation, which is called like a procedure: the records of `chain` and the prompts
+    /// in the list `prompts`, up to a prompt it doesn't include. `attachments` are the marks
+    /// where it was captured, with those of a frame it was captured in tail position of, whose
+    /// continuation it is. A composable one goes on on top of the continuation it's called in;
+    /// an `escape`, as `call/cc` makes, replaces that one up to the nearest default prompt.
+    pub struct Continuation { chain: Value, attachments: Value, prompts: Value, escape: bool }
     /// An error object: `fault` says what went wrong, and for [`Fault::Error`], `message` and
     /// `irritants` are what `error` was called with.
     pub struct Condition { fault: Frozen<Fault>, message: Value, irritants: Value }
+    /// What `dynamic-wind` runs on the way in and out: a winders mark holds a list of them for
+    /// each prompt's part of the continuation, innermost first.
+    pub struct Winder { before: Value, after: Value }
+    /// What `guard` and `co/try-resume` put in the handlers mark: a raise that reaches it goes
+    /// back to its prompt, whose tag it is, and calls `handler` there with what was raised, or
+    /// if that's `#f`, returns `#f` and it.
+    pub struct Guard { handler: Value }
+    /// A record of a chain that the VM goes on from itself: once what's above it returns, its
+    /// `kind` says what to do next, with `a` and `b`. `attachments` and
+    /// `next` are as a [`Frames`] record's. It's never changed, so a continuation can go on from
+    /// it any number of times.
+    pub struct Native { kind: u32, a: Value, b: Value, attachments: Value, next: Value }
     /// A coroutine, and what a [`crate::Machine`] keeps of the one it runs in the arena: the
     /// accumulator between runs, the chain of records under its stack, its marks, as a list of
-    /// `(key . value)` pairs, the list of prompts the chain runs under, and the procedure VM
-    /// faults are passed to, or `#f` to pass them to its `resumer`. `spare` is a segment the
-    /// stack left, which an overflow takes from `spare_base` up.
+    /// `(key . value)` pairs, and the list of prompts the chain runs under. `spare` is a segment
+    /// the stack left, which an overflow takes from `spare_base` up.
     ///
     /// `body` is the procedure it starts with, until it does. `resumer` is the task that resumed
     /// it, and `resumed` the one it's resuming, if any. While it's suspended, its frames are on
-    /// `segment` from `base` up, or if it has none, its chain holds them all. `state` says whether it's pending, running, finished or
-    /// failed, and `protected` that it was resumed by `co/try-resume`.
+    /// `segment` from `base` up, or if it has none, its chain holds them all. `state` says
+    /// whether it's pending, running, finished or failed.
     pub struct Task {
         acc: Value,
         chain: Value,
         attachments: Value,
         prompts: Value,
-        fault: Value,
         spare: Member<Segment>,
         spare_base: u32,
         body: Value,
@@ -84,7 +97,6 @@ objects! {
         segment: Member<Segment>,
         base: u32,
         state: u32,
-        protected: bool,
     }
     /// What `(values ...)` makes of other than one value: an object like any other, which the
     /// `values` intrinsics take apart.

@@ -28,7 +28,7 @@ fn steps_run_against_the_frame() {
         let vectors = Vectors::new(mc);
         let constants = Constants::of(vectors.immutable_from_slice(&[fix(7)]).unwrap().value(mc)).unwrap();
         let upvalues = vectors.from_slice(&[Value::TRUE]).unwrap().items(mc);
-        let mut cx = Context { mc, frame, constants, upvalues, acc: Value::VOID, fuel: Fuel { run: u64::MAX, rest: 0 } };
+        let mut cx = Context { mc, task: crate::coroutine::root(mc).unwrap(), frame, constants, upvalues, acc: Value::VOID, fuel: Fuel { run: u64::MAX, rest: 0 } };
 
         assert_eq!(step(Op::LoadConst { dst: 0, index: 0 }, &mut cx), Ok(Control::Next));
         assert_eq!(step(Op::Move { dst: 1, src: 0 }, &mut cx), Ok(Control::Next));
@@ -105,10 +105,13 @@ fn malformed_bytecode_faults() {
         let vectors = Vectors::new(mc);
         let constants = Constants::of(vectors.immutable_from_slice(&[]).unwrap().value(mc)).unwrap();
         let upvalues = vectors.from_slice(&[]).unwrap().items(mc);
-        let mut cx = Context { mc, frame, constants, upvalues, acc: Value::VOID, fuel: Fuel { run: u64::MAX, rest: 0 } };
+        let mut cx = Context { mc, task: crate::coroutine::root(mc).unwrap(), frame, constants, upvalues, acc: Value::VOID, fuel: Fuel { run: u64::MAX, rest: 0 } };
         frame.set(0, fix(1));
         let requests = [
-            Op::CallRequest { base: 1, args: 1, request: Request::MarkValue },
+            Op::CallRequest { base: 1, args: 1, request: Request::WithMark },
+            Op::CallRead { base: 1, args: 1, read: Read::MarkValue },
+            Op::Read1 { dst: 1, a: 0, read: Read::FrameMark },
+            Op::Read2 { dst: 1, a: 0, b: 0, read: Read::Running },
             Op::TailCallRequest { base: 1, args: 3, request: Request::Capture },
             Op::CallRequest { base: 1, args: 1, request: Request::Apply },
             Op::CallIntrinsic1 { dst: 1, a: 0, intrinsic: Intrinsic::Cons },
@@ -142,7 +145,7 @@ fn closures_capture_registers_upvalues_and_each_other() {
         let stray = code(mc, &[Capture::Upvalue(9)]);
         let constants = Constants::of(vectors.immutable_from_slice(&[fix(7), even, odd, stray]).unwrap().value(mc)).unwrap();
         let upvalues = vectors.from_slice(&[fix(11)]).unwrap().items(mc);
-        let mut cx = Context { mc, frame, constants, upvalues, acc: Value::VOID, fuel: Fuel { run: u64::MAX, rest: 0 } };
+        let mut cx = Context { mc, task: crate::coroutine::root(mc).unwrap(), frame, constants, upvalues, acc: Value::VOID, fuel: Fuel { run: u64::MAX, rest: 0 } };
 
         frame.set(0, fix(5));
         assert_eq!(step(Op::NewClosure { dst: 1, count: 2, code: 1 }, &mut cx), Ok(Control::Next));
@@ -173,7 +176,7 @@ fn with_frame(f: impl for<'s, 'gc> FnOnce(&mut Context<'s, 'gc>)) {
         let vectors = Vectors::new(mc);
         let constants = Constants::of(vectors.immutable_from_slice(&[]).unwrap().value(mc)).unwrap();
         let upvalues = vectors.from_slice(&[]).unwrap().items(mc);
-        f(&mut Context { mc, frame, constants, upvalues, acc: Value::VOID, fuel: Fuel { run: u64::MAX, rest: 0 } });
+        f(&mut Context { mc, task: crate::coroutine::root(mc).unwrap(), frame, constants, upvalues, acc: Value::VOID, fuel: Fuel { run: u64::MAX, rest: 0 } });
     });
 }
 

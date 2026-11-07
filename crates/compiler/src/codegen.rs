@@ -12,7 +12,7 @@ use ragwort_types::gc::{Gc, Mutation, Value, WINDOW};
 use ragwort_types::vector::Vectors;
 use ragwort_vm::frame::{self, ARGS, CLOSURE, MAX_PARAMS};
 use ragwort_vm::objects::{Bytecode, BytecodeFields, Closure};
-use ragwort_vm::{Capture, Intrinsic, Op, Request};
+use ragwort_vm::{Capture, Intrinsic, Op, Read, Request};
 
 use crate::ir::{Closure as IrClosure, L4, UpvalSource, VarRef};
 use crate::{CompileError, Prim, Var};
@@ -396,6 +396,18 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
                     self.ops.push(Op::Return { src });
                 }
             }
+            L4::Intrinsic(Prim::Read(read), args) if matches!(want, Want::Reg(_)) && (1..=2).contains(&args.len()) => {
+                let Want::Reg(dst) = want else { unreachable!() };
+                let v0 = self.arg_vreg(&args[0])?;
+                let a = self.arg_reg(v0, 0);
+                if let [_, a1] = args.as_slice() {
+                    let v1 = self.arg_vreg(a1)?;
+                    let b = self.arg_reg(v1, 1);
+                    self.write(dst, |dst| Op::Read2 { dst, a, b, read: *read });
+                } else {
+                    self.write(dst, |dst| Op::Read1 { dst, a, read: *read });
+                }
+            }
             L4::Intrinsic(prim, args) => {
                 if let (Prim::Intrinsic(intrinsic), Want::Reg(dst)) = (*prim, want) {
                     match args.as_slice() {
@@ -433,6 +445,7 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
                 let base = self.layout_prim_args(*prim, args)?;
                 match *prim {
                     Prim::Intrinsic(i) => self.intrinsic(i, base, argc, want)?,
+                    Prim::Read(r) => self.read_op(r, base, argc, want),
                     Prim::Request(r) => self.request(r, base, argc, want)?,
                 }
             }
@@ -589,6 +602,19 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
         Ok(())
     }
 
+    /// A read takes at most 3 arguments, so they always fit.
+    fn read_op(&mut self, read: Read, base: VReg, args: usize, want: Want) {
+        let base = self.stage(base, args);
+        let args = args as u8;
+        match want {
+            Want::Tail => self.ops.push(Op::TailCallRead { base, args, read }),
+            Want::Reg(dst) => {
+                self.ops.push(Op::CallRead { base, args, read });
+                self.take(dst);
+            }
+        }
+    }
+
     fn request(&mut self, request: Request, base: VReg, args: usize, want: Want) -> Result<(), Stop> {
         if self.fits(base, args) {
             let base = self.stage(base, args);
@@ -613,6 +639,7 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
                     Want::Reg(dst) => self.take(dst),
                 }
             }
+            Prim::Read(_) => unreachable!("lowering spreads no read"),
             Prim::Request(request) => self.emit_request(request, base, args, true, want),
         }
         Ok(())

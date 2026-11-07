@@ -432,6 +432,9 @@ impl<'gc> Cp0<'_, 'gc> {
                 {
                     return Some(L2::Intrinsic(Prim::Request(request), args.to_vec()));
                 }
+                [Op::TailCallRead { base: b, args: n, read }] if b == base && usize::from(n) == args.len() => {
+                    return Some(L2::Intrinsic(Prim::Read(read), args.to_vec()));
+                }
                 // `add1`/`sub1`-style wrappers: (%lambda (z) (%intrinsic + z k))
                 [Op::AddImm { dst, a, imm }, Op::Return { src }] if a == base && dst == src && args.len() == 1 => {
                     let k = L2::Quote(Value::fixnum(i64::from(imm))?);

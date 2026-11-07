@@ -32,7 +32,7 @@ use std::fmt;
 
 use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Value};
 use ragwort_vm::objects::Global;
-use ragwort_vm::{Intrinsic, Request};
+use ragwort_vm::{Intrinsic, Read, Request};
 
 /// A local variable, numbered by the expander so no two bindings share one.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -49,6 +49,7 @@ pub enum Place<'gc> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Prim {
     Intrinsic(Intrinsic),
+    Read(Read),
     Request(Request),
 }
 
@@ -125,6 +126,7 @@ impl fmt::Display for CompileError {
             Self::Rebound(v) => write!(f, "variable {} bound more than once", v.0),
             Self::SameLambda(id) => write!(f, "lambda {id} appears more than once"),
             Self::Arity(Prim::Intrinsic(i)) => write!(f, "wrong number of arguments to {}", i.name()),
+            Self::Arity(Prim::Read(r)) => write!(f, "wrong number of arguments to {}", r.name()),
             Self::Arity(Prim::Request(r)) => write!(f, "wrong number of arguments to {}", r.name()),
             Self::TooManyConstants => write!(f, "more than 2^32 constants"),
             Self::TooManyRegisters => write!(f, "more than 2^32 locals"),

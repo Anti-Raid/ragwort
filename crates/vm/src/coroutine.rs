@@ -17,9 +17,10 @@
 use ragwort_types::gc::raw::Raw;
 use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Segment, Value, WINDOW};
 
+use crate::args::Args;
 use crate::intrinsic::values;
 use crate::machine::{Outer, Step, Then};
-use crate::objects::{Frames, FramesFields, MultiValue, MultiValueFields, Task, TaskFields};
+use crate::objects::{Frames, FramesFields, Native, NativeFields, Task, TaskFields};
 use crate::{Fault, Outcome};
 
 /// The slots of a coroutine's first segment: a frame's window, and room past it for calls from
@@ -43,7 +44,7 @@ pub(crate) fn root<'gc>(mc: &Mutation<'gc>) -> Result<Gc<'gc, Task>, OutOfMemory
 
 fn task<'gc>(mc: &Mutation<'gc>, body: Value<'gc>, state: u32) -> Result<Gc<'gc, Task>, OutOfMemory> {
     let none = Value::FALSE;
-    Task::new(mc, Value::VOID, none, Value::NIL, Value::NIL, none, None, 0, body, none, none, None, 0, state, false)
+    Task::new(mc, Value::VOID, none, Value::NIL, Value::NIL, None, 0, body, none, none, None, 0, state)
 }
 
 pub(crate) fn of<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> Option<Gc<'gc, Task>> {
@@ -67,47 +68,34 @@ fn give<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, segment: Gc<'gc, Segment>)
     }
 }
 
-/// `flag`, then `values`, as one value: what `co/try-resume` returns.
-pub(crate) fn flagged<'gc>(mc: &Mutation<'gc>, flag: Value<'gc>, values_: Value<'gc>) -> Result<Value<'gc>, Fault> {
-    let mut all = vec![flag];
-    match values_.downcast::<MultiValue>(mc) {
-        Some(mv) => {
-            let items = mv.items(mc);
-            all.extend((0..items.len()).map(|i| items.get(i)));
-        }
-        None => all.push(values_),
-    }
-    values(mc, all.into_iter())
-}
-
 impl<'gc> Outer<'_, 'gc> {
-    /// Resumes the coroutine `co` with `args`, for `co/resume`, or if `protected`,
-    /// `co/try-resume`. The caller's continuation is on its chain already.
-    pub(crate) fn resume_coroutine(&mut self, co: Value<'gc>, args: &[Value<'gc>], protected: bool) -> Step<'gc> {
+    /// Resumes the coroutine `co` with `args`, for `co/resume`. The caller's continuation is on
+    /// its chain already.
+    pub(crate) fn resume_coroutine(&mut self, co: Value<'gc>, args: Args<'gc>) -> Step<'gc> {
         let mc = self.mc();
         let co = of(mc, co).ok_or(Fault::WrongType)?;
         if co.state(mc) != PENDING {
             return Err(Fault::NotPending);
         }
+        let args = args.detach(mc)?;
         let from = self.task();
         self.leave(from)?;
         from.set_resumed(mc, Value::object(mc, co));
         co.set_resumer(mc, Value::object(mc, from));
         co.set_state(mc, RUNNING);
-        co.set_protected(mc, protected);
         let body = co.body(mc);
         if body == Value::FALSE && co.segment(mc).is_some() {
             self.enter_task(co)?;
-            return self.then(Then::Return(values(mc, args.iter().copied())?));
+            return self.then(Then::Return(args.values(mc)?));
         }
         let segment = self.free_segment(from)?;
         self.segments.stack.switch(mc, segment);
         self.segments.task = co;
         if body == Value::FALSE {
-            return self.then(Then::Return(values(mc, args.iter().copied())?));
+            return self.then(Then::Return(args.values(mc)?));
         }
         co.set_body(mc, Value::FALSE);
-        self.then(Then::Call(body, args.to_vec()))
+        self.then(Then::Call(body, args))
     }
 
     /// Suspends the running coroutine, for `co/yield`, so what resumed it goes on with
@@ -129,7 +117,6 @@ impl<'gc> Outer<'_, 'gc> {
         if let Some(segment) = freed {
             give(mc, to, segment);
         }
-        let yielded = if from.protected(mc) { flagged(mc, Value::TRUE, yielded)? } else { yielded };
         self.then(Then::Return(yielded))
     }
 
@@ -168,6 +155,10 @@ impl<'gc> Outer<'_, 'gc> {
         }
         let (mut run, mut chain, mut end) = (Vec::new(), task.chain(mc), base);
         while end > 0 {
+            if let Some(native) = chain.downcast::<Native>(mc) {
+                chain = native.next(mc);
+                continue;
+            }
             let Some(record) = chain.downcast::<Frames>(mc) else { return Ok(None) };
             if record.segment(mc) != Some(segment) || !record.one_shot(mc) || record.owns(mc) || record.end(mc) as usize != end {
                 return Ok(None);

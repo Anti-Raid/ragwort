@@ -16,7 +16,7 @@ use ragwort_types::pair::{Pair, Pairs};
 
 use crate::Fault;
 use crate::frame::{self, Link};
-use crate::objects::{Frames, FramesFields, Task, TaskFields};
+use crate::objects::{Frames, FramesFields, Native, NativeFields, Task, TaskFields};
 
 /// The most slots of a record copied back onto the stack at once. The top frame is always
 /// copied whole; a deep continuation comes back a chunk at a time, as its frames return.
@@ -144,11 +144,16 @@ impl<'gc> Segments<'_, 'gc> {
         Ok(Some(Resume { fp: at + (top - split), pc: link.pc }))
     }
 
+    /// Whether a bottom frame with `len` slots under it fits on this segment.
+    pub(crate) fn fits(&self, len: usize) -> bool {
+        self.stack.base() + len + WINDOW <= self.stack.segment(self.mc).len(self.mc)
+    }
+
     /// Where a bottom frame goes with `len` slots under it: at the stack's base, or on another
     /// segment if this one has no room.
     pub(crate) fn bottom(&mut self, len: usize) -> Result<usize, Fault> {
         let base = self.stack.base();
-        if base + len + WINDOW <= self.stack.segment(self.mc).len(self.mc) {
+        if self.fits(len) {
             return Ok(base);
         }
         self.stack.set_top(base);
@@ -162,7 +167,7 @@ impl<'gc> Segments<'_, 'gc> {
     /// tail position stays in constant space.
     pub(crate) fn set_mark(&self, key: Value<'gc>, value: Value<'gc>) -> Result<(), Fault> {
         let (mc, task) = (self.mc, self.task);
-        let restored = task.chain(mc).downcast::<Frames>(mc).map_or(Value::NIL, |r| r.attachments(mc));
+        let restored = restored(mc, task.chain(mc));
         let (pairs, mut at, mut own) = (Pairs::new(mc), task.attachments(mc), Vec::new());
         while at != restored {
             let cell = Pair::of(at).ok_or(Fault::Malformed)?;
@@ -220,12 +225,29 @@ impl<'gc> Segments<'_, 'gc> {
 /// copied when resumed from then on, not taken back in place. One-shot records are only ever on
 /// top of a chain, as in Chez, so this stops at the first that isn't.
 pub(crate) fn promote<'gc>(mc: &Mutation<'gc>, mut chain: Value<'gc>) {
-    while let Some(record) = chain.downcast::<Frames>(mc) {
-        if !record.one_shot(mc) {
+    loop {
+        if let Some(record) = chain.downcast::<Frames>(mc) {
+            if !record.one_shot(mc) {
+                break;
+            }
+            record.set_one_shot(mc, false);
+            chain = record.next(mc);
+        } else if let Some(native) = chain.downcast::<Native>(mc) {
+            chain = native.next(mc);
+        } else {
             break;
         }
-        record.set_one_shot(mc, false);
-        chain = record.next(mc);
+    }
+}
+
+/// The marks the record on top of `chain` puts back, or none if it's empty.
+pub(crate) fn restored<'gc>(mc: &Mutation<'gc>, chain: Value<'gc>) -> Value<'gc> {
+    if let Some(record) = chain.downcast::<Frames>(mc) {
+        record.attachments(mc)
+    } else if let Some(native) = chain.downcast::<Native>(mc) {
+        native.attachments(mc)
+    } else {
+        Value::NIL
     }
 }
 

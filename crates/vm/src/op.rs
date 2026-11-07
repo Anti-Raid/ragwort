@@ -2,14 +2,14 @@
 //! relative to the instruction after them.
 
 use ragwort_types::{Error, named};
-use ragwort_types::gc::{Frame, Mutation, OutOfMemory, Slots, Value, WINDOW};
+use ragwort_types::gc::{Frame, Gc, Mutation, OutOfMemory, Slots, Value, WINDOW};
 use ragwort_types::constant::Constants;
 use ragwort_types::num::NumError;
 use ragwort_types::string::StrError;
 
-use crate::objects::{self, BytecodeFields, ClosureFields, SpillFields};
+use crate::objects::{self, BytecodeFields, ClosureFields, SpillFields, Task};
 use crate::machine::list;
-use crate::{Intrinsic, Request};
+use crate::{Intrinsic, Read, Request};
 
 #[cfg(test)]
 #[path = "tests/op.rs"]
@@ -72,6 +72,15 @@ named! {
         /// Runs `intrinsic` like `CallIntrinsic`, then returns its result. A built-in used as a value
         /// is a closure whose code is just this.
         TailCallIntrinsic { base: u8, args: u8, intrinsic: Intrinsic } = "tail-call-intrinsic",
+        /// Runs `read` on the `args` registers from `base`, leaving its result in the accumulator,
+        /// and goes on.
+        CallRead { base: u8, args: u8, read: Read } = "call-read",
+        /// Runs `read` like `CallRead`, then returns its result.
+        TailCallRead { base: u8, args: u8, read: Read } = "tail-call-read",
+        /// Runs 1-argument `read` on register `a` and stores its result in `dst`.
+        Read1 { dst: u8, a: u8, read: Read } = "read1",
+        /// Runs 2-argument `read` on registers `(a, b)` and stores its result in `dst`.
+        Read2 { dst: u8, a: u8, b: u8, read: Read } = "read2",
         /// Has the run loop carry out `request` on the `args` registers from `base`. One that calls a
         /// procedure, as `call/cc` does, goes on here when it returns, so `base` must be past the
         /// frame's link, as a call's is.
@@ -114,6 +123,8 @@ pub enum Capture {
 /// What an instruction runs against.
 pub struct Context<'s, 'gc> {
     pub mc: &'s Mutation<'gc>,
+    /// The running task, whose marks and prompts a [`Read`] reads.
+    pub task: Gc<'gc, Task>,
     pub frame: Frame<'s, 'gc>,
     /// The module's constants, which `LoadConst` indexes.
     pub constants: Constants<'gc>,
@@ -210,6 +221,50 @@ pub enum Fault {
 }
 
 impl Fault {
+    /// What [`Fault::kind`] numbers, as the prelude's `error-object-kind` names them.
+    pub const KINDS: [&str; 17] = [
+        "malformed",
+        "out-of-memory",
+        "wrong-type",
+        "out-of-range",
+        "immutable",
+        "arity",
+        "not-procedure",
+        "no-prompt",
+        "unbound",
+        "finished",
+        "out-of-fuel",
+        "error",
+        "not-pending",
+        "divide-by-zero",
+        "no-exact-value",
+        "not-integer",
+        "too-long",
+    ];
+
+    /// Which of [`Fault::KINDS`] it is.
+    pub fn kind(self) -> usize {
+        match self {
+            Fault::Malformed | Fault::Str(StrError::NotNarrowest) => 0,
+            Fault::OutOfMemory => 1,
+            Fault::WrongType => 2,
+            Fault::OutOfRange | Fault::Str(StrError::OutOfRange) => 3,
+            Fault::Immutable => 4,
+            Fault::Arity => 5,
+            Fault::NotProcedure => 6,
+            Fault::NoPrompt => 7,
+            Fault::Unbound => 8,
+            Fault::Finished => 9,
+            Fault::OutOfFuel => 10,
+            Fault::Error => 11,
+            Fault::NotPending => 12,
+            Fault::Num(NumError::DivideByZero) => 13,
+            Fault::Num(NumError::NoExactValue) => 14,
+            Fault::Num(NumError::NotInteger) => 15,
+            Fault::Str(StrError::TooLong) => 16,
+        }
+    }
+
     /// Whether it ends the run, rather than being raised: the bytecode or the machine is broken,
     /// or the arena is out of room, or the machine is out of fuel.
     pub fn is_fatal(self) -> bool {
@@ -352,6 +407,29 @@ impl Op {
                     return Err(Fault::Malformed);
                 }
                 let val = intrinsic.exec3(mc, frame, a, b, c, &mut cx.fuel)?;
+                frame.set(dst, val);
+            }
+            Op::CallRead { base, args, read } | Op::TailCallRead { base, args, read } => {
+                if usize::from(base) + usize::from(args) > WINDOW || read.arity() != args {
+                    return Err(Fault::Malformed);
+                }
+                cx.acc = read.exec(mc, cx.task, frame, base, &mut cx.fuel)?;
+                if matches!(self, Op::TailCallRead { .. }) {
+                    return Ok(Control::Return);
+                }
+            }
+            Op::Read1 { dst, a, read } => {
+                if read.arity() != 1 {
+                    return Err(Fault::Malformed);
+                }
+                let val = read.apply(mc, cx.task, |_| frame.get(a), &mut cx.fuel)?;
+                frame.set(dst, val);
+            }
+            Op::Read2 { dst, a, b, read } => {
+                if read.arity() != 2 {
+                    return Err(Fault::Malformed);
+                }
+                let val = read.apply(mc, cx.task, |i| frame.get(if i == 0 { a } else { b }), &mut cx.fuel)?;
                 frame.set(dst, val);
             }
             Op::CallRequest { base, args, request } | Op::TailCallRequest { base, args, request } => {
