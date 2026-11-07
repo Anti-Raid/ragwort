@@ -656,6 +656,12 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
     }
 
     fn emit_request(&mut self, request: Request, base: u8, args: u8, spread: bool, want: Want) {
+        // A guard holds the frame it's called from anyway, and called from it, the VM keeps its
+        // handler there, with no prompt.
+        if let (Request::Guard, Want::Tail, false) = (request, want, spread) {
+            self.ops.extend([Op::CallRequest { base, args, request }, Op::LoadAcc { dst: SCRATCH }, Op::Return { src: SCRATCH }]);
+            return;
+        }
         self.ops.push(match (want, spread) {
             (Want::Tail, false) => Op::TailCallRequest { base, args, request },
             (Want::Tail, true) => Op::TailApplyRequest { base, args, request },

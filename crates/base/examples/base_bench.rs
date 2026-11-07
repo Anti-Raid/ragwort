@@ -123,6 +123,7 @@ fn main() {
     each("guard catching a raise:", "(guard (e (#t e)) (raise n))");
     each("guard, nothing raised:", "(guard (e (#t e)) n)");
     each("guard catching a VM fault:", "(guard (e (#t e)) (car n))");
+    each("call-with-mark:", "(call-with-mark 'k n (lambda () (mark-value 'k #f)))");
     each("dynamic-wind, nothing raised:", "(dynamic-wind (lambda () 1) (lambda () n) (lambda () 2))");
     each("call/cc escape:", "(call/cc (lambda (k) (k n)))");
     each("call/cc escape from a wind:", "(call/cc (lambda (k) (dynamic-wind (lambda () 1) (lambda () (k n)) (lambda () 2))))");

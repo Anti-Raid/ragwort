@@ -96,6 +96,10 @@ fn lets_scope_and_shadow() {
     // A `%let`'s inits are in the scope around it, a `%letrec`'s in its own.
     assert_eq!(eval("(%let ((x 'a)) (%let ((y x) (x 'b)) (%intrinsic cons y x)))"), "(a . b)");
     assert_eq!(eval("(%let ((x 'outer)) (%letrec ((f (%lambda () x)) (x 'inner)) (%app f)))"), "inner");
+    // A `%let*`'s inits see the names before them, which may repeat.
+    assert_eq!(eval("(%let ((x 'a)) (%let* ((y x) (x 'b) (z (%intrinsic cons y x)) (x z)) x))"), "(a . b)");
+    assert_eq!(eval("(%let* () 'a)"), "a");
+    assert_eq!(eval("(%let ((x 'a)) (%intrinsic cons (%let* ((x 'b) (x 'c)) x) x))"), "(c . a)");
     // A body's expressions run in order.
     assert_eq!(eval("(%let ((x 'a)) (%set! x 'b) (%set! x (%intrinsic cons x x)) x)"), "(b . b)");
 }
@@ -200,6 +204,8 @@ fn bad_forms_point_at_themselves() {
     assert_eq!(error("(%let ((x)) x)"), (BadShape, "((x))"));
     assert_eq!(error("(%let ((x 'a)))"), (BadShape, "(%let ((x 'a)))"));
     assert_eq!(error("(%let ((x 'a) (x 'b)) x)"), (Duplicate, "x"));
+    assert_eq!(error("(%let* ((x)) x)"), (BadShape, "((x))"));
+    assert_eq!(error("(%let* ((x 'a)))"), (BadShape, "(%let* ((x 'a)))"));
     assert_eq!(error("(%lambda (a b . a) a)"), (Duplicate, "a"));
     assert_eq!(error("(%lambda ('a) a)"), (BadShape, "'a"));
     assert_eq!(error("(%set! (a) 'b)"), (BadShape, "(a)"));
@@ -258,4 +264,59 @@ fn apply_intrinsic_spreads_its_last_argument() {
     let many = vec!["1"; 300].join(" ");
     assert_eq!(eval(&format!("(%apply-intrinsic + {many} '(1 1))")), "302");
     assert_eq!(error("(%apply-intrinsic +)"), (BadShape, "(%apply-intrinsic +)"));
+}
+
+#[test]
+fn the_winders_take_only_winders() {
+    let set = "(%let ((w (%intrinsic winders)))
+                 (%intrinsic set-winders! (%intrinsic cons (%intrinsic make-winder 'in 'out) w))
+                 (%let ((inside (%intrinsic winders)))
+                   (%intrinsic set-winders! w)
+                   (%intrinsic cons (%intrinsic length inside) (%intrinsic winders))))";
+    assert_eq!(eval(set), "(1)");
+    assert_eq!(fault("(%intrinsic set-winders! 1)"), Fault::WrongType);
+    assert_eq!(fault("(%intrinsic set-winders! '(1))"), Fault::WrongType);
+}
+
+#[test]
+fn a_mark_set_for_a_call_is_put_back_when_it_returns() {
+    let simple = "(%let ((key (%intrinsic make-continuation-prompt-tag)))
+                    (%let ((r (%intrinsic with-mark key 1 (%lambda (x) (%intrinsic cons x (%intrinsic mark-value key #f))) 'in)))
+                      (%intrinsic cons r (%intrinsic mark-value key #f))))";
+    assert_eq!(eval(simple), "((in . 1) . #f)");
+    // Each level checks the marks it sees, inside and after its calls, as frames overflow
+    // segments, are cut into records and copied back, again each time a continuation captured
+    // at the bottom is called.
+    let deep = "(%let* ((key (%intrinsic make-continuation-prompt-tag)) (saved #f) (count 0)
+                        (check (%lambda (want) (%if (%intrinsic eqv? (%intrinsic mark-value key #f) want) 0 1))))
+                  (%letrec ((down (%lambda (n outer)
+                                    (%if (%intrinsic eqv? n 0)
+                                         (%intrinsic call/cc (%lambda (k) (%set! saved k) 0))
+                                         (%let ((r (%intrinsic with-mark key n
+                                                     (%lambda ()
+                                                       (%intrinsic with-mark key (%intrinsic + n 1000)
+                                                         (%lambda ()
+                                                           (%let ((inner (%app down (%intrinsic + n -1) (%intrinsic + n 1000))))
+                                                             (%intrinsic + inner (%app check (%intrinsic + n 1000))))))))))
+                                           (%intrinsic + r (%app check outer)))))))
+                    (%let ((r (%app down 2000 #f)))
+                      (%set! count (%intrinsic + count 1))
+                      (%if (%intrinsic eqv? count 3) (%intrinsic cons r count) (%app saved 0)))))";
+    assert_eq!(eval(deep), "(0 . 3)");
+    // With no requests on the way down, the records are as big as segments, and copying them
+    // back splits them between a frame and the call that set its mark.
+    let calls = "(%let* ((key (%intrinsic make-continuation-prompt-tag)) (saved #f) (count 0)
+                         (check (%lambda (want) (%if (%intrinsic eqv? (%intrinsic mark-value key #f) want) 0 1))))
+                   (%letrec ((down (%lambda (n outer)
+                                     (%if (%intrinsic eqv? n 0)
+                                          (%intrinsic call/cc (%lambda (k) (%set! saved k) 0))
+                                          (%let ((r (%intrinsic with-mark key n
+                                                      (%lambda ()
+                                                        (%let ((inner (%app down (%intrinsic + n -1) n)))
+                                                          (%intrinsic + inner (%app check n)))))))
+                                            (%intrinsic + r (%app check outer)))))))
+                     (%let ((r (%app down 2000 #f)))
+                       (%set! count (%intrinsic + count 1))
+                       (%if (%intrinsic eqv? count 3) (%intrinsic cons r count) (%app saved 0)))))";
+    assert_eq!(eval(calls), "(0 . 3)");
 }

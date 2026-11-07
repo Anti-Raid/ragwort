@@ -3,9 +3,9 @@
 //! runs, and what it leads to is a [`Then`]. What only reads the continuation's marks is a
 //! [`Read`](crate::Read), which the inner loop runs.
 //!
-//! These are marks, prompts and continuations, as Racket has them, exceptions and
-//! `dynamic-wind`, which the VM runs between calls of Scheme code, and switching coroutines. The default prompt
-//! tag's handler is the prelude's.
+//! These are marks, prompts and continuations, as Racket has them, exceptions and the jumps that
+//! run `dynamic-wind`'s winders, which the VM runs between calls of Scheme code, and switching
+//! coroutines. The default prompt tag's handler is the prelude's.
 
 use ragwort_types::gc::Value;
 use ragwort_types::named;
@@ -48,10 +48,6 @@ named! {
         /// which goes on in place of the continuation it's called in, up to the nearest default
         /// prompt, once the winders it leaves and enters have run.
         CallCc = "call/cc",
-        /// `(dynamic-wind before thunk after)`: calls `before`, then `thunk` inside a winder of
-        /// them, then `after`, and returns what `thunk` did. A jump out of the thunk runs the
-        /// `after`, and one into it the `before`.
-        DynamicWind = "dynamic-wind",
         /// `(with-exception-handler handler thunk)`: calls `thunk` with `handler` innermost on
         /// the handler stack.
         WithHandler = "with-exception-handler",
@@ -88,7 +84,6 @@ impl Request {
             Request::WithMark | Request::CallWithPrompt => (3, None),
             Request::ApplyValues | Request::Capture | Request::WithHandler | Request::Guard => (2, Some(2)),
             Request::CallCc | Request::Raise | Request::RaiseContinuable => (1, Some(1)),
-            Request::DynamicWind => (3, Some(3)),
             Request::Abort | Request::Resume | Request::TryResume | Request::Compose => (1, None),
             Request::Yield => (0, None),
         };
@@ -126,7 +121,6 @@ impl Request {
                 prompts::compose(mc, task, arg(0)?.downcast::<Continuation>(mc).ok_or(Fault::WrongType)?)?;
                 Then::Return(args.tail(mc, 1)?.values(mc)?)
             }
-            Request::DynamicWind => outer.dynamic_wind(arg(0)?, arg(1)?, arg(2)?)?,
             Request::WithHandler => outer.with_handler(arg(0)?, arg(1)?)?,
             Request::Raise => Then::Raise(arg(0)?, false),
             Request::RaiseContinuable => Then::Raise(arg(0)?, true),

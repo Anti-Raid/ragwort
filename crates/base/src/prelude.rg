@@ -95,9 +95,23 @@
                   (%let ((h (%intrinsic car rest)) (args (%intrinsic cdr rest)))
                     (%apply-intrinsic call-with-prompt tag h proc args))))))))
 
-; dynamic-wind, call/cc and exceptions, as R7RS has them, are the VM's: a jump out of or
-; into a winder's extent runs its after or before, and VM faults are raised as error objects.
-(%define-global dynamic-wind (%lambda (before thunk after) (%intrinsic dynamic-wind before thunk after)))
+; dynamic-wind is Chez's: it sets the task's winders around the thunk, and a jump out of or into
+; their extent, which the VM runs, runs a winder's after or before. call/cc and exceptions are the
+; VM's, and VM faults are raised as error objects.
+; Marks, as Racket's continuation marks: `thunk` is called with `key` marked `value`, which a
+; call in tail position replaces, and `mark-value` is the nearest mark for `key`, or `default`.
+(%define-global call-with-mark (%lambda (key value thunk) (%intrinsic with-mark key value thunk)))
+(%define-global mark-value (%lambda (key default) (%intrinsic mark-value key default)))
+
+(%define-global dynamic-wind
+  (%lambda (before thunk after)
+    (%let* ((_ (%app before))
+            (outside (%intrinsic winders))
+            (_ (%intrinsic set-winders! (%intrinsic cons (%intrinsic make-winder before after) outside)))
+            (result (%app thunk))
+            (_ (%intrinsic set-winders! outside)))
+      (%app after)
+      result)))
 (%define-global abort-current-continuation (%lambda (tag . args) (%apply-intrinsic abort tag args)))
 (%define-global call/cc (%lambda (f) (%intrinsic call/cc f)))
 (%define-global call-with-current-continuation (%lambda (f) (%intrinsic call/cc f)))

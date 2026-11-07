@@ -314,7 +314,7 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         let (end, link) = if tail {
             (fp, Link::of(frame.get(at)).ok_or(Fault::Malformed)?)
         } else if base > at {
-            (fp + usize::from(base), Link { pc: self.regs.pc, base })
+            (fp + usize::from(base), Link::to(self.regs.pc, base))
         } else {
             return Err(Fault::Malformed);
         };
@@ -324,7 +324,7 @@ impl<'a, 'gc> Outer<'a, 'gc> {
     /// Makes the frame of a call that doesn't fit, with its caller's, on another segment.
     fn overflow(&mut self, callee: usize, argc: u8, rest: Value<'gc>) -> Result<(), Fault> {
         let base = callee - self.regs.fp;
-        let link = Link { pc: self.regs.pc, base: u8::try_from(base).map_err(|_| Fault::Malformed)? };
+        let link = Link::to(self.regs.pc, u8::try_from(base).map_err(|_| Fault::Malformed)?);
         let fp = self.segments.overflow(self.regs.fp, callee + 1 + usize::from(argc), base + WINDOW)?;
         self.regs.fp = fp;
         self.enter(fp + base, argc, rest, link)

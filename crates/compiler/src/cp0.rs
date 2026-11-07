@@ -432,6 +432,11 @@ impl<'gc> Cp0<'_, 'gc> {
                 {
                     return Some(L2::Intrinsic(Prim::Request(request), args.to_vec()));
                 }
+                [Op::CallRequest { base: b, args: n, request }, Op::LoadAcc { dst }, Op::Return { src }]
+                    if b == base && usize::from(n) == args.len() && dst == src =>
+                {
+                    return Some(L2::Intrinsic(Prim::Request(request), args.to_vec()));
+                }
                 [Op::TailCallRead { base: b, args: n, read }] if b == base && usize::from(n) == args.len() => {
                     return Some(L2::Intrinsic(Prim::Read(read), args.to_vec()));
                 }

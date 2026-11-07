@@ -69,6 +69,7 @@ enum Form {
     Quote,
     If,
     Let,
+    LetStar,
     Letrec,
     Set,
     DefineGlobal,
@@ -78,10 +79,11 @@ enum Form {
     ApplyIntrinsic,
 }
 
-const FORMS: [(&str, Form); 10] = [
+const FORMS: [(&str, Form); 11] = [
     ("%quote", Form::Quote),
     ("%if", Form::If),
     ("%let", Form::Let),
+    ("%let*", Form::LetStar),
     ("%letrec", Form::Letrec),
     ("%set!", Form::Set),
     ("%define-global", Form::DefineGlobal),
@@ -168,6 +170,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             (Form::Quote, &[datum]) => Core::Quote(self.datum(datum)?),
             (Form::If, &[test, then, other]) => Core::If(Box::new(self.expr(test)?), Box::new(self.expr(then)?), Box::new(self.expr(other)?)),
             (Form::Let | Form::Letrec, &[binds, ref body @ ..]) => self.binding(matches!(form, Form::Letrec), node, binds, body)?,
+            (Form::LetStar, &[binds, ref body @ ..]) => self.sequential(node, binds, body)?,
             (Form::Set, &[name, value]) => {
                 self.name(name)?;
                 Core::Set(self.place(name)?, Box::new(self.expr(value)?))
@@ -205,6 +208,28 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         self.unbind(&names);
         let binds = vars.into_iter().zip(inits).collect();
         Ok(if recursive { Core::Letrec(binds, Box::new(body)) } else { Core::Let(binds, Box::new(body)) })
+    }
+
+    /// A `%let*`: nested `%let`s of one binding each, so each init sees the names before it.
+    fn sequential(&mut self, node: Syntax<'gc>, binds: Syntax<'gc>, body: &[Syntax<'gc>]) -> Result<Core<'gc>, LowerError> {
+        if body.is_empty() {
+            return Err(self.error(LowerErrorKind::BadShape, node));
+        }
+        let (mut names, mut lets) = (Vec::new(), Vec::new());
+        for bind in self.list(binds)? {
+            let bind = self.list(bind)?;
+            let &[name, init] = bind.as_slice() else { return Err(self.error(LowerErrorKind::BadShape, binds)) };
+            let name = self.name(name)?;
+            let init = self.expr(init)?;
+            lets.extend(self.bind(&[name]).into_iter().zip([init]));
+            names.push(name);
+        }
+        let mut core = self.body(body)?;
+        self.unbind(&names);
+        while let Some(bind) = lets.pop() {
+            core = Core::Let(vec![bind], Box::new(core));
+        }
+        Ok(core)
     }
 
     fn lambda(&mut self, node: Syntax<'gc>, formals: Syntax<'gc>, body: &[Syntax<'gc>]) -> Result<Core<'gc>, LowerError> {

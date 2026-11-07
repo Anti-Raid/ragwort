@@ -1,16 +1,16 @@
 //! A [`Read`] is a function of its arguments and the running task's dynamic state: its marks,
-//! prompts, and which task it is. It changes nothing, so the inner loop runs it as it does an
-//! intrinsic.
+//! prompts, winders, and which task it is. The inner loop runs it as it does an intrinsic.
 //!
-//! What it reads only changes across a request, so its value is the same anywhere in a frame's
-//! code, though not in a closure the frame makes, which can run under other marks: the compiler
-//! may drop or reorder one, but never folds one or moves one into a lambda.
+//! A frame's code sees its marks and prompts change only across a request, but for the
+//! winders, which `set-winders!` sets, for `dynamic-wind`: the compiler never moves a read, and
+//! drops only those whose values go unused, never `set-winders!`.
 
 use ragwort_types::gc::{Frame, Gc, Mutation, Value};
 use ragwort_types::named;
+use ragwort_types::pair::Pair;
 
 use crate::intrinsic::made;
-use crate::objects::Task;
+use crate::objects::{Task, TaskFields, Winder};
 use crate::op::Fuel;
 use crate::prompts::{self, tag_of};
 use crate::Fault;
@@ -31,6 +31,10 @@ named! {
         /// `(co/running)`: the running coroutine, or in a machine's own task, that task, which
         /// is running until the machine finishes, and never pending, so nothing can resume it.
         Running = "co/running",
+        /// `(winders)`: the task's winders, up to the nearest prompt, innermost first.
+        Winders = "winders",
+        /// `(set-winders! winders)`: sets them, to `()` or a list whose first is a winder.
+        SetWinders = "set-winders!",
     }
 }
 
@@ -38,7 +42,8 @@ impl Read {
     /// How many arguments it takes. Bytecode that passes another number is malformed.
     pub const fn arity(self) -> u8 {
         match self {
-            Read::Running => 0,
+            Read::Running | Read::Winders => 0,
+            Read::SetWinders => 1,
             Read::MarkValue | Read::FrameMark => 2,
             Read::FrameMarks => 3,
         }
@@ -46,7 +51,7 @@ impl Read {
 
     /// Whether a call with valid arity cannot fault, so one whose value is unused can go.
     pub const fn is_discardable(self) -> bool {
-        !matches!(self, Read::FrameMarks)
+        !matches!(self, Read::FrameMarks | Read::SetWinders)
     }
 
     /// Whether its value is never `#f`.
@@ -77,6 +82,15 @@ impl Read {
                 made(mc, fuel, prompts::part_marks(mc, task, arg(0), arg(1), tag)?)
             }
             Read::Running => Value::object(mc, task),
+            Read::Winders => task.winders(mc),
+            Read::SetWinders => {
+                let winders = arg(0);
+                if winders != Value::NIL && !Pair::of(winders).is_some_and(|cell| cell.head(mc).downcast::<Winder>(mc).is_some()) {
+                    return Err(Fault::WrongType);
+                }
+                task.set_winders(mc, winders);
+                Value::VOID
+            }
         })
     }
 }

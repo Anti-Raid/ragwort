@@ -20,30 +20,41 @@ pub fn link_slot(arity: i64) -> u8 {
 }
 
 /// Where a frame returns to: its caller goes on at `pc`, in its frame `base` slots below this
-/// one. It's what Chez keeps as a frame's return address.
+/// one. It's what Chez keeps as a frame's return address. A call that set a mark for the frame,
+/// as a `with-mark` that isn't in tail position does, `marks`: returning puts back the caller's
+/// marks, which it keeps [`SAVED_MARKS`] slots below the frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Link {
     pub pc: usize,
     pub base: u8,
+    pub marks: bool,
 }
+
+/// How far below a frame whose link has `marks` its caller keeps its own.
+pub const SAVED_MARKS: u8 = 2;
 
 impl Link {
     /// The link of the bottom frame of the stack, whose caller is in the continuation records
     /// under it: returning from it underflows, as returning to Chez's `dounderflow` does.
-    pub const BOTTOM: Link = Link { pc: 0, base: 0 };
+    pub const BOTTOM: Link = Link { pc: 0, base: 0, marks: false };
+
+    /// The link of a call at `base` that goes on at `pc`.
+    pub fn to(pc: usize, base: u8) -> Link {
+        Link { pc, base, marks: false }
+    }
 
     pub fn is_bottom(self) -> bool {
         self.base == 0
     }
 
-    /// The link as a fixnum, `pc << 8 | base`, as it's kept in a frame.
+    /// The link as a fixnum, `pc << 9 | marks << 8 | base`, as it's kept in a frame.
     pub fn value<'gc>(self) -> Option<Value<'gc>> {
-        Value::fixnum(i64::try_from(self.pc).ok()?.checked_mul(256)? | i64::from(self.base))
+        Value::fixnum(i64::try_from(self.pc).ok()?.checked_mul(512)? | i64::from(self.marks) << 8 | i64::from(self.base))
     }
 
     pub fn of(value: Value<'_>) -> Option<Link> {
         let n = u64::try_from(value.as_fixnum()?).ok()?;
-        Some(Link { pc: usize::try_from(n >> 8).ok()?, base: n as u8 })
+        Some(Link { pc: usize::try_from(n >> 9).ok()?, base: n as u8, marks: n & 256 != 0 })
     }
 }
 

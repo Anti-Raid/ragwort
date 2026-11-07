@@ -890,6 +890,74 @@ fn vm_faults_and_errors_are_error_objects() {
 }
 
 #[test]
+fn marks_are_seen_inside_and_dropped_after() {
+    let text = "(define (depth) (mark-value 'depth 0))
+                (define (nest n) (if (eqv? n 0) (list (depth)) (call-with-mark 'depth (+ (depth) 1) (lambda () (cons (depth) (nest (- n 1)))))))
+                (list (nest 3) (depth))";
+    assert_eq!(eval(text), "((1 2 3 3) 0)");
+    // One set in tail position replaces the mark of the frame it's in, so a loop runs in
+    // constant space.
+    let tail = "(define (loop n) (if (eqv? n 0) (mark-value 'k #f) (call-with-mark 'k n (lambda () (loop (- n 1))))))
+                (list (loop 100000) (call-with-mark 'k 'outer (lambda () (+ 0 (loop 3)))))";
+    assert_eq!(eval(tail), "(1 1)");
+    let syntax = "(define (loop n) (if (eqv? n 0) (mark-value 'k #f) (with-continuation-mark 'k n (loop (- n 1)))))
+                  (list (loop 100000) (with-continuation-mark 'k 'a (list (mark-value 'k #f) (+ 0 (loop 2)))) (mark-value 'k 'none))";
+    assert_eq!(eval(syntax), "(1 (a 1) none)");
+    assert!(eval_in(&mut arena(), "(with-continuation-mark 'k 1)").is_err());
+}
+
+#[test]
+fn handlers_set_for_a_call_are_put_back_when_it_returns() {
+    // After each level's handler call returns, a raise goes to the level outside it, as frames
+    // overflow segments and are copied back, again each time the bottom's continuation is called.
+    let text = "(define saved #f) (define count 0)
+                (define (down n)
+                  (if (eqv? n 0)
+                      (+ (call/cc (lambda (k) (set! saved k) 0)) (raise-continuable 0))
+                      (let ((r (with-exception-handler (lambda (e) n) (lambda () (down (- n 1))))))
+                        (+ r (raise-continuable 0)))))
+                (let ((r (with-exception-handler (lambda (e) 0) (lambda () (down 2000)))))
+                  (set! count (+ count 1))
+                  (if (eqv? count 3) (list r count) (saved 0)))";
+    assert_eq!(eval(text), "(2001000 3)");
+}
+
+#[test]
+fn guards_go_back_to_the_frames_they_were_set_in() {
+    // Each level raises what its guard caught to the level outside it, leaving a winder, as
+    // frames overflow segments and are copied back, again each time the bottom's continuation
+    // is called.
+    let text = "(define saved #f) (define count 0) (define outs 0)
+                (define (down n)
+                  (if (eqv? n 0)
+                      (raise (call/cc (lambda (k) (set! saved k) 0)))
+                      (raise (guard (e (#t (+ e n)))
+                               (dynamic-wind (lambda () #f) (lambda () (down (- n 1))) (lambda () (set! outs (+ outs 1))))))))
+                (let ((r (guard (e (#t e)) (down 2000))))
+                  (set! count (+ count 1))
+                  (if (eqv? count 3) (list r count outs) (saved 0)))";
+    assert_eq!(eval(text), "(2001000 3 6000)");
+    let tail = "(define (safe x) (guard (e (#t 'caught)) (car x))) (list (safe 1) (safe '(a)))";
+    assert_eq!(eval(tail), "(caught a)");
+    let log = "(define log '()) (define (note x) (set! log (cons x log)))";
+    let across = format!(
+        "{log} (list (guard (e (#t (list 'g e)))
+                       (call-with-continuation-prompt
+                         (lambda () (dynamic-wind (lambda () (note 'in)) (lambda () (raise 'x)) (lambda () (note 'out))))))
+                     (reverse log))"
+    );
+    assert_eq!(eval(&across), "((g x) (in out))");
+    // A guard in a composable continuation catches what's raised where it's called.
+    let mut arena = arena();
+    let capture = "(define k #f)
+                   (call-with-continuation-prompt
+                     (lambda () (guard (e (#t (list 'caught (error-object-kind e))))
+                                  (+ 1 (call-with-composable-continuation (lambda (c) (set! k c) 0))))))";
+    assert_eq!(eval_in(&mut arena, capture), Ok(Ok("1".into())));
+    assert_eq!(eval_in(&mut arena, "(list (k 1) (k 'a))"), Ok(Ok("(2 (caught wrong-type))".into())));
+}
+
+#[test]
 fn winders_run_on_the_way_in_and_out() {
     let log = "(define log '()) (define (note x) (set! log (cons x log)))";
     let wind = |body: &str| eval(&format!("{log} (let ((r {body})) (list r (reverse log)))"));
@@ -964,7 +1032,7 @@ fn raising_in_a_loop_runs_in_constant_space() {
     let mut arena = arena();
     let text = "(let ((log 0))
                   (let loop ((i 0) (sum 0))
-                    (if (eqv? i 20000)
+                    (if (eqv? i 60000)
                         (list sum log)
                         (loop (+ i 1)
                               (+ sum (guard (e ((null? e) 0) ((pair? e) (car e)))
@@ -990,7 +1058,7 @@ fn raising_in_a_loop_runs_in_constant_space() {
             break done;
         }
     };
-    assert_eq!(done, "(20000 20000)");
+    assert_eq!(done, "(60000 60000)");
     let (first, second) = live.split_at(live.len() / 2);
     assert!(second.len() > 4, "expected the run to pause for collections");
     assert!(second.iter().max() <= first.iter().max(), "live memory grows: {live:?}");

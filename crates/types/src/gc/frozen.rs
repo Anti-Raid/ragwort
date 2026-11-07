@@ -69,9 +69,8 @@ pub(crate) struct FrozenTable {
     /// What the values that outlived a collection, and weren't found dead since, are charged.
     /// Young ones are left out: a minor collection frees those.
     live: Cell<usize>,
-    /// What the first so many young values are charged, and how many: `young_bytes` counts on
-    /// from there, so `add` doesn't have to.
-    young_counted: Cell<(usize, usize)>,
+    /// What the young values are charged.
+    young_bytes: Cell<usize>,
 }
 
 impl FrozenTable {
@@ -86,7 +85,7 @@ impl FrozenTable {
             dead: RefCell::default(),
             made: Cell::new(0),
             live: Cell::new(0),
-            young_counted: Cell::new((0, 0)),
+            young_bytes: Cell::new(0),
         }
     }
 
@@ -129,6 +128,7 @@ impl FrozenTable {
         slot.cost.set(cost);
         budget.force(cost);
         self.young.borrow_mut().push(id);
+        self.young_bytes.set(self.young_bytes.get() + cost);
         Ok(id)
     }
 
@@ -158,7 +158,7 @@ impl FrozenTable {
             }
         }
         self.live.set(live);
-        self.young_counted.set((0, 0));
+        self.young_bytes.set(0);
     }
 
     /// After a major collection's marking: every unmarked value is dead. That includes those a
@@ -182,7 +182,7 @@ impl FrozenTable {
         }
         self.live.set(live);
         self.young.borrow_mut().clear();
-        self.young_counted.set((0, 0));
+        self.young_bytes.set(0);
     }
 
     /// Empties the slots of up to `max` dead values, between steps, when nothing can be
@@ -213,13 +213,7 @@ impl FrozenTable {
 
     /// What the values made since the last collection are charged.
     pub(crate) fn young_bytes(&self) -> usize {
-        let young = self.young.borrow();
-        let (mut bytes, counted) = self.young_counted.get();
-        for &id in &young[counted..] {
-            bytes += self.slot(u64::from(id) + 1).map_or(0, |s| s.cost.get());
-        }
-        self.young_counted.set((bytes, young.len()));
-        bytes
+        self.young_bytes.get()
     }
 
     pub(crate) fn count(&self) -> usize {

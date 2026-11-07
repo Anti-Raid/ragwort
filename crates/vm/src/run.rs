@@ -7,9 +7,10 @@ use ragwort_types::constant::Constants;
 use ragwort_types::gc::{Frame, Gc, Mutation, Slots, Stack, Value, WINDOW};
 use ragwort_types::pair::{Pair, Pairs};
 
-use crate::frame::{self, ARGS, CLOSURE, Link, MAX_PARAMS};
+use crate::frame::{self, ARGS, CLOSURE, Link, MAX_PARAMS, SAVED_MARKS};
 use crate::op::Fuel;
-use crate::objects::{BytecodeFields, Closure, ClosureFields, MultiValue, MultiValueFields, Task};
+use crate::objects::{BytecodeFields, Closure, ClosureFields, Guard, MultiValue, MultiValueFields, Task, TaskFields};
+use crate::prompts::{self, handler_key};
 use crate::{Context, Control, Fault, Op, Request};
 
 /// The most arguments a call passes: they and the link after them fill the frame.
@@ -115,7 +116,7 @@ impl<'s, 'gc> Run<'s, 'gc> {
                 Control::Return => self.ret()?,
                 Control::Call { base, args } => {
                     self.charge()?;
-                    self.call(Call::new(base, args))?;
+                    self.call(Call::new(base, args), false)?;
                 }
                 Control::TailCall { base, args } => {
                     self.charge()?;
@@ -145,10 +146,11 @@ impl<'s, 'gc> Run<'s, 'gc> {
         Ok(())
     }
 
-    /// Calls in a new frame at `call.base`, which returns here. The frame must start past this
-    /// one's link, so it overwrites nothing this frame keeps.
+    /// Calls in a new frame at `call.base`, which returns here, putting back this frame's marks
+    /// if it set `marks` for it. The frame must start past this one's link, so it overwrites
+    /// nothing this frame keeps.
     #[inline(always)]
-    fn call(&mut self, call: Call<'gc>) -> Result<(), Exit<'gc>> {
+    fn call(&mut self, call: Call<'gc>, marks: bool) -> Result<(), Exit<'gc>> {
         fits(call)?;
         if call.base <= self.link {
             return Err(Fault::Malformed.into());
@@ -159,7 +161,7 @@ impl<'s, 'gc> Run<'s, 'gc> {
             return Err(Exit::Overflow { callee, argc: call.argc, rest: call.rest });
         }
         let frame = self.stack.frame(self.cx.mc, callee).ok_or(Fault::Malformed)?;
-        let link = Link { pc: self.pc, base: call.base }.value().ok_or(Fault::Malformed)?;
+        let link = Link { pc: self.pc, base: call.base, marks }.value().ok_or(Fault::Malformed)?;
         self.enter(frame, callee, closure, call, link)
     }
 
@@ -186,7 +188,12 @@ impl<'s, 'gc> Run<'s, 'gc> {
     #[inline(always)]
     fn enter(&mut self, frame: Frame<'s, 'gc>, fp: usize, closure: Gc<'gc, Closure>, call: Call<'gc>, link: Value<'gc>) -> Result<(), Exit<'gc>> {
         let mc = self.cx.mc;
-        bind(mc, frame, closure.code(mc).ok_or(Fault::Malformed)?.arity(mc), call.argc, call.rest, &mut self.cx.fuel)?;
+        let arity = closure.code(mc).ok_or(Fault::Malformed)?.arity(mc);
+        if let Err(fault) = bind(mc, frame, arity, call.argc, call.rest, &mut self.cx.fuel) {
+            // A tail call's frame is the callee's now, so a fault finds its link where it looks.
+            frame.set(frame::link_slot(arity), link);
+            return Err(fault.into());
+        }
         (self.ops, self.cx.constants, self.cx.upvalues, self.link) = load(mc, closure)?;
         frame.set(self.link, link);
         (self.cx.frame, self.fp, self.pc) = (frame, fp, 0);
@@ -198,12 +205,15 @@ impl<'s, 'gc> Run<'s, 'gc> {
     #[inline(always)]
     fn ret(&mut self) -> Result<(), Exit<'gc>> {
         let mc = self.cx.mc;
-        let Link { pc, base } = Link::of(self.cx.frame.get(self.link)).ok_or(Fault::Malformed)?;
+        let Link { pc, base, marks } = Link::of(self.cx.frame.get(self.link)).ok_or(Fault::Malformed)?;
         if base == 0 {
             return Err(Exit::Underflow);
         }
         self.fp = self.fp.checked_sub(usize::from(base)).ok_or(Fault::Malformed)?;
         let frame = self.stack.frame(mc, self.fp).ok_or(Fault::Malformed)?;
+        if marks {
+            self.cx.task.set_attachments(mc, frame.get(base.checked_sub(SAVED_MARKS).ok_or(Fault::Malformed)?));
+        }
         let caller = frame.get(CLOSURE).downcast::<Closure>(mc).ok_or(Fault::Malformed)?;
         (self.ops, self.cx.constants, self.cx.upvalues, self.link) = load(mc, caller)?;
         (self.cx.frame, self.pc) = (frame, pc);
@@ -211,7 +221,10 @@ impl<'s, 'gc> Run<'s, 'gc> {
     }
 
     /// Makes `apply` or `apply-values` a call, as it's laid out as one, with the list or
-    /// [`MultiValue`] to spread last. The outer loop carries out the other requests.
+    /// [`MultiValue`] to spread last, and a `with-mark` or `with-exception-handler` of a closure
+    /// that isn't in tail position one that sets the mark, as Chez sets an attachment for a call:
+    /// the frame keeps its marks in the request's first register, under the callee's frame, for
+    /// the return to put back. The outer loop carries out the other requests.
     #[inline(always)]
     fn request(&mut self, base: u8, args: u8, request: Request, spread: bool, tail: bool) -> Result<(), Exit<'gc>> {
         let frame = self.cx.frame;
@@ -232,9 +245,57 @@ impl<'s, 'gc> Run<'s, 'gc> {
                     Call { base, argc: 1, rest: Value::NIL }
                 }
             }
+            Request::WithMark if !spread && !tail && args >= 3 => return self.marked_call(base, args, request),
+            Request::WithHandler | Request::Guard if !spread && !tail && args == 2 => return self.marked_call(base, args, request),
             _ => return Err(Exit::Request { base, args, request, spread, tail }),
         };
-        if tail { self.tail_call(call) } else { self.call(call) }
+        if tail { self.tail_call(call) } else { self.call(call, false) }
+    }
+
+    /// Calls the closure of a `with-mark`, or the thunk of a `with-exception-handler` or a
+    /// `guard`, which isn't in tail position, with the mark set, in a frame [`SAVED_MARKS`] past
+    /// `base`, if it takes the arguments as they are; a guard is kept in the register under the
+    /// frame. Out of line, as it's rare next to calls, and inlined, it slowed them.
+    #[inline(never)]
+    fn marked_call(&mut self, base: u8, args: u8, request: Request) -> Result<(), Exit<'gc>> {
+        let (mc, frame, task) = (self.cx.mc, self.cx.frame, self.cx.task);
+        let (procedure, argc) = match request {
+            Request::WithMark => (frame.get(base + 2), args - 3),
+            Request::Guard => (frame.get(base), 0),
+            _ => (frame.get(base + 1), 0),
+        };
+        let call = Call { base: base + SAVED_MARKS, argc, rest: Value::NIL };
+        fits(call)?;
+        let takes = procedure.downcast::<Closure>(mc).and_then(|c| c.code(mc)).is_some_and(|code| code.arity(mc) == i64::from(argc));
+        if !takes || self.fp + usize::from(call.base) > self.limit {
+            return Err(Exit::Request { base, args, request, spread: false, tail: false });
+        }
+        let (pairs, saved) = (Pairs::new(mc), task.attachments(mc));
+        let (key, value, guard) = match request {
+            Request::WithMark => (frame.get(base), frame.get(base + 1), None),
+            _ => {
+                let handler = if request == Request::Guard {
+                    Value::object(mc, Guard::new(mc, frame.get(base + 1), task.winders(mc), true).map_err(Fault::from)?)
+                } else {
+                    frame.get(base)
+                };
+                let handlers = prompts::mark(mc, task, handler_key(), Value::NIL)?;
+                let guard = (request == Request::Guard).then_some(handler);
+                (handler_key(), pairs.cons(handler, handlers).map_err(Fault::from)?.value(mc), guard)
+            }
+        };
+        let mark = pairs.cons(key, value).map_err(Fault::from)?.value(mc);
+        let marks = pairs.cons(mark, saved).map_err(Fault::from)?.value(mc);
+        frame.set(call.base, procedure);
+        frame.set(base, saved);
+        if let Some(guard) = guard {
+            frame.set(base + 1, guard);
+        }
+        task.set_attachments(mc, marks);
+        if mc.step_due() {
+            self.cx.fuel.pause();
+        }
+        self.call(call, true)
     }
 }
 

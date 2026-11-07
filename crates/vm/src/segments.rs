@@ -7,15 +7,17 @@
 //! times. A record no continuation holds is one-shot, and is resumed in place, as Chez resumes
 //! one-shot continuations; any other is copied back a chunk at a time.
 //!
-//! Marks are Chez's continuation attachments: a list in the task, which each record keeps as it
-//! was when it was made, and puts back when it's resumed, so marks set since are dropped.
+//! Marks are Chez's continuation attachments: a list in the task, which each record keeps as its
+//! top frame has it, and puts back when it's resumed, so marks set since are dropped. A frame
+//! that sets one for a call keeps its own under the callee's frame, as its link says, so the
+//! records cut between them keep those.
 
 use ragwort_types::gc::raw::Raw;
 use ragwort_types::gc::{Frame, Gc, Mutation, Segment, Stack, Value, WINDOW};
 use ragwort_types::pair::{Pair, Pairs};
 
 use crate::Fault;
-use crate::frame::{self, Link};
+use crate::frame::{self, Link, SAVED_MARKS};
 use crate::objects::{Frames, FramesFields, Native, NativeFields, Task, TaskFields};
 
 /// The most slots of a record copied back onto the stack at once. The top frame is always
@@ -47,8 +49,9 @@ impl<'gc> Segments<'_, 'gc> {
             return Ok(());
         }
         let segment = self.stack.segment(self.mc);
+        let marks = self.marks_under(end, link)?;
         self.stack.capture(self.mc, end).ok_or(Fault::Malformed)?;
-        self.push(segment, start, end, link, false)
+        self.push(segment, start, end, link, marks, false)
     }
 
     /// Moves the frame at `fp`, with the slots up to `end` it holds a call in, to another
@@ -61,6 +64,7 @@ impl<'gc> Segments<'_, 'gc> {
         let (start, old) = (self.stack.base(), self.stack.segment(mc));
         let caller = self.frame(fp)?;
         let link = frame::link_of(mc, caller)?;
+        let marks = if fp > start { self.marks_under(fp, link)? } else { Value::NIL };
         let mut moved = [Value::VOID; WINDOW];
         for (i, slot) in moved[..len].iter_mut().enumerate() {
             *slot = caller.get(i as u8);
@@ -68,7 +72,7 @@ impl<'gc> Segments<'_, 'gc> {
         self.stack.set_top(fp);
         self.move_to(need)?;
         if fp > start {
-            self.push(old, start, fp, link, true)?;
+            self.push(old, start, fp, link, marks, true)?;
         }
         let at = self.stack.base();
         let dst = self.frame(at)?;
@@ -120,20 +124,19 @@ impl<'gc> Segments<'_, 'gc> {
         if end > slots.len() {
             return Err(Fault::Malformed);
         }
-        let mut split = top;
-        while split > start {
-            let under = below(split, frame::link_at(mc, slots, split)?.base)?;
-            if end - under > CHUNK {
-                break;
+        let (mut split, mut marks) = (top, record.attachments(mc));
+        let rest = loop {
+            if split <= start {
+                break record.next(mc);
             }
-            split = under;
-        }
-        let rest = if split > start {
-            let link = frame::link_at(mc, slots, split)?.value().ok_or(Fault::Malformed)?;
-            let (start, split, attachments, one_shot) = (slot(start)?, slot(split)?, record.attachments(mc), record.one_shot(mc));
-            Value::object(mc, Frames::new(mc, Some(segment), start, split, link, attachments, one_shot, false, record.next(mc))?)
-        } else {
-            record.next(mc)
+            let link = frame::link_at(mc, slots, split)?;
+            let under = below(split, link.base)?;
+            let caller_marks = if link.marks { slots.get(below(split, SAVED_MARKS)?) } else { marks };
+            if end - under > CHUNK {
+                let (start, at, link, one_shot) = (slot(start)?, slot(split)?, link.value().ok_or(Fault::Malformed)?, record.one_shot(mc));
+                break Value::object(mc, Frames::new(mc, Some(segment), start, at, link, caller_marks, one_shot, false, record.next(mc))?);
+            }
+            (split, marks) = (under, caller_marks);
         };
         let at = self.bottom(end - split)?;
         if !self.stack.write(mc, at, slots.slice(split..end).ok_or(Fault::Malformed)?) {
@@ -212,10 +215,20 @@ impl<'gc> Segments<'_, 'gc> {
         Ok(())
     }
 
-    fn push(&self, segment: Gc<'gc, Segment>, start: usize, end: usize, link: Link, owns: bool) -> Result<(), Fault> {
+    /// The marks of the caller of the frame at `fp`, whose link is `link`: the task's, unless the
+    /// call set a mark, and the caller kept its own under the frame.
+    fn marks_under(&self, fp: usize, link: Link) -> Result<Value<'gc>, Fault> {
+        if !link.marks {
+            return Ok(self.task.attachments(self.mc));
+        }
+        let at = fp.checked_sub(usize::from(SAVED_MARKS)).filter(|&at| at >= self.stack.base()).ok_or(Fault::Malformed)?;
+        self.stack.get(self.mc, at).ok_or(Fault::Malformed)
+    }
+
+    fn push(&self, segment: Gc<'gc, Segment>, start: usize, end: usize, link: Link, marks: Value<'gc>, owns: bool) -> Result<(), Fault> {
         let (mc, task) = (self.mc, self.task);
         let (start, end, link) = (slot(start)?, slot(end)?, link.value().ok_or(Fault::Malformed)?);
-        let record = Frames::new(mc, Some(segment), start, end, link, task.attachments(mc), true, owns, task.chain(mc))?;
+        let record = Frames::new(mc, Some(segment), start, end, link, marks, true, owns, task.chain(mc))?;
         task.set_chain(mc, Value::object(mc, record));
         Ok(())
     }
@@ -239,6 +252,47 @@ pub(crate) fn promote<'gc>(mc: &Mutation<'gc>, mut chain: Value<'gc>) {
         }
     }
 }
+
+/// The chain that goes on from the caller of the frame in the records of `chain` that `guard`
+/// was set for, which the caller keeps under it, or `None` if there's none. What's above the
+/// frame is dropped, and the records under it are shared, not copied. If the record on top is
+/// one-shot, so are those above it, and nothing else holds what they, and it, have of its
+/// segment past where it ends now, which comes with it.
+pub(crate) fn cut_at<'gc>(mc: &Mutation<'gc>, mut chain: Value<'gc>, guard: Value<'gc>) -> Result<Option<Cut<'gc>>, Fault> {
+    loop {
+        if let Some(native) = chain.downcast::<Native>(mc) {
+            chain = native.next(mc);
+            continue;
+        }
+        let Some(record) = chain.downcast::<Frames>(mc) else { return Ok(None) };
+        let segment = record.segment(mc).ok_or(Fault::Malformed)?;
+        let slots = segment.slots(mc);
+        let (start, end) = (record.start(mc) as usize, record.end(mc) as usize);
+        if end > slots.len() {
+            return Err(Fault::Malformed);
+        }
+        let set_for = |at: usize, link: Link| link.marks && at >= start + usize::from(SAVED_MARKS) && slots.get(at - 1) == guard;
+        let mut link = Link::of(record.link(mc)).ok_or(Fault::Malformed)?;
+        let free = |at| record.one_shot(mc).then_some((segment, at));
+        if set_for(end, link) {
+            return Ok(Some((chain, free(end))));
+        }
+        let mut at = end;
+        while link.base > 0 {
+            at = at.checked_sub(usize::from(link.base)).filter(|&at| at >= start).ok_or(Fault::Malformed)?;
+            link = frame::link_at(mc, slots, at)?;
+            if set_for(at, link) {
+                let (marks, value) = (slots.get(at - usize::from(SAVED_MARKS)), link.value().ok_or(Fault::Malformed)?);
+                let cut = Frames::new(mc, Some(segment), slot(start)?, slot(at)?, value, marks, record.one_shot(mc), false, record.next(mc))?;
+                return Ok(Some((Value::object(mc, cut), free(at))));
+            }
+        }
+        chain = record.next(mc);
+    }
+}
+
+/// A chain [`cut_at`] a frame, and the segment it's free from where, if any.
+pub(crate) type Cut<'gc> = (Value<'gc>, Option<(Gc<'gc, Segment>, usize)>);
 
 /// The marks the record on top of `chain` puts back, or none if it's empty.
 pub(crate) fn restored<'gc>(mc: &Mutation<'gc>, chain: Value<'gc>) -> Value<'gc> {

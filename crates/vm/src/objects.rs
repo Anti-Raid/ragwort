@@ -46,30 +46,33 @@ objects! {
         owns: bool,
         next: Value,
     }
-    /// A prompt, as Racket CS keeps one: a frame of the metacontinuation. `chain` and
-    /// `attachments` are the continuation the prompt returns to, which its body doesn't see: it
-    /// runs on an empty one. An abort to `tag` calls `handler` there. A prompt a composable
-    /// continuation pushes to return to where it's called has no tag, only void.
-    pub struct Prompt { tag: Value, handler: Value, chain: Value, attachments: Value }
+    /// A prompt, as Racket CS keeps one: a frame of the metacontinuation. `chain`,
+    /// `attachments` and `winders` are the continuation the prompt returns to, which its body
+    /// doesn't see: it runs on an empty one. An abort to `tag` calls `handler` there. A prompt a
+    /// composable continuation pushes to return to where it's called has no tag, only void.
+    pub struct Prompt { tag: Value, handler: Value, chain: Value, attachments: Value, winders: Value }
     /// A continuation prompt tag. `name` is what `make-continuation-prompt-tag` was given, or
     /// void.
     pub struct Tag { name: Value }
     /// A continuation, which is called like a procedure: the records of `chain` and the prompts
     /// in the list `prompts`, up to a prompt it doesn't include. `attachments` are the marks
     /// where it was captured, with those of a frame it was captured in tail position of, whose
-    /// continuation it is. A composable one goes on on top of the continuation it's called in;
-    /// an `escape`, as `call/cc` makes, replaces that one up to the nearest default prompt.
-    pub struct Continuation { chain: Value, attachments: Value, prompts: Value, escape: bool }
+    /// continuation it is, and `winders` the task's there. A composable one goes on on top of
+    /// the continuation it's called in; an `escape`, as `call/cc` makes, replaces that one up to
+    /// the nearest default prompt.
+    pub struct Continuation { chain: Value, attachments: Value, winders: Value, prompts: Value, escape: bool }
     /// An error object: `fault` says what went wrong, and for [`Fault::Error`], `message` and
     /// `irritants` are what `error` was called with.
     pub struct Condition { fault: Frozen<Fault>, message: Value, irritants: Value }
-    /// What `dynamic-wind` runs on the way in and out: a winders mark holds a list of them for
-    /// each prompt's part of the continuation, innermost first.
+    /// What `dynamic-wind` runs on the way in and out: a task's `winders`, and a prompt's, hold
+    /// a list of them for a prompt's part of the continuation, innermost first.
     pub struct Winder { before: Value, after: Value }
     /// What `guard` and `co/try-resume` put in the handlers mark: a raise that reaches it goes
-    /// back to its prompt, whose tag it is, and calls `handler` there with what was raised, or
-    /// if that's `#f`, returns `#f` and it.
-    pub struct Guard { handler: Value }
+    /// back to where it was set and calls `handler` there with what was raised, or if that's
+    /// `#f`, returns `#f` and it. One `in_frame` is kept in the register under the frame of the
+    /// thunk it was set for, whose caller a raise goes back to, with the task's winders as
+    /// `winders` were; any other is its own prompt's tag.
+    pub struct Guard { handler: Value, winders: Value, in_frame: bool }
     /// A record of a chain that the VM goes on from itself: once what's above it returns, its
     /// `kind` says what to do next, with `a` and `b`. `attachments` and
     /// `next` are as a [`Frames`] record's. It's never changed, so a continuation can go on from
@@ -77,7 +80,8 @@ objects! {
     pub struct Native { kind: u32, a: Value, b: Value, attachments: Value, next: Value }
     /// A coroutine, and what a [`crate::Machine`] keeps of the one it runs in the arena: the
     /// accumulator between runs, the chain of records under its stack, its marks, as a list of
-    /// `(key . value)` pairs, and the list of prompts the chain runs under. `spare` is a segment
+    /// `(key . value)` pairs, its [`Winder`]s, as `dynamic-wind` sets them, up to the nearest
+    /// prompt, and the list of prompts the chain runs under. `spare` is a segment
     /// the stack left, which an overflow takes from `spare_base` up.
     ///
     /// `body` is the procedure it starts with, until it does. `resumer` is the task that resumed
@@ -88,6 +92,7 @@ objects! {
         acc: Value,
         chain: Value,
         attachments: Value,
+        winders: Value,
         prompts: Value,
         spare: Member<Segment>,
         spare_base: u32,

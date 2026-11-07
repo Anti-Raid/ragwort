@@ -25,19 +25,12 @@ pub(crate) const fn handler_key<'gc>() -> Value<'gc> {
     Value::from_bits(5 << 32 | 0b1101)
 }
 
-/// The key of the marks that hold a prompt's part of the continuation's [`Winder`]s, as a list,
-/// innermost first.
-pub(crate) const fn winders_key<'gc>() -> Value<'gc> {
-    Value::from_bits(6 << 32 | 0b1101)
-}
-
 /// Puts the current continuation in a prompt for `tag`, with `handler` for aborts to it, and
 /// starts an empty one.
 pub(crate) fn push<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, tag: Value<'gc>, handler: Value<'gc>) -> Result<(), Fault> {
-    let prompt = Prompt::new(mc, tag, handler, task.chain(mc), task.attachments(mc))?;
+    let prompt = Prompt::new(mc, tag, handler, task.chain(mc), task.attachments(mc), task.winders(mc))?;
     task.set_prompts(mc, Pairs::new(mc).cons(Value::object(mc, prompt), task.prompts(mc))?.value(mc));
-    task.set_chain(mc, Value::FALSE);
-    task.set_attachments(mc, Value::NIL);
+    empty(mc, task);
     Ok(())
 }
 
@@ -61,8 +54,7 @@ pub(crate) fn abort<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, tag: Value<'gc
             Ok(Some(found.prompt.handler(mc)))
         }
         None => {
-            task.set_chain(mc, Value::FALSE);
-            task.set_attachments(mc, Value::NIL);
+            empty(mc, task);
             task.set_prompts(mc, Value::NIL);
             Ok(None)
         }
@@ -87,13 +79,13 @@ pub(crate) fn capture<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, tag: Value<'
         }
     };
     promote(mc, task.chain(mc));
-    Ok(Value::object(mc, Continuation::new(mc, task.chain(mc), task.attachments(mc), prompts, escape)?))
+    Ok(Value::object(mc, Continuation::new(mc, task.chain(mc), task.attachments(mc), task.winders(mc), prompts, escape)?))
 }
 
 /// Goes on with `k` on top of the current continuation, which a prompt with no tag keeps, unless
 /// it's empty, as it is in tail position under a prompt.
 pub(crate) fn compose<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, k: Gc<'gc, Continuation>) -> Result<(), Fault> {
-    if task.chain(mc) != Value::FALSE || task.attachments(mc) != Value::NIL {
+    if task.chain(mc) != Value::FALSE || task.attachments(mc) != Value::NIL || task.winders(mc) != Value::NIL {
         push(mc, task, Value::VOID, Value::VOID)?;
     }
     let mut above = Vec::new();
@@ -105,6 +97,7 @@ pub(crate) fn compose<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, k: Gc<'gc, C
     task.set_prompts(mc, list(mc, &above, task.prompts(mc))?);
     task.set_chain(mc, k.chain(mc));
     task.set_attachments(mc, k.attachments(mc));
+    task.set_winders(mc, k.winders(mc));
     Ok(())
 }
 
@@ -119,8 +112,7 @@ pub(crate) fn clear_to_default<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>) -> 
         at = cell.tail(mc);
     }
     task.set_prompts(mc, at);
-    task.set_chain(mc, Value::FALSE);
-    task.set_attachments(mc, Value::NIL);
+    empty(mc, task);
     Ok(())
 }
 
@@ -161,56 +153,56 @@ pub(crate) fn part_marks<'gc>(
 /// The [`Winder`]s of the continuation of `task`, up to the nearest prompt for `tag` or all of
 /// them, innermost first, each with the list of those outside it in its prompt's part.
 pub(crate) fn winds<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, tag: Option<Value<'gc>>) -> Result<Vec<Wind<'gc>>, Fault> {
-    if !has_winders(mc, task.attachments(mc), task.prompts(mc), tag)? {
-        return Ok(Vec::new());
-    }
-    winds_in(mc, &parts(mc, task, tag)?)
+    winds_in(mc, task.winders(mc), task.prompts(mc), tag)
 }
 
 /// [`winds`] of the continuation `k`, all of it.
 pub(crate) fn winds_of<'gc>(mc: &Mutation<'gc>, k: Gc<'gc, Continuation>) -> Result<Vec<Wind<'gc>>, Fault> {
-    if !has_winders(mc, k.attachments(mc), k.prompts(mc), None)? {
-        return Ok(Vec::new());
-    }
-    winds_in(mc, &parts_of(mc, k)?)
+    winds_in(mc, k.winders(mc), k.prompts(mc), None)
 }
 
-/// Whether the parts of a continuation, whose marks are `marks` and then those under each of
-/// `prompts`, up to the nearest prompt for `tag`, hold any winders, as [`parts`] finds them.
-fn has_winders<'gc>(mc: &Mutation<'gc>, marks: Value<'gc>, mut prompts: Value<'gc>, tag: Option<Value<'gc>>) -> Result<bool, Fault> {
-    let holds = |marks| Ok::<_, Fault>(nearest(mc, marks, winders_key())?.is_some_and(|ws| ws != Value::NIL));
-    if holds(marks)? {
-        return Ok(true);
-    }
-    while let Some(cell) = Pair::of(prompts) {
-        let prompt = prompt(mc, cell.head(mc))?;
-        if tag.is_some_and(|tag| prompt.tag(mc) == tag) {
-            return Ok(false);
+/// The winds of the first `parts` prompt parts of the continuation of `task`, then those of the
+/// next part down to the list `winders`, whose own stay.
+pub(crate) fn winds_above<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, parts: usize, winders: Value<'gc>) -> Result<Vec<Wind<'gc>>, Fault> {
+    let (mut winds, mut at, mut prompts) = (Vec::new(), task.winders(mc), task.prompts(mc));
+    for part in 0..=parts {
+        let stop = if part == parts { winders } else { Value::NIL };
+        while at != stop {
+            let cell = Pair::of(at).ok_or(Fault::Malformed)?;
+            winds.push((cell.head(mc).downcast::<Winder>(mc).ok_or(Fault::Malformed)?, cell.tail(mc)));
+            at = cell.tail(mc);
         }
-        if holds(prompt.attachments(mc))? {
-            return Ok(true);
+        if part < parts {
+            let cell = Pair::of(prompts).ok_or(Fault::Malformed)?;
+            (at, prompts) = (prompt(mc, cell.head(mc))?.winders(mc), cell.tail(mc));
         }
-        prompts = cell.tail(mc);
     }
-    match tag {
-        Some(tag) if tag != default_tag() => Err(Fault::NoPrompt),
-        _ => Ok(false),
-    }
+    Ok(winds)
 }
 
 /// A [`Winder`], and the list of those outside it in its prompt's part of the continuation.
 pub(crate) type Wind<'gc> = (Gc<'gc, Winder>, Value<'gc>);
 
-fn winds_in<'gc>(mc: &Mutation<'gc>, parts: &[Value<'gc>]) -> Result<Vec<Wind<'gc>>, Fault> {
+/// The winds of `winders`, then of those under each of `prompts`, up to the nearest prompt for
+/// `tag`, or all of them.
+fn winds_in<'gc>(mc: &Mutation<'gc>, mut winders: Value<'gc>, mut prompts: Value<'gc>, tag: Option<Value<'gc>>) -> Result<Vec<Wind<'gc>>, Fault> {
     let mut winds = Vec::new();
-    for &marks in parts {
-        let mut at = nearest(mc, marks, winders_key())?.unwrap_or(Value::NIL);
-        while let Some(cell) = Pair::of(at) {
+    loop {
+        while let Some(cell) = Pair::of(winders) {
             winds.push((cell.head(mc).downcast::<Winder>(mc).ok_or(Fault::Malformed)?, cell.tail(mc)));
-            at = cell.tail(mc);
+            winders = cell.tail(mc);
         }
+        let Some(cell) = Pair::of(prompts) else { break };
+        let prompt = prompt(mc, cell.head(mc))?;
+        if tag.is_some_and(|tag| prompt.tag(mc) == tag) {
+            return Ok(winds);
+        }
+        (winders, prompts) = (prompt.winders(mc), cell.tail(mc));
     }
-    Ok(winds)
+    match tag {
+        Some(tag) if tag != default_tag() => Err(Fault::NoPrompt),
+        _ => Ok(winds),
+    }
 }
 
 /// The marks of each prompt's part of the continuation of `task`, innermost first, up to the
@@ -230,17 +222,6 @@ fn parts<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, tag: Option<Value<'gc>>) 
         Some(tag) if tag != default_tag() => Err(Fault::NoPrompt),
         _ => Ok(parts),
     }
-}
-
-/// The marks of each part of `k`: where it was captured, then those under each of its prompts.
-fn parts_of<'gc>(mc: &Mutation<'gc>, k: Gc<'gc, Continuation>) -> Result<Vec<Value<'gc>>, Fault> {
-    let mut parts = vec![k.attachments(mc)];
-    let mut at = k.prompts(mc);
-    while let Some(cell) = Pair::of(at) {
-        parts.push(prompt(mc, cell.head(mc))?.attachments(mc));
-        at = cell.tail(mc);
-    }
-    Ok(parts)
 }
 
 fn nearest<'gc>(mc: &Mutation<'gc>, mut marks: Value<'gc>, key: Value<'gc>) -> Result<Option<Value<'gc>>, Fault> {
@@ -299,6 +280,14 @@ fn find<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, tag: Value<'gc>) -> Result
 fn restore<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, prompt: Gc<'gc, Prompt>) {
     task.set_chain(mc, prompt.chain(mc));
     task.set_attachments(mc, prompt.attachments(mc));
+    task.set_winders(mc, prompt.winders(mc));
+}
+
+/// Starts an empty continuation, up to the nearest prompt.
+fn empty<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>) {
+    task.set_chain(mc, Value::FALSE);
+    task.set_attachments(mc, Value::NIL);
+    task.set_winders(mc, Value::NIL);
 }
 
 fn prompt<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Result<Gc<'gc, Prompt>, Fault> {

@@ -65,6 +65,13 @@ impl<'gc> Expander<'_, 'gc> {
             (Macro::Case, &[key, ref clauses @ ..]) => self.case(stx, key, clauses),
             (Macro::Do, &[specs, end, ref commands @ ..]) => self.do_loop(stx, specs, end, commands),
             (Macro::Guard, &[spec, ref body @ ..]) if !body.is_empty() => self.guard(stx, spec, body),
+            // `(call-with-mark key value (lambda () body))`, as Racket's, whose body is in tail
+            // position, so one in tail position replaces the mark of the frame it's in.
+            (Macro::WithMark, &[key, value, body]) => {
+                let none = self.list(&[], stx)?;
+                let thunk = self.build(stx, "lambda", &[&[none, body]])?;
+                self.build(stx, "call-with-mark", &[&[key, value, thunk]])
+            }
             (Macro::Quasiquote, &[template]) => match self.quasi(template, 0)? {
                 Some(built) => Ok(built),
                 None => self.quoted(template, stx),

@@ -140,6 +140,8 @@ named! {
         Unbox = "unbox",
         /// `(set-box! b x)`: sets the contents of the box `b` to `x` returning void.
         SetBox = "set-box!",
+        /// `(make-winder before after)`: what `dynamic-wind` puts in the task's winders.
+        MakeWinder = "make-winder",
         /// `(default-continuation-prompt-tag)`.
         DefaultPromptTag = "default-continuation-prompt-tag",
         /// `(make-continuation-prompt-tag [name])`.
@@ -205,7 +207,7 @@ impl Intrinsic {
             Intrinsic::BytevectorRef | Intrinsic::ListTail | Intrinsic::ListRef | Intrinsic::Memq | Intrinsic::Memv | Intrinsic::Member | Intrinsic::Assq | Intrinsic::Assv | Intrinsic::Assoc => Some(2),
             Intrinsic::BytevectorSet => Some(3),
             Intrinsic::GlobalSet | Intrinsic::DefineGlobal => Some(2),
-            Intrinsic::Cons | Intrinsic::Eq | Intrinsic::Eqv | Intrinsic::Equal | Intrinsic::SetBox | Intrinsic::ValuesRef => Some(2),
+            Intrinsic::Cons | Intrinsic::Eq | Intrinsic::Eqv | Intrinsic::Equal | Intrinsic::SetBox | Intrinsic::ValuesRef | Intrinsic::MakeWinder => Some(2),
         }
     }
 
@@ -292,6 +294,7 @@ impl Intrinsic {
         matches!(
             self,
             Cons | MakeBox
+                | MakeWinder
                 | Eq
                 | Eqv
                 | IsNull
@@ -371,6 +374,7 @@ impl Intrinsic {
                 | VectorToList
                 | ListToVector
                 | MakeBox
+                | MakeWinder
                 | DefaultPromptTag
                 | MakePromptTag
                 | ValuesLength
@@ -625,6 +629,7 @@ impl Intrinsic {
                 made(mc, fuel, vector.value(mc))
             }
             Intrinsic::MakeBox => made(mc, fuel, Value::object(mc, objects::Box::new(mc, arg(0))?)),
+            Intrinsic::MakeWinder => made(mc, fuel, Value::object(mc, objects::Winder::new(mc, arg(0), arg(1))?)),
             Intrinsic::Unbox => arg(0).downcast::<objects::Box>(mc).ok_or(Fault::WrongType)?.value(mc),
             Intrinsic::SetBox => {
                 arg(0).downcast::<objects::Box>(mc).ok_or(Fault::WrongType)?.set_value(mc, arg(1));

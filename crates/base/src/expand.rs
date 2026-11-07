@@ -51,6 +51,7 @@ pub(crate) enum Macro {
     Do,
     Quasiquote,
     Guard,
+    WithMark,
     /// A `let` with a name, which nothing binds by itself.
     NamedLet,
 }
@@ -71,7 +72,7 @@ pub(crate) enum Keyword {
     Aux(Aux),
 }
 
-const KEYWORDS: [(&str, Keyword); 31] = [
+const KEYWORDS: [(&str, Keyword); 32] = [
     ("quote", Keyword::Form(Form::Quote)),
     ("if", Keyword::Form(Form::If)),
     ("lambda", Keyword::Form(Form::Lambda)),
@@ -99,6 +100,7 @@ const KEYWORDS: [(&str, Keyword); 31] = [
     ("do", Keyword::Macro(Macro::Do)),
     ("quasiquote", Keyword::Macro(Macro::Quasiquote)),
     ("guard", Keyword::Macro(Macro::Guard)),
+    ("with-continuation-mark", Keyword::Macro(Macro::WithMark)),
     ("else", Keyword::Aux(Aux::Else)),
     ("=>", Keyword::Aux(Aux::Arrow)),
     ("unquote", Keyword::Aux(Aux::Unquote)),

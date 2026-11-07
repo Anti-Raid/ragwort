@@ -44,7 +44,7 @@ pub(crate) fn root<'gc>(mc: &Mutation<'gc>) -> Result<Gc<'gc, Task>, OutOfMemory
 
 fn task<'gc>(mc: &Mutation<'gc>, body: Value<'gc>, state: u32) -> Result<Gc<'gc, Task>, OutOfMemory> {
     let none = Value::FALSE;
-    Task::new(mc, Value::VOID, none, Value::NIL, Value::NIL, None, 0, body, none, none, None, 0, state)
+    Task::new(mc, Value::VOID, none, Value::NIL, Value::NIL, Value::NIL, None, 0, body, none, none, None, 0, state)
 }
 
 pub(crate) fn of<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> Option<Gc<'gc, Task>> {
@@ -133,6 +133,7 @@ impl<'gc> Outer<'_, 'gc> {
         task.set_resumer(mc, Value::FALSE);
         task.set_chain(mc, Value::FALSE);
         task.set_attachments(mc, Value::NIL);
+        task.set_winders(mc, Value::NIL);
         task.set_prompts(mc, Value::NIL);
         task.set_spare(mc, None);
         self.back(to)?;
