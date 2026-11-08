@@ -309,9 +309,25 @@ named! {
     }
 }
 
+/// Each intrinsic's arity, by its place in [`Intrinsic::ALL`], so the VM's check of one is a load.
+const ARITIES: [Option<u8>; Intrinsic::ALL.len()] = {
+    let mut arities = [None; Intrinsic::ALL.len()];
+    let mut i = 0;
+    while i < arities.len() {
+        arities[i] = Intrinsic::ALL[i].arity_of();
+        i += 1;
+    }
+    arities
+};
+
 impl Intrinsic {
     /// How many arguments it takes, or `None` for any number.
+    #[inline]
     pub fn arity(self) -> Option<u8> {
+        ARITIES[self as usize]
+    }
+
+    const fn arity_of(self) -> Option<u8> {
         match self {
             Intrinsic::Add | Intrinsic::Sub | Intrinsic::Mul | Intrinsic::Div | Intrinsic::Append => None,
             Intrinsic::NumEq | Intrinsic::Lt | Intrinsic::Gt | Intrinsic::Le | Intrinsic::Ge => None,

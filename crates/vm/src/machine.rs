@@ -190,10 +190,11 @@ impl Machine {
                 return Ok(outcome);
             }
         }
+        let mut deferred = None;
         loop {
-            let exit = run::exec(mc, &self.stack, *task, regs, fuel);
+            let exit = run::exec(mc, &self.stack, *task, regs, fuel, &mut deferred);
             let mut outer = Outer::new(mc, &mut self.stack, *task, regs, self.segment);
-            let step = outer.exit(exit);
+            let step = outer.exit(exit, &mut deferred);
             *task = outer.task();
             if let Some(outcome) = step? {
                 return Ok(outcome);
@@ -255,7 +256,7 @@ impl<'a, 'gc> Outer<'a, 'gc> {
 
     /// Carries out what the inner loop stopped for. A fault that isn't fatal is raised, as a
     /// `Condition`, as is one in calling the handler, which is then outside the handlers.
-    fn exit(&mut self, exit: Exit<'gc>) -> Step<'gc> {
+    fn exit(&mut self, exit: Exit<'gc>, deferred: &mut Option<Deferred>) -> Step<'gc> {
         let mut step = match exit {
             Exit::Paused => return Ok(Some(Outcome::Paused)),
             Exit::Fault(fault) => Err(fault),
@@ -263,7 +264,7 @@ impl<'a, 'gc> Outer<'a, 'gc> {
             Exit::Underflow => self.resume(),
             Exit::Call { base, argc, rest, tail } => self.call(base, argc, rest, tail),
             Exit::Request { base, args, request, spread, tail } => self.request(base, args, request, spread, tail),
-            Exit::Host { base, tail, then } => self.keep(base, tail).and_then(|()| self.host_then(then)),
+            Exit::Host { base, tail, then } => self.keep(base, tail).and_then(|()| self.host_then(then, deferred.take())),
         };
         while let Err(fault) = step
             && !fault.is_fatal()
@@ -371,12 +372,12 @@ impl<'a, 'gc> Outer<'a, 'gc> {
     }
 
     /// Raises or defers from a host function's call, whose continuation is the current one.
-    fn host_then(&mut self, then: HostThen<'gc>) -> Step<'gc> {
+    fn host_then(&mut self, then: HostThen<'gc>, deferred: Option<Deferred>) -> Step<'gc> {
         match then {
             HostThen::Raise(raised) => self.raise(raised, false),
-            HostThen::Defer(deferred) => {
+            HostThen::Defer => {
                 self.regs.acc = Value::VOID;
-                Ok(Some(Outcome::Deferred(deferred)))
+                Ok(Some(Outcome::Deferred(deferred.ok_or(Fault::Malformed)?)))
             }
         }
     }

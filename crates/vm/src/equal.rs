@@ -24,9 +24,14 @@ const SLOW: u64 = 20;
 const CLASS_COST: usize = size_of::<(u64, usize, usize, u32)>() + 16;
 
 /// `eqv?`: the same object, or numbers of the same exactness and value.
+#[inline]
 pub(crate) fn eqv<'gc>(mc: &Mutation<'gc>, a: Value<'gc>, b: Value<'gc>) -> bool {
     if a == b {
         return true;
+    }
+    // Different fixnums are different numbers.
+    if a.as_fixnum().is_some() && b.as_fixnum().is_some() {
+        return false;
     }
     let nums = Nums::new(mc);
     match (nums.number(a), nums.number(b)) {

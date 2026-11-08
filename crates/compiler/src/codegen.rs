@@ -98,8 +98,8 @@ impl<'a, 'gc> Module<'a, 'gc> {
 
     /// Where `def` is in the module's host functions.
     fn host(&self, def: &'static HostDef) -> Result<u32, CompileError> {
-        let hosts = self.owner.and_then(|m| m.hosts(self.mc)).map_or(&[][..], |h| *h);
-        let i = hosts.iter().position(|h| h == def).ok_or(CompileError::UnknownHost(def))?;
+        let hosts = self.owner.and_then(|m| m.hosts(self.mc)).map_or(&[][..], |h| &h[..]);
+        let i = hosts.iter().position(|&h| h == def).ok_or(CompileError::UnknownHost(def))?;
         u32::try_from(i).map_err(|_| CompileError::TooManyConstants)
     }
 

@@ -385,7 +385,8 @@ impl Template {
         if *size > MAX_INLINE {
             return None;
         }
-        let closed = |prim: &Prim| !matches!(prim, Prim::Slot(..) | Prim::Host(_));
+        // A host function is in the table of any module that requires this one.
+        let closed = |prim: &Prim| !matches!(prim, Prim::Slot(..));
         let mut all = |args: &[Core<'_>], locals: &mut Vec<Var>| args.iter().map(|a| Self::of(a, params, locals, size)).collect::<Option<Vec<_>>>();
         Some(match core {
             Core::Ref(Place::Local(v)) => match params.iter().position(|p| p == v) {
@@ -645,9 +646,25 @@ impl<'gc> ModuleBuilder<'gc> {
         self.bindings.get(&k).copied().or_else(|| self.implicit.get(&k).copied().map(Binding::Import))
     }
 
-    /// Makes the module, once all its definitions are known.
+    /// Makes the module, once all its definitions are known. Its host functions are its own and
+    /// those of each module it requires, which have those of the modules they require, so its
+    /// code can call any that an inlined call of their exports does.
     pub fn start(&mut self, mc: &Mutation<'gc>) -> Result<Gc<'gc, Module>, OutOfMemory> {
-        let module = ragwort_vm::module::new(mc, self.name, &self.names, self.hosts)?;
+        let mut hosts: Vec<&'static HostDef> = self.hosts.iter().collect();
+        let imported = self.bindings.values().filter_map(|b| if let Binding::Import(i) = b { Some(i) } else { None }).chain(self.implicit.values());
+        let mut seen = Vec::new();
+        for import in imported {
+            if seen.contains(&import.module) {
+                continue;
+            }
+            seen.push(import.module);
+            for &def in import.module.hosts(mc).map_or(&[][..], |h| &h[..]) {
+                if !hosts.contains(&def) {
+                    hosts.push(def);
+                }
+            }
+        }
+        let module = ragwort_vm::module::new(mc, self.name, &self.names, hosts)?;
         self.module = Some(module);
         Ok(module)
     }

@@ -50,12 +50,17 @@ impl<'gc> Resolver<'gc> for Registry {
 /// Loads the module `name` from `files`, runs it, and registers it for the modules loaded after
 /// to require. Returns its last form's value, written out, or the fault one raised.
 fn module_in(arena: &mut Arena, name: &str, files: &[(Language, &str)]) -> Result<Result<String, Fault>, Error> {
+    module_hosting(arena, name, &[], files)
+}
+
+/// [`module_in`], for a module whose native files call `hosts`.
+fn module_hosting(arena: &mut Arena, name: &str, hosts: &'static [HostDef], files: &[(Language, &str)]) -> Result<Result<String, Fault>, Error> {
     arena.mutate(|mc| {
         let symbols = Symbols::of(mc.root(0)).unwrap();
         let prelude = mc.root(1).downcast::<Module>(mc).unwrap();
         let sessions: Vec<SyntaxSession> = files.iter().map(|(_, text)| SyntaxSession::new(mc, text).unwrap()).collect();
         let files: Vec<File> = files.iter().zip(&sessions).map(|(&(language, _), session)| File { language, session }).collect();
-        let loaded = load(mc, symbols, prelude, &Source { name, hosts: &[], files: &files, implicit: &[] }, &mut Registry)?;
+        let loaded = load(mc, symbols, prelude, &Source { name, hosts, files: &files, implicit: &[] }, &mut Registry)?;
         let mut last = Value::VOID;
         for thunk in loaded.thunks {
             match run(mc, thunk) {
@@ -68,6 +73,25 @@ fn module_in(arena: &mut Arena, name: &str, files: &[(Language, &str)]) -> Resul
         mc.set_root(2, Pairs::new(mc).list_with_tail(vec![entry], mc.root(2)).unwrap());
         Ok(Ok(ragwort_printer_scheme::to_string(mc, last, ragwort_printer_scheme::Mode::Write, usize::MAX).unwrap()))
     })
+}
+
+fn add_host<'s, 'gc>(_: &mut ragwort_vm::HostContext<'s, 'gc>, args: ragwort_vm::HostArgs<'s, 'gc>) -> Result<ragwort_vm::Reply<'gc>, Fault> {
+    let sum = args.iter().map(|v| v.as_fixnum().ok_or(Fault::WrongType)).sum::<Result<i64, _>>()?;
+    Ok(ragwort_vm::Reply::Value(Value::fixnum(sum).ok_or(Fault::OutOfRange)?))
+}
+
+static HOSTS: [HostDef; 1] = [HostDef { name: "add", arity: 2, purity: ragwort_vm::Purity::Impure, function: add_host }];
+
+#[test]
+fn host_wrappers_inline_into_the_modules_that_require_them() {
+    let mut arena = arena();
+    let bindings = "(%define add (%lambda (a b) (%call-host add a b))) (%provide (all-defined-out))";
+    assert_eq!(module_hosting(&mut arena, "host", &HOSTS, &[(Native, bindings)]), Ok(Ok("#<void>".into())));
+    // A module that requires it, with no host functions of its own, calls it, and one that
+    // requires that calls what it wraps it in.
+    let wrapper = "(require \"host\") (define (add10 n) (add n 10)) (provide add10) (add 1 2)";
+    assert_eq!(module_in(&mut arena, "mid", &[(Scheme, wrapper)]), Ok(Ok("3".into())));
+    assert_eq!(module_in(&mut arena, "bot", &[(Scheme, "(require \"mid\") (list (add10 5) (map add10 '(1 2)))")]), Ok(Ok("(15 (11 12))".into())));
 }
 
 #[test]

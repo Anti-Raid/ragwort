@@ -33,6 +33,7 @@ pub struct HostDef {
 
 impl HostDef {
     /// Whether it takes `n` arguments.
+    #[inline]
     pub fn takes(&self, n: usize) -> bool {
         takes(self.arity, n)
     }
@@ -79,12 +80,14 @@ pub struct HostContext<'s, 'gc> {
 }
 
 impl<'s, 'gc> HostContext<'s, 'gc> {
+    #[inline]
     pub fn mc(&self) -> &'s Mutation<'gc> {
         self.mc
     }
 
     /// Spends `units` of the machine's fuel, for work the call does, or faults with
     /// [`Fault::OutOfFuel`] if there aren't that many.
+    #[inline]
     pub fn charge(&mut self, units: u64) -> Result<(), Fault> {
         self.fuel.spend(units)
     }
@@ -99,23 +102,28 @@ pub struct HostArgs<'s, 'gc> {
 }
 
 impl<'s, 'gc> HostArgs<'s, 'gc> {
+    #[inline]
     pub(crate) fn registers(frame: Frame<'s, 'gc>, base: u8, len: u8) -> Self {
         HostArgs { frame, base, len }
     }
 
+    #[inline]
     pub fn len(self) -> usize {
         usize::from(self.len)
     }
 
+    #[inline]
     pub fn is_empty(self) -> bool {
         self.len == 0
     }
 
+    #[inline]
     pub fn get(self, i: usize) -> Option<Value<'gc>> {
         let i = u8::try_from(i).ok().filter(|&i| i < self.len)?;
         Some(self.frame.get(self.base + i))
     }
 
+    #[inline]
     pub fn iter(self) -> impl ExactSizeIterator<Item = Value<'gc>> + use<'s, 'gc> {
         (0..self.len()).map(move |i| self.get(i).expect("an argument below the count"))
     }
@@ -155,11 +163,13 @@ impl PartialEq for Deferred {
 
 impl Eq for Deferred {}
 
-/// A module named `name`, with a variable for each of `names`, none defined yet, whose native
-/// code calls `hosts`.
-pub fn new<'gc>(mc: &Mutation<'gc>, name: Value<'gc>, names: &[Value<'gc>], hosts: &'static [HostDef]) -> Result<Gc<'gc, Module>, OutOfMemory> {
+/// A module named `name`, with a variable for each of `names`, none defined yet, whose code
+/// calls `hosts`: those of its own native code, and those the code it inlines from other modules
+/// calls.
+pub fn new<'gc>(mc: &Mutation<'gc>, name: Value<'gc>, names: &[Value<'gc>], hosts: impl IntoIterator<Item = &'static HostDef>) -> Result<Gc<'gc, Module>, OutOfMemory> {
     let vector = Vectors::new(mc).immutable_from_slice(names)?.value(mc);
     let interface: Box<dyn Any> = Box::new(());
+    let hosts: Box<[&'static HostDef]> = hosts.into_iter().collect();
     Module::new(mc, name, vector, mc.frozen(hosts)?, mc.frozen(interface)?, names.len(), Value::UNDEFINED)
 }
 
@@ -189,6 +199,14 @@ pub fn external_data<'gc, T: Any>(mc: &Mutation<'gc>, external: Value<'gc>) -> O
 
 /// Whether code that takes `arity` arguments, as [`crate::objects::Bytecode`] counts them,
 /// takes `n`.
+#[inline]
 pub(crate) fn takes(arity: i64, n: usize) -> bool {
-    crate::frame::Shape::of(arity).takes(n as u64)
+    let n = n as i64;
+    if arity == n {
+        true
+    } else if arity < 0 {
+        n >= -(arity + 1)
+    } else {
+        crate::frame::Shape::of(arity).takes(n as u64)
+    }
 }

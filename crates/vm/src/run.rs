@@ -4,13 +4,13 @@
 use std::convert::Infallible;
 
 use ragwort_types::constant::Constants;
-use ragwort_types::gc::{Frame, Gc, Mutation, Slots, Stack, Value, WINDOW};
+use ragwort_types::gc::{Frame, Gc, Mutation, Stack, Value, WINDOW};
 use ragwort_types::pair::{Pair, Pairs};
 
 use crate::frame::{self, ARGS, CLOSURE, Kept, Link, MAX_PARAMS, SAVED_MARKS, Shape};
 use crate::op::Fuel;
-use crate::module::{Deferred, HostArgs, HostContext, Reply};
-use crate::objects::{BytecodeFields, Closure, ClosureFields, Guard, ModuleFields, MultiValue, MultiValueFields, Task, TaskFields};
+use crate::module::{Deferred, HostArgs, HostContext, HostDef, Reply};
+use crate::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Guard, ModuleFields, MultiValue, MultiValueFields, Task, TaskFields};
 use crate::prompts::{self, handler_key};
 use crate::{Context, Control, Fault, Op, Request};
 
@@ -41,10 +41,11 @@ pub(crate) enum Exit<'gc> {
     Host { base: u8, tail: bool, then: HostThen<'gc> },
 }
 
-/// What a host function's call leaves the loop for.
+/// What a host function's call leaves the loop for. A deferral's data goes in the slot
+/// [`exec`] fills, so an [`Exit`] has nothing to drop, and the loop drops none on every call.
 pub(crate) enum HostThen<'gc> {
     Raise(Value<'gc>),
-    Defer(Deferred),
+    Defer,
 }
 
 impl From<Fault> for Exit<'_> {
@@ -58,8 +59,8 @@ impl From<Fault> for Exit<'_> {
 /// It and [`Run::go`] are inlined into the machine's loop: compiled as a function of their own,
 /// the loop's registers spilled on every instruction, and calls took twice as long.
 #[inline(always)]
-pub(crate) fn exec<'s, 'gc>(mc: &'s Mutation<'gc>, stack: &'s Stack, task: Gc<'gc, Task>, regs: &mut Regs<'gc>, fuel: &mut Fuel) -> Exit<'gc> {
-    let mut run = match Run::new(mc, stack, task, regs, *fuel) {
+pub(crate) fn exec<'s, 'gc>(mc: &'s Mutation<'gc>, stack: &'s Stack, task: Gc<'gc, Task>, regs: &mut Regs<'gc>, fuel: &mut Fuel, deferred: &'s mut Option<Deferred>) -> Exit<'gc> {
+    let mut run = match Run::new(mc, stack, task, regs, *fuel, deferred) {
         Ok(run) => run,
         Err(fault) => return Exit::Fault(fault),
     };
@@ -87,8 +88,13 @@ impl<'gc> Call<'gc> {
 struct Run<'s, 'gc> {
     cx: Context<'s, 'gc>,
     stack: &'s Stack,
-    /// The current closure's code, and the instruction to run next.
+    /// The current closure's code, its instructions, its module's host functions once one has
+    /// been called, and the instruction to run next.
+    code: Gc<'gc, Bytecode>,
     ops: &'gc [Op],
+    hosts: Option<&'gc [&'static HostDef]>,
+    /// Where a host function's deferral leaves its data.
+    deferred: &'s mut Option<Deferred>,
     pc: usize,
     /// Where the current frame starts, and where its link is in it.
     fp: usize,
@@ -98,13 +104,18 @@ struct Run<'s, 'gc> {
 }
 
 impl<'s, 'gc> Run<'s, 'gc> {
-    fn new(mc: &'s Mutation<'gc>, stack: &'s Stack, task: Gc<'gc, Task>, regs: &Regs<'gc>, fuel: Fuel) -> Result<Self, Fault> {
+    fn new(mc: &'s Mutation<'gc>, stack: &'s Stack, task: Gc<'gc, Task>, regs: &Regs<'gc>, fuel: Fuel, deferred: &'s mut Option<Deferred>) -> Result<Self, Fault> {
         let frame = stack.frame(mc, regs.fp).ok_or(Fault::Malformed)?;
-        let (ops, constants, upvalues, link) = load(mc, frame.get(CLOSURE).downcast::<Closure>(mc).ok_or(Fault::Malformed)?)?;
+        let closure = frame.get(CLOSURE).downcast::<Closure>(mc).ok_or(Fault::Malformed)?;
+        let code = closure.code(mc).ok_or(Fault::Malformed)?;
+        let (ops, constants, link) = load(mc, code)?;
         Ok(Run {
-            cx: Context { mc, task, frame, constants, upvalues, acc: regs.acc, fuel },
+            cx: Context { mc, task, frame, constants, upvalues: closure.items(mc), acc: regs.acc, fuel },
             stack,
+            code,
             ops,
+            hosts: None,
+            deferred,
             pc: regs.pc,
             fp: regs.fp,
             link,
@@ -202,15 +213,28 @@ impl<'s, 'gc> Run<'s, 'gc> {
     #[inline(always)]
     fn enter(&mut self, frame: Frame<'s, 'gc>, fp: usize, closure: Gc<'gc, Closure>, call: Call<'gc>, link: Value<'gc>) -> Result<(), Exit<'gc>> {
         let mc = self.cx.mc;
-        let arity = closure.code(mc).ok_or(Fault::Malformed)?.arity(mc);
+        let code = closure.code(mc).ok_or(Fault::Malformed)?;
+        let arity = code.arity(mc);
         if let Err(fault) = bind(mc, frame, arity, call.argc, call.rest, &mut self.cx.fuel) {
             // A tail call's frame is the callee's now, so a fault finds its link where it looks.
             frame.set(frame::link_slot(arity), link);
             return Err(fault.into());
         }
-        (self.ops, self.cx.constants, self.cx.upvalues, self.link) = load(mc, closure)?;
+        self.switch(closure, code)?;
         frame.set(self.link, link);
         (self.cx.frame, self.fp, self.pc) = (frame, fp, 0);
+        Ok(())
+    }
+
+    /// Runs `closure`, whose code is `code`, from now on. Its code is loaded only if it isn't the
+    /// code running, as it is for a loop's call of itself.
+    #[inline(always)]
+    fn switch(&mut self, closure: Gc<'gc, Closure>, code: Gc<'gc, Bytecode>) -> Result<(), Fault> {
+        if code != self.code {
+            (self.ops, self.cx.constants, self.link) = load(self.cx.mc, code)?;
+            (self.code, self.hosts) = (code, None);
+        }
+        self.cx.upvalues = closure.items(self.cx.mc);
         Ok(())
     }
 
@@ -229,7 +253,7 @@ impl<'s, 'gc> Run<'s, 'gc> {
             self.cx.task.set_attachments(mc, frame.get(Kept::under(usize::from(base), 0)?.marks as u8));
         }
         let caller = frame.get(CLOSURE).downcast::<Closure>(mc).ok_or(Fault::Malformed)?;
-        (self.ops, self.cx.constants, self.cx.upvalues, self.link) = load(mc, caller)?;
+        self.switch(caller, caller.code(mc).ok_or(Fault::Malformed)?)?;
         (self.cx.frame, self.pc) = (frame, pc);
         Ok(())
     }
@@ -240,8 +264,11 @@ impl<'s, 'gc> Run<'s, 'gc> {
     #[inline(never)]
     fn host(&mut self, base: u8, args: u8, host: u32, tail: bool) -> Result<(), Exit<'gc>> {
         let mc = self.cx.mc;
-        let module = self.cx.frame.get(CLOSURE).downcast::<Closure>(mc).and_then(|c| c.code(mc)).and_then(|code| code.module(mc));
-        let def = module.and_then(|m| m.hosts(mc)).and_then(|hosts| hosts.get(host as usize)).ok_or(Fault::Malformed)?;
+        let hosts = match self.hosts {
+            Some(hosts) => hosts,
+            None => *self.hosts.insert(self.code.module(mc).and_then(|m| m.hosts(mc)).map_or(&[][..], |h| &h[..])),
+        };
+        let def = *hosts.get(host as usize).ok_or(Fault::Malformed)?;
         if !def.takes(usize::from(args)) {
             return Err(Fault::Arity.into());
         }
@@ -261,7 +288,10 @@ impl<'s, 'gc> Run<'s, 'gc> {
                 if tail { self.tail_call(call) } else { self.call(call, false) }
             }
             Reply::Raise(raised) => Err(Exit::Host { base, tail, then: HostThen::Raise(raised) }),
-            Reply::Defer(data) => Err(Exit::Host { base, tail, then: HostThen::Defer(Deferred::new(data)) }),
+            Reply::Defer(data) => {
+                *self.deferred = Some(Deferred::new(data));
+                Err(Exit::Host { base, tail, then: HostThen::Defer })
+            }
         }
     }
 
@@ -356,11 +386,10 @@ fn fits(call: Call<'_>) -> Result<(), Fault> {
 
 /// A closure's instructions, constants and upvalues, and where its frame's link is.
 #[inline(always)]
-fn load<'gc>(mc: &Mutation<'gc>, closure: Gc<'gc, Closure>) -> Result<(&'gc [Op], Constants<'gc>, Slots<'gc>, u8), Fault> {
-    let code = closure.code(mc).ok_or(Fault::Malformed)?;
+fn load<'gc>(mc: &Mutation<'gc>, code: Gc<'gc, Bytecode>) -> Result<(&'gc [Op], Constants<'gc>, u8), Fault> {
     let ops = code.ops(mc).ok_or(Fault::Malformed)?;
     let link = frame::link_slot(code.arity(mc));
-    Ok((ops, Constants::of(code.constants(mc)).ok_or(Fault::Malformed)?, closure.items(mc), link))
+    Ok((ops, Constants::of(code.constants(mc)).ok_or(Fault::Malformed)?, link))
 }
 
 /// Binds `argc` arguments, in the registers from [`ARGS`], then the elements of the list `rest`,

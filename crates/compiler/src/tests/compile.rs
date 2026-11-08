@@ -850,8 +850,17 @@ fn symbol<'gc>(mc: &Mutation<'gc>, name: &str) -> Value<'gc> {
 /// A module that defines and exports each of `defs`, assigning those marked so, once its code
 /// has run.
 fn exporting<'gc>(mc: &Mutation<'gc>, defs: Vec<(&str, Core<'gc>, bool)>) -> Gc<'gc, ragwort_vm::objects::Module> {
-    let mut builder = ModuleBuilder::new(Value::FALSE, &[]);
+    exporting_with(mc, &[], &[], defs)
+}
+
+/// A module of `defs`, as [`exporting`] makes, whose code calls `hosts` and which requires
+/// `imports`, by the names given.
+fn exporting_with<'gc>(mc: &Mutation<'gc>, hosts: &'static [HostDef], imports: &[(&str, Import<'gc>)], defs: Vec<(&str, Core<'gc>, bool)>) -> Gc<'gc, ragwort_vm::objects::Module> {
+    let mut builder = ModuleBuilder::new(Value::FALSE, hosts);
     let symbols = Symbols::with_seed(mc, 1).unwrap();
+    for &(name, import) in imports {
+        builder.import(symbols.intern_str(&Strings::new(mc), name).unwrap().value(mc), import).unwrap();
+    }
     let names: Vec<_> = defs.iter().map(|(name, _, _)| symbols.intern_str(&Strings::new(mc), name).unwrap().value(mc)).collect();
     for (top, &name) in names.iter().enumerate() {
         builder.define(name, top as u32).unwrap();
@@ -957,6 +966,33 @@ fn modules_export_what_code_that_requires_them_needs() {
         builder.provide_all(mc).unwrap();
         let unrun = builder.finish(mc).unwrap();
         assert_eq!(imported(mc, unrun, "x").reference(mc), Err(Uninitialized));
+    });
+}
+
+#[test]
+fn host_calls_inline_into_the_modules_that_require_them() {
+    let mut arena = Arena::new(1 << 24, 0);
+    arena.mutate(|mc| {
+        // A module whose export wraps a host call; one that requires it, whose own export calls
+        // that, inlined; and code of a third, which requires only the second and has no host
+        // functions of its own.
+        let host = |args| Core::Intrinsic(Prim::Host(ADD_HOST), args);
+        let lib = exporting_with(mc, &HOSTS, &[], vec![("plus", lambda(&[0, 1], None, host(vec![var(0), var(1)])), false)]);
+        let plus = imported(mc, lib, "plus");
+        let mut fresh = fresher();
+        let body = plus.call(mc, vec![var(0), q(10)], &mut fresh).unwrap();
+        let mid = exporting_with(mc, &[], &[("plus", plus)], vec![("add10", lambda(&[0], None, body), false)]);
+        let add10 = imported(mc, mid, "add10");
+        assert!(ragwort_compiler_interface(mc, mid).get("add10").unwrap().inline.is_some());
+        let mut user = ModuleBuilder::new(Value::FALSE, &[]);
+        user.import(symbol(mc, "add10"), add10).unwrap();
+        user.start(mc).unwrap();
+        let call = add10.call(mc, vec![q(5)], &mut fresh).unwrap();
+        let thunk = user.compile(mc, &call).unwrap();
+        let ops = all_ops(mc, thunk);
+        assert!(ops.iter().any(|op| matches!(op, Op::CallHost { .. } | Op::TailCallHost { .. })), "{ops:?}");
+        assert!(!ops.iter().any(|op| matches!(op, Op::Call { .. } | Op::TailCall { .. })), "{ops:?}");
+        assert_eq!(run_to_end(mc, thunk), Ok(fix(15)));
     });
 }
 

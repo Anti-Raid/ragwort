@@ -115,7 +115,7 @@ objects! {
     pub struct Module {
         name: Value,
         names: Value,
-        hosts: Frozen<&'static [crate::module::HostDef]>,
+        hosts: Frozen<std::boxed::Box<[&'static crate::module::HostDef]>>,
         interface: Frozen<std::boxed::Box<dyn std::any::Any>>,
     } items Value
     /// Something of the host's, for its procedures to be passed, such as a machine's own state:
