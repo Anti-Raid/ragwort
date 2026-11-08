@@ -10,6 +10,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+/// The most fuel a constant fold may spend.
+const FOLD_FUEL: u64 = 1 << 16;
+
 use ragwort_types::gc::{Mutation, Value};
 use ragwort_vm::{Fuel, Intrinsic};
 
@@ -447,7 +450,8 @@ impl<'gc> Cp0<'_, 'gc> {
                     _ => unreachable!(),
                 })
                 .collect();
-            let mut fuel = Fuel { run: u64::MAX, rest: u64::MAX };
+            // A fold that would take long, such as a huge exact `expt`, is left to run.
+            let mut fuel = Fuel { run: FOLD_FUEL, rest: 0 };
             if let Ok(val) = intrinsic.run(self.mc, &values, &mut fuel) {
                 return L2::Quote(val);
             }

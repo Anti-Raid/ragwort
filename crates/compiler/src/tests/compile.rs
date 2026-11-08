@@ -449,6 +449,11 @@ fn micropass_optimizations() {
         let compared = when(prim(Intrinsic::Lt, vec![q(1), q(2), q(3)]), prim(Intrinsic::Le, vec![q(2), q(1)]), q(0));
         let ops = all_ops(mc, compile(mc, None, &compared).unwrap());
         assert!(matches!(ops.as_slice(), [Op::LoadConst { .. }, Op::Return { .. }]), "{ops:?}");
+        //    A small power folds; one that would take long to compute is left to run.
+        let ops = all_ops(mc, compile(mc, None, &prim(Intrinsic::Expt, vec![q(2), q(10)])).unwrap());
+        assert!(matches!(ops.as_slice(), [Op::LoadConst { .. }, Op::Return { .. }]), "{ops:?}");
+        let ops = all_ops(mc, compile(mc, None, &prim(Intrinsic::Expt, vec![q(3), q(1_000_000)])).unwrap());
+        assert!(ops.len() > 2, "{ops:?}");
 
         // 4. A call of an imported wrapper of an intrinsic inlines to it, so `(+ x 1)` compiles to
         //    `AddImm`, as do two calls of an imported `add1`, with no calls left.

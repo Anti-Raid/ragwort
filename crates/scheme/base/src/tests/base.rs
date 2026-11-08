@@ -324,6 +324,45 @@ fn numbers_compare_by_value() {
 }
 
 #[test]
+fn powers_stay_exact_when_they_can() {
+    let text = "(list (expt 2 100) (expt 2/3 3) (expt 2 -2) (expt 1.5 2) (expt 4 1/2) (expt 0 0) (expt 0.0 0) (expt -1 (expt 10 30))
+                      (expt 1 (expt 10 30)) (expt 0+1i 2) (expt -8 1/3))";
+    assert_eq!(eval(text), "(1267650600228229401496703205376 8/27 1/4 2.25 2 1 1 1 1 -1 1.0+1.732050807568877i)");
+    assert_eq!(uncaught("(expt 0 -1)"), "#<error Num(DivideByZero)>");
+    // A result too big for the arena is turned down before it's computed, which ends the run.
+    arena().mutate(|mc| {
+        let [thunk] = load_text(mc, "(expt 3 (expt 10 15))").unwrap()[..] else { panic!("one form") };
+        assert_eq!(Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap().run(mc), Err(Fault::OutOfMemory));
+        // And one that fits is charged for the work before it's done.
+        let [thunk] = load_text(mc, "(expt 3 1000000)").unwrap()[..] else { panic!("one form") };
+        let mut machine = Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap();
+        machine.set_fuel(10_000);
+        assert_eq!(machine.run(mc), Err(Fault::OutOfFuel));
+    });
+    assert_eq!(uncaught("(expt 'x 2)"), "#<error WrongType>");
+}
+
+#[test]
+fn integer_division_keeps_the_sign_it_should() {
+    let text = "(list (quotient 17 5) (quotient -17 5) (remainder 17 -5) (remainder -17 5) (modulo -17 5) (modulo 17 -5) (modulo -15 5)
+                      (quotient 17.0 5) (modulo -17 5.0) (remainder -0.0 3) (modulo 100000000000000000000 7) (quotient -100000000000000000000 3)
+                      (remainder 4611686018427387903 -1) (quotient -4611686018427387904 -1))";
+    assert_eq!(eval(text), "(3 -3 2 -2 3 -3 0 3.0 3.0 -0.0 2 -33333333333333333333 0 4611686018427387904)");
+    assert_eq!(uncaught("(modulo 1 0)"), "#<error Num(DivideByZero)>");
+    assert_eq!(uncaught("(remainder 1/2 3)"), "#<error Num(NotInteger)>");
+    assert_eq!(uncaught("(quotient 1.5 1)"), "#<error Num(NotInteger)>");
+    assert_eq!(uncaught("(modulo \"1\" 2)"), "#<error WrongType>");
+}
+
+#[test]
+fn symbols_and_strings_name_each_other() {
+    let text = "(list (symbol? 'a) (symbol? \"a\") (symbol? '#:a) (string? \"a\") (string? 'a) (symbol->string 'abc) (eq? 'abc (string->symbol \"abc\"))
+                      (string->symbol \"two words\") (eq? (string->symbol (symbol->string 'x)) 'x))";
+    assert_eq!(eval(text), "(#t #f #f #t #f \"abc\" #t |two words| #t)");
+    assert_eq!(uncaught("(symbol->string \"a\")"), "#<error WrongType>");
+}
+
+#[test]
 fn keywords_are_interned_values() {
     let text = "(list '#:when (keyword? '#:when) (keyword? 'when) (eq? '#:a '#:a) (eq? '#:a (string->keyword \"a\"))
                       (keyword->string '#:when) (equal? '(#:x 1) '(#:x 1)) (string->keyword \"two words\"))";

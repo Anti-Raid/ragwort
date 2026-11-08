@@ -8,10 +8,10 @@ use ragwort_types::Error;
 use ragwort_types::bytevector::{AnyBytevector, Bytevectors};
 use ragwort_types::gc::{Frame, Mutation, ScratchVec, Value};
 use ragwort_types::named;
-use ragwort_types::num::{Number, Nums, complex, real};
+use ragwort_types::num::{ComplexHost, ComplexView, Number, Nums, RationalHost, RationalView, RealHost, RealView, complex, int, real};
 use ragwort_types::pair::{Pair, Pairs};
 use ragwort_types::string::{self, Strings};
-use ragwort_types::symbol::{Keyword, Symbols};
+use ragwort_types::symbol::{Keyword, Symbol, Symbols};
 use ragwort_types::syntax::Syntax;
 use ragwort_types::vector::{AnyVector, Vectors};
 
@@ -45,6 +45,15 @@ named! {
         Le = "<=",
         /// `(>= x1 x2 ...)`: whether no real is more than the one before it.
         Ge = ">=",
+        /// `(expt z w)`: `z` to the power `w`, exact when both are exact and `w` is an integer.
+        /// An exact result is charged fuel for its size before it's computed.
+        Expt = "expt",
+        /// `(quotient n m)`: `n / m` truncated, of integers, exact or not.
+        Quotient = "quotient",
+        /// `(remainder n m)`: what `quotient` leaves, with `n`'s sign.
+        Remainder = "remainder",
+        /// `(modulo n m)`: `n` mod `m`, with `m`'s sign.
+        Modulo = "modulo",
         /// (cons a d)
         Cons = "cons",
         /// (car lst)
@@ -124,6 +133,14 @@ named! {
         IsBoolean = "boolean?",
         /// `keyword?`: whether `x` is a keyword, `#:name`.
         IsKeyword = "keyword?",
+        /// `symbol?`: whether `x` is a symbol.
+        IsSymbol = "symbol?",
+        /// `string?`: whether `x` is a string.
+        IsString = "string?",
+        /// `(symbol->string s)`: the symbol's name.
+        SymbolToString = "symbol->string",
+        /// `(string->symbol s)`: the symbol named `s`, the one the reader reads for that name.
+        StringToSymbol = "string->symbol",
         /// `(keyword->string k)`: the keyword's name, without its `#:`.
         KeywordToString = "keyword->string",
         /// `(string->keyword s)`: the keyword named `s`, the one the reader reads as `#:s`.
@@ -258,7 +275,10 @@ impl Intrinsic {
             Intrinsic::MakeCoroutine | Intrinsic::IsCoroutine | Intrinsic::CoroutineState => Some(1),
             Intrinsic::Car | Intrinsic::Cdr | Intrinsic::IsNull | Intrinsic::IsPair | Intrinsic::IsList | Intrinsic::Length | Intrinsic::Reverse | Intrinsic::IsBox | Intrinsic::MakeBox | Intrinsic::Unbox => Some(1),
             Intrinsic::IsValues | Intrinsic::ValuesLength | Intrinsic::Not | Intrinsic::IsBoolean | Intrinsic::IsKeyword => Some(1),
-            Intrinsic::KeywordToString | Intrinsic::StringToKeyword => Some(1),
+            Intrinsic::KeywordToString | Intrinsic::StringToKeyword | Intrinsic::IsSymbol => Some(1),
+            Intrinsic::SymbolToString | Intrinsic::StringToSymbol => Some(1),
+            Intrinsic::Expt | Intrinsic::Quotient | Intrinsic::Remainder | Intrinsic::Modulo => Some(2),
+            Intrinsic::IsString => Some(1),
             Intrinsic::IsSyntax | Intrinsic::IsIdentifier | Intrinsic::SyntaxE | Intrinsic::SyntaxToDatum => Some(1),
             Intrinsic::DatumToSyntax | Intrinsic::BoundIdentifierEq | Intrinsic::FreeIdentifierEq | Intrinsic::GenerateTemporaries | Intrinsic::SyntaxMatch => Some(2),
             Intrinsic::Caar | Intrinsic::Cadr | Intrinsic::Cdar | Intrinsic::Cddr | Intrinsic::Caaar | Intrinsic::Caadr | Intrinsic::Cadar | Intrinsic::Caddr | Intrinsic::Cdaar | Intrinsic::Cdadr | Intrinsic::Cddar | Intrinsic::Cdddr | Intrinsic::Caaaar | Intrinsic::Caaadr | Intrinsic::Caadar | Intrinsic::Caaddr | Intrinsic::Cadaar | Intrinsic::Cadadr | Intrinsic::Caddar | Intrinsic::Cadddr | Intrinsic::Cdaaar | Intrinsic::Cdaadr | Intrinsic::Cdadar | Intrinsic::Cdaddr | Intrinsic::Cddaar | Intrinsic::Cddadr | Intrinsic::Cdddar | Intrinsic::Cddddr => Some(1),
@@ -283,6 +303,10 @@ impl Intrinsic {
                 | Gt
                 | Le
                 | Ge
+                | Expt
+                | Quotient
+                | Remainder
+                | Modulo
                 | Car
                 | Cdr
                 | Caar
@@ -332,6 +356,8 @@ impl Intrinsic {
                 | Not
                 | IsBoolean
                 | IsKeyword
+                | IsSymbol
+                | IsString
                 | Void
                 | IsBytevector
                 | BytevectorLength
@@ -369,6 +395,8 @@ impl Intrinsic {
                 | Not
                 | IsBoolean
                 | IsKeyword
+                | IsSymbol
+                | IsString
                 | Void
                 | IsBytevector
                 | IsVector
@@ -394,6 +422,8 @@ impl Intrinsic {
                 | IsPair
                 | IsBoolean
                 | IsKeyword
+                | IsSymbol
+                | IsString
                 | IsBox
                 | IsBytevector
                 | IsVector
@@ -429,6 +459,10 @@ impl Intrinsic {
             Add | Sub
                 | Mul
                 | Div
+                | Expt
+                | Quotient
+                | Remainder
+                | Modulo
                 | Cons
                 | Length
                 | Reverse
@@ -620,6 +654,21 @@ impl Intrinsic {
             Intrinsic::Not => boolean(arg(0) == Value::FALSE),
             Intrinsic::IsBoolean => boolean(arg(0) == Value::TRUE || arg(0) == Value::FALSE),
             Intrinsic::IsKeyword => boolean(Keyword::of(arg(0)).is_some()),
+            Intrinsic::IsSymbol => boolean(Symbol::of(arg(0)).is_some()),
+            Intrinsic::IsString => boolean(Strings::new(mc).string(arg(0)).is_some()),
+            Intrinsic::Quotient | Intrinsic::Remainder | Intrinsic::Modulo => divide(mc, fuel, self, arg(0), arg(1))?,
+            Intrinsic::SymbolToString => Symbol::of(arg(0)).ok_or(Fault::WrongType)?.name(mc).value(),
+            Intrinsic::StringToSymbol => {
+                let strings = Strings::new(mc);
+                let name = strings.string(arg(0)).ok_or(Fault::WrongType)?;
+                made(mc, fuel, Symbols::of_arena(mc)?.intern(&strings, name)?.value(mc))
+            }
+            Intrinsic::Expt => {
+                let h = Nums::new(mc);
+                let (z, w) = (h.number(arg(0)).ok_or(Fault::WrongType)?, h.number(arg(1)).ok_or(Fault::WrongType)?);
+                charge_power(mc, &h, fuel, z, w)?;
+                made(mc, fuel, complex::expt(&h, z, w)?.value())
+            }
             Intrinsic::KeywordToString => Keyword::of(arg(0)).ok_or(Fault::WrongType)?.symbol(mc).name(mc).value(),
             Intrinsic::StringToKeyword => {
                 let strings = Strings::new(mc);
@@ -859,6 +908,60 @@ fn arith<'gc>(
         };
     }
     Ok(acc)
+}
+
+/// `quotient`, `remainder` or `modulo` of `n` and `m`, in place if they're fixnums.
+fn divide<'gc>(mc: &Mutation<'gc>, fuel: &mut Fuel, op: Intrinsic, n: Value<'gc>, m: Value<'gc>) -> Result<Value<'gc>, Fault> {
+    if let (Some(a), Some(b)) = (n.as_fixnum(), m.as_fixnum())
+        && b != 0
+    {
+        // Fixnums are narrower than an i64, so neither can overflow.
+        let fast = match op {
+            Intrinsic::Quotient => a / b,
+            Intrinsic::Remainder => a % b,
+            _ => {
+                let r = a % b;
+                if r != 0 && (r < 0) != (b < 0) { r + b } else { r }
+            }
+        };
+        if let Some(v) = Value::fixnum(fast) {
+            return Ok(v);
+        }
+    }
+    let h = Nums::new(mc);
+    let (x, y) = (h.real(n).ok_or(Fault::WrongType)?, h.real(m).ok_or(Fault::WrongType)?);
+    let generic = match op {
+        Intrinsic::Quotient => real::quotient(&h, x, y),
+        Intrinsic::Remainder => real::remainder(&h, x, y),
+        _ => real::modulo(&h, x, y),
+    };
+    Ok(made(mc, fuel, generic?.value()))
+}
+
+/// Charges for `z^w` before it's computed, if it's exact: memory for its digits, and fuel for
+/// the squarings that make them, about their count squared.
+fn charge_power<'gc>(mc: &Mutation<'gc>, h: &Nums<'_, 'gc>, fuel: &mut Fuel, z: Number<'gc>, w: Number<'gc>) -> Result<(), Fault> {
+    let ComplexView::Real(e) = h.complex_view(w) else { return Ok(()) };
+    let RealView::Exact(e) = h.real_view(e) else { return Ok(()) };
+    let RationalView::Integer(e) = h.rational_view(e) else { return Ok(()) };
+    // An exponent past an i64 is too big for anything but 0, 1 and -1, which `expt` sees to.
+    let Some(e) = int::to_i64(h, e) else { return Ok(()) };
+    // Bits past the first, so 0, 1 and -1 cost nothing however high the power.
+    let bits = |n| int::integer_length(h, n).saturating_sub(1);
+    let real = |r| match h.real_view(r) {
+        RealView::Flonum(_) => 0,
+        RealView::Exact(q) => match h.rational_view(q) {
+            RationalView::Integer(n) => bits(n),
+            RationalView::Ratio { num, den } => bits(num) + bits(den),
+        },
+    };
+    let per_power = match h.complex_view(z) {
+        ComplexView::Real(r) => real(r),
+        ComplexView::Complex { re, im } => real(re) + real(im),
+    };
+    let words = per_power.saturating_mul(e.unsigned_abs()) / 64;
+    mc.ensure(usize::try_from(words.saturating_mul(8)).unwrap_or(usize::MAX))?;
+    fuel.spend(words.saturating_mul(words) / equal::PER_FUEL)
 }
 
 /// Whether each of `xs` is as `op` says of the next: for `=`, numbers, and for the others, reals.
