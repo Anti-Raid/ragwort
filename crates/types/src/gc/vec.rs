@@ -117,10 +117,7 @@ impl<'gc, S: Item> GcVec<'gc, S> {
         }
         let alloc = |n| mc.alloc_items::<VecSlots<S>, 0>([], n, Value::from_bits(0));
         let doubled = (capacity * 2).max(4);
-        let slots = match doubled > needed {
-            true => mc.optional(|| alloc(doubled)).ok(),
-            false => None,
-        };
+        let slots = if doubled > needed { mc.optional(|| alloc(doubled)).ok() } else { None };
         let slots = match slots {
             Some(slots) => slots,
             None => alloc(needed)?,

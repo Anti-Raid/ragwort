@@ -14,7 +14,7 @@ use ragwort_types::vector::{AnyVector, Vectors};
 
 use crate::op::Fuel;
 use crate::{Fault, coroutine, equal, prompts, syntax};
-use crate::objects::{self, BoxFields, Condition, ConditionFields, Global, GlobalFields, MultiValue, MultiValueFields, Tag, TaskFields};
+use crate::objects::{self, BoxFields, Condition, ConditionFields, ModuleFields, MultiValue, MultiValueFields, Tag, TaskFields};
 
 named! {
     #[repr(u16)]
@@ -155,12 +155,10 @@ named! {
         ValuesLength = "values-length",
         /// `(values-ref mv k)`.
         ValuesRef = "values-ref",
-        /// The value of the [`Global`] `g`, or [`Fault::Unbound`] if it isn't defined.
-        GlobalRef = "global-ref",
-        /// `(set! g v)` of the defined [`Global`] `g`, returning void.
-        GlobalSet = "global-set!",
-        /// `(define g v)` of the [`Global`] `g`, defined or not, returning void.
-        DefineGlobal = "define-global",
+        /// `(module-ref m k)`: variable `k` of the [`objects::Module`] `m`, or
+        /// [`Fault::Unbound`] if it isn't defined, as code of another module reads one it
+        /// exports that it sets.
+        ModuleRef = "module-ref",
         /// `(make-error message irritant ...)`: a `Condition` of [`Fault::Error`], which the
         /// prelude's `error` raises.
         MakeError = "make-error",
@@ -218,14 +216,13 @@ impl Intrinsic {
             Intrinsic::IsBytevector | Intrinsic::BytevectorLength | Intrinsic::IsProcedure | Intrinsic::IsContinuation => Some(1),
             Intrinsic::MakeCoroutine | Intrinsic::IsCoroutine | Intrinsic::CoroutineState => Some(1),
             Intrinsic::Car | Intrinsic::Cdr | Intrinsic::IsNull | Intrinsic::IsPair | Intrinsic::IsList | Intrinsic::Length | Intrinsic::Reverse | Intrinsic::IsBox | Intrinsic::MakeBox | Intrinsic::Unbox => Some(1),
-            Intrinsic::IsValues | Intrinsic::ValuesLength | Intrinsic::GlobalRef | Intrinsic::Not | Intrinsic::IsBoolean => Some(1),
+            Intrinsic::IsValues | Intrinsic::ValuesLength | Intrinsic::Not | Intrinsic::IsBoolean => Some(1),
             Intrinsic::IsSyntax | Intrinsic::IsIdentifier | Intrinsic::SyntaxE | Intrinsic::SyntaxToDatum => Some(1),
             Intrinsic::DatumToSyntax | Intrinsic::BoundIdentifierEq => Some(2),
             Intrinsic::Caar | Intrinsic::Cadr | Intrinsic::Cdar | Intrinsic::Cddr | Intrinsic::Caaar | Intrinsic::Caadr | Intrinsic::Cadar | Intrinsic::Caddr | Intrinsic::Cdaar | Intrinsic::Cdadr | Intrinsic::Cddar | Intrinsic::Cdddr | Intrinsic::Caaaar | Intrinsic::Caaadr | Intrinsic::Caadar | Intrinsic::Caaddr | Intrinsic::Cadaar | Intrinsic::Cadadr | Intrinsic::Caddar | Intrinsic::Cadddr | Intrinsic::Cdaaar | Intrinsic::Cdaadr | Intrinsic::Cdadar | Intrinsic::Cdaddr | Intrinsic::Cddaar | Intrinsic::Cddadr | Intrinsic::Cdddar | Intrinsic::Cddddr => Some(1),
             Intrinsic::BytevectorRef | Intrinsic::ListTail | Intrinsic::ListRef | Intrinsic::Memq | Intrinsic::Memv | Intrinsic::Member | Intrinsic::Assq | Intrinsic::Assv | Intrinsic::Assoc => Some(2),
             Intrinsic::BytevectorSet => Some(3),
-            Intrinsic::GlobalSet | Intrinsic::DefineGlobal => Some(2),
-            Intrinsic::Cons | Intrinsic::Eq | Intrinsic::Eqv | Intrinsic::Equal | Intrinsic::SetBox | Intrinsic::ValuesRef | Intrinsic::MakeWinder => Some(2),
+            Intrinsic::Cons | Intrinsic::Eq | Intrinsic::Eqv | Intrinsic::Equal | Intrinsic::SetBox | Intrinsic::ValuesRef | Intrinsic::MakeWinder | Intrinsic::ModuleRef => Some(2),
         }
     }
 
@@ -400,8 +397,6 @@ impl Intrinsic {
                 | DefaultPromptTag
                 | MakePromptTag
                 | ValuesLength
-                | GlobalSet
-                | DefineGlobal
                 | BytevectorSet
                 | SetBox
                 | MakeError
@@ -462,7 +457,7 @@ impl Intrinsic {
 
     /// Runs it on `args`, as the VM does on registers, but without a frame: for a compiler folding
     /// a call of constants, for one. Whether a call can be folded, as one that makes a new box
-    /// or sets a global can't, is the caller's to know.
+    /// or sets one can't, is the caller's to know.
     #[inline]
     pub fn run<'gc>(self, mc: &Mutation<'gc>, args: &[Value<'gc>], fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
         if self.arity().is_some_and(|arity| usize::from(arity) != args.len()) {
@@ -677,21 +672,14 @@ impl Intrinsic {
                 }
                 items.get(k)
             }
-            Intrinsic::GlobalRef => {
-                let global = arg(0).downcast::<Global>(mc).ok_or(Fault::WrongType)?;
-                if !global.defined(mc) {
+            Intrinsic::ModuleRef => {
+                let items = arg(0).downcast::<objects::Module>(mc).ok_or(Fault::WrongType)?.items(mc);
+                let k = arg(1).as_fixnum().ok_or(Fault::WrongType)?;
+                let value = usize::try_from(k).ok().filter(|&k| k < items.len()).map(|k| items.get(k)).ok_or(Fault::OutOfRange)?;
+                if value == Value::UNDEFINED {
                     return Err(Fault::Unbound);
                 }
-                global.value(mc)
-            }
-            Intrinsic::GlobalSet | Intrinsic::DefineGlobal => {
-                let global = arg(0).downcast::<Global>(mc).ok_or(Fault::WrongType)?;
-                if self == Intrinsic::GlobalSet && !global.defined(mc) {
-                    return Err(Fault::Unbound);
-                }
-                global.set_value(mc, arg(1));
-                global.set_defined(mc, true);
-                Value::VOID
+                value
             }
             Intrinsic::MakeError if args == 0 => return Err(Fault::Arity),
             Intrinsic::MakeError => {

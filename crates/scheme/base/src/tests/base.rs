@@ -1,25 +1,45 @@
-use ragwort_types::gc::Arena;
+use ragwort_compiler::module::NoModules;
+use ragwort_types::gc::{Arena, Value};
+use ragwort_types::pair::Pairs;
 use ragwort_vm::objects::{Condition, ConditionFields};
 use ragwort_vm::{Fault, MIN_SEGMENT, Machine, Outcome};
 
 use super::*;
 use crate::ExpandErrorKind::*;
 
-/// Root 0 holds the symbol table, root 1 the code's globals and root 2 the prelude's, which it
-/// has defined.
+/// Root 0 holds the symbol table, root 1 a list of the modules loaded, newest first, root 2 the
+/// prelude's module, which has run, and root 3 the modules other modules can require, as a list
+/// of `(name . module)`.
 fn arena() -> Arena {
-    let mut arena = Arena::new(1 << 24, 3);
+    let mut arena = Arena::new(1 << 24, 4);
     arena.mutate(|mc| {
         let symbols = Symbols::with_seed(mc, 1).unwrap();
-        let base = Globals::new(mc).unwrap();
         mc.set_root(0, symbols.value(mc));
-        mc.set_root(1, Globals::new(mc).unwrap().value(mc));
-        mc.set_root(2, base.value(mc));
-        for thunk in prelude(mc, symbols, base).unwrap() {
+        mc.set_root(1, Value::NIL);
+        mc.set_root(3, Value::NIL);
+        let session = SyntaxSession::named(mc, "prelude", PRELUDE).unwrap();
+        let loaded = ragwort_native::load(mc, symbols, PRELUDE_NAME, &[], &[&session], &mut NoModules).unwrap();
+        for thunk in loaded.thunks {
             run(mc, thunk).unwrap();
         }
+        mc.set_root(2, Value::object(mc, loaded.module));
     });
     arena
+}
+
+/// Loads `text` as a module, which implicitly requires the modules loaded before it, as a REPL's
+/// input does, and exports what it defines for those loaded after.
+fn load_text<'gc>(mc: &Mutation<'gc>, text: &str) -> Result<Vec<Value<'gc>>, Error> {
+    let symbols = Symbols::of(mc.root(0)).unwrap();
+    let prelude = mc.root(2).downcast::<Module>(mc).unwrap();
+    let session = SyntaxSession::new(mc, text).unwrap();
+    let all = SyntaxSession::new(mc, "(provide (all-defined-out))").unwrap();
+    let mut earlier: Vec<Gc<Module>> = Pairs::new(mc).elements(mc.root(1)).map(|m| m.downcast::<Module>(mc).unwrap()).collect();
+    earlier.reverse();
+    let loaded = load(mc, symbols, prelude, "main", &[&session, &all], &earlier, &mut NoModules)?;
+    let modules = Pairs::new(mc).cons(Value::object(mc, loaded.module), mc.root(1)).unwrap();
+    mc.set_root(1, modules.value(mc));
+    Ok(loaded.thunks)
 }
 
 fn run<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Result<Value<'gc>, Fault> {
@@ -49,10 +69,7 @@ fn raised_text<'gc>(mc: &Mutation<'gc>, raised: Value<'gc>) -> String {
 /// What the one form `text` raised that nothing caught, written out.
 fn uncaught(text: &str) -> String {
     arena().mutate(|mc| {
-        let symbols = Symbols::of(mc.root(0)).unwrap();
-        let (globals, base) = (Globals::of(mc, mc.root(1)).unwrap(), Globals::of(mc, mc.root(2)).unwrap());
-        let session = SyntaxSession::new(mc, text).unwrap();
-        let [thunk] = load(mc, symbols, globals, base, &session).unwrap()[..] else { panic!("one form") };
+        let [thunk] = load_text(mc, text).unwrap()[..] else { panic!("one form") };
         show(mc, run_raising(mc, thunk).expect_err("raised"))
     })
 }
@@ -65,11 +82,8 @@ fn show<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> String {
 /// fault one raised.
 fn eval_in(arena: &mut Arena, text: &str) -> Result<Result<String, Fault>, Error> {
     arena.mutate(|mc| {
-        let symbols = Symbols::of(mc.root(0)).unwrap();
-        let (globals, base) = (Globals::of(mc, mc.root(1)).unwrap(), Globals::of(mc, mc.root(2)).unwrap());
-        let session = SyntaxSession::new(mc, text).unwrap();
         let mut last = Value::VOID;
-        for thunk in load(mc, symbols, globals, base, &session)? {
+        for thunk in load_text(mc, text)? {
             match run(mc, thunk) {
                 Ok(value) => last = value,
                 Err(fault) => return Ok(Err(fault)),
@@ -289,13 +303,13 @@ fn macros_are_hygienic() {
 }
 
 #[test]
-fn globals_last_from_one_load_to_the_next() {
+fn each_load_requires_the_ones_before() {
     let mut arena = arena();
     assert_eq!(eval_in(&mut arena, "(define counter 0) (define (bump!) (set! counter (+ counter 1)) counter)"), Ok(Ok("#<void>".into())));
     assert_eq!(eval_in(&mut arena, "(bump!) (bump!)"), Ok(Ok("2".into())));
     assert_eq!(eval_in(&mut arena, "(define (car x) 'mine)"), Ok(Ok("#<void>".into())));
     assert_eq!(eval_in(&mut arena, "(list (car '(1)) (cadr '(1 2)))"), Ok(Ok("(mine 2)".into())));
-    assert_eq!(eval_in(&mut arena, "nowhere"), Ok(Err(Fault::Unbound)));
+    assert!(matches!(eval_in(&mut arena, "nowhere"), Err(Error::Expand(e)) if e.kind == Unbound));
 }
 
 #[test]
@@ -328,10 +342,7 @@ fn bad_syntax_points_at_itself() {
 fn rest_lists_let_the_collector_keep_up() {
     let mut arena = arena();
     let mut machine = arena.mutate(|mc| {
-        let symbols = Symbols::of(mc.root(0)).unwrap();
-        let (globals, base) = (Globals::of(mc, mc.root(1)).unwrap(), Globals::of(mc, mc.root(2)).unwrap());
-        let session = SyntaxSession::new(mc, "(define (count n) (if (eqv? n 0) 'done (count (+ n -1)))) (count 400000)").unwrap();
-        let mut thunks = load(mc, symbols, globals, base, &session).unwrap();
+        let mut thunks = load_text(mc, "(define (count n) (if (eqv? n 0) 'done (count (+ n -1)))) (count 400000)").unwrap();
         let last = thunks.pop().unwrap();
         thunks.into_iter().for_each(|thunk| _ = run(mc, thunk).unwrap());
         Machine::new(mc, MIN_SEGMENT, last, &[]).unwrap()
@@ -722,10 +733,7 @@ fn a_failing_coroutine_raises_where_it_was_resumed_unless_protected() {
 /// The one thunk `text` loads as, in a machine.
 fn machine(arena: &mut Arena, text: &str) -> Machine {
     arena.mutate(|mc| {
-        let symbols = Symbols::of(mc.root(0)).unwrap();
-        let (globals, base) = (Globals::of(mc, mc.root(1)).unwrap(), Globals::of(mc, mc.root(2)).unwrap());
-        let session = SyntaxSession::new(mc, text).unwrap();
-        let thunks = load(mc, symbols, globals, base, &session).unwrap();
+        let thunks = load_text(mc, text).unwrap();
         let [thunk] = thunks.as_slice() else { panic!("one form") };
         Machine::new(mc, MIN_SEGMENT, *thunk, &[]).unwrap()
     })
@@ -1054,3 +1062,6 @@ fn raising_in_a_loop_runs_in_constant_space() {
 
 #[path = "macros.rs"]
 mod macros;
+
+#[path = "modules.rs"]
+mod modules;

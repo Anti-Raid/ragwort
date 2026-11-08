@@ -235,7 +235,7 @@ impl<'gc> Expander<'_, 'gc> {
                 let symbol = self.tree.symbol(*literal).expect("literals are identifiers");
                 let set = self.tree.scopes_of(*literal)?;
                 let literal = self.resolve_name(symbol, set).map_err(|_| self.error(ExpandErrorKind::Ambiguous, *literal))?;
-                let literal = (literal, matches!(literal, Binding::Free { .. } | Binding::Global(_) | Binding::Import(_)).then_some(symbol));
+                let literal = (literal, matches!(literal, Binding::Free | Binding::Slot(_) | Binding::Import(_)).then_some(symbol));
                 self.binding_of(v, at)? == literal
             }
             Pattern::Datum(datum) => {

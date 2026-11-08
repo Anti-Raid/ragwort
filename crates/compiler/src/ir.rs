@@ -3,8 +3,8 @@
 //! Each pass either transforms an IR within the same grammar (`cp0: L2 -> L2`) or reduces the
 //! grammar by eliminating forms:
 //! - [`Core`](crate::Core) (`L0`): input from the expander/lowerer.
-//! - [`L1`]: globals (`DefineGlobal`, `Place::Global`, `Place::Import`) lowered to intrinsics and
-//!   constants; all variables are lexical [`Var`]s.
+//! - [`L1`]: module variables (`Place::Slot`) lowered to slot primitives; all variables are
+//!   lexical [`Var`]s.
 //! - [`L2`]: `Letrec` eliminated via Waddell–Sarkar–Dybvig fixing in favor of `Let`, `Fix`
 //!   (mutually recursive unassigned lambdas), `Seq`, and `Set`.
 //! - [`L3`]: `Set` eliminated via assignment conversion (`MakeBox`, `Unbox`, `SetBox`); all
@@ -15,7 +15,7 @@
 use ragwort_types::gc::Value;
 use ragwort_vm::Purity;
 
-use crate::{Func, Prim, Var};
+use crate::{Func, Prim, SlotOp, Var};
 
 /// Fresh variable and lambda identifier generator threaded across passes.
 #[derive(Clone, Copy, Debug)]
@@ -38,7 +38,7 @@ impl Supply {
     }
 }
 
-/// `L1`: lexical core forms after lowering globals.
+/// `L1`: lexical core forms after lowering module variables.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum L1<'gc> {
     Quote(Value<'gc>),
@@ -81,6 +81,7 @@ impl<'gc> L2<'gc> {
             L2::Intrinsic(Prim::Intrinsic(i), args) => i.is_discardable() && args.iter().all(Self::is_pure),
             L2::Intrinsic(Prim::Read(r), args) => r.is_discardable() && args.iter().all(Self::is_pure),
             L2::Intrinsic(Prim::Host(h), args) => h.purity == Purity::Discardable && args.iter().all(Self::is_pure),
+            L2::Intrinsic(Prim::Slot(SlotOp::Load, _), _) => true,
             L2::Set(_, _) | L2::App(_, _) | L2::Intrinsic(_, _) | L2::ApplyIntrinsic(_, _) => false,
         }
     }

@@ -1,18 +1,35 @@
-use ragwort_types::gc::{Arena, WINDOW};
-use ragwort_vm::objects::{Condition, ConditionFields};
+use ragwort_types::gc::{Arena, Gc, Value, WINDOW};
+use ragwort_vm::objects::{Condition, ConditionFields, Module};
 use ragwort_vm::{Fault, Intrinsic, MIN_SEGMENT, Machine, Outcome, Purity, Read, Request};
+
+use ragwort_types::pair::Pair;
+use ragwort_types::string::Strings;
+
+use ragwort_types::pair::Pairs;
 
 use super::*;
 use crate::LowerErrorKind::*;
 
-/// Root 0 holds the symbol table and root 1 the globals, so they last from one load to the next.
+/// Root 0 holds the symbol table and root 1 the modules that have run, as a list of pairs of
+/// a name and a module, so code loaded later can require them.
 fn arena() -> Arena {
     let mut arena = Arena::new(1 << 24, 2);
     arena.mutate(|mc| {
         mc.set_root(0, Symbols::with_seed(mc, 1).unwrap().value(mc));
-        mc.set_root(1, Globals::new(mc).unwrap().value(mc));
+        mc.set_root(1, Value::NIL);
     });
     arena
+}
+
+/// The modules in root 1.
+struct Registry;
+
+impl<'gc> Resolver<'gc> for Registry {
+    fn resolve(&mut self, mc: &Mutation<'gc>, name: &str, _: Value<'gc>) -> Option<Gc<'gc, Module>> {
+        let name = Symbols::of(mc.root(0))?.intern_str(&Strings::new(mc), name).ok()?.value(mc);
+        let mut entries = Pairs::new(mc).elements(mc.root(1)).filter_map(Pair::of);
+        entries.find(|entry| entry.head(mc) == name)?.tail(mc).downcast::<Module>(mc)
+    }
 }
 
 fn add_host<'s, 'gc>(_: &mut ragwort_vm::HostContext<'s, 'gc>, args: ragwort_vm::HostArgs<'s, 'gc>) -> Result<ragwort_vm::Reply<'gc>, Fault> {
@@ -34,26 +51,43 @@ fn show<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> String {
     ragwort_printer_scheme::to_string(mc, v, ragwort_printer_scheme::Mode::Write, usize::MAX).unwrap()
 }
 
-/// Loads `text` and runs its forms in order. Returns the last one's value, written out, or the
-/// fault one raised.
-fn eval_in(arena: &mut Arena, text: &str) -> Result<Result<String, Fault>, Error> {
-    arena.mutate(|mc| {
-        let (symbols, globals) = (Symbols::of(mc.root(0)).unwrap(), Globals::of(mc, mc.root(1)).unwrap());
-        let session = SyntaxSession::new(mc, text).unwrap();
-        let mut last = Value::VOID;
-        for thunk in load(mc, symbols, globals, &HOSTS, &session)? {
-            let mut machine = Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap();
-            last = loop {
-                match machine.run(mc).unwrap() {
-                    Outcome::Paused => {}
-                    Outcome::Yielded(_) | Outcome::Host(_) | Outcome::Deferred(_) => panic!("yielded"),
-                    Outcome::Done(value) => break value,
-                    Outcome::Raised(raised) => return Ok(Err(*raised.downcast::<Condition>(mc).unwrap().fault(mc).unwrap())),
-                }
-            };
+/// Runs `thunk` to the end: its value, or the fault it raised.
+fn run<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Result<Value<'gc>, Fault> {
+    let mut machine = Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap();
+    loop {
+        match machine.run(mc).unwrap() {
+            Outcome::Paused => {}
+            Outcome::Yielded(_) | Outcome::Host(_) | Outcome::Deferred(_) => panic!("yielded"),
+            Outcome::Done(value) => return Ok(value),
+            Outcome::Raised(raised) => return Err(*raised.downcast::<Condition>(mc).unwrap().fault(mc).unwrap()),
         }
+    }
+}
+
+/// Loads `text` as the module `name` and runs its forms in order. If they all do, other code can
+/// require it. Returns the last one's value, written out, or the fault one raised.
+fn module_in(arena: &mut Arena, name: &str, text: &str) -> Result<Result<String, Fault>, Error> {
+    arena.mutate(|mc| {
+        let symbols = Symbols::of(mc.root(0)).unwrap();
+        let session = SyntaxSession::new(mc, text).unwrap();
+        let loaded = load(mc, symbols, name, &HOSTS, &[&session], &mut Registry)?;
+        let mut last = Value::VOID;
+        for thunk in loaded.thunks {
+            match run(mc, thunk) {
+                Ok(value) => last = value,
+                Err(fault) => return Ok(Err(fault)),
+            }
+        }
+        let name = symbols.intern_str(&Strings::new(mc), name).unwrap().value(mc);
+        let entry = Pairs::new(mc).list_with_tail(vec![name], Value::object(mc, loaded.module)).unwrap();
+        let modules = Pairs::new(mc).list_with_tail(vec![entry], mc.root(1)).unwrap();
+        mc.set_root(1, modules);
         Ok(Ok(show(mc, last)))
     })
+}
+
+fn eval_in(arena: &mut Arena, text: &str) -> Result<Result<String, Fault>, Error> {
+    module_in(arena, "main", text)
 }
 
 fn eval(text: &str) -> String {
@@ -107,8 +141,8 @@ fn closures_and_assignment() {
 }
 
 #[test]
-fn letrec_and_globals() {
-    let rev = "(%define-global reverse
+fn letrec_and_definitions() {
+    let rev = "(%define reverse
                  (%lambda (xs)
                    (%letrec ((loop (%lambda (xs acc)
                                      (%if (%intrinsic null? xs)
@@ -117,14 +151,118 @@ fn letrec_and_globals() {
                      (%app loop xs '()))))
                (%app reverse '(a b c))";
     assert_eq!(eval(rev), "(c b a)");
-    // Globals last from one load to the next, in the same `Globals`.
+    // A definition can be named before it's defined, but not used.
+    assert_eq!(eval("(%define f (%lambda () later)) (%define later 'yes) (%app f)"), "yes");
+    assert_eq!(fault("(%define f (%lambda () later)) (%app f) (%define later 'yes)"), Fault::Unbound);
+    assert_eq!(fault("(%set! later 'no) (%define later 'yes)"), Fault::Unbound);
+    assert_eq!(eval("(%define g 'a) (%set! g (%intrinsic cons g g)) g"), "(a . a)");
+    assert_eq!(error("nowhere"), (Unbound, "nowhere"));
+    assert_eq!(error("(%set! nowhere 'a)"), (Unbound, "nowhere"));
+    assert_eq!(error("(%define x 1) (%define x 2)"), (Duplicate, "x"));
+    assert_eq!(error("(%let ((x 1)) (%define y x))"), (Definition, "(%define y x)"));
+    assert_eq!(error("(%app (%lambda () (%require lib)))"), (Definition, "(%require lib)"));
+}
+
+#[test]
+fn modules_require_what_others_provide() {
     let mut arena = arena();
-    assert_eq!(eval_in(&mut arena, "(%define-global g 'a)"), Ok(Ok("#<void>".into())));
-    assert_eq!(eval_in(&mut arena, "(%set! g (%intrinsic cons g g)) g"), Ok(Ok("(a . a)".into())));
-    // A global can be named before it's defined, but not used.
-    assert_eq!(eval("(%define-global f (%lambda () later)) (%define-global later 'yes) (%app f)"), "yes");
-    assert_eq!(fault("nowhere"), Fault::Unbound);
-    assert_eq!(fault("(%set! nowhere 'a)"), Fault::Unbound);
+    let lib = "(%provide g (rename-out (bump bump!)) counter first)
+               (%define g 'a)
+               (%define counter 0)
+               (%define bump (%lambda () (%set! counter (%intrinsic + counter 1)) counter))
+               (%define first (%lambda (p) (%intrinsic car p)))
+               (%define hidden 'h)";
+    assert_eq!(module_in(&mut arena, "lib", lib), Ok(Ok("#<void>".into())));
+    let mut eval = |text: &str| eval_in(&mut arena, text).unwrap().unwrap();
+    assert_eq!(eval("(%require lib) g"), "a");
+    // An export its module assigns is read as it is.
+    assert_eq!(eval("(%require lib) (%app bump!) (%app bump!) counter"), "2");
+    assert_eq!(eval("(%require \"lib\") (%app first '(x y))"), "x");
+    assert_eq!(eval("(%require (only-in lib g first)) (%app first (%intrinsic cons g g))"), "a");
+    assert_eq!(eval("(%require (prefix-in lib: lib)) lib:g"), "a");
+    assert_eq!(eval("(%require (rename-in lib (g h))) h"), "a");
+    assert_eq!(eval("(%require (except-in lib g)) (%define g 'mine) g"), "mine");
+    // Requiring the same thing twice is fine.
+    assert_eq!(eval("(%require lib (only-in lib g)) g"), "a");
+    let mut error = |text: &str| match eval_in(&mut arena, text) {
+        Err(Error::Lower(e)) => (e.kind, text[e.start as usize..e.end as usize].to_string()),
+        other => panic!("{text} lowered: {other:?}"),
+    };
+    assert_eq!(error("(%require lib) hidden"), (Unbound, "hidden".into()));
+    assert_eq!(error("(%require lib) bump"), (Unbound, "bump".into()));
+    assert_eq!(error("(%require lib) (%set! g 'b)"), (Immutable, "g".into()));
+    assert_eq!(error("(%require lib) (%define g 'b)"), (Conflict, "g".into()));
+    assert_eq!(error("(%require lib (rename-in lib (first g)))"), (Conflict, "(rename-in lib (first g))".into()));
+    assert_eq!(error("(%require (only-in lib nope))"), (NotProvided, "nope".into()));
+    assert_eq!(error("(%require (rename-in lib (nope x)))"), (NotProvided, "(nope x)".into()));
+    assert_eq!(error("(%require nowhere)"), (Resolve, "nowhere".into()));
+    assert_eq!(error("(%require (sideways lib))"), (BadShape, "(sideways lib)".into()));
+    assert_eq!(error("(%provide nope)"), (NotDefined, "nope".into()));
+    assert_eq!(error("(%define a 1) (%provide a (rename-out (a a)))"), (Duplicate, "(a a)".into()));
+    assert_eq!(error("(%provide (all-defined-out x))"), (BadShape, "(all-defined-out x)".into()));
+}
+
+#[test]
+fn calls_of_imported_wrappers_inline() {
+    let mut arena = arena();
+    let lib = "(%provide (all-defined-out))
+               (%define first (%lambda (p) (%intrinsic car p)))
+               (%define sum (%lambda xs (%apply-intrinsic + xs)))
+               (%define add1 (%lambda (z) (%intrinsic + z 1)))";
+    module_in(&mut arena, "lib", lib).unwrap().unwrap();
+    let main = "(%require lib) (%define f (%lambda (p) (%app add1 (%app sum (%app first p) 2 3))))";
+    let ops = arena.mutate(|mc| {
+        let symbols = Symbols::of(mc.root(0)).unwrap();
+        let session = SyntaxSession::new(mc, main).unwrap();
+        let loaded = load(mc, symbols, "main", &HOSTS, &[&session], &mut Registry).unwrap();
+        for &thunk in &loaded.thunks {
+            run(mc, thunk).unwrap();
+        }
+        let f = ragwort_vm::objects::ModuleFields::items(loaded.module, mc).get(0);
+        let f = f.downcast::<ragwort_vm::objects::Closure>(mc).unwrap();
+        let ops = ragwort_vm::objects::ClosureFields::code(f, mc).unwrap();
+        ragwort_vm::objects::BytecodeFields::ops(ops, mc).unwrap().to_vec()
+    });
+    assert!(!ops.iter().any(|op| matches!(op, ragwort_vm::Op::Call { .. } | ragwort_vm::Op::TailCall { .. })), "{ops:?}");
+    assert_eq!(eval_in(&mut arena, &format!("{main} (%app f '(1))")).unwrap().unwrap(), "7");
+}
+
+#[test]
+fn a_module_reads_its_variables_unchecked_once_theyre_defined() {
+    let ops = |text: &str| {
+        let mut arena = arena();
+        arena.mutate(|mc| {
+            let symbols = Symbols::of(mc.root(0)).unwrap();
+            let session = SyntaxSession::new(mc, text).unwrap();
+            let loaded = load(mc, symbols, "main", &HOSTS, &[&session], &mut Registry).unwrap();
+            let mut ops = Vec::new();
+            for thunk in loaded.thunks {
+                let thunk = thunk.downcast::<ragwort_vm::objects::Closure>(mc).unwrap();
+                let code = ragwort_vm::objects::ClosureFields::code(thunk, mc).unwrap();
+                ops.extend_from_slice(ragwort_vm::objects::BytecodeFields::ops(code, mc).unwrap());
+                // And the code of the lambdas it makes.
+                let constants = ragwort_types::constant::Constants::of(ragwort_vm::objects::BytecodeFields::constants(code, mc)).unwrap();
+                for i in 0..constants.len(mc) as u32 {
+                    let constant = constants.get(mc, i).unwrap();
+                    let closure = constant.downcast::<ragwort_vm::objects::Closure>(mc).and_then(|c| ragwort_vm::objects::ClosureFields::code(c, mc));
+                    if let Some(code) = constant.downcast::<ragwort_vm::objects::Bytecode>(mc).or(closure) {
+                        ops.extend_from_slice(ragwort_vm::objects::BytecodeFields::ops(code, mc).unwrap());
+                    }
+                }
+            }
+            ops
+        })
+    };
+    let checked = |ops: &[ragwort_vm::Op]| ops.iter().any(|op| matches!(op, ragwort_vm::Op::LoadSlotChecked { .. }));
+    let unchecked = |ops: &[ragwort_vm::Op]| ops.iter().any(|op| matches!(op, ragwort_vm::Op::LoadSlot { .. }));
+    let earlier = ops("(%define a 1) a");
+    assert!(unchecked(&earlier) && !checked(&earlier), "{earlier:?}");
+    let later = ops("(%define f (%lambda () b)) (%define b 1)");
+    assert!(checked(&later), "{later:?}");
+    let own = ops("(%define loop (%lambda (n) (%if (%intrinsic eqv? n 0) 0 (%app loop (%intrinsic + n -1)))))");
+    assert!(unchecked(&own) && !checked(&own), "{own:?}");
+    let not_lambda = ops("(%define x (%let ((y 1)) x))");
+    assert!(checked(&not_lambda), "{not_lambda:?}");
 }
 
 #[test]
@@ -139,7 +277,7 @@ fn requests_are_intrinsics_too() {
 #[test]
 fn requests_pass_on_their_arguments_from_where_they_are() {
     // At some depth, what with-mark calls doesn't fit on the segment its arguments are on.
-    let deep = "(%define-global go
+    let deep = "(%define go
                   (%lambda (n)
                     (%if (%intrinsic eqv? n 0)
                          0
@@ -158,7 +296,7 @@ fn requests_pass_on_their_arguments_from_where_they_are() {
 
 #[test]
 fn reads_see_the_marks_where_they_run() {
-    let k = "(%define-global k (%intrinsic make-continuation-prompt-tag))";
+    let k = "(%define k (%intrinsic make-continuation-prompt-tag))";
     // Read in a frame and used in a closure run under another mark: the frame's value.
     let outer = "(%intrinsic with-mark k 5
                    (%lambda () (%let ((h (%intrinsic mark-value k 0))) (%intrinsic with-mark k 1 (%lambda () h)))))";
@@ -313,9 +451,9 @@ fn host_requests_go_to_what_runs_the_machine() {
                     (%intrinsic cons a (%intrinsic cons b c))))";
     let mut arena = arena();
     let asked = arena.mutate(|mc| {
-        let (symbols, globals) = (Symbols::of(mc.root(0)).unwrap(), Globals::of(mc, mc.root(1)).unwrap());
+        let symbols = Symbols::of(mc.root(0)).unwrap();
         let session = SyntaxSession::new(mc, text).unwrap();
-        let [thunk] = load(mc, symbols, globals, &HOSTS, &session).unwrap()[..] else { panic!("one form") };
+        let [thunk] = load(mc, symbols, "main", &HOSTS, &[&session], &mut Registry).unwrap().thunks[..] else { panic!("one form") };
         let mut machine = Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap();
         let mut asked = Vec::new();
         let mut outcome = machine.run(mc);
@@ -337,15 +475,19 @@ fn host_requests_go_to_what_runs_the_machine() {
 #[test]
 fn a_finished_machine_restarts_on_its_stack() {
     // A continuation the first task left keeps its frames while the next runs.
-    let text = "(%define-global k #f)
-                (%define-global first (%lambda () (%intrinsic + 1 (%intrinsic call/cc (%lambda (c) (%set! k c) 1)))))
-                (%define-global again (%lambda (n) (%intrinsic cons n (%intrinsic co/resume (%intrinsic make-coroutine (%lambda () n))))))
-                (%define-global back (%lambda (n) (%app k n)))";
+    let text = "(%define k #f)
+                (%define first (%lambda () (%intrinsic + 1 (%intrinsic call/cc (%lambda (c) (%set! k c) 1)))))
+                (%define again (%lambda (n) (%intrinsic cons n (%intrinsic co/resume (%intrinsic make-coroutine (%lambda () n))))))
+                (%define back (%lambda (n) (%app k n)))";
     let mut arena = arena();
     eval_in(&mut arena, text).unwrap().unwrap();
     let shown = arena.mutate(|mc| {
-        let globals = Globals::of(mc, mc.root(1)).unwrap();
-        let global = |name: &str| globals.iter(mc).find(|g| show(mc, g.name(mc)) == name).unwrap().value(mc);
+        let module = Registry.resolve(mc, "main", Value::FALSE).unwrap();
+        let names = ragwort_types::vector::Vectors::new(mc).vector(ragwort_vm::objects::ModuleFields::names(module, mc)).unwrap();
+        let variable = |name: &str| {
+            let i = (0..names.len(mc)).find(|&i| show(mc, names.get(mc, i).unwrap()) == name).unwrap();
+            ragwort_vm::objects::ModuleFields::items(module, mc).get(i)
+        };
         let finish = |machine: &mut Machine| loop {
             match machine.run(mc).unwrap() {
                 Outcome::Paused => {}
@@ -353,12 +495,12 @@ fn a_finished_machine_restarts_on_its_stack() {
                 other => panic!("{other:?}"),
             }
         };
-        let mut machine = Machine::new(mc, MIN_SEGMENT, global("first"), &[]).unwrap();
-        let busy = format!("{:?}", machine.restart(mc, global("first"), &[]).err());
+        let mut machine = Machine::new(mc, MIN_SEGMENT, variable("first"), &[]).unwrap();
+        let busy = format!("{:?}", machine.restart(mc, variable("first"), &[]).err());
         let a = finish(&mut machine);
-        machine.restart(mc, global("again"), &[Value::fixnum(7).unwrap()]).unwrap();
+        machine.restart(mc, variable("again"), &[Value::fixnum(7).unwrap()]).unwrap();
         let b = finish(&mut machine);
-        machine.restart(mc, global("back"), &[Value::fixnum(41).unwrap()]).unwrap();
+        machine.restart(mc, variable("back"), &[Value::fixnum(41).unwrap()]).unwrap();
         (busy, a, b, finish(&mut machine))
     });
     assert_eq!(shown, ("Some(NotPending)".into(), "2".into(), "(7 . 7)".into(), "42".into()));
@@ -369,7 +511,7 @@ fn native_code_calls_the_host_and_wraps_it_for_other_code() {
     assert_eq!(eval("(%call-host add 1 2)"), "3");
     assert_eq!(eval("(%call-host list 1 2 3)"), "(1 2 3)");
     // A wrapper is an ordinary procedure, which passes on what the host needs, such as a mark.
-    let wrapped = "(%define-global add (%lambda (a) (%call-host add a (%intrinsic mark-value 'k 0))))
+    let wrapped = "(%define add (%lambda (a) (%call-host add a (%intrinsic mark-value 'k 0))))
                    (%intrinsic with-mark 'k 5 (%lambda () (%app add 1)))";
     assert_eq!(eval(wrapped), "6");
     assert_eq!(fault("(%call-host add 1 'x)"), Fault::WrongType);

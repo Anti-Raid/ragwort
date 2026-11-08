@@ -5,6 +5,7 @@ members = [
     "crates/gc-region",
     "crates/native",
     "crates/num",
+    "crates/modules-core",
     "crates/string",
     "crates/types",
     "crates/vm",

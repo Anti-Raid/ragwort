@@ -15,7 +15,7 @@ use ragwort_vm::objects::{self, Bytecode, BytecodeFields, Closure, ModuleFields}
 use ragwort_vm::{Capture, HostDef, Intrinsic, Op, Purity, Read, Request};
 
 use crate::ir::{Closure as IrClosure, L4, UpvalSource, VarRef};
-use crate::{CompileError, Prim, Var};
+use crate::{CompileError, Prim, SlotOp, Var};
 
 /// A virtual register: `0..LIMIT` are physical frame registers, `LIMIT..` are slots of the
 /// frame's spill object.
@@ -399,6 +399,7 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
                     self.ops.push(Op::Return { src });
                 }
             }
+            L4::Intrinsic(Prim::Slot(op, slot), args) => self.slot(*op, *slot, args, want)?,
             L4::Intrinsic(Prim::Read(read), args) if matches!(want, Want::Reg(_)) && (1..=2).contains(&args.len()) => {
                 let Want::Reg(dst) = want else { unreachable!() };
                 let v0 = self.arg_vreg(&args[0])?;
@@ -451,6 +452,7 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
                     Prim::Read(r) => self.read_op(r, base, argc, want),
                     Prim::Request(r) => self.request(r, base, argc, want)?,
                     Prim::Host(h) => self.host(h, base, argc, want)?,
+                    Prim::Slot(..) => unreachable!("slot accesses are compiled before"),
                 }
             }
             L4::ApplyIntrinsic(prim, args) => {
@@ -591,6 +593,38 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
         Ok(())
     }
 
+    /// An access of variable `slot` of the module, a store's value in `args`.
+    fn slot(&mut self, op: SlotOp, slot: u32, args: &[L4<'gc>], want: Want) -> Result<(), Stop> {
+        let len = self.module.owner.map_or(0, |m| m.items(self.module.mc).len());
+        if slot as usize >= len {
+            return Err(Stop::Error(CompileError::UnknownSlot(slot)));
+        }
+        match (op, args) {
+            (SlotOp::Load | SlotOp::LoadChecked, []) => {
+                let t = self.into(want)?;
+                match op {
+                    SlotOp::Load => self.write(t, |dst| Op::LoadSlot { dst, slot }),
+                    _ => self.write(t, |dst| Op::LoadSlotChecked { dst, slot }),
+                }
+                if let Want::Tail = want {
+                    let src = self.read(t);
+                    self.ops.push(Op::Return { src });
+                }
+            }
+            (SlotOp::Store | SlotOp::StoreChecked, [value]) => {
+                let v = self.arg_vreg(value)?;
+                let src = self.arg_reg(v, 0);
+                self.ops.push(match op {
+                    SlotOp::Store => Op::StoreSlot { src, slot },
+                    _ => Op::StoreSlotChecked { src, slot },
+                });
+                self.expr(&L4::Quote(Value::VOID), want)?;
+            }
+            _ => unreachable!("lowering checks a slot access's arguments"),
+        }
+        Ok(())
+    }
+
     /// A call of a host function, laid out as a request is, as what it replies can call a
     /// procedure at `base`. Its arguments must fit the frame, as nothing else can call it.
     fn host(&mut self, def: &'static HostDef, base: VReg, args: usize, want: Want) -> Result<(), Stop> {
@@ -649,9 +683,10 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
     }
 
     fn spread(&mut self, prim: Prim, base: VReg, args: usize, want: Want) -> Result<(), Stop> {
-        let (base, args) = match self.fits(base, args) {
-            true => (self.stage(base, args), args as u8),
-            false => (self.list(base, args - 1, Some(base + args as VReg - 1))?, 1),
+        let (base, args) = if self.fits(base, args) {
+            (self.stage(base, args), args as u8)
+        } else {
+            (self.list(base, args - 1, Some(base + args as VReg - 1))?, 1)
         };
         match prim {
             Prim::Intrinsic(intrinsic) => {
@@ -661,7 +696,7 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
                     Want::Reg(dst) => self.take(dst),
                 }
             }
-            Prim::Read(_) | Prim::Host(_) => unreachable!("lowering spreads no read or host function"),
+            Prim::Read(_) | Prim::Host(_) | Prim::Slot(..) => unreachable!("lowering spreads no read, host function or slot access"),
             Prim::Request(request) => self.emit_request(request, base, args, true, want),
         }
         Ok(())
@@ -1050,6 +1085,7 @@ fn l4_is_reorderable<'gc>(expr: &L4<'gc>) -> bool {
             binds.iter().all(|(_, init)| l4_is_reorderable(init)) && l4_is_reorderable(body)
         }
         L4::Intrinsic(Prim::Host(h), args) => h.purity != Purity::Impure && args.iter().all(l4_is_reorderable),
+        L4::Intrinsic(Prim::Slot(SlotOp::Load | SlotOp::LoadChecked, _), _) => true,
         L4::Intrinsic(Prim::Intrinsic(i), args) => {
             (i.is_discardable()
                 || matches!(

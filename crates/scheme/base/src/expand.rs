@@ -7,14 +7,14 @@
 
 use std::rc::Rc;
 
+use ragwort_compiler::module::{self, Import, Imports, ModuleBuilder, ModuleError, RequireSpec, Resolver, SpecError, Uninitialized};
 use ragwort_compiler::{Core, Lambda, Place, Var};
-use ragwort_native::Globals;
 use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Value};
-use ragwort_types::string::Strings;
+use ragwort_types::string::{Strings, chars};
 use ragwort_types::symbol::{Symbol, Symbols};
 use ragwort_types::syntax::{Abbreviation, Syntax, SyntaxContext, SyntaxMeta, SyntaxSpan};
-use ragwort_vm::Machine;
-use ragwort_vm::objects::{Global, GlobalFields};
+use ragwort_vm::{HostDef, Machine};
+use ragwort_vm::objects::Module;
 
 use crate::case::{Built, Compiled};
 use crate::scope::{BASE, Map, Op, Scope, Set, TOP};
@@ -41,6 +41,8 @@ pub(crate) enum Form {
     Begin,
     Let,
     Letrec,
+    Require,
+    Provide,
     DefineSyntax,
     LetSyntax,
     LetrecSyntax,
@@ -88,7 +90,7 @@ pub(crate) enum Keyword {
     Aux(Aux),
 }
 
-const KEYWORDS: [(&str, Keyword); 36] = [
+const KEYWORDS: [(&str, Keyword); 38] = [
     ("quote", Keyword::Form(Form::Quote)),
     ("if", Keyword::Form(Form::If)),
     ("lambda", Keyword::Form(Form::Lambda)),
@@ -98,6 +100,8 @@ const KEYWORDS: [(&str, Keyword); 36] = [
     ("let", Keyword::Form(Form::Let)),
     ("letrec", Keyword::Form(Form::Letrec)),
     ("letrec*", Keyword::Form(Form::Letrec)),
+    ("require", Keyword::Form(Form::Require)),
+    ("provide", Keyword::Form(Form::Provide)),
     ("define-syntax", Keyword::Form(Form::DefineSyntax)),
     ("let-syntax", Keyword::Form(Form::LetSyntax)),
     ("letrec-syntax", Keyword::Form(Form::LetrecSyntax)),
@@ -131,11 +135,12 @@ const KEYWORDS: [(&str, Keyword); 36] = [
 pub(crate) enum Binding<'gc> {
     Keyword(Keyword),
     Local(Var),
-    Global(Gc<'gc, Global>),
-    /// A global of the prelude's, which code outside it can't assign.
-    Import(Gc<'gc, Global>),
-    /// No binding: a global of the code's own named so, or of the prelude's if `base`.
-    Free { base: bool },
+    /// A variable of the module's own.
+    Slot(u32),
+    /// What the module requires, which code can't assign.
+    Import(Import<'gc>),
+    /// No binding.
+    Free,
     /// A macro defined in this load: the index of its transformer.
     Macro(u32),
     /// A pattern variable of `syntax-case`, which only `syntax` refers to: the local that holds
@@ -150,27 +155,39 @@ pub(crate) struct Ambiguous;
 enum Head {
     Define(Stx),
     DefineSyntax(Stx),
+    Require(Stx),
+    Provide(Stx),
     Begin(Vec<Stx>),
     Expr(Stx),
 }
 
-/// A top-level form, with what it defines bound.
-pub(crate) enum Top<'gc> {
-    Define(Gc<'gc, Global>, Stx),
+/// A top-level form of a module's Scheme, with what it defines bound, to [`Expander::lower`].
+pub struct Top(TopForm);
+
+enum TopForm {
+    /// The module variable's slot, and its value.
+    Define(u32, Stx),
     Expr(Stx),
 }
 
-pub(crate) struct Expander<'a, 'gc> {
+/// Expands the Scheme files of a module, into a [`ModuleBuilder`] other front ends can build it
+/// with too: first [`Expander::declare`] each of their forms, then [`Expander::provide`] and start
+/// the module, then [`Expander::lower`] each, in order, and [`Expander::finish`].
+pub struct Expander<'a, 'gc> {
     pub(crate) mc: &'a Mutation<'gc>,
     strings: Strings<'a, 'gc>,
     symbols: Symbols<'gc>,
     pub(crate) tree: Tree<'a, 'gc>,
     keywords: Map<u64, Keyword>,
-    globals: Globals<'gc>,
-    prelude: Globals<'gc>,
-    /// The globals of each table, by their names' words.
-    user_cells: Map<u64, Gc<'gc, Global>>,
-    base_cells: Map<u64, Gc<'gc, Global>>,
+    /// The module being expanded, which what's read in just the top-level scope refers to by
+    /// name, and the prelude's exports, which the base bindings are.
+    builder: ModuleBuilder<'gc>,
+    base_cells: Map<u64, Import<'gc>>,
+    /// The `provide`s, which name what the module defines anywhere.
+    provides: Vec<Stx>,
+    /// The top-level form being expanded, and the variable whose lambda it's in, if it's one.
+    form: u32,
+    defining: Option<u32>,
     /// The bindings made in this load, with the scopes each was made in, by the newest of those
     /// scopes and the name's word. An identifier's bindings are under its own scopes.
     bindings: Map<(Scope, u64), Vec<(Set, Binding<'gc>)>>,
@@ -203,25 +220,42 @@ fn key<'gc>(symbol: Symbol<'gc>, mc: &Mutation<'gc>) -> u64 {
 }
 
 impl<'a, 'gc> Expander<'a, 'gc> {
-    pub(crate) fn new(mc: &'a Mutation<'gc>, symbols: Symbols<'gc>, globals: Globals<'gc>, prelude: Globals<'gc>) -> Result<Self, ExpandError> {
+    /// An expander of the Scheme files of the module named `name`, whose native files call
+    /// `hosts`. It requires the `prelude` module, which has run and whose exports the base
+    /// bindings are, implicitly, then each of `implicit`, whose exports shadow what those before
+    /// it export.
+    pub fn new(
+        mc: &'a Mutation<'gc>,
+        symbols: Symbols<'gc>,
+        prelude: Gc<'gc, Module>,
+        name: &str,
+        hosts: &'static [HostDef],
+        implicit: &[Gc<'gc, Module>],
+    ) -> Result<Self, ExpandError> {
         let strings = Strings::new(mc);
         let intern = |name: &str| symbols.intern_str(&strings, name);
+        let mut builder = ModuleBuilder::new(intern(name)?.value(mc), hosts);
+        for &module in std::iter::once(&prelude).chain(implicit) {
+            builder.require_implicitly(mc, symbols, module).map_err(|_| OutOfMemory)?;
+        }
         let keywords = KEYWORDS.iter().map(|&(name, k)| Ok((key(intern(name)?, mc), k))).collect::<Result<_, ragwort_types::Error>>()?;
         let abbreviations = Abbreviation::ALL.iter().map(|a| intern(a.name())).collect::<Result<_, _>>()?;
         let mut tree = Tree::new(mc, abbreviations);
         let top = tree.scopes.set(vec![TOP])?;
         let base = tree.scopes.set(vec![BASE])?;
-        let cells = |table: Globals<'gc>| table.iter(mc).map(|g| (g.name(mc).to_bits(), g)).collect();
+        let exports = Imports::all(mc, prelude).unwrap_or_default().0;
+        let base_cells = exports.into_iter().map(|(name, import)| Ok((key(intern(&name)?, mc), import))).collect::<Result<_, ragwort_types::Error>>()?;
         Ok(Self {
             mc,
             strings,
             symbols,
             tree,
             keywords,
-            globals,
-            prelude,
-            user_cells: cells(globals),
-            base_cells: cells(prelude),
+            builder,
+            base_cells,
+            provides: Vec::new(),
+            form: 0,
+            defining: None,
             bindings: Map::default(),
             bound_in: Map::default(),
             top,
@@ -255,8 +289,13 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         }
     }
 
+    /// The module, which the other front ends build it with.
+    pub fn builder(&mut self) -> &mut ModuleBuilder<'gc> {
+        &mut self.builder
+    }
+
     /// What the reader read, in the top-level scope.
-    pub(crate) fn read(&mut self, node: Syntax<'gc>) -> Result<Stx, ExpandError> {
+    fn read(&mut self, node: Syntax<'gc>) -> Result<Stx, ExpandError> {
         let span = node.span(self.mc);
         let stx = self.tree.read(node, MAX_DATA_DEPTH).map_err(|e| {
             let kind = if e == TreeError::TooDeep { ExpandErrorKind::TooDeep } else { OutOfMemory.into() };
@@ -265,33 +304,154 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         Ok(self.tree.with(stx, TOP, Op::Add)?)
     }
 
-    /// Binds what `form`, read at the top level, defines, and adds what it holds to `out`.
-    pub(crate) fn top(&mut self, form: Stx, out: &mut Vec<Top<'gc>>) -> Result<(), ExpandError> {
-        let mut queue = vec![form];
+    /// Binds what `node`, a form the reader read, defines, requires from `resolver` or provides,
+    /// and adds what it holds to `out`, the module's top-level forms from its `first` on.
+    pub fn declare(&mut self, node: Syntax<'gc>, first: u32, out: &mut Vec<Top>, resolver: &mut dyn Resolver<'gc>) -> Result<(), ExpandError> {
+        let mut queue = vec![self.read(node)?];
         while let Some(form) = queue.pop() {
             match self.head(form)? {
                 Head::Define(form) => {
                     let (id, value) = self.definition(form)?;
-                    let cell = self.define_top(id)?;
-                    out.push(Top::Define(cell, value));
+                    let index = u32::try_from(out.len()).ok().and_then(|n| first.checked_add(n)).ok_or_else(|| self.error(OutOfMemory, form))?;
+                    let slot = self.define_top(id, index)?;
+                    out.push(Top(TopForm::Define(slot, value)));
                 }
                 Head::DefineSyntax(form) => {
                     let (id, m) = self.define_syntax(form)?;
                     self.bind(id, Binding::Macro(m))?;
                 }
+                Head::Require(form) => {
+                    for spec in self.proper(form)?.into_iter().skip(1) {
+                        let imports = self.spec(spec)?.imports(self.mc, resolver, self.builder.name()).map_err(|e| match e {
+                            SpecError::Resolve(at) => self.error(ExpandErrorKind::Resolve, at),
+                            SpecError::NotProvided(at) => self.error(ExpandErrorKind::NotProvided, at),
+                        })?;
+                        self.builder.require(self.mc, self.symbols, imports).map_err(|e| self.module_error(e, spec))?;
+                    }
+                }
+                Head::Provide(form) => self.provides.push(form),
                 Head::Begin(forms) => queue.extend(forms.into_iter().rev()),
-                Head::Expr(e) => out.push(Top::Expr(e)),
+                Head::Expr(e) => out.push(Top(TopForm::Expr(e))),
             }
         }
         Ok(())
     }
 
-    pub(crate) fn lower(&mut self, top: Top<'gc>) -> Result<Core<'gc>, ExpandError> {
-        self.depth = 0;
-        match top {
-            Top::Define(cell, value) => Ok(Core::DefineGlobal(cell, Box::new(self.expr(value)?))),
-            Top::Expr(e) => self.expr(e),
+    /// Exports what the module provides, once every form is declared.
+    pub fn provide(&mut self) -> Result<(), ExpandError> {
+        for form in std::mem::take(&mut self.provides) {
+            for spec in self.proper(form)?.into_iter().skip(1) {
+                if self.is_id(spec) {
+                    let symbol = self.tree.symbol(spec).expect("an identifier");
+                    let name = self.text(spec).expect("an identifier");
+                    self.builder.provide(&name, symbol.value(self.mc)).map_err(|e| self.module_error(e, spec))?;
+                    continue;
+                }
+                let items = self.proper(spec)?;
+                let word = items.first().filter(|&&head| self.is_id(head)).and_then(|&head| self.text(head));
+                match (word.as_deref(), &items[1..]) {
+                    (Some("all-defined-out"), []) => self.builder.provide_all(self.mc).map_err(|e| self.module_error(e, spec))?,
+                    (Some("rename-out"), renames) => {
+                        for &rename in renames {
+                            let (inner, external) = self.pair_of_names(rename)?;
+                            let symbol = self.tree.symbol(inner).expect("an identifier");
+                            self.builder.provide(&external, symbol.value(self.mc)).map_err(|e| self.module_error(e, rename))?;
+                        }
+                    }
+                    _ => return Err(self.error(ExpandErrorKind::BadSyntax, spec)),
+                }
+            }
         }
+        Ok(())
+    }
+
+    /// The require spec `spec`.
+    fn spec(&mut self, spec: Stx) -> Result<RequireSpec<Stx>, ExpandError> {
+        if let Some(name) = self.text(spec) {
+            return Ok(RequireSpec::Module(name, spec));
+        }
+        let items = self.proper(spec)?;
+        let word = items.first().filter(|&&head| self.is_id(head)).and_then(|&head| self.text(head));
+        let named = |this: &mut Self, ids: &[Stx]| -> Result<Vec<(String, Stx)>, ExpandError> {
+            ids.iter().map(|&id| Ok((this.identifier(id)?, id))).collect()
+        };
+        Ok(match (word.as_deref(), &items[1..]) {
+            (Some("only-in"), &[inner, ref ids @ ..]) => RequireSpec::Only(Box::new(self.spec(inner)?), named(self, ids)?),
+            (Some("except-in"), &[inner, ref ids @ ..]) => RequireSpec::Except(Box::new(self.spec(inner)?), named(self, ids)?),
+            (Some("prefix-in"), &[prefix, inner]) => RequireSpec::Prefix(self.identifier(prefix)?, Box::new(self.spec(inner)?)),
+            (Some("rename-in"), &[inner, ref renames @ ..]) => {
+                let mut pairs = Vec::with_capacity(renames.len());
+                for &rename in renames {
+                    let (old, new) = self.pair_of_names(rename)?;
+                    pairs.push((self.text(old).expect("an identifier"), new, rename));
+                }
+                RequireSpec::Rename(Box::new(self.spec(inner)?), pairs)
+            }
+            _ => return Err(self.error(ExpandErrorKind::BadSyntax, spec)),
+        })
+    }
+
+    /// The identifiers in `(old new)`.
+    fn pair_of_names(&mut self, stx: Stx) -> Result<(Stx, String), ExpandError> {
+        match *self.proper(stx)?.as_slice() {
+            [old, new] if self.is_id(old) && self.is_id(new) => Ok((old, self.text(new).expect("an identifier"))),
+            _ => Err(self.error(ExpandErrorKind::BadSyntax, stx)),
+        }
+    }
+
+    /// The name of the identifier `stx`.
+    fn identifier(&mut self, stx: Stx) -> Result<String, ExpandError> {
+        if !self.is_id(stx) {
+            return Err(self.error(ExpandErrorKind::BadSyntax, stx));
+        }
+        Ok(self.text(stx).expect("an identifier"))
+    }
+
+    /// The text of `stx`, if it's an identifier or a string.
+    fn text(&mut self, stx: Stx) -> Option<String> {
+        let s = match self.tree.symbol(stx) {
+            Some(symbol) => symbol.name(self.mc),
+            None => match self.tree.view(stx).ok()? {
+                View::Datum(value) => self.strings.string(value)?,
+                _ => return None,
+            },
+        };
+        Some(chars(&self.strings, s).collect())
+    }
+
+    fn module_error(&self, e: ModuleError, stx: Stx) -> ExpandError {
+        let kind = match e {
+            ModuleError::Duplicate => ExpandErrorKind::Duplicate,
+            ModuleError::Conflict => ExpandErrorKind::Conflict,
+            ModuleError::NotDefined => ExpandErrorKind::NotDefined,
+            ModuleError::OutOfMemory => OutOfMemory.into(),
+        };
+        self.error(kind, stx)
+    }
+
+    /// Expands `top`, the module's top-level form `form`, once it's started.
+    pub fn lower(&mut self, top: Top, form: u32) -> Result<Core<'gc>, ExpandError> {
+        self.depth = 0;
+        self.form = form;
+        match top.0 {
+            TopForm::Define(slot, value) => {
+                let lambda = matches!(self.tree.view(value)?, View::List(items, None) if items.first().is_some_and(|&head| {
+                    self.is_id(head) && matches!(self.resolve(head), Ok(Binding::Keyword(Keyword::Form(Form::Lambda))))
+                }));
+                self.defining = lambda.then_some(slot);
+                let value = self.expr(value);
+                self.defining = None;
+                let value = value?;
+                self.builder.defined(slot, &value);
+                Ok(Core::Set(Place::Slot { slot, checked: false }, Box::new(value)))
+            }
+            TopForm::Expr(e) => self.expr(e),
+        }
+    }
+
+    /// The module, once its forms are compiled.
+    pub fn finish(self) -> Result<Gc<'gc, Module>, OutOfMemory> {
+        self.builder.finish(self.mc)
     }
 
     /// Whether `form` is a definition, of a variable or a macro, a `begin`, or some other
@@ -309,6 +469,8 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 Binding::Keyword(Keyword::Macro(m)) => self.transform(m, form)?,
                 Binding::Keyword(Keyword::Form(Form::Define)) => return Ok(Head::Define(form)),
                 Binding::Keyword(Keyword::Form(Form::DefineSyntax)) => return Ok(Head::DefineSyntax(form)),
+                Binding::Keyword(Keyword::Form(Form::Require)) => return Ok(Head::Require(form)),
+                Binding::Keyword(Keyword::Form(Form::Provide)) => return Ok(Head::Provide(form)),
                 Binding::Keyword(Keyword::Form(Form::Begin)) => return Ok(Head::Begin(self.proper(form)?[1..].to_vec())),
                 _ => return Ok(Head::Expr(form)),
             };
@@ -343,30 +505,17 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         }
     }
 
-    /// The global a top-level definition of `id` sets: the one of its name if it's in just the
-    /// top-level scope, or else a new one only identifiers with its scopes refer to.
-    fn define_top(&mut self, id: Stx) -> Result<Gc<'gc, Global>, ExpandError> {
-        let symbol = self.tree.symbol(id).expect("definitions bind identifiers");
+    /// The slot of the module variable a definition of `id`, in top-level form `form`, defines:
+    /// one its name refers to if it's in just the top-level scope, or else one only identifiers
+    /// with its scopes do.
+    fn define_top(&mut self, id: Stx, form: u32) -> Result<u32, ExpandError> {
+        let name = self.tree.symbol(id).expect("definitions bind identifiers").value(self.mc);
         if self.tree.scopes_of(id)? == self.top {
-            return self.cell(symbol, false);
+            return self.builder.define(name, form).map_err(|e| self.module_error(e, id));
         }
-        let cell = Global::new(self.mc, symbol.value(self.mc), Value::VOID, false)?;
-        self.bind(id, Binding::Global(cell))?;
-        Ok(cell)
-    }
-
-    /// The global named `symbol` in the code's table, or if `base`, the prelude's, made if it's
-    /// not there.
-    fn cell(&mut self, symbol: Symbol<'gc>, base: bool) -> Result<Gc<'gc, Global>, ExpandError> {
-        let (cells, table) = if base { (&mut self.base_cells, self.prelude) } else { (&mut self.user_cells, self.globals) };
-        let k = key(symbol, self.mc);
-        if let Some(&cell) = cells.get(&k) {
-            return Ok(cell);
-        }
-        let cell = Global::new(self.mc, symbol.value(self.mc), Value::VOID, false)?;
-        table.add(self.mc, cell)?;
-        cells.insert(k, cell);
-        Ok(cell)
+        let slot = self.builder.define_private(name, form).map_err(|e| self.module_error(e, id))?;
+        self.bind(id, Binding::Slot(slot))?;
+        Ok(slot)
     }
 
     /// What `id` refers to.
@@ -402,17 +551,21 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             }
             return Ok(binding);
         }
+        // What's introduced as the base's means the prelude's, whatever the module binds.
         let base = self.tree.scopes.contains(set, BASE);
-        if !base && let Some(&cell) = self.user_cells.get(&k) {
-            return Ok(Binding::Global(cell));
+        if !base && let Some(binding) = self.builder.binding(symbol.value(self.mc)) {
+            return Ok(match binding {
+                module::Binding::Slot(slot) => Binding::Slot(slot),
+                module::Binding::Import(import) => Binding::Import(import),
+            });
         }
         if let Some(&keyword) = self.keywords.get(&k) {
             return Ok(Binding::Keyword(keyword));
         }
-        if let Some(&cell) = self.base_cells.get(&k) {
-            return Ok(Binding::Import(cell));
+        if base && let Some(&import) = self.base_cells.get(&k) {
+            return Ok(Binding::Import(import));
         }
-        Ok(Binding::Free { base })
+        Ok(Binding::Free)
     }
 
     pub(crate) fn bind(&mut self, id: Stx, binding: Binding<'gc>) -> Result<(), ExpandError> {
@@ -492,6 +645,11 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                     let out = self.expand_macro(m, stx)?;
                     return self.expr(out);
                 }
+                Binding::Import(import) if tail.is_none() => {
+                    let args = self.exprs(&items[1..])?;
+                    let mc = self.mc;
+                    return import.call(mc, args, &mut || self.fresh()).map_err(|Uninitialized| self.error(ExpandErrorKind::Unbound, head));
+                }
                 _ => {}
             }
         }
@@ -518,7 +676,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 Ok(Core::If(Box::new(self.expr(test)?), Box::new(self.expr(then)?), Box::new(self.expr(other)?)))
             }
             (Form::Lambda, &[formals, ref body @ ..]) => self.lambda(stx, formals, body),
-            (Form::Define, _) => Err(self.error(ExpandErrorKind::Definition, stx)),
+            (Form::Define | Form::Require | Form::Provide, _) => Err(self.error(ExpandErrorKind::Definition, stx)),
             (Form::Set, &[id, value]) if self.is_id(id) => self.set(id, value),
             (Form::Begin, &[_, ..]) => self.sequence(&items[1..]),
             (Form::Let, &[name, _, _, ..]) if self.is_id(name) => {
@@ -538,9 +696,9 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     fn reference(&mut self, id: Stx) -> Result<Core<'gc>, ExpandError> {
         let place = match self.resolve(id)? {
             Binding::Local(var) => Place::Local(var),
-            Binding::Global(cell) => Place::Global(cell),
-            Binding::Import(cell) => Place::Import(cell),
-            Binding::Free { base } => Place::Global(self.cell(self.tree.symbol(id).expect("an identifier"), base)?),
+            Binding::Slot(slot) => self.builder.place(slot, self.form, self.defining),
+            Binding::Import(import) => return import.reference(self.mc).map_err(|Uninitialized| self.error(ExpandErrorKind::Unbound, id)),
+            Binding::Free => return Err(self.error(ExpandErrorKind::Unbound, id)),
             Binding::Macro(m) => {
                 let out = self.expand_macro(m, id)?;
                 return self.expr(out);
@@ -553,9 +711,12 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     fn set(&mut self, id: Stx, value: Stx) -> Result<Core<'gc>, ExpandError> {
         let place = match self.resolve(id)? {
             Binding::Local(var) => Place::Local(var),
-            Binding::Global(cell) => Place::Global(cell),
-            Binding::Free { base: false } => Place::Global(self.cell(self.tree.symbol(id).expect("an identifier"), false)?),
-            Binding::Import(_) | Binding::Free { base: true } => return Err(self.error(ExpandErrorKind::Immutable, id)),
+            Binding::Slot(slot) => {
+                self.builder.assign(slot);
+                self.builder.place(slot, self.form, self.defining)
+            }
+            Binding::Import(_) => return Err(self.error(ExpandErrorKind::Immutable, id)),
+            Binding::Free => return Err(self.error(ExpandErrorKind::Unbound, id)),
             Binding::Keyword(_) | Binding::Macro(_) | Binding::Pattern { .. } => return Err(self.error(ExpandErrorKind::BadSyntax, id)),
         };
         Ok(Core::Set(place, Box::new(self.expr(value)?)))
@@ -647,6 +808,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                     names.push(id);
                     self.bind(id, Binding::Macro(m))?;
                 }
+                Head::Require(form) | Head::Provide(form) => return Err(self.error(ExpandErrorKind::Definition, form)),
                 Head::Begin(forms) => queue.extend(forms.into_iter().rev()),
                 Head::Expr(e) => items.push((None, e)),
             }

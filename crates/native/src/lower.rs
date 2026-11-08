@@ -2,18 +2,16 @@
 
 use std::collections::{HashMap, HashSet};
 
+use ragwort_compiler::module::{Binding, ModuleBuilder, ModuleError, RequireSpec, Resolver, SpecError, Uninitialized};
 use ragwort_compiler::{Core, Lambda, Place, Prim, Var};
 use ragwort_types::Error;
-use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Value};
-use ragwort_types::pair::Pairs;
-use ragwort_types::string::Strings;
-use ragwort_types::symbol::Symbols;
+use ragwort_types::gc::{Mutation, OutOfMemory, Value};
+use ragwort_types::pair::{Pair, Pairs};
+use ragwort_types::string::{Strings, chars};
+use ragwort_types::symbol::{Symbol, Symbols};
 use ragwort_types::vector::Vectors;
 use ragwort_types::syntax::{Abbreviation, Syntax, SyntaxKind};
-use ragwort_vm::objects::{Global, GlobalFields};
 use ragwort_vm::{HostDef, Intrinsic, Read, Request};
-
-use crate::Globals;
 
 /// How deeply forms can nest before lowering them would take too much of the native stack.
 const MAX_DEPTH: usize = 256;
@@ -24,8 +22,25 @@ pub enum LowerErrorKind {
     NotAForm,
     /// A form whose parts aren't the ones it takes.
     BadShape,
-    /// A name bound twice by one `%let`, `%letrec` or `%lambda`.
+    /// A name bound twice by one `%let`, `%letrec` or `%lambda`, or a module that defines or
+    /// provides a name twice.
     Duplicate,
+    /// A name that's no local, definition of the module's or import.
+    Unbound,
+    /// A name the module both defines and requires, or requires as two different things.
+    Conflict,
+    /// A `%set!` of an import.
+    Immutable,
+    /// A `%define`, `%require` or `%provide` that isn't at the top level.
+    Definition,
+    /// A module the resolver doesn't have, or one it gave that no [`ModuleBuilder`] built.
+    Resolve,
+    /// A require of a name the module doesn't export.
+    NotProvided,
+    /// A provide of a name the module doesn't define.
+    NotDefined,
+    /// A reference to an export of a module that hasn't defined it yet.
+    Uninitialized,
     /// An `%intrinsic` of a name that isn't one.
     UnknownIntrinsic,
     /// A `%call-host` of a name that isn't one of the host functions the code was given.
@@ -66,7 +81,7 @@ impl From<Error> for LowerError {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Form {
     Quote,
     If,
@@ -74,7 +89,9 @@ enum Form {
     LetStar,
     Letrec,
     Set,
-    DefineGlobal,
+    Define,
+    Require,
+    Provide,
     Lambda,
     App,
     Intrinsic,
@@ -82,14 +99,16 @@ enum Form {
     CallHost,
 }
 
-const FORMS: [(&str, Form); 12] = [
+const FORMS: [(&str, Form); 14] = [
     ("%quote", Form::Quote),
     ("%if", Form::If),
     ("%let", Form::Let),
     ("%let*", Form::LetStar),
     ("%letrec", Form::Letrec),
     ("%set!", Form::Set),
-    ("%define-global", Form::DefineGlobal),
+    ("%define", Form::Define),
+    ("%require", Form::Require),
+    ("%provide", Form::Provide),
     ("%lambda", Form::Lambda),
     ("%app", Form::App),
     ("%intrinsic", Form::Intrinsic),
@@ -97,14 +116,19 @@ const FORMS: [(&str, Form); 12] = [
     ("%call-host", Form::CallHost),
 ];
 
-/// Lowers forms one at a time, numbering their variables and lambdas apart, naming globals in
-/// its [`Globals`], and calling the host functions it was given.
+/// Lowers the forms of a module's native files, into the module's builder, numbering their
+/// variables and lambdas apart: first [`Lowerer::declare`] each, then [`Lowerer::provide`] and
+/// start the module, then [`Lowerer::lower`] each, in order.
 pub struct Lowerer<'a, 'gc> {
     mc: &'a Mutation<'gc>,
     pairs: Pairs<'a, 'gc>,
-    globals: Globals<'gc>,
-    /// The globals, by their names' words.
-    cells: HashMap<u64, Gc<'gc, Global>>,
+    strings: Strings<'a, 'gc>,
+    symbols: Symbols<'gc>,
+    /// The `%provide`s, which name what the module defines anywhere.
+    provides: Vec<Syntax<'gc>>,
+    /// The top-level form being lowered, and the variable whose lambda it's in, if it's one.
+    top: u32,
+    defining: Option<u32>,
     /// The forms and the built-ins, by their names' words.
     forms: HashMap<u64, Form>,
     prims: HashMap<u64, Prim>,
@@ -121,7 +145,8 @@ pub struct Lowerer<'a, 'gc> {
 }
 
 impl<'a, 'gc> Lowerer<'a, 'gc> {
-    pub fn new(mc: &'a Mutation<'gc>, symbols: Symbols<'gc>, globals: Globals<'gc>, hosts: &'static [HostDef]) -> Result<Self, Error> {
+    /// A lowerer of code that calls the host functions `hosts`.
+    pub fn new(mc: &'a Mutation<'gc>, symbols: Symbols<'gc>, hosts: &'static [HostDef]) -> Result<Self, Error> {
         let strings = Strings::new(mc);
         let word = |name: &str| symbols.intern_str(&strings, name).map(|s| s.value(mc).to_bits());
         let forms = FORMS.iter().map(|&(name, form)| Ok((word(name)?, form))).collect::<Result<_, Error>>()?;
@@ -129,13 +154,15 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         let reads = Read::ALL.iter().map(|&r| (r.name(), Prim::Read(r)));
         let requests = Request::ALL.iter().map(|&r| (r.name(), Prim::Request(r)));
         let prims = intrinsics.chain(reads).chain(requests).map(|(name, prim)| Ok((word(name)?, prim))).collect::<Result<_, Error>>()?;
-        let cells = globals.iter(mc).map(|g| (g.name(mc).to_bits(), g)).collect();
         let hosts = hosts.iter().map(|def| Ok((word(def.name)?, def))).collect::<Result<_, Error>>()?;
         Ok(Self {
             mc,
             pairs: Pairs::new(mc),
-            globals,
-            cells,
+            strings: Strings::new(mc),
+            symbols,
+            provides: Vec::new(),
+            top: 0,
+            defining: None,
             forms,
             prims,
             hosts,
@@ -147,57 +174,202 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         })
     }
 
-    /// Lowers a form read at the top level.
-    pub fn lower(&mut self, node: Syntax<'gc>) -> Result<Core<'gc>, LowerError> {
-        self.scope.clear();
-        self.depth = 0;
-        self.expr(node)
+    /// Declares what top-level form `top`, `node`, defines, requires from `resolver` or provides.
+    pub fn declare(&mut self, builder: &mut ModuleBuilder<'gc>, node: Syntax<'gc>, top: u32, resolver: &mut dyn Resolver<'gc>) -> Result<(), LowerError> {
+        let items = match self.head(node) {
+            Some(Form::Define | Form::Require | Form::Provide) => self.list(node)?,
+            _ => return Ok(()),
+        };
+        match (self.head(node), &items[1..]) {
+            (Some(Form::Define), &[name, _]) => {
+                self.name(name)?;
+                builder.define(name.datum(self.mc), top).map_err(|e| self.module_error(e, name))?;
+            }
+            (Some(Form::Require), specs) => {
+                for &spec in specs {
+                    let imports = self.spec(spec)?.imports(self.mc, resolver, builder.name()).map_err(|e| match e {
+                        SpecError::Resolve(at) => self.error(LowerErrorKind::Resolve, at),
+                        SpecError::NotProvided(at) => self.error(LowerErrorKind::NotProvided, at),
+                    })?;
+                    builder.require(self.mc, self.symbols, imports).map_err(|e| self.module_error(e, spec))?;
+                }
+            }
+            (Some(Form::Provide), _) => self.provides.push(node),
+            _ => return Err(self.error(LowerErrorKind::BadShape, node)),
+        }
+        Ok(())
     }
 
-    fn expr(&mut self, node: Syntax<'gc>) -> Result<Core<'gc>, LowerError> {
+    /// Exports what the module provides, once every form is declared.
+    pub fn provide(&mut self, builder: &mut ModuleBuilder<'gc>) -> Result<(), LowerError> {
+        for node in std::mem::take(&mut self.provides) {
+            for spec in self.list(node)?.into_iter().skip(1) {
+                self.provide_spec(builder, spec)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Lowers top-level form `top`, `node`, if it has code to run, once the module's started.
+    pub fn lower(&mut self, builder: &mut ModuleBuilder<'gc>, node: Syntax<'gc>, top: u32) -> Result<Option<Core<'gc>>, LowerError> {
+        self.scope.clear();
+        self.depth = 0;
+        self.top = top;
+        match self.head(node) {
+            Some(Form::Require | Form::Provide) => Ok(None),
+            Some(Form::Define) => {
+                let items = self.list(node)?;
+                let &[_, name, value] = items.as_slice() else { return Err(self.error(LowerErrorKind::BadShape, node)) };
+                let Some(Binding::Slot(slot)) = builder.binding(name.datum(self.mc)) else { unreachable!("declared") };
+                self.defining = (self.head(value) == Some(Form::Lambda)).then_some(slot);
+                let value = self.expr(builder, value);
+                self.defining = None;
+                let value = value?;
+                builder.defined(slot, &value);
+                Ok(Some(Core::Set(Place::Slot { slot, checked: false }, Box::new(value))))
+            }
+            _ => self.expr(builder, node).map(Some),
+        }
+    }
+
+    /// The form `node` is, if it's a list that starts with one's name.
+    fn head(&self, node: Syntax<'gc>) -> Option<Form> {
+        if node.kind(self.mc) != Some(SyntaxKind::List) {
+            return None;
+        }
+        let head = Syntax::of(Pair::of(node.datum(self.mc))?.head(self.mc))?;
+        if head.kind(self.mc) != Some(SyntaxKind::Identifier) {
+            return None;
+        }
+        self.forms.get(&head.datum(self.mc).to_bits()).copied()
+    }
+
+    /// The require spec `spec`.
+    fn spec(&self, spec: Syntax<'gc>) -> Result<RequireSpec<Syntax<'gc>>, LowerError> {
+        if let Some(name) = self.text(spec) {
+            return Ok(RequireSpec::Module(name, spec));
+        }
+        let items = self.list(spec)?;
+        let word = items.first().and_then(|&head| self.text(head).filter(|_| head.kind(self.mc) == Some(SyntaxKind::Identifier)));
+        let named = |n: &Syntax<'gc>| -> Result<(String, Syntax<'gc>), LowerError> { Ok((self.identifier(*n)?, *n)) };
+        Ok(match (word.as_deref(), &items[1..]) {
+            (Some("only-in"), &[inner, ref names @ ..]) => RequireSpec::Only(Box::new(self.spec(inner)?), names.iter().map(named).collect::<Result<_, _>>()?),
+            (Some("except-in"), &[inner, ref names @ ..]) => RequireSpec::Except(Box::new(self.spec(inner)?), names.iter().map(named).collect::<Result<_, _>>()?),
+            (Some("prefix-in"), &[prefix, inner]) => RequireSpec::Prefix(self.identifier(prefix)?, Box::new(self.spec(inner)?)),
+            (Some("rename-in"), &[inner, ref renames @ ..]) => {
+                let renames = renames.iter().map(|&r| self.pair_of_names(r).map(|(old, new)| (old, new, r))).collect::<Result<_, _>>()?;
+                RequireSpec::Rename(Box::new(self.spec(inner)?), renames)
+            }
+            _ => return Err(self.error(LowerErrorKind::BadShape, spec)),
+        })
+    }
+
+    /// Exports what the provide spec `spec` names.
+    fn provide_spec(&mut self, builder: &mut ModuleBuilder<'gc>, spec: Syntax<'gc>) -> Result<(), LowerError> {
+        if spec.kind(self.mc) == Some(SyntaxKind::Identifier) {
+            let name = self.identifier(spec)?;
+            return builder.provide(&name, spec.datum(self.mc)).map_err(|e| self.module_error(e, spec));
+        }
+        let items = self.list(spec)?;
+        let word = items.first().filter(|head| head.kind(self.mc) == Some(SyntaxKind::Identifier)).and_then(|&head| self.text(head));
+        match (word.as_deref(), &items[1..]) {
+            (Some("all-defined-out"), []) => builder.provide_all(self.mc).map_err(|e| self.module_error(e, spec)),
+            (Some("rename-out"), renames) => {
+                for &rename in renames {
+                    let (_, external) = self.pair_of_names(rename)?;
+                    let inner = self.list(rename)?[0];
+                    builder.provide(&external, inner.datum(self.mc)).map_err(|e| self.module_error(e, rename))?;
+                }
+                Ok(())
+            }
+            _ => Err(self.error(LowerErrorKind::BadShape, spec)),
+        }
+    }
+
+    /// The names in `(old new)`.
+    fn pair_of_names(&self, node: Syntax<'gc>) -> Result<(String, String), LowerError> {
+        match self.list(node)?.as_slice() {
+            &[old, new] => Ok((self.identifier(old)?, self.identifier(new)?)),
+            _ => Err(self.error(LowerErrorKind::BadShape, node)),
+        }
+    }
+
+    /// The name of the identifier `node`.
+    fn identifier(&self, node: Syntax<'gc>) -> Result<String, LowerError> {
+        self.name(node)?;
+        self.text(node).ok_or_else(|| self.error(LowerErrorKind::BadShape, node))
+    }
+
+    /// The text of `node`, if it's an identifier or a string.
+    fn text(&self, node: Syntax<'gc>) -> Option<String> {
+        let datum = node.datum(self.mc);
+        let s = match node.kind(self.mc)? {
+            SyntaxKind::Identifier => Symbol::of(datum)?.name(self.mc),
+            SyntaxKind::Literal => self.strings.string(datum)?,
+            _ => return None,
+        };
+        Some(chars(&self.strings, s).collect())
+    }
+
+    fn module_error(&self, e: ModuleError, node: Syntax<'gc>) -> LowerError {
+        let kind = match e {
+            ModuleError::Duplicate => LowerErrorKind::Duplicate,
+            ModuleError::Conflict => LowerErrorKind::Conflict,
+            ModuleError::NotDefined => LowerErrorKind::NotDefined,
+            ModuleError::OutOfMemory => OutOfMemory.into(),
+        };
+        self.error(kind, node)
+    }
+
+    fn expr(&mut self, builder: &mut ModuleBuilder<'gc>, node: Syntax<'gc>) -> Result<Core<'gc>, LowerError> {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
             return Err(self.error(LowerErrorKind::TooDeep, node));
         }
         let core = match node.kind(self.mc) {
-            Some(SyntaxKind::Identifier) => Core::Ref(self.place(node)?),
+            Some(SyntaxKind::Identifier) => self.reference(builder, node)?,
             Some(SyntaxKind::Literal | SyntaxKind::Vector) => Core::Quote(self.datum(node)?),
             Some(SyntaxKind::Abbreviation(Abbreviation::Quote)) => Core::Quote(self.datum(self.inner(node)?)?),
-            Some(SyntaxKind::List) => self.form(node)?,
+            Some(SyntaxKind::List) => self.form(builder, node)?,
             _ => return Err(self.error(LowerErrorKind::Unsupported, node)),
         };
         self.depth -= 1;
         Ok(core)
     }
 
-    fn form(&mut self, node: Syntax<'gc>) -> Result<Core<'gc>, LowerError> {
+    fn form(&mut self, builder: &mut ModuleBuilder<'gc>, node: Syntax<'gc>) -> Result<Core<'gc>, LowerError> {
         let items = self.list(node)?;
         let form = items.first().filter(|head| head.kind(self.mc) == Some(SyntaxKind::Identifier)).and_then(|head| self.forms.get(&head.datum(self.mc).to_bits()));
         let Some(&form) = form else { return Err(self.error(LowerErrorKind::NotAForm, node)) };
         Ok(match (form, &items[1..]) {
             (Form::Quote, &[datum]) => Core::Quote(self.datum(datum)?),
-            (Form::If, &[test, then, other]) => Core::If(Box::new(self.expr(test)?), Box::new(self.expr(then)?), Box::new(self.expr(other)?)),
-            (Form::Let | Form::Letrec, &[binds, ref body @ ..]) => self.binding(matches!(form, Form::Letrec), node, binds, body)?,
-            (Form::LetStar, &[binds, ref body @ ..]) => self.sequential(node, binds, body)?,
+            (Form::If, &[test, then, other]) => Core::If(Box::new(self.expr(builder, test)?), Box::new(self.expr(builder, then)?), Box::new(self.expr(builder, other)?)),
+            (Form::Let | Form::Letrec, &[binds, ref body @ ..]) => self.binding(builder, matches!(form, Form::Letrec), node, binds, body)?,
+            (Form::LetStar, &[binds, ref body @ ..]) => self.sequential(builder, node, binds, body)?,
             (Form::Set, &[name, value]) => {
                 self.name(name)?;
-                Core::Set(self.place(name)?, Box::new(self.expr(value)?))
+                let place = self.assigned(builder, name)?;
+                Core::Set(place, Box::new(self.expr(builder, value)?))
             }
-            (Form::DefineGlobal, &[name, value]) => {
-                self.name(name)?;
-                Core::DefineGlobal(self.global(name)?, Box::new(self.expr(value)?))
-            }
-            (Form::Lambda, &[formals, ref body @ ..]) => self.lambda(node, formals, body)?,
-            (Form::App, &[f, ref args @ ..]) => Core::App(Box::new(self.expr(f)?), self.exprs(args)?),
-            (Form::Intrinsic, &[name, ref args @ ..]) => self.intrinsic(node, name, args, false)?,
-            (Form::ApplyIntrinsic, &[name, ref args @ ..]) if !args.is_empty() => self.intrinsic(node, name, args, true)?,
-            (Form::CallHost, &[name, ref args @ ..]) => self.call_host(node, name, args)?,
+            (Form::Define | Form::Require | Form::Provide, _) => return Err(self.error(LowerErrorKind::Definition, node)),
+            (Form::Lambda, &[formals, ref body @ ..]) => self.lambda(builder, node, formals, body)?,
+            (Form::App, &[f, ref args @ ..]) => match self.import(builder, f) {
+                Some(import) => {
+                    let args = self.exprs(builder, args)?;
+                    let mc = self.mc;
+                    import.call(mc, args, &mut || self.fresh()).map_err(|Uninitialized| self.error(LowerErrorKind::Uninitialized, f))?
+                }
+                None => Core::App(Box::new(self.expr(builder, f)?), self.exprs(builder, args)?),
+            },
+            (Form::Intrinsic, &[name, ref args @ ..]) => self.intrinsic(builder, node, name, args, false)?,
+            (Form::ApplyIntrinsic, &[name, ref args @ ..]) if !args.is_empty() => self.intrinsic(builder, node, name, args, true)?,
+            (Form::CallHost, &[name, ref args @ ..]) => self.call_host(builder, node, name, args)?,
             _ => return Err(self.error(LowerErrorKind::BadShape, node)),
         })
     }
 
     /// A `%let`, or if `recursive`, a `%letrec`.
-    fn binding(&mut self, recursive: bool, node: Syntax<'gc>, binds: Syntax<'gc>, body: &[Syntax<'gc>]) -> Result<Core<'gc>, LowerError> {
+    fn binding(&mut self, builder: &mut ModuleBuilder<'gc>, recursive: bool, node: Syntax<'gc>, binds: Syntax<'gc>, body: &[Syntax<'gc>]) -> Result<Core<'gc>, LowerError> {
         if body.is_empty() {
             return Err(self.error(LowerErrorKind::BadShape, node));
         }
@@ -211,16 +383,16 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         self.distinct(&names)?;
         // A `%letrec`'s names are in scope in its inits, a `%let`'s only in its body.
         let vars = if recursive { self.bind(&names) } else { Vec::new() };
-        let inits = pairs.iter().map(|&(_, init)| self.expr(init)).collect::<Result<Vec<_>, _>>()?;
+        let inits = pairs.iter().map(|&(_, init)| self.expr(builder, init)).collect::<Result<Vec<_>, _>>()?;
         let vars = if recursive { vars } else { self.bind(&names) };
-        let body = self.body(body)?;
+        let body = self.body(builder, body)?;
         self.unbind(&names);
         let binds = vars.into_iter().zip(inits).collect();
         Ok(if recursive { Core::Letrec(binds, Box::new(body)) } else { Core::Let(binds, Box::new(body)) })
     }
 
     /// A `%let*`: nested `%let`s of one binding each, so each init sees the names before it.
-    fn sequential(&mut self, node: Syntax<'gc>, binds: Syntax<'gc>, body: &[Syntax<'gc>]) -> Result<Core<'gc>, LowerError> {
+    fn sequential(&mut self, builder: &mut ModuleBuilder<'gc>, node: Syntax<'gc>, binds: Syntax<'gc>, body: &[Syntax<'gc>]) -> Result<Core<'gc>, LowerError> {
         if body.is_empty() {
             return Err(self.error(LowerErrorKind::BadShape, node));
         }
@@ -229,11 +401,11 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             let bind = self.list(bind)?;
             let &[name, init] = bind.as_slice() else { return Err(self.error(LowerErrorKind::BadShape, binds)) };
             let name = self.name(name)?;
-            let init = self.expr(init)?;
+            let init = self.expr(builder, init)?;
             lets.extend(self.bind(&[name]).into_iter().zip([init]));
             names.push(name);
         }
-        let mut core = self.body(body)?;
+        let mut core = self.body(builder, body)?;
         self.unbind(&names);
         while let Some(bind) = lets.pop() {
             core = Core::Let(vec![bind], Box::new(core));
@@ -241,7 +413,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         Ok(core)
     }
 
-    fn lambda(&mut self, node: Syntax<'gc>, formals: Syntax<'gc>, body: &[Syntax<'gc>]) -> Result<Core<'gc>, LowerError> {
+    fn lambda(&mut self, builder: &mut ModuleBuilder<'gc>, node: Syntax<'gc>, formals: Syntax<'gc>, body: &[Syntax<'gc>]) -> Result<Core<'gc>, LowerError> {
         if body.is_empty() {
             return Err(self.error(LowerErrorKind::BadShape, node));
         }
@@ -260,7 +432,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         names.extend(rest);
         self.distinct(&names)?;
         let mut vars = self.bind(&names);
-        let body = self.body(body)?;
+        let body = self.body(builder, body)?;
         self.unbind(&names);
         let rest = (vars.len() > params).then(|| vars.pop()).flatten();
         let id = self.lambdas;
@@ -270,37 +442,38 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
 
     /// An `%intrinsic`, or if `spread`, an `%apply-intrinsic`, whose argument count is only known
     /// as it runs.
-    fn intrinsic(&mut self, node: Syntax<'gc>, name: Syntax<'gc>, args: &[Syntax<'gc>], spread: bool) -> Result<Core<'gc>, LowerError> {
+    fn intrinsic(&mut self, builder: &mut ModuleBuilder<'gc>, node: Syntax<'gc>, name: Syntax<'gc>, args: &[Syntax<'gc>], spread: bool) -> Result<Core<'gc>, LowerError> {
         self.name(name)?;
         let &prim = self.prims.get(&name.datum(self.mc).to_bits()).ok_or_else(|| self.error(LowerErrorKind::UnknownIntrinsic, name))?;
         if spread {
-            return Ok(Core::ApplyIntrinsic(prim, self.exprs(args)?));
+            return Ok(Core::ApplyIntrinsic(prim, self.exprs(builder, args)?));
         }
         let takes = match prim {
             Prim::Intrinsic(i) => i.arity().is_none_or(|arity| usize::from(arity) == args.len()),
             Prim::Read(r) => usize::from(r.arity()) == args.len(),
             Prim::Request(r) => r.takes(args.len()),
             Prim::Host(h) => h.takes(args.len()),
+            Prim::Slot(op, _) => op.arity() == args.len(),
         };
         if !takes {
             return Err(self.error(LowerErrorKind::Arity, node));
         }
-        Ok(Core::Intrinsic(prim, self.exprs(args)?))
+        Ok(Core::Intrinsic(prim, self.exprs(builder, args)?))
     }
 
     /// A `%call-host` of the host function named `name`.
-    fn call_host(&mut self, node: Syntax<'gc>, name: Syntax<'gc>, args: &[Syntax<'gc>]) -> Result<Core<'gc>, LowerError> {
+    fn call_host(&mut self, builder: &mut ModuleBuilder<'gc>, node: Syntax<'gc>, name: Syntax<'gc>, args: &[Syntax<'gc>]) -> Result<Core<'gc>, LowerError> {
         self.name(name)?;
         let &def = self.hosts.get(&name.datum(self.mc).to_bits()).ok_or_else(|| self.error(LowerErrorKind::UnknownHost, name))?;
         if !def.takes(args.len()) {
             return Err(self.error(LowerErrorKind::Arity, node));
         }
-        Ok(Core::Intrinsic(Prim::Host(def), self.exprs(args)?))
+        Ok(Core::Intrinsic(Prim::Host(def), self.exprs(builder, args)?))
     }
 
     /// A body's expressions, in order, as one.
-    fn body(&mut self, nodes: &[Syntax<'gc>]) -> Result<Core<'gc>, LowerError> {
-        let mut cores = self.exprs(nodes)?;
+    fn body(&mut self, builder: &mut ModuleBuilder<'gc>, nodes: &[Syntax<'gc>]) -> Result<Core<'gc>, LowerError> {
+        let mut cores = self.exprs(builder, nodes)?;
         let mut body = cores.pop().expect("bodies aren't empty");
         while let Some(core) = cores.pop() {
             body = Core::Let(vec![(self.fresh(), core)], Box::new(body));
@@ -308,8 +481,8 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         Ok(body)
     }
 
-    fn exprs(&mut self, nodes: &[Syntax<'gc>]) -> Result<Vec<Core<'gc>>, LowerError> {
-        nodes.iter().map(|&node| self.expr(node)).collect()
+    fn exprs(&mut self, builder: &mut ModuleBuilder<'gc>, nodes: &[Syntax<'gc>]) -> Result<Vec<Core<'gc>>, LowerError> {
+        nodes.iter().map(|&node| self.expr(builder, node)).collect()
     }
 
     /// The quoted datum `node` reads as, without its syntax.
@@ -346,24 +519,44 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         Ok(datum)
     }
 
-    /// What `name`, an identifier, refers to.
-    fn place(&mut self, name: Syntax<'gc>) -> Result<Place<'gc>, LowerError> {
-        match self.scope.get(&name.datum(self.mc).to_bits()).and_then(|vars| vars.last()) {
-            Some(&var) => Ok(Place::Local(var)),
-            None => Ok(Place::Global(self.global(name)?)),
+    /// What `name`, an identifier, refers to: the innermost local of that name, or else the
+    /// module's variable, or else its import.
+    fn resolve(&self, builder: &ModuleBuilder<'gc>, name: Syntax<'gc>) -> Result<Result<Var, Binding<'gc>>, LowerError> {
+        if let Some(&var) = self.scope.get(&name.datum(self.mc).to_bits()).and_then(|vars| vars.last()) {
+            return Ok(Ok(var));
+        }
+        builder.binding(name.datum(self.mc)).map(Err).ok_or_else(|| self.error(LowerErrorKind::Unbound, name))
+    }
+
+    fn reference(&mut self, builder: &mut ModuleBuilder<'gc>, name: Syntax<'gc>) -> Result<Core<'gc>, LowerError> {
+        Ok(match self.resolve(builder, name)? {
+            Ok(var) => Core::Ref(Place::Local(var)),
+            Err(Binding::Slot(slot)) => Core::Ref(builder.place(slot, self.top, self.defining)),
+            Err(Binding::Import(import)) => import.reference(self.mc).map_err(|Uninitialized| self.error(LowerErrorKind::Uninitialized, name))?,
+        })
+    }
+
+    /// The place a `%set!` of `name` assigns.
+    fn assigned(&mut self, builder: &mut ModuleBuilder<'gc>, name: Syntax<'gc>) -> Result<Place, LowerError> {
+        match self.resolve(builder, name)? {
+            Ok(var) => Ok(Place::Local(var)),
+            Err(Binding::Slot(slot)) => {
+                builder.assign(slot);
+                Ok(builder.place(slot, self.top, self.defining))
+            }
+            Err(Binding::Import(_)) => Err(self.error(LowerErrorKind::Immutable, name)),
         }
     }
 
-    /// The global named by `name`, made if no code has named it yet.
-    fn global(&mut self, name: Syntax<'gc>) -> Result<Gc<'gc, Global>, LowerError> {
-        let symbol = name.datum(self.mc);
-        if let Some(&global) = self.cells.get(&symbol.to_bits()) {
-            return Ok(global);
+    /// The import `f` names, if it's an identifier that names one.
+    fn import(&self, builder: &ModuleBuilder<'gc>, f: Syntax<'gc>) -> Option<ragwort_compiler::module::Import<'gc>> {
+        if f.kind(self.mc) != Some(SyntaxKind::Identifier) {
+            return None;
         }
-        let global = Global::new(self.mc, symbol, Value::VOID, false).map_err(|e| self.error(e, name))?;
-        self.globals.add(self.mc, global).map_err(|e| self.error(e, name))?;
-        self.cells.insert(symbol.to_bits(), global);
-        Ok(global)
+        match self.resolve(builder, f) {
+            Ok(Err(Binding::Import(import))) => Some(import),
+            _ => None,
+        }
     }
 
     fn bind(&mut self, names: &[Syntax<'gc>]) -> Vec<Var> {

@@ -4,11 +4,12 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use ragwort_scheme::{load, prelude};
-use ragwort_native::Globals;
+use ragwort_compiler::module::NoModules;
+use ragwort_scheme::{PRELUDE, PRELUDE_NAME, load};
 use ragwort_types::gc::{Arena, Mutation, Value};
 use ragwort_types::symbol::Symbols;
 use ragwort_types::syntax::SyntaxSession;
+use ragwort_vm::objects::Module;
 use ragwort_vm::{MIN_SEGMENT, Machine, Outcome};
 
 const N: i64 = 10_000_000;
@@ -67,16 +68,16 @@ fn run<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Value<'gc> {
     }
 }
 
-/// An arena with the symbol table in root 0, the code's globals in 1 and the prelude's in 2.
+/// An arena with the symbol table in root 0 and the prelude's module in 1, once it's run.
 fn arena() -> Arena {
-    let mut arena = Arena::new(1 << 28, 3);
+    let mut arena = Arena::new(1 << 28, 2);
     arena.mutate(|mc| {
         let symbols = Symbols::with_seed(mc, 1).expect("table");
-        let base = Globals::new(mc).expect("globals");
         mc.set_root(0, symbols.value(mc));
-        mc.set_root(1, Globals::new(mc).expect("globals").value(mc));
-        mc.set_root(2, base.value(mc));
-        for thunk in prelude(mc, symbols, base).expect("prelude") {
+        let session = SyntaxSession::named(mc, "prelude", PRELUDE).expect("session");
+        let loaded = ragwort_native::load(mc, symbols, PRELUDE_NAME, &[], &[&session], &mut NoModules).expect("prelude");
+        mc.set_root(1, Value::object(mc, loaded.module));
+        for thunk in loaded.thunks {
             run(mc, thunk);
         }
     });
@@ -92,13 +93,15 @@ fn time(text: &str, native: bool, run_all: bool) -> Duration {
         arena.collect();
         let (loaded, mut machine) = arena.mutate(|mc| {
             let symbols = Symbols::of(mc.root(0)).expect("table");
-            let (globals, base) = (Globals::of(mc, mc.root(1)).expect("globals"), Globals::of(mc, mc.root(2)).expect("globals"));
+            let prelude = mc.root(1).downcast::<Module>(mc).expect("the prelude");
             let session = SyntaxSession::new(mc, text).expect("session");
             let start = Instant::now();
-            let mut thunks = match native {
-                true => ragwort_native::load(mc, symbols, globals, &[], &session).expect("load"),
-                false => load(mc, symbols, globals, base, &session).expect("load"),
+            let loaded = if native {
+                ragwort_native::load(mc, symbols, "main", &[], &[&session], &mut NoModules).expect("load")
+            } else {
+                load(mc, symbols, prelude, "main", &[&session], &[], &mut NoModules).expect("load")
             };
+            let mut thunks = loaded.thunks;
             let loaded = start.elapsed();
             let last = thunks.pop().expect("a form");
             for thunk in thunks {
@@ -132,7 +135,7 @@ fn main() {
 
     let base = format!("(define (count n) (if (eqv? n 0) 0 (count (+ n -1)))) (count {N})");
     let native = format!(
-        "(%define-global count (%lambda (n) (%if (%intrinsic eqv? n 0) 0 (%app count (%intrinsic + n -1))))) (%app count {N})"
+        "(%define count (%lambda (n) (%if (%intrinsic eqv? n 0) 0 (%app count (%intrinsic + n -1))))) (%app count {N})"
     );
     let per = |d: Duration| d.as_secs_f64() * 1e9 / N as f64;
     println!("countdown through the prelude: {:.1} ns per iteration", per(time(&base, false, true)));

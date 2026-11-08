@@ -87,7 +87,7 @@ impl<'gc> Expander<'_, 'gc> {
         let core = self.expr(expr)?;
         let thunk = compile(self.mc, None, &core).map_err(|e| match e {
             // It refers to a variable of the code around it, which isn't there yet.
-            CompileError::Unbound(_) => self.error(ExpandErrorKind::Phase, expr),
+            CompileError::Unbound(_) | CompileError::UnknownSlot(_) => self.error(ExpandErrorKind::Phase, expr),
             _ => self.error(ExpandErrorKind::Transformer, at),
         })?;
         let transformer = self.run(thunk, &[], at)?;
@@ -188,7 +188,7 @@ impl<'gc> Expander<'_, 'gc> {
         let symbol = Symbol::of(id.datum(mc)).ok_or_else(|| self.error(ExpandErrorKind::Transformer, at))?;
         let set = self.set_of(id.context(mc), id.span(mc))?;
         let binding = self.resolve_name(symbol, set).map_err(|_| self.error_at(ExpandErrorKind::Ambiguous, id.span(mc)))?;
-        Ok((binding, matches!(binding, Binding::Free { .. } | Binding::Global(_) | Binding::Import(_)).then_some(symbol)))
+        Ok((binding, matches!(binding, Binding::Free | Binding::Slot(_) | Binding::Import(_)).then_some(symbol)))
     }
 
     /// A fresh identifier for each element of the list `list`, named as it is if it's an

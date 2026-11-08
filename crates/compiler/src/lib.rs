@@ -2,12 +2,12 @@
 //!
 //! Each pass either simplifies within an intermediate representation or reduces the grammar by
 //! eliminating forms:
-//! 1. `lower`: validates [`Core`] and lowers `DefineGlobal`, `Place::Global`, and
-//!    `Place::Import` to explicit intrinsics and constants, producing [`ir::L1`].
+//! 1. `lower`: validates [`Core`] and lowers module variables (`Place::Slot`) to slot
+//!    primitives, producing [`ir::L1`].
 //! 2. `letrec`: Waddell–Sarkar–Dybvig `letrec` / `letrec*` fixing (`L1 -> L2`), replacing
 //!    `Letrec` with `Let`, `Fix` (SCCs of unassigned mutually recursive lambdas), `Seq`, and `Set`.
-//! 3. `cp0`: source-level optimizer (`L2 -> L2`) performing copy/constant propagation, prelude
-//!    procedure call lowering, pure intrinsic constant folding, beta-reduction, local procedure
+//! 3. `cp0`: source-level optimizer (`L2 -> L2`) performing copy/constant propagation,
+//!    pure intrinsic constant folding, beta-reduction, local procedure
 //!    inlining, conditional simplification, and dead-binding elimination.
 //! 4. `assign`: assignment conversion (`L2 -> L3`), rewriting only mutated (`Set`) variables into
 //!    explicit `MakeBox` / `Unbox` / `SetBox` intrinsics so all variables in [`ir::L3`] are
@@ -23,6 +23,7 @@ mod cp0;
 pub mod ir;
 mod letrec;
 mod lower;
+pub mod module;
 
 #[cfg(test)]
 #[path = "tests/compile.rs"]
@@ -31,7 +32,7 @@ mod tests;
 use std::fmt;
 
 use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Value};
-use ragwort_vm::objects::{Global, Module};
+use ragwort_vm::objects::Module;
 use ragwort_vm::{HostDef, Intrinsic, Read, Request};
 
 /// A local variable, numbered by the expander so no two bindings share one.
@@ -39,11 +40,11 @@ use ragwort_vm::{HostDef, Intrinsic, Read, Request};
 pub struct Var(pub u32);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Place<'gc> {
+pub enum Place {
     Local(Var),
-    Global(Gc<'gc, Global>),
-    /// A global of the prelude's, which code outside the prelude cannot assign or redefine.
-    Import(Gc<'gc, Global>),
+    /// Variable `slot` of the module the code is compiled into. Unless `checked`, the front end
+    /// knows it's defined wherever this runs, and a [`Core::Set`] of it is its definition.
+    Slot { slot: u32, checked: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +54,28 @@ pub enum Prim {
     Request(Request),
     /// A host function, from a static table, which the code's module carries.
     Host(&'static HostDef),
+    /// An access of variable `slot` of the code's module, which [`Place::Slot`] lowers to.
+    Slot(SlotOp, u32),
+}
+
+/// What a [`Prim::Slot`] does: a load takes no arguments and a store one, its value. A checked
+/// one faults if the variable isn't defined yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotOp {
+    Load,
+    LoadChecked,
+    Store,
+    StoreChecked,
+}
+
+impl SlotOp {
+    /// How many arguments it takes.
+    pub fn arity(self) -> usize {
+        match self {
+            SlotOp::Load | SlotOp::LoadChecked => 0,
+            SlotOp::Store | SlotOp::StoreChecked => 1,
+        }
+    }
 }
 
 /// A function parameterization and body parameterized over an IR expression type `E`.
@@ -72,7 +95,7 @@ pub type Lambda<'gc> = Func<Core<'gc>>;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Core<'gc> {
     Quote(Value<'gc>),
-    Ref(Place<'gc>),
+    Ref(Place),
     If(Box<Core<'gc>>, Box<Core<'gc>>, Box<Core<'gc>>),
     /// Parallel bindings: none of the `Var`s are in scope in the right-hand sides.
     Let(Vec<(Var, Core<'gc>)>, Box<Core<'gc>>),
@@ -80,9 +103,7 @@ pub enum Core<'gc> {
     /// right-hand sides and the body.
     Letrec(Vec<(Var, Core<'gc>)>, Box<Core<'gc>>),
     /// Evaluates to void.
-    Set(Place<'gc>, Box<Core<'gc>>),
-    /// Sets the [`Global`] and marks it defined, evaluating to void.
-    DefineGlobal(Gc<'gc, Global>, Box<Core<'gc>>),
+    Set(Place, Box<Core<'gc>>),
     App(Box<Core<'gc>>, Vec<Core<'gc>>),
     Lambda(Lambda<'gc>),
     Intrinsic(Prim, Vec<Core<'gc>>),
@@ -104,6 +125,8 @@ pub enum CompileError {
     TooManyConstants,
     /// A call of a host function the module the code is compiled into doesn't have.
     UnknownHost(&'static HostDef),
+    /// A variable the module the code is compiled into doesn't have.
+    UnknownSlot(u32),
     /// More parameters or spilled locals than a [`u32`] can count.
     TooManyRegisters,
     /// A call of a host function with more arguments than fit a frame.
@@ -135,8 +158,10 @@ impl fmt::Display for CompileError {
             Self::Arity(Prim::Read(r)) => write!(f, "wrong number of arguments to {}", r.name()),
             Self::Arity(Prim::Request(r)) => write!(f, "wrong number of arguments to {}", r.name()),
             Self::Arity(Prim::Host(h)) => write!(f, "wrong number of arguments to host function {}", h.name),
+            Self::Arity(Prim::Slot(_, slot)) => write!(f, "wrong number of arguments to an access of module variable {slot}"),
             Self::TooManyConstants => write!(f, "more than 2^32 constants"),
             Self::UnknownHost(h) => write!(f, "host function {} isn't one of the module's", h.name),
+            Self::UnknownSlot(slot) => write!(f, "variable {slot} isn't one of the module's"),
             Self::TooManyRegisters => write!(f, "more than 2^32 locals"),
             Self::TooManyArguments => write!(f, "a host call with more arguments than fit a frame"),
             Self::TooDeep => write!(f, "expressions nested too deeply"),
@@ -151,7 +176,7 @@ impl std::error::Error for CompileError {}
 /// [`Closure`](ragwort_vm::objects::Closure) of no arguments, ready to pass to
 /// [`ragwort_vm::Machine::new`].
 pub fn compile<'gc>(mc: &Mutation<'gc>, module: Option<Gc<'gc, Module>>, core: &Core<'gc>) -> Result<Value<'gc>, CompileError> {
-    let (l1, supply) = lower::lower_globals(mc, core)?;
+    let (l1, supply) = lower::lower(core)?;
     let (l2, supply) = letrec::fix_letrec(l1, supply);
     let (l2, supply) = cp0::optimize(mc, l2, supply);
     let (l3, _) = assign::assignment_convert(l2, supply);

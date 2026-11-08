@@ -1,21 +1,17 @@
-//! Pass 1 (`Core -> L1`): validates the input AST and lowers globals (`DefineGlobal`,
-//! `Place::Global`, `Place::Import`) into explicit intrinsics and constants.
+//! Pass 1 (`Core -> L1`): validates the input AST and lowers module variables (`Place::Slot`)
+//! into slot primitives.
 
 use std::collections::HashSet;
 
-use ragwort_types::gc::{Mutation, Value};
-use ragwort_vm::Intrinsic;
-use ragwort_vm::objects::GlobalFields;
 
 use crate::ir::{L1, Supply};
-use crate::{CompileError, Core, Func, Lambda, Place, Prim, Var};
+use crate::{CompileError, Core, Func, Lambda, Place, Prim, SlotOp, Var};
 
 /// How deeply expressions can nest before compiling them would take too much of the native stack.
 const MAX_DEPTH: usize = 256;
 
-pub(crate) fn lower_globals<'gc>(mc: &Mutation<'gc>, core: &Core<'gc>) -> Result<(L1<'gc>, Supply), CompileError> {
+pub(crate) fn lower<'gc>(core: &Core<'gc>) -> Result<(L1<'gc>, Supply), CompileError> {
     let mut pass = Lower {
-        mc,
         bound: HashSet::new(),
         scope: HashSet::new(),
         lambdas: HashSet::new(),
@@ -28,8 +24,7 @@ pub(crate) fn lower_globals<'gc>(mc: &Mutation<'gc>, core: &Core<'gc>) -> Result
     Ok((l1, supply))
 }
 
-struct Lower<'a, 'gc> {
-    mc: &'a Mutation<'gc>,
+struct Lower {
     bound: HashSet<Var>,
     scope: HashSet<Var>,
     lambdas: HashSet<u32>,
@@ -38,8 +33,8 @@ struct Lower<'a, 'gc> {
     depth: usize,
 }
 
-impl<'gc> Lower<'_, 'gc> {
-    fn expr(&mut self, core: &Core<'gc>) -> Result<L1<'gc>, CompileError> {
+impl Lower {
+    fn expr<'gc>(&mut self, core: &Core<'gc>) -> Result<L1<'gc>, CompileError> {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
             return Err(CompileError::TooDeep);
@@ -50,9 +45,8 @@ impl<'gc> Lower<'_, 'gc> {
                 self.check_bound(*v)?;
                 L1::Ref(*v)
             }
-            Core::Ref(Place::Import(g)) if g.defined(self.mc) => L1::Quote(g.value(self.mc)),
-            Core::Ref(Place::Global(g) | Place::Import(g)) => {
-                L1::Intrinsic(Prim::Intrinsic(Intrinsic::GlobalRef), vec![L1::Quote(Value::object(self.mc, *g))])
+            Core::Ref(Place::Slot { slot, checked }) => {
+                L1::Intrinsic(Prim::Slot(if *checked { SlotOp::LoadChecked } else { SlotOp::Load }, *slot), Vec::new())
             }
             Core::If(test, then, other) => L1::If(Box::new(self.expr(test)?), Box::new(self.expr(then)?), Box::new(self.expr(other)?)),
             Core::Let(binds, body) => self.let_form(binds, body)?,
@@ -61,13 +55,9 @@ impl<'gc> Lower<'_, 'gc> {
                 self.check_bound(*v)?;
                 L1::Set(*v, Box::new(self.expr(value)?))
             }
-            Core::Set(Place::Global(g) | Place::Import(g), value) => {
-                let value = self.expr(value)?;
-                L1::Intrinsic(Prim::Intrinsic(Intrinsic::GlobalSet), vec![L1::Quote(Value::object(self.mc, *g)), value])
-            }
-            Core::DefineGlobal(g, value) => {
-                let value = self.expr(value)?;
-                L1::Intrinsic(Prim::Intrinsic(Intrinsic::DefineGlobal), vec![L1::Quote(Value::object(self.mc, *g)), value])
+            Core::Set(Place::Slot { slot, checked }, value) => {
+                let op = if *checked { SlotOp::StoreChecked } else { SlotOp::Store };
+                L1::Intrinsic(Prim::Slot(op, *slot), vec![self.expr(value)?])
             }
             Core::App(f, args) => L1::App(Box::new(self.expr(f)?), self.exprs(args)?),
             Core::Lambda(f) => self.lambda_form(f)?,
@@ -77,6 +67,7 @@ impl<'gc> Lower<'_, 'gc> {
                     Prim::Read(r) => usize::from(r.arity()) == args.len(),
                     Prim::Request(r) => r.takes(args.len()),
                     Prim::Host(h) => h.takes(args.len()),
+                    Prim::Slot(op, _) => op.arity() == args.len(),
                 };
                 if !takes {
                     return Err(CompileError::Arity(*prim));
@@ -86,7 +77,7 @@ impl<'gc> Lower<'_, 'gc> {
             Core::ApplyIntrinsic(prim, args) => {
                 // A read takes a fixed number of arguments, so its prelude wrapper spreads them, and
                 // a host function's arguments must fit a frame.
-                if args.is_empty() || matches!(prim, Prim::Read(_) | Prim::Host(_)) {
+                if args.is_empty() || matches!(prim, Prim::Read(_) | Prim::Host(_) | Prim::Slot(..)) {
                     return Err(CompileError::Arity(*prim));
                 }
                 L1::ApplyIntrinsic(*prim, self.exprs(args)?)
@@ -97,7 +88,7 @@ impl<'gc> Lower<'_, 'gc> {
     }
 
     #[inline(never)]
-    fn let_form(&mut self, binds: &[(Var, Core<'gc>)], body: &Core<'gc>) -> Result<L1<'gc>, CompileError> {
+    fn let_form<'gc>(&mut self, binds: &[(Var, Core<'gc>)], body: &Core<'gc>) -> Result<L1<'gc>, CompileError> {
         for &(v, _) in binds {
             self.reserve_var(v)?;
         }
@@ -116,7 +107,7 @@ impl<'gc> Lower<'_, 'gc> {
     }
 
     #[inline(never)]
-    fn letrec_form(&mut self, binds: &[(Var, Core<'gc>)], body: &Core<'gc>) -> Result<L1<'gc>, CompileError> {
+    fn letrec_form<'gc>(&mut self, binds: &[(Var, Core<'gc>)], body: &Core<'gc>) -> Result<L1<'gc>, CompileError> {
         for &(v, _) in binds {
             self.reserve_var(v)?;
             self.scope.insert(v);
@@ -133,7 +124,7 @@ impl<'gc> Lower<'_, 'gc> {
     }
 
     #[inline(never)]
-    fn lambda_form(&mut self, f: &Lambda<'gc>) -> Result<L1<'gc>, CompileError> {
+    fn lambda_form<'gc>(&mut self, f: &Lambda<'gc>) -> Result<L1<'gc>, CompileError> {
         if !self.lambdas.insert(f.id) {
             return Err(CompileError::SameLambda(f.id));
         }
@@ -149,7 +140,7 @@ impl<'gc> Lower<'_, 'gc> {
         Ok(L1::Lambda(Func { id: f.id, params: f.params.clone(), rest: f.rest, body: Box::new(body) }))
     }
 
-    fn exprs(&mut self, exprs: &[Core<'gc>]) -> Result<Vec<L1<'gc>>, CompileError> {
+    fn exprs<'gc>(&mut self, exprs: &[Core<'gc>]) -> Result<Vec<L1<'gc>>, CompileError> {
         exprs.iter().map(|e| self.expr(e)).collect()
     }
 

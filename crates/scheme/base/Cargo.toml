@@ -8,14 +8,14 @@ ragwort-types = { path = "../../types", default-features = false }
 ragwort-reader-scheme = { path = "../reader", default-features = false }
 ragwort-vm = { path = "../../vm", default-features = false }
 ragwort-compiler = { path = "../../compiler", default-features = false }
-ragwort-native = { path = "../../native", default-features = false }
 
 [dev-dependencies]
+ragwort-native = { path = "../../native", default-features = false }
 ragwort-printer-scheme = { path = "../printer", default-features = false }
 
 [features]
 default = ["mmap"]
-mmap = ["ragwort-types/mmap", "ragwort-reader-scheme/mmap", "ragwort-vm/mmap", "ragwort-compiler/mmap", "ragwort-native/mmap"]
+mmap = ["ragwort-types/mmap", "ragwort-reader-scheme/mmap", "ragwort-vm/mmap", "ragwort-compiler/mmap"]
 
 [lints]
 workspace = true

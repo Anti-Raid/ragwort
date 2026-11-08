@@ -311,9 +311,8 @@ fn equality_goes_as_deep_as_it_should() {
         // Shared parts are compared once, not once for each way to reach them: 64 levels of
         // `(cons x x)` and `(vector x x)` have 2^64 paths each.
         let shared = |leaf, vector: bool| {
-            (0..64).fold(leaf, |x, _| match vector {
-                true => vectors.immutable_from_slice(&[x, x]).unwrap().value(mc),
-                false => pairs.cons(x, x).unwrap().value(mc),
+            (0..64).fold(leaf, |x, _| {
+                if vector { vectors.immutable_from_slice(&[x, x]).unwrap().value(mc) } else { pairs.cons(x, x).unwrap().value(mc) }
             })
         };
         for vector in [false, true] {

@@ -339,16 +339,18 @@ impl<'gc> Printer<'_, 'gc> {
         if let Some(n) = v.as_fixnum() {
             write!(self.out, "{n}")?;
         } else if let Some(s) = self.strings.string(v) {
-            match write {
-                true => self.write_string(s, '"'),
-                false => write!(self.out, "{}", string::display(&self.strings, s))?,
+            if write {
+                self.write_string(s, '"');
+            } else {
+                write!(self.out, "{}", string::display(&self.strings, s))?;
             }
         } else if let Some(symbol) = Symbol::of(v) {
             self.symbol(symbol, write)?;
         } else if let Some(c) = v.as_char() {
-            match write {
-                true => self.write_char(c),
-                false => self.out.push(c),
+            if write {
+                self.write_char(c);
+            } else {
+                self.out.push(c);
             }
         } else if let Some(z) = self.nums.number(v) {
             self.number(z)?;

@@ -2,7 +2,6 @@
 //!
 //! Performs in a single pass:
 //! - Copy and constant propagation for unassigned variables
-//! - Known prelude closure call lowering to direct [`Intrinsic`] / [`Request`] operations
 //! - Pure intrinsic constant folding
 //! - Direct beta-reduction (`((lambda (x ...) body) a ...)`)
 //! - Single-use and small local procedure inlining
@@ -11,10 +10,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ragwort_types::constant::Constants;
 use ragwort_types::gc::{Mutation, Value};
-use ragwort_vm::objects::{BytecodeFields, Closure, ClosureFields};
-use ragwort_vm::{Fuel, Intrinsic, Op};
+use ragwort_vm::{Fuel, Intrinsic};
 
 use crate::ir::{L2, Supply};
 use crate::letrec::collect_usage;
@@ -41,6 +38,7 @@ pub(crate) fn optimize<'gc>(mc: &Mutation<'gc>, expr: L2<'gc>, supply: Supply) -
         pred_facts: HashMap::new(),
         single_use: HashMap::new(),
         small_funcs: HashMap::new(),
+        known_pairs: HashMap::new(),
         inline_depth: 0,
     };
     let out = crate::letrec::prune(pass.expr(expr));
@@ -78,6 +76,9 @@ struct Cp0<'a, 'gc> {
     single_use: HashMap<Var, Func<L2<'gc>>>,
     /// Small unassigned `Let`-bound lambdas with no nested lambdas, eligible for cloning at call sites.
     small_funcs: HashMap<Var, Func<L2<'gc>>>,
+    /// Unassigned variables bound to `(cons a b)` of constants and unassigned variables. Pairs
+    /// are immutable, so the variable's car and cdr are `a` and `b` wherever it's in scope.
+    known_pairs: HashMap<Var, [L2<'gc>; 2]>,
     inline_depth: usize,
 }
 
@@ -273,6 +274,9 @@ impl<'gc> Cp0<'_, 'gc> {
                     L2::Lambda(ref func) if self.inline_depth < 4 && is_small_inlinable(func, &self.assigned) => {
                         self.small_funcs.insert(v, func.clone());
                     }
+                    L2::Intrinsic(Prim::Intrinsic(Intrinsic::Cons), ref parts) if parts.iter().all(|p| self.copyable(p)) => {
+                        self.known_pairs.insert(v, [parts[0].clone(), parts[1].clone()]);
+                    }
                     _ => {}
                 }
             }
@@ -286,6 +290,16 @@ impl<'gc> Cp0<'_, 'gc> {
         }
 
         Self::finish_let(kept, body)
+    }
+
+    /// Whether `e` can be copied to wherever its value's used: a constant, or a variable no code
+    /// assigns.
+    fn copyable(&self, e: &L2<'gc>) -> bool {
+        match e {
+            L2::Quote(_) => true,
+            L2::Ref(u) => !self.assigned.contains(u),
+            _ => false,
+        }
     }
 
     /// Unused bindings are left to [`prune`](crate::letrec::prune), which finds them all in one walk.
@@ -374,13 +388,6 @@ impl<'gc> Cp0<'_, 'gc> {
             return out;
         }
 
-        // Known prelude/imported closure call lowering: (Quote(<Closure>) arg ...)
-        if let L2::Quote(val) = f
-            && let Some(lowered) = self.lower_closure_call(val, &args)
-        {
-            return lowered;
-        }
-
         L2::App(Box::new(f), args)
     }
 
@@ -404,95 +411,6 @@ impl<'gc> Cp0<'_, 'gc> {
         self.opt_let(binds, done, body)
     }
 
-    /// Inspects a constant 0-capture [`Closure`] (such as an imported prelude procedure) and
-    /// lowers calls with matching arity directly to [`L2::Intrinsic`] or inline expressions.
-    fn lower_closure_call(&mut self, val: Value<'gc>, args: &[L2<'gc>]) -> Option<L2<'gc>> {
-        let mc = self.mc;
-        let closure = val.downcast::<Closure>(mc)?;
-        if !closure.items(mc).is_empty() {
-            return None;
-        }
-        let code = closure.code(mc)?;
-        let ops = code.ops(mc)?;
-        let arity = code.arity(mc);
-
-        if arity >= 0 {
-            if args.len() != arity as usize {
-                return None;
-            }
-            let (base, rest) = strip_arg_moves(ops, args.len())?;
-            match *rest {
-                [Op::TailCallIntrinsic { base: b, args: n, intrinsic }]
-                    if b == base && usize::from(n) == args.len() =>
-                {
-                    return Some(self.opt_intrinsic(Prim::Intrinsic(intrinsic), args.to_vec()));
-                }
-                [Op::TailCallRequest { base: b, args: n, request }]
-                    if b == base && usize::from(n) == args.len() =>
-                {
-                    return Some(L2::Intrinsic(Prim::Request(request), args.to_vec()));
-                }
-                [Op::CallRequest { base: b, args: n, request }, Op::LoadAcc { dst }, Op::Return { src }]
-                    if b == base && usize::from(n) == args.len() && dst == src =>
-                {
-                    return Some(L2::Intrinsic(Prim::Request(request), args.to_vec()));
-                }
-                [Op::TailCallRead { base: b, args: n, read }] if b == base && usize::from(n) == args.len() => {
-                    return Some(L2::Intrinsic(Prim::Read(read), args.to_vec()));
-                }
-                // `add1`/`sub1`-style wrappers: (%lambda (z) (%intrinsic + z k))
-                [Op::AddImm { dst, a, imm }, Op::Return { src }] if a == base && dst == src && args.len() == 1 => {
-                    let k = L2::Quote(Value::fixnum(i64::from(imm))?);
-                    return Some(self.opt_intrinsic(Prim::Intrinsic(Intrinsic::Add), vec![args[0].clone(), k]));
-                }
-                [Op::LoadConst { dst: d1, index }, Op::Return { src: d2 }] if d1 == d2 => {
-                    let cs = Constants::of(code.constants(mc))?;
-                    let c = cs.get(mc, index)?;
-                    return Some(args.iter().cloned().rfold(L2::Quote(c), |acc, e| L2::seq(e, acc)));
-                }
-                _ => return None,
-            }
-        }
-
-        let req = (-arity - 1) as usize;
-        if args.len() < req {
-            return None;
-        }
-        let (base, rest) = strip_arg_moves(ops, req + 1)?;
-        match *rest {
-            [Op::ApplyIntrinsic { base: b, args: m, intrinsic }, Op::LoadAcc { dst }, Op::Return { src }]
-                if b == base
-                    && dst == src
-                    && usize::from(m) == req + 1
-                    && intrinsic.arity().is_none_or(|a| usize::from(a) == args.len()) =>
-            {
-                Some(self.opt_intrinsic(Prim::Intrinsic(intrinsic), args.to_vec()))
-            }
-            [Op::TailApplyRequest { base: b, args: m, request }]
-                if b == base && usize::from(m) == req + 1 && request.takes(args.len()) =>
-            {
-                Some(L2::Intrinsic(Prim::Request(request), args.to_vec()))
-            }
-            // `list`: (%lambda xs xs)
-            [Op::Return { src: 1 }] if req == 0 && args.len() <= MAX_REST_INLINE => {
-                let list = args.iter().cloned().rfold(L2::Quote(Value::NIL), |acc, item| {
-                    self.opt_intrinsic(Prim::Intrinsic(Intrinsic::Cons), vec![item, acc])
-                });
-                Some(list)
-            }
-            // `void`: (%lambda args (%intrinsic void))
-            [Op::TailCallIntrinsic { base: b, args: 0, intrinsic: Intrinsic::Void }] if req == 0 && b >= 1 => {
-                Some(args.iter().cloned().rfold(L2::Quote(Value::VOID), |acc, e| L2::seq(e, acc)))
-            }
-            [Op::LoadConst { dst: d1, index }, Op::Return { src: d2 }] if req == 0 && d1 == d2 => {
-                let cs = Constants::of(code.constants(mc))?;
-                let c = cs.get(mc, index)?;
-                Some(args.iter().cloned().rfold(L2::Quote(c), |acc, e| L2::seq(e, acc)))
-            }
-            _ => None,
-        }
-    }
-
     fn opt_intrinsic(&mut self, prim: Prim, mut args: Vec<L2<'gc>>) -> L2<'gc> {
         let Prim::Intrinsic(intrinsic) = prim else {
             return L2::Intrinsic(prim, args);
@@ -505,6 +423,14 @@ impl<'gc> Cp0<'_, 'gc> {
             args.insert(0, *inner);
             let out = self.opt_intrinsic(prim, args);
             return L2::seq(*prefix, out);
+        }
+        // Likewise a leading `let`, whose variables are unique, so the rest can't refer to them:
+        // `(car (let ((x (f))) (cons x 1))) -> (let ((x (f))) x)`.
+        if let Some(L2::Let(_, _)) = args.first() {
+            let L2::Let(binds, inner) = args.remove(0) else { unreachable!() };
+            args.insert(0, *inner);
+            let out = self.opt_intrinsic(prim, args);
+            return Self::finish_let(binds, out);
         }
 
         // `(void e ...)` evaluates `e ...` for effect and returns `#<void>`.
@@ -546,6 +472,16 @@ impl<'gc> Cp0<'_, 'gc> {
                 args[1] = L2::Quote(neg);
                 return L2::Intrinsic(Prim::Intrinsic(Intrinsic::Add), args);
             }
+        }
+
+        // A variable known to hold a pair is the `cons` that made it, to the rules below, which
+        // then fold it away: but for `list?`, which would make the pair again.
+        if args.len() == 1
+            && (intrinsic.cxr_step().is_some() || (intrinsic.is_type_predicate() && intrinsic != Intrinsic::IsList))
+            && let L2::Ref(v) = args[0]
+            && let Some([head, tail]) = self.known_pairs.get(&v)
+        {
+            args[0] = L2::Intrinsic(Prim::Intrinsic(Intrinsic::Cons), vec![head.clone(), tail.clone()]);
         }
 
         // 2. Store-to-load forwarding for `car`..`cddddr` on `(cons head tail)` while preserving
@@ -677,25 +613,6 @@ impl<'gc> Cp0<'_, 'gc> {
 
         L2::Intrinsic(prim, args)
     }
-}
-
-/// Matches either a direct parameter slice at `base = 1` or `k` leading `Move`s copying
-/// parameters `1..=k` to `base..base + k`.
-fn strip_arg_moves(ops: &[Op], k: usize) -> Option<(u8, &[Op])> {
-    if k == 0 {
-        return Some((1, ops));
-    }
-    if let Some(Op::Move { dst: base, src: 1 }) = ops.first().copied()
-        && ops.len() >= k
-    {
-        let all_match = (0..k).all(|i| {
-            matches!(ops[i], Op::Move { dst, src } if dst == base.wrapping_add(i as u8) && src == 1 + i as u8)
-        });
-        if all_match {
-            return Some((base, &ops[k..]));
-        }
-    }
-    Some((1, ops))
 }
 
 fn func_takes<E>(func: &Func<E>, argc: usize) -> bool {

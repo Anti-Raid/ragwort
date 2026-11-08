@@ -1,4 +1,5 @@
-//! Times the run loop: a tail-recursive countdown (calls and jumps in one frame), a deep
+//! Times the run loop: a tail-recursive countdown (calls and jumps in one frame), which finds
+//! itself in a register or a module variable, checked or not, a deep
 //! non-tail sum (frames, segment overflow and underflow), and a countdown that calls a closure
 //! each time round, against one calling a host function, and one deferring to the host, which
 //! replies at once.
@@ -9,7 +10,7 @@ use std::time::Instant;
 use ragwort_types::gc::{Arena, Value};
 use ragwort_types::vector::Vectors;
 use ragwort_vm::Intrinsic::{Add, Eq};
-use ragwort_vm::objects::{Bytecode, Closure};
+use ragwort_vm::objects::{Bytecode, Closure, ModuleFields};
 use ragwort_vm::{Fault, HostArgs, HostContext, HostDef, Machine, Op, Outcome, Purity, Reply, SEGMENT, module};
 
 /// `(define (count n) (if (eq? 0 n) 0 (count (+ n -1))))`
@@ -85,6 +86,38 @@ const HOST_CALLS: &[Op] = &[
     Op::TailCall { base: 6, args: 1 },
 ];
 
+/// [`COUNT`], calling itself through variable 0 of its module, as its own definition does.
+const SLOT_COUNT: &[Op] = &[
+    Op::LoadConst { dst: 3, index: 0 },
+    Op::Move { dst: 4, src: 1 },
+    Op::CallIntrinsic { base: 3, args: 2, intrinsic: Eq },
+    Op::LoadAcc { dst: 5 },
+    Op::JumpIfFalse { test: 5, offset: 1 },
+    Op::Return { src: 3 },
+    Op::LoadConst { dst: 4, index: 1 },
+    Op::Move { dst: 3, src: 1 },
+    Op::CallIntrinsic { base: 3, args: 2, intrinsic: Add },
+    Op::LoadAcc { dst: 7 },
+    Op::LoadSlot { dst: 6, slot: 0 },
+    Op::TailCall { base: 6, args: 1 },
+];
+
+/// [`SLOT_COUNT`], checking the variable is defined.
+const CHECKED_COUNT: &[Op] = &[
+    Op::LoadConst { dst: 3, index: 0 },
+    Op::Move { dst: 4, src: 1 },
+    Op::CallIntrinsic { base: 3, args: 2, intrinsic: Eq },
+    Op::LoadAcc { dst: 5 },
+    Op::JumpIfFalse { test: 5, offset: 1 },
+    Op::Return { src: 3 },
+    Op::LoadConst { dst: 4, index: 1 },
+    Op::Move { dst: 3, src: 1 },
+    Op::CallIntrinsic { base: 3, args: 2, intrinsic: Add },
+    Op::LoadAcc { dst: 7 },
+    Op::LoadSlotChecked { dst: 6, slot: 0 },
+    Op::TailCall { base: 6, args: 1 },
+];
+
 /// `(lambda (x) x)`
 const IDENTITY: &[Op] = &[Op::Return { src: 1 }];
 
@@ -99,12 +132,13 @@ fn defer<'s, 'gc>(_: &mut HostContext<'s, 'gc>, _: HostArgs<'s, 'gc>) -> Result<
 static IDENTITY_HOST: [HostDef; 1] = [HostDef { name: "identity", arity: 1, purity: Purity::Impure, function: identity }];
 static DEFER_HOST: [HostDef; 1] = [HostDef { name: "defer", arity: 1, purity: Purity::Impure, function: defer }];
 
-/// What [`CALLS`] or [`HOST_CALLS`] calls.
+/// What [`CALLS`] or [`HOST_CALLS`] calls, or where a countdown finds itself.
 #[derive(Clone, Copy)]
 enum Callee {
     None,
     Closure,
     Host(&'static [HostDef]),
+    Slot,
 }
 
 /// Best time per call of `ops` with `n`, over a few runs, replying to each deferred call with
@@ -121,19 +155,21 @@ fn time(name: &str, ops: &'static [Op], callee: Callee, n: i64, runs: usize) {
                 Callee::Host(hosts) => hosts,
                 _ => &[],
             };
-            let owner = Some(module::new(mc, Value::FALSE, &[], hosts).expect("alloc"));
+            let owner = module::new(mc, Value::FALSE, &[fix(0)], hosts).expect("alloc");
             let closure = |ops: &'static [Op], constants| {
                 let captures = mc.frozen(Box::from([])).expect("alloc");
-                let code = Bytecode::new(mc, mc.frozen(Box::from(ops)).expect("alloc"), constants, captures, 1, owner).expect("alloc");
+                let code = Bytecode::new(mc, mc.frozen(Box::from(ops)).expect("alloc"), constants, captures, 1, Some(owner)).expect("alloc");
                 Value::object(mc, Closure::new(mc, Some(code), 0, Value::VOID).expect("alloc"))
             };
             let f = match callee {
                 Callee::None => Value::VOID,
                 Callee::Closure => closure(IDENTITY, empty),
-                Callee::Host(_) => Value::VOID,
+                Callee::Host(_) | Callee::Slot => Value::VOID,
             };
             let constants = Vectors::new(mc).immutable_from_slice(&[fix(0), fix(-1), f]).expect("alloc");
-            Machine::new(mc, SEGMENT, closure(ops, constants.value(mc)), &[fix(n)]).expect("start")
+            let count = closure(ops, constants.value(mc));
+            owner.items(mc).set(mc, 0, count);
+            Machine::new(mc, SEGMENT, count, &[fix(n)]).expect("start")
         });
         let start = Instant::now();
         while !arena
@@ -157,6 +193,8 @@ fn time(name: &str, ops: &'static [Op], callee: Callee, n: i64, runs: usize) {
 
 fn main() {
     time("tail-recursive countdown (1e7)", COUNT, Callee::None, 10_000_000, 5);
+    time("countdown through a module variable", SLOT_COUNT, Callee::Slot, 10_000_000, 5);
+    time("countdown through a checked variable", CHECKED_COUNT, Callee::Slot, 10_000_000, 5);
     time("non-tail sum, 1e6 deep", SUM, Callee::None, 1_000_000, 5);
     time("non-tail sum, 1e3 deep", SUM, Callee::None, 1_000, 2000);
     time("countdown calling a closure", CALLS, Callee::Closure, 1_000_000, 5);

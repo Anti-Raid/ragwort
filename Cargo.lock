@@ -61,6 +61,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ragwort-modules-core"
+version = "0.1.0"
+dependencies = [
+ "ragwort-compiler",
+ "ragwort-native",
+ "ragwort-printer-scheme",
+ "ragwort-reader-scheme",
+ "ragwort-scheme",
+ "ragwort-types",
+ "ragwort-vm",
+]
+
+[[package]]
 name = "ragwort-native"
 version = "0.1.0"
 dependencies = [

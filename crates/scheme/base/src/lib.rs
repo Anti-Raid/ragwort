@@ -9,15 +9,20 @@
 //! The code defines macros with `define-syntax`, `let-syntax` and `letrec-syntax`, as R6RS has
 //! them: a transformer is a procedure of the syntax of a use, which `syntax-case` takes apart
 //! and `syntax` makes, and the expander runs it in a machine as it goes. Macros last as long as
-//! the load that defines them, and their transformers see the prelude's globals, but not what's
-//! being loaded with them, which hasn't run yet.
+//! the module that defines them, and their transformers see what it requires, but not its own
+//! variables, which haven't been defined yet.
 //!
-//! Procedures such as `car` and `+` are globals the [`PRELUDE`] defines, in native ragwort. Code
-//! can define its own globals of the same names, which then shadow the prelude's in what's loaded
-//! after, but can't assign the prelude's.
+//! Code is [`load`]ed as a module, whose files are one body: its top-level definitions are all
+//! bound before any of its expressions expand, so they can refer to each other in any order, from
+//! any of its files. An [`Expander`] expands a module's Scheme files into a
+//! [`ModuleBuilder`](ragwort_compiler::module::ModuleBuilder) that
+//! other front ends can build the module with too, so a module can have files in more than one
+//! language. A name that's no local, definition or import is an error. `(require spec ...)` and `(provide spec ...)` go at the top level and take the specs
+//! native ragwort's `%require` and `%provide` do.
 //!
-//! Each [`load`] is like a module body: its top-level definitions are all bound before any of its
-//! expressions expand, so they can refer to each other in any order.
+//! Procedures such as `car` and `+` are what the [`PRELUDE`] module, in native ragwort, exports,
+//! which every Scheme module requires implicitly, and which must have run before one's expanded. A module can define its own of the same names, which
+//! shadow the prelude's, but can't assign the prelude's.
 
 mod case;
 mod convert;
@@ -33,14 +38,15 @@ mod tests;
 
 use std::fmt;
 
-use ragwort_compiler::{CompileError, compile};
-use ragwort_native::Globals;
+use ragwort_compiler::CompileError;
+use ragwort_compiler::module::{Loaded, Resolver};
 use ragwort_reader_scheme::{ReadError, Reader};
-use ragwort_types::gc::{Mutation, OutOfMemory, Value};
+use ragwort_types::gc::{Gc, Mutation, OutOfMemory};
 use ragwort_types::symbol::Symbols;
 use ragwort_types::syntax::SyntaxSession;
+use ragwort_vm::objects::Module;
 
-use crate::expand::Expander;
+pub use crate::expand::{Expander, Top};
 
 /// The prelude, in native ragwort.
 pub const PRELUDE: &str = include_str!("prelude.rg");
@@ -55,8 +61,20 @@ pub enum ExpandErrorKind {
     Definition,
     /// A body with no expression after its definitions.
     NoExpression,
-    /// A `set!` of a global of the prelude's.
+    /// A `set!` of an import.
     Immutable,
+    /// A name that's no local, definition of the module's or import, or an import of a module
+    /// that hasn't defined it yet.
+    Unbound,
+    /// A name the module both defines and requires, or requires as two different things.
+    Conflict,
+    /// A module the resolver doesn't have, or one it gave that no
+    /// [`ModuleBuilder`](ragwort_compiler::module::ModuleBuilder) built.
+    Resolve,
+    /// A require of a name the module doesn't export.
+    NotProvided,
+    /// A provide of a name the module doesn't define.
+    NotDefined,
     /// An identifier that two bindings could be, neither of whose scopes include the other's.
     Ambiguous,
     /// Syntax the expander doesn't support yet: `quasisyntax` and its unquotes, a `syntax-rules`
@@ -113,7 +131,12 @@ impl fmt::Display for ExpandError {
             ExpandErrorKind::Duplicate => "an identifier bound twice",
             ExpandErrorKind::Definition => "a definition where an expression goes",
             ExpandErrorKind::NoExpression => "a body with no expression",
-            ExpandErrorKind::Immutable => "an assignment of a prelude global",
+            ExpandErrorKind::Immutable => "an assignment of an import",
+            ExpandErrorKind::Unbound => "a name nothing defines",
+            ExpandErrorKind::Conflict => "a name both defined and required",
+            ExpandErrorKind::Resolve => "a module that can't be found",
+            ExpandErrorKind::NotProvided => "a name the module doesn't provide",
+            ExpandErrorKind::NotDefined => "a provide of a name that isn't defined",
             ExpandErrorKind::Ambiguous => "an identifier with more than one binding",
             ExpandErrorKind::Unsupported => "syntax that isn't supported yet",
             ExpandErrorKind::Transformer => "a macro's transformer that failed",
@@ -134,6 +157,12 @@ pub enum Error {
     Compile(CompileError),
 }
 
+impl From<OutOfMemory> for Error {
+    fn from(e: OutOfMemory) -> Self {
+        Error::Expand(e.into())
+    }
+}
+
 impl From<ReadError> for Error {
     fn from(e: ReadError) -> Self {
         Error::Read(e)
@@ -152,33 +181,37 @@ impl From<CompileError> for Error {
     }
 }
 
-/// Compiles the [`PRELUDE`], defining its globals in `prelude`. Returns a procedure of no
-/// arguments for each of its forms, to run in order before any code [`load`]s.
-pub fn prelude<'gc>(mc: &Mutation<'gc>, symbols: Symbols<'gc>, prelude: Globals<'gc>) -> Result<Vec<Value<'gc>>, ragwort_native::Error> {
-    let session = SyntaxSession::named(mc, "prelude", PRELUDE).map_err(|e| ragwort_native::LowerError::from(ragwort_types::Error::from(e)))?;
-    ragwort_native::load(mc, symbols, prelude, &[], &session)
-}
+/// The name of the [`PRELUDE`]'s module.
+pub const PRELUDE_NAME: &str = "ragwort/prelude";
 
-/// Reads `session`'s text, interning names in `symbols`, and expands and compiles each form in
-/// it. Its globals are named in `globals`, and those it doesn't define there are the prelude's,
-/// in `prelude`. Returns a procedure of no arguments for each top-level form, to run in order.
+/// Builds the module named `name` from the Scheme in `files`, one body across them all,
+/// interning names in `symbols`, and expands and compiles each of its forms. It requires the
+/// `prelude` module, which has run, implicitly, then each of `implicit`, whose exports shadow what
+/// those before it export, and the modules `resolver` finds as it says.
 pub fn load<'gc>(
     mc: &Mutation<'gc>,
     symbols: Symbols<'gc>,
-    globals: Globals<'gc>,
-    prelude: Globals<'gc>,
-    session: &SyntaxSession,
-) -> Result<Vec<Value<'gc>>, Error> {
-    let mut expander = Expander::new(mc, symbols, globals, prelude)?;
+    prelude: Gc<'gc, Module>,
+    name: &str,
+    files: &[&SyntaxSession],
+    implicit: &[Gc<'gc, Module>],
+    resolver: &mut dyn Resolver<'gc>,
+) -> Result<Loaded<'gc>, Error> {
+    let mut expander = Expander::new(mc, symbols, prelude, name, &[], implicit)?;
     let mut tops = Vec::new();
-    for node in Reader::new(mc, symbols, session)? {
-        let form = expander.read(node?)?;
-        expander.top(form, &mut tops)?;
+    for session in files {
+        for node in Reader::new(mc, symbols, session)? {
+            let first = u32::try_from(tops.len()).map_err(|_| OutOfMemory)?;
+            expander.declare(node?, first, &mut tops, resolver)?;
+        }
     }
+    expander.provide()?;
+    expander.builder().start(mc)?;
     let mut thunks = Vec::with_capacity(tops.len());
-    for top in tops {
-        let core = expander.lower(top)?;
-        thunks.push(compile(mc, None, &core)?);
+    for (i, top) in tops.into_iter().enumerate() {
+        let core = expander.lower(top, u32::try_from(i).map_err(|_| OutOfMemory)?)?;
+        thunks.push(expander.builder().compile(mc, &core)?);
     }
-    Ok(thunks)
+    let module = expander.finish()?;
+    Ok(Loaded { module, thunks })
 }

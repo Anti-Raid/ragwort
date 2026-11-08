@@ -14,7 +14,7 @@ use std::fmt;
 use ragwort_types::gc::{Frame, Gc, Mutation, OutOfMemory, Value};
 use ragwort_types::vector::Vectors;
 
-use crate::objects::{ExternalRef, ExternalRefFields, Module};
+use crate::objects::{ExternalRef, ExternalRefFields, Module, ModuleFields};
 use crate::{Fault, Fuel};
 
 /// A host function.
@@ -159,7 +159,20 @@ impl Eq for Deferred {}
 /// code calls `hosts`.
 pub fn new<'gc>(mc: &Mutation<'gc>, name: Value<'gc>, names: &[Value<'gc>], hosts: &'static [HostDef]) -> Result<Gc<'gc, Module>, OutOfMemory> {
     let vector = Vectors::new(mc).immutable_from_slice(names)?.value(mc);
-    Module::new(mc, name, vector, mc.frozen(hosts)?, names.len(), Value::UNDEFINED)
+    let interface: Box<dyn Any> = Box::new(());
+    Module::new(mc, name, vector, mc.frozen(hosts)?, mc.frozen(interface)?, names.len(), Value::UNDEFINED)
+}
+
+/// What the compiler knows of what `module` exports, if it's a `T`.
+pub fn interface<'gc, T: Any>(mc: &Mutation<'gc>, module: Gc<'gc, Module>) -> Option<&'gc T> {
+    module.interface(mc)?.downcast_ref()
+}
+
+/// Sets what the compiler knows of what `module` exports.
+pub fn set_interface<'gc, T: Any>(mc: &Mutation<'gc>, module: Gc<'gc, Module>, interface: T) -> Result<(), OutOfMemory> {
+    let interface: Box<dyn Any> = Box::new(interface);
+    module.set_interface(mc, mc.frozen(interface)?);
+    Ok(())
 }
 
 /// An [`ExternalRef`] of `data`, which owns `bytes` outside the arena that it's charged for,

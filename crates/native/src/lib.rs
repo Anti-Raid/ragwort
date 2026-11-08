@@ -7,7 +7,9 @@
 //! (%let ((name init) ...) body ...)
 //! (%letrec ((name init) ...) body ...)
 //! (%set! name value)
-//! (%define-global name value)
+//! (%define name value)
+//! (%require spec ...)
+//! (%provide spec ...)
 //! (%lambda (name ... . rest) body ...)   (%lambda rest body ...)
 //! (%app f arg ...)
 //! (%intrinsic name arg ...)
@@ -19,9 +21,17 @@
 //! [`HostDef`]s the code was loaded with, which only native ragwort can: other code calls the
 //! native procedures that wrap them, which pass on what they need, such as a mark.
 //!
-//! A name is the innermost local of that name in scope, or else the global of that name. A
-//! body's expressions run in order, and the last one's value is the body's. A list that doesn't
-//! start with one of the forms is an error, as calls are `%app`s.
+//! Code is loaded as a module, whose files' top-level forms are one body. A `%define`, which
+//! only goes at the top level, defines one of its variables, which code anywhere in the module
+//! can refer to, as it can to what a `%require` imports, and a `%provide` exports some. A require
+//! spec is a module's name, an identifier or a string, or `(only-in spec name ...)`,
+//! `(except-in spec name ...)`, `(prefix-in prefix spec)` or `(rename-in spec (old new) ...)`. A
+//! provide spec is a name, `(rename-out (name external) ...)` or `(all-defined-out)`.
+//!
+//! A name is the innermost local of that name in scope, or else the module's variable of that
+//! name, or else its import of it. A body's expressions run in order, and the last one's value is
+//! the body's. A list that doesn't start with one of the forms is an error, as calls are
+//! `%app`s.
 
 mod lower;
 
@@ -31,48 +41,14 @@ mod tests;
 
 pub use lower::{LowerError, LowerErrorKind, Lowerer};
 
-use ragwort_compiler::{CompileError, compile};
+use ragwort_compiler::CompileError;
+use ragwort_compiler::module::{Loaded, ModuleBuilder, Resolver};
 use ragwort_reader_scheme::{ReadError, Reader};
-use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Value};
-use ragwort_types::pair::Pairs;
-use ragwort_types::symbol::{Symbol, Symbols};
+use ragwort_types::gc::{Mutation, OutOfMemory};
+use ragwort_types::string::Strings;
+use ragwort_types::symbol::Symbols;
 use ragwort_types::syntax::SyntaxSession;
 use ragwort_vm::HostDef;
-use ragwort_vm::objects::{Box as Cell, BoxFields, Global, GlobalFields};
-
-/// The globals native code names: a cell holding a list of [`Global`]s, each named by its
-/// symbol. Keep it in a root to keep the globals from one load to the next.
-#[derive(Clone, Copy, Debug)]
-pub struct Globals<'gc>(Gc<'gc, Cell>);
-
-impl<'gc> Globals<'gc> {
-    pub fn new(mc: &Mutation<'gc>) -> Result<Self, OutOfMemory> {
-        Ok(Self(Cell::new(mc, Value::NIL)?))
-    }
-
-    pub fn of(mc: &Mutation<'gc>, v: Value<'gc>) -> Option<Self> {
-        v.downcast::<Cell>(mc).map(Self)
-    }
-
-    pub fn value(self, mc: &Mutation<'gc>) -> Value<'gc> {
-        Value::object(mc, self.0)
-    }
-
-    /// The global named `name`, if code has named it.
-    pub fn get(self, mc: &Mutation<'gc>, name: Symbol<'gc>) -> Option<Gc<'gc, Global>> {
-        self.iter(mc).find(|g| g.name(mc) == name.value(mc))
-    }
-
-    pub fn iter(self, mc: &Mutation<'gc>) -> impl Iterator<Item = Gc<'gc, Global>> {
-        Pairs::new(mc).elements(self.0.value(mc)).filter_map(|g| g.downcast::<Global>(mc))
-    }
-
-    pub fn add(self, mc: &Mutation<'gc>, global: Gc<'gc, Global>) -> Result<(), OutOfMemory> {
-        let list = Pairs::new(mc).cons(Value::object(mc, global), self.0.value(mc))?;
-        self.0.set_value(mc, list.value(mc));
-        Ok(())
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -99,16 +75,38 @@ impl From<CompileError> for Error {
     }
 }
 
-/// Reads `session`'s text, interning names in `symbols`, and compiles each form in it, naming
-/// globals in `globals` and calling the host functions in `hosts`. Returns a procedure of no
-/// arguments for each, to run in order.
-pub fn load<'gc>(mc: &Mutation<'gc>, symbols: Symbols<'gc>, globals: Globals<'gc>, hosts: &'static [HostDef], session: &SyntaxSession) -> Result<Vec<Value<'gc>>, Error> {
-    let mut lowerer = Lowerer::new(mc, symbols, globals, hosts).map_err(LowerError::from)?;
-    let module = ragwort_vm::module::new(mc, Value::FALSE, &[], hosts).map_err(CompileError::from)?;
-    let mut thunks = Vec::new();
-    for node in Reader::new(mc, symbols, session)? {
-        let core = lowerer.lower(node?)?;
-        thunks.push(compile(mc, Some(module), &core)?);
+/// Builds the module named `name` from the native ragwort in `files`, one body across them all,
+/// interning names in `symbols`. Its code can call the host functions in `hosts`, and it requires
+/// the modules `resolver` finds.
+pub fn load<'gc>(
+    mc: &Mutation<'gc>,
+    symbols: Symbols<'gc>,
+    name: &str,
+    hosts: &'static [HostDef],
+    files: &[&SyntaxSession],
+    resolver: &mut dyn Resolver<'gc>,
+) -> Result<Loaded<'gc>, Error> {
+    let name = symbols.intern_str(&Strings::new(mc), name).map_err(LowerError::from)?;
+    let mut builder = ModuleBuilder::new(name.value(mc), hosts);
+    let mut lowerer = Lowerer::new(mc, symbols, hosts).map_err(LowerError::from)?;
+    let mut forms = Vec::new();
+    for session in files {
+        for node in Reader::new(mc, symbols, session)? {
+            forms.push(node?);
+        }
     }
-    Ok(thunks)
+    let top = |i: usize| u32::try_from(i).map_err(|_| LowerError::from(ragwort_types::Error::from(OutOfMemory)));
+    for (i, &node) in forms.iter().enumerate() {
+        lowerer.declare(&mut builder, node, top(i)?, resolver)?;
+    }
+    lowerer.provide(&mut builder)?;
+    builder.start(mc).map_err(|e| LowerError::from(ragwort_types::Error::from(e)))?;
+    let mut thunks = Vec::new();
+    for (i, &node) in forms.iter().enumerate() {
+        if let Some(core) = lowerer.lower(&mut builder, node, top(i)?)? {
+            thunks.push(builder.compile(mc, &core)?);
+        }
+    }
+    let module = builder.finish(mc).map_err(CompileError::from)?;
+    Ok(Loaded { module, thunks })
 }

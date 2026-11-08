@@ -26,9 +26,6 @@ objects! {
     pub struct Closure { code: Member<Bytecode> } items Value
     /// An assigned variable, shared by the closures that capture it.
     pub struct Box { value: Value }
-    /// A global variable: its name, for messages, and its value once it's `defined`. Code holds
-    /// the ones it uses as constants.
-    pub struct Global { name: Value, value: Value, defined: bool }
     /// Frames handed to a continuation, as Chez's continuation objects hold them: slots
     /// `start..end` of `segment`, which the stack no longer writes. They end where the frame
     /// above them would start, and `link` is that frame's link, where the top one goes on.
@@ -107,9 +104,15 @@ objects! {
     }
     /// A module, which ragwort code sees only as a whole: its variables, its items, each
     /// `UNDEFINED` until it's defined, which its code's slot instructions read and write, their
-    /// names, for messages, in the immutable vector `names`, and the host functions its native
-    /// code calls, which [`Op::CallHost`] indexes.
-    pub struct Module { name: Value, names: Value, hosts: Frozen<&'static [crate::module::HostDef]> } items Value
+    /// names, for messages, in the immutable vector `names`, the host functions its native code
+    /// calls, which [`Op::CallHost`] indexes, and what the compiler knows of what it exports,
+    /// for the code that requires it.
+    pub struct Module {
+        name: Value,
+        names: Value,
+        hosts: Frozen<&'static [crate::module::HostDef]>,
+        interface: Frozen<std::boxed::Box<dyn std::any::Any>>,
+    } items Value
     /// Something of the host's, for its procedures to be passed, such as a machine's own state:
     /// `data` outside the arena, dropped once the object is collected, and `held`, which the
     /// collector traces, for what of the arena's the host keeps with it.
