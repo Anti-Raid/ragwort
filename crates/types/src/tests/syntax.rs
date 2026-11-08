@@ -18,7 +18,7 @@ fn syntax_graph_survives_collection_and_compaction() {
         let session = SyntaxSession::new(mc, "'(a . 42)").unwrap();
         let source = session.source(mc).unwrap();
         let span = SyntaxSpan::new(mc, source, 0, source.byte_len(mc) as u32).unwrap();
-        let symbol = Symbols::new(mc).unwrap().intern_str(&Strings::new(mc), "a").unwrap();
+        let symbol = Symbols::of_arena(mc).unwrap().intern_str(&Strings::new(mc), "a").unwrap();
         let node = |kind, datum| {
             let meta = SyntaxMeta::new(mc, kind, None, None).unwrap();
             Syntax::new(mc, datum, span, Some(meta)).unwrap()

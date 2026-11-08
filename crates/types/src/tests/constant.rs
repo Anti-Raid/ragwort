@@ -68,7 +68,7 @@ fn immediates_need_no_slot() {
 #[test]
 fn equal_contents_share_a_slot() {
     Arena::new(4 << 20, 1).mutate(|mc| {
-        let symbols = Symbols::new(mc).unwrap();
+        let symbols = Symbols::of_arena(mc).unwrap();
         let mut pool = ConstPool::new(mc).unwrap();
         let mut seen = HashMap::new();
         for i in 0..400 {
@@ -87,13 +87,12 @@ fn equal_contents_share_a_slot() {
 fn kinds_and_exactness_stay_apart() {
     Arena::new(1 << 20, 1).mutate(|mc| {
         let (h, n) = (Strings::new(mc), Nums::new(mc));
-        let symbols = Symbols::new(mc).unwrap();
+        let symbols = Symbols::of_arena(mc).unwrap();
         let mut pool = ConstPool::new(mc).unwrap();
         let two = n.integer(fix(2)).unwrap();
         let big = int::expt(&n, two, 1000).unwrap().value();
         let values = [
             symbols.intern_str(&h, "abcdefgh").unwrap().value(mc),
-            Symbols::new(mc).unwrap().intern_str(&h, "abcdefgh").unwrap().value(mc),
             string::from_str(&h, "abcdefgh").unwrap().value(),
             big,
             Value::flonum(mc, 2f64.powi(1000)).unwrap(),
@@ -104,7 +103,7 @@ fn kinds_and_exactness_stay_apart() {
         let consts: Vec<_> = values.iter().map(|&v| pooled(pool.add(mc, v).unwrap())).collect();
         assert_eq!(consts.iter().map(|c| c.index()).collect::<Vec<_>>(), (0..values.len() as u32).collect::<Vec<_>>());
         let again = complex::rectangular(&n, n.real(fix(1)).unwrap(), n.real(big).unwrap()).unwrap().value();
-        assert_eq!(pool.add(mc, again), Ok(Constant::Pooled(consts[6])));
+        assert_eq!(pool.add(mc, again), Ok(Constant::Pooled(consts[5])));
     });
 }
 
@@ -126,7 +125,7 @@ fn other_objects_get_a_slot_each_time() {
 fn constants_keep_their_slots_as_objects_move() {
     let mut arena = Arena::new(8 << 20, 1);
     let (mut pool, seen) = arena.mutate(|mc| {
-        let symbols = Symbols::new(mc).unwrap();
+        let symbols = Symbols::of_arena(mc).unwrap();
         mc.set_root(0, symbols.value(mc));
         let mut pool = ConstPool::new(mc).unwrap();
         let mut seen = HashMap::new();
@@ -162,7 +161,7 @@ fn constants_keep_their_slots_as_objects_move() {
 fn failed_steps_leave_the_pool_whole() {
     let mut arena = Arena::new(8 << 20, 1);
     let mut pool = arena.mutate(|mc| {
-        mc.set_root(0, Symbols::new(mc).unwrap().value(mc));
+        mc.set_root(0, Symbols::of_arena(mc).unwrap().value(mc));
         ConstPool::new(mc).unwrap()
     });
     let mut seen = HashMap::new();
@@ -197,7 +196,7 @@ fn values<'gc>(mc: &Mutation<'gc>) -> GcVec<'gc> {
 fn running_out_leaves_the_pool_whole() {
     let mut arena = Arena::new(1 << 20, 2);
     let mut pool = arena.mutate(|mc| {
-        let symbols = Symbols::new(mc).unwrap();
+        let symbols = Symbols::of_arena(mc).unwrap();
         mc.set_root(0, symbols.value(mc));
         let values = GcVec::<slot::Value>::new(mc).unwrap();
         for i in 0..50 {

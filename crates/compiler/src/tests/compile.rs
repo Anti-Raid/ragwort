@@ -445,6 +445,10 @@ fn micropass_optimizations() {
         let ops = all_ops(mc, thunk);
         assert_eq!(ops.len(), 2, "expected constant-folded [LoadConst, Return], got {ops:?}");
         assert!(matches!(ops.as_slice(), [Op::LoadConst { .. }, Op::Return { .. }]));
+        //    Comparisons fold too: (if (< 1 2 3) (<= 2 1) 0) -> #f
+        let compared = when(prim(Intrinsic::Lt, vec![q(1), q(2), q(3)]), prim(Intrinsic::Le, vec![q(2), q(1)]), q(0));
+        let ops = all_ops(mc, compile(mc, None, &compared).unwrap());
+        assert!(matches!(ops.as_slice(), [Op::LoadConst { .. }, Op::Return { .. }]), "{ops:?}");
 
         // 4. A call of an imported wrapper of an intrinsic inlines to it, so `(+ x 1)` compiles to
         //    `AddImm`, as do two calls of an imported `add1`, with no calls left.

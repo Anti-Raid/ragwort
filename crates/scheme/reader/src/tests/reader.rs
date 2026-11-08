@@ -54,6 +54,22 @@ fn identifiers_take_everything_up_to_a_delimiter() {
 }
 
 #[test]
+fn keywords_read_back_as_themselves() {
+    assert_eq!(read("#:when (f #:x 1) #:a-b?").unwrap(), ["#:when", "(f #:x 1)", "#:a-b?"]);
+    assert_eq!(read("#!fold-case #:When").unwrap(), ["#:when"]);
+    assert_eq!(read("#:|two words| #:|k|").unwrap(), ["#:|two words|", "#:k"]);
+    assert_eq!(error("(#: x)"), (ErrorKind::Unsupported, 1, 3));
+    let mut arena = arena();
+    arena.mutate(|mc| {
+        let session = SyntaxSession::new(mc, "#:k #:k k").unwrap();
+        let nodes = read_all(mc, symbols(mc), &session).unwrap();
+        assert_eq!(nodes[0].datum(mc), nodes[1].datum(mc));
+        assert_ne!(nodes[0].datum(mc), nodes[2].datum(mc));
+        assert_eq!(nodes[0].kind(mc), Some(SyntaxKind::Literal));
+    });
+}
+
+#[test]
 fn identifiers_are_interned() {
     let mut arena = arena();
     arena

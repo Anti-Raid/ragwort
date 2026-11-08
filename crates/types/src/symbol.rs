@@ -1,14 +1,14 @@
 //! Symbols: interned strings, which [`string::intern`] keeps one per name, so symbols are
 //! equal exactly when they're the same object. Each keeps its name's hash. The table holds
 //! them weakly, so a symbol nothing else reaches is collected, and interning its name again
-//! makes a new one.
+//! makes a new one. Keywords, `#:name`, are interned the same way, one for each symbol.
 
 use std::hash::{BuildHasher, RandomState};
 
 use crate::Error;
 use crate::gc::table::{Table as GcTable, WeakObjects};
 use crate::gc::{Gc, Mutation, OutOfMemory, Value};
-use crate::objects::{self, Data, InternedFields, SymFields};
+use crate::objects::{self, Data, InternedFields, KeywordFields, SymFields};
 use crate::string::{self, Str, Strings, Table};
 
 #[cfg(test)]
@@ -42,20 +42,51 @@ impl<'gc> Symbol<'gc> {
     }
 }
 
-/// The intern table, whose probing [`string::intern`] does. Keep it in a root, or in an
-/// object a root reaches.
+/// A keyword: interned, so keywords are equal exactly when they're the same object.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Keyword<'gc>(Gc<'gc, objects::Keyword>);
+
+impl<'gc> Keyword<'gc> {
+    #[inline]
+    pub fn of(v: Value<'gc>) -> Option<Self> {
+        match Data::of(v) {
+            Some(Data::Keyword(k)) => Some(Self(k)),
+            _ => None,
+        }
+    }
+
+    pub fn value(self, mc: &Mutation<'gc>) -> Value<'gc> {
+        Value::object(mc, self.0)
+    }
+
+    /// The symbol it's named as.
+    pub fn symbol(self, mc: &Mutation<'gc>) -> Symbol<'gc> {
+        Symbol(self.0.symbol(mc).expect("a keyword has its symbol"))
+    }
+}
+
+/// An arena's intern table, whose probing [`string::intern`] does. Each arena has one, which
+/// it keeps, so a name has one symbol wherever it's interned, the program's code included.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Symbols<'gc>(Gc<'gc, objects::Interned>);
 
 impl<'gc> Symbols<'gc> {
-    /// A table whose hashes are seeded at random, so which names collide can't be planned.
-    pub fn new(mc: &Mutation<'gc>) -> Result<Self, OutOfMemory> {
+    /// The arena's table. If it has none yet, it's made, its hashes seeded at random so which
+    /// names collide can't be planned.
+    pub fn of_arena(mc: &Mutation<'gc>) -> Result<Self, OutOfMemory> {
         Self::with_seed(mc, RandomState::new().hash_one(0u8))
     }
 
+    /// The arena's table, made with `seed` if it has none yet.
     pub fn with_seed(mc: &Mutation<'gc>, seed: u64) -> Result<Self, OutOfMemory> {
+        if let Some(symbols) = Self::of(Value::from_bits(mc.interned().get())) {
+            return Ok(symbols);
+        }
         let table = GcTable::<WeakObjects<objects::Sym>>::new(mc)?;
-        Ok(Self(objects::Interned::new(mc, seed, Some(table.head()))?))
+        let keywords = GcTable::<WeakObjects<objects::Keyword>>::new(mc)?;
+        let symbols = Self(objects::Interned::new(mc, seed, Some(table.head()), Some(keywords.head()))?);
+        mc.interned().set(symbols.value(mc).to_bits());
+        Ok(symbols)
     }
 
     pub fn of(v: Value<'gc>) -> Option<Self> {
@@ -82,6 +113,13 @@ impl<'gc> Symbols<'gc> {
     #[inline]
     pub fn intern_str(self, h: &Strings<'_, 'gc>, s: &str) -> Result<Symbol<'gc>, Error> {
         string::intern_str(h, &self.interner(h), s).map(Symbol)
+    }
+
+    /// The keyword named as `symbol` is.
+    pub fn keyword(self, mc: &Mutation<'gc>, symbol: Symbol<'gc>) -> Result<Keyword<'gc>, OutOfMemory> {
+        let table = GcTable::<WeakObjects<objects::Keyword>>::of(self.0.keywords(mc).expect("an intern table has its keywords"));
+        let same = |keyword: Gc<'gc, objects::Keyword>| Ok::<_, OutOfMemory>(keyword.symbol(mc) == Some(symbol.0));
+        table.find_or_insert(mc, symbol.hash(mc), same, || objects::Keyword::new(mc, Some(symbol.0))).map(Keyword)
     }
 
     #[inline]

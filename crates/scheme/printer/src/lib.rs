@@ -25,7 +25,7 @@ use ragwort_types::gc::{Gc, Mutation, Value};
 use ragwort_types::num::{ComplexHost, ComplexView, Nums, RealHost, RealView, rational};
 use ragwort_types::pair::Pair;
 use ragwort_types::string::{self, Strings};
-use ragwort_types::symbol::Symbol;
+use ragwort_types::symbol::{Keyword, Symbol};
 use ragwort_types::syntax::{Abbreviation, Syntax, SyntaxKind};
 use ragwort_types::vector::{AnyVector, Vector};
 use ragwort_vm::Fault;
@@ -346,6 +346,11 @@ impl<'gc> Printer<'_, 'gc> {
             }
         } else if let Some(symbol) = Symbol::of(v) {
             self.symbol(symbol, write)?;
+        } else if let Some(keyword) = Keyword::of(v) {
+            let name = string::display(&self.strings, keyword.symbol(self.mc).name(self.mc)).to_string();
+            self.out.push_str("#:");
+            let bars = name.is_empty() || name.bytes().any(ends_name) || name.chars().any(|c| c.is_control() || c.is_whitespace());
+            if write && bars { self.write_text(name.chars(), '|') } else { self.out.push_str(&name) }
         } else if let Some(c) = v.as_char() {
             if write {
                 self.write_char(c);

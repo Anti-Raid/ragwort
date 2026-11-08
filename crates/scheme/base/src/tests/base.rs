@@ -313,6 +313,26 @@ fn each_load_requires_the_ones_before() {
 }
 
 #[test]
+fn numbers_compare_by_value() {
+    let text = "(list (< 1 2 3) (< 1 3 2) (> 3 2 1) (<= 1 1 2) (>= 2 2 3) (= 1 1.0 1) (< 1/3 0.34) (< 1) (= 1+2i 1+2i)
+                      (< 1267650600228229401496703205376 1267650600228229401496703205377) (> +inf.0 100000000000000000000000000000000) (< +nan.0 1) (= +nan.0 +nan.0) (>= 2 1 +nan.0))";
+    assert_eq!(eval(text), "(#t #f #t #t #f #t #t #t #t #t #t #f #f #f)");
+    // Every argument's checked, though the answer's known before it.
+    assert_eq!(uncaught("(< 2 1 'x)"), "#<error WrongType>");
+    assert_eq!(uncaught("(< 1+2i 2)"), "#<error WrongType>");
+    assert_eq!(uncaught("(<)"), "#<error Arity>");
+}
+
+#[test]
+fn keywords_are_interned_values() {
+    let text = "(list '#:when (keyword? '#:when) (keyword? 'when) (eq? '#:a '#:a) (eq? '#:a (string->keyword \"a\"))
+                      (keyword->string '#:when) (equal? '(#:x 1) '(#:x 1)) (string->keyword \"two words\"))";
+    assert_eq!(eval(text), "(#:when #t #f #t #t \"when\" #t #:|two words|)");
+    // As in Racket, a keyword isn't an expression by itself.
+    assert_eq!(error("(list #:when 1)"), (BadSyntax, "#:when"));
+}
+
+#[test]
 fn bad_syntax_points_at_itself() {
     assert_eq!(error("(if)"), (BadSyntax, "(if)"));
     assert_eq!(error("(lambda (x 1) x)"), (BadSyntax, "1"));

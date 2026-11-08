@@ -17,7 +17,7 @@ fn number<'gc>(mc: &Mutation<'gc>, text: &str) -> Value<'gc> {
 }
 
 fn symbol<'gc>(mc: &Mutation<'gc>, name: &str) -> Value<'gc> {
-    let symbols = Symbols::new(mc).unwrap();
+    let symbols = Symbols::of_arena(mc).unwrap();
     symbols.intern_str(&Strings::new(mc), name).unwrap().value(mc)
 }
 

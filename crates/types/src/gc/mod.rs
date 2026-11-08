@@ -1411,7 +1411,8 @@ impl Arena {
             low: Cell::new(1),
             next: Cell::new(TYPES - 1),
             cache: [const { Cell::new((0, 0)) }; 64],
-            roots: vec![Cell::new(Value::NIL.word); roots].into_boxed_slice(),
+            // One more, after the program's, for the arena's intern table.
+            roots: vec![Cell::new(Value::NIL.word); roots + 1].into_boxed_slice(),
             stacks: RefCell::new(Vec::new()),
             handles: RefCell::new(Vec::new()),
             id: NEXT_ARENA.fetch_add(1, Ordering::Relaxed),
@@ -1738,11 +1739,18 @@ impl<'gc> Mutation<'gc> {
     }
 
     pub fn root(&self, i: usize) -> Value<'gc> {
-        Value::from_bits(self.heap.m.roots[i].get())
+        let roots = &self.heap.m.roots;
+        Value::from_bits(roots[..roots.len() - 1][i].get())
     }
 
     pub fn set_root(&self, i: usize, value: Value<'gc>) {
-        self.heap.m.roots[i].set(value.word);
+        let roots = &self.heap.m.roots;
+        roots[..roots.len() - 1][i].set(value.word);
+    }
+
+    /// The root that holds the arena's intern table, once there is one.
+    pub(crate) fn interned(&self) -> &Cell<u64> {
+        self.heap.m.roots.last().expect("the arena has a root for its intern table")
     }
 
     /// Charged its size, plus `HOST_COST`. Memory the value owns elsewhere, such as a

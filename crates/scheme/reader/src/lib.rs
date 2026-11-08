@@ -2,7 +2,8 @@
 //! reads identifiers, `|`-quoted ones too, lists
 //! in `()` or `[]`, dotted tails as in `(a b . c)`, vectors as `#(a b)`, the `'`, `` ` ``, `,`
 //! and `,@` abbreviations, and as literals booleans, numbers (complex ones too), strings,
-//! characters and bytevectors as `#u8(1 2)`, as R7RS writes them. `;` line comments, nested
+//! characters and bytevectors as `#u8(1 2)`, as R7RS writes them, and keywords as `#:name`, as
+//! Racket does. `;` line comments, nested
 //! `#| |#` block comments and `#;` datum comments are skipped, and after `#!fold-case`,
 //! identifiers and character names are read in lower case until `#!no-fold-case`.
 //!
@@ -203,6 +204,12 @@ impl<'a, 'gc> Reader<'a, 'gc> {
                     self.node(s.value(), self.literal, start)?
                 }
                 Token::Identifier(name) => self.identifier(&name, start)?,
+                Token::Keyword(name) => {
+                    let failed = |e| ReadError::new(e, start, self.at);
+                    let symbol = self.symbols.intern_str(&self.strings, &name).map_err(failed)?;
+                    let keyword = self.symbols.keyword(self.mc, symbol).map_err(|e| failed(e.into()))?;
+                    self.node(keyword.value(self.mc), self.literal, start)?
+                }
                 Token::Number(text) => {
                     let number = self.number(text, start)?.ok_or(ReadError::new(ErrorKind::BadNumber, start, self.at))?;
                     self.node(number, self.literal, start)?

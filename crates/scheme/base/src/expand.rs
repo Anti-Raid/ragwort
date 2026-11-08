@@ -635,6 +635,8 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         }
         let core = match self.tree.view(stx)? {
             View::Id => self.reference(stx)?,
+            // A keyword isn't an expression, as in Racket: it's quoted to be a value.
+            View::Datum(value) if ragwort_types::symbol::Keyword::of(value).is_some() => return Err(self.error(ExpandErrorKind::BadSyntax, stx)),
             View::Datum(value) => Core::Quote(value),
             View::Vector(_) => Core::Quote(self.strip(stx)?),
             View::List(items, tail) => self.compound(stx, &items, tail)?,

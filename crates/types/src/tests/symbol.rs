@@ -149,7 +149,38 @@ fn churn_leaves_the_table_small() {
 }
 
 #[test]
-fn tables_are_seeded_apart() {
-    let mut arena = Arena::new(1 << 20, 0);
-    arena.mutate(|mc| assert_ne!(Symbols::new(mc).unwrap().seed(mc), Symbols::new(mc).unwrap().seed(mc)));
+fn an_arena_has_one_table_seeded_apart_from_others() {
+    let seed = |arena: &mut Arena| arena.mutate(|mc| Symbols::of_arena(mc).unwrap().seed(mc));
+    let (mut a, mut b) = (Arena::new(1 << 20, 0), Arena::new(1 << 20, 0));
+    assert_ne!(seed(&mut a), seed(&mut b));
+    a.mutate(|mc| {
+        let symbols = Symbols::of_arena(mc).unwrap();
+        assert_eq!(Symbols::with_seed(mc, symbols.seed(mc) ^ 1), Ok(symbols));
+    });
+    // The arena keeps it, and what it interned, with nothing else holding them.
+    let kept = a.mutate(|mc| Symbols::of_arena(mc).unwrap().intern_str(&Strings::new(mc), "kept").unwrap().hash(mc));
+    a.collect();
+    a.mutate(|mc| assert_eq!(Symbols::of_arena(mc).unwrap().intern_str(&Strings::new(mc), "kept").unwrap().hash(mc), kept));
+}
+
+/// A name has one keyword, apart from its symbol, which a collection keeps while it's reached.
+#[test]
+fn one_keyword_per_name() {
+    let mut arena = arena();
+    arena.mutate(|mc| {
+        let (symbols, kept) = roots(mc);
+        let h = Strings::new(mc);
+        let when = symbols.keyword(mc, symbols.intern_str(&h, "when").unwrap()).unwrap();
+        assert_eq!(symbols.keyword(mc, symbols.intern_str(&h, "when").unwrap()).unwrap(), when);
+        assert_ne!(symbols.keyword(mc, symbols.intern_str(&h, "unless").unwrap()).unwrap(), when);
+        assert!(Symbol::of(when.value(mc)).is_none() && Keyword::of(when.value(mc)).is_some());
+        kept.push(mc, when.value(mc)).unwrap();
+    });
+    arena.collect();
+    arena.mutate(|mc| {
+        let (symbols, kept) = roots(mc);
+        let when = Keyword::of(kept.get(mc, 0).unwrap()).unwrap();
+        assert_eq!(display(&Strings::new(mc), when.symbol(mc).name(mc)).to_string(), "when");
+        assert_eq!(symbols.keyword(mc, when.symbol(mc)).unwrap(), when);
+    });
 }

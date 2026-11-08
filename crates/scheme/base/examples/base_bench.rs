@@ -154,6 +154,8 @@ fn main() {
     let per = |d: Duration| d.as_secs_f64() * 1e9 / N as f64;
     println!("countdown through the prelude: {:.1} ns per iteration", per(time(&base, false, true)));
     println!("countdown on intrinsics:       {:.1} ns per iteration", per(time(&native, true, true)));
+    let less = format!("(define (count n) (if (< n 1) 0 (count (- n 1)))) (count {N})");
+    println!("countdown testing with <:      {:.1} ns per iteration", per(time(&less, false, true)));
 
     let switch = format!(
         "(define co (make-coroutine (lambda () (let loop ((i 0)) (co/yield i) (loop (+ i 1))))))

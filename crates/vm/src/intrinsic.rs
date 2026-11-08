@@ -2,13 +2,16 @@
 //! or calls a procedure, so it can't be captured halfway or re-enter the VM. Anything that calls a
 //! procedure or changes the continuation is a [`crate::Request`] instead.
 
+use std::cmp::Ordering;
+
 use ragwort_types::Error;
 use ragwort_types::bytevector::{AnyBytevector, Bytevectors};
 use ragwort_types::gc::{Frame, Mutation, ScratchVec, Value};
 use ragwort_types::named;
-use ragwort_types::num::{Number, Nums, complex};
+use ragwort_types::num::{Number, Nums, complex, real};
 use ragwort_types::pair::{Pair, Pairs};
 use ragwort_types::string::{self, Strings};
+use ragwort_types::symbol::{Keyword, Symbols};
 use ragwort_types::syntax::Syntax;
 use ragwort_types::vector::{AnyVector, Vectors};
 
@@ -30,6 +33,18 @@ named! {
         /// divide exactly stay in place; an exact zero divisor faults with
         /// [`NumError::DivideByZero`](ragwort_types::num::NumError::DivideByZero).
         Div = "/",
+        /// `(= z1 z2 ...)`: whether the numbers are all the same value, whatever their
+        /// exactness. NaN is `=` to nothing.
+        NumEq = "=",
+        /// `(< x1 x2 ...)`: whether the reals increase. Each argument is checked, whatever the
+        /// answer; NaN makes it, and the others, `#f`.
+        Lt = "<",
+        /// `(> x1 x2 ...)`: whether the reals decrease.
+        Gt = ">",
+        /// `(<= x1 x2 ...)`: whether no real is less than the one before it.
+        Le = "<=",
+        /// `(>= x1 x2 ...)`: whether no real is more than the one before it.
+        Ge = ">=",
         /// (cons a d)
         Cons = "cons",
         /// (car lst)
@@ -107,6 +122,12 @@ named! {
         Not = "not",
         /// `boolean?`.
         IsBoolean = "boolean?",
+        /// `keyword?`: whether `x` is a keyword, `#:name`.
+        IsKeyword = "keyword?",
+        /// `(keyword->string k)`: the keyword's name, without its `#:`.
+        KeywordToString = "keyword->string",
+        /// `(string->keyword s)`: the keyword named `s`, the one the reader reads as `#:s`.
+        StringToKeyword = "string->keyword",
         /// `(void x ...)`: void, whatever it's given.
         Void = "void",
         /// `bytevector?`.
@@ -224,6 +245,7 @@ impl Intrinsic {
     pub fn arity(self) -> Option<u8> {
         match self {
             Intrinsic::Add | Intrinsic::Sub | Intrinsic::Mul | Intrinsic::Div | Intrinsic::Append => None,
+            Intrinsic::NumEq | Intrinsic::Lt | Intrinsic::Gt | Intrinsic::Le | Intrinsic::Ge => None,
             Intrinsic::MakePromptTag | Intrinsic::Values | Intrinsic::MakeError | Intrinsic::MakeSyntaxError | Intrinsic::Void | Intrinsic::MakeBytevector | Intrinsic::SyntaxBuild => None,
             Intrinsic::MakeVector | Intrinsic::MakeVectorOf => None,
             Intrinsic::IsVector | Intrinsic::VectorLength | Intrinsic::VectorToList | Intrinsic::ListToVector => Some(1),
@@ -235,7 +257,8 @@ impl Intrinsic {
             Intrinsic::IsBytevector | Intrinsic::BytevectorLength | Intrinsic::IsProcedure | Intrinsic::IsContinuation => Some(1),
             Intrinsic::MakeCoroutine | Intrinsic::IsCoroutine | Intrinsic::CoroutineState => Some(1),
             Intrinsic::Car | Intrinsic::Cdr | Intrinsic::IsNull | Intrinsic::IsPair | Intrinsic::IsList | Intrinsic::Length | Intrinsic::Reverse | Intrinsic::IsBox | Intrinsic::MakeBox | Intrinsic::Unbox => Some(1),
-            Intrinsic::IsValues | Intrinsic::ValuesLength | Intrinsic::Not | Intrinsic::IsBoolean => Some(1),
+            Intrinsic::IsValues | Intrinsic::ValuesLength | Intrinsic::Not | Intrinsic::IsBoolean | Intrinsic::IsKeyword => Some(1),
+            Intrinsic::KeywordToString | Intrinsic::StringToKeyword => Some(1),
             Intrinsic::IsSyntax | Intrinsic::IsIdentifier | Intrinsic::SyntaxE | Intrinsic::SyntaxToDatum => Some(1),
             Intrinsic::DatumToSyntax | Intrinsic::BoundIdentifierEq | Intrinsic::FreeIdentifierEq | Intrinsic::GenerateTemporaries | Intrinsic::SyntaxMatch => Some(2),
             Intrinsic::Caar | Intrinsic::Cadr | Intrinsic::Cdar | Intrinsic::Cddr | Intrinsic::Caaar | Intrinsic::Caadr | Intrinsic::Cadar | Intrinsic::Caddr | Intrinsic::Cdaar | Intrinsic::Cdadr | Intrinsic::Cddar | Intrinsic::Cdddr | Intrinsic::Caaaar | Intrinsic::Caaadr | Intrinsic::Caadar | Intrinsic::Caaddr | Intrinsic::Cadaar | Intrinsic::Cadadr | Intrinsic::Caddar | Intrinsic::Cadddr | Intrinsic::Cdaaar | Intrinsic::Cdaadr | Intrinsic::Cdadar | Intrinsic::Cdaddr | Intrinsic::Cddaar | Intrinsic::Cddadr | Intrinsic::Cdddar | Intrinsic::Cddddr => Some(1),
@@ -255,6 +278,11 @@ impl Intrinsic {
             Add | Sub
                 | Mul
                 | Div
+                | NumEq
+                | Lt
+                | Gt
+                | Le
+                | Ge
                 | Car
                 | Cdr
                 | Caar
@@ -303,6 +331,7 @@ impl Intrinsic {
                 | IsBox
                 | Not
                 | IsBoolean
+                | IsKeyword
                 | Void
                 | IsBytevector
                 | BytevectorLength
@@ -339,6 +368,7 @@ impl Intrinsic {
                 | IsBox
                 | Not
                 | IsBoolean
+                | IsKeyword
                 | Void
                 | IsBytevector
                 | IsVector
@@ -363,6 +393,7 @@ impl Intrinsic {
             IsNull
                 | IsPair
                 | IsBoolean
+                | IsKeyword
                 | IsBox
                 | IsBytevector
                 | IsVector
@@ -527,6 +558,8 @@ impl Intrinsic {
                 let (first, rest) = if args == 1 { (fixnum(1), 0) } else { (arg(0), 1) };
                 arith(mc, fuel, first, (rest..args).map(&arg), fixnum_div, |h, a, b| complex::div(h, a, b))?
             }
+            Intrinsic::NumEq | Intrinsic::Lt | Intrinsic::Gt | Intrinsic::Le | Intrinsic::Ge if args == 0 => return Err(Fault::Arity),
+            Intrinsic::NumEq | Intrinsic::Lt | Intrinsic::Gt | Intrinsic::Le | Intrinsic::Ge => boolean(compare(mc, self, (0..args).map(&arg))?),
             Intrinsic::Cons => made(mc, fuel, Pairs::new(mc).cons(arg(0), arg(1))?.value(mc)),
             Intrinsic::Car => car(mc, arg(0))?,
             Intrinsic::Cdr => cdr(mc, arg(0))?,
@@ -586,6 +619,15 @@ impl Intrinsic {
             Intrinsic::IsBox => boolean(arg(0).downcast::<objects::Box>(mc).is_some()),
             Intrinsic::Not => boolean(arg(0) == Value::FALSE),
             Intrinsic::IsBoolean => boolean(arg(0) == Value::TRUE || arg(0) == Value::FALSE),
+            Intrinsic::IsKeyword => boolean(Keyword::of(arg(0)).is_some()),
+            Intrinsic::KeywordToString => Keyword::of(arg(0)).ok_or(Fault::WrongType)?.symbol(mc).name(mc).value(),
+            Intrinsic::StringToKeyword => {
+                let strings = Strings::new(mc);
+                let name = strings.string(arg(0)).ok_or(Fault::WrongType)?;
+                let symbols = Symbols::of_arena(mc)?;
+                let keyword = symbols.keyword(mc, symbols.intern(&strings, name)?)?;
+                made(mc, fuel, keyword.value(mc))
+            }
             Intrinsic::Void => Value::VOID,
             Intrinsic::IsBytevector => boolean(AnyBytevector::of(arg(0)).is_some()),
             Intrinsic::MakeBytevector => {
@@ -817,6 +859,42 @@ fn arith<'gc>(
         };
     }
     Ok(acc)
+}
+
+/// Whether each of `xs` is as `op` says of the next: for `=`, numbers, and for the others, reals.
+/// Each is checked, whatever the answer.
+fn compare<'gc>(mc: &Mutation<'gc>, op: Intrinsic, mut xs: impl Iterator<Item = Value<'gc>>) -> Result<bool, Fault> {
+    let holds = |order: Ordering| match op {
+        Intrinsic::Lt => order.is_lt(),
+        Intrinsic::Gt => order.is_gt(),
+        Intrinsic::Le => order.is_le(),
+        Intrinsic::Ge => order.is_ge(),
+        _ => order.is_eq(),
+    };
+    let h = Nums::new(mc);
+    let number = |x: Value<'gc>| h.number(x).ok_or(Fault::WrongType);
+    let real = |x: Value<'gc>| h.real(x).ok_or(Fault::WrongType);
+    let check = |x: Value<'gc>| if op == Intrinsic::NumEq { number(x).map(drop) } else { real(x).map(drop) };
+    let mut before = xs.next().ok_or(Fault::Arity)?;
+    let mut so_far = true;
+    if before.as_fixnum().is_none() {
+        check(before)?;
+    }
+    for x in xs {
+        let fixnums = before.as_fixnum().zip(x.as_fixnum());
+        if fixnums.is_none() {
+            check(x)?;
+        }
+        if so_far {
+            so_far = match fixnums {
+                Some((a, b)) => holds(a.cmp(&b)),
+                None if op == Intrinsic::NumEq => complex::equal(&h, number(before)?, number(x)?)?,
+                None => real::compare(&h, real(before)?, real(x)?)?.is_some_and(holds),
+            };
+        }
+        before = x;
+    }
+    Ok(so_far)
 }
 
 /// `(reverse xs)`: a new list with the elements of proper list `xs` in reverse order.

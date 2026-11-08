@@ -89,6 +89,8 @@ pub enum Token<'a> {
     Char(char),
     String(Cow<'a, str>),
     Identifier(Cow<'a, str>),
+    /// `#:name`, the keyword named `name`.
+    Keyword(Cow<'a, str>),
     /// Text that starts as a number does, and must be one.
     Number(&'a str),
     /// Text that's a number if it reads as one, as `+i` and `-inf.0` do, or else the
@@ -258,8 +260,8 @@ impl<'a> Lexer<'a> {
     }
 
     /// What follows a `#` at `start`: a vector's or bytevector's opening, a datum comment, a
-    /// label or a use of one, a character, a boolean or a number with prefixes, or `None` for
-    /// a directive.
+    /// label or a use of one, a character, a keyword, a boolean or a number with prefixes, or
+    /// `None` for a directive.
     fn hash(&mut self, start: usize) -> Result<Option<Token<'a>>, LexError> {
         let rest = &self.text.as_bytes()[self.at..];
         let (token, len) = match *rest {
@@ -271,6 +273,7 @@ impl<'a> Lexer<'a> {
             [b'u' | b'U', b'8', b'(', ..] => (Token::OpenBytevector, 3),
             [b';', ..] => (Token::DatumComment, 1),
             [b'\\', ..] => return self.character(start).map(Some),
+            [b':', ..] => return self.keyword(start).map(Some),
             _ => {
                 let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
                 if digits > 0 && matches!(rest.get(digits), Some(b'=' | b'#')) {
@@ -309,6 +312,21 @@ impl<'a> Lexer<'a> {
             }
             _ => return Err(self.error(ErrorKind::Unsupported, start, self.at)),
         }))
+    }
+
+    /// A `#:` keyword at `start`, its name read as an identifier's is, or between `|`s.
+    fn keyword(&mut self, start: usize) -> Result<Token<'a>, LexError> {
+        let from = start + 2;
+        if self.text.as_bytes().get(from) == Some(&b'|') {
+            self.at = from + 1;
+            return Ok(Token::Keyword(self.quoted(from, '|')?));
+        }
+        self.at = self.name_end(from);
+        if self.at == from {
+            return Err(self.error(ErrorKind::Unsupported, start, self.at));
+        }
+        let name = &self.text[from..self.at];
+        Ok(Token::Keyword(if self.fold { Cow::Owned(name.to_lowercase()) } else { Cow::Borrowed(name) }))
     }
 
     /// A `#\` character at `start`: the character after it, or the name of one.

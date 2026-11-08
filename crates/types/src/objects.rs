@@ -9,8 +9,10 @@ crate::gc::objects! {
 
     /// A symbol: its name, a flat string, and the name's hash.
     pub(crate) struct Sym { name: Value, hash: u64 }
-    /// The intern table: the seed of its hashes, and the symbols, held weakly.
-    pub(crate) struct Interned { seed: u64, table: Member<TableHead> }
+    /// The intern table: the seed of its hashes, and the symbols and keywords, held weakly.
+    pub(crate) struct Interned { seed: u64, table: Member<TableHead>, keywords: Member<TableHead> }
+    /// A keyword, `#:name`, by its name's symbol.
+    pub(crate) struct Keyword { symbol: Member<Sym> }
     /// `length` is that of the list the pair starts, or 0 if its pairs don't end in `()`.
     pub(crate) struct Pair { head: Value, tail: Value, length: u64 }
     pub(crate) struct Vector {} items Value
