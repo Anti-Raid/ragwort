@@ -31,8 +31,8 @@ mod tests;
 use std::fmt;
 
 use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Value};
-use ragwort_vm::objects::Global;
-use ragwort_vm::{Intrinsic, Read, Request};
+use ragwort_vm::objects::{Global, Module};
+use ragwort_vm::{HostDef, Intrinsic, Read, Request};
 
 /// A local variable, numbered by the expander so no two bindings share one.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -51,6 +51,8 @@ pub enum Prim {
     Intrinsic(Intrinsic),
     Read(Read),
     Request(Request),
+    /// A host function, from a static table, which the code's module carries.
+    Host(&'static HostDef),
 }
 
 /// A function parameterization and body parameterized over an IR expression type `E`.
@@ -100,8 +102,12 @@ pub enum CompileError {
     Arity(Prim),
     /// More constants than a [`u32`] index can name.
     TooManyConstants,
+    /// A call of a host function the module the code is compiled into doesn't have.
+    UnknownHost(&'static HostDef),
     /// More parameters or spilled locals than a [`u32`] can count.
     TooManyRegisters,
+    /// A call of a host function with more arguments than fit a frame.
+    TooManyArguments,
     /// Expressions nested more than 1024 deep.
     TooDeep,
     OutOfMemory,
@@ -128,8 +134,11 @@ impl fmt::Display for CompileError {
             Self::Arity(Prim::Intrinsic(i)) => write!(f, "wrong number of arguments to {}", i.name()),
             Self::Arity(Prim::Read(r)) => write!(f, "wrong number of arguments to {}", r.name()),
             Self::Arity(Prim::Request(r)) => write!(f, "wrong number of arguments to {}", r.name()),
+            Self::Arity(Prim::Host(h)) => write!(f, "wrong number of arguments to host function {}", h.name),
             Self::TooManyConstants => write!(f, "more than 2^32 constants"),
+            Self::UnknownHost(h) => write!(f, "host function {} isn't one of the module's", h.name),
             Self::TooManyRegisters => write!(f, "more than 2^32 locals"),
+            Self::TooManyArguments => write!(f, "a host call with more arguments than fit a frame"),
             Self::TooDeep => write!(f, "expressions nested too deeply"),
             Self::OutOfMemory => write!(f, "out of memory"),
         }
@@ -138,13 +147,14 @@ impl fmt::Display for CompileError {
 
 impl std::error::Error for CompileError {}
 
-/// Compiles `core` through the micropass pipeline into a [`Closure`](ragwort_vm::objects::Closure)
-/// of no arguments, ready to pass to [`ragwort_vm::Machine::new`].
-pub fn compile<'gc>(mc: &Mutation<'gc>, core: &Core<'gc>) -> Result<Value<'gc>, CompileError> {
+/// Compiles `core`, as code of `module`, if any, through the micropass pipeline into a
+/// [`Closure`](ragwort_vm::objects::Closure) of no arguments, ready to pass to
+/// [`ragwort_vm::Machine::new`].
+pub fn compile<'gc>(mc: &Mutation<'gc>, module: Option<Gc<'gc, Module>>, core: &Core<'gc>) -> Result<Value<'gc>, CompileError> {
     let (l1, supply) = lower::lower_globals(mc, core)?;
     let (l2, supply) = letrec::fix_letrec(l1, supply);
     let (l2, supply) = cp0::optimize(mc, l2, supply);
     let (l3, _) = assign::assignment_convert(l2, supply);
     let l4 = closure::closure_convert(&l3);
-    codegen::emit(mc, &l4)
+    codegen::emit(mc, module, &l4)
 }

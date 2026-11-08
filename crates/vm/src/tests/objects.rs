@@ -14,7 +14,7 @@ fn objects_live_beside_the_types_crates() {
         let ops = mc.frozen(Box::from([Op::LoadConst { dst: 0, index: 0 }, Op::Return { src: 0 }])).unwrap();
         mc.set_root(0, symbols.value(mc));
         let captures = mc.frozen(Box::<[Capture]>::from([])).unwrap();
-        mc.set_root(1, Value::object(mc, Bytecode::new(mc, ops, name.value(mc), captures, 0).unwrap()));
+        mc.set_root(1, Value::object(mc, Bytecode::new(mc, ops, name.value(mc), captures, 0, None).unwrap()));
         mc.set_root(2, Value::object(mc, super::Box::new(mc, Value::fixnum(7).unwrap()).unwrap()));
     });
     arena.collect();

@@ -13,6 +13,7 @@
 //!   [`VarRef::Upvalue`], and every [`Closure`] carries its [`UpvalSource`] capture table.
 
 use ragwort_types::gc::Value;
+use ragwort_vm::Purity;
 
 use crate::{Func, Prim, Var};
 
@@ -79,6 +80,7 @@ impl<'gc> L2<'gc> {
             L2::Fix(_, body) => body.is_pure(),
             L2::Intrinsic(Prim::Intrinsic(i), args) => i.is_discardable() && args.iter().all(Self::is_pure),
             L2::Intrinsic(Prim::Read(r), args) => r.is_discardable() && args.iter().all(Self::is_pure),
+            L2::Intrinsic(Prim::Host(h), args) => h.purity == Purity::Discardable && args.iter().all(Self::is_pure),
             L2::Set(_, _) | L2::App(_, _) | L2::Intrinsic(_, _) | L2::ApplyIntrinsic(_, _) => false,
         }
     }
@@ -107,6 +109,9 @@ impl<'gc> L2<'gc> {
                 args.into_iter().rfold(second, |acc, a| Self::seq(a, acc))
             }
             L2::Intrinsic(Prim::Read(r), args) if r.is_discardable() => args.into_iter().rfold(second, |acc, a| Self::seq(a, acc)),
+            L2::Intrinsic(Prim::Host(h), args) if h.purity == Purity::Discardable => {
+                args.into_iter().rfold(second, |acc, a| Self::seq(a, acc))
+            }
             L2::If(test, then, other) if then.is_pure() && other.is_pure() => Self::seq(*test, second),
             first => L2::Seq(Box::new(first), Box::new(second)),
         }

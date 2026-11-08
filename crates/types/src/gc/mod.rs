@@ -186,7 +186,7 @@ pub use budget::Charge;
 use raw::Raw;
 pub use ragwort_derive::objects;
 use root::{ROOT_COST, RootRecord};
-pub use root::{ForeignRoot, Root};
+pub use root::{ForeignRoot, Root, ValueRoot};
 use slot::{Item, Refs, Role, Slot};
 use stack::{STACK_COST, StackRecord};
 pub use scratch::ScratchVec;
@@ -240,7 +240,7 @@ pub const WINDOW: usize = 64;
 const _: () = assert!(WINDOW.is_power_of_two() && WINDOW >= 32 && WINDOW <= 256);
 
 pub(crate) const TAG: u64 = 0b1111;
-const OBJECT: u64 = 0b0001;
+pub(crate) const OBJECT: u64 = 0b0001;
 const CONSTANT: u64 = 0b1101;
 /// The bit of a constant's id that makes it a character.
 const CHAR: u64 = 1 << 31;
@@ -510,6 +510,8 @@ impl<'gc> Value<'gc> {
     pub const NIL: Self = Self::constant(2);
     /// What a stack slot above `top` becomes.
     pub const VOID: Self = Self::constant(3);
+    /// What a module's variable holds until it's defined.
+    pub const UNDEFINED: Self = Self::constant(4);
     /// What an ephemeron's key and value become once the key dies.
     pub const BROKEN: Self = Self::constant(7);
 

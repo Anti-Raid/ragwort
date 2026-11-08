@@ -32,7 +32,7 @@ fn run_raising<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Result<Value<'gc>,
     loop {
         match machine.run(mc).unwrap() {
             Outcome::Paused => {}
-            Outcome::Yielded(_) | Outcome::Host(_) => panic!("yielded"),
+            Outcome::Yielded(_) | Outcome::Host(_) | Outcome::Deferred(_) => panic!("yielded"),
             Outcome::Done(value) => return Ok(value),
             Outcome::Raised(raised) => return Err(raised),
         }

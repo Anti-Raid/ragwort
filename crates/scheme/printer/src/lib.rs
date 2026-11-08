@@ -29,7 +29,7 @@ use ragwort_types::symbol::Symbol;
 use ragwort_types::syntax::{Abbreviation, Syntax, SyntaxKind};
 use ragwort_types::vector::{AnyVector, Vector};
 use ragwort_vm::Fault;
-use ragwort_vm::objects::{Closure, Condition, ConditionFields, Continuation, MultiValue, MultiValueFields, Tag, Task};
+use ragwort_vm::objects::{Closure, Condition, ConditionFields, Continuation, ExternalRef, MultiValue, MultiValueFields, Tag, Task};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -367,8 +367,10 @@ impl<'gc> Printer<'_, 'gc> {
                 Value::TRUE => "#t",
                 Value::FALSE => "#f",
                 Value::VOID => "#<void>",
+                Value::UNDEFINED => "#<undefined>",
                 _ if v.downcast::<Closure>(mc).is_some() => "#<procedure>",
                 _ if v.downcast::<Continuation>(mc).is_some() => "#<continuation>",
+                _ if v.downcast::<ExternalRef>(mc).is_some() => "#<external>",
                 _ if v.downcast::<Task>(mc).is_some() => "#<coroutine>",
                 _ if v.downcast::<Tag>(mc).is_some() => "#<prompt-tag>",
                 _ => "#<object>",

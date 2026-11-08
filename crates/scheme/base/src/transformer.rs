@@ -85,7 +85,7 @@ impl<'gc> Expander<'_, 'gc> {
     /// Expands, compiles and runs `expr`, the transformer of a macro `at` defines, and keeps it.
     fn transformer(&mut self, expr: Stx, at: Stx) -> Result<u32, ExpandError> {
         let core = self.expr(expr)?;
-        let thunk = compile(self.mc, &core).map_err(|e| match e {
+        let thunk = compile(self.mc, None, &core).map_err(|e| match e {
             // It refers to a variable of the code around it, which isn't there yet.
             CompileError::Unbound(_) => self.error(ExpandErrorKind::Phase, expr),
             _ => self.error(ExpandErrorKind::Transformer, at),

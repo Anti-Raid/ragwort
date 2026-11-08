@@ -6,7 +6,7 @@ use ragwort_types::pair::{Pair, Pairs};
 use ragwort_vm::Intrinsic::{Add, Car, Cons, Eq, MakeBox, MakePromptTag, Not, SetBox, Unbox};
 use ragwort_vm::frame::MAX_PARAMS;
 use ragwort_vm::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Condition, ConditionFields, Global};
-use ragwort_vm::{Fault, Intrinsic, MIN_SEGMENT, Machine, Op, Outcome, Read, Request};
+use ragwort_vm::{Fault, HostDef, Intrinsic, MIN_SEGMENT, Machine, Op, Outcome, Purity, Read, Request};
 
 use super::*;
 
@@ -79,12 +79,12 @@ fn gref<'gc>(g: Gc<'gc, Global>) -> Core<'gc> {
 fn eval(build: impl for<'gc> FnOnce(&Mutation<'gc>) -> Core<'gc>, check: impl for<'gc> FnOnce(&Mutation<'gc>, Result<Value<'gc>, Fault>)) {
     let mut arena = Arena::new(1 << 24, 0);
     arena.mutate(|mc| {
-        let thunk = compile(mc, &build(mc)).unwrap();
+        let thunk = compile(mc, Some(hosting(mc)), &build(mc)).unwrap();
         let mut machine = Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap();
         let result = loop {
             match machine.run(mc).unwrap() {
                 Outcome::Paused => {}
-                Outcome::Yielded(_) | Outcome::Host(_) => panic!("yielded"),
+                Outcome::Yielded(_) | Outcome::Host(_) | Outcome::Deferred(_) => panic!("yielded"),
                 Outcome::Done(value) => break Ok(value),
                 Outcome::Raised(raised) => break Err(*raised.downcast::<Condition>(mc).unwrap().fault(mc).unwrap()),
             }
@@ -112,7 +112,7 @@ fn items<'gc>(mc: &Mutation<'gc>, mut v: Value<'gc>) -> Vec<i64> {
 
 fn error(build: impl for<'gc> FnOnce(&Mutation<'gc>) -> Core<'gc>) -> CompileError {
     let mut arena = Arena::new(1 << 24, 0);
-    arena.mutate(|mc| compile(mc, &build(mc)).unwrap_err())
+    arena.mutate(|mc| compile(mc, Some(hosting(mc)), &build(mc)).unwrap_err())
 }
 
 #[test]
@@ -415,7 +415,7 @@ fn micropass_optimizations() {
     arena.mutate(|mc| {
         // 1. Unmutated captured variables are never boxed (`assign` pass only boxes `Set` vars).
         let unmutated_capture = lambda(&[0], None, lambda(&[], None, var(0)));
-        let thunk = compile(mc, &unmutated_capture).unwrap();
+        let thunk = compile(mc, None, &unmutated_capture).unwrap();
         let ops = all_ops(mc, thunk);
         assert!(!has_box_op(&ops), "immutable captured variable should not be boxed: {ops:?}");
 
@@ -424,7 +424,7 @@ fn micropass_optimizations() {
         let even = lambda(&[2], None, when(eq(var(2), q(0)), Core::Quote(Value::TRUE), app(var(1), vec![add(var(2), q(-1))])));
         let odd = lambda(&[3], None, when(eq(var(3), q(0)), Core::Quote(Value::FALSE), app(var(0), vec![add(var(3), q(-1))])));
         let mutual = letrec(vec![(0, even), (1, odd)], app(var(0), vec![q(10)]));
-        let thunk = compile(mc, &mutual).unwrap();
+        let thunk = compile(mc, None, &mutual).unwrap();
         let ops = all_ops(mc, thunk);
         assert!(!has_box_op(&ops), "mutually recursive lambdas should not be boxed: {ops:?}");
         assert!(ops.iter().any(|op| matches!(op, Op::NewClosure { count: 2, .. })), "expected batch NewClosure(count: 2): {ops:?}");
@@ -434,19 +434,19 @@ fn micropass_optimizations() {
         let inc = lambda(&[1], None, add(var(1), q(1)));
         let test = prim(Not, vec![eq(app(var(0), vec![q(41)]), q(42))]);
         let folded = let_(vec![(0, inc)], when(test, q(0), app(var(0), vec![q(99)])));
-        let thunk = compile(mc, &folded).unwrap();
+        let thunk = compile(mc, None, &folded).unwrap();
         let ops = all_ops(mc, thunk);
         assert_eq!(ops.len(), 2, "expected constant-folded [LoadConst, Return], got {ops:?}");
         assert!(matches!(ops.as_slice(), [Op::LoadConst { .. }, Op::Return { .. }]));
 
         // 4. `Place::Import` of a defined prelude wrapper lowers to a direct intrinsic, and
         //    `(+ x 1)` then compiles to `AddImm`.
-        let add_fn = compile(mc, &lambda(&[], Some(0), Core::ApplyIntrinsic(Prim::Intrinsic(Add), vec![var(0)]))).unwrap();
+        let add_fn = compile(mc, None, &lambda(&[], Some(0), Core::ApplyIntrinsic(Prim::Intrinsic(Add), vec![var(0)]))).unwrap();
         let mut machine = Machine::new(mc, MIN_SEGMENT, add_fn, &[]).unwrap();
         let Outcome::Done(add_closure) = machine.run(mc).unwrap() else { panic!() };
         let import_add = Global::new(mc, Value::VOID, add_closure, true).unwrap();
         let call_import = app(Core::Ref(Place::Import(import_add)), vec![var(0), q(1)]);
-        let thunk = compile(mc, &lambda(&[0], None, call_import)).unwrap();
+        let thunk = compile(mc, None, &lambda(&[0], None, call_import)).unwrap();
         let ops = all_ops(mc, thunk);
         assert!(
             matches!(ops.as_slice(), [.., Op::AddImm { dst, a: 1, imm: 1 }, Op::Return { src }] if dst == src),
@@ -455,7 +455,7 @@ fn micropass_optimizations() {
 
         // 4a. An imported `add1`-style wrapper, `(lambda (z) (+ z 1))`, compiles to
         //     `[AddImm, Return]`, which `cp0` recognizes and inlines into its callers.
-        let add1_fn = compile(mc, &lambda(&[0], None, add(var(0), q(1)))).unwrap();
+        let add1_fn = compile(mc, None, &lambda(&[0], None, add(var(0), q(1)))).unwrap();
         let mut machine = Machine::new(mc, MIN_SEGMENT, add1_fn, &[]).unwrap();
         let Outcome::Done(add1_closure) = machine.run(mc).unwrap() else { panic!() };
         let add1_ops = add1_closure.downcast::<Closure>(mc).unwrap().code(mc).unwrap().ops(mc).unwrap().to_vec();
@@ -463,7 +463,7 @@ fn micropass_optimizations() {
         let import_add1 = Global::new(mc, Value::VOID, add1_closure, true).unwrap();
         // (lambda (x) (add1 (add1 x))) -> two AddImms, no calls.
         let twice = app(Core::Ref(Place::Import(import_add1)), vec![app(Core::Ref(Place::Import(import_add1)), vec![var(0)])]);
-        let thunk = compile(mc, &lambda(&[0], None, twice)).unwrap();
+        let thunk = compile(mc, None, &lambda(&[0], None, twice)).unwrap();
         let ops = all_ops(mc, thunk);
         assert!(!ops.iter().any(|op| matches!(op, Op::Call { .. } | Op::TailCall { .. })), "expected add1 to inline: {ops:?}");
         assert_eq!(ops.iter().filter(|op| matches!(op, Op::AddImm { imm: 1, .. })).count(), 2, "{ops:?}");
@@ -481,7 +481,7 @@ fn micropass_optimizations() {
             (prim(Intrinsic::Sub, vec![var(0), q(i64::from(i16::MAX))]), -i16::MAX),
             (add(var(0), q(i64::from(i16::MIN))), i16::MIN),
         ] {
-            let thunk = compile(mc, &lambda(&[0], None, expr)).unwrap();
+            let thunk = compile(mc, None, &lambda(&[0], None, expr)).unwrap();
             let ops = all_ops(mc, thunk);
             assert!(
                 ops.iter().any(|op| matches!(op, Op::AddImm { imm: i, .. } if *i == imm)),
@@ -495,7 +495,7 @@ fn micropass_optimizations() {
             (prim(Intrinsic::Sub, vec![var(0), q(0)]), Intrinsic::Sub),
             (add(var(0), var(0)), Add),
         ] {
-            let thunk = compile(mc, &lambda(&[0], None, expr)).unwrap();
+            let thunk = compile(mc, None, &lambda(&[0], None, expr)).unwrap();
             let ops = all_ops(mc, thunk);
             assert!(!ops.iter().any(|op| matches!(op, Op::AddImm { .. })), "expected no AddImm: {ops:?}");
             assert!(
@@ -507,11 +507,11 @@ fn micropass_optimizations() {
         // 4c. A leading effect floats out of an intrinsic's first argument, so the constant behind
         //     it counts: `(+ (begin (f) 1) x)` compiles to `AddImm`, `(+ (begin (f) 2) 3)` to 5.
         let effect_first = add(seq(9, app(var(1), vec![]), q(1)), var(0));
-        let ops = all_ops(mc, compile(mc, &lambda(&[0, 1], None, effect_first)).unwrap());
+        let ops = all_ops(mc, compile(mc, None, &lambda(&[0, 1], None, effect_first)).unwrap());
         assert!(ops.iter().any(|op| matches!(op, Op::AddImm { imm: 1, .. })), "expected AddImm: {ops:?}");
         assert!(!ops.iter().any(|op| matches!(op, Op::TailCallIntrinsic { intrinsic: Add, .. })), "{ops:?}");
         let folds = add(seq(9, app(var(1), vec![]), q(2)), q(3));
-        let ops = all_ops(mc, compile(mc, &lambda(&[0, 1], None, folds)).unwrap());
+        let ops = all_ops(mc, compile(mc, None, &lambda(&[0, 1], None, folds)).unwrap());
         assert!(!ops.iter().any(|op| matches!(op, Op::AddImm { .. } | Op::TailCallIntrinsic { intrinsic: Add, .. })), "{ops:?}");
 
         // 5. Store-to-load forwarding on `cadr`/`cons` and `unbox`/`box` eliminates allocations.
@@ -519,7 +519,7 @@ fn micropass_optimizations() {
         let cadr_cons = prim(Intrinsic::Cadr, vec![prim(Cons, vec![var(0), prim(Cons, vec![var(1), Core::Quote(Value::NIL)])])]);
         let unbox_box = prim(Unbox, vec![prim(MakeBox, vec![q(1)])]);
         let forwarded = lambda(&[0, 1], None, add(cadr_cons, unbox_box));
-        let thunk = compile(mc, &forwarded).unwrap();
+        let thunk = compile(mc, None, &forwarded).unwrap();
         let ops = all_ops(mc, thunk);
         assert!(!has_box_op(&ops), "expected (unbox (box 1)) to fold away: {ops:?}");
         assert!(
@@ -535,7 +535,7 @@ fn micropass_optimizations() {
         // 6. Tail-recursive local loop contifies into an in-frame backward `Jump` with zero closures.
         let looping = lambda(&[1, 2], None, when(eq(var(1), q(0)), var(2), app(var(0), vec![add(var(1), q(-1)), add(var(2), var(1))])));
         let loop_expr = letrec(vec![(0, looping)], app(var(0), vec![q(10), q(0)]));
-        let thunk = compile(mc, &loop_expr).unwrap();
+        let thunk = compile(mc, None, &loop_expr).unwrap();
         let ops = all_ops(mc, thunk);
         assert!(
             !ops.iter().any(|op| matches!(op, Op::NewClosure { .. } | Op::TailCall { .. } | Op::Call { .. })),
@@ -570,13 +570,13 @@ fn micropass_optimizations() {
     arena.mutate(|mc| {
         // (procedure? (lambda (x) x)) -> #t
         let proc_lam = prim(Intrinsic::IsProcedure, vec![lambda(&[0], None, var(0))]);
-        let thunk = compile(mc, &proc_lam).unwrap();
+        let thunk = compile(mc, None, &proc_lam).unwrap();
         let ops = all_ops(mc, thunk);
         assert_eq!(ops.len(), 2, "expected (procedure? (lambda ...)) to fold to #t: {ops:?}");
 
         // (continuation? (lambda (x) x)) -> #f
         let cont_lam = prim(Intrinsic::IsContinuation, vec![lambda(&[0], None, var(0))]);
-        let thunk = compile(mc, &cont_lam).unwrap();
+        let thunk = compile(mc, None, &cont_lam).unwrap();
         let ops = all_ops(mc, thunk);
         assert_eq!(ops.len(), 2, "expected (continuation? (lambda ...)) to fold to #f: {ops:?}");
 
@@ -594,7 +594,7 @@ fn micropass_optimizations() {
             when(prim(Intrinsic::IsContinuation, vec![var(0)]), q(5), q(6)),
         );
         let dom = lambda(&[0], None, when(prim(Intrinsic::IsContinuation, vec![var(0)]), inner_then, inner_else));
-        let thunk = compile(mc, &dom).unwrap();
+        let thunk = compile(mc, None, &dom).unwrap();
         let ops = all_ops(mc, thunk);
         let pred_calls = ops
             .iter()
@@ -630,7 +630,7 @@ fn micropass_optimizations() {
                 app(var(2), vec![var(0), q(0)]),
             ),
         );
-        let thunk = compile(mc, &list_len_loop).unwrap();
+        let thunk = compile(mc, None, &list_len_loop).unwrap();
         let ops = all_ops(mc, thunk);
         assert!(
             ops.windows(5).any(|w| matches!(
@@ -671,7 +671,7 @@ fn micropass_optimizations() {
             when(eq(var(1), q(0)), var(5), app(var(0), vec![add(var(1), q(-1)), inner_loop])),
         );
         let nested_loops = letrec(vec![(0, outer_fn)], app(var(0), vec![q(10), q(0)]));
-        let thunk = compile(mc, &nested_loops).unwrap();
+        let thunk = compile(mc, None, &nested_loops).unwrap();
         let ops = all_ops(mc, thunk);
         assert!(
             !ops.iter().any(|op| matches!(op, Op::NewClosure { .. } | Op::Call { .. } | Op::TailCall { .. })),
@@ -740,7 +740,7 @@ fn micropass_optimizations() {
             ),
         );
         let length = lambda(&[0], None, letrec(vec![(2, body)], app(var(2), vec![var(0), q(0)])));
-        let thunk = compile(mc, &length).unwrap();
+        let thunk = compile(mc, None, &length).unwrap();
         let ops = all_ops(mc, thunk);
         // The whole loop: fused `null?` test, `cdr` in place, `(+ len 1)` as `AddImm` in place, back-edge.
         assert!(
@@ -782,9 +782,9 @@ fn only_imports_that_just_spread_into_an_intrinsic_inline_as_it() {
         // `(lambda xs (+ . xs))` inlines; `(lambda xs (not (+ . xs)))` and `(lambda xs (car (cons . xs)))`
         // do more with the result than return it, so they must not.
         for (body, want) in [(spread(Add), fix(7)), (prim(Not, vec![spread(Add)]), Value::FALSE), (prim(Car, vec![spread(Cons)]), fix(3))] {
-            let closure = run(compile(mc, &lambda(&[], Some(0), body)).unwrap());
+            let closure = run(compile(mc, None, &lambda(&[], Some(0), body)).unwrap());
             for defined in [Place::Import(Global::new(mc, Value::VOID, closure, true).unwrap()), Place::Global(Global::new(mc, Value::VOID, closure, true).unwrap())] {
-                assert_eq!(run(compile(mc, &app(Core::Ref(defined), vec![q(3), q(4)])).unwrap()), want);
+                assert_eq!(run(compile(mc, None, &app(Core::Ref(defined), vec![q(3), q(4)])).unwrap()), want);
             }
         }
     });
@@ -815,7 +815,7 @@ fn constant<'gc>(mc: &Mutation<'gc>, xs: &[i64]) -> Core<'gc> {
 
 /// Whether `core` compiles to just loading a constant.
 fn folds<'gc>(mc: &Mutation<'gc>, core: Core<'gc>) -> bool {
-    matches!(all_ops(mc, compile(mc, &core).unwrap()).as_slice(), [Op::LoadConst { .. }, Op::Return { .. }])
+    matches!(all_ops(mc, compile(mc, None, &core).unwrap()).as_slice(), [Op::LoadConst { .. }, Op::Return { .. }])
 }
 
 #[test]
@@ -829,19 +829,19 @@ fn reads_of_constant_vectors_fold() {
         assert!(folds(mc, prim(IsVector, vec![q(1)])));
 
         // An index past the end is left to fault when it runs.
-        let past = all_ops(mc, compile(mc, &prim(VectorRef, vec![constant(mc, &[1]), q(1)])).unwrap());
+        let past = all_ops(mc, compile(mc, None, &prim(VectorRef, vec![constant(mc, &[1]), q(1)])).unwrap());
         assert_eq!(calls(&past, VectorRef), 1, "{past:?}");
 
         // A vector `vector` makes can change, so reading one isn't folded.
         let made = prim(VectorRef, vec![prim(MakeVectorOf, vec![q(1), q(2)]), q(0)]);
-        let ops = all_ops(mc, compile(mc, &made).unwrap());
+        let ops = all_ops(mc, compile(mc, None, &made).unwrap());
         assert_eq!(calls(&ops, VectorRef), 1, "{ops:?}");
 
         // Under `(pair? x)`, `(vector? x)` is false, and under `(vector? x)`, it's true:
         // (lambda (x) (if (pair? x) (vector? x) (if (vector? x) (vector? x) 0))) has one test left.
         let is = |i: Intrinsic| prim(i, vec![var(0)]);
         let tests = when(is(IsPair), is(IsVector), when(is(IsVector), is(IsVector), q(0)));
-        let ops = all_ops(mc, compile(mc, &lambda(&[0], None, tests)).unwrap());
+        let ops = all_ops(mc, compile(mc, None, &lambda(&[0], None, tests)).unwrap());
         assert_eq!(calls(&ops, IsVector), 1, "{ops:?}");
     });
     assert_eq!(number(|mc| prim(VectorRef, vec![constant(mc, &[1, 2]), q(1)])), Ok(2));
@@ -855,7 +855,7 @@ fn read<'gc>(r: Read, args: Vec<Core<'gc>>) -> Core<'gc> {
 }
 
 fn ops<'gc>(mc: &Mutation<'gc>, core: Core<'gc>) -> Vec<Op> {
-    all_ops(mc, compile(mc, &core).unwrap())
+    all_ops(mc, compile(mc, Some(hosting(mc)), &core).unwrap())
 }
 
 #[test]
@@ -876,4 +876,55 @@ fn reads_get_register_forms_and_unused_ones_go() {
     });
     assert_eq!(error(|_| read(Read::MarkValue, vec![q(1)])), CompileError::Arity(Prim::Read(Read::MarkValue)));
     assert_eq!(error(|_| Core::ApplyIntrinsic(Prim::Read(Read::Running), vec![q(1)])), CompileError::Arity(Prim::Read(Read::Running)));
+}
+
+fn add_host<'s, 'gc>(_: &mut ragwort_vm::HostContext<'s, 'gc>, args: ragwort_vm::HostArgs<'s, 'gc>) -> Result<ragwort_vm::Reply<'gc>, Fault> {
+    Ok(ragwort_vm::Reply::Value(fix(args.iter().map(|v| v.as_fixnum().unwrap()).sum())))
+}
+
+fn call_with<'s, 'gc>(cx: &mut ragwort_vm::HostContext<'s, 'gc>, args: ragwort_vm::HostArgs<'s, 'gc>) -> Result<ragwort_vm::Reply<'gc>, Fault> {
+    Ok(ragwort_vm::Reply::Call(args.get(0).unwrap(), Pairs::new(cx.mc()).list(&[args.get(1).unwrap()])?))
+}
+
+static HOSTS: [HostDef; 3] = [
+    HostDef { name: "add", arity: -1, purity: Purity::Impure, function: add_host },
+    HostDef { name: "add", arity: -1, purity: Purity::Discardable, function: add_host },
+    HostDef { name: "call-with", arity: 2, purity: Purity::Impure, function: call_with },
+];
+static ADD_HOST: &HostDef = &HOSTS[0];
+static ADD_DISCARDABLE: &HostDef = &HOSTS[1];
+static CALL_WITH: &HostDef = &HOSTS[2];
+static ELSEWHERE: HostDef = HostDef { name: "elsewhere", arity: 0, purity: Purity::Impure, function: add_host };
+
+/// A module of no variables whose code can call [`HOSTS`].
+fn hosting<'gc>(mc: &Mutation<'gc>) -> Gc<'gc, ragwort_vm::objects::Module> {
+    ragwort_vm::module::new(mc, Value::FALSE, &[], &HOSTS).unwrap()
+}
+
+fn host<'gc>(def: &'static HostDef, args: Vec<Core<'gc>>) -> Core<'gc> {
+    Core::Intrinsic(Prim::Host(def), args)
+}
+
+#[test]
+fn host_functions_are_called_in_the_loop() {
+    assert_eq!(number(|_| add(q(1), host(ADD_HOST, vec![q(10), q(20)]))), Ok(31));
+    assert_eq!(number(|_| host(CALL_WITH, vec![lambda(&[0], None, add(var(0), q(1))), q(10)])), Ok(11));
+    // Nothing else can call one, so its arguments must fit a frame, and aren't spread.
+    assert_eq!(error(|_| host(ADD_HOST, (1..=60).map(q).collect())), CompileError::TooManyArguments);
+    assert_eq!(error(|_| host(CALL_WITH, vec![q(1)])), CompileError::Arity(Prim::Host(CALL_WITH)));
+    assert_eq!(error(|_| Core::ApplyIntrinsic(Prim::Host(ADD_HOST), vec![q(1)])), CompileError::Arity(Prim::Host(ADD_HOST)));
+    assert_eq!(error(|_| host(&ELSEWHERE, vec![])), CompileError::UnknownHost(&ELSEWHERE));
+    let mut arena = Arena::new(1 << 22, 0);
+    arena.mutate(|mc| assert_eq!(compile(mc, None, &host(ADD_HOST, vec![])), Err(CompileError::UnknownHost(ADD_HOST))));
+    let mut arena = Arena::new(1 << 22, 0);
+    arena.mutate(|mc| {
+        let called = ops(mc, add(q(1), host(ADD_HOST, vec![q(10), q(20)])));
+        assert!(called.iter().any(|op| matches!(op, Op::CallHost { args: 2, .. })), "{called:?}");
+        let tail = ops(mc, lambda(&[0], None, host(ADD_HOST, vec![var(0)])));
+        assert!(tail.iter().any(|op| matches!(op, Op::TailCallHost { args: 1, .. })), "{tail:?}");
+        // An unused call goes only if the host says it can.
+        let unused = |def: &'static HostDef| ops(mc, lambda(&[0], None, let_(vec![(1, host(def, vec![var(0)]))], q(1))));
+        assert!(unused(ADD_HOST).iter().any(|op| matches!(op, Op::CallHost { .. })));
+        assert!(!unused(ADD_DISCARDABLE).iter().any(|op| matches!(op, Op::CallHost { .. })));
+    });
 }

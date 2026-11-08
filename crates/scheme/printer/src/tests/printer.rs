@@ -164,3 +164,12 @@ fn syntax_is_written_as_its_datum_once() {
         assert_eq!(write(mc, Pairs::new(mc).list(&[a, a]).unwrap()), "(#<syntax a> #<syntax a>)");
     });
 }
+
+#[test]
+fn external_refs_and_undefined_print_as_what_they_are() {
+    with(|mc| {
+        let external = Value::object(mc, ragwort_vm::module::external(mc, 5_u8, 0, Value::NIL).unwrap());
+        let list = Pairs::new(mc).list(&[external, Value::UNDEFINED]).unwrap();
+        assert_eq!(write(mc, list), "(#<external> #<undefined>)");
+    });
+}

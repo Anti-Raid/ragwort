@@ -8,7 +8,8 @@ use ragwort_types::num::NumError;
 use ragwort_types::pair::Pair;
 use ragwort_types::string::StrError;
 
-use crate::objects::{self, BytecodeFields, ClosureFields, SpillFields, Task};
+use crate::frame::CLOSURE;
+use crate::objects::{self, BytecodeFields, ClosureFields, ModuleFields, SpillFields, Task};
 use crate::{Intrinsic, Read, Request};
 
 #[cfg(test)]
@@ -103,6 +104,22 @@ named! {
         LoadSpill { dst: u8, spill: u8, slot: u32 } = "load-spill",
         /// Stores register `src` in slot `slot` of the spill in register `spill`.
         StoreSpill { src: u8, spill: u8, slot: u32 } = "store-spill",
+        /// Loads variable `slot` of the code's [`Module`](crate::objects::Module), which the
+        /// compiler knows is defined.
+        LoadSlot { dst: u8, slot: u32 } = "load-slot",
+        /// Loads variable `slot` of the code's module, faulting with [`Fault::Unbound`] if it
+        /// isn't defined yet.
+        LoadSlotChecked { dst: u8, slot: u32 } = "load-slot-checked",
+        /// Stores register `src` in variable `slot` of the code's module, as its definition does.
+        StoreSlot { src: u8, slot: u32 } = "store-slot",
+        /// Stores register `src` in variable `slot` of the code's module, as `set!` does,
+        /// faulting with [`Fault::Unbound`] if it isn't defined yet.
+        StoreSlotChecked { src: u8, slot: u32 } = "store-slot-checked",
+        /// Calls host function `host` of the code's module on the `args` registers from `base`,
+        /// which is laid out as a call's, as its [`Reply`](crate::module::Reply) can call a
+        /// procedure there.
+        CallHost { base: u8, args: u8, host: u32 } = "call-host",
+        TailCallHost { base: u8, args: u8, host: u32 } = "tail-call-host",
     }
 }
 
@@ -180,6 +197,8 @@ pub enum Control {
     /// `spread`.
     CallRequest { base: u8, args: u8, request: Request, spread: bool },
     TailCallRequest { base: u8, args: u8, request: Request, spread: bool },
+    /// A call of host function `host` of the code's module on the `args` registers from `base`.
+    Host { base: u8, args: u8, host: u32, tail: bool },
     /// Back to the caller, with the accumulator.
     Return,
 }
@@ -205,7 +224,7 @@ pub enum Fault {
     NotProcedure,
     /// An abort or capture to a prompt tag with no prompt.
     NoPrompt,
-    /// A reference to, or `set!` of, a global that isn't defined.
+    /// A reference to, or `set!` of, a variable that isn't defined yet.
     Unbound,
     /// A run of a machine whose task already finished.
     Finished,
@@ -441,6 +460,12 @@ impl Op {
                     _ => Control::TailCallRequest { base, args, request, spread: false },
                 });
             }
+            Op::CallHost { base, args, host } | Op::TailCallHost { base, args, host } => {
+                if usize::from(base) + usize::from(args.max(1)) > WINDOW {
+                    return Err(Fault::Malformed);
+                }
+                return Ok(Control::Host { base, args, host, tail: matches!(self, Op::TailCallHost { .. }) });
+            }
             Op::ApplyIntrinsic { base, args, intrinsic } => {
                 if args == 0 || usize::from(base) + usize::from(args) > WINDOW {
                     return Err(Fault::Malformed);
@@ -466,6 +491,22 @@ impl Op {
             }
             Op::LoadSpill { dst, spill, slot } => frame.set(dst, spilled(mc, frame, spill, slot)?.get(slot as usize)),
             Op::StoreSpill { src, spill, slot } => spilled(mc, frame, spill, slot)?.set(mc, slot as usize, frame.get(src)),
+            Op::LoadSlot { dst, slot } => frame.set(dst, variables(mc, frame, slot)?.get(slot as usize)),
+            Op::LoadSlotChecked { dst, slot } => {
+                let value = variables(mc, frame, slot)?.get(slot as usize);
+                if value == Value::UNDEFINED {
+                    return Err(Fault::Unbound);
+                }
+                frame.set(dst, value);
+            }
+            Op::StoreSlot { src, slot } => variables(mc, frame, slot)?.set(mc, slot as usize, frame.get(src)),
+            Op::StoreSlotChecked { src, slot } => {
+                let variables = variables(mc, frame, slot)?;
+                if variables.get(slot as usize) == Value::UNDEFINED {
+                    return Err(Fault::Unbound);
+                }
+                variables.set(mc, slot as usize, frame.get(src));
+            }
         }
         Ok(Control::Next)
     }
@@ -479,6 +520,13 @@ fn spilled<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, spill: u8, slot: u32)
         return Err(Fault::Malformed);
     }
     Ok(slots)
+}
+
+/// The variables of the module of the code running in `frame`, which have a slot `slot`.
+#[inline]
+fn variables<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, slot: u32) -> Result<Slots<'gc>, Fault> {
+    let module = frame.get(CLOSURE).downcast::<objects::Closure>(mc).and_then(|c| c.code(mc)).and_then(|code| code.module(mc));
+    module.map(|m| m.items(mc)).filter(|slots| (slot as usize) < slots.len()).ok_or(Fault::Malformed)
 }
 
 /// The elements of the proper list `list`.

@@ -130,7 +130,7 @@ fn malformed_bytecode_faults() {
 fn code<'gc>(mc: &Mutation<'gc>, captures: &[Capture]) -> Value<'gc> {
     let ops = mc.frozen(Box::from([Op::Return { src: 0 }])).unwrap();
     let empty = Vectors::new(mc).immutable_from_slice(&[]).unwrap().value(mc);
-    Value::object(mc, objects::Bytecode::new(mc, ops, empty, mc.frozen(Box::from(captures)).unwrap(), 0).unwrap())
+    Value::object(mc, objects::Bytecode::new(mc, ops, empty, mc.frozen(Box::from(captures)).unwrap(), 0, None).unwrap())
 }
 
 #[test]

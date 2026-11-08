@@ -7,8 +7,9 @@ use crate::args::Args;
 use crate::frame::{self, CLOSURE, Link};
 use crate::intrinsic::values;
 use crate::objects::{BytecodeFields, Closure, ClosureFields, Condition, Continuation, Native, NativeFields, Task, TaskFields};
-use crate::run::{self, Exit, Regs, bind};
+use crate::run::{self, Exit, HostThen, Regs, bind};
 use crate::segments::{CHUNK, Resume, Segments};
+use crate::module::Deferred;
 use crate::{Fault, Fuel, Request, coroutine, prompts};
 
 #[cfg(test)]
@@ -36,6 +37,10 @@ pub enum Outcome<'gc> {
     /// The task asked what runs it for something, with these values, as one: `host`, in it or
     /// in a coroutine it resumed. [`Machine::reply`] goes on with the answer.
     Host(Value<'gc>),
+    /// A host function's call replied [`Reply::Defer`](crate::Reply::Defer) with this.
+    /// [`Machine::reply`] goes on with what the call returns, or [`Machine::raise`] raises from
+    /// it.
+    Deferred(Deferred),
 }
 
 /// What the next run goes on from, if not where the last one paused.
@@ -44,8 +49,10 @@ enum Waiting {
     No,
     /// The task yielded.
     Yield,
-    /// The task asked with `host`.
+    /// The task asked with `host`, or a host function deferred.
     Host,
+    /// The host raised from where the task waits on it.
+    Raise,
 }
 
 /// A task: a procedure call run on its own stack. It holds no brand, so it lives outside the
@@ -123,7 +130,7 @@ impl Machine {
         self.finished = matches!(outcome, Ok(Outcome::Done(_) | Outcome::Raised(_)) | Err(Fault::OutOfFuel));
         self.waiting = match outcome {
             Ok(Outcome::Yielded(_)) => Waiting::Yield,
-            Ok(Outcome::Host(_)) => Waiting::Host,
+            Ok(Outcome::Host(_) | Outcome::Deferred(_)) => Waiting::Host,
             _ => Waiting::No,
         };
         if self.finished {
@@ -137,21 +144,33 @@ impl Machine {
     /// Goes on with a task that yielded, as [`Machine::run`] does, with its `co/yield` returning
     /// `args`. Faults with [`Fault::NotPending`] if it isn't waiting on a yield.
     pub fn resume<'gc>(&mut self, mc: &Mutation<'gc>, args: &[Value<'gc>]) -> Result<Outcome<'gc>, Fault> {
-        self.answer(mc, Waiting::Yield, values(mc, args.iter().copied())?)
+        self.answer(mc, Waiting::Yield, values(mc, args.iter().copied())?)?;
+        self.run(mc)
     }
 
-    /// Goes on with a task that asked with `host`, as [`Machine::run`] does, with the `host`
-    /// returning `answer`. Faults with [`Fault::NotPending`] if it isn't waiting on one.
+    /// Goes on with a task that asked with `host`, or whose host function deferred, as
+    /// [`Machine::run`] does, with that returning `answer`. Faults with [`Fault::NotPending`] if
+    /// it isn't waiting on one.
     pub fn reply<'gc>(&mut self, mc: &Mutation<'gc>, answer: Value<'gc>) -> Result<Outcome<'gc>, Fault> {
-        self.answer(mc, Waiting::Host, answer)
+        self.answer(mc, Waiting::Host, answer)?;
+        self.run(mc)
     }
 
-    fn answer<'gc>(&mut self, mc: &Mutation<'gc>, on: Waiting, value: Value<'gc>) -> Result<Outcome<'gc>, Fault> {
+    /// Goes on with a task waiting as [`Machine::reply`] takes, raising `raised` from what it
+    /// waits on, as `raise` does.
+    pub fn raise<'gc>(&mut self, mc: &Mutation<'gc>, raised: Value<'gc>) -> Result<Outcome<'gc>, Fault> {
+        self.answer(mc, Waiting::Host, raised)?;
+        self.waiting = Waiting::Raise;
+        self.run(mc)
+    }
+
+    /// Gives the task `value`, for the next run, if it's waiting `on` that.
+    fn answer<'gc>(&mut self, mc: &Mutation<'gc>, on: Waiting, value: Value<'gc>) -> Result<(), Fault> {
         if self.waiting != on {
             return Err(if self.finished { Fault::Finished } else { Fault::NotPending });
         }
         coroutine::current(mc, self.task.get(mc).expect("a machine runs in its own arena")).set_acc(mc, value);
-        self.run(mc)
+        Ok(())
     }
 
     /// Keeps what the next run needs where a collection finds it.
@@ -165,9 +184,10 @@ impl Machine {
     /// Runs the inner loop, and carries out what it stops for, until the task ends or the run's
     /// fuel runs out. `task` is the running one, which switching coroutines changes.
     fn drive<'gc>(&mut self, mc: &Mutation<'gc>, task: &mut Gc<'gc, Task>, regs: &mut Regs<'gc>, fuel: &mut Fuel) -> Result<Outcome<'gc>, Fault> {
-        if std::mem::replace(&mut self.waiting, Waiting::No) != Waiting::No {
+        let waiting = std::mem::replace(&mut self.waiting, Waiting::No);
+        if waiting != Waiting::No {
             let mut outer = Outer::new(mc, &mut self.stack, *task, regs, self.segment);
-            let step = outer.resume();
+            let step = if waiting == Waiting::Raise { outer.raise(outer.regs.acc, false) } else { outer.resume() };
             *task = outer.task();
             if let Some(outcome) = step? {
                 return Ok(outcome);
@@ -248,6 +268,7 @@ impl<'a, 'gc> Outer<'a, 'gc> {
             Exit::Underflow => self.resume(),
             Exit::Call { base, argc, rest, tail } => self.call(base, argc, rest, tail),
             Exit::Request { base, args, request, spread, tail } => self.request(base, args, request, spread, tail),
+            Exit::Host { base, tail, then } => self.keep(base, tail).and_then(|()| self.host_then(then)),
         };
         while let Err(fault) = step
             && !fault.is_fatal()
@@ -352,6 +373,17 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         }
         self.start(procedure, args)?;
         Ok(None)
+    }
+
+    /// Raises or defers from a host function's call, whose continuation is the current one.
+    fn host_then(&mut self, then: HostThen<'gc>) -> Step<'gc> {
+        match then {
+            HostThen::Raise(raised) => self.raise(raised, false),
+            HostThen::Defer(deferred) => {
+                self.regs.acc = Value::VOID;
+                Ok(Some(Outcome::Deferred(deferred)))
+            }
+        }
     }
 
     /// Hands the frames under the continuation of the current call or request to the chain. A

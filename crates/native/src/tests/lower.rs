@@ -1,6 +1,6 @@
 use ragwort_types::gc::{Arena, WINDOW};
 use ragwort_vm::objects::{Condition, ConditionFields};
-use ragwort_vm::{Fault, Intrinsic, MIN_SEGMENT, Machine, Outcome, Read, Request};
+use ragwort_vm::{Fault, Intrinsic, MIN_SEGMENT, Machine, Outcome, Purity, Read, Request};
 
 use super::*;
 use crate::LowerErrorKind::*;
@@ -15,6 +15,21 @@ fn arena() -> Arena {
     arena
 }
 
+fn add_host<'s, 'gc>(_: &mut ragwort_vm::HostContext<'s, 'gc>, args: ragwort_vm::HostArgs<'s, 'gc>) -> Result<ragwort_vm::Reply<'gc>, Fault> {
+    let sum = args.iter().map(|v| v.as_fixnum().ok_or(Fault::WrongType)).sum::<Result<i64, _>>()?;
+    Ok(ragwort_vm::Reply::Value(Value::fixnum(sum).unwrap()))
+}
+
+fn list_host<'s, 'gc>(cx: &mut ragwort_vm::HostContext<'s, 'gc>, args: ragwort_vm::HostArgs<'s, 'gc>) -> Result<ragwort_vm::Reply<'gc>, Fault> {
+    Ok(ragwort_vm::Reply::Value(Pairs::new(cx.mc()).list(&args.iter().collect::<Vec<_>>())?))
+}
+
+/// The host functions every test's code is loaded with.
+static HOSTS: [HostDef; 2] = [
+    HostDef { name: "add", arity: 2, purity: Purity::Pure, function: add_host },
+    HostDef { name: "list", arity: -1, purity: Purity::Discardable, function: list_host },
+];
+
 fn show<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> String {
     ragwort_printer_scheme::to_string(mc, v, ragwort_printer_scheme::Mode::Write, usize::MAX).unwrap()
 }
@@ -26,12 +41,12 @@ fn eval_in(arena: &mut Arena, text: &str) -> Result<Result<String, Fault>, Error
         let (symbols, globals) = (Symbols::of(mc.root(0)).unwrap(), Globals::of(mc, mc.root(1)).unwrap());
         let session = SyntaxSession::new(mc, text).unwrap();
         let mut last = Value::VOID;
-        for thunk in load(mc, symbols, globals, &session)? {
+        for thunk in load(mc, symbols, globals, &HOSTS, &session)? {
             let mut machine = Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap();
             last = loop {
                 match machine.run(mc).unwrap() {
                     Outcome::Paused => {}
-                    Outcome::Yielded(_) | Outcome::Host(_) => panic!("yielded"),
+                    Outcome::Yielded(_) | Outcome::Host(_) | Outcome::Deferred(_) => panic!("yielded"),
                     Outcome::Done(value) => break value,
                     Outcome::Raised(raised) => return Ok(Err(*raised.downcast::<Condition>(mc).unwrap().fault(mc).unwrap())),
                 }
@@ -300,7 +315,7 @@ fn host_requests_go_to_what_runs_the_machine() {
     let asked = arena.mutate(|mc| {
         let (symbols, globals) = (Symbols::of(mc.root(0)).unwrap(), Globals::of(mc, mc.root(1)).unwrap());
         let session = SyntaxSession::new(mc, text).unwrap();
-        let [thunk] = load(mc, symbols, globals, &session).unwrap()[..] else { panic!("one form") };
+        let [thunk] = load(mc, symbols, globals, &HOSTS, &session).unwrap()[..] else { panic!("one form") };
         let mut machine = Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap();
         let mut asked = Vec::new();
         let mut outcome = machine.run(mc);
@@ -347,4 +362,19 @@ fn a_finished_machine_restarts_on_its_stack() {
         (busy, a, b, finish(&mut machine))
     });
     assert_eq!(shown, ("Some(NotPending)".into(), "2".into(), "(7 . 7)".into(), "42".into()));
+}
+
+#[test]
+fn native_code_calls_the_host_and_wraps_it_for_other_code() {
+    assert_eq!(eval("(%call-host add 1 2)"), "3");
+    assert_eq!(eval("(%call-host list 1 2 3)"), "(1 2 3)");
+    // A wrapper is an ordinary procedure, which passes on what the host needs, such as a mark.
+    let wrapped = "(%define-global add (%lambda (a) (%call-host add a (%intrinsic mark-value 'k 0))))
+                   (%intrinsic with-mark 'k 5 (%lambda () (%app add 1)))";
+    assert_eq!(eval(wrapped), "6");
+    assert_eq!(fault("(%call-host add 1 'x)"), Fault::WrongType);
+    assert_eq!(error("(%call-host nope 1)"), (UnknownHost, "nope"));
+    assert_eq!(error("(%call-host add 1)"), (Arity, "(%call-host add 1)"));
+    assert_eq!(error("(%call-host)"), (BadShape, "(%call-host)"));
+    assert_eq!(error("(%call-host (add) 1)"), (BadShape, "(add)"));
 }

@@ -9,7 +9,8 @@ use ragwort_types::pair::{Pair, Pairs};
 
 use crate::frame::{self, ARGS, CLOSURE, Kept, Link, MAX_PARAMS, SAVED_MARKS};
 use crate::op::Fuel;
-use crate::objects::{BytecodeFields, Closure, ClosureFields, Guard, MultiValue, MultiValueFields, Task, TaskFields};
+use crate::module::{Deferred, HostArgs, HostContext, Reply};
+use crate::objects::{BytecodeFields, Closure, ClosureFields, Guard, ModuleFields, MultiValue, MultiValueFields, Task, TaskFields};
 use crate::prompts::{self, handler_key};
 use crate::{Context, Control, Fault, Op, Request};
 
@@ -35,6 +36,15 @@ pub(crate) enum Exit<'gc> {
     Call { base: u8, argc: u8, rest: Value<'gc>, tail: bool },
     /// A request on the `args` registers from `base`, the last a list of more if `spread`.
     Request { base: u8, args: u8, request: Request, spread: bool, tail: bool },
+    /// What a host function called with a call laid out at `base` asked for that the loop
+    /// can't do.
+    Host { base: u8, tail: bool, then: HostThen<'gc> },
+}
+
+/// What a host function's call leaves the loop for.
+pub(crate) enum HostThen<'gc> {
+    Raise(Value<'gc>),
+    Defer(Deferred),
 }
 
 impl From<Fault> for Exit<'_> {
@@ -130,6 +140,10 @@ impl<'s, 'gc> Run<'s, 'gc> {
                     self.charge()?;
                     self.request(base, args, request, spread, true)?;
                 }
+                Control::Host { base, args, host, tail } => {
+                    self.charge()?;
+                    self.host(base, args, host, tail)?;
+                }
             }
         }
     }
@@ -218,6 +232,37 @@ impl<'s, 'gc> Run<'s, 'gc> {
         (self.ops, self.cx.constants, self.cx.upvalues, self.link) = load(mc, caller)?;
         (self.cx.frame, self.pc) = (frame, pc);
         Ok(())
+    }
+
+    /// Calls host function `host` of the code's module on the `args` registers from `base`, and
+    /// goes on as it replies. Out of line, as the call through its function is the most of what
+    /// it costs.
+    #[inline(never)]
+    fn host(&mut self, base: u8, args: u8, host: u32, tail: bool) -> Result<(), Exit<'gc>> {
+        let mc = self.cx.mc;
+        let module = self.cx.frame.get(CLOSURE).downcast::<Closure>(mc).and_then(|c| c.code(mc)).and_then(|code| code.module(mc));
+        let def = module.and_then(|m| m.hosts(mc)).and_then(|hosts| hosts.get(host as usize)).ok_or(Fault::Malformed)?;
+        if !def.takes(usize::from(args)) {
+            return Err(Fault::Arity.into());
+        }
+        let reply = (def.function)(&mut HostContext { mc, fuel: &mut self.cx.fuel }, HostArgs::registers(self.cx.frame, base, args))?;
+        if mc.step_due() {
+            self.cx.fuel.pause();
+        }
+        match reply {
+            Reply::Value(value) => {
+                self.cx.acc = value;
+                if tail { self.ret() } else { Ok(()) }
+            }
+            Reply::Call(procedure, args) => {
+                let call = Call { base, argc: 0, rest: args };
+                fits(call)?;
+                self.cx.frame.set(base, procedure);
+                if tail { self.tail_call(call) } else { self.call(call, false) }
+            }
+            Reply::Raise(raised) => Err(Exit::Host { base, tail, then: HostThen::Raise(raised) }),
+            Reply::Defer(data) => Err(Exit::Host { base, tail, then: HostThen::Defer(Deferred::new(data)) }),
+        }
     }
 
     /// Makes `apply` or `apply-values` a call, as it's laid out as one, with the list or

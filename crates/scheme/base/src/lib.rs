@@ -156,7 +156,7 @@ impl From<CompileError> for Error {
 /// arguments for each of its forms, to run in order before any code [`load`]s.
 pub fn prelude<'gc>(mc: &Mutation<'gc>, symbols: Symbols<'gc>, prelude: Globals<'gc>) -> Result<Vec<Value<'gc>>, ragwort_native::Error> {
     let session = SyntaxSession::named(mc, "prelude", PRELUDE).map_err(|e| ragwort_native::LowerError::from(ragwort_types::Error::from(e)))?;
-    ragwort_native::load(mc, symbols, prelude, &session)
+    ragwort_native::load(mc, symbols, prelude, &[], &session)
 }
 
 /// Reads `session`'s text, interning names in `symbols`, and expands and compiles each form in
@@ -178,7 +178,7 @@ pub fn load<'gc>(
     let mut thunks = Vec::with_capacity(tops.len());
     for top in tops {
         let core = expander.lower(top)?;
-        thunks.push(compile(mc, &core)?);
+        thunks.push(compile(mc, None, &core)?);
     }
     Ok(thunks)
 }

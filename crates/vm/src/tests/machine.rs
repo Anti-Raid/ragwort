@@ -5,7 +5,8 @@ use ragwort_types::vector::Vectors;
 use super::*;
 use crate::Intrinsic::{Add, Car, Cons, Eq, IsValues, MakeBox, MakePromptTag, SetBox, Unbox, Values, ValuesLength, ValuesRef};
 use crate::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Condition, ConditionFields, MultiValue, MultiValueFields, Tag};
-use crate::{Capture, Fault, Op, Read, Request};
+use crate::objects::{ExternalRef, ExternalRefFields, Module};
+use crate::{Capture, Fault, HostArgs, HostContext, HostDef, Op, Purity, Read, Reply, Request};
 
 fn fix<'gc>(n: i64) -> Value<'gc> {
     Value::fixnum(n).unwrap()
@@ -17,11 +18,21 @@ type Func<'a> = (i64, &'a [Capture], &'a [Op]);
 /// Functions sharing a constant table of `constants`, then the functions themselves, so
 /// function `i` is constant `constants.len() + i`.
 fn module<'gc>(mc: &Mutation<'gc>, constants: &[Value<'gc>], funcs: &[Func<'_>]) -> Vec<Gc<'gc, Bytecode>> {
+    module_in(mc, None, constants, funcs)
+}
+
+/// As [`module`], with the functions in a module of no variables calling `hosts`.
+fn module_calling<'gc>(mc: &Mutation<'gc>, constants: &[Value<'gc>], hosts: &'static [HostDef], funcs: &[Func<'_>]) -> Vec<Gc<'gc, Bytecode>> {
+    module_in(mc, Some(crate::module::new(mc, Value::FALSE, &[], hosts).unwrap()), constants, funcs)
+}
+
+/// As [`module`], with the functions in `owner`.
+fn module_in<'gc>(mc: &Mutation<'gc>, owner: Option<Gc<'gc, Module>>, constants: &[Value<'gc>], funcs: &[Func<'_>]) -> Vec<Gc<'gc, Bytecode>> {
     let codes: Vec<_> = funcs
         .iter()
         .map(|&(arity, captures, ops)| {
             let (ops, captures) = (mc.frozen(Box::from(ops)).unwrap(), mc.frozen(Box::from(captures)).unwrap());
-            Bytecode::new(mc, ops, Value::VOID, captures, arity).unwrap()
+            Bytecode::new(mc, ops, Value::VOID, captures, arity, owner).unwrap()
         })
         .collect();
     let mut table = constants.to_vec();
@@ -91,7 +102,7 @@ fn run<'gc>(mc: &Mutation<'gc>, code: Gc<'gc, Bytecode>, args: &[Value<'gc>]) ->
     let values = match to_end(mc, &mut machine)? {
         Outcome::Done(value) => spread(mc, value),
         Outcome::Raised(raised) => return Err(fault(mc, raised)),
-        Outcome::Paused | Outcome::Yielded(_) | Outcome::Host(_) => unreachable!(),
+        Outcome::Paused | Outcome::Yielded(_) | Outcome::Host(_) | Outcome::Deferred(_) => unreachable!(),
     };
     let digits = |v: Value<'gc>| items(mc, v).iter().fold(0, |a, &n| a * 10 + n);
     Ok(values.iter().map(|&v| if Pair::of(v).is_some() { digits(v) } else { v.as_fixnum().unwrap() }).collect())
@@ -106,7 +117,7 @@ fn finish(arena: &mut Arena, mut machine: Machine) -> Result<(Vec<i64>, usize), 
                 Outcome::Done(value) => Some(fixnums(mc, value)),
                 Outcome::Raised(raised) => return Err(fault(mc, raised)),
                 Outcome::Paused => None,
-                Outcome::Yielded(_) | Outcome::Host(_) => unreachable!(),
+                Outcome::Yielded(_) | Outcome::Host(_) | Outcome::Deferred(_) => unreachable!(),
             })
         })??;
         if let Some(values) = done {
@@ -127,7 +138,7 @@ fn call(constants: &[i64], funcs: &[Func<'_>], args: &[i64]) -> Result<Vec<i64>,
         match to_end(mc, &mut machine)? {
             Outcome::Done(value) => Ok(fixnums(mc, value)),
             Outcome::Raised(raised) => Err(fault(mc, raised)),
-            Outcome::Paused | Outcome::Yielded(_) | Outcome::Host(_) => unreachable!(),
+            Outcome::Paused | Outcome::Yielded(_) | Outcome::Host(_) | Outcome::Deferred(_) => unreachable!(),
         }
     })
 }
@@ -960,5 +971,254 @@ fn running_out_of_fuel_finishes_the_task() {
         assert_eq!(to_end(mc, &mut machine), Err(Fault::OutOfFuel));
         assert_eq!(machine.fuel(), 0);
         assert_eq!(machine.run(mc), Err(Fault::Finished));
+    });
+}
+
+#[test]
+fn module_variables_are_checked_until_defined() {
+    let mut arena = Arena::new(1 << 24, 0);
+    arena.mutate(|mc| {
+        let instance = crate::module::new(mc, Value::FALSE, &[fix(0), fix(1)], &[]).unwrap();
+        let constants = [Value::VOID, fix(5), fix(6)];
+        let funcs: [Func<'_>; 6] = [
+            (0, &[], &[Op::LoadSlotChecked { dst: 2, slot: 0 }, Op::Return { src: 2 }]),
+            (0, &[], &[Op::LoadConst { dst: 2, index: 1 }, Op::StoreSlotChecked { src: 2, slot: 0 }, Op::Return { src: 2 }]),
+            (
+                0,
+                &[],
+                &[
+                    Op::LoadConst { dst: 2, index: 1 },
+                    Op::StoreSlot { src: 2, slot: 1 },
+                    Op::LoadSlot { dst: 3, slot: 1 },
+                    Op::LoadConst { dst: 2, index: 2 },
+                    Op::StoreSlotChecked { src: 2, slot: 1 },
+                    Op::LoadSlotChecked { dst: 4, slot: 1 },
+                    Op::TailCallIntrinsic { base: 3, args: 2, intrinsic: Values },
+                ],
+            ),
+            (0, &[], &[Op::LoadSlot { dst: 2, slot: 2 }, Op::Return { src: 2 }]),
+            (0, &[], &[Op::StoreSlot { src: 1, slot: 2 }, Op::Return { src: 1 }]),
+            (0, &[], &[Op::LoadSlotChecked { dst: 2, slot: 0 }, Op::Return { src: 2 }]),
+        ];
+        let mut codes = module_in(mc, Some(instance), &constants, &funcs);
+        // Code from no module has no variables.
+        codes[5] = module(mc, &constants, &funcs[5..])[0];
+        assert_eq!(run(mc, codes[0], &[]), Err(Fault::Unbound));
+        assert_eq!(run(mc, codes[1], &[]), Err(Fault::Unbound));
+        assert_eq!(run(mc, codes[2], &[]), Ok(vec![5, 6]));
+        let slots = crate::objects::ModuleFields::items(instance, mc);
+        assert_eq!((slots.get(0), slots.get(1)), (Value::UNDEFINED, fix(6)));
+        for code in &codes[3..] {
+            assert_eq!(run(mc, *code, &[]), Err(Fault::Malformed));
+        }
+    });
+}
+
+
+/// `(add n ...)`, spending a unit of fuel for each.
+fn add_host<'s, 'gc>(cx: &mut HostContext<'s, 'gc>, args: HostArgs<'s, 'gc>) -> Result<Reply<'gc>, Fault> {
+    cx.charge(args.len() as u64)?;
+    let sum = args.iter().map(|v| v.as_fixnum().ok_or(Fault::WrongType)).sum::<Result<i64, _>>()?;
+    Ok(Reply::Value(fix(sum)))
+}
+
+/// `(call-with f x)`: `(f x)`, in its place.
+fn call_with<'s, 'gc>(cx: &mut HostContext<'s, 'gc>, args: HostArgs<'s, 'gc>) -> Result<Reply<'gc>, Fault> {
+    Ok(Reply::Call(args.get(0).unwrap(), Pairs::new(cx.mc()).list(&[args.get(1).unwrap()])?))
+}
+
+fn raise_host<'s, 'gc>(_: &mut HostContext<'s, 'gc>, args: HostArgs<'s, 'gc>) -> Result<Reply<'gc>, Fault> {
+    Ok(Reply::Raise(args.get(0).unwrap()))
+}
+
+/// Defers with its argument, as a fixnum.
+fn defer_host<'s, 'gc>(_: &mut HostContext<'s, 'gc>, args: HostArgs<'s, 'gc>) -> Result<Reply<'gc>, Fault> {
+    Ok(Reply::Defer(Box::new(args.get(0).unwrap().as_fixnum())))
+}
+
+/// `(burn n)`: spends `n` units of fuel.
+fn burn<'s, 'gc>(cx: &mut HostContext<'s, 'gc>, args: HostArgs<'s, 'gc>) -> Result<Reply<'gc>, Fault> {
+    cx.charge(args.get(0).unwrap().as_fixnum().unwrap() as u64)?;
+    Ok(Reply::Value(Value::VOID))
+}
+
+static HOSTS: [HostDef; 5] = [
+    HostDef { name: "add", arity: -1, purity: Purity::Pure, function: add_host },
+    HostDef { name: "call-with", arity: 2, purity: Purity::Impure, function: call_with },
+    HostDef { name: "raise", arity: 1, purity: Purity::Impure, function: raise_host },
+    HostDef { name: "defer", arity: 1, purity: Purity::Impure, function: defer_host },
+    HostDef { name: "burn", arity: 1, purity: Purity::Impure, function: burn },
+];
+const DEFER: u32 = 3;
+const BURN: u32 = 4;
+
+#[test]
+fn host_functions_run_where_theyre_called() {
+    let mut arena = Arena::new(1 << 24, 0);
+    arena.mutate(|mc| {
+        let constants = [fix(10), fix(20), fix(1)];
+        let inc = 3 + 7;
+        let funcs: [Func<'_>; 9] = [
+            // (+ 1 (add 10 20)), (add 10), (add)
+            (
+                0,
+                &[],
+                &[
+                    Op::LoadConst { dst: 2, index: 0 },
+                    Op::LoadConst { dst: 3, index: 1 },
+                    Op::CallHost { base: 2, args: 2, host: 0 },
+                    Op::LoadAcc { dst: 4 },
+                    Op::AddImm { dst: 4, a: 4, imm: 1 },
+                    Op::Return { src: 4 },
+                ],
+            ),
+            (0, &[], &[Op::LoadConst { dst: 2, index: 0 }, Op::TailCallHost { base: 2, args: 1, host: 0 }]),
+            (0, &[], &[Op::TailCallHost { base: 2, args: 0, host: 0 }]),
+            // (call-with 10): too few.
+            (0, &[], &[Op::LoadConst { dst: 2, index: 0 }, Op::TailCallHost { base: 2, args: 1, host: 1 }]),
+            // (+ 100 (call-with inc 10)), and in tail position.
+            (
+                0,
+                &[],
+                &[
+                    Op::NewClosure { dst: 2, count: 1, code: inc },
+                    Op::LoadConst { dst: 3, index: 0 },
+                    Op::CallHost { base: 2, args: 2, host: 1 },
+                    Op::LoadAcc { dst: 4 },
+                    Op::AddImm { dst: 4, a: 4, imm: 100 },
+                    Op::Return { src: 4 },
+                ],
+            ),
+            (0, &[], &[Op::NewClosure { dst: 2, count: 1, code: inc }, Op::LoadConst { dst: 3, index: 0 }, Op::TailCallHost { base: 2, args: 2, host: 1 }]),
+            // (raise 1)
+            (0, &[], &[Op::LoadConst { dst: 2, index: 2 }, Op::CallHost { base: 2, args: 1, host: 2 }, Op::Return { src: 2 }]),
+            // inc
+            (1, &[], &[Op::AddImm { dst: 1, a: 1, imm: 1 }, Op::Return { src: 1 }]),
+            // A host function the module doesn't have.
+            (0, &[], &[Op::TailCallHost { base: 2, args: 0, host: 5 }]),
+        ];
+        let codes = module_calling(mc, &constants, &HOSTS, &funcs);
+        assert_eq!(run(mc, codes[0], &[]), Ok(vec![31]));
+        assert_eq!(run(mc, codes[1], &[]), Ok(vec![10]));
+        assert_eq!(run(mc, codes[2], &[]), Ok(vec![0]));
+        assert_eq!(run(mc, codes[3], &[]), Err(Fault::Arity));
+        assert_eq!(run(mc, codes[4], &[]), Ok(vec![111]));
+        assert_eq!(run(mc, codes[5], &[]), Ok(vec![11]));
+        let mut machine = Machine::new(mc, MIN_SEGMENT, closure(mc, codes[6]), &[]).unwrap();
+        assert_eq!(to_end(mc, &mut machine), Ok(Outcome::Raised(fix(1))));
+        assert_eq!(run(mc, codes[8], &[]), Err(Fault::Malformed));
+    });
+}
+
+#[test]
+fn deferred_host_calls_wait_for_the_host() {
+    let mut arena = Arena::new(1 << 24, 0);
+    arena.mutate(|mc| {
+        // (+ 1 (defer 10))
+        let code: &[Op] = &[
+            Op::LoadConst { dst: 2, index: 0 },
+            Op::CallHost { base: 2, args: 1, host: DEFER },
+            Op::LoadAcc { dst: 3 },
+            Op::AddImm { dst: 3, a: 3, imm: 1 },
+            Op::Return { src: 3 },
+        ];
+        let code = module_calling(mc, &[fix(10)], &HOSTS, &[(0, &[], code)])[0];
+        let mut machine = Machine::new(mc, MIN_SEGMENT, closure(mc, code), &[]).unwrap();
+        let Ok(Outcome::Deferred(deferred)) = to_end(mc, &mut machine) else { panic!("not deferred") };
+        assert_eq!(deferred.into_inner().downcast::<Option<i64>>().ok().map(|b| *b), Some(Some(10)));
+        // A run goes on as a reply of void, which can't be added to.
+        let Ok(Outcome::Raised(raised)) = machine.run(mc) else { panic!("not raised") };
+        assert_eq!(fault(mc, raised), Fault::WrongType);
+        let mut machine = Machine::new(mc, MIN_SEGMENT, closure(mc, code), &[]).unwrap();
+        assert!(matches!(to_end(mc, &mut machine), Ok(Outcome::Deferred(_))));
+        assert_eq!(machine.reply(mc, fix(41)), Ok(Outcome::Done(fix(42))));
+        assert_eq!(machine.raise(mc, fix(1)).err(), Some(Fault::Finished));
+        let mut machine = Machine::new(mc, MIN_SEGMENT, closure(mc, code), &[]).unwrap();
+        assert!(matches!(to_end(mc, &mut machine), Ok(Outcome::Deferred(_))));
+        assert_eq!(machine.raise(mc, fix(7)), Ok(Outcome::Raised(fix(7))));
+    });
+}
+
+#[test]
+fn host_functions_spend_the_machines_fuel() {
+    let mut arena = Arena::new(1 << 24, 0);
+    arena.mutate(|mc| {
+        let call = |index| [Op::LoadConst { dst: 2, index }, Op::TailCallHost { base: 2, args: 1, host: BURN }];
+        let (fifty, five_hundred) = (call(0), call(1));
+        let codes = module_calling(mc, &[fix(50), fix(500)], &HOSTS, &[(0, &[], &fifty), (0, &[], &five_hundred)]);
+        for (code, left) in [(codes[0], Some(50)), (codes[1], None)] {
+            let mut machine = Machine::new(mc, MIN_SEGMENT, closure(mc, code), &[]).unwrap();
+            machine.set_fuel(101);
+            let outcome = to_end(mc, &mut machine);
+            match left {
+                Some(left) => assert_eq!((outcome, machine.fuel()), (Ok(Outcome::Done(Value::VOID)), left)),
+                None => assert_eq!(outcome, Err(Fault::OutOfFuel)),
+            }
+        }
+    });
+}
+
+#[test]
+fn external_refs_hold_the_hosts_data_and_trace_their_value() {
+    struct Dropped(std::rc::Rc<std::cell::Cell<bool>>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+    type State = (Dropped, std::cell::Cell<i64>);
+    fn count<'s, 'gc>(cx: &mut HostContext<'s, 'gc>, args: HostArgs<'s, 'gc>) -> Result<Reply<'gc>, Fault> {
+        let (_, n) = crate::module::external_data::<State>(cx.mc(), args.get(0).unwrap()).ok_or(Fault::WrongType)?;
+        n.set(n.get() + 1);
+        Ok(Reply::Value(fix(n.get())))
+    }
+    static COUNT: [HostDef; 1] = [HostDef { name: "count", arity: 1, purity: Purity::Impure, function: count }];
+    let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+    let mut arena = Arena::new(1 << 24, 1);
+    arena.mutate(|mc| {
+        let state: State = (Dropped(dropped.clone()), std::cell::Cell::new(0));
+        let external = crate::module::external(mc, state, 0, list(mc, &[1, 2])).unwrap();
+        mc.set_root(0, Value::object(mc, external));
+    });
+    arena.set_evacuate_all(true);
+    arena.collect();
+    arena.mutate(|mc| {
+        let external = mc.root(0);
+        let call = |index| [Op::LoadConst { dst: 2, index }, Op::TailCallHost { base: 2, args: 1, host: 0 }];
+        let (counted, wrong) = (call(0), call(1));
+        let codes = module_calling(mc, &[external, fix(3)], &COUNT, &[(0, &[], &counted), (0, &[], &wrong)]);
+        assert_eq!((run(mc, codes[0], &[]), run(mc, codes[0], &[])), (Ok(vec![1]), Ok(vec![2])));
+        assert_eq!(run(mc, codes[1], &[]), Err(Fault::WrongType));
+        assert_eq!(items(mc, external.downcast::<ExternalRef>(mc).unwrap().held(mc)), [1, 2]);
+        assert!(crate::module::external_data::<i64>(mc, external).is_none());
+        mc.set_root(0, Value::NIL);
+    });
+    assert!(!dropped.get());
+    arena.collect();
+    arena.collect();
+    assert!(dropped.get());
+}
+
+#[test]
+fn what_the_host_raises_goes_to_the_raise_handler() {
+    let mut arena = Arena::new(1 << 24, 0);
+    arena.mutate(|mc| {
+        let call = |host| [Op::LoadConst { dst: 2, index: 0 }, Op::CallHost { base: 2, args: 1, host }, Op::Return { src: 2 }];
+        let (raising, deferring) = (call(2), call(DEFER));
+        let handler = [Op::Return { src: 1 }];
+        let codes = module_calling(mc, &[fix(1)], &HOSTS, &[(0, &[], &raising), (0, &[], &deferring), (1, &[], &handler)]);
+        // A raise can't go on, so the handler returning raises an error with what was raised.
+        for (code, raised) in [(codes[0], fix(1)), (codes[1], fix(7))] {
+            let thunk = with_raise_handler(mc, closure(mc, codes[2]), closure(mc, code));
+            let mut machine = Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap();
+            let mut outcome = to_end(mc, &mut machine).unwrap();
+            if let Outcome::Deferred(_) = outcome {
+                outcome = machine.raise(mc, raised).unwrap();
+            }
+            let Outcome::Raised(value) = outcome else { panic!("{outcome:?}") };
+            assert_eq!(fault(mc, value), Fault::Error);
+            let irritants = value.downcast::<Condition>(mc).unwrap().irritants(mc);
+            assert_eq!(Pair::of(irritants).unwrap().head(mc), raised);
+        }
     });
 }

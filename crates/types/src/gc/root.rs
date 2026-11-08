@@ -5,7 +5,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use crate::gc::{Gc, Mutation, Object, OutOfMemory, Value};
+use crate::gc::{Gc, Mutation, OBJECT, Object, OutOfMemory, TAG, Value};
 
 /// What a root is charged.
 pub(crate) const ROOT_COST: usize = 32;
@@ -58,5 +58,44 @@ impl<T: Object> Root<T> {
             return Err(ForeignRoot);
         }
         Ok(Value::from_bits(self.record.word.get()).downcast(mc).expect("a root keeps its object"))
+    }
+}
+
+/// Keeps any value alive across steps, as a [`Root`] keeps an object, for what holds values of
+/// any kind outside the arena. One that isn't an object is kept in the handle, which costs the
+/// arena nothing.
+#[derive(Clone)]
+pub struct ValueRoot {
+    arena: u64,
+    held: Held,
+}
+
+#[derive(Clone)]
+enum Held {
+    Word(u64),
+    Record(Rc<RootRecord>),
+}
+
+impl ValueRoot {
+    pub fn new<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Result<Self, OutOfMemory> {
+        let (m, word) = (mc.heap.m, value.to_bits());
+        if word & TAG != OBJECT {
+            return Ok(Self { arena: m.id, held: Held::Word(word) });
+        }
+        m.budget.count_allocation()?;
+        m.budget.charge(ROOT_COST)?;
+        let record = Rc::new(RootRecord { word: Cell::new(word) });
+        m.handles.borrow_mut().push(record.clone());
+        Ok(Self { arena: m.id, held: Held::Record(record) })
+    }
+
+    pub fn get<'gc>(&self, mc: &Mutation<'gc>) -> Result<Value<'gc>, ForeignRoot> {
+        if self.arena != mc.heap.m.id {
+            return Err(ForeignRoot);
+        }
+        Ok(Value::from_bits(match &self.held {
+            Held::Word(word) => *word,
+            Held::Record(record) => record.word.get(),
+        }))
     }
 }

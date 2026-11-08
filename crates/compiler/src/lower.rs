@@ -76,6 +76,7 @@ impl<'gc> Lower<'_, 'gc> {
                     Prim::Intrinsic(i) => i.arity().is_none_or(|n| usize::from(n) == args.len()),
                     Prim::Read(r) => usize::from(r.arity()) == args.len(),
                     Prim::Request(r) => r.takes(args.len()),
+                    Prim::Host(h) => h.takes(args.len()),
                 };
                 if !takes {
                     return Err(CompileError::Arity(*prim));
@@ -83,8 +84,9 @@ impl<'gc> Lower<'_, 'gc> {
                 L1::Intrinsic(*prim, self.exprs(args)?)
             }
             Core::ApplyIntrinsic(prim, args) => {
-                // A read takes a fixed number of arguments, so its prelude wrapper spreads them.
-                if args.is_empty() || matches!(prim, Prim::Read(_)) {
+                // A read takes a fixed number of arguments, so its prelude wrapper spreads them, and
+                // a host function's arguments must fit a frame.
+                if args.is_empty() || matches!(prim, Prim::Read(_) | Prim::Host(_)) {
                     return Err(CompileError::Arity(*prim));
                 }
                 L1::ApplyIntrinsic(*prim, self.exprs(args)?)

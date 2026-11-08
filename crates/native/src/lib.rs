@@ -12,9 +12,12 @@
 //! (%app f arg ...)
 //! (%intrinsic name arg ...)
 //! (%apply-intrinsic name arg ... list)
+//! (%call-host name arg ...)
 //! ```
 //!
-//! An `%apply-intrinsic`'s last argument is a list of more.
+//! An `%apply-intrinsic`'s last argument is a list of more. A `%call-host` calls one of the
+//! [`HostDef`]s the code was loaded with, which only native ragwort can: other code calls the
+//! native procedures that wrap them, which pass on what they need, such as a mark.
 //!
 //! A name is the innermost local of that name in scope, or else the global of that name. A
 //! body's expressions run in order, and the last one's value is the body's. A list that doesn't
@@ -34,6 +37,7 @@ use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Value};
 use ragwort_types::pair::Pairs;
 use ragwort_types::symbol::{Symbol, Symbols};
 use ragwort_types::syntax::SyntaxSession;
+use ragwort_vm::HostDef;
 use ragwort_vm::objects::{Box as Cell, BoxFields, Global, GlobalFields};
 
 /// The globals native code names: a cell holding a list of [`Global`]s, each named by its
@@ -96,13 +100,15 @@ impl From<CompileError> for Error {
 }
 
 /// Reads `session`'s text, interning names in `symbols`, and compiles each form in it, naming
-/// globals in `globals`. Returns a procedure of no arguments for each, to run in order.
-pub fn load<'gc>(mc: &Mutation<'gc>, symbols: Symbols<'gc>, globals: Globals<'gc>, session: &SyntaxSession) -> Result<Vec<Value<'gc>>, Error> {
-    let mut lowerer = Lowerer::new(mc, symbols, globals).map_err(LowerError::from)?;
+/// globals in `globals` and calling the host functions in `hosts`. Returns a procedure of no
+/// arguments for each, to run in order.
+pub fn load<'gc>(mc: &Mutation<'gc>, symbols: Symbols<'gc>, globals: Globals<'gc>, hosts: &'static [HostDef], session: &SyntaxSession) -> Result<Vec<Value<'gc>>, Error> {
+    let mut lowerer = Lowerer::new(mc, symbols, globals, hosts).map_err(LowerError::from)?;
+    let module = ragwort_vm::module::new(mc, Value::FALSE, &[], hosts).map_err(CompileError::from)?;
     let mut thunks = Vec::new();
     for node in Reader::new(mc, symbols, session)? {
         let core = lowerer.lower(node?)?;
-        thunks.push(compile(mc, &core)?);
+        thunks.push(compile(mc, Some(module), &core)?);
     }
     Ok(thunks)
 }

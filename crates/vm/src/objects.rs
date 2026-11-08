@@ -11,14 +11,16 @@ mod tests;
 objects! {
     pub kind Vm;
 
-    /// A function's code: its instructions, the module's constant table they index, where its
-    /// closures' upvalues come from, one capture for each, and how many arguments it takes, as
-    /// Chez encodes it: `n >= 0` for exactly `n`, `-(n + 1)` for at least `n`, the rest in a list.
+    /// A function's code: its instructions, the constant table they index, shared by what was
+    /// compiled with it, where its closures' upvalues come from, one capture for each, how many
+    /// arguments it takes, as Chez encodes it: `n >= 0` for exactly `n`, `-(n + 1)` for at least
+    /// `n`, the rest in a list, and the [`Module`] it's from, if any.
     pub struct Bytecode {
         ops: Frozen<std::boxed::Box<[Op]>>,
         constants: Value,
         captures: Frozen<std::boxed::Box<[Capture]>>,
         arity: i64,
+        module: Member<Module>,
     }
     /// A procedure: its code, and the values it captured, which `LoadUpvalue` reads.
     pub struct Closure { code: Member<Bytecode> } items Value
@@ -103,6 +105,15 @@ objects! {
         base: u32,
         state: u32,
     }
+    /// A module, which ragwort code sees only as a whole: its variables, its items, each
+    /// `UNDEFINED` until it's defined, which its code's slot instructions read and write, their
+    /// names, for messages, in the immutable vector `names`, and the host functions its native
+    /// code calls, which [`Op::CallHost`] indexes.
+    pub struct Module { name: Value, names: Value, hosts: Frozen<&'static [crate::module::HostDef]> } items Value
+    /// Something of the host's, for its procedures to be passed, such as a machine's own state:
+    /// `data` outside the arena, dropped once the object is collected, and `held`, which the
+    /// collector traces, for what of the arena's the host keeps with it.
+    pub struct ExternalRef { held: Value, data: Frozen<std::boxed::Box<dyn std::any::Any>> }
     /// What `(values ...)` makes of other than one value: an object like any other, which the
     /// `values` intrinsics take apart.
     pub struct MultiValue {} items Value

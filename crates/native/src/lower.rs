@@ -11,7 +11,7 @@ use ragwort_types::symbol::Symbols;
 use ragwort_types::vector::Vectors;
 use ragwort_types::syntax::{Abbreviation, Syntax, SyntaxKind};
 use ragwort_vm::objects::{Global, GlobalFields};
-use ragwort_vm::{Intrinsic, Read, Request};
+use ragwort_vm::{HostDef, Intrinsic, Read, Request};
 
 use crate::Globals;
 
@@ -28,7 +28,9 @@ pub enum LowerErrorKind {
     Duplicate,
     /// An `%intrinsic` of a name that isn't one.
     UnknownIntrinsic,
-    /// An `%intrinsic` with a number of arguments it doesn't take.
+    /// A `%call-host` of a name that isn't one of the host functions the code was given.
+    UnknownHost,
+    /// An `%intrinsic` or `%call-host` with a number of arguments it doesn't take.
     Arity,
     /// Syntax native ragwort doesn't have, such as a quasiquote outside a quoted datum.
     Unsupported,
@@ -77,9 +79,10 @@ enum Form {
     App,
     Intrinsic,
     ApplyIntrinsic,
+    CallHost,
 }
 
-const FORMS: [(&str, Form); 11] = [
+const FORMS: [(&str, Form); 12] = [
     ("%quote", Form::Quote),
     ("%if", Form::If),
     ("%let", Form::Let),
@@ -91,10 +94,11 @@ const FORMS: [(&str, Form); 11] = [
     ("%app", Form::App),
     ("%intrinsic", Form::Intrinsic),
     ("%apply-intrinsic", Form::ApplyIntrinsic),
+    ("%call-host", Form::CallHost),
 ];
 
-/// Lowers forms one at a time, numbering their variables and lambdas apart, and naming globals
-/// in its [`Globals`].
+/// Lowers forms one at a time, numbering their variables and lambdas apart, naming globals in
+/// its [`Globals`], and calling the host functions it was given.
 pub struct Lowerer<'a, 'gc> {
     mc: &'a Mutation<'gc>,
     pairs: Pairs<'a, 'gc>,
@@ -104,6 +108,8 @@ pub struct Lowerer<'a, 'gc> {
     /// The forms and the built-ins, by their names' words.
     forms: HashMap<u64, Form>,
     prims: HashMap<u64, Prim>,
+    /// The host functions, by their names' words.
+    hosts: HashMap<u64, &'static HostDef>,
     /// The symbols each [`Abbreviation`] stands for, in order, for what they read
     /// as in a quoted datum.
     abbreviations: Vec<Value<'gc>>,
@@ -115,7 +121,7 @@ pub struct Lowerer<'a, 'gc> {
 }
 
 impl<'a, 'gc> Lowerer<'a, 'gc> {
-    pub fn new(mc: &'a Mutation<'gc>, symbols: Symbols<'gc>, globals: Globals<'gc>) -> Result<Self, Error> {
+    pub fn new(mc: &'a Mutation<'gc>, symbols: Symbols<'gc>, globals: Globals<'gc>, hosts: &'static [HostDef]) -> Result<Self, Error> {
         let strings = Strings::new(mc);
         let word = |name: &str| symbols.intern_str(&strings, name).map(|s| s.value(mc).to_bits());
         let forms = FORMS.iter().map(|&(name, form)| Ok((word(name)?, form))).collect::<Result<_, Error>>()?;
@@ -124,6 +130,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         let requests = Request::ALL.iter().map(|&r| (r.name(), Prim::Request(r)));
         let prims = intrinsics.chain(reads).chain(requests).map(|(name, prim)| Ok((word(name)?, prim))).collect::<Result<_, Error>>()?;
         let cells = globals.iter(mc).map(|g| (g.name(mc).to_bits(), g)).collect();
+        let hosts = hosts.iter().map(|def| Ok((word(def.name)?, def))).collect::<Result<_, Error>>()?;
         Ok(Self {
             mc,
             pairs: Pairs::new(mc),
@@ -131,6 +138,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             cells,
             forms,
             prims,
+            hosts,
             abbreviations: Abbreviation::ALL.iter().map(|a| Ok(symbols.intern_str(&strings, a.name())?.value(mc))).collect::<Result<_, ragwort_types::Error>>()?,
             scope: HashMap::new(),
             vars: 0,
@@ -183,6 +191,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             (Form::App, &[f, ref args @ ..]) => Core::App(Box::new(self.expr(f)?), self.exprs(args)?),
             (Form::Intrinsic, &[name, ref args @ ..]) => self.intrinsic(node, name, args, false)?,
             (Form::ApplyIntrinsic, &[name, ref args @ ..]) if !args.is_empty() => self.intrinsic(node, name, args, true)?,
+            (Form::CallHost, &[name, ref args @ ..]) => self.call_host(node, name, args)?,
             _ => return Err(self.error(LowerErrorKind::BadShape, node)),
         })
     }
@@ -271,11 +280,22 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             Prim::Intrinsic(i) => i.arity().is_none_or(|arity| usize::from(arity) == args.len()),
             Prim::Read(r) => usize::from(r.arity()) == args.len(),
             Prim::Request(r) => r.takes(args.len()),
+            Prim::Host(h) => h.takes(args.len()),
         };
         if !takes {
             return Err(self.error(LowerErrorKind::Arity, node));
         }
         Ok(Core::Intrinsic(prim, self.exprs(args)?))
+    }
+
+    /// A `%call-host` of the host function named `name`.
+    fn call_host(&mut self, node: Syntax<'gc>, name: Syntax<'gc>, args: &[Syntax<'gc>]) -> Result<Core<'gc>, LowerError> {
+        self.name(name)?;
+        let &def = self.hosts.get(&name.datum(self.mc).to_bits()).ok_or_else(|| self.error(LowerErrorKind::UnknownHost, name))?;
+        if !def.takes(args.len()) {
+            return Err(self.error(LowerErrorKind::Arity, node));
+        }
+        Ok(Core::Intrinsic(Prim::Host(def), self.exprs(args)?))
     }
 
     /// A body's expressions, in order, as one.

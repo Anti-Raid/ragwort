@@ -60,7 +60,7 @@ fn run<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Value<'gc> {
     loop {
         match machine.run(mc).expect("run") {
             Outcome::Paused => {}
-            Outcome::Yielded(_) | Outcome::Host(_) => panic!("yielded"),
+            Outcome::Yielded(_) | Outcome::Host(_) | Outcome::Deferred(_) => panic!("yielded"),
             Outcome::Done(value) => return value,
             Outcome::Raised(_) => panic!("raised"),
         }
@@ -96,7 +96,7 @@ fn time(text: &str, native: bool, run_all: bool) -> Duration {
             let session = SyntaxSession::new(mc, text).expect("session");
             let start = Instant::now();
             let mut thunks = match native {
-                true => ragwort_native::load(mc, symbols, globals, &session).expect("load"),
+                true => ragwort_native::load(mc, symbols, globals, &[], &session).expect("load"),
                 false => load(mc, symbols, globals, base, &session).expect("load"),
             };
             let loaded = start.elapsed();

@@ -11,8 +11,8 @@ use std::collections::{HashMap, HashSet};
 use ragwort_types::gc::{Gc, Mutation, Value, WINDOW};
 use ragwort_types::vector::Vectors;
 use ragwort_vm::frame::{self, ARGS, CLOSURE, MAX_PARAMS};
-use ragwort_vm::objects::{Bytecode, BytecodeFields, Closure};
-use ragwort_vm::{Capture, Intrinsic, Op, Read, Request};
+use ragwort_vm::objects::{self, Bytecode, BytecodeFields, Closure, ModuleFields};
+use ragwort_vm::{Capture, HostDef, Intrinsic, Op, Purity, Read, Request};
 
 use crate::ir::{Closure as IrClosure, L4, UpvalSource, VarRef};
 use crate::{CompileError, Prim, Var};
@@ -28,14 +28,8 @@ const STAGE: usize = WINDOW / 4;
 const LIMIT: VReg = (WINDOW - STAGE) as VReg;
 const SCRATCH: u8 = LIMIT as u8;
 
-pub(crate) fn emit<'gc>(mc: &Mutation<'gc>, l4: &L4<'gc>) -> Result<Value<'gc>, CompileError> {
-    let mut module = Module {
-        mc,
-        constants: Vec::new(),
-        index: HashMap::new(),
-        codes: Vec::new(),
-        spills: HashSet::new(),
-    };
+pub(crate) fn emit<'gc>(mc: &Mutation<'gc>, owner: Option<Gc<'gc, objects::Module>>, l4: &L4<'gc>) -> Result<Value<'gc>, CompileError> {
+    let mut module = Module { mc, owner, constants: Vec::new(), index: HashMap::new(), codes: Vec::new(), spills: HashSet::new() };
     let code = module.compile_function(None, &[], None, &[], l4)?;
     let table = Vectors::new(mc).immutable_from_slice(&module.constants)?.value(mc);
     for &c in &module.codes {
@@ -74,6 +68,8 @@ enum Want {
 
 struct Module<'a, 'gc> {
     mc: &'a Mutation<'gc>,
+    /// The module the code is from, whose variables and host functions it uses.
+    owner: Option<Gc<'gc, objects::Module>>,
     constants: Vec<Value<'gc>>,
     index: HashMap<u64, u32>,
     codes: Vec<Gc<'gc, Bytecode>>,
@@ -89,6 +85,13 @@ impl<'a, 'gc> Module<'a, 'gc> {
         self.constants.push(value);
         self.index.insert(value.to_bits(), i);
         Ok(i)
+    }
+
+    /// Where `def` is in the module's host functions.
+    fn host(&self, def: &'static HostDef) -> Result<u32, CompileError> {
+        let hosts = self.owner.and_then(|m| m.hosts(self.mc)).map_or(&[][..], |h| *h);
+        let i = hosts.iter().position(|h| h == def).ok_or(CompileError::UnknownHost(def))?;
+        u32::try_from(i).map_err(|_| CompileError::TooManyConstants)
     }
 
     fn compile_function(
@@ -172,7 +175,7 @@ impl<'a, 'gc> Module<'a, 'gc> {
         }
         let ops = f.ops;
         let mc = self.mc;
-        let code = Bytecode::new(mc, mc.frozen(Box::from(ops))?, Value::VOID, mc.frozen(Box::from(captures))?, arity)?;
+        let code = Bytecode::new(mc, mc.frozen(Box::from(ops))?, Value::VOID, mc.frozen(Box::from(captures))?, arity, self.owner)?;
         self.codes.push(code);
         Ok(code)
     }
@@ -447,6 +450,7 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
                     Prim::Intrinsic(i) => self.intrinsic(i, base, argc, want)?,
                     Prim::Read(r) => self.read_op(r, base, argc, want),
                     Prim::Request(r) => self.request(r, base, argc, want)?,
+                    Prim::Host(h) => self.host(h, base, argc, want)?,
                 }
             }
             L4::ApplyIntrinsic(prim, args) => {
@@ -587,6 +591,24 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
         Ok(())
     }
 
+    /// A call of a host function, laid out as a request is, as what it replies can call a
+    /// procedure at `base`. Its arguments must fit the frame, as nothing else can call it.
+    fn host(&mut self, def: &'static HostDef, base: VReg, args: usize, want: Want) -> Result<(), Stop> {
+        let host = self.module.host(def)?;
+        if !self.fits(base, args) {
+            return Err(Stop::Error(CompileError::TooManyArguments));
+        }
+        let (base, args) = (self.stage(base, args), args as u8);
+        match want {
+            Want::Tail => self.ops.push(Op::TailCallHost { base, args, host }),
+            Want::Reg(dst) => {
+                self.ops.push(Op::CallHost { base, args, host });
+                self.take(dst);
+            }
+        }
+        Ok(())
+    }
+
     fn intrinsic(&mut self, intrinsic: Intrinsic, base: VReg, args: usize, want: Want) -> Result<(), Stop> {
         if self.fits(base, args) {
             let base = self.stage(base, args);
@@ -639,7 +661,7 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
                     Want::Reg(dst) => self.take(dst),
                 }
             }
-            Prim::Read(_) => unreachable!("lowering spreads no read"),
+            Prim::Read(_) | Prim::Host(_) => unreachable!("lowering spreads no read or host function"),
             Prim::Request(request) => self.emit_request(request, base, args, true, want),
         }
         Ok(())
@@ -1027,6 +1049,7 @@ fn l4_is_reorderable<'gc>(expr: &L4<'gc>) -> bool {
         L4::Let(binds, body) => {
             binds.iter().all(|(_, init)| l4_is_reorderable(init)) && l4_is_reorderable(body)
         }
+        L4::Intrinsic(Prim::Host(h), args) => h.purity != Purity::Impure && args.iter().all(l4_is_reorderable),
         L4::Intrinsic(Prim::Intrinsic(i), args) => {
             (i.is_discardable()
                 || matches!(
