@@ -25,10 +25,13 @@ crate::gc::objects! {
     pub(crate) struct SyntaxSource { name: Member<SyntaxText>, text: Weak<SyntaxText>, size: u64, lines: Frozen<Box<[u32]>> }
     /// What a session keeps alive: the source, and its text.
     pub(crate) struct Session { source: Member<SyntaxSource>, text: Member<SyntaxText> }
+    /// A scope made to be apart from every other.
+    pub(crate) struct SyntaxScope {}
     /// An identifier's scopes.
-    pub(crate) struct SyntaxContext {} items u64
+    pub(crate) struct SyntaxContext {} items Value
     /// Spans are the start byte in the low half, the end in the high.
     pub(crate) struct SyntaxOrigin { source: Member<SyntaxSource>, span: u64, parent: Member<SyntaxOrigin> }
     pub(crate) struct SyntaxMeta { kind: u32, context: Member<SyntaxContext>, origin: Member<SyntaxOrigin> }
-    pub(crate) struct Syntax { datum: Value, source: Member<SyntaxSource>, span: u64, meta: Member<SyntaxMeta> }
+    /// `binding` is `#f` for none.
+    pub(crate) struct Syntax { datum: Value, source: Member<SyntaxSource>, span: u64, meta: Member<SyntaxMeta>, binding: Value }
 }

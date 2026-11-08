@@ -22,6 +22,11 @@ objects! {
         arity: i64,
         module: Member<Module>,
     }
+    /// A `syntax-case` pattern, and the literals and data it refers to: see
+    /// [`syntax_case`](crate::syntax_case).
+    pub struct SyntaxPattern { shape: Frozen<std::boxed::Box<crate::syntax_case::PatternShape>> } items Value
+    /// A `syntax` template, and the syntax it's made of.
+    pub struct SyntaxTemplate { shape: Frozen<std::boxed::Box<crate::syntax_case::TemplateShape>> } items Value
     /// A procedure: its code, and the values it captured, which `LoadUpvalue` reads.
     pub struct Closure { code: Member<Bytecode> } items Value
     /// An assigned variable, shared by the closures that capture it.

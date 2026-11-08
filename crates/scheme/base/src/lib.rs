@@ -8,7 +8,8 @@
 //!
 //! The code defines macros with `define-syntax`, `let-syntax` and `letrec-syntax`, as R6RS has
 //! them: a transformer is a procedure of the syntax of a use, which `syntax-case` takes apart
-//! and `syntax` makes, and the expander runs it in a machine as it goes. Macros last as long as
+//! and `syntax` makes, and the expander runs it in a machine as it goes; `quote-syntax` is the
+//! syntax of what it's given, as it is. Macros last as long as
 //! the module that defines them, and their transformers see what it requires, but not its own
 //! variables, which haven't been defined yet.
 //!

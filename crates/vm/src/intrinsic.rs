@@ -162,6 +162,9 @@ named! {
         /// `(make-error message irritant ...)`: a `Condition` of [`Fault::Error`], which the
         /// prelude's `error` raises.
         MakeError = "make-error",
+        /// `(make-syntax-error message form subform ...)`: a condition of kind `syntax`, its
+        /// irritants the malformed `form` and the `subform`s of it that are.
+        MakeSyntaxError = "make-syntax-error",
         /// `procedure?`: whether `x` is a [`objects::Closure`] or [`objects::Continuation`].
         IsProcedure = "procedure?",
         /// `continuation?`: whether `x` is a [`objects::Continuation`], composable or not.
@@ -192,11 +195,27 @@ named! {
         /// `(syntax->datum stx)`: the datum `stx` stands for, with all its syntax unwrapped.
         SyntaxToDatum = "syntax->datum",
         /// `(datum->syntax context datum)`: `datum` as syntax, with the scopes and span of the
-        /// syntax `context`, or none if it's `#f`. What's syntax already in it stays as it is.
+        /// syntax `context`, or none if it's `#f`. What's syntax already in it stays as it is. Its
+        /// identifiers named as `context` is refer to what it does.
         DatumToSyntax = "datum->syntax",
         /// `(bound-identifier=? a b)`: whether a binding of the identifier `a` would bind `b`:
         /// they have the same name and scopes.
         BoundIdentifierEq = "bound-identifier=?",
+        /// `(free-identifier=? a b)`: whether the identifiers `a` and `b` refer to the same
+        /// binding, as the expander found it when it made them. Identifiers it didn't make, such as
+        /// temporaries, are the same only as each other, by name.
+        FreeIdentifierEq = "free-identifier=?",
+        /// `(generate-temporaries list name)`: an identifier for each element of `list`, of
+        /// syntax or not, each in a new scope of its own, so it's apart from every other. It's
+        /// named as the element is if that's an identifier, or else `name`.
+        GenerateTemporaries = "generate-temporaries",
+        /// `(syntax-match pattern input)`: a vector of what the variables of the
+        /// [`SyntaxPattern`](crate::objects::SyntaxPattern) matched in `input`, or `#f`.
+        SyntaxMatch = "syntax-match",
+        /// `(syntax-build template value ...)`: the syntax the
+        /// [`SyntaxTemplate`](crate::objects::SyntaxTemplate) makes of what its pattern variables
+        /// matched.
+        SyntaxBuild = "syntax-build",
     }
 }
 
@@ -205,7 +224,7 @@ impl Intrinsic {
     pub fn arity(self) -> Option<u8> {
         match self {
             Intrinsic::Add | Intrinsic::Sub | Intrinsic::Mul | Intrinsic::Div | Intrinsic::Append => None,
-            Intrinsic::MakePromptTag | Intrinsic::Values | Intrinsic::MakeError | Intrinsic::Void | Intrinsic::MakeBytevector => None,
+            Intrinsic::MakePromptTag | Intrinsic::Values | Intrinsic::MakeError | Intrinsic::MakeSyntaxError | Intrinsic::Void | Intrinsic::MakeBytevector | Intrinsic::SyntaxBuild => None,
             Intrinsic::MakeVector | Intrinsic::MakeVectorOf => None,
             Intrinsic::IsVector | Intrinsic::VectorLength | Intrinsic::VectorToList | Intrinsic::ListToVector => Some(1),
             Intrinsic::VectorRef => Some(2),
@@ -218,7 +237,7 @@ impl Intrinsic {
             Intrinsic::Car | Intrinsic::Cdr | Intrinsic::IsNull | Intrinsic::IsPair | Intrinsic::IsList | Intrinsic::Length | Intrinsic::Reverse | Intrinsic::IsBox | Intrinsic::MakeBox | Intrinsic::Unbox => Some(1),
             Intrinsic::IsValues | Intrinsic::ValuesLength | Intrinsic::Not | Intrinsic::IsBoolean => Some(1),
             Intrinsic::IsSyntax | Intrinsic::IsIdentifier | Intrinsic::SyntaxE | Intrinsic::SyntaxToDatum => Some(1),
-            Intrinsic::DatumToSyntax | Intrinsic::BoundIdentifierEq => Some(2),
+            Intrinsic::DatumToSyntax | Intrinsic::BoundIdentifierEq | Intrinsic::FreeIdentifierEq | Intrinsic::GenerateTemporaries | Intrinsic::SyntaxMatch => Some(2),
             Intrinsic::Caar | Intrinsic::Cadr | Intrinsic::Cdar | Intrinsic::Cddr | Intrinsic::Caaar | Intrinsic::Caadr | Intrinsic::Cadar | Intrinsic::Caddr | Intrinsic::Cdaar | Intrinsic::Cdadr | Intrinsic::Cddar | Intrinsic::Cdddr | Intrinsic::Caaaar | Intrinsic::Caaadr | Intrinsic::Caadar | Intrinsic::Caaddr | Intrinsic::Cadaar | Intrinsic::Cadadr | Intrinsic::Caddar | Intrinsic::Cadddr | Intrinsic::Cdaaar | Intrinsic::Cdaadr | Intrinsic::Cdadar | Intrinsic::Cdaddr | Intrinsic::Cddaar | Intrinsic::Cddadr | Intrinsic::Cdddar | Intrinsic::Cddddr => Some(1),
             Intrinsic::BytevectorRef | Intrinsic::ListTail | Intrinsic::ListRef | Intrinsic::Memq | Intrinsic::Memv | Intrinsic::Member | Intrinsic::Assq | Intrinsic::Assv | Intrinsic::Assoc => Some(2),
             Intrinsic::BytevectorSet => Some(3),
@@ -400,6 +419,7 @@ impl Intrinsic {
                 | BytevectorSet
                 | SetBox
                 | MakeError
+                | MakeSyntaxError
                 | MakeCoroutine
                 | CoroutineState
                 | ErrorObjectMessage
@@ -682,13 +702,15 @@ impl Intrinsic {
                 value
             }
             Intrinsic::MakeError if args == 0 => return Err(Fault::Arity),
-            Intrinsic::MakeError => {
+            Intrinsic::MakeSyntaxError if args < 2 => return Err(Fault::Arity),
+            Intrinsic::MakeError | Intrinsic::MakeSyntaxError => {
                 let pairs = Pairs::new(mc);
                 let mut irritants = Value::NIL;
                 for i in (1..args).rev() {
                     irritants = pairs.cons(arg(i), irritants)?.value(mc);
                 }
-                made(mc, fuel, Value::object(mc, Condition::new(mc, mc.frozen(Fault::Error)?, arg(0), irritants)?))
+                let fault = if self == Intrinsic::MakeError { Fault::Error } else { Fault::Syntax };
+                made(mc, fuel, Value::object(mc, Condition::new(mc, mc.frozen(fault)?, arg(0), irritants)?))
             }
             Intrinsic::IsProcedure => boolean(
                 arg(0).downcast::<objects::Closure>(mc).is_some()
@@ -716,7 +738,22 @@ impl Intrinsic {
                 let syntax = syntax::to_syntax(mc, arg(0), arg(1), fuel)?;
                 made(mc, fuel, syntax)
             }
-            Intrinsic::BoundIdentifierEq => boolean(syntax::same_identifier(mc, arg(0), arg(1))?),
+            Intrinsic::BoundIdentifierEq => boolean(syntax::same_identifier(mc, arg(0), arg(1), fuel)?),
+            Intrinsic::FreeIdentifierEq => boolean(syntax::same_binding(mc, arg(0), arg(1))?),
+            Intrinsic::SyntaxMatch => {
+                let matched = crate::syntax_case::matched(mc, arg(0), arg(1), fuel)?;
+                made(mc, fuel, matched)
+            }
+            Intrinsic::SyntaxBuild if args == 0 => return Err(Fault::Arity),
+            Intrinsic::SyntaxBuild => {
+                let values: Vec<_> = (1..args).map(&arg).collect();
+                let built = crate::syntax_case::build(mc, arg(0), &values, fuel)?;
+                made(mc, fuel, built)
+            }
+            Intrinsic::GenerateTemporaries => {
+                let temporaries = syntax::temporaries(mc, arg(0), arg(1), fuel)?;
+                made(mc, fuel, temporaries)
+            }
             Intrinsic::ErrorObjectMessage => {
                 let c = arg(0).downcast::<Condition>(mc).ok_or(Fault::WrongType)?;
                 match c.message(mc) {

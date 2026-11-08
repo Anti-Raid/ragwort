@@ -31,8 +31,10 @@ fn source(forms: usize) -> String {
 }
 
 /// Forms that use `cond`, `and`, `or` and `let*`, those of `syntax-rules` macros if `macros`.
-fn macro_source(forms: usize, macros: bool) -> String {
-    let defs = "(define-syntax my-or (syntax-rules () ((_) #f) ((_ e) e) ((_ e r ...) (let ((t e)) (if t t (my-or r ...))))))
+/// `forms` definitions using `cond`, `and`, `or` and `let*`: the built-in ones if `macros` is
+/// "", or else copies written with `syntax-rules`, if it's "rules", or `syntax-case`.
+fn macro_source(forms: usize, macros: &str) -> String {
+    let rules = "(define-syntax my-or (syntax-rules () ((_) #f) ((_ e) e) ((_ e r ...) (let ((t e)) (if t t (my-or r ...))))))
                 (define-syntax my-and (syntax-rules () ((_) #t) ((_ e) e) ((_ e r ...) (if e (my-and r ...) #f))))
                 (define-syntax my-let* (syntax-rules ()
                   ((_ () body ...) (let () body ...))
@@ -40,7 +42,15 @@ fn macro_source(forms: usize, macros: bool) -> String {
                 (define-syntax my-cond (syntax-rules (else)
                   ((_ (else e ...)) (begin e ...))
                   ((_ (c e ...) clause ...) (if c (begin e ...) (my-cond clause ...)))))\n";
-    let my = if macros { "my-" } else { "" };
+    let cases = "(define-syntax my-or (lambda (stx) (syntax-case stx () ((_) #'#f) ((_ e) #'e) ((_ e r ...) #'(let ((t e)) (if t t (my-or r ...)))))))
+                (define-syntax my-and (lambda (stx) (syntax-case stx () ((_) #'#t) ((_ e) #'e) ((_ e r ...) #'(if e (my-and r ...) #f)))))
+                (define-syntax my-let* (lambda (stx) (syntax-case stx ()
+                  ((_ () body ...) #'(let () body ...))
+                  ((_ ((x v) rest ...) body ...) #'(let ((x v)) (my-let* (rest ...) body ...))))))
+                (define-syntax my-cond (lambda (stx) (syntax-case stx (else)
+                  ((_ (else e ...)) #'(begin e ...))
+                  ((_ (c e ...) clause ...) #'(if c (begin e ...) (my-cond clause ...))))))\n";
+    let my = if macros.is_empty() { "" } else { "my-" };
     let forms: String = (0..forms)
         .map(|i| {
             format!(
@@ -53,7 +63,11 @@ fn macro_source(forms: usize, macros: bool) -> String {
             )
         })
         .collect();
-    if macros { format!("{defs}{forms}") } else { forms }
+    match macros {
+        "" => forms,
+        "rules" => format!("{rules}{forms}"),
+        _ => format!("{cases}{forms}"),
+    }
 }
 
 fn run<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Value<'gc> {
@@ -61,7 +75,7 @@ fn run<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Value<'gc> {
     loop {
         match machine.run(mc).expect("run") {
             Outcome::Paused => {}
-            Outcome::Yielded(_) | Outcome::Host(_) | Outcome::Deferred(_) => panic!("yielded"),
+            Outcome::Yielded(_) | Outcome::Deferred(_) => panic!("yielded"),
             Outcome::Done(value) => return value,
             Outcome::Raised(_) => panic!("raised"),
         }
@@ -127,7 +141,7 @@ fn main() {
     let ms = took.as_secs_f64() * 1e3;
     println!("load {forms} forms, {} KiB: {ms:.2} ms, {:.1} us per form", text.len() >> 10, ms * 1e3 / forms as f64);
 
-    for (name, macros) in [("built-in macros", false), ("syntax-rules macros", true)] {
+    for (name, macros) in [("built-in macros", ""), ("syntax-rules macros", "rules"), ("syntax-case macros", "case")] {
         let text = macro_source(forms, macros);
         let us = time(&text, false, false).as_secs_f64() * 1e6 / forms as f64;
         println!("load {forms} forms, {name}: {us:.1} us per form");

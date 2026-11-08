@@ -5,7 +5,7 @@
 use ragwort_types::gc::{Mutation, Value};
 use ragwort_types::pair::{Pair, Pairs};
 use ragwort_types::symbol::Symbol;
-use ragwort_types::syntax::{Syntax, SyntaxKind, SyntaxMeta, SyntaxSpan};
+use ragwort_types::syntax::{Syntax, SyntaxContext, SyntaxKind, SyntaxMeta, SyntaxScope, SyntaxSpan};
 use ragwort_types::vector::{AnyVector, Vectors};
 
 use crate::Fault;
@@ -63,7 +63,9 @@ pub(crate) fn to_syntax<'gc>(mc: &Mutation<'gc>, context: Value<'gc>, datum: Val
         None => return Err(Fault::WrongType),
     };
     let meta = |kind| SyntaxMeta::new(mc, kind, scopes, None);
-    let wrap = Wrap { span, id: meta(SyntaxKind::Identifier)?, list: meta(SyntaxKind::List)?, vector: meta(SyntaxKind::Vector)? };
+    let named = Syntax::of(context).filter(|_| is_identifier(mc, context)).and_then(|s| Some((s.datum(mc), s.binding(mc)?)));
+    let (id, list, vector) = (meta(SyntaxKind::Identifier)?, meta(SyntaxKind::List)?, meta(SyntaxKind::Vector)?);
+    let wrap = Wrap { span, id, named, list, vector };
     let mut count = 0;
     let syntax = wrap.wrap(mc, datum, MAX_DEPTH, &mut count)?;
     fuel.spend(count / PER_FUEL)?;
@@ -73,6 +75,9 @@ pub(crate) fn to_syntax<'gc>(mc: &Mutation<'gc>, context: Value<'gc>, datum: Val
 struct Wrap<'gc> {
     span: SyntaxSpan<'gc>,
     id: SyntaxMeta<'gc>,
+    /// The context's name and binding, if it's an identifier with one: what one named as it is
+    /// refers to.
+    named: Option<(Value<'gc>, Value<'gc>)>,
     list: SyntaxMeta<'gc>,
     vector: SyntaxMeta<'gc>,
 }
@@ -84,7 +89,8 @@ impl<'gc> Wrap<'gc> {
         let (datum, meta) = if Syntax::of(x).is_some() {
             return Ok(x);
         } else if Symbol::of(x).is_some() {
-            (x, Some(self.id))
+            let binding = self.named.filter(|&(name, _)| name == x).map(|(_, binding)| binding);
+            return Ok(Syntax::bound(mc, x, self.span, Some(self.id), binding)?.value(mc));
         } else if Pair::of(x).is_some() {
             let (mut items, mut at) = (Vec::new(), x);
             while let Some(pair) = Pair::of(at) {
@@ -106,7 +112,7 @@ impl<'gc> Wrap<'gc> {
 
 /// Whether the identifiers `a` and `b` have the same name and scopes, so that a binding of one
 /// would bind the other.
-pub(crate) fn same_identifier<'gc>(mc: &Mutation<'gc>, a: Value<'gc>, b: Value<'gc>) -> Result<bool, Fault> {
+pub(crate) fn same_identifier<'gc>(mc: &Mutation<'gc>, a: Value<'gc>, b: Value<'gc>, fuel: &mut Fuel) -> Result<bool, Fault> {
     if !is_identifier(mc, a) || !is_identifier(mc, b) {
         return Err(Fault::WrongType);
     }
@@ -114,8 +120,65 @@ pub(crate) fn same_identifier<'gc>(mc: &Mutation<'gc>, a: Value<'gc>, b: Value<'
     if a.datum(mc) != b.datum(mc) {
         return Ok(false);
     }
-    Ok(match (a.context(mc), b.context(mc)) {
-        (Some(x), Some(y)) => x == y || x.scopes(mc).eq(y.scopes(mc)),
-        (x, y) => x.is_none_or(|x| x.scopes(mc).len() == 0) && y.is_none_or(|y| y.scopes(mc).len() == 0),
+    let scopes = |c: Option<SyntaxContext<'gc>>| c.map(|c| c.scopes(mc).collect::<Vec<_>>()).unwrap_or_default();
+    let (x, y) = (a.context(mc), b.context(mc));
+    if x == y {
+        return Ok(true);
+    }
+    let (x, y) = (scopes(x), scopes(y));
+    // Contexts made apart can list the same scopes in another order.
+    if x.len() != y.len() || x == y {
+        return Ok(x == y);
+    }
+    let compared = (x.len() as u64).saturating_mul(y.len() as u64);
+    fuel.spend(compared / PER_FUEL)?;
+    Ok(x.iter().all(|scope| y.contains(scope)))
+}
+
+/// Whether the identifiers `a` and `b` refer to the same binding. The expander gives what it
+/// makes a value standing for its binding: an object of the binding's own, a keyword's name, or
+/// for a module's variable, or a name it doesn't bind, a pair of the module's name and the name
+/// the module gives it.
+pub(crate) fn same_binding<'gc>(mc: &Mutation<'gc>, a: Value<'gc>, b: Value<'gc>) -> Result<bool, Fault> {
+    if !is_identifier(mc, a) || !is_identifier(mc, b) {
+        return Err(Fault::WrongType);
+    }
+    let (a, b) = (Syntax::of(a).ok_or(Fault::WrongType)?, Syntax::of(b).ok_or(Fault::WrongType)?);
+    Ok(match (a.binding(mc), b.binding(mc)) {
+        (Some(x), Some(y)) => match (Pair::of(x), Pair::of(y)) {
+            (Some(x), Some(y)) => x.head(mc) == y.head(mc) && x.tail(mc) == y.tail(mc),
+            _ => x == y,
+        },
+        (None, None) => a.datum(mc) == b.datum(mc),
+        _ => false,
     })
+}
+
+/// An identifier for each element of `list`, each in a new scope of its own: named as the
+/// element is if it's an identifier, or else `name`, a symbol, and where it is if it's syntax.
+pub(crate) fn temporaries<'gc>(mc: &Mutation<'gc>, list: Value<'gc>, name: Value<'gc>, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
+    if Symbol::of(name).is_none() {
+        return Err(Fault::WrongType);
+    }
+    let (mut temporaries, mut at) = (Vec::new(), list);
+    loop {
+        if let Some(pair) = Pair::of(at) {
+            let item = pair.head(mc);
+            let syntax = Syntax::of(item);
+            let named = if is_identifier(mc, item) { syntax.map_or(name, |s| s.datum(mc)) } else { name };
+            let context = SyntaxContext::new(mc, &[SyntaxScope::new(mc)?])?;
+            let meta = SyntaxMeta::new(mc, SyntaxKind::Identifier, Some(context), None)?;
+            let span = syntax.map(|s| s.span(mc)).unwrap_or_default();
+            temporaries.push(Syntax::new(mc, named, span, Some(meta))?.value(mc));
+            at = pair.tail(mc);
+        } else if let Some(rest) = Syntax::of(at).filter(|s| s.kind(mc) == Some(SyntaxKind::List)) {
+            at = rest.datum(mc);
+        } else if at == Value::NIL {
+            break;
+        } else {
+            return Err(Fault::WrongType);
+        }
+    }
+    fuel.spend(temporaries.len() as u64 / PER_FUEL)?;
+    Ok(Pairs::new(mc).list(&temporaries)?)
 }

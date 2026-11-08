@@ -3,52 +3,22 @@
 //! of each use, for the syntax to expand in its place. A step flips a fresh scope on what the
 //! transformer's given and on what it makes, as the built-in macros' do.
 //!
-//! What only the expander knows, a transformer asks with `host`: whether a pattern matches, the
-//! syntax a template makes, what an identifier's bound to. The expander answers, and the machine
-//! goes on.
+//! A transformer needs nothing of the expander's as it runs: what it's given says what each of its
+//! identifiers refers to, and its patterns and templates are values of the VM's. A syntax error
+//! it raises, that it doesn't catch, is bad syntax where the error says.
 
 use ragwort_compiler::{CompileError, Core, compile};
 use ragwort_types::gc::Value;
-use ragwort_types::pair::{Pair, Pairs};
-use ragwort_types::symbol::Symbol;
-use ragwort_types::syntax::{Syntax, SyntaxKind, SyntaxSpan};
-use ragwort_vm::objects::{Closure, MultiValue, MultiValueFields};
+use ragwort_types::pair::Pair;
+use ragwort_types::syntax::{Syntax, SyntaxSpan};
+use ragwort_vm::objects::{Closure, Condition, ConditionFields};
 use ragwort_types::gc::OutOfMemory;
-use ragwort_vm::{Fault, MIN_SEGMENT, Machine, Outcome, Request};
+use ragwort_vm::{Fault, MIN_SEGMENT, Machine, Outcome};
 
 use crate::expand::{Binding, Expander};
 use crate::scope::Op;
 use crate::tree::Stx;
 use crate::{ExpandError, ExpandErrorKind};
-
-/// What a transformer asks the expander, with `host`: its first value. The prelude's syntax
-/// procedures ask by these numbers too.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Ask {
-    /// `(host 0 pattern input)`: the vector of what the pattern's variables matched, or `#f`.
-    Match = 0,
-    /// `(host 1 template value ...)`: the syntax the template makes of what its pattern
-    /// variables matched.
-    Build = 1,
-    /// `(host 2 input)`: that no clause of a `syntax-case` matched `input`.
-    NoMatch = 2,
-    /// `(host 3 a b)`: `free-identifier=?`.
-    FreeIdentifierEq = 3,
-    /// `(host 4 list)`: `generate-temporaries`.
-    Temporaries = 4,
-    /// `(host 5 form)`: `syntax-violation`, of the syntax `form`.
-    Violation = 5,
-}
-
-impl Ask {
-    const ALL: [Ask; 6] = [Ask::Match, Ask::Build, Ask::NoMatch, Ask::FreeIdentifierEq, Ask::Temporaries, Ask::Violation];
-
-    /// A call that asks this with `args`.
-    pub(crate) fn call<'gc>(self, args: impl IntoIterator<Item = Core<'gc>>) -> Core<'gc> {
-        let ask = Core::Quote(Value::fixnum(self as i64).expect("a fixnum"));
-        Core::Intrinsic(ragwort_compiler::Prim::Request(Request::Host), std::iter::once(ask).chain(args).collect())
-    }
-}
 
 impl<'gc> Expander<'_, 'gc> {
     /// The identifier a `define-syntax` binds, and its transformer.
@@ -130,11 +100,8 @@ impl<'gc> Expander<'_, 'gc> {
         let result = loop {
             match outcome {
                 Ok(Outcome::Paused) => outcome = machine.run(mc),
-                Ok(Outcome::Host(asked)) => match self.answer(asked, at) {
-                    Ok(answer) => outcome = machine.reply(mc, answer),
-                    Err(e) => break Err(e),
-                },
                 Ok(Outcome::Done(value)) => break Ok(value),
+                Ok(Outcome::Raised(raised)) => break Err(self.raised(raised, at)),
                 Err(fault) => break Err(failed(self, fault)),
                 Ok(_) => break Err(self.error(ExpandErrorKind::Transformer, at)),
             }
@@ -143,82 +110,22 @@ impl<'gc> Expander<'_, 'gc> {
         result
     }
 
-    fn answer(&mut self, asked: Value<'gc>, at: Stx) -> Result<Value<'gc>, ExpandError> {
+    /// What a transformer for `at` raising `raised` is: a syntax error is bad syntax where its
+    /// innermost form is, and anything else is the transformer's failure.
+    fn raised(&self, raised: Value<'gc>, at: Stx) -> ExpandError {
         let mc = self.mc;
-        let values = match asked.downcast::<MultiValue>(mc) {
-            Some(many) => {
-                let items = many.items(mc);
-                (0..items.len()).map(|i| items.get(i)).collect()
-            }
-            None => vec![asked],
+        let Some(condition) = raised.downcast::<Condition>(mc).filter(|c| c.fault(mc) == Some(&Fault::Syntax)) else {
+            return self.error(ExpandErrorKind::Transformer, at);
         };
-        let failed = |this: &Self| this.error(ExpandErrorKind::Transformer, at);
-        let Some((ask, args)) = values.split_first() else { return Err(failed(self)) };
-        let ask = ask.as_fixnum().and_then(|n| Ask::ALL.into_iter().find(|&a| a as i64 == n)).ok_or_else(|| failed(self))?;
-        let index = |v: Value<'gc>| v.as_fixnum().and_then(|n| usize::try_from(n).ok());
-        match (ask, args) {
-            (Ask::Match, &[pattern, input]) => {
-                let pattern = index(pattern).and_then(|i| self.patterns.get(i).cloned()).ok_or_else(|| failed(self))?;
-                self.match_pattern(&pattern, input, at)
-            }
-            (Ask::Build, &[template, ref values @ ..]) => {
-                let template = index(template).and_then(|i| self.templates.get(i).cloned()).ok_or_else(|| failed(self))?;
-                self.instantiate(&template, values, at)
-            }
-            (Ask::NoMatch | Ask::Violation, &[input]) => Err(self.error_at(ExpandErrorKind::BadSyntax, self.span_of(input, at))),
-            (Ask::FreeIdentifierEq, &[a, b]) => {
-                let (a, b) = (self.binding_of(a, at)?, self.binding_of(b, at)?);
-                Ok(if a == b { Value::TRUE } else { Value::FALSE })
-            }
-            (Ask::Temporaries, &[list]) => self.temporaries(list, at),
-            _ => Err(failed(self)),
+        let (mut form, mut rest) = (Value::VOID, condition.irritants(mc));
+        while let Some(pair) = Pair::of(rest) {
+            (form, rest) = (pair.head(mc), pair.tail(mc));
         }
+        self.error_at(ExpandErrorKind::BadSyntax, self.span_of(form, at))
     }
 
     /// Where the syntax `value` came from, or `at` if it isn't syntax or has no span.
     pub(crate) fn span_of(&self, value: Value<'gc>, at: Stx) -> SyntaxSpan<'gc> {
         Syntax::of(value).map(|s| s.span(self.mc)).filter(|span| span.source().is_some()).unwrap_or_else(|| self.tree.span(at))
-    }
-
-    /// What the identifier `id`, as syntax, refers to, its name with it if it's free, as two
-    /// free identifiers are the same if they're named the same.
-    pub(crate) fn binding_of(&mut self, id: Value<'gc>, at: Stx) -> Result<(Binding<'gc>, Option<Symbol<'gc>>), ExpandError> {
-        let mc = self.mc;
-        let id = Syntax::of(id).filter(|s| s.kind(mc) == Some(SyntaxKind::Identifier)).ok_or_else(|| self.error(ExpandErrorKind::Transformer, at))?;
-        let symbol = Symbol::of(id.datum(mc)).ok_or_else(|| self.error(ExpandErrorKind::Transformer, at))?;
-        let set = self.set_of(id.context(mc), id.span(mc))?;
-        let binding = self.resolve_name(symbol, set).map_err(|_| self.error_at(ExpandErrorKind::Ambiguous, id.span(mc)))?;
-        Ok((binding, matches!(binding, Binding::Free | Binding::Slot(_) | Binding::Import(_)).then_some(symbol)))
-    }
-
-    /// A fresh identifier for each element of the list `list`, named as it is if it's an
-    /// identifier: bound or referred to, it's apart from every other.
-    fn temporaries(&mut self, list: Value<'gc>, at: Stx) -> Result<Value<'gc>, ExpandError> {
-        let mc = self.mc;
-        let failed = |this: &Self| this.error(ExpandErrorKind::Transformer, at);
-        let (mut names, mut rest) = (Vec::new(), list);
-        loop {
-            if let Some(pair) = Pair::of(rest) {
-                let item = Syntax::of(pair.head(mc)).filter(|s| s.kind(mc) == Some(SyntaxKind::Identifier));
-                names.push(item.and_then(|s| Symbol::of(s.datum(mc))));
-                rest = pair.tail(mc);
-            } else if let Some(list) = Syntax::of(rest).filter(|s| s.kind(mc) == Some(SyntaxKind::List)) {
-                rest = list.datum(mc);
-            } else if rest == Value::NIL {
-                break;
-            } else {
-                return Err(failed(self));
-            }
-        }
-        let t = self.symbol("t")?;
-        let span = self.tree.span(at);
-        let mut temps = Vec::with_capacity(names.len());
-        for name in names {
-            let scope = self.tree.scopes.fresh()?;
-            let set = self.tree.scopes.set(vec![scope])?;
-            let meta = self.meta(set, SyntaxKind::Identifier)?;
-            temps.push(Syntax::new(mc, name.unwrap_or(t).value(mc), span, Some(meta))?.value(mc));
-        }
-        Ok(Pairs::new(mc).list(&temps)?)
     }
 }

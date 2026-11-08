@@ -7,7 +7,7 @@ use crate::vector::Vectors;
 use super::*;
 
 fn arena(limit: usize) -> Arena {
-    Arena::new(limit, 1)
+    Arena::new(limit, 2)
 }
 
 // Syntax keeps its children and metadata; the session keeps the source text.
@@ -26,7 +26,9 @@ fn syntax_graph_survives_collection_and_compaction() {
         let a = node(SyntaxKind::Identifier, symbol.value(mc));
         let b = Syntax::new(mc, Value::fixnum(42).unwrap(), span, None).unwrap();
         let pair = Pairs::new(mc).cons(a.value(mc), b.value(mc)).unwrap();
-        let context = SyntaxContext::new(mc, &[SyntaxScope(7), SyntaxScope(9)]).unwrap();
+        let (seven, nine) = (SyntaxScope::new(mc).unwrap(), SyntaxScope::of(Value::fixnum(9).unwrap()));
+        mc.set_root(1, seven.value());
+        let context = SyntaxContext::new(mc, &[seven, nine]).unwrap();
         let parent = SyntaxOrigin::new(mc, span, None).unwrap();
         let origin = SyntaxOrigin::new(mc, span, Some(parent)).unwrap();
         let meta = SyntaxMeta::new(mc, SyntaxKind::List, Some(context), Some(origin)).unwrap();
@@ -57,7 +59,7 @@ fn syntax_graph_survives_collection_and_compaction() {
         assert!(Symbol::of(a.datum(mc)).is_some());
         assert_eq!((b.datum(mc).as_fixnum(), b.kind(mc)), (Some(42), Some(SyntaxKind::Literal)));
         let scopes: Vec<_> = list.context(mc).unwrap().scopes(mc).collect();
-        assert_eq!(scopes, [SyntaxScope(7), SyntaxScope(9)]);
+        assert_eq!(scopes, [SyntaxScope::of(mc.root(1)), SyntaxScope::of(Value::fixnum(9).unwrap())]);
         let origin = list.origin(mc).unwrap();
         let span = origin.parent(mc).unwrap().span(mc);
         assert!(origin.parent(mc).unwrap().parent(mc).is_none());

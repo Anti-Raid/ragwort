@@ -73,11 +73,6 @@ named! {
         /// returns the `v`s. In a machine's own task, it ends the run with
         /// [`Outcome::Yielded`](crate::Outcome::Yielded). Returns the values it's resumed with.
         Yield = "co/yield",
-        /// `(host v ...)`: ends the run with [`Outcome::Host`](crate::Outcome::Host) of the
-        /// `v`s, as one, wherever it's called, even in a coroutine, for what runs the machine to
-        /// answer. [`Machine::reply`](crate::Machine::reply) goes on with it, and it returns what
-        /// that's given.
-        Host = "host",
     }
 }
 
@@ -90,7 +85,7 @@ impl Request {
             Request::ApplyValues | Request::Capture | Request::WithHandler | Request::Guard => (2, Some(2)),
             Request::CallCc | Request::Raise | Request::RaiseContinuable => (1, Some(1)),
             Request::Abort | Request::Resume | Request::TryResume | Request::Compose => (1, None),
-            Request::Yield | Request::Host => (0, None),
+            Request::Yield => (0, None),
         };
         args >= least && most.is_none_or(|most| args <= most)
     }
@@ -139,7 +134,6 @@ impl Request {
                 Then::Resume(arg(0)?, args.tail(mc, 1)?)
             }
             Request::Yield => Then::Yield(args.values(mc)?),
-            Request::Host => Then::Host(args.values(mc)?),
         })
     }
 }

@@ -5,18 +5,16 @@
 //! scopes are the most of its own.
 
 
-use std::rc::Rc;
 
 use ragwort_compiler::module::{self, Import, Imports, ModuleBuilder, ModuleError, RequireSpec, Resolver, SpecError, Uninitialized};
 use ragwort_compiler::{Core, Lambda, Place, Var};
 use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Value};
 use ragwort_types::string::{Strings, chars};
 use ragwort_types::symbol::{Symbol, Symbols};
-use ragwort_types::syntax::{Abbreviation, Syntax, SyntaxContext, SyntaxMeta, SyntaxSpan};
+use ragwort_types::syntax::{Abbreviation, Syntax, SyntaxContext, SyntaxMeta, SyntaxScope, SyntaxSpan};
 use ragwort_vm::{HostDef, Machine};
 use ragwort_vm::objects::Module;
 
-use crate::case::{Built, Compiled};
 use crate::scope::{BASE, Map, Op, Scope, Set, TOP};
 use crate::tree::{Stx, Tree, TreeError, View};
 use crate::{ExpandError, ExpandErrorKind};
@@ -48,6 +46,8 @@ pub(crate) enum Form {
     LetrecSyntax,
     SyntaxCase,
     Syntax,
+    /// `(quote-syntax datum)`: the syntax of `datum`, as it is, pattern variables and all.
+    QuoteSyntax,
     /// `quasisyntax` and its unquotes.
     Unsupported,
 }
@@ -90,7 +90,7 @@ pub(crate) enum Keyword {
     Aux(Aux),
 }
 
-const KEYWORDS: [(&str, Keyword); 38] = [
+const KEYWORDS: [(&str, Keyword); 39] = [
     ("quote", Keyword::Form(Form::Quote)),
     ("if", Keyword::Form(Form::If)),
     ("lambda", Keyword::Form(Form::Lambda)),
@@ -107,6 +107,7 @@ const KEYWORDS: [(&str, Keyword); 38] = [
     ("letrec-syntax", Keyword::Form(Form::LetrecSyntax)),
     ("syntax-case", Keyword::Form(Form::SyntaxCase)),
     ("syntax", Keyword::Form(Form::Syntax)),
+    ("quote-syntax", Keyword::Form(Form::QuoteSyntax)),
     ("quasisyntax", Keyword::Form(Form::Unsupported)),
     ("unsyntax", Keyword::Form(Form::Unsupported)),
     ("unsyntax-splicing", Keyword::Form(Form::Unsupported)),
@@ -130,6 +131,14 @@ const KEYWORDS: [(&str, Keyword); 38] = [
     ("_", Keyword::Aux(Aux::Underscore)),
     ("...", Keyword::Aux(Aux::Ellipsis)),
 ];
+
+/// A binding identifiers have been made with: one of the load's own, of a kind and number, or a
+/// module's variable or free name, by the words of the module's name and the variable's.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Stamp {
+    Own(u8, u32),
+    Named(u64, u64),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Binding<'gc> {
@@ -181,7 +190,7 @@ pub struct Expander<'a, 'gc> {
     keywords: Map<u64, Keyword>,
     /// The module being expanded, which what's read in just the top-level scope refers to by
     /// name, and the prelude's exports, which the base bindings are.
-    builder: ModuleBuilder<'gc>,
+    pub(crate) builder: ModuleBuilder<'gc>,
     base_cells: Map<u64, Import<'gc>>,
     /// The `provide`s, which name what the module defines anywhere.
     provides: Vec<Stx>,
@@ -201,10 +210,6 @@ pub struct Expander<'a, 'gc> {
     depth: usize,
     /// The transformers of the load's macros.
     pub(crate) macros: Vec<Value<'gc>>,
-    /// The patterns of its `syntax-case` clauses, and the templates of its `syntax` forms that
-    /// have pattern variables in them.
-    pub(crate) patterns: Vec<Rc<Compiled<'gc>>>,
-    pub(crate) templates: Vec<Rc<Built<'gc>>>,
     /// What runs the transformers, once one has, and the fuel they have between them till then.
     pub(crate) machine: Option<Machine>,
     pub(crate) fuel: u64,
@@ -212,7 +217,13 @@ pub struct Expander<'a, 'gc> {
     pub(crate) unwrapped: Map<u64, Stx>,
     /// The metadata made for syntax of each kind with each set of scopes, and their contexts.
     pub(crate) metas: Map<(Set, usize), SyntaxMeta<'gc>>,
+    /// The value standing for each binding identifiers have been made with.
+    pub(crate) binding_values: Map<Stamp, Value<'gc>>,
     pub(crate) contexts: Map<Set, SyntaxContext<'gc>>,
+    /// The object each of the load's scopes is, in syntax, and the scope each object it's been
+    /// given is, by the object's word. The prelude is the base scope, in every load.
+    pub(crate) scope_objects: Map<Scope, SyntaxScope<'gc>>,
+    pub(crate) scope_numbers: Map<u64, Scope>,
 }
 
 fn key<'gc>(symbol: Symbol<'gc>, mc: &Mutation<'gc>) -> u64 {
@@ -264,13 +275,14 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             lambdas: 0,
             depth: 0,
             macros: Vec::new(),
-            patterns: Vec::new(),
-            templates: Vec::new(),
             machine: None,
             fuel: MACRO_FUEL,
             unwrapped: Map::default(),
             metas: Map::default(),
+            binding_values: Map::default(),
             contexts: Map::default(),
+            scope_objects: [(BASE, SyntaxScope::of(Value::object(mc, prelude)))].into_iter().collect(),
+            scope_numbers: [(Value::object(mc, prelude).to_bits(), BASE)].into_iter().collect(),
         })
     }
 
@@ -688,6 +700,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             (Form::LetSyntax | Form::LetrecSyntax, &[binds, ref body @ ..]) => self.let_syntax(stx, binds, body, form == Form::LetrecSyntax),
             (Form::SyntaxCase, &[input, literals, ref clauses @ ..]) => self.syntax_case(input, literals, clauses),
             (Form::Syntax, &[template]) => self.syntax(template),
+            (Form::QuoteSyntax, &[datum]) => Ok(Core::Quote(self.wrap(datum)?)),
             (Form::Unsupported, _) => Err(self.error(ExpandErrorKind::Unsupported, stx)),
             _ => bad(self),
         }

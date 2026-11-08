@@ -130,7 +130,7 @@
   (%lambda (c)
     (%intrinsic vector-ref
       #(malformed out-of-memory wrong-type out-of-range immutable arity not-procedure no-prompt unbound finished
-        out-of-fuel error not-pending divide-by-zero no-exact-value not-integer too-long)
+        out-of-fuel error not-pending divide-by-zero no-exact-value not-integer too-long syntax)
       (%intrinsic error-object-kind c))))
 ; What `guard` expands to: `thunk`, and if it raises, `handler` in its place, with what it raised.
 (%define %guard (%lambda (thunk handler) (%intrinsic guard thunk handler)))
@@ -182,8 +182,8 @@
            (%app each1 f xs)
            (%let ((_ (%intrinsic apply map f xs more))) (%intrinsic void))))))
 
-; Syntax objects, for macros' transformers. What only the expander knows, they ask it with
-; `host`, by the numbers of `transformer::Ask`, and so work only while the expander runs them.
+; Syntax objects, for macros' transformers and any other code: the expander says what each
+; identifier it makes refers to, so these need nothing of it.
 (%define syntax? (%lambda (x) (%intrinsic syntax? x)))
 (%define identifier? (%lambda (x) (%intrinsic identifier? x)))
 (%define syntax-e (%lambda (stx) (%intrinsic syntax-e stx)))
@@ -194,8 +194,8 @@
   (%lambda (stx)
     (%let ((e (%if (%intrinsic syntax? stx) (%intrinsic syntax-e stx) stx)))
       (%if (%intrinsic list? e) e #f))))
-(%define free-identifier=? (%lambda (a b) (%intrinsic host 3 a b)))
-(%define generate-temporaries (%lambda (xs) (%intrinsic host 4 xs)))
+(%define free-identifier=? (%lambda (a b) (%intrinsic free-identifier=? a b)))
+(%define generate-temporaries (%lambda (xs) (%intrinsic generate-temporaries xs (%quote t))))
 (%define syntax-violation
   (%lambda (who message form . subform)
-    (%intrinsic host 5 (%if (%intrinsic null? subform) form (%intrinsic car subform)))))
+    (%intrinsic raise (%apply-intrinsic make-syntax-error message form subform))))

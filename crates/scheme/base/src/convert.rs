@@ -3,13 +3,16 @@
 //! object made from the tree goes back to the node it came from, so the parts of a use that a
 //! transformer hands back as they were cost nothing to take back.
 
-use ragwort_types::gc::Value;
+use ragwort_types::gc::{OutOfMemory, Value};
 use ragwort_types::pair::{Pair, Pairs};
 use ragwort_types::symbol::Symbol;
-use ragwort_types::syntax::{Syntax, SyntaxContext, SyntaxKind, SyntaxMeta, SyntaxScope, SyntaxSpan};
+use ragwort_types::syntax::{Syntax, SyntaxContext, SyntaxKind, SyntaxMeta, SyntaxScope};
 use ragwort_types::vector::{AnyVector, Vectors};
 
-use crate::expand::{Expander, MAX_DATA_DEPTH};
+use ragwort_compiler::module;
+use ragwort_vm::objects::ModuleFields;
+
+use crate::expand::{Binding, Expander, MAX_DATA_DEPTH, Stamp};
 use crate::scope::{Scope, Set};
 use crate::tree::{Stx, View};
 use crate::{ExpandError, ExpandErrorKind};
@@ -43,7 +46,8 @@ impl<'gc> Expander<'_, 'gc> {
                 Some(self.meta(set, kind)?)
             }
         };
-        let value = Syntax::new(mc, datum, span, meta)?.value(mc);
+        let binding = if kind == SyntaxKind::Identifier { self.binding_value(stx)? } else { None };
+        let value = Syntax::bound(mc, datum, span, meta, binding)?.value(mc);
         self.tree.scopes.charge(size_of::<(u64, Stx)>())?;
         self.unwrapped.insert(value.to_bits(), stx);
         Ok(value)
@@ -63,7 +67,8 @@ impl<'gc> Expander<'_, 'gc> {
         let context = match self.contexts.get(&set) {
             Some(&context) => context,
             None => {
-                let scopes: Vec<_> = self.tree.scopes.scopes(set).iter().map(|&scope| SyntaxScope(u64::from(scope))).collect();
+                let numbers = self.tree.scopes.scopes(set).to_vec();
+                let scopes = numbers.into_iter().map(|scope| self.scope_object(scope)).collect::<Result<Vec<_>, _>>()?;
                 let context = SyntaxContext::new(self.mc, &scopes)?;
                 self.contexts.insert(set, context);
                 context
@@ -75,12 +80,73 @@ impl<'gc> Expander<'_, 'gc> {
         Ok(meta)
     }
 
-    /// The scopes of `context`.
-    pub(crate) fn set_of(&mut self, context: Option<SyntaxContext<'gc>>, at: SyntaxSpan<'gc>) -> Result<Set, ExpandError> {
+    /// What the identifier `id` refers to, as a value for its syntax: see
+    /// `ragwort_vm`'s `free-identifier=?`. One that's ambiguous has none.
+    fn binding_value(&mut self, id: Stx) -> Result<Option<Value<'gc>>, ExpandError> {
+        let mc = self.mc;
+        let symbol = self.tree.symbol(id).expect("an identifier");
+        let set = self.tree.scopes_of(id)?;
+        let Ok(binding) = self.resolve_name(symbol, set) else { return Ok(None) };
+        let named = |module: Value<'gc>, name: Value<'gc>| Stamp::Named(module.to_bits(), name.to_bits());
+        let (stamp, name) = match binding {
+            Binding::Keyword(_) => return Ok(Some(symbol.value(mc))),
+            Binding::Local(var) => (Stamp::Own(0, var.0), None),
+            Binding::Macro(m) => (Stamp::Own(1, m), None),
+            Binding::Pattern { var, .. } => (Stamp::Own(2, var.0), None),
+            Binding::Slot(slot) if !matches!(self.builder.binding(symbol.value(mc)), Some(module::Binding::Slot(s)) if s == slot) => (Stamp::Own(3, slot), None),
+            Binding::Slot(_) | Binding::Free => {
+                let module = self.builder.name();
+                (named(module, symbol.value(mc)), Some((module, symbol.value(mc))))
+            }
+            Binding::Import(import) => {
+                let (module, names) = (import.module.name(mc), import.module.names(mc));
+                let name = AnyVector::of(names).and_then(|names| names.get(mc, import.export.slot as usize)).unwrap_or(Value::FALSE);
+                (named(module, name), Some((module, name)))
+            }
+        };
+        if let Some(&value) = self.binding_values.get(&stamp) {
+            return Ok(Some(value));
+        }
+        let value = match name {
+            Some((module, name)) => Pairs::new(mc).cons(module, name)?.value(mc),
+            None => SyntaxScope::new(mc)?.value(),
+        };
+        self.tree.scopes.charge(size_of::<(Stamp, Value)>())?;
+        self.binding_values.insert(stamp, value);
+        Ok(Some(value))
+    }
+
+    /// The object that's `scope` in syntax.
+    fn scope_object(&mut self, scope: Scope) -> Result<SyntaxScope<'gc>, OutOfMemory> {
+        if let Some(&object) = self.scope_objects.get(&scope) {
+            return Ok(object);
+        }
+        let object = SyntaxScope::new(self.mc)?;
+        self.tree.scopes.charge(size_of::<(Scope, SyntaxScope)>() + size_of::<(u64, Scope)>())?;
+        self.scope_objects.insert(scope, object);
+        self.scope_numbers.insert(object.value().to_bits(), scope);
+        Ok(object)
+    }
+
+    /// The scopes of `context`. One the load hasn't seen, from another or made at run time,
+    /// is a new scope to it.
+    pub(crate) fn set_of(&mut self, context: Option<SyntaxContext<'gc>>) -> Result<Set, OutOfMemory> {
         let Some(context) = context else { return Ok(Set::EMPTY) };
-        let scopes = context.scopes(self.mc).map(|scope| Scope::try_from(scope.0)).collect::<Result<Vec<_>, _>>();
-        let scopes = scopes.map_err(|_| self.error_at(ExpandErrorKind::BadSyntax, at))?;
-        Ok(self.tree.scopes.set(scopes)?)
+        let mut scopes = Vec::with_capacity(context.scopes(self.mc).len());
+        for object in context.scopes(self.mc) {
+            let scope = match self.scope_numbers.get(&object.value().to_bits()) {
+                Some(&scope) => scope,
+                None => {
+                    let scope = self.tree.scopes.fresh()?;
+                    self.tree.scopes.charge(size_of::<(Scope, SyntaxScope)>() + size_of::<(u64, Scope)>())?;
+                    self.scope_objects.insert(scope, object);
+                    self.scope_numbers.insert(object.value().to_bits(), scope);
+                    scope
+                }
+            };
+            scopes.push(scope);
+        }
+        self.tree.scopes.set(scopes)
     }
 
     /// The syntax a transformer made, `value`, in the tree. What it has that isn't syntax is as
@@ -106,7 +172,7 @@ impl<'gc> Expander<'_, 'gc> {
         Ok(match kind {
             SyntaxKind::Identifier => {
                 let symbol = Symbol::of(datum).ok_or_else(|| bad(self))?;
-                let set = self.set_of(context, span)?;
+                let set = self.set_of(context)?;
                 self.tree.id(symbol, set, span)?
             }
             SyntaxKind::List => {

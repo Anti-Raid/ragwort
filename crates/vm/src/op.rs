@@ -235,13 +235,16 @@ pub enum Fault {
     /// A resume of a coroutine that isn't pending: one that's running, or that has finished
     /// or failed.
     NotPending,
+    /// What `make-syntax-error` makes a condition of: syntax that's malformed, such as a macro
+    /// use no clause of its `syntax-case` matches.
+    Syntax,
     Num(NumError),
     Str(StrError),
 }
 
 impl Fault {
     /// What [`Fault::kind`] numbers, as the prelude's `error-object-kind` names them.
-    pub const KINDS: [&str; 17] = [
+    pub const KINDS: [&str; 18] = [
         "malformed",
         "out-of-memory",
         "wrong-type",
@@ -259,6 +262,7 @@ impl Fault {
         "no-exact-value",
         "not-integer",
         "too-long",
+        "syntax",
     ];
 
     /// Which of [`Fault::KINDS`] it is.
@@ -281,6 +285,7 @@ impl Fault {
             Fault::Num(NumError::NoExactValue) => 14,
             Fault::Num(NumError::NotInteger) => 15,
             Fault::Str(StrError::TooLong) => 16,
+            Fault::Syntax => 17,
         }
     }
 

@@ -41,9 +41,15 @@ fn list_host<'s, 'gc>(cx: &mut ragwort_vm::HostContext<'s, 'gc>, args: ragwort_v
     Ok(ragwort_vm::Reply::Value(Pairs::new(cx.mc()).list(&args.iter().collect::<Vec<_>>())?))
 }
 
+/// `(wait n)`: defers with `n`, as a fixnum, for the test to reply to.
+fn wait_host<'s, 'gc>(_: &mut ragwort_vm::HostContext<'s, 'gc>, args: ragwort_vm::HostArgs<'s, 'gc>) -> Result<ragwort_vm::Reply<'gc>, Fault> {
+    Ok(ragwort_vm::Reply::Defer(Box::new(args.get(0).and_then(|n| n.as_fixnum()))))
+}
+
 /// The host functions every test's code is loaded with.
-static HOSTS: [HostDef; 2] = [
+static HOSTS: [HostDef; 3] = [
     HostDef { name: "add", arity: 2, purity: Purity::Pure, function: add_host },
+    HostDef { name: "wait", arity: 1, purity: Purity::Impure, function: wait_host },
     HostDef { name: "list", arity: -1, purity: Purity::Discardable, function: list_host },
 ];
 
@@ -57,7 +63,7 @@ fn run<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Result<Value<'gc>, Fault> 
     loop {
         match machine.run(mc).unwrap() {
             Outcome::Paused => {}
-            Outcome::Yielded(_) | Outcome::Host(_) | Outcome::Deferred(_) => panic!("yielded"),
+            Outcome::Yielded(_) | Outcome::Deferred(_) => panic!("yielded"),
             Outcome::Done(value) => return Ok(value),
             Outcome::Raised(raised) => return Err(*raised.downcast::<Condition>(mc).unwrap().fault(mc).unwrap()),
         }
@@ -443,11 +449,11 @@ fn a_mark_set_for_a_call_is_put_back_when_it_returns() {
 }
 
 #[test]
-fn host_requests_go_to_what_runs_the_machine() {
-    // The host is asked from the task and from a coroutine it resumes, and each answer is what
-    // the request returns; a plain run answers void.
-    let text = "(%let ((co (%intrinsic make-coroutine (%lambda () (%intrinsic cons (%intrinsic host 'inner) 'done)))))
-                  (%let* ((a (%intrinsic host 'first 2)) (b (%intrinsic co/resume co)) (c (%intrinsic host)))
+fn deferred_host_calls_go_to_what_runs_the_machine() {
+    // A host call defers from the task and from a coroutine it resumes, and each reply is what
+    // the call returns; a plain run replies void.
+    let text = "(%let ((co (%intrinsic make-coroutine (%lambda () (%intrinsic cons (%call-host wait 3) 'done)))))
+                  (%let* ((a (%call-host wait 1)) (b (%intrinsic co/resume co)) (c (%call-host wait 2)))
                     (%intrinsic cons a (%intrinsic cons b c))))";
     let mut arena = arena();
     let asked = arena.mutate(|mc| {
@@ -459,8 +465,8 @@ fn host_requests_go_to_what_runs_the_machine() {
         let mut outcome = machine.run(mc);
         loop {
             match outcome.unwrap() {
-                Outcome::Host(v) => {
-                    asked.push(show(mc, v));
+                Outcome::Deferred(waits) => {
+                    asked.push(*waits.into_inner().downcast::<Option<i64>>().unwrap());
                     outcome = if asked.len() == 3 { machine.run(mc) } else { machine.reply(mc, Value::fixnum(asked.len() as i64).unwrap()) };
                 }
                 Outcome::Paused => outcome = machine.run(mc),
@@ -469,7 +475,7 @@ fn host_requests_go_to_what_runs_the_machine() {
             }
         }
     });
-    assert_eq!(asked, (vec!["#<values first 2>".into(), "inner".into(), "#<values>".into()], "(1 (2 . done) . #<void>)".into(), "Some(Finished)".into()));
+    assert_eq!(asked, (vec![Some(1), Some(3), Some(2)], "(1 (2 . done) . #<void>)".into(), "Some(Finished)".into()));
 }
 
 #[test]

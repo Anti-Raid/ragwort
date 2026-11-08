@@ -174,17 +174,34 @@ impl<'gc> SyntaxSpan<'gc> {
     }
 }
 
-/// A scope ID. Identifiers with the same name can belong to different scopes.
+/// A scope. Identifiers with the same name are the same identifier only if they have the same
+/// scopes, which are compared by identity, so any object can stand for one; [`SyntaxScope::new`]
+/// makes one that's apart from every other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SyntaxScope(pub u64);
+pub struct SyntaxScope<'gc>(Value<'gc>);
 
-/// An identifier's scopes.
+impl<'gc> SyntaxScope<'gc> {
+    pub fn new(mc: &Mutation<'gc>) -> Result<Self, OutOfMemory> {
+        Ok(Self(Value::object(mc, objects::SyntaxScope::new(mc)?)))
+    }
+
+    /// The scope `value` stands for.
+    pub fn of(value: Value<'gc>) -> Self {
+        Self(value)
+    }
+
+    pub fn value(self) -> Value<'gc> {
+        self.0
+    }
+}
+
+/// An identifier's scopes, each once.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SyntaxContext<'gc>(Gc<'gc, objects::SyntaxContext>);
 
 impl<'gc> SyntaxContext<'gc> {
-    pub fn new(mc: &Mutation<'gc>, scopes: &[SyntaxScope]) -> Result<Self, OutOfMemory> {
-        let context = objects::SyntaxContext::new(mc, scopes.len(), 0)?;
+    pub fn new(mc: &Mutation<'gc>, scopes: &[SyntaxScope<'gc>]) -> Result<Self, OutOfMemory> {
+        let context = objects::SyntaxContext::new(mc, scopes.len(), Value::FALSE)?;
         let items = context.items(mc);
         for (i, scope) in scopes.iter().enumerate() {
             items.set(mc, i, scope.0);
@@ -192,7 +209,7 @@ impl<'gc> SyntaxContext<'gc> {
         Ok(Self(context))
     }
 
-    pub fn scopes(self, mc: &Mutation<'gc>) -> impl ExactSizeIterator<Item = SyntaxScope> + use<'gc> {
+    pub fn scopes(self, mc: &Mutation<'gc>) -> impl ExactSizeIterator<Item = SyntaxScope<'gc>> + use<'gc> {
         let items = self.0.items(mc);
         (0..items.len()).map(move |i| SyntaxScope(items.get(i)))
     }
@@ -329,7 +346,21 @@ impl<'gc> Syntax<'gc> {
     /// Metadata describes the datum's shape; this does not check that they agree.
     #[inline]
     pub fn new(mc: &Mutation<'gc>, datum: Value<'gc>, span: SyntaxSpan<'gc>, meta: Option<SyntaxMeta<'gc>>) -> Result<Self, OutOfMemory> {
-        Ok(Self(objects::Syntax::new(mc, datum, span.source_gc(), span.word(), meta.map(|m| m.0))?))
+        Self::bound(mc, datum, span, meta, None)
+    }
+
+    /// An identifier's syntax that also says what it refers to: `binding`, a value made to
+    /// stand for it, which [`Syntax::binding`] gives back.
+    #[inline]
+    pub fn bound(
+        mc: &Mutation<'gc>,
+        datum: Value<'gc>,
+        span: SyntaxSpan<'gc>,
+        meta: Option<SyntaxMeta<'gc>>,
+        binding: Option<Value<'gc>>,
+    ) -> Result<Self, OutOfMemory> {
+        let binding = binding.unwrap_or(Value::FALSE);
+        Ok(Self(objects::Syntax::new(mc, datum, span.source_gc(), span.word(), meta.map(|m| m.0), binding)?))
     }
 
     #[inline]
@@ -346,6 +377,12 @@ impl<'gc> Syntax<'gc> {
 
     pub fn metadata(self, mc: &Mutation<'gc>) -> Option<SyntaxMeta<'gc>> {
         self.0.meta(mc).map(SyntaxMeta)
+    }
+
+    /// What an identifier refers to, if what made it said: a value made to stand for its
+    /// binding.
+    pub fn binding(self, mc: &Mutation<'gc>) -> Option<Value<'gc>> {
+        Some(self.0.binding(mc)).filter(|&b| b != Value::FALSE)
     }
 
     /// Returns `None` if the stored tag is invalid.

@@ -15,6 +15,7 @@ mod request;
 mod run;
 mod segments;
 mod syntax;
+pub mod syntax_case;
 mod wind;
 
 pub use segments::CHUNK;
