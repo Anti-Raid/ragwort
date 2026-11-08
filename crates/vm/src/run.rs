@@ -7,7 +7,7 @@ use ragwort_types::constant::Constants;
 use ragwort_types::gc::{Frame, Gc, Mutation, Slots, Stack, Value, WINDOW};
 use ragwort_types::pair::{Pair, Pairs};
 
-use crate::frame::{self, ARGS, CLOSURE, Link, MAX_PARAMS, SAVED_MARKS};
+use crate::frame::{self, ARGS, CLOSURE, Kept, Link, MAX_PARAMS, SAVED_MARKS};
 use crate::op::Fuel;
 use crate::objects::{BytecodeFields, Closure, ClosureFields, Guard, MultiValue, MultiValueFields, Task, TaskFields};
 use crate::prompts::{self, handler_key};
@@ -212,7 +212,7 @@ impl<'s, 'gc> Run<'s, 'gc> {
         self.fp = self.fp.checked_sub(usize::from(base)).ok_or(Fault::Malformed)?;
         let frame = self.stack.frame(mc, self.fp).ok_or(Fault::Malformed)?;
         if marks {
-            self.cx.task.set_attachments(mc, frame.get(base.checked_sub(SAVED_MARKS).ok_or(Fault::Malformed)?));
+            self.cx.task.set_attachments(mc, frame.get(Kept::under(usize::from(base), 0)?.marks as u8));
         }
         let caller = frame.get(CLOSURE).downcast::<Closure>(mc).ok_or(Fault::Malformed)?;
         (self.ops, self.cx.constants, self.cx.upvalues, self.link) = load(mc, caller)?;
@@ -221,10 +221,10 @@ impl<'s, 'gc> Run<'s, 'gc> {
     }
 
     /// Makes `apply` or `apply-values` a call, as it's laid out as one, with the list or
-    /// [`MultiValue`] to spread last, and a `with-mark` or `with-exception-handler` of a closure
-    /// that isn't in tail position one that sets the mark, as Chez sets an attachment for a call:
-    /// the frame keeps its marks in the request's first register, under the callee's frame, for
-    /// the return to put back. The outer loop carries out the other requests.
+    /// [`MultiValue`] to spread last, and a `with-mark`, `with-exception-handler` or `guard` of a
+    /// closure that isn't in tail position one that sets the mark, as Chez sets an attachment for
+    /// a call: the frame keeps its marks under the callee's frame, for the return to put back.
+    /// The outer loop carries out the other requests.
     #[inline(always)]
     fn request(&mut self, base: u8, args: u8, request: Request, spread: bool, tail: bool) -> Result<(), Exit<'gc>> {
         let frame = self.cx.frame;
@@ -275,7 +275,7 @@ impl<'s, 'gc> Run<'s, 'gc> {
             Request::WithMark => (frame.get(base), frame.get(base + 1), None),
             _ => {
                 let handler = if request == Request::Guard {
-                    Value::object(mc, Guard::new(mc, frame.get(base + 1), task.winders(mc), true).map_err(Fault::from)?)
+                    Value::object(mc, Guard::new(mc, frame.get(base + 1), task.winders(mc)).map_err(Fault::from)?)
                 } else {
                     frame.get(base)
                 };
@@ -286,10 +286,11 @@ impl<'s, 'gc> Run<'s, 'gc> {
         };
         let mark = pairs.cons(key, value).map_err(Fault::from)?.value(mc);
         let marks = pairs.cons(mark, saved).map_err(Fault::from)?.value(mc);
+        let kept = Kept::under(usize::from(call.base), 0)?;
         frame.set(call.base, procedure);
-        frame.set(base, saved);
+        frame.set(kept.marks as u8, saved);
         if let Some(guard) = guard {
-            frame.set(base + 1, guard);
+            frame.set(kept.guard as u8, guard);
         }
         task.set_attachments(mc, marks);
         if mc.step_due() {

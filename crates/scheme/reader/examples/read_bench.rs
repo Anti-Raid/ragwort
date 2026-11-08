@@ -4,7 +4,7 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use ragwort_reader::read_all;
+use ragwort_reader_scheme::read_all;
 use ragwort_types::gc::Arena;
 use ragwort_types::symbol::Symbols;
 use ragwort_types::syntax::SyntaxSession;

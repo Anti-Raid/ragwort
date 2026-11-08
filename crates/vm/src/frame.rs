@@ -30,8 +30,25 @@ pub struct Link {
     pub marks: bool,
 }
 
-/// How far below a frame whose link has `marks` its caller keeps its own.
+/// How far below a frame whose link has `marks` its caller keeps its own, and above them, the
+/// guard it set for the call, if any.
 pub const SAVED_MARKS: u8 = 2;
+
+/// Where a caller that set marks for a call keeps its own, under the callee's frame, and the
+/// [`Guard`](crate::objects::Guard) it set for the call, if any.
+#[derive(Clone, Copy)]
+pub(crate) struct Kept {
+    pub(crate) marks: usize,
+    pub(crate) guard: usize,
+}
+
+impl Kept {
+    /// What's kept under the frame at `fp`, in slots from `floor` up.
+    pub(crate) fn under(fp: usize, floor: usize) -> Result<Kept, Fault> {
+        let marks = fp.checked_sub(usize::from(SAVED_MARKS)).filter(|&at| at >= floor).ok_or(Fault::Malformed)?;
+        Ok(Kept { marks, guard: marks + 1 })
+    }
+}
 
 impl Link {
     /// The link of the bottom frame of the stack, whose caller is in the continuation records

@@ -1,5 +1,15 @@
 [workspace]
-members = ["crates/*"]
+members = [
+    "crates/compiler",
+    "crates/derive",
+    "crates/gc-region",
+    "crates/native",
+    "crates/num",
+    "crates/string",
+    "crates/types",
+    "crates/vm",
+    "crates/scheme/*",
+]
 resolver = "3"
 
 # Every crate but gc-region opts in. gc-region allows unsafe code in one file, for mapping memory

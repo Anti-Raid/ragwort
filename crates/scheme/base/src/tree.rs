@@ -102,6 +102,11 @@ impl<'a, 'gc> Tree<'a, 'gc> {
         self.make(Shape::List { first, len, dotted: tail.is_some() }, Set::EMPTY, span)
     }
 
+    pub(crate) fn vector(&mut self, items: &[Stx], span: SyntaxSpan<'gc>) -> Result<Stx, OutOfMemory> {
+        let (first, len) = self.parts(items.iter().copied())?;
+        self.make(Shape::Vector { first, len }, Set::EMPTY, span)
+    }
+
     pub(crate) fn span(&self, stx: Stx) -> SyntaxSpan<'gc> {
         self.node(stx).span
     }

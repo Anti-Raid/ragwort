@@ -9,10 +9,11 @@ use ragwort_types::named;
 use ragwort_types::num::{Number, Nums, complex};
 use ragwort_types::pair::{Pair, Pairs};
 use ragwort_types::string::{self, Strings};
+use ragwort_types::syntax::Syntax;
 use ragwort_types::vector::{AnyVector, Vectors};
 
 use crate::op::Fuel;
-use crate::{Fault, coroutine, equal, prompts};
+use crate::{Fault, coroutine, equal, prompts, syntax};
 use crate::objects::{self, BoxFields, Condition, ConditionFields, Global, GlobalFields, MultiValue, MultiValueFields, Tag, TaskFields};
 
 named! {
@@ -183,6 +184,21 @@ named! {
         ErrorObjectIrritants = "error-object-irritants",
         /// `(error-object-kind c)`: which of [`Fault::KINDS`] the condition is, as a fixnum.
         ErrorObjectKind = "error-object-kind",
+        /// `syntax?`.
+        IsSyntax = "syntax?",
+        /// `identifier?`: whether `x` is the syntax of a symbol.
+        IsIdentifier = "identifier?",
+        /// `(syntax-e stx)`: what `stx` wraps, a symbol, a list or vector of syntax, or a
+        /// literal.
+        SyntaxE = "syntax-e",
+        /// `(syntax->datum stx)`: the datum `stx` stands for, with all its syntax unwrapped.
+        SyntaxToDatum = "syntax->datum",
+        /// `(datum->syntax context datum)`: `datum` as syntax, with the scopes and span of the
+        /// syntax `context`, or none if it's `#f`. What's syntax already in it stays as it is.
+        DatumToSyntax = "datum->syntax",
+        /// `(bound-identifier=? a b)`: whether a binding of the identifier `a` would bind `b`:
+        /// they have the same name and scopes.
+        BoundIdentifierEq = "bound-identifier=?",
     }
 }
 
@@ -203,6 +219,8 @@ impl Intrinsic {
             Intrinsic::MakeCoroutine | Intrinsic::IsCoroutine | Intrinsic::CoroutineState => Some(1),
             Intrinsic::Car | Intrinsic::Cdr | Intrinsic::IsNull | Intrinsic::IsPair | Intrinsic::IsList | Intrinsic::Length | Intrinsic::Reverse | Intrinsic::IsBox | Intrinsic::MakeBox | Intrinsic::Unbox => Some(1),
             Intrinsic::IsValues | Intrinsic::ValuesLength | Intrinsic::GlobalRef | Intrinsic::Not | Intrinsic::IsBoolean => Some(1),
+            Intrinsic::IsSyntax | Intrinsic::IsIdentifier | Intrinsic::SyntaxE | Intrinsic::SyntaxToDatum => Some(1),
+            Intrinsic::DatumToSyntax | Intrinsic::BoundIdentifierEq => Some(2),
             Intrinsic::Caar | Intrinsic::Cadr | Intrinsic::Cdar | Intrinsic::Cddr | Intrinsic::Caaar | Intrinsic::Caadr | Intrinsic::Cadar | Intrinsic::Caddr | Intrinsic::Cdaar | Intrinsic::Cdadr | Intrinsic::Cddar | Intrinsic::Cdddr | Intrinsic::Caaaar | Intrinsic::Caaadr | Intrinsic::Caadar | Intrinsic::Caaddr | Intrinsic::Cadaar | Intrinsic::Cadadr | Intrinsic::Caddar | Intrinsic::Cadddr | Intrinsic::Cdaaar | Intrinsic::Cdaadr | Intrinsic::Cdadar | Intrinsic::Cdaddr | Intrinsic::Cddaar | Intrinsic::Cddadr | Intrinsic::Cdddar | Intrinsic::Cddddr => Some(1),
             Intrinsic::BytevectorRef | Intrinsic::ListTail | Intrinsic::ListRef | Intrinsic::Memq | Intrinsic::Memv | Intrinsic::Member | Intrinsic::Assq | Intrinsic::Assv | Intrinsic::Assoc => Some(2),
             Intrinsic::BytevectorSet => Some(3),
@@ -284,6 +302,8 @@ impl Intrinsic {
                 | IsContinuation
                 | IsCoroutine
                 | IsErrorObject
+                | IsSyntax
+                | IsIdentifier
         )
     }
 
@@ -314,6 +334,8 @@ impl Intrinsic {
                 | IsContinuation
                 | IsCoroutine
                 | IsErrorObject
+                | IsSyntax
+                | IsIdentifier
         )
     }
 
@@ -698,6 +720,15 @@ impl Intrinsic {
                 Value::fixnum(i64::from(co.state(mc))).expect("states are fixnums")
             }
             Intrinsic::IsErrorObject => boolean(arg(0).downcast::<Condition>(mc).is_some()),
+            Intrinsic::IsSyntax => boolean(Syntax::of(arg(0)).is_some()),
+            Intrinsic::IsIdentifier => boolean(syntax::is_identifier(mc, arg(0))),
+            Intrinsic::SyntaxE => syntax::unwrap(mc, arg(0))?,
+            Intrinsic::SyntaxToDatum => syntax::to_datum(mc, arg(0), fuel)?,
+            Intrinsic::DatumToSyntax => {
+                let syntax = syntax::to_syntax(mc, arg(0), arg(1), fuel)?;
+                made(mc, fuel, syntax)
+            }
+            Intrinsic::BoundIdentifierEq => boolean(syntax::same_identifier(mc, arg(0), arg(1))?),
             Intrinsic::ErrorObjectMessage => {
                 let c = arg(0).downcast::<Condition>(mc).ok_or(Fault::WrongType)?;
                 match c.message(mc) {

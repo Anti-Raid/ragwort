@@ -1,5 +1,6 @@
-//! A [`Read`] is a function of its arguments and the running task's dynamic state: its marks,
-//! prompts, winders, and which task it is. The inner loop runs it as it does an intrinsic.
+//! A [`Read`] runs on its arguments and the running task's dynamic state: its marks, prompts,
+//! winders, and which task it is, which all but `set-winders!` only read. The inner loop runs it
+//! as it does an intrinsic.
 //!
 //! A frame's code sees its marks and prompts change only across a request, but for the
 //! winders, which `set-winders!` sets, for `dynamic-wind`: the compiler never moves a read, and

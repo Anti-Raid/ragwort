@@ -4,15 +4,13 @@
 
 use std::cmp::Ordering;
 
-use ragwort_types::Error;
-use ragwort_types::gc::Value;
-use ragwort_types::num::{ComplexHost, Number, Nums, Real, RationalHost, RealHost, complex, int, rational, real};
+use ragwort_num::{ComplexHost, complex, int, rational, real};
 
 /// The most a decimal's exponent can scale it by when it's read exact.
 const MAX_EXACT_SCALE: u64 = 100_000;
 
-/// The number `token` writes, or `None` if it doesn't write one.
-pub(crate) fn parse<'gc>(nums: &Nums<'_, 'gc>, token: &str) -> Result<Option<Value<'gc>>, Error> {
+/// The number `token` writes, made by the host `nums`, or `None` if it doesn't write one.
+pub fn parse<H: ComplexHost>(nums: &H, token: &str) -> Result<Option<H::Number>, H::Error> {
     let (mut radix, mut exact, mut rest) = (None, None, token);
     while let [b'#', prefix, ..] = rest.as_bytes() {
         match prefix.to_ascii_lowercase() {
@@ -32,10 +30,10 @@ pub(crate) fn parse<'gc>(nums: &Nums<'_, 'gc>, token: &str) -> Result<Option<Val
         Some(false) => complex::inexact(nums, z)?,
         None => z,
     };
-    Ok(Some(z.value()))
+    Ok(Some(z))
 }
 
-fn complex_number<'gc>(nums: &Nums<'_, 'gc>, text: &str, radix: u32, exact: Option<bool>) -> Result<Option<Number<'gc>>, Error> {
+fn complex_number<H: ComplexHost>(nums: &H, text: &str, radix: u32, exact: Option<bool>) -> Result<Option<H::Number>, H::Error> {
     let real = |text: &str| number(nums, text, radix, exact);
     if let Some((magnitude, angle)) = text.split_once('@') {
         let (Some(m), Some(a)) = (real(magnitude)?, real(angle)?) else { return Ok(None) };
@@ -70,7 +68,7 @@ fn complex_number<'gc>(nums: &Nums<'_, 'gc>, text: &str, radix: u32, exact: Opti
     Ok(Some(complex::rectangular(nums, re, im)?))
 }
 
-fn number<'gc>(nums: &Nums<'_, 'gc>, text: &str, radix: u32, exact: Option<bool>) -> Result<Option<Real<'gc>>, Error> {
+fn number<H: ComplexHost>(nums: &H, text: &str, radix: u32, exact: Option<bool>) -> Result<Option<H::Real>, H::Error> {
     let (negative, body) = match text.as_bytes().first() {
         Some(b'+') => (false, &text[1..]),
         Some(b'-') => (true, &text[1..]),
@@ -100,7 +98,7 @@ fn number<'gc>(nums: &Nums<'_, 'gc>, text: &str, radix: u32, exact: Option<bool>
 }
 
 /// `digits [. digits] [e [sign] digits]`, with a digit before or after the point.
-fn decimal<'gc>(nums: &Nums<'_, 'gc>, negative: bool, body: &str, exact: Option<bool>) -> Result<Option<Real<'gc>>, Error> {
+fn decimal<H: ComplexHost>(nums: &H, negative: bool, body: &str, exact: Option<bool>) -> Result<Option<H::Real>, H::Error> {
     let (mantissa, exponent) = match body.find(['e', 'E']) {
         Some(i) => (&body[..i], Some(&body[i + 1..])),
         None => (body, None),

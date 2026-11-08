@@ -36,17 +36,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ragwort-base"
-version = "0.1.0"
-dependencies = [
- "ragwort-compiler",
- "ragwort-native",
- "ragwort-reader",
- "ragwort-types",
- "ragwort-vm",
-]
-
-[[package]]
 name = "ragwort-compiler"
 version = "0.1.0"
 dependencies = [
@@ -76,7 +65,8 @@ name = "ragwort-native"
 version = "0.1.0"
 dependencies = [
  "ragwort-compiler",
- "ragwort-reader",
+ "ragwort-printer-scheme",
+ "ragwort-reader-scheme",
  "ragwort-types",
  "ragwort-vm",
 ]
@@ -86,10 +76,40 @@ name = "ragwort-num"
 version = "0.1.0"
 
 [[package]]
-name = "ragwort-reader"
+name = "ragwort-parser-scheme"
 version = "0.1.0"
 dependencies = [
+ "ragwort-num",
+]
+
+[[package]]
+name = "ragwort-printer-scheme"
+version = "0.1.0"
+dependencies = [
+ "ragwort-parser-scheme",
  "ragwort-types",
+ "ragwort-vm",
+]
+
+[[package]]
+name = "ragwort-reader-scheme"
+version = "0.1.0"
+dependencies = [
+ "ragwort-parser-scheme",
+ "ragwort-printer-scheme",
+ "ragwort-types",
+]
+
+[[package]]
+name = "ragwort-scheme"
+version = "0.1.0"
+dependencies = [
+ "ragwort-compiler",
+ "ragwort-native",
+ "ragwort-printer-scheme",
+ "ragwort-reader-scheme",
+ "ragwort-types",
+ "ragwort-vm",
 ]
 
 [[package]]

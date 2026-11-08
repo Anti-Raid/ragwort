@@ -1,7 +1,4 @@
 use ragwort_types::gc::Arena;
-use ragwort_types::pair::Pair;
-use ragwort_types::string::{Strings, display};
-use ragwort_types::symbol::Symbol;
 use ragwort_vm::objects::{Condition, ConditionFields};
 use ragwort_vm::{Fault, MIN_SEGMENT, Machine, Outcome};
 
@@ -35,7 +32,7 @@ fn run_raising<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Result<Value<'gc>,
     loop {
         match machine.run(mc).unwrap() {
             Outcome::Paused => {}
-            Outcome::Yielded(_) => panic!("yielded"),
+            Outcome::Yielded(_) | Outcome::Host(_) => panic!("yielded"),
             Outcome::Done(value) => return Ok(value),
             Outcome::Raised(raised) => return Err(raised),
         }
@@ -61,36 +58,7 @@ fn uncaught(text: &str) -> String {
 }
 
 fn show<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> String {
-    let strings = Strings::new(mc);
-    if let Some(symbol) = Symbol::of(v) {
-        return display(&strings, symbol.name(mc)).to_string();
-    }
-    if let Some(s) = strings.string(v) {
-        return format!("{:?}", display(&strings, s).to_string());
-    }
-    if let Some(c) = v.as_char() {
-        return format!("#\\{c}");
-    }
-    let Some(pair) = Pair::of(v) else {
-        return match v {
-            Value::NIL => "()",
-            Value::TRUE => "#t",
-            Value::FALSE => "#f",
-            Value::VOID => "#<void>",
-            _ => return v.as_fixnum().map_or("#<object>".into(), |n| n.to_string()),
-        }
-        .to_string();
-    };
-    let mut out = vec![show(mc, pair.head(mc))];
-    let mut rest = pair.tail(mc);
-    while let Some(pair) = Pair::of(rest) {
-        out.push(show(mc, pair.head(mc)));
-        rest = pair.tail(mc);
-    }
-    if rest != Value::NIL {
-        out.push(format!(". {}", show(mc, rest)));
-    }
-    format!("({})", out.join(" "))
+    ragwort_printer_scheme::to_string(mc, v, ragwort_printer_scheme::Mode::Write, usize::MAX).unwrap()
 }
 
 /// Loads `text` and runs its forms in order. Returns the last one's value, written out, or the
@@ -161,9 +129,10 @@ fn bodies_bind_their_definitions_as_letrec_star() {
     assert_eq!(eval("(define x 'global) (define (f) (define x 'local) x) (list (f) x)"), "(local global)");
     assert_eq!(eval("(let () (begin (define a 1) (define b 2)) (+ a b))"), "3");
     assert_eq!(eval("(let () (define a 1) (set! a 5) (define b a) b)"), "5");
-    // A definition of a macro's name shadows the macro across the whole body or load.
+    // A definition of a macro's name shadows the macro across the whole body or load, but
+    // forms before it in the body are expanded as uses of the macro, as in R6RS.
     assert_eq!(eval("(let ((f #f)) (set! f (lambda () (when))) (define (when) 99) (f))"), "99");
-    assert_eq!(eval_in(&mut arena(), "(let () (when) (define (when) 99) (when))"), Ok(Err(Fault::NotProcedure)));
+    assert_eq!(error("(let () (when) (define (when) 99) (when))"), (BadSyntax, "(when)"));
 }
 
 #[test]
@@ -211,7 +180,7 @@ fn quasiquote_builds_what_it_unquotes() {
     assert_eq!(eval("(let ((x 1)) `(a `(b ,(c ,x))))"), "(a (quasiquote (b (unquote (c 1)))))");
     assert_eq!(eval("`(1 ,@(list 2 3))"), "(1 2 3)");
     assert_eq!(eval("(let ((x 'y)) `((,x . ,x) ,(list x)))"), "((y . y) (y))");
-    assert_eq!(eval("`#(1 2)"), "#<object>");
+    assert_eq!(eval("`#(1 2)"), "#(1 2)");
     assert_eq!(error("(let ((x 1)) `#(1 ,x))"), (Unsupported, "#(1 ,x)"));
     assert_eq!(error("`,@x"), (BadSyntax, ",@x"));
 }
@@ -340,9 +309,9 @@ fn bad_syntax_points_at_itself() {
     assert_eq!(error("(define (f) (define x 2))"), (NoExpression, "(define (f) (define x 2))"));
     assert_eq!(error("(set! car 1)"), (Immutable, "car"));
     assert_eq!(error("(set! if 1)"), (BadSyntax, "if"));
-    assert_eq!(error("(define-syntax m 1)"), (Unsupported, "(define-syntax m 1)"));
-    assert_eq!(error("(car #'x)"), (Unsupported, "#'x"));
-    assert_eq!(error("(car '(a #`(b #,c)) (syntax d))"), (Unsupported, "(syntax d)"));
+    assert_eq!(error("(define-syntax m 1)"), (Transformer, "(define-syntax m 1)"));
+    assert_eq!(error("(car #`x)"), (Unsupported, "#`x"));
+    assert_eq!(error("(car '(a #`(b #,c)) #`d)"), (Unsupported, "#`d"));
     assert_eq!(error("(cond (else 1) (#t 2))"), (BadSyntax, "(else 1)"));
     assert_eq!(error("(let ((x)) x)"), (BadSyntax, "(x)"));
     assert_eq!(error("()"), (BadSyntax, "()"));
@@ -391,7 +360,7 @@ fn prelude_wraps_the_cxrs_booleans_void_and_bytevectors() {
 
 #[test]
 fn arithmetic() {
-    assert_eq!(eval("(list (- 5) (- 10 1 2) (*) (* 2 3 4) (/ 12 3) (/ 2) (/ 1 2 3) (- 1/2 1/2))"), "(-5 7 1 24 4 #<object> #<object> 0)");
+    assert_eq!(eval("(list (- 5) (- 10 1 2) (*) (* 2 3 4) (/ 12 3) (/ 2) (/ 1 2 3) (- 1/2 1/2))"), "(-5 7 1 24 4 1/2 1/6 0)");
     assert_eq!(eval("(list (eqv? (/ 2) 1/2) (eqv? (/ 1 2 3) 1/6) (eqv? (/ 7 2) 7/2) (eqv? (* 1.5 2) 3.0) (eqv? (- 0.5 1/2) 0.0))"), "(#t #t #t #t #t)");
     // Past the fixnums, onto bignums, and back.
     assert_eq!(eval("(define big (* 4611686018427387903 4611686018427387903)) (list (eqv? (/ big 4611686018427387903) 4611686018427387903) (- big big))"), "(#t 0)");
@@ -923,6 +892,24 @@ fn handlers_set_for_a_call_are_put_back_when_it_returns() {
 }
 
 #[test]
+fn guards_the_loop_cant_keep_in_a_frame_go_back_to_their_records() {
+    // A thunk that takes any number of arguments, or a guard set by `apply`, can't be called
+    // in the loop, so the outer loop keeps its guard in a record on the chain.
+    let text = "(define log '()) (define (note x) (set! log (cons x log)))
+                (define (f n) (if (eqv? n 0) (raise 'deep) (+ 1 (f (- n 1)))))
+                (define (through-wind)
+                  (%guard (lambda args (dynamic-wind (lambda () (note 'in)) (lambda () (f 3000)) (lambda () (note 'out))))
+                          (lambda (e) (list 'caught e))))
+                (list (through-wind)
+                      (+ 1 (%guard (lambda args 5) (lambda (e) 'no)))
+                      (apply %guard (list (lambda args (car 1)) (lambda (e) (error-object-kind e))))
+                      (with-continuation-mark 'k 'v (list (%guard (lambda args (raise 1)) (lambda (e) (mark-value 'k e)))))
+                      (let loop ((n 0)) (if (eqv? n 20000) n (loop (+ 1 (%guard (lambda args (car n)) (lambda (e) n))))))
+                      (reverse log))";
+    assert_eq!(eval(text), "((caught deep) 6 wrong-type (v) 20000 (in out))");
+}
+
+#[test]
 fn guards_go_back_to_the_frames_they_were_set_in() {
     // Each level raises what its guard caught to the level outside it, leaving a winder, as
     // frames overflow segments and are copied back, again each time the bottom's continuation
@@ -1029,37 +1016,41 @@ fn errors_no_handler_takes_run_the_afters_first() {
 
 #[test]
 fn raising_in_a_loop_runs_in_constant_space() {
-    let mut arena = arena();
-    let text = "(let ((log 0))
+    let text = |n: u64| {
+        format!(
+            "(let ((log 0))
                   (let loop ((i 0) (sum 0))
-                    (if (eqv? i 60000)
+                    (if (eqv? i {n})
                         (list sum log)
                         (loop (+ i 1)
                               (+ sum (guard (e ((null? e) 0) ((pair? e) (car e)))
                                        (dynamic-wind (lambda () #f)
                                                      (lambda () (+ (with-exception-handler (lambda (e) 1) (lambda () (raise-continuable i)))
                                                                    (raise (list (vector-ref (vector 1) 0)))))
-                                                     (lambda () (set! log (+ log 1))))))))))";
-    let mut machine = machine(&mut arena, text);
-    let (mut runs, mut live) = (0, Vec::new());
-    let done = loop {
-        runs += 1;
-        if runs % 8 == 0 {
+                                                     (lambda () (set! log (+ log 1))))))))))"
+        )
+    };
+    assert_eq!(eval(&text(1000)), "(1000 1000)");
+    // Run one that doesn't end for as many pauses as it takes to see the live memory settle.
+    let mut arena = arena();
+    let mut machine = machine(&mut arena, &text(u64::MAX >> 4));
+    let mut live = Vec::new();
+    for run in 1..=128 {
+        if run % 8 == 0 {
             arena.collect();
             live.push(arena.used());
         }
-        let outcome = arena.step(|mc| match machine.run(mc).unwrap() {
-            Outcome::Paused => None,
-            Outcome::Done(v) => Some(show(mc, v)),
-            Outcome::Raised(r) => panic!("{}", raised_text(mc, r)),
-            other => panic!("{other:?}"),
-        });
-        if let Some(done) = outcome.unwrap() {
-            break done;
-        }
-    };
-    assert_eq!(done, "(60000 60000)");
+        arena
+            .step(|mc| match machine.run(mc).unwrap() {
+                Outcome::Paused => {}
+                Outcome::Raised(r) => panic!("{}", raised_text(mc, r)),
+                other => panic!("{other:?}"),
+            })
+            .unwrap();
+    }
     let (first, second) = live.split_at(live.len() / 2);
-    assert!(second.len() > 4, "expected the run to pause for collections");
     assert!(second.iter().max() <= first.iter().max(), "live memory grows: {live:?}");
 }
+
+#[path = "macros.rs"]
+mod macros;

@@ -178,3 +178,21 @@
       (%if (%intrinsic null? more)
            (%app each1 f xs)
            (%let ((_ (%intrinsic apply map f xs more))) (%intrinsic void))))))
+
+; Syntax objects, for macros' transformers. What only the expander knows, they ask it with
+; `host`, by the numbers of `transformer::Ask`, and so work only while the expander runs them.
+(%define-global syntax? (%lambda (x) (%intrinsic syntax? x)))
+(%define-global identifier? (%lambda (x) (%intrinsic identifier? x)))
+(%define-global syntax-e (%lambda (stx) (%intrinsic syntax-e stx)))
+(%define-global syntax->datum (%lambda (stx) (%intrinsic syntax->datum stx)))
+(%define-global datum->syntax (%lambda (context datum) (%intrinsic datum->syntax context datum)))
+(%define-global bound-identifier=? (%lambda (a b) (%intrinsic bound-identifier=? a b)))
+(%define-global syntax->list
+  (%lambda (stx)
+    (%let ((e (%if (%intrinsic syntax? stx) (%intrinsic syntax-e stx) stx)))
+      (%if (%intrinsic list? e) e #f))))
+(%define-global free-identifier=? (%lambda (a b) (%intrinsic host 3 a b)))
+(%define-global generate-temporaries (%lambda (xs) (%intrinsic host 4 xs)))
+(%define-global syntax-violation
+  (%lambda (who message form . subform)
+    (%intrinsic host 5 (%if (%intrinsic null? subform) form (%intrinsic car subform)))))

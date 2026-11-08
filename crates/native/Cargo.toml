@@ -5,13 +5,16 @@ edition = "2024"
 
 [dependencies]
 ragwort-types = { path = "../types", default-features = false }
-ragwort-reader = { path = "../reader", default-features = false }
+ragwort-reader-scheme = { path = "../scheme/reader", default-features = false }
 ragwort-vm = { path = "../vm", default-features = false }
 ragwort-compiler = { path = "../compiler", default-features = false }
 
+[dev-dependencies]
+ragwort-printer-scheme = { path = "../scheme/printer", default-features = false }
+
 [features]
 default = ["mmap"]
-mmap = ["ragwort-types/mmap", "ragwort-reader/mmap", "ragwort-vm/mmap", "ragwort-compiler/mmap"]
+mmap = ["ragwort-types/mmap", "ragwort-reader-scheme/mmap", "ragwort-vm/mmap", "ragwort-compiler/mmap"]
 
 [lints]
 workspace = true

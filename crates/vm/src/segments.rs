@@ -17,8 +17,9 @@ use ragwort_types::gc::{Frame, Gc, Mutation, Segment, Stack, Value, WINDOW};
 use ragwort_types::pair::{Pair, Pairs};
 
 use crate::Fault;
-use crate::frame::{self, Link, SAVED_MARKS};
+use crate::frame::{self, Kept, Link};
 use crate::objects::{Frames, FramesFields, Native, NativeFields, Task, TaskFields};
+use crate::wind::Kind;
 
 /// The most slots of a record copied back onto the stack at once. The top frame is always
 /// copied whole; a deep continuation comes back a chunk at a time, as its frames return.
@@ -131,7 +132,7 @@ impl<'gc> Segments<'_, 'gc> {
             }
             let link = frame::link_at(mc, slots, split)?;
             let under = below(split, link.base)?;
-            let caller_marks = if link.marks { slots.get(below(split, SAVED_MARKS)?) } else { marks };
+            let caller_marks = if link.marks { slots.get(Kept::under(split, start)?.marks) } else { marks };
             if end - under > CHUNK {
                 let (start, at, link, one_shot) = (slot(start)?, slot(split)?, link.value().ok_or(Fault::Malformed)?, record.one_shot(mc));
                 break Value::object(mc, Frames::new(mc, Some(segment), start, at, link, caller_marks, one_shot, false, record.next(mc))?);
@@ -221,8 +222,7 @@ impl<'gc> Segments<'_, 'gc> {
         if !link.marks {
             return Ok(self.task.attachments(self.mc));
         }
-        let at = fp.checked_sub(usize::from(SAVED_MARKS)).filter(|&at| at >= self.stack.base()).ok_or(Fault::Malformed)?;
-        self.stack.get(self.mc, at).ok_or(Fault::Malformed)
+        self.stack.get(self.mc, Kept::under(fp, self.stack.base())?.marks).ok_or(Fault::Malformed)
     }
 
     fn push(&self, segment: Gc<'gc, Segment>, start: usize, end: usize, link: Link, marks: Value<'gc>, owns: bool) -> Result<(), Fault> {
@@ -253,14 +253,17 @@ pub(crate) fn promote<'gc>(mc: &Mutation<'gc>, mut chain: Value<'gc>) {
     }
 }
 
-/// The chain that goes on from the caller of the frame in the records of `chain` that `guard`
-/// was set for, which the caller keeps under it, or `None` if there's none. What's above the
-/// frame is dropped, and the records under it are shared, not copied. If the record on top is
-/// one-shot, so are those above it, and nothing else holds what they, and it, have of its
-/// segment past where it ends now, which comes with it.
+/// The continuation `chain` goes on with from where `guard` was set, or `None` if it's not in
+/// `chain`: from the caller of the frame it was set for, which keeps it under that frame, or
+/// from under the [`Kind::Guarded`] record that holds it. What's above is dropped, and the
+/// records under it are shared, not copied.
 pub(crate) fn cut_at<'gc>(mc: &Mutation<'gc>, mut chain: Value<'gc>, guard: Value<'gc>) -> Result<Option<Cut<'gc>>, Fault> {
     loop {
         if let Some(native) = chain.downcast::<Native>(mc) {
+            if native.kind(mc) == Kind::Guarded as u32 && native.a(mc) == guard {
+                let chain = native.next(mc);
+                return Ok(Some(Cut { chain, marks: native.attachments(mc), free: free(mc, chain, None) }));
+            }
             chain = native.next(mc);
             continue;
         }
@@ -271,28 +274,43 @@ pub(crate) fn cut_at<'gc>(mc: &Mutation<'gc>, mut chain: Value<'gc>, guard: Valu
         if end > slots.len() {
             return Err(Fault::Malformed);
         }
-        let set_for = |at: usize, link: Link| link.marks && at >= start + usize::from(SAVED_MARKS) && slots.get(at - 1) == guard;
+        let set_for = |at: usize, link: Link| match Kept::under(at, start) {
+            Ok(kept) if link.marks && slots.get(kept.guard) == guard => Some(kept),
+            _ => None,
+        };
         let mut link = Link::of(record.link(mc)).ok_or(Fault::Malformed)?;
-        let free = |at| record.one_shot(mc).then_some((segment, at));
-        if set_for(end, link) {
-            return Ok(Some((chain, free(end))));
+        if set_for(end, link).is_some() {
+            return Ok(Some(Cut { chain, marks: record.attachments(mc), free: free(mc, chain, None) }));
         }
         let mut at = end;
         while link.base > 0 {
             at = at.checked_sub(usize::from(link.base)).filter(|&at| at >= start).ok_or(Fault::Malformed)?;
             link = frame::link_at(mc, slots, at)?;
-            if set_for(at, link) {
-                let (marks, value) = (slots.get(at - usize::from(SAVED_MARKS)), link.value().ok_or(Fault::Malformed)?);
+            if let Some(kept) = set_for(at, link) {
+                let (marks, value) = (slots.get(kept.marks), link.value().ok_or(Fault::Malformed)?);
                 let cut = Frames::new(mc, Some(segment), slot(start)?, slot(at)?, value, marks, record.one_shot(mc), false, record.next(mc))?;
-                return Ok(Some((Value::object(mc, cut), free(at))));
+                return Ok(Some(Cut { chain: Value::object(mc, cut), marks, free: free(mc, chain, Some(at)) }));
             }
         }
         chain = record.next(mc);
     }
 }
 
-/// A chain [`cut_at`] a frame, and the segment it's free from where, if any.
-pub(crate) type Cut<'gc> = (Value<'gc>, Option<(Gc<'gc, Segment>, usize)>);
+/// A continuation [`cut_at`] a guard: its chain and marks, and if the record on top is one-shot,
+/// its segment from where it ends now. Those above it were one-shot too, and nothing else holds
+/// what they had of the segment, so the stack can take it back.
+pub(crate) struct Cut<'gc> {
+    pub(crate) chain: Value<'gc>,
+    pub(crate) marks: Value<'gc>,
+    pub(crate) free: Option<(Gc<'gc, Segment>, usize)>,
+}
+
+/// Where the segment of the record on top of `chain` is free from, if it's one-shot: where it
+/// ends, or `at` if it's cut there.
+fn free<'gc>(mc: &Mutation<'gc>, chain: Value<'gc>, at: Option<usize>) -> Option<(Gc<'gc, Segment>, usize)> {
+    let record = chain.downcast::<Frames>(mc).filter(|record| record.one_shot(mc))?;
+    Some((record.segment(mc)?, at.unwrap_or(record.end(mc) as usize)))
+}
 
 /// The marks the record on top of `chain` puts back, or none if it's empty.
 pub(crate) fn restored<'gc>(mc: &Mutation<'gc>, chain: Value<'gc>) -> Value<'gc> {

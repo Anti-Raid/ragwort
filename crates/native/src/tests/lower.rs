@@ -1,6 +1,4 @@
 use ragwort_types::gc::{Arena, WINDOW};
-use ragwort_types::pair::Pair;
-use ragwort_types::string::display;
 use ragwort_vm::objects::{Condition, ConditionFields};
 use ragwort_vm::{Fault, Intrinsic, MIN_SEGMENT, Machine, Outcome, Read, Request};
 
@@ -18,29 +16,7 @@ fn arena() -> Arena {
 }
 
 fn show<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> String {
-    if let Some(symbol) = Symbol::of(v) {
-        return display(&ragwort_types::string::Strings::new(mc), symbol.name(mc)).to_string();
-    }
-    let Some(pair) = Pair::of(v) else {
-        return match v {
-            Value::NIL => "()",
-            Value::TRUE => "#t",
-            Value::FALSE => "#f",
-            Value::VOID => "#<void>",
-            _ => return v.as_fixnum().map_or("#<object>".into(), |n| n.to_string()),
-        }
-        .to_string();
-    };
-    let mut out = vec![show(mc, pair.head(mc))];
-    let mut rest = pair.tail(mc);
-    while let Some(pair) = Pair::of(rest) {
-        out.push(show(mc, pair.head(mc)));
-        rest = pair.tail(mc);
-    }
-    if rest != Value::NIL {
-        out.push(format!(". {}", show(mc, rest)));
-    }
-    format!("({})", out.join(" "))
+    ragwort_printer_scheme::to_string(mc, v, ragwort_printer_scheme::Mode::Write, usize::MAX).unwrap()
 }
 
 /// Loads `text` and runs its forms in order. Returns the last one's value, written out, or the
@@ -55,7 +31,7 @@ fn eval_in(arena: &mut Arena, text: &str) -> Result<Result<String, Fault>, Error
             last = loop {
                 match machine.run(mc).unwrap() {
                     Outcome::Paused => {}
-                    Outcome::Yielded(_) => panic!("yielded"),
+                    Outcome::Yielded(_) | Outcome::Host(_) => panic!("yielded"),
                     Outcome::Done(value) => break value,
                     Outcome::Raised(raised) => return Ok(Err(*raised.downcast::<Condition>(mc).unwrap().fault(mc).unwrap())),
                 }
@@ -284,39 +260,91 @@ fn a_mark_set_for_a_call_is_put_back_when_it_returns() {
                     (%let ((r (%intrinsic with-mark key 1 (%lambda (x) (%intrinsic cons x (%intrinsic mark-value key #f))) 'in)))
                       (%intrinsic cons r (%intrinsic mark-value key #f))))";
     assert_eq!(eval(simple), "((in . 1) . #f)");
-    // Each level checks the marks it sees, inside and after its calls, as frames overflow
-    // segments, are cut into records and copied back, again each time a continuation captured
-    // at the bottom is called.
-    let deep = "(%let* ((key (%intrinsic make-continuation-prompt-tag)) (saved #f) (count 0)
-                        (check (%lambda (want) (%if (%intrinsic eqv? (%intrinsic mark-value key #f) want) 0 1))))
-                  (%letrec ((down (%lambda (n outer)
-                                    (%if (%intrinsic eqv? n 0)
-                                         (%intrinsic call/cc (%lambda (k) (%set! saved k) 0))
-                                         (%let ((r (%intrinsic with-mark key n
-                                                     (%lambda ()
-                                                       (%intrinsic with-mark key (%intrinsic + n 1000)
-                                                         (%lambda ()
-                                                           (%let ((inner (%app down (%intrinsic + n -1) (%intrinsic + n 1000))))
-                                                             (%intrinsic + inner (%app check (%intrinsic + n 1000))))))))))
-                                           (%intrinsic + r (%app check outer)))))))
-                    (%let ((r (%app down 2000 #f)))
-                      (%set! count (%intrinsic + count 1))
-                      (%if (%intrinsic eqv? count 3) (%intrinsic cons r count) (%app saved 0)))))";
-    assert_eq!(eval(deep), "(0 . 3)");
+    // Each level marks `n` for what it calls, which goes down a level and checks the marks it
+    // sees after, as does the level, as frames overflow segments, are cut into records and copied
+    // back, again each time a continuation captured at the bottom is called.
+    let deep = |inside: &str| {
+        format!(
+            "(%let* ((key (%intrinsic make-continuation-prompt-tag)) (saved #f) (count 0)
+                     (check (%lambda (want) (%if (%intrinsic eqv? (%intrinsic mark-value key #f) want) 0 1))))
+               (%letrec ((down (%lambda (n outer)
+                                 (%if (%intrinsic eqv? n 0)
+                                      (%intrinsic call/cc (%lambda (k) (%set! saved k) 0))
+                                      (%let ((r (%intrinsic with-mark key n (%lambda () {inside}))))
+                                        (%intrinsic + r (%app check outer)))))))
+                 (%let ((r (%app down 2000 #f)))
+                   (%set! count (%intrinsic + count 1))
+                   (%if (%intrinsic eqv? count 3) (%intrinsic cons r count) (%app saved 0)))))"
+        )
+    };
+    // A mark in tail position replaces the level's, and the requests keep records small.
+    let replaced = "(%intrinsic with-mark key (%intrinsic + n 1000)
+                      (%lambda ()
+                        (%let ((inner (%app down (%intrinsic + n -1) (%intrinsic + n 1000))))
+                          (%intrinsic + inner (%app check (%intrinsic + n 1000))))))";
+    assert_eq!(eval(&deep(replaced)), "(0 . 3)");
     // With no requests on the way down, the records are as big as segments, and copying them
     // back splits them between a frame and the call that set its mark.
-    let calls = "(%let* ((key (%intrinsic make-continuation-prompt-tag)) (saved #f) (count 0)
-                         (check (%lambda (want) (%if (%intrinsic eqv? (%intrinsic mark-value key #f) want) 0 1))))
-                   (%letrec ((down (%lambda (n outer)
-                                     (%if (%intrinsic eqv? n 0)
-                                          (%intrinsic call/cc (%lambda (k) (%set! saved k) 0))
-                                          (%let ((r (%intrinsic with-mark key n
-                                                      (%lambda ()
-                                                        (%let ((inner (%app down (%intrinsic + n -1) n)))
-                                                          (%intrinsic + inner (%app check n)))))))
-                                            (%intrinsic + r (%app check outer)))))))
-                     (%let ((r (%app down 2000 #f)))
-                       (%set! count (%intrinsic + count 1))
-                       (%if (%intrinsic eqv? count 3) (%intrinsic cons r count) (%app saved 0)))))";
-    assert_eq!(eval(calls), "(0 . 3)");
+    let calls = "(%let ((inner (%app down (%intrinsic + n -1) n))) (%intrinsic + inner (%app check n)))";
+    assert_eq!(eval(&deep(calls)), "(0 . 3)");
+}
+
+#[test]
+fn host_requests_go_to_what_runs_the_machine() {
+    // The host is asked from the task and from a coroutine it resumes, and each answer is what
+    // the request returns; a plain run answers void.
+    let text = "(%let ((co (%intrinsic make-coroutine (%lambda () (%intrinsic cons (%intrinsic host 'inner) 'done)))))
+                  (%let* ((a (%intrinsic host 'first 2)) (b (%intrinsic co/resume co)) (c (%intrinsic host)))
+                    (%intrinsic cons a (%intrinsic cons b c))))";
+    let mut arena = arena();
+    let asked = arena.mutate(|mc| {
+        let (symbols, globals) = (Symbols::of(mc.root(0)).unwrap(), Globals::of(mc, mc.root(1)).unwrap());
+        let session = SyntaxSession::new(mc, text).unwrap();
+        let [thunk] = load(mc, symbols, globals, &session).unwrap()[..] else { panic!("one form") };
+        let mut machine = Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap();
+        let mut asked = Vec::new();
+        let mut outcome = machine.run(mc);
+        loop {
+            match outcome.unwrap() {
+                Outcome::Host(v) => {
+                    asked.push(show(mc, v));
+                    outcome = if asked.len() == 3 { machine.run(mc) } else { machine.reply(mc, Value::fixnum(asked.len() as i64).unwrap()) };
+                }
+                Outcome::Paused => outcome = machine.run(mc),
+                Outcome::Done(v) => break (asked, show(mc, v), format!("{:?}", machine.reply(mc, Value::NIL).err())),
+                other => panic!("{other:?}"),
+            }
+        }
+    });
+    assert_eq!(asked, (vec!["#<values first 2>".into(), "inner".into(), "#<values>".into()], "(1 (2 . done) . #<void>)".into(), "Some(Finished)".into()));
+}
+
+#[test]
+fn a_finished_machine_restarts_on_its_stack() {
+    // A continuation the first task left keeps its frames while the next runs.
+    let text = "(%define-global k #f)
+                (%define-global first (%lambda () (%intrinsic + 1 (%intrinsic call/cc (%lambda (c) (%set! k c) 1)))))
+                (%define-global again (%lambda (n) (%intrinsic cons n (%intrinsic co/resume (%intrinsic make-coroutine (%lambda () n))))))
+                (%define-global back (%lambda (n) (%app k n)))";
+    let mut arena = arena();
+    eval_in(&mut arena, text).unwrap().unwrap();
+    let shown = arena.mutate(|mc| {
+        let globals = Globals::of(mc, mc.root(1)).unwrap();
+        let global = |name: &str| globals.iter(mc).find(|g| show(mc, g.name(mc)) == name).unwrap().value(mc);
+        let finish = |machine: &mut Machine| loop {
+            match machine.run(mc).unwrap() {
+                Outcome::Paused => {}
+                Outcome::Done(v) => break show(mc, v),
+                other => panic!("{other:?}"),
+            }
+        };
+        let mut machine = Machine::new(mc, MIN_SEGMENT, global("first"), &[]).unwrap();
+        let busy = format!("{:?}", machine.restart(mc, global("first"), &[]).err());
+        let a = finish(&mut machine);
+        machine.restart(mc, global("again"), &[Value::fixnum(7).unwrap()]).unwrap();
+        let b = finish(&mut machine);
+        machine.restart(mc, global("back"), &[Value::fixnum(41).unwrap()]).unwrap();
+        (busy, a, b, finish(&mut machine))
+    });
+    assert_eq!(shown, ("Some(NotPending)".into(), "2".into(), "(7 . 7)".into(), "42".into()));
 }

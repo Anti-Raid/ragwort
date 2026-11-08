@@ -1,7 +1,7 @@
 
 use ragwort_types::gc::raw::Raw;
 use ragwort_types::gc::{Gc, Mutation, Root, Segment, Slots, Stack, Value, WINDOW};
-use ragwort_types::pair::{Pair, Pairs};
+use ragwort_types::pair::Pairs;
 
 use crate::args::Args;
 use crate::frame::{self, CLOSURE, Link};
@@ -33,6 +33,19 @@ pub enum Outcome<'gc> {
     /// The task yielded these values, as one: `co/yield` in it, not in a coroutine it resumed.
     /// [`Machine::resume`] goes on with it.
     Yielded(Value<'gc>),
+    /// The task asked what runs it for something, with these values, as one: `host`, in it or
+    /// in a coroutine it resumed. [`Machine::reply`] goes on with the answer.
+    Host(Value<'gc>),
+}
+
+/// What the next run goes on from, if not where the last one paused.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Waiting {
+    No,
+    /// The task yielded.
+    Yield,
+    /// The task asked with `host`.
+    Host,
 }
 
 /// A task: a procedure call run on its own stack. It holds no brand, so it lives outside the
@@ -45,8 +58,7 @@ pub struct Machine {
     segment: usize,
     fuel: u64,
     finished: bool,
-    /// Whether the task yielded, and the next run goes on from the yield.
-    yielded: bool,
+    waiting: Waiting,
 }
 
 impl Machine {
@@ -57,16 +69,26 @@ impl Machine {
         let mut stack = mc.stack(Segment::new(mc, segment)?)?;
         let task = coroutine::root(mc)?;
         let mut regs = Regs { fp: 0, pc: 0, acc: Value::VOID };
-        let args = match *args {
-            [] => Args::none(),
-            [a] => Args::one(a),
-            [a, b] => Args::two(a, b),
-            _ => Args::list(Pairs::new(mc).list(args)?),
-        };
-        Outer::new(mc, &mut stack, task, &mut regs, segment).start(procedure, args)?;
-        let mut machine = Machine { stack, task: Root::new(mc, task)?, fp: 0, pc: 0, segment, fuel: u64::MAX, finished: false, yielded: false };
+        Outer::new(mc, &mut stack, task, &mut regs, segment).start(procedure, args_of(mc, args)?)?;
+        let mut machine = Machine { stack, task: Root::new(mc, task)?, fp: 0, pc: 0, segment, fuel: u64::MAX, finished: false, waiting: Waiting::No };
         machine.save(mc, task, &regs);
         Ok(machine)
+    }
+
+    /// Starts a new task in a machine whose last one finished, calling `procedure` with `args`
+    /// on the stack it left, from where continuations it made hold no more of it, so a host
+    /// that runs one call after another doesn't make a stack for each. Its fuel is as it was.
+    /// Faults with [`Fault::NotPending`] if the last task hasn't finished.
+    pub fn restart<'gc>(&mut self, mc: &Mutation<'gc>, procedure: Value<'gc>, args: &[Value<'gc>]) -> Result<(), Fault> {
+        if !self.finished {
+            return Err(Fault::NotPending);
+        }
+        let task = coroutine::root(mc)?;
+        let mut regs = Regs { fp: 0, pc: 0, acc: Value::VOID };
+        Outer::new(mc, &mut self.stack, task, &mut regs, self.segment).start(procedure, args_of(mc, args)?)?;
+        (self.task, self.finished, self.waiting) = (Root::new(mc, task)?, false, Waiting::No);
+        self.save(mc, task, &regs);
+        Ok(())
     }
 
     /// Sets how much fuel the task has left in all, unlimited at first. Calls and jumps spend
@@ -83,8 +105,9 @@ impl Machine {
     /// Runs until the task finishes, yields or its fuel runs out, or until it has made enough
     /// that the step should end so the collector can keep up, as [`Mutation::step_due`] says:
     /// then it pauses at its next call or jump, and the next run goes on from there. After a
-    /// yield, it goes on as [`Machine::resume`] with no values does. Running it again once it's
-    /// finished faults with [`Fault::Finished`].
+    /// yield, it goes on as [`Machine::resume`] with no values does, and after a `host`, as
+    /// [`Machine::reply`] with void. Running it again once it's finished faults with
+    /// [`Fault::Finished`].
     pub fn run<'gc>(&mut self, mc: &Mutation<'gc>) -> Result<Outcome<'gc>, Fault> {
         if self.finished {
             return Err(Fault::Finished);
@@ -98,7 +121,11 @@ impl Machine {
         };
         self.fuel = fuel.left();
         self.finished = matches!(outcome, Ok(Outcome::Done(_) | Outcome::Raised(_)) | Err(Fault::OutOfFuel));
-        self.yielded = matches!(outcome, Ok(Outcome::Yielded(_)));
+        self.waiting = match outcome {
+            Ok(Outcome::Yielded(_)) => Waiting::Yield,
+            Ok(Outcome::Host(_)) => Waiting::Host,
+            _ => Waiting::No,
+        };
         if self.finished {
             let state = if matches!(outcome, Ok(Outcome::Done(_))) { coroutine::FINISHED } else { coroutine::FAILED };
             self.task.get(mc).expect("a machine runs in its own arena").set_state(mc, state);
@@ -110,11 +137,20 @@ impl Machine {
     /// Goes on with a task that yielded, as [`Machine::run`] does, with its `co/yield` returning
     /// `args`. Faults with [`Fault::NotPending`] if it isn't waiting on a yield.
     pub fn resume<'gc>(&mut self, mc: &Mutation<'gc>, args: &[Value<'gc>]) -> Result<Outcome<'gc>, Fault> {
-        if !self.yielded {
+        self.answer(mc, Waiting::Yield, values(mc, args.iter().copied())?)
+    }
+
+    /// Goes on with a task that asked with `host`, as [`Machine::run`] does, with the `host`
+    /// returning `answer`. Faults with [`Fault::NotPending`] if it isn't waiting on one.
+    pub fn reply<'gc>(&mut self, mc: &Mutation<'gc>, answer: Value<'gc>) -> Result<Outcome<'gc>, Fault> {
+        self.answer(mc, Waiting::Host, answer)
+    }
+
+    fn answer<'gc>(&mut self, mc: &Mutation<'gc>, on: Waiting, value: Value<'gc>) -> Result<Outcome<'gc>, Fault> {
+        if self.waiting != on {
             return Err(if self.finished { Fault::Finished } else { Fault::NotPending });
         }
-        let task = self.task.get(mc).expect("a machine runs in its own arena");
-        task.set_acc(mc, values(mc, args.iter().copied())?);
+        coroutine::current(mc, self.task.get(mc).expect("a machine runs in its own arena")).set_acc(mc, value);
         self.run(mc)
     }
 
@@ -129,7 +165,7 @@ impl Machine {
     /// Runs the inner loop, and carries out what it stops for, until the task ends or the run's
     /// fuel runs out. `task` is the running one, which switching coroutines changes.
     fn drive<'gc>(&mut self, mc: &Mutation<'gc>, task: &mut Gc<'gc, Task>, regs: &mut Regs<'gc>, fuel: &mut Fuel) -> Result<Outcome<'gc>, Fault> {
-        if std::mem::take(&mut self.yielded) {
+        if std::mem::replace(&mut self.waiting, Waiting::No) != Waiting::No {
             let mut outer = Outer::new(mc, &mut self.stack, *task, regs, self.segment);
             let step = outer.resume();
             *task = outer.task();
@@ -152,6 +188,15 @@ impl Machine {
     }
 }
 
+fn args_of<'gc>(mc: &Mutation<'gc>, args: &[Value<'gc>]) -> Result<Args<'gc>, Fault> {
+    Ok(match *args {
+        [] => Args::none(),
+        [a] => Args::one(a),
+        [a, b] => Args::two(a, b),
+        _ => Args::list(Pairs::new(mc).list(args)?),
+    })
+}
+
 /// What a step of the outer loop leads to: going on, or the end of the run.
 pub(crate) type Step<'gc> = Result<Option<Outcome<'gc>>, Fault>;
 
@@ -169,6 +214,8 @@ pub(crate) enum Then<'gc> {
     Uncaught(Value<'gc>, bool),
     /// A yield of the value, as one, from the running coroutine.
     Yield(Value<'gc>),
+    /// The values, as one, for what runs the machine to answer.
+    Host(Value<'gc>),
 }
 
 /// The outer loop's state, between two stretches of the inner loop: the stack, and the
@@ -288,6 +335,10 @@ impl<'a, 'gc> Outer<'a, 'gc> {
             Then::Raise(obj, continuable) => self.raise(obj, continuable),
             Then::Uncaught(obj, unwound) => self.uncaught(obj, unwound),
             Then::Yield(values) => self.yield_coroutine(values),
+            Then::Host(values) => {
+                self.regs.acc = Value::VOID;
+                Ok(Some(Outcome::Host(values)))
+            }
         }
     }
 
@@ -395,17 +446,4 @@ impl<'a, 'gc> Outer<'a, 'gc> {
 /// An error object for `fault`.
 pub(crate) fn condition<'gc>(mc: &Mutation<'gc>, fault: Fault, message: Value<'gc>, irritants: Value<'gc>) -> Result<Value<'gc>, Fault> {
     Ok(Value::object(mc, Condition::new(mc, mc.frozen(fault)?, message, irritants)?))
-}
-
-/// The elements of the proper list `list`.
-pub(crate) fn list<'gc>(mc: &Mutation<'gc>, mut list: Value<'gc>) -> Result<Vec<Value<'gc>>, Fault> {
-    let mut items = Vec::new();
-    while let Some(pair) = Pair::of(list) {
-        items.push(pair.head(mc));
-        list = pair.tail(mc);
-    }
-    if list != Value::NIL {
-        return Err(Fault::WrongType);
-    }
-    Ok(items)
 }

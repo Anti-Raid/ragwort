@@ -69,10 +69,10 @@ objects! {
     pub struct Winder { before: Value, after: Value }
     /// What `guard` and `co/try-resume` put in the handlers mark: a raise that reaches it goes
     /// back to where it was set and calls `handler` there with what was raised, or if that's
-    /// `#f`, returns `#f` and it. One `in_frame` is kept in the register under the frame of the
-    /// thunk it was set for, whose caller a raise goes back to, with the task's winders as
-    /// `winders` were; any other is its own prompt's tag.
-    pub struct Guard { handler: Value, winders: Value, in_frame: bool }
+    /// `#f`, returns `#f` and it, with the task's winders as `winders` were. It's kept where it
+    /// goes back to: in the register under the frame of the thunk it was set for, or in a
+    /// [`Native`] record the outer loop pushed.
+    pub struct Guard { handler: Value, winders: Value }
     /// A record of a chain that the VM goes on from itself: once what's above it returns, its
     /// `kind` says what to do next, with `a` and `b`. `attachments` and
     /// `next` are as a [`Frames`] record's. It's never changed, so a continuation can go on from

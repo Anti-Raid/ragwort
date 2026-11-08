@@ -29,6 +29,8 @@ pub enum ErrorKind {
     BadByte,
     /// A `#n#` with no `#n=` before it in the same top-level datum.
     UnknownLabel,
+    /// A `#n=` or `#n#` whose `n` is too big to be a label.
+    BadLabel,
     /// A `#n#` inside the datum `#n=` labels, which would make it a cycle.
     CyclicLabel,
     /// A second `#n=` of one `n` in one top-level datum.
@@ -40,6 +42,19 @@ pub enum ErrorKind {
     /// The arena couldn't make a value the reader needed: it ran out of memory, or a name was too
     /// long for a string.
     Arena(Error),
+}
+
+impl From<ragwort_parser_scheme::ErrorKind> for ErrorKind {
+    fn from(e: ragwort_parser_scheme::ErrorKind) -> Self {
+        use ragwort_parser_scheme::ErrorKind as Lex;
+        match e {
+            Lex::Unclosed => Self::Unclosed,
+            Lex::Unsupported => Self::Unsupported,
+            Lex::BadChar => Self::BadChar,
+            Lex::BadEscape => Self::BadEscape,
+            Lex::BadLabel => Self::BadLabel,
+        }
+    }
 }
 
 impl From<OutOfMemory> for ErrorKind {
@@ -87,6 +102,7 @@ impl fmt::Display for ReadError {
             ErrorKind::BadEscape => "an unknown escape",
             ErrorKind::BadByte => "a bytevector item that isn't a byte",
             ErrorKind::UnknownLabel => "a datum label used before it's defined",
+            ErrorKind::BadLabel => "a datum label too big to be one",
             ErrorKind::CyclicLabel => "a datum label used inside the datum it labels",
             ErrorKind::DuplicateLabel => "a datum label defined twice",
             ErrorKind::InvalidUtf8 => "text that isn't UTF-8",

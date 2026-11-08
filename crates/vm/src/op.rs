@@ -5,10 +5,10 @@ use ragwort_types::{Error, named};
 use ragwort_types::gc::{Frame, Gc, Mutation, OutOfMemory, Slots, Value, WINDOW};
 use ragwort_types::constant::Constants;
 use ragwort_types::num::NumError;
+use ragwort_types::pair::Pair;
 use ragwort_types::string::StrError;
 
 use crate::objects::{self, BytecodeFields, ClosureFields, SpillFields, Task};
-use crate::machine::list;
 use crate::{Intrinsic, Read, Request};
 
 #[cfg(test)]
@@ -479,4 +479,17 @@ fn spilled<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, spill: u8, slot: u32)
         return Err(Fault::Malformed);
     }
     Ok(slots)
+}
+
+/// The elements of the proper list `list`.
+fn list<'gc>(mc: &Mutation<'gc>, mut list: Value<'gc>) -> Result<Vec<Value<'gc>>, Fault> {
+    let mut items = Vec::new();
+    while let Some(pair) = Pair::of(list) {
+        items.push(pair.head(mc));
+        list = pair.tail(mc);
+    }
+    if list != Value::NIL {
+        return Err(Fault::WrongType);
+    }
+    Ok(items)
 }

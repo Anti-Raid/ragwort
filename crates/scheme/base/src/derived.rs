@@ -67,6 +67,21 @@ impl<'gc> Expander<'_, 'gc> {
             (Macro::Guard, &[spec, ref body @ ..]) if !body.is_empty() => self.guard(stx, spec, body),
             // `(call-with-mark key value (lambda () body))`, as Racket's, whose body is in tail
             // position, so one in tail position replaces the mark of the frame it's in.
+            (Macro::SyntaxRules, &[literals, ref rules @ ..]) if !self.is_id(literals) => self.syntax_rules(stx, literals, rules),
+            // `(syntax-case (list e ...) () ((pattern ...) (let () body ...)))`.
+            (Macro::WithSyntax, &[binds, ref body @ ..]) if !body.is_empty() => {
+                let (mut patterns, mut exprs) = (Vec::new(), Vec::new());
+                for bind in self.proper(binds)? {
+                    let &[pattern, e] = self.proper(bind)?.as_slice() else { return Err(self.error(ExpandErrorKind::BadSyntax, bind)) };
+                    patterns.push(pattern);
+                    exprs.push(e);
+                }
+                let (patterns, exprs) = (self.list(&patterns, stx)?, self.build(stx, "list", &[&exprs])?);
+                let none = self.list(&[], stx)?;
+                let body = self.build(stx, "let", &[&[none], body])?;
+                let clause = self.list(&[patterns, body], stx)?;
+                self.build(stx, "syntax-case", &[&[exprs, none, clause]])
+            }
             (Macro::WithMark, &[key, value, body]) => {
                 let none = self.list(&[], stx)?;
                 let thunk = self.build(stx, "lambda", &[&[none, body]])?;
@@ -158,6 +173,28 @@ impl<'gc> Expander<'_, 'gc> {
                 self.build(clause, "if", &[&[test, body, more]])
             }
         }
+    }
+
+    /// `(lambda (x) (syntax-case x (literal ...) ((_ . pattern) (syntax template)) ...))`, for
+    /// rules `((keyword . pattern) template)`: the keyword isn't matched.
+    fn syntax_rules(&mut self, stx: Stx, literals: Stx, rules: &[Stx]) -> Result<Stx, ExpandError> {
+        let x = self.introduce("x", stx)?;
+        let mut clauses = Vec::with_capacity(rules.len());
+        for &rule in rules {
+            let &[pattern, template] = self.proper(rule)?.as_slice() else { return Err(self.error(ExpandErrorKind::BadSyntax, rule)) };
+            let View::List(items, tail) = self.tree.view(pattern)? else { return Err(self.error(ExpandErrorKind::BadSyntax, pattern)) };
+            if items.is_empty() {
+                return Err(self.error(ExpandErrorKind::BadSyntax, pattern));
+            }
+            let any = self.introduce("_", pattern)?;
+            let span = self.tree.span(pattern);
+            let pattern = self.tree.list(&[&[any], &items[1..]].concat(), tail, span)?;
+            let template = self.build(rule, "syntax", &[&[template]])?;
+            clauses.push(self.list(&[pattern, template], rule)?);
+        }
+        let case = self.build(stx, "syntax-case", &[&[x, literals], &clauses])?;
+        let formals = self.list(&[x], stx)?;
+        self.build(stx, "lambda", &[&[formals, case]])
     }
 
     /// `(%guard (lambda () body ...) (lambda (var) (cond clause ... (else (raise-continuable

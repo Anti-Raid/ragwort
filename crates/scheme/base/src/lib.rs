@@ -2,9 +2,15 @@
 //! forms and compiled.
 //!
 //! The expander knows `quote`, `if`, `lambda`, `define`, `set!`, `begin`, `let` (named too),
-//! `letrec` and `letrec*` itself. `let*`, `and`, `or`, `when`, `unless`, `cond`, `case`, `do` and
-//! `quasiquote` are macros, written in Rust for now, that expand hygienically by sets of scopes,
-//! as `syntax-rules` and `syntax-case` macros will.
+//! `letrec` and `letrec*` itself. `let*`, `and`, `or`, `when`, `unless`, `cond`, `case`, `do`,
+//! `quasiquote`, `guard`, `syntax-rules` and `with-syntax` are macros written in Rust, which
+//! expand hygienically by sets of scopes, as the code's own do.
+//!
+//! The code defines macros with `define-syntax`, `let-syntax` and `letrec-syntax`, as R6RS has
+//! them: a transformer is a procedure of the syntax of a use, which `syntax-case` takes apart
+//! and `syntax` makes, and the expander runs it in a machine as it goes. Macros last as long as
+//! the load that defines them, and their transformers see the prelude's globals, but not what's
+//! being loaded with them, which hasn't run yet.
 //!
 //! Procedures such as `car` and `+` are globals the [`PRELUDE`] defines, in native ragwort. Code
 //! can define its own globals of the same names, which then shadow the prelude's in what's loaded
@@ -13,9 +19,12 @@
 //! Each [`load`] is like a module body: its top-level definitions are all bound before any of its
 //! expressions expand, so they can refer to each other in any order.
 
+mod case;
+mod convert;
 mod derived;
 mod expand;
 mod scope;
+mod transformer;
 mod tree;
 
 #[cfg(test)]
@@ -26,7 +35,7 @@ use std::fmt;
 
 use ragwort_compiler::{CompileError, compile};
 use ragwort_native::Globals;
-use ragwort_reader::{ReadError, Reader};
+use ragwort_reader_scheme::{ReadError, Reader};
 use ragwort_types::gc::{Mutation, OutOfMemory, Value};
 use ragwort_types::symbol::Symbols;
 use ragwort_types::syntax::SyntaxSession;
@@ -50,9 +59,15 @@ pub enum ExpandErrorKind {
     Immutable,
     /// An identifier that two bindings could be, neither of whose scopes include the other's.
     Ambiguous,
-    /// Syntax the expander doesn't support yet: defining macros, `syntax` and its kin, and
-    /// unquoting in a vector.
+    /// Syntax the expander doesn't support yet: `quasisyntax` and its unquotes, a `syntax-rules`
+    /// with an ellipsis of its own, and unquoting in a vector.
     Unsupported,
+    /// A macro's transformer that raised, ran out of fuel, isn't a procedure, or made what isn't
+    /// syntax.
+    Transformer,
+    /// A macro's transformer that refers to a variable of the code around it, which doesn't
+    /// exist yet when the transformer runs, as the code is still being expanded.
+    Phase,
     /// Expressions nested more than 256 deep, or data more than 1024.
     TooDeep,
     /// The arena couldn't make a value expanding needed.
@@ -101,6 +116,8 @@ impl fmt::Display for ExpandError {
             ExpandErrorKind::Immutable => "an assignment of a prelude global",
             ExpandErrorKind::Ambiguous => "an identifier with more than one binding",
             ExpandErrorKind::Unsupported => "syntax that isn't supported yet",
+            ExpandErrorKind::Transformer => "a macro's transformer that failed",
+            ExpandErrorKind::Phase => "a macro's transformer that refers to a variable that doesn't exist yet",
             ExpandErrorKind::TooDeep => "forms nested too deeply",
             ExpandErrorKind::Arena(_) => "running out of memory",
         };

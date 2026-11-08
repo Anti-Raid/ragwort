@@ -20,15 +20,16 @@ use crate::args::Args;
 use crate::machine::{Outer, Then, condition};
 use crate::objects::{Continuation, ContinuationFields, Guard, GuardFields, MultiValue, Native, NativeFields, Prompt, PromptFields, TaskFields, WinderFields};
 use crate::prompts::{self, Wind, default_tag, handler_key};
-use crate::segments::{Cut, cut_at, restored};
+use crate::segments::{Cut, cut_at};
 
 /// What a [`Native`] record does once what's above it returns, with its `a` and `b`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
     /// The handler of a `raise` of `a` returned: raise an error in its place.
     Handled,
-    /// A `co/try-resume` returned: return `#t` and what it did.
-    Tried,
+    /// What a [`Guard`] `a` was set for returned: return what it did, or `#t` and it if `b` says
+    /// it's a `co/try-resume`'s.
+    Guarded,
     /// Call the thunk of the first `(thunk . winders)` of the list `a`, with the task's winders
     /// set to `winders`, then go on with the rest. Once there are none, go on as the record `b` does.
     Winds,
@@ -42,14 +43,14 @@ pub(crate) enum Kind {
     Compose,
     /// `a` was raised with no handler, and the `after`s have run.
     Uncaught,
-    /// `b` was raised to the [`Guard`] `a`: go back to its prompt.
+    /// `b` was raised to the [`Guard`] `a`: go back to where it was set.
     Catch,
 }
 
 impl Kind {
     const ALL: [Kind; 8] = [
         Kind::Handled,
-        Kind::Tried,
+        Kind::Guarded,
         Kind::Winds,
         Kind::Abort,
         Kind::Escape,
@@ -84,7 +85,8 @@ impl<'gc> Outer<'_, 'gc> {
                 let message = string::from_str(&Strings::new(mc), "exception handler returned")?.value();
                 Then::Raise(condition(mc, Fault::Error, message, Pairs::new(mc).cons(a, Value::NIL)?.value(mc))?, false)
             }
-            Kind::Tried => {
+            Kind::Guarded if b == Value::FALSE => Then::Return(self.regs.acc),
+            Kind::Guarded => {
                 let acc = self.regs.acc;
                 let all = if acc.downcast::<MultiValue>(mc).is_some() { Args::before(Value::TRUE, acc) } else { Args::two(Value::TRUE, acc) };
                 Then::Return(all.values(mc)?)
@@ -103,23 +105,19 @@ impl<'gc> Outer<'_, 'gc> {
             Kind::Uncaught => Then::Uncaught(a, true),
             Kind::Catch => {
                 let guard = a.downcast::<Guard>(mc).ok_or(Fault::Malformed)?;
-                if guard.in_frame(mc) {
-                    let (part, (chain, free), under) = self.back_to_frame(a)?;
-                    let stack = &mut self.segments.stack;
-                    if let Some((segment, at)) = free
-                        && part == 0
-                        && segment == stack.segment(mc)
-                        && !stack.reclaim(mc, at)
-                    {
-                        return Err(Fault::Malformed);
-                    }
-                    task.set_prompts(mc, under);
-                    task.set_chain(mc, chain);
-                    task.set_attachments(mc, restored(mc, chain));
-                    task.set_winders(mc, guard.winders(mc));
-                } else {
-                    prompts::abort(mc, task, a)?;
+                let (part, Cut { chain, marks, free }, under) = self.back_to(a)?;
+                let stack = &mut self.segments.stack;
+                if let Some((segment, at)) = free
+                    && part == 0
+                    && segment == stack.segment(mc)
+                    && !stack.reclaim(mc, at)
+                {
+                    return Err(Fault::Malformed);
                 }
+                task.set_prompts(mc, under);
+                task.set_chain(mc, chain);
+                task.set_attachments(mc, marks);
+                task.set_winders(mc, guard.winders(mc));
                 match guard.handler(mc) {
                     Value::FALSE => Then::Return(values(mc, [Value::FALSE, b].into_iter())?),
                     handler => Then::Call(handler, Args::one(b)),
@@ -148,11 +146,7 @@ impl<'gc> Outer<'_, 'gc> {
         let Some(cell) = Pair::of(handlers) else { return Ok(Then::Uncaught(obj, false)) };
         let handler = cell.head(mc);
         if let Some(guard) = handler.downcast::<Guard>(mc) {
-            let winds = if guard.in_frame(mc) {
-                prompts::winds_above(mc, task, self.back_to_frame(handler)?.0, guard.winders(mc))?
-            } else {
-                prompts::winds(mc, task, Some(handler))?
-            };
+            let winds = prompts::winds_above(mc, task, self.back_to(handler)?.0, guard.winders(mc))?;
             return self.unwind(winds_todo(mc, &winds, &[])?, Kind::Catch, handler, obj);
         }
         self.segments.set_mark(handler_key(), cell.tail(mc))?;
@@ -178,24 +172,22 @@ impl<'gc> Outer<'_, 'gc> {
         Ok(Then::Call(thunk, Args::none()))
     }
 
-    /// Puts a prompt for a new [`Guard`] of `handler` on the continuation, and the guard
-    /// innermost in the handlers mark, for what's called next.
+    /// Pushes a record of a new [`Guard`] of `handler` on the chain, a `co/try-resume`'s if
+    /// it's `tried`, and puts the guard innermost in the handlers mark, for what's called next.
     pub(crate) fn guard(&mut self, handler: Value<'gc>, tried: bool) -> Result<(), Fault> {
         let (mc, task) = (self.mc(), self.task());
-        let guard = Value::object(mc, Guard::new(mc, handler, Value::VOID, false)?);
-        prompts::push(mc, task, guard, Value::VOID)?;
-        if tried {
-            self.push(Kind::Tried, Value::VOID, Value::VOID)?;
-        }
-        let handlers = prompts::mark(mc, task, handler_key(), Value::NIL)?;
-        self.segments.set_mark(handler_key(), Pairs::new(mc).cons(guard, handlers)?.value(mc))
+        let guard = Value::object(mc, Guard::new(mc, handler, task.winders(mc))?);
+        self.push(Kind::Guarded, guard, if tried { Value::TRUE } else { Value::FALSE })?;
+        let (pairs, handlers) = (Pairs::new(mc), prompts::mark(mc, task, handler_key(), Value::NIL)?);
+        let mark = pairs.cons(handler_key(), pairs.cons(guard, handlers)?.value(mc))?.value(mc);
+        task.set_attachments(mc, pairs.cons(mark, task.attachments(mc))?.value(mc));
+        Ok(())
     }
 
-    /// Where a raise to the [`Guard`] `guard`, kept in a frame, goes back to: which prompt's part
-    /// of the continuation its frame is in, counting from the current one, the chain that goes
-    /// on from its caller, and the prompts under that part. In the current part, the stack takes
-    /// back what's free of its segment, so the chain is resumed in place.
-    fn back_to_frame(&self, guard: Value<'gc>) -> Result<(usize, Cut<'gc>, Value<'gc>), Fault> {
+    /// Where a raise to the [`Guard`] `guard` goes back to: which prompt's part of the
+    /// continuation it's kept in, counting from the current one, the continuation there, and
+    /// the prompts under that part.
+    fn back_to(&self, guard: Value<'gc>) -> Result<(usize, Cut<'gc>, Value<'gc>), Fault> {
         let (mc, task) = (self.mc(), self.task());
         if let Some(cut) = cut_at(mc, task.chain(mc), guard)? {
             return Ok((0, cut, task.prompts(mc)));

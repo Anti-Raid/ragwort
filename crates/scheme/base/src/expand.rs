@@ -5,14 +5,18 @@
 //! scopes are the most of its own.
 
 
+use std::rc::Rc;
+
 use ragwort_compiler::{Core, Lambda, Place, Var};
 use ragwort_native::Globals;
 use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Value};
 use ragwort_types::string::Strings;
 use ragwort_types::symbol::{Symbol, Symbols};
-use ragwort_types::syntax::{Abbreviation, Syntax};
+use ragwort_types::syntax::{Abbreviation, Syntax, SyntaxContext, SyntaxMeta, SyntaxSpan};
+use ragwort_vm::Machine;
 use ragwort_vm::objects::{Global, GlobalFields};
 
+use crate::case::{Built, Compiled};
 use crate::scope::{BASE, Map, Op, Scope, Set, TOP};
 use crate::tree::{Stx, Tree, TreeError, View};
 use crate::{ExpandError, ExpandErrorKind};
@@ -21,7 +25,10 @@ use crate::{ExpandError, ExpandErrorKind};
 /// stack.
 const MAX_DEPTH: usize = 256;
 /// How deeply data can nest, which takes less of it.
-const MAX_DATA_DEPTH: usize = 1024;
+pub(crate) const MAX_DATA_DEPTH: usize = 1024;
+/// How much fuel the transformers of a load's macros have, between them, so a macro that
+/// expands forever ends.
+const MACRO_FUEL: u64 = 1 << 26;
 
 /// The forms the expander knows itself.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -34,8 +41,13 @@ pub(crate) enum Form {
     Begin,
     Let,
     Letrec,
-    /// Defining macros and making syntax, which need `syntax-rules` or `syntax-case`.
-    Macros,
+    DefineSyntax,
+    LetSyntax,
+    LetrecSyntax,
+    SyntaxCase,
+    Syntax,
+    /// `quasisyntax` and its unquotes.
+    Unsupported,
 }
 
 /// The macros built in, written in Rust.
@@ -52,6 +64,8 @@ pub(crate) enum Macro {
     Quasiquote,
     Guard,
     WithMark,
+    SyntaxRules,
+    WithSyntax,
     /// A `let` with a name, which nothing binds by itself.
     NamedLet,
 }
@@ -63,6 +77,8 @@ pub(crate) enum Aux {
     Arrow,
     Unquote,
     UnquoteSplicing,
+    Underscore,
+    Ellipsis,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -72,7 +88,7 @@ pub(crate) enum Keyword {
     Aux(Aux),
 }
 
-const KEYWORDS: [(&str, Keyword); 32] = [
+const KEYWORDS: [(&str, Keyword); 36] = [
     ("quote", Keyword::Form(Form::Quote)),
     ("if", Keyword::Form(Form::If)),
     ("lambda", Keyword::Form(Form::Lambda)),
@@ -82,14 +98,16 @@ const KEYWORDS: [(&str, Keyword); 32] = [
     ("let", Keyword::Form(Form::Let)),
     ("letrec", Keyword::Form(Form::Letrec)),
     ("letrec*", Keyword::Form(Form::Letrec)),
-    ("define-syntax", Keyword::Form(Form::Macros)),
-    ("let-syntax", Keyword::Form(Form::Macros)),
-    ("letrec-syntax", Keyword::Form(Form::Macros)),
-    ("syntax-rules", Keyword::Form(Form::Macros)),
-    ("syntax", Keyword::Form(Form::Macros)),
-    ("quasisyntax", Keyword::Form(Form::Macros)),
-    ("unsyntax", Keyword::Form(Form::Macros)),
-    ("unsyntax-splicing", Keyword::Form(Form::Macros)),
+    ("define-syntax", Keyword::Form(Form::DefineSyntax)),
+    ("let-syntax", Keyword::Form(Form::LetSyntax)),
+    ("letrec-syntax", Keyword::Form(Form::LetrecSyntax)),
+    ("syntax-case", Keyword::Form(Form::SyntaxCase)),
+    ("syntax", Keyword::Form(Form::Syntax)),
+    ("quasisyntax", Keyword::Form(Form::Unsupported)),
+    ("unsyntax", Keyword::Form(Form::Unsupported)),
+    ("unsyntax-splicing", Keyword::Form(Form::Unsupported)),
+    ("syntax-rules", Keyword::Macro(Macro::SyntaxRules)),
+    ("with-syntax", Keyword::Macro(Macro::WithSyntax)),
     ("let*", Keyword::Macro(Macro::LetStar)),
     ("and", Keyword::Macro(Macro::And)),
     ("or", Keyword::Macro(Macro::Or)),
@@ -105,9 +123,11 @@ const KEYWORDS: [(&str, Keyword); 32] = [
     ("=>", Keyword::Aux(Aux::Arrow)),
     ("unquote", Keyword::Aux(Aux::Unquote)),
     ("unquote-splicing", Keyword::Aux(Aux::UnquoteSplicing)),
+    ("_", Keyword::Aux(Aux::Underscore)),
+    ("...", Keyword::Aux(Aux::Ellipsis)),
 ];
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Binding<'gc> {
     Keyword(Keyword),
     Local(Var),
@@ -116,11 +136,20 @@ pub(crate) enum Binding<'gc> {
     Import(Gc<'gc, Global>),
     /// No binding: a global of the code's own named so, or of the prelude's if `base`.
     Free { base: bool },
+    /// A macro defined in this load: the index of its transformer.
+    Macro(u32),
+    /// A pattern variable of `syntax-case`, which only `syntax` refers to: the local that holds
+    /// what it matched, a list of them for each ellipsis it's under, `depth` of them.
+    Pattern { var: Var, depth: u32 },
 }
+
+/// An identifier that two bindings could be, neither of whose scopes include the other's.
+pub(crate) struct Ambiguous;
 
 /// A form at the top level or in a body, expanded far enough to tell what it is.
 enum Head {
     Define(Stx),
+    DefineSyntax(Stx),
     Begin(Vec<Stx>),
     Expr(Stx),
 }
@@ -153,6 +182,20 @@ pub(crate) struct Expander<'a, 'gc> {
     vars: u32,
     lambdas: u32,
     depth: usize,
+    /// The transformers of the load's macros.
+    pub(crate) macros: Vec<Value<'gc>>,
+    /// The patterns of its `syntax-case` clauses, and the templates of its `syntax` forms that
+    /// have pattern variables in them.
+    pub(crate) patterns: Vec<Rc<Compiled<'gc>>>,
+    pub(crate) templates: Vec<Rc<Built<'gc>>>,
+    /// What runs the transformers, once one has, and the fuel they have between them till then.
+    pub(crate) machine: Option<Machine>,
+    pub(crate) fuel: u64,
+    /// The node each syntax object made from the tree was made from, by the object's word.
+    pub(crate) unwrapped: Map<u64, Stx>,
+    /// The metadata made for syntax of each kind with each set of scopes, and their contexts.
+    pub(crate) metas: Map<(Set, usize), SyntaxMeta<'gc>>,
+    pub(crate) contexts: Map<Set, SyntaxContext<'gc>>,
 }
 
 fn key<'gc>(symbol: Symbol<'gc>, mc: &Mutation<'gc>) -> u64 {
@@ -186,11 +229,22 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             vars: 0,
             lambdas: 0,
             depth: 0,
+            macros: Vec::new(),
+            patterns: Vec::new(),
+            templates: Vec::new(),
+            machine: None,
+            fuel: MACRO_FUEL,
+            unwrapped: Map::default(),
+            metas: Map::default(),
+            contexts: Map::default(),
         })
     }
 
     pub(crate) fn error(&self, kind: impl Into<ExpandErrorKind>, stx: Stx) -> ExpandError {
-        let span = self.tree.span(stx);
+        self.error_at(kind, self.tree.span(stx))
+    }
+
+    pub(crate) fn error_at(&self, kind: impl Into<ExpandErrorKind>, span: SyntaxSpan<'gc>) -> ExpandError {
         ExpandError { kind: kind.into(), start: span.start(), end: span.end() }
     }
 
@@ -221,6 +275,10 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                     let cell = self.define_top(id)?;
                     out.push(Top::Define(cell, value));
                 }
+                Head::DefineSyntax(form) => {
+                    let (id, m) = self.define_syntax(form)?;
+                    self.bind(id, Binding::Macro(m))?;
+                }
                 Head::Begin(forms) => queue.extend(forms.into_iter().rev()),
                 Head::Expr(e) => out.push(Top::Expr(e)),
             }
@@ -236,15 +294,26 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         }
     }
 
-    /// Whether `form` is a definition, a `begin`, or some other expression.
-    fn head(&mut self, form: Stx) -> Result<Head, ExpandError> {
-        let View::List(items, None) = self.tree.view(form)? else { return Ok(Head::Expr(form)) };
-        let Some(&head) = items.first().filter(|&&head| self.is_id(head)) else { return Ok(Head::Expr(form)) };
-        match self.resolve(head)? {
-            Binding::Keyword(Keyword::Form(Form::Define)) => Ok(Head::Define(form)),
-            Binding::Keyword(Keyword::Form(Form::Begin)) => Ok(Head::Begin(items[1..].to_vec())),
-            _ => Ok(Head::Expr(form)),
+    /// Whether `form` is a definition, of a variable or a macro, a `begin`, or some other
+    /// expression, once the macro uses it is are expanded.
+    fn head(&mut self, mut form: Stx) -> Result<Head, ExpandError> {
+        for _ in 0..MAX_DEPTH {
+            let (head, alone) = match self.tree.view(form)? {
+                View::Id => (form, true),
+                View::List(items, None) if items.first().is_some_and(|&head| self.is_id(head)) => (items[0], false),
+                _ => return Ok(Head::Expr(form)),
+            };
+            form = match self.resolve(head)? {
+                Binding::Macro(m) => self.expand_macro(m, form)?,
+                _ if alone => return Ok(Head::Expr(form)),
+                Binding::Keyword(Keyword::Macro(m)) => self.transform(m, form)?,
+                Binding::Keyword(Keyword::Form(Form::Define)) => return Ok(Head::Define(form)),
+                Binding::Keyword(Keyword::Form(Form::DefineSyntax)) => return Ok(Head::DefineSyntax(form)),
+                Binding::Keyword(Keyword::Form(Form::Begin)) => return Ok(Head::Begin(self.proper(form)?[1..].to_vec())),
+                _ => return Ok(Head::Expr(form)),
+            };
         }
+        Err(self.error(ExpandErrorKind::TooDeep, form))
     }
 
     /// The identifier a `define` binds and the expression it binds it to. `(define (f . formals)
@@ -304,6 +373,11 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     pub(crate) fn resolve(&mut self, id: Stx) -> Result<Binding<'gc>, ExpandError> {
         let symbol = self.tree.symbol(id).expect("only identifiers resolve");
         let set = self.tree.scopes_of(id)?;
+        self.resolve_name(symbol, set).map_err(|Ambiguous| self.error(ExpandErrorKind::Ambiguous, id))
+    }
+
+    /// What an identifier named `symbol` with the scopes `set` refers to.
+    pub(crate) fn resolve_name(&self, symbol: Symbol<'gc>, set: Set) -> Result<Binding<'gc>, Ambiguous> {
         let k = key(symbol, self.mc);
         let scopes = &self.tree.scopes;
         // A binding visible to `id` is under one of `id`'s scopes, so look up whichever list
@@ -324,7 +398,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         }
         if let Some((best, binding)) = best {
             if candidates().any(|&(s, _)| !scopes.subset(s, best)) {
-                return Err(self.error(ExpandErrorKind::Ambiguous, id));
+                return Err(Ambiguous);
             }
             return Ok(binding);
         }
@@ -341,7 +415,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         Ok(Binding::Free { base })
     }
 
-    fn bind(&mut self, id: Stx, binding: Binding<'gc>) -> Result<(), ExpandError> {
+    pub(crate) fn bind(&mut self, id: Stx, binding: Binding<'gc>) -> Result<(), ExpandError> {
         let symbol = self.tree.symbol(id).expect("only identifiers are bound");
         let set = self.tree.scopes_of(id)?;
         self.tree.scopes.charge(size_of::<(Set, Binding)>())?;
@@ -362,14 +436,14 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         Ok(var)
     }
 
-    fn fresh(&mut self) -> Var {
+    pub(crate) fn fresh(&mut self) -> Var {
         let var = Var(self.vars);
         self.vars = self.vars.checked_add(1).expect("fewer than 2^32 variables");
         var
     }
 
     /// Fails on the second of any two `ids` with the same name and scopes.
-    fn distinct(&mut self, ids: &[Stx]) -> Result<(), ExpandError> {
+    pub(crate) fn distinct(&mut self, ids: &[Stx]) -> Result<(), ExpandError> {
         let mut seen = std::collections::HashSet::new();
         for &id in ids {
             let symbol = self.tree.symbol(id).expect("only identifiers are bound");
@@ -382,14 +456,14 @@ impl<'a, 'gc> Expander<'a, 'gc> {
 
     /// Applies the macro `m` to its use `stx`, flipping a fresh scope on what it's given and
     /// what it makes.
-    fn transform(&mut self, m: Macro, stx: Stx) -> Result<Stx, ExpandError> {
+    pub(crate) fn transform(&mut self, m: Macro, stx: Stx) -> Result<Stx, ExpandError> {
         let intro = self.tree.scopes.fresh()?;
         let input = self.tree.with(stx, intro, Op::Flip)?;
         let output = self.derived(m, input)?;
         Ok(self.tree.with(output, intro, Op::Flip)?)
     }
 
-    fn expr(&mut self, stx: Stx) -> Result<Core<'gc>, ExpandError> {
+    pub(crate) fn expr(&mut self, stx: Stx) -> Result<Core<'gc>, ExpandError> {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
             return Err(self.error(ExpandErrorKind::TooDeep, stx));
@@ -414,6 +488,10 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                     return self.expr(out);
                 }
                 Binding::Keyword(Keyword::Aux(_)) => return Err(self.error(ExpandErrorKind::BadSyntax, head)),
+                Binding::Macro(m) => {
+                    let out = self.expand_macro(m, stx)?;
+                    return self.expr(out);
+                }
                 _ => {}
             }
         }
@@ -448,7 +526,11 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 self.expr(out)
             }
             (Form::Let | Form::Letrec, &[binds, ref body @ ..]) => self.binding(stx, binds, body, form == Form::Letrec),
-            (Form::Macros, _) => Err(self.error(ExpandErrorKind::Unsupported, stx)),
+            (Form::DefineSyntax, _) => Err(self.error(ExpandErrorKind::Definition, stx)),
+            (Form::LetSyntax | Form::LetrecSyntax, &[binds, ref body @ ..]) => self.let_syntax(stx, binds, body, form == Form::LetrecSyntax),
+            (Form::SyntaxCase, &[input, literals, ref clauses @ ..]) => self.syntax_case(input, literals, clauses),
+            (Form::Syntax, &[template]) => self.syntax(template),
+            (Form::Unsupported, _) => Err(self.error(ExpandErrorKind::Unsupported, stx)),
             _ => bad(self),
         }
     }
@@ -459,7 +541,11 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             Binding::Global(cell) => Place::Global(cell),
             Binding::Import(cell) => Place::Import(cell),
             Binding::Free { base } => Place::Global(self.cell(self.tree.symbol(id).expect("an identifier"), base)?),
-            Binding::Keyword(_) => return Err(self.error(ExpandErrorKind::BadSyntax, id)),
+            Binding::Macro(m) => {
+                let out = self.expand_macro(m, id)?;
+                return self.expr(out);
+            }
+            Binding::Keyword(_) | Binding::Pattern { .. } => return Err(self.error(ExpandErrorKind::BadSyntax, id)),
         };
         Ok(Core::Ref(place))
     }
@@ -470,7 +556,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             Binding::Global(cell) => Place::Global(cell),
             Binding::Free { base: false } => Place::Global(self.cell(self.tree.symbol(id).expect("an identifier"), false)?),
             Binding::Import(_) | Binding::Free { base: true } => return Err(self.error(ExpandErrorKind::Immutable, id)),
-            Binding::Keyword(_) => return Err(self.error(ExpandErrorKind::BadSyntax, id)),
+            Binding::Keyword(_) | Binding::Macro(_) | Binding::Pattern { .. } => return Err(self.error(ExpandErrorKind::BadSyntax, id)),
         };
         Ok(Core::Set(place, Box::new(self.expr(value)?)))
     }
@@ -484,6 +570,12 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         }
         let last = self.expr(last)?;
         Ok(if binds.is_empty() { last } else { Core::Let(binds, Box::new(last)) })
+    }
+
+    pub(crate) fn lambda_id(&mut self) -> u32 {
+        let id = self.lambdas;
+        self.lambdas = self.lambdas.checked_add(1).expect("fewer than 2^32 lambdas");
+        id
     }
 
     fn lambda(&mut self, stx: Stx, formals: Stx, body: &[Stx]) -> Result<Core<'gc>, ExpandError> {
@@ -502,9 +594,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let rest = rest.map(|id| self.local(id)).transpose()?;
         let body = self.scoped(body, scope)?;
         let body = self.body(stx, &body)?;
-        let id = self.lambdas;
-        self.lambdas = self.lambdas.checked_add(1).expect("fewer than 2^32 lambdas");
-        Ok(Core::Lambda(Lambda { id, params, rest, body: Box::new(body) }))
+        Ok(Core::Lambda(Lambda { id: self.lambda_id(), params, rest, body: Box::new(body) }))
     }
 
     /// A `let`, or if `recursive`, a `letrec`.
@@ -538,24 +628,30 @@ impl<'a, 'gc> Expander<'a, 'gc> {
 
     /// A body: definitions and expressions in any order, as `letrec*` binds them, then an
     /// expression for its value. `stx` is the form it's the body of.
-    fn body(&mut self, stx: Stx, body: &[Stx]) -> Result<Core<'gc>, ExpandError> {
+    pub(crate) fn body(&mut self, stx: Stx, body: &[Stx]) -> Result<Core<'gc>, ExpandError> {
         let scope = self.tree.scopes.fresh()?;
         let mut queue = self.scoped(body, scope)?;
         queue.reverse();
         let mut items: Vec<(Option<Var>, Stx)> = Vec::new();
-        let mut defined = Vec::new();
+        let (mut defined, mut names) = (Vec::new(), Vec::new());
         while let Some(form) = queue.pop() {
             match self.head(form)? {
                 Head::Define(form) => {
                     let (id, value) = self.definition(form)?;
                     defined.push(id);
+                    names.push(id);
                     items.push((Some(self.local(id)?), value));
+                }
+                Head::DefineSyntax(form) => {
+                    let (id, m) = self.define_syntax(form)?;
+                    names.push(id);
+                    self.bind(id, Binding::Macro(m))?;
                 }
                 Head::Begin(forms) => queue.extend(forms.into_iter().rev()),
                 Head::Expr(e) => items.push((None, e)),
             }
         }
-        self.distinct(&defined)?;
+        self.distinct(&names)?;
         let Some((None, last)) = items.pop() else { return Err(self.error(ExpandErrorKind::NoExpression, stx)) };
         if defined.is_empty() {
             let mut stxs: Vec<Stx> = items.into_iter().map(|(_, e)| e).collect();
@@ -571,7 +667,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     }
 
     /// `stxs` with `scope` added.
-    fn scoped(&mut self, stxs: &[Stx], scope: Scope) -> Result<Vec<Stx>, ExpandError> {
+    pub(crate) fn scoped(&mut self, stxs: &[Stx], scope: Scope) -> Result<Vec<Stx>, ExpandError> {
         Ok(stxs.iter().map(|&stx| self.tree.with(stx, scope, Op::Add)).collect::<Result<_, _>>()?)
     }
 
@@ -596,9 +692,13 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         }
     }
 
+    pub(crate) fn symbol(&self, name: &str) -> Result<Symbol<'gc>, ExpandError> {
+        Ok(self.symbols.intern_str(&self.strings, name)?)
+    }
+
     /// An identifier for the base binding of `name`, which nothing read can shadow, at `at`.
     pub(crate) fn introduce(&mut self, name: &str, at: Stx) -> Result<Stx, ExpandError> {
-        let symbol = self.symbols.intern_str(&self.strings, name)?;
+        let symbol = self.symbol(name)?;
         let span = self.tree.span(at);
         Ok(self.tree.id(symbol, self.base, span)?)
     }

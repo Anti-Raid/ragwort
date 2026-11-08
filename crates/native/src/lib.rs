@@ -29,7 +29,7 @@ mod tests;
 pub use lower::{LowerError, LowerErrorKind, Lowerer};
 
 use ragwort_compiler::{CompileError, compile};
-use ragwort_reader::{ReadError, Reader};
+use ragwort_reader_scheme::{ReadError, Reader};
 use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Value};
 use ragwort_types::pair::Pairs;
 use ragwort_types::symbol::{Symbol, Symbols};

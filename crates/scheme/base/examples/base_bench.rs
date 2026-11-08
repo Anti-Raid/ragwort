@@ -4,7 +4,7 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use ragwort_base::{load, prelude};
+use ragwort_scheme::{load, prelude};
 use ragwort_native::Globals;
 use ragwort_types::gc::{Arena, Mutation, Value};
 use ragwort_types::symbol::Symbols;
@@ -29,12 +29,38 @@ fn source(forms: usize) -> String {
         .collect()
 }
 
+/// Forms that use `cond`, `and`, `or` and `let*`, those of `syntax-rules` macros if `macros`.
+fn macro_source(forms: usize, macros: bool) -> String {
+    let defs = "(define-syntax my-or (syntax-rules () ((_) #f) ((_ e) e) ((_ e r ...) (let ((t e)) (if t t (my-or r ...))))))
+                (define-syntax my-and (syntax-rules () ((_) #t) ((_ e) e) ((_ e r ...) (if e (my-and r ...) #f))))
+                (define-syntax my-let* (syntax-rules ()
+                  ((_ () body ...) (let () body ...))
+                  ((_ ((x v) rest ...) body ...) (let ((x v)) (my-let* (rest ...) body ...)))))
+                (define-syntax my-cond (syntax-rules (else)
+                  ((_ (else e ...)) (begin e ...))
+                  ((_ (c e ...) clause ...) (if c (begin e ...) (my-cond clause ...)))))\n";
+    let my = if macros { "my-" } else { "" };
+    let forms: String = (0..forms)
+        .map(|i| {
+            format!(
+                "(define (f{i} xs n)
+                   (let loop ((xs xs) (acc '()))
+                     ({my}cond ((null? xs) (reverse acc))
+                           (({my}and (pair? xs) ({my}or (eqv? (car xs) n) (eqv? (car xs) {i})))
+                            (loop (cdr xs) (cons (car xs) acc)))
+                           (else ({my}let* ((x (car xs)) (y (+ x 1))) (loop (cdr xs) (cons y acc)))))))\n"
+            )
+        })
+        .collect();
+    if macros { format!("{defs}{forms}") } else { forms }
+}
+
 fn run<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Value<'gc> {
     let mut machine = Machine::new(mc, MIN_SEGMENT, thunk, &[]).expect("machine");
     loop {
         match machine.run(mc).expect("run") {
             Outcome::Paused => {}
-            Outcome::Yielded(_) => panic!("yielded"),
+            Outcome::Yielded(_) | Outcome::Host(_) => panic!("yielded"),
             Outcome::Done(value) => return value,
             Outcome::Raised(_) => panic!("raised"),
         }
@@ -97,6 +123,12 @@ fn main() {
     let took = time(&text, false, false);
     let ms = took.as_secs_f64() * 1e3;
     println!("load {forms} forms, {} KiB: {ms:.2} ms, {:.1} us per form", text.len() >> 10, ms * 1e3 / forms as f64);
+
+    for (name, macros) in [("built-in macros", false), ("syntax-rules macros", true)] {
+        let text = macro_source(forms, macros);
+        let us = time(&text, false, false).as_secs_f64() * 1e6 / forms as f64;
+        println!("load {forms} forms, {name}: {us:.1} us per form");
+    }
 
     let base = format!("(define (count n) (if (eqv? n 0) 0 (count (+ n -1)))) (count {N})");
     let native = format!(

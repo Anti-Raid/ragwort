@@ -13,6 +13,7 @@ mod read;
 mod request;
 mod run;
 mod segments;
+mod syntax;
 mod wind;
 
 pub use segments::CHUNK;

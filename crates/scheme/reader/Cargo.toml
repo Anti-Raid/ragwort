@@ -1,0 +1,18 @@
+[package]
+name = "ragwort-reader-scheme"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ragwort-parser-scheme = { path = "../parser" }
+ragwort-types = { path = "../../types", default-features = false }
+
+[dev-dependencies]
+ragwort-printer-scheme = { path = "../printer", default-features = false }
+
+[features]
+default = ["mmap"]
+mmap = ["ragwort-types/mmap"]
+
+[lints]
+workspace = true
