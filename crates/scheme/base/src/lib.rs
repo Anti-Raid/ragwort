@@ -29,6 +29,7 @@ mod case;
 mod convert;
 mod derived;
 mod expand;
+mod formals;
 mod scope;
 mod transformer;
 mod tree;

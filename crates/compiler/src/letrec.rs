@@ -99,7 +99,7 @@ fn transform<'gc>(expr: L1<'gc>, usage: &mut Usage) -> L2<'gc> {
             let mut inner = Usage::default();
             let body = transform(*f.body, &mut inner);
             usage.absorb(inner.bind(f.params.iter().copied().chain(f.rest)));
-            L2::Lambda(Func { id: f.id, params: f.params, rest: f.rest, body: Box::new(body) })
+            L2::Lambda(Func { id: f.id, params: f.params, optional: f.optional, rest: f.rest, body: Box::new(body) })
         }
         L1::Intrinsic(prim, args) => L2::Intrinsic(prim, transform_all(args, usage)),
         L1::ApplyIntrinsic(prim, args) => L2::ApplyIntrinsic(prim, transform_all(args, usage)),

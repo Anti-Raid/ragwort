@@ -17,7 +17,7 @@ use ragwort_types::vector::{AnyVector, Vectors};
 
 use crate::op::Fuel;
 use crate::{Fault, coroutine, equal, prompts, syntax};
-use crate::objects::{self, BoxFields, Condition, ConditionFields, ModuleFields, MultiValue, MultiValueFields, Tag, TaskFields};
+use crate::objects::{self, BoxFields, Condition, ConditionFields, KeywordProcedureFields, ModuleFields, MultiValue, MultiValueFields, Tag, TaskFields};
 
 named! {
     #[repr(u16)]
@@ -137,6 +137,58 @@ named! {
         IsSymbol = "symbol?",
         /// `string?`: whether `x` is a string.
         IsString = "string?",
+        /// `(string-length s)`: how many characters `s` has.
+        StringLength = "string-length",
+        /// `(string-append s ...)`: the strings' characters, in order, in a new string. Long
+        /// ones are joined, not copied.
+        StringAppend = "string-append",
+        /// `(substring s start [end])`: the characters of `s` from `start` up to `end`, or its end.
+        Substring = "substring",
+        /// `(string-ref s k)`: the `k`th character of `s`, from 0.
+        StringRef = "string-ref",
+        /// `(string=? s1 s2 ...)`: whether the strings have the same characters. Each argument is
+        /// checked, whatever the answer.
+        StringEq = "string=?",
+        /// `(string<? s1 s2 ...)`: whether the strings increase, by code point, a prefix first.
+        StringLt = "string<?",
+        /// `(string>? s1 s2 ...)`: whether the strings decrease.
+        StringGt = "string>?",
+        /// `(string<=? s1 s2 ...)`: whether no string is less than the one before it.
+        StringLe = "string<=?",
+        /// `(string>=? s1 s2 ...)`: whether no string is more than the one before it.
+        StringGe = "string>=?",
+        /// `(string->list s [start [end]])`: a list of the characters of `s`, or of that range.
+        StringToList = "string->list",
+        /// `(number->string z [radix])`: `z` written as the reader reads it, in radix 2, 8, 10
+        /// or 16. Inexact numbers are exact in radixes but 10.
+        NumberToString = "number->string",
+        /// `(string-join strs [sep])`: the strings of list `strs`, `sep` between each two, `" "`
+        /// if it's not given.
+        StringJoin = "string-join",
+        /// `char?`: whether `x` is a character.
+        IsChar = "char?",
+        /// `(char->integer c)`: `c`'s code point.
+        CharToInteger = "char->integer",
+        /// `(integer->char n)`: the character whose code point is `n`, which is a Unicode scalar
+        /// value: up to `#x10FFFF`, and not a surrogate.
+        IntegerToChar = "integer->char",
+        /// `(char=? c1 c2 ...)`: whether the characters are the same. Each argument is checked,
+        /// whatever the answer.
+        CharEq = "char=?",
+        /// `(char<? c1 c2 ...)`: whether the characters' code points increase.
+        CharLt = "char<?",
+        /// `(char>? c1 c2 ...)`: whether they decrease.
+        CharGt = "char>?",
+        /// `(char<=? c1 c2 ...)`: whether no code point is less than the one before it.
+        CharLe = "char<=?",
+        /// `(char>=? c1 c2 ...)`: whether no code point is more than the one before it.
+        CharGe = "char>=?",
+        /// `(%keyword-procedure plain core keywords required)`: a keyword procedure, as a `lambda`
+        /// with keyword parameters makes. See [`crate::keyword`].
+        MakeKeywordProcedure = "%keyword-procedure",
+        /// `(procedure-keywords f)`: the keywords `f` requires and those it takes, as two sorted
+        /// lists, both empty for a procedure without keyword parameters.
+        ProcedureKeywords = "procedure-keywords",
         /// `(symbol->string s)`: the symbol's name.
         SymbolToString = "symbol->string",
         /// `(string->symbol s)`: the symbol named `s`, the one the reader reads for that name.
@@ -278,7 +330,15 @@ impl Intrinsic {
             Intrinsic::KeywordToString | Intrinsic::StringToKeyword | Intrinsic::IsSymbol => Some(1),
             Intrinsic::SymbolToString | Intrinsic::StringToSymbol => Some(1),
             Intrinsic::Expt | Intrinsic::Quotient | Intrinsic::Remainder | Intrinsic::Modulo => Some(2),
-            Intrinsic::IsString => Some(1),
+            Intrinsic::IsString | Intrinsic::StringLength => Some(1),
+            Intrinsic::StringAppend | Intrinsic::Substring | Intrinsic::StringToList | Intrinsic::NumberToString => None,
+            Intrinsic::StringEq | Intrinsic::StringLt | Intrinsic::StringGt | Intrinsic::StringLe | Intrinsic::StringGe => None,
+            Intrinsic::StringRef => Some(2),
+            Intrinsic::StringJoin => None,
+            Intrinsic::MakeKeywordProcedure => Some(4),
+            Intrinsic::ProcedureKeywords => Some(1),
+            Intrinsic::IsChar | Intrinsic::CharToInteger | Intrinsic::IntegerToChar => Some(1),
+            Intrinsic::CharEq | Intrinsic::CharLt | Intrinsic::CharGt | Intrinsic::CharLe | Intrinsic::CharGe => None,
             Intrinsic::IsSyntax | Intrinsic::IsIdentifier | Intrinsic::SyntaxE | Intrinsic::SyntaxToDatum => Some(1),
             Intrinsic::DatumToSyntax | Intrinsic::BoundIdentifierEq | Intrinsic::FreeIdentifierEq | Intrinsic::GenerateTemporaries | Intrinsic::SyntaxMatch => Some(2),
             Intrinsic::Caar | Intrinsic::Cadr | Intrinsic::Cdar | Intrinsic::Cddr | Intrinsic::Caaar | Intrinsic::Caadr | Intrinsic::Cadar | Intrinsic::Caddr | Intrinsic::Cdaar | Intrinsic::Cdadr | Intrinsic::Cddar | Intrinsic::Cdddr | Intrinsic::Caaaar | Intrinsic::Caaadr | Intrinsic::Caadar | Intrinsic::Caaddr | Intrinsic::Cadaar | Intrinsic::Cadadr | Intrinsic::Caddar | Intrinsic::Cadddr | Intrinsic::Cdaaar | Intrinsic::Cdaadr | Intrinsic::Cdadar | Intrinsic::Cdaddr | Intrinsic::Cddaar | Intrinsic::Cddadr | Intrinsic::Cdddar | Intrinsic::Cddddr => Some(1),
@@ -307,6 +367,20 @@ impl Intrinsic {
                 | Quotient
                 | Remainder
                 | Modulo
+                | StringLength
+                | StringRef
+                | StringEq
+                | StringLt
+                | StringGt
+                | StringLe
+                | StringGe
+                | CharToInteger
+                | IntegerToChar
+                | CharEq
+                | CharLt
+                | CharGt
+                | CharLe
+                | CharGe
                 | Car
                 | Cdr
                 | Caar
@@ -358,6 +432,7 @@ impl Intrinsic {
                 | IsKeyword
                 | IsSymbol
                 | IsString
+                | IsChar
                 | Void
                 | IsBytevector
                 | BytevectorLength
@@ -397,6 +472,7 @@ impl Intrinsic {
                 | IsKeyword
                 | IsSymbol
                 | IsString
+                | IsChar
                 | Void
                 | IsBytevector
                 | IsVector
@@ -424,6 +500,7 @@ impl Intrinsic {
                 | IsKeyword
                 | IsSymbol
                 | IsString
+                | IsChar
                 | IsBox
                 | IsBytevector
                 | IsVector
@@ -463,6 +540,15 @@ impl Intrinsic {
                 | Quotient
                 | Remainder
                 | Modulo
+                | StringLength
+                | StringAppend
+                | Substring
+                | StringRef
+                | StringToList
+                | NumberToString
+                | StringJoin
+                | CharToInteger
+                | IntegerToChar
                 | Cons
                 | Length
                 | Reverse
@@ -656,6 +742,70 @@ impl Intrinsic {
             Intrinsic::IsKeyword => boolean(Keyword::of(arg(0)).is_some()),
             Intrinsic::IsSymbol => boolean(Symbol::of(arg(0)).is_some()),
             Intrinsic::IsString => boolean(Strings::new(mc).string(arg(0)).is_some()),
+            Intrinsic::StringLength => {
+                let strings = Strings::new(mc);
+                fixnum(string::len(&strings, strings.string(arg(0)).ok_or(Fault::WrongType)?) as i64)
+            }
+            Intrinsic::StringAppend => string_append(mc, (0..args).map(arg), fuel)?,
+            Intrinsic::Substring | Intrinsic::StringToList if !(1..=3).contains(&args) || self == Intrinsic::Substring && args == 1 => {
+                return Err(Fault::Arity);
+            }
+            Intrinsic::Substring | Intrinsic::StringToList => {
+                let strings = Strings::new(mc);
+                let s = strings.string(arg(0)).ok_or(Fault::WrongType)?;
+                let start = if args > 1 { index(arg(1))? } else { 0 };
+                let end = if args > 2 { index(arg(2))? } else { string::len(&strings, s) };
+                let part = if (start, end) == (0, string::len(&strings, s)) { s } else { string::substring(&strings, s, start, end)? };
+                if self == Intrinsic::Substring {
+                    made(mc, fuel, part.value())
+                } else {
+                    fuel.spend((end - start) as u64 / equal::PER_FUEL)?;
+                    let mut chars = ScratchVec::new(mc);
+                    for c in string::chars(&strings, part) {
+                        chars.push(Value::char(c))?;
+                    }
+                    made(mc, fuel, Pairs::new(mc).list(&chars)?)
+                }
+            }
+            Intrinsic::StringRef => {
+                let strings = Strings::new(mc);
+                Value::char(string::char_at(&strings, strings.string(arg(0)).ok_or(Fault::WrongType)?, index(arg(1))?)?)
+            }
+            Intrinsic::StringEq | Intrinsic::StringLt | Intrinsic::StringGt | Intrinsic::StringLe | Intrinsic::StringGe if args == 0 => {
+                return Err(Fault::Arity);
+            }
+            Intrinsic::StringEq | Intrinsic::StringLt | Intrinsic::StringGt | Intrinsic::StringLe | Intrinsic::StringGe => {
+                boolean(compare_strings(mc, self, (0..args).map(&arg))?)
+            }
+            Intrinsic::StringJoin if !(1..=2).contains(&args) => return Err(Fault::Arity),
+            Intrinsic::StringJoin => string_join(mc, arg(0), (args == 2).then(|| arg(1)), fuel)?,
+            Intrinsic::IsChar => boolean(arg(0).as_char().is_some()),
+            Intrinsic::CharToInteger => fixnum(i64::from(u32::from(arg(0).as_char().ok_or(Fault::WrongType)?))),
+            Intrinsic::IntegerToChar => {
+                let n = arg(0).as_fixnum().ok_or(Fault::WrongType)?;
+                Value::char(u32::try_from(n).ok().and_then(char::from_u32).ok_or(Fault::OutOfRange)?)
+            }
+            Intrinsic::CharEq | Intrinsic::CharLt | Intrinsic::CharGt | Intrinsic::CharLe | Intrinsic::CharGe if args == 0 => {
+                return Err(Fault::Arity);
+            }
+            Intrinsic::CharEq | Intrinsic::CharLt | Intrinsic::CharGt | Intrinsic::CharLe | Intrinsic::CharGe => {
+                boolean(compare_chars(self, (0..args).map(&arg))?)
+            }
+            Intrinsic::NumberToString if !(1..=2).contains(&args) => return Err(Fault::Arity),
+            Intrinsic::NumberToString => {
+                let h = Nums::new(mc);
+                let z = h.number(arg(0)).ok_or(Fault::WrongType)?;
+                let radix = if args == 2 { arg(1).as_fixnum().ok_or(Fault::WrongType)? } else { 10 };
+                let radix = [2, 8, 10, 16].into_iter().find(|&r| r == radix).ok_or(Fault::OutOfRange)? as u32;
+                if let Some(n) = arg(0).as_fixnum() {
+                    return Ok(made(mc, fuel, fixnum_to_string(mc, n, radix)?));
+                }
+                // Writing a bignum takes about its digits squared.
+                let words = exact_bits(&h, z) / 64;
+                fuel.spend(words.saturating_mul(words) / equal::PER_FUEL)?;
+                let text = complex::to_string(&h, z, radix)?;
+                made(mc, fuel, string::from_str(&Strings::new(mc), &text)?.value())
+            }
             Intrinsic::Quotient | Intrinsic::Remainder | Intrinsic::Modulo => divide(mc, fuel, self, arg(0), arg(1))?,
             Intrinsic::SymbolToString => Symbol::of(arg(0)).ok_or(Fault::WrongType)?.name(mc).value(),
             Intrinsic::StringToSymbol => {
@@ -803,14 +953,29 @@ impl Intrinsic {
                 let fault = if self == Intrinsic::MakeError { Fault::Error } else { Fault::Syntax };
                 made(mc, fuel, Value::object(mc, Condition::new(mc, mc.frozen(fault)?, arg(0), irritants)?))
             }
-            Intrinsic::IsProcedure => boolean(
-                arg(0).downcast::<objects::Closure>(mc).is_some()
-                    || arg(0).downcast::<objects::Continuation>(mc).is_some(),
-            ),
+            Intrinsic::IsProcedure => boolean(is_procedure(mc, arg(0))),
+            Intrinsic::MakeKeywordProcedure => {
+                let (plain, core) = (arg(0), arg(1));
+                if plain != Value::FALSE && !is_procedure(mc, plain) || !is_procedure(mc, core) {
+                    return Err(Fault::WrongType);
+                }
+                made(mc, fuel, Value::object(mc, objects::KeywordProcedure::new(mc, plain, core, arg(2), arg(3))?))
+            }
+            Intrinsic::ProcedureKeywords => {
+                let f = arg(0);
+                if !is_procedure(mc, f) {
+                    return Err(Fault::WrongType);
+                }
+                let (required, keywords) = match f.downcast::<objects::KeywordProcedure>(mc) {
+                    Some(k) => (k.required(mc), k.keywords(mc)),
+                    None => (Value::NIL, Value::NIL),
+                };
+                values(mc, [required, keywords].into_iter())?
+            }
             Intrinsic::IsContinuation => boolean(arg(0).downcast::<objects::Continuation>(mc).is_some()),
             Intrinsic::MakeCoroutine => {
                 let body = arg(0);
-                if body.downcast::<objects::Closure>(mc).is_none() && body.downcast::<objects::Continuation>(mc).is_none() {
+                if !is_procedure(mc, body) {
                     return Err(Fault::WrongType);
                 }
                 made(mc, fuel, Value::object(mc, coroutine::new(mc, body)?))
@@ -938,15 +1103,36 @@ fn divide<'gc>(mc: &Mutation<'gc>, fuel: &mut Fuel, op: Intrinsic, n: Value<'gc>
     Ok(made(mc, fuel, generic?.value()))
 }
 
-/// Charges for `z^w` before it's computed, if it's exact: memory for its digits, and fuel for
-/// the squarings that make them, about their count squared.
-fn charge_power<'gc>(mc: &Mutation<'gc>, h: &Nums<'_, 'gc>, fuel: &mut Fuel, z: Number<'gc>, w: Number<'gc>) -> Result<(), Fault> {
-    let ComplexView::Real(e) = h.complex_view(w) else { return Ok(()) };
-    let RealView::Exact(e) = h.real_view(e) else { return Ok(()) };
-    let RationalView::Integer(e) = h.rational_view(e) else { return Ok(()) };
-    // An exponent past an i64 is too big for anything but 0, 1 and -1, which `expt` sees to.
-    let Some(e) = int::to_i64(h, e) else { return Ok(()) };
-    // Bits past the first, so 0, 1 and -1 cost nothing however high the power.
+/// `n` in `radix`, its digits written on the stack.
+fn fixnum_to_string<'gc>(mc: &Mutation<'gc>, n: i64, radix: u32) -> Result<Value<'gc>, Fault> {
+    // 64 binary digits and a sign.
+    let mut digits = [0u8; 65];
+    let (mut at, mut left) = (digits.len(), n.unsigned_abs());
+    loop {
+        at -= 1;
+        digits[at] = b"0123456789abcdef"[(left % radix as u64) as usize];
+        left /= radix as u64;
+        if left == 0 {
+            break;
+        }
+    }
+    if n < 0 {
+        at -= 1;
+        digits[at] = b'-';
+    }
+    let text = std::str::from_utf8(&digits[at..]).expect("digits are ASCII");
+    Ok(string::from_str(&Strings::new(mc), text)?.value())
+}
+
+/// Whether `v` can be called: a closure, a continuation or a keyword procedure.
+fn is_procedure<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> bool {
+    v.downcast::<objects::Closure>(mc).is_some()
+        || v.downcast::<objects::Continuation>(mc).is_some()
+        || v.downcast::<objects::KeywordProcedure>(mc).is_some()
+}
+
+/// The bits of `z`'s exact parts, past each one's first, so 0, 1 and -1 have none.
+fn exact_bits<'gc>(h: &Nums<'_, 'gc>, z: Number<'gc>) -> u64 {
     let bits = |n| int::integer_length(h, n).saturating_sub(1);
     let real = |r| match h.real_view(r) {
         RealView::Flonum(_) => 0,
@@ -955,11 +1141,94 @@ fn charge_power<'gc>(mc: &Mutation<'gc>, h: &Nums<'_, 'gc>, fuel: &mut Fuel, z: 
             RationalView::Ratio { num, den } => bits(num) + bits(den),
         },
     };
-    let per_power = match h.complex_view(z) {
+    match h.complex_view(z) {
         ComplexView::Real(r) => real(r),
         ComplexView::Complex { re, im } => real(re) + real(im),
+    }
+}
+
+/// Whether each of `xs` is as `op` says of the next, all of them characters.
+fn compare_chars<'gc>(op: Intrinsic, xs: impl Iterator<Item = Value<'gc>>) -> Result<bool, Fault> {
+    let (mut before, mut so_far) = (None, true);
+    for x in xs {
+        let x = x.as_char().ok_or(Fault::WrongType)?;
+        if let Some(b) = before {
+            so_far &= match op {
+                Intrinsic::CharEq => b == x,
+                Intrinsic::CharLt => b < x,
+                Intrinsic::CharGt => b > x,
+                Intrinsic::CharLe => b <= x,
+                _ => b >= x,
+            };
+        }
+        before = Some(x);
+    }
+    Ok(so_far)
+}
+
+/// `(string-join strs [sep])`: the strings of proper list `strs` with `sep`, or a space, between.
+fn string_join<'gc>(mc: &Mutation<'gc>, strs: Value<'gc>, sep: Option<Value<'gc>>, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
+    let (strings, pairs) = (Strings::new(mc), Pairs::new(mc));
+    let sep = match sep {
+        Some(v) => strings.string(v).ok_or(Fault::WrongType)?,
+        None => string::from_str(&strings, " ")?,
     };
-    let words = per_power.saturating_mul(e.unsigned_abs()) / 64;
+    let n = pairs.list_len(strs).ok_or(Fault::WrongType)?;
+    if n == 0 {
+        return Ok(string::empty(&strings)?.value());
+    }
+    fuel.spend(n / equal::PER_FUEL)?;
+    let mut items = pairs.elements(strs).map(|v| strings.string(v).ok_or(Fault::WrongType));
+    // Most joins are of a few strings, whose parts fit on the stack.
+    let joined = if n <= 4 {
+        let mut parts = [sep; 7];
+        for (i, s) in items.enumerate() {
+            parts[2 * i] = s?;
+        }
+        string::concat_all(&strings, &parts[..2 * n as usize - 1])?
+    } else {
+        let mut parts = ScratchVec::new(mc);
+        parts.push(items.next().ok_or(Fault::WrongType)??)?;
+        for s in items {
+            parts.push(sep)?;
+            parts.push(s?)?;
+        }
+        string::concat_all(&strings, &parts)?
+    };
+    Ok(made(mc, fuel, joined.value()))
+}
+
+/// Whether each of `xs` is as `op` says of the next, all of them strings.
+fn compare_strings<'gc>(mc: &Mutation<'gc>, op: Intrinsic, xs: impl Iterator<Item = Value<'gc>>) -> Result<bool, Fault> {
+    let strings = Strings::new(mc);
+    let (mut before, mut so_far) = (None, true);
+    for x in xs {
+        let x = strings.string(x).ok_or(Fault::WrongType)?;
+        if let Some(b) = before
+            && so_far
+        {
+            so_far = match op {
+                Intrinsic::StringEq => string::equal(&strings, b, x)?,
+                Intrinsic::StringLt => string::compare(&strings, b, x)?.is_lt(),
+                Intrinsic::StringGt => string::compare(&strings, b, x)?.is_gt(),
+                Intrinsic::StringLe => string::compare(&strings, b, x)?.is_le(),
+                _ => string::compare(&strings, b, x)?.is_ge(),
+            };
+        }
+        before = Some(x);
+    }
+    Ok(so_far)
+}
+
+/// Charges for `z^w` before it's computed, if it's exact: memory for its digits, and fuel for
+/// the squarings that make them, about their count squared.
+fn charge_power<'gc>(mc: &Mutation<'gc>, h: &Nums<'_, 'gc>, fuel: &mut Fuel, z: Number<'gc>, w: Number<'gc>) -> Result<(), Fault> {
+    let ComplexView::Real(e) = h.complex_view(w) else { return Ok(()) };
+    let RealView::Exact(e) = h.real_view(e) else { return Ok(()) };
+    let RationalView::Integer(e) = h.rational_view(e) else { return Ok(()) };
+    // An exponent past an i64 is too big for anything but 0, 1 and -1, which `expt` sees to.
+    let Some(e) = int::to_i64(h, e) else { return Ok(()) };
+    let words = exact_bits(h, z).saturating_mul(e.unsigned_abs()) / 64;
     mc.ensure(usize::try_from(words.saturating_mul(8)).unwrap_or(usize::MAX))?;
     fuel.spend(words.saturating_mul(words) / equal::PER_FUEL)
 }
@@ -1052,6 +1321,30 @@ fn find<'gc>(mc: &Mutation<'gc>, kind: Intrinsic, x: Value<'gc>, mut xs: Value<'
         xs = pair.tail(mc);
     }
     Ok(Value::FALSE)
+}
+
+fn string_append<'gc>(mc: &Mutation<'gc>, args: impl ExactSizeIterator<Item = Value<'gc>>, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
+    let strings = Strings::new(mc);
+    let n = args.len();
+    fuel.spend(n as u64 / equal::PER_FUEL)?;
+    let mut args = args.map(|v| strings.string(v).ok_or(Fault::WrongType));
+    let Some(first) = args.next().transpose()? else { return Ok(string::empty(&strings)?.value()) };
+    // Most calls have a few parts, which fit on the stack.
+    let joined = if n <= 8 {
+        let mut parts = [first; 8];
+        for (part, s) in parts[1..].iter_mut().zip(args) {
+            *part = s?;
+        }
+        string::concat_all(&strings, &parts[..n])?
+    } else {
+        let mut parts = ScratchVec::new(mc);
+        parts.push(first)?;
+        for s in args {
+            parts.push(s?)?;
+        }
+        string::concat_all(&strings, &parts)?
+    };
+    Ok(made(mc, fuel, joined.value()))
 }
 
 /// `(append list ... [obj])`: copies each proper list before the last non-empty argument onto

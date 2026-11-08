@@ -158,6 +158,7 @@ pub enum VarRef {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Closure<'gc> {
     pub id: u32,
+    pub optional: u32,
     pub params: Vec<Var>,
     pub rest: Option<Var>,
     pub captures: Vec<UpvalSource>,

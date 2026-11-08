@@ -506,6 +506,18 @@ fn widest<U: Unit>(units: &[U]) -> u32 {
 }
 
 impl<'a> Units<'a> {
+    /// The `k`th eight of these one-byte units in a little-endian word, or the ones left.
+    #[inline]
+    pub(crate) fn byte_chunk(self, k: usize) -> u64 {
+        let n = (self.len() - 8 * k).min(8);
+        match self {
+            Units::Inline(s) => s.word,
+            Units::Packed(p) if p.width == Width::One => p.word_at(k, n),
+            Units::One(b) => u8::pack(&b[8 * k..8 * k + n]),
+            _ => panic!("reading bytes of wider units"),
+        }
+    }
+
     #[inline]
     pub fn len(self) -> usize {
         each!(self, s => s.len(), p => p.len())
@@ -637,6 +649,58 @@ impl<'a> Units<'a> {
             Self::Packed(p) if p.width == Width::One => p.len() + p.byte_words().map(|w| (w & HIGH).count_ones() as usize).sum::<usize>(),
             Self::Inline(p) => p.len() + (p.word & HIGH).count_ones() as usize,
             _ => self.chars().map(char::len_utf8).sum(),
+        }
+    }
+}
+
+/// Fills units from the start with runs of units, one after another, which are no wider and as
+/// long in all. Into one-byte units packed in words, it writes a word at a time.
+pub(crate) struct RunWriter<'o, 'a> {
+    out: &'o mut UnitsMut<'a>,
+    at: usize,
+    /// The next word's bytes so far, `filled` bits of them, for one-byte packed units.
+    word: u64,
+    filled: u32,
+}
+
+impl<'o, 'a> RunWriter<'o, 'a> {
+    pub(crate) fn new(out: &'o mut UnitsMut<'a>) -> Self {
+        Self { out, at: 0, word: 0, filled: 0 }
+    }
+
+    #[inline]
+    pub(crate) fn push(&mut self, run: Units<'_>) {
+        let n = run.len();
+        let UnitsMut::Packed(p) = &*self.out else {
+            self.out.write(self.at, run);
+            self.at += n;
+            return;
+        };
+        if p.width != Width::One {
+            p.write(self.at, run);
+            self.at += n;
+            return;
+        }
+        for k in 0..n.div_ceil(8) {
+            let (chunk, bits) = (run.byte_chunk(k), 8 * (n - 8 * k).min(8) as u32);
+            self.word |= chunk << self.filled;
+            if self.filled + bits < 64 {
+                self.filled += bits;
+                continue;
+            }
+            p.words[self.at / 8].set(self.word);
+            self.at += 8;
+            self.word = chunk.checked_shr(64 - self.filled).unwrap_or(0);
+            self.filled = self.filled + bits - 64;
+        }
+    }
+
+    pub(crate) fn finish(self) {
+        if let UnitsMut::Packed(p) = &*self.out
+            && p.width == Width::One
+            && self.filled > 0
+        {
+            p.words[self.at / 8].set(self.word);
         }
     }
 }

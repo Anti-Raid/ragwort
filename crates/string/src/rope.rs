@@ -5,6 +5,7 @@
 //! [`LEAF`] bytes instead of a node per piece.
 
 use crate::iter::MAX_DEPTH;
+use crate::units::RunWriter;
 use crate::{Chunks, Host, Info, MAX_LEN, Res, StrError, StrView, Units, Width, info, len};
 
 /// The most bytes concatenation copies rather than sharing.
@@ -138,14 +139,29 @@ fn copy<H: Host>(h: &H, parts: &[H::Str]) -> Res<H> {
         width = width.max(i.width);
     }
     h.charge(n as u64)?;
-    h.flat(width, n, |mut out| {
-        let mut at = 0;
+    if width == Width::One && n <= 8 {
+        // Short and narrow, as much text is: the parts shift into one word.
+        let (mut word, mut at) = (0, 0);
         for &s in parts {
-            for run in Chunks::new(h, s, 0, len(h, s)) {
-                out.write(at, run);
-                at += run.len();
+            let StrView::Flat(units) = h.view(s) else { break };
+            if !units.is_empty() {
+                word |= units.byte_chunk(0).checked_shl(8 * at as u32).unwrap_or(0);
+                at += units.len();
             }
         }
+        if at == n {
+            return h.flat(width, n, |mut out| out.write_words(std::iter::once(word)));
+        }
+    }
+    h.flat(width, n, |mut out| {
+        let mut writer = RunWriter::new(&mut out);
+        for &s in parts {
+            match h.view(s) {
+                StrView::Flat(units) => writer.push(units),
+                StrView::Rope { .. } => Chunks::new(h, s, 0, len(h, s)).for_each(|run| writer.push(run)),
+            }
+        }
+        writer.finish();
     })
 }
 

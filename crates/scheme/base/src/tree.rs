@@ -7,7 +7,7 @@
 
 use ragwort_types::gc::{Mutation, OutOfMemory, ScratchVec, Value};
 use ragwort_types::pair::Pairs;
-use ragwort_types::symbol::Symbol;
+use ragwort_types::symbol::{Keyword, Symbol};
 use ragwort_types::syntax::{Syntax, SyntaxKind, SyntaxSpan};
 use ragwort_types::vector::Vectors;
 
@@ -125,6 +125,14 @@ impl<'a, 'gc> Tree<'a, 'gc> {
     pub(crate) fn symbol(&self, stx: Stx) -> Option<Symbol<'gc>> {
         match self.node(stx).shape {
             Shape::Id(symbol) => Some(symbol),
+            _ => None,
+        }
+    }
+
+    /// The keyword `stx` is, if it's one, as `#:name` reads.
+    pub(crate) fn keyword(&self, stx: Stx) -> Option<Keyword<'gc>> {
+        match self.node(stx).shape {
+            Shape::Datum(value) => Keyword::of(value),
             _ => None,
         }
     }

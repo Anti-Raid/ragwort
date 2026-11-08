@@ -6,11 +6,11 @@ use ragwort_types::pair::Pairs;
 use crate::args::Args;
 use crate::frame::{self, CLOSURE, Link};
 use crate::intrinsic::values;
-use crate::objects::{BytecodeFields, Closure, ClosureFields, Condition, Continuation, Native, NativeFields, Task, TaskFields};
+use crate::objects::{BytecodeFields, Closure, ClosureFields, Condition, Continuation, KeywordProcedure, Native, NativeFields, Task, TaskFields};
 use crate::run::{self, Exit, HostThen, Regs, bind};
 use crate::segments::{CHUNK, Resume, Segments};
 use crate::module::Deferred;
-use crate::{Fault, Fuel, Request, coroutine, prompts};
+use crate::{Fault, Fuel, Request, coroutine, keyword, prompts};
 
 #[cfg(test)]
 #[path = "tests/machine.rs"]
@@ -360,6 +360,10 @@ impl<'a, 'gc> Outer<'a, 'gc> {
     fn apply(&mut self, procedure: Value<'gc>, args: Args<'gc>) -> Step<'gc> {
         if let Some(k) = procedure.downcast::<Continuation>(self.mc()) {
             let then = self.go_to(k, args)?;
+            return self.then(then);
+        }
+        if let Some(f) = procedure.downcast::<KeywordProcedure>(self.mc()) {
+            let then = keyword::positional(self.mc(), f, args)?;
             return self.then(then);
         }
         self.start(procedure, args)?;

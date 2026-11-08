@@ -171,6 +171,33 @@ fn short_strings_live_in_the_word() {
 /// Strings made and dropped in the young generation go at the next minor collection, and the
 /// kept ones keep their characters.
 #[test]
+fn parts_join_a_word_at_a_time() {
+    arena(8 << 20).mutate(|mc| {
+        let h = Strings::new(mc);
+        let s = |t: &str| from_str(&h, t).unwrap();
+        let long = s("0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz");
+        let external = h.external(ExternalText::new("an external string, long enough to stay outside")).unwrap();
+        let outside = h.external(ExternalText::new("an external string that's long enough to be kept outside the arena")).unwrap();
+        assert!(h.is_external(outside));
+        let cases = [
+            (vec![s("<@"), s("user"), s(">")], "<@user>"),
+            (vec![s("ab"), s(""), s("cde"), s("fgh")], "abcdefgh"),
+            (vec![s("caf"), s("é!")], "café!"),
+            (vec![s("a"), s("🦀")], "a🦀"),
+            (vec![s("ab"), substring(&h, long, 3, 6).unwrap(), s("z")], "ab345z"),
+            (vec![s("x"), substring(&h, external, 3, 6).unwrap()], "xext"),
+            (vec![s("x"), concat(&h, long, long).unwrap()], &*format!("x{0}{0}", display(&h, long))),
+            (vec![s("abc"), long, s("de"), outside, s("é")], &*format!("abc{}de{}é", display(&h, long), display(&h, outside))),
+        ];
+        for (parts, want) in cases {
+            let joined = concat_all(&h, &parts).unwrap();
+            assert_eq!(display(&h, joined).to_string(), want);
+            assert_eq!(len(&h, joined), want.chars().count());
+        }
+    });
+}
+
+#[test]
 fn young_strings_free_their_characters() {
     let mut arena = arena(8 << 20);
     arena.mutate(|mc| {

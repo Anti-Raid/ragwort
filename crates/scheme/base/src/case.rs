@@ -89,7 +89,7 @@ impl<'gc> Expander<'_, 'gc> {
             Some(fender) => {
                 // The rest are tried if the fender fails or the pattern doesn't match.
                 let k = self.fresh();
-                let thunk = Core::Lambda(Lambda { id: self.lambda_id(), params: Vec::new(), rest: None, body: Box::new(next) });
+                let thunk = Core::Lambda(Lambda { id: self.lambda_id(), params: Vec::new(), optional: 0, rest: None, body: Box::new(next) });
                 let again = || Core::App(Box::new(local(k)), Vec::new());
                 let body = Core::If(Box::new(self.expr(fender)?), Box::new(output), Box::new(again()));
                 let body = Core::Let(binds, Box::new(body));

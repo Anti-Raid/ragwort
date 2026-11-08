@@ -7,7 +7,7 @@ use ragwort_types::constant::Constants;
 use ragwort_types::gc::{Frame, Gc, Mutation, Slots, Stack, Value, WINDOW};
 use ragwort_types::pair::{Pair, Pairs};
 
-use crate::frame::{self, ARGS, CLOSURE, Kept, Link, MAX_PARAMS, SAVED_MARKS};
+use crate::frame::{self, ARGS, CLOSURE, Kept, Link, MAX_PARAMS, SAVED_MARKS, Shape};
 use crate::op::Fuel;
 use crate::module::{Deferred, HostArgs, HostContext, Reply};
 use crate::objects::{BytecodeFields, Closure, ClosureFields, Guard, ModuleFields, MultiValue, MultiValueFields, Task, TaskFields};
@@ -383,41 +383,58 @@ fn bind_slow<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, mut arg
     if let Some(mv) = rest.downcast::<MultiValue>(mc) {
         return bind_values(mc, frame, arity, argc, mv);
     }
-    if arity.unsigned_abs() > u64::from(MAX_PARAMS) {
-        return bind_spread(mc, frame, arity, argc, rest);
+    let shape = Shape::of(arity);
+    if shape.slots() > u64::from(MAX_PARAMS) {
+        return bind_spread(mc, frame, shape, argc, rest);
     }
-    let variadic = arity < 0;
-    let required = if variadic { -(arity + 1) } else { arity };
-    let required = u8::try_from(required)
-        .ok()
-        .filter(|&n| usize::from(n) + usize::from(variadic) <= MAX_ARGS)
-        .ok_or(Fault::Malformed)?;
-    while argc < required {
-        let pair = Pair::of(rest).ok_or(if rest == Value::NIL { Fault::Arity } else { Fault::WrongType })?;
-        frame.set(ARGS + argc, pair.head(mc));
-        (rest, argc) = (pair.tail(mc), argc + 1);
+    let (required, fixed) = counts(shape)?;
+    while argc < fixed {
+        let item = match Pair::of(rest) {
+            Some(pair) => {
+                rest = pair.tail(mc);
+                pair.head(mc)
+            }
+            None if rest != Value::NIL => return Err(Fault::WrongType),
+            None if argc < required => return Err(Fault::Arity),
+            None => Value::UNSUPPLIED,
+        };
+        frame.set(ARGS + argc, item);
+        argc += 1;
     }
-    if !variadic {
+    if !shape.rest {
         return match () {
-            () if argc > required || Pair::of(rest).is_some() => Err(Fault::Arity),
+            () if argc > fixed || Pair::of(rest).is_some() => Err(Fault::Arity),
             () if rest != Value::NIL => Err(Fault::WrongType),
             () => Ok(()),
         };
     }
     let pairs = Pairs::new(mc);
-    for i in (required..argc).rev() {
+    for i in (fixed..argc).rev() {
         rest = pairs.cons(frame.get(ARGS + i), rest)?.value(mc);
     }
-    frame.set(ARGS + required, rest);
+    frame.set(ARGS + fixed, rest);
     Ok(())
+}
+
+/// The parameters of `shape` that must have arguments, and those before its rest list, which
+/// fit in registers.
+fn counts(shape: Shape) -> Result<(u8, u8), Fault> {
+    let fixed = u8::try_from(shape.required + shape.optional)
+        .ok()
+        .filter(|&n| usize::from(n) + usize::from(shape.rest) <= MAX_ARGS)
+        .ok_or(Fault::Malformed)?;
+    Ok((shape.required as u8, fixed))
 }
 
 /// Binds as [`bind`] does, for code with more parameters than [`MAX_PARAMS`]: the first
 /// `MAX_PARAMS - 1` arguments in their registers, then a list of the others in the last.
 #[inline(never)]
-fn bind_spread<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, mut argc: u8, mut rest: Value<'gc>) -> Result<(), Fault> {
-    let variadic = arity < 0;
-    let slots = arity.unsigned_abs();
+fn bind_spread<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, shape: Shape, mut argc: u8, mut rest: Value<'gc>) -> Result<(), Fault> {
+    // The compiler keeps optional parameters to code that takes few enough.
+    if shape.optional > 0 {
+        return Err(Fault::Malformed);
+    }
+    let (variadic, slots) = (shape.rest, shape.slots());
     let keep = MAX_PARAMS - 1;
     while argc < keep {
         let pair = Pair::of(rest).ok_or(if rest == Value::NIL { Fault::Arity } else { Fault::WrongType })?;
@@ -446,35 +463,33 @@ fn bind_spread<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, mut a
 /// Binds as [`bind`] does when `rest` is a [`MultiValue`] from `apply-values`.
 fn bind_values<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, mut argc: u8, mv: Gc<'gc, MultiValue>) -> Result<(), Fault> {
     let items = mv.items(mc);
-    if arity.unsigned_abs() > u64::from(MAX_PARAMS) {
+    let shape = Shape::of(arity);
+    if shape.slots() > u64::from(MAX_PARAMS) {
         let rest = Pairs::new(mc).list_with_tail((0..items.len()).map(|i| items.get(i)), Value::NIL)?;
-        return bind_spread(mc, frame, arity, argc, rest);
+        return bind_spread(mc, frame, shape, argc, rest);
     }
-    let variadic = arity < 0;
-    let required = if variadic { -(arity + 1) } else { arity };
-    let required = u8::try_from(required)
-        .ok()
-        .filter(|&n| usize::from(n) + usize::from(variadic) <= MAX_ARGS)
-        .ok_or(Fault::Malformed)?;
+    let (required, fixed) = counts(shape)?;
     let mut idx = 0;
-    while argc < required {
-        if idx >= items.len() {
-            return Err(Fault::Arity);
-        }
-        frame.set(ARGS + argc, items.get(idx));
+    while argc < fixed {
+        let item = match () {
+            () if idx < items.len() => items.get(idx),
+            () if argc < required => return Err(Fault::Arity),
+            () => Value::UNSUPPLIED,
+        };
+        frame.set(ARGS + argc, item);
         (idx, argc) = (idx + 1, argc + 1);
     }
-    if !variadic {
-        if argc > required || idx < items.len() {
+    if !shape.rest {
+        if argc > fixed || idx < items.len() {
             return Err(Fault::Arity);
         }
         return Ok(());
     }
     let pairs = Pairs::new(mc);
-    let mut rest = pairs.list_with_tail((idx..items.len()).map(|i| items.get(i)), Value::NIL)?;
-    for i in (required..argc).rev() {
+    let mut rest = pairs.list_with_tail((idx.min(items.len())..items.len()).map(|i| items.get(i)), Value::NIL)?;
+    for i in (fixed..argc).rev() {
         rest = pairs.cons(frame.get(ARGS + i), rest)?.value(mc);
     }
-    frame.set(ARGS + required, rest);
+    frame.set(ARGS + fixed, rest);
     Ok(())
 }

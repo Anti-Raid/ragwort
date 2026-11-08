@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 use ragwort_types::gc::{Gc, Mutation, Value, WINDOW};
 use ragwort_types::vector::Vectors;
-use ragwort_vm::frame::{self, ARGS, CLOSURE, MAX_PARAMS};
+use ragwort_vm::frame::{self, ARGS, CLOSURE, MAX_PARAMS, Shape};
 use ragwort_vm::objects::{self, Bytecode, BytecodeFields, Closure, ModuleFields};
 use ragwort_vm::{Capture, HostDef, Intrinsic, Op, Purity, Read, Request};
 
@@ -30,7 +30,7 @@ const SCRATCH: u8 = LIMIT as u8;
 
 pub(crate) fn emit<'gc>(mc: &Mutation<'gc>, owner: Option<Gc<'gc, objects::Module>>, l4: &L4<'gc>) -> Result<Value<'gc>, CompileError> {
     let mut module = Module { mc, owner, constants: Vec::new(), index: HashMap::new(), codes: Vec::new(), spills: HashSet::new() };
-    let code = module.compile_function(None, &[], None, &[], l4)?;
+    let code = module.compile_function(None, Formals { params: &[], optional: 0, rest: None }, &[], l4)?;
     let table = Vectors::new(mc).immutable_from_slice(&module.constants)?.value(mc);
     for &c in &module.codes {
         c.set_constants(mc, table);
@@ -76,6 +76,15 @@ struct Module<'a, 'gc> {
     spills: HashSet<u32>,
 }
 
+/// A function's parameters: the last `optional` of `params` can be left out, and `rest` takes
+/// the arguments past them.
+#[derive(Clone, Copy)]
+struct Formals<'a> {
+    params: &'a [Var],
+    optional: u32,
+    rest: Option<Var>,
+}
+
 impl<'a, 'gc> Module<'a, 'gc> {
     fn constant(&mut self, value: Value<'gc>) -> Result<u32, CompileError> {
         if let Some(&i) = self.index.get(&value.to_bits()) {
@@ -97,8 +106,7 @@ impl<'a, 'gc> Module<'a, 'gc> {
     fn compile_function(
         &mut self,
         lambda: Option<u32>,
-        params: &[Var],
-        rest: Option<Var>,
+        formals: Formals<'_>,
         captures: &[Capture],
         body: &L4<'gc>,
     ) -> Result<Gc<'gc, Bytecode>, CompileError> {
@@ -106,7 +114,7 @@ impl<'a, 'gc> Module<'a, 'gc> {
         let mut near = true;
         let (constants, codes) = (self.constants.len(), self.codes.len());
         loop {
-            match self.attempt(spill, near, params, rest, captures, body) {
+            match self.attempt(spill, near, formals, captures, body) {
                 Ok(code) => return Ok(code),
                 Err(Stop::Error(e)) => return Err(e),
                 Err(Stop::Spill) if !spill => {
@@ -128,13 +136,18 @@ impl<'a, 'gc> Module<'a, 'gc> {
         &mut self,
         spill: bool,
         near: bool,
-        params: &[Var],
-        rest: Option<Var>,
+        formals: Formals<'_>,
         captures: &[Capture],
         body: &L4<'gc>,
     ) -> Result<Gc<'gc, Bytecode>, Stop> {
-        let n = i64::try_from(params.len()).map_err(|_| CompileError::TooManyRegisters)?;
-        let arity = if rest.is_some() { -(n + 1) } else { n };
+        let Formals { params, optional, rest } = formals;
+        let (n, optional) = (params.len() as u64, u64::from(optional));
+        let shape = Shape { required: n - optional, optional, rest: rest.is_some() };
+        // Optional parameters are bound in registers, past which code can't take them.
+        if optional > 0 && shape.slots() > u64::from(frame::MAX_PARAMS) {
+            return Err(CompileError::TooManyRegisters.into());
+        }
+        let arity = shape.encode().ok_or(CompileError::TooManyRegisters)?;
         let link = frame::link_slot(arity);
         let mut f = Compiler {
             module: self,
@@ -484,7 +497,8 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
             };
             captures.push(cap);
         }
-        Ok(self.module.compile_function(Some(clos.id), &clos.params, clos.rest, &captures, &clos.body)?)
+        let formals = Formals { params: &clos.params, optional: clos.optional, rest: clos.rest };
+        Ok(self.module.compile_function(Some(clos.id), formals, &captures, &clos.body)?)
     }
 
     fn push_contiguous_bytecodes(&mut self, bytecodes: &[Gc<'gc, Bytecode>]) -> Result<u32, CompileError> {

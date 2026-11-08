@@ -437,7 +437,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         let rest = (vars.len() > params).then(|| vars.pop()).flatten();
         let id = self.lambdas;
         self.lambdas = self.lambdas.checked_add(1).expect("fewer than 2^32 lambdas");
-        Ok(Core::Lambda(Lambda { id, params: vars, rest, body: Box::new(body) }))
+        Ok(Core::Lambda(Lambda { id, params: vars, optional: 0, rest, body: Box::new(body) }))
     }
 
     /// An `%intrinsic`, or if `spread`, an `%apply-intrinsic`, whose argument count is only known

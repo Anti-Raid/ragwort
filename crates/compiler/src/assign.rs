@@ -95,5 +95,5 @@ fn convert_func<'gc>(f: Func<L2<'gc>>, assigned: &HashSet<Var>, supply: &mut Sup
     });
     let body = convert(*f.body, assigned, supply);
     let body = if box_binds.is_empty() { body } else { L3::Let(box_binds, Box::new(body)) };
-    Func { id: f.id, params, rest, body: Box::new(body) }
+    Func { id: f.id, params, optional: f.optional, rest, body: Box::new(body) }
 }

@@ -512,6 +512,8 @@ impl<'gc> Value<'gc> {
     pub const VOID: Self = Self::constant(3);
     /// What a module's variable holds until it's defined.
     pub const UNDEFINED: Self = Self::constant(4);
+    /// What an optional parameter is bound to when its call passes no argument for it.
+    pub const UNSUPPLIED: Self = Self::constant(5);
     /// What an ephemeron's key and value become once the key dies.
     pub const BROKEN: Self = Self::constant(7);
 

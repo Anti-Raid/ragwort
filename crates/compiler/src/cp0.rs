@@ -130,7 +130,7 @@ impl<'gc> Cp0<'_, 'gc> {
     }
 
     fn opt_func(&mut self, f: Func<L2<'gc>>) -> Func<L2<'gc>> {
-        Func { id: f.id, params: f.params, rest: f.rest, body: Box::new(self.expr(*f.body)) }
+        Func { id: f.id, params: f.params, optional: f.optional, rest: f.rest, body: Box::new(self.expr(*f.body)) }
     }
 
     fn arm(&mut self, arm: Arm<'gc>) -> L2<'gc> {
@@ -396,6 +396,10 @@ impl<'gc> Cp0<'_, 'gc> {
 
     /// `func`'s parameters bound to `args` (already optimized if `done`), and its body.
     fn bind_params(&mut self, func: Func<L2<'gc>>, mut args: Vec<L2<'gc>>, done: bool) -> (Vec<(Var, L2<'gc>)>, L2<'gc>) {
+        // Optional parameters left out are unsupplied, as the VM binds them.
+        if args.len() < func.params.len() {
+            args.resize(func.params.len(), L2::Quote(Value::UNSUPPLIED));
+        }
         let rest = func.rest.map(|rest| {
             let list = args.split_off(func.params.len()).into_iter().rfold(L2::Quote(Value::NIL), |acc, item| {
                 let cons = Prim::Intrinsic(Intrinsic::Cons);
@@ -620,9 +624,10 @@ impl<'gc> Cp0<'_, 'gc> {
 }
 
 fn func_takes<E>(func: &Func<E>, argc: usize) -> bool {
+    let (most, least) = (func.params.len(), func.params.len() - func.optional as usize);
     match func.rest {
-        None => argc == func.params.len(),
-        Some(_) => argc >= func.params.len() && argc - func.params.len() <= MAX_REST_INLINE,
+        None => (least..=most).contains(&argc),
+        Some(_) => argc >= least && argc.saturating_sub(most) <= MAX_REST_INLINE,
     }
 }
 
@@ -737,7 +742,7 @@ fn alpha_rename<'gc>(func: &Func<L2<'gc>>, supply: &mut Supply) -> Func<L2<'gc>>
         fresh
     });
     let body = rename_expr(&func.body, &mut map, supply);
-    Func { id: supply.fresh_lambda(), params, rest, body: Box::new(body) }
+    Func { id: supply.fresh_lambda(), params, optional: func.optional, rest, body: Box::new(body) }
 }
 
 fn rename_expr<'gc>(expr: &L2<'gc>, map: &mut HashMap<Var, Var>, supply: &mut Supply) -> L2<'gc> {

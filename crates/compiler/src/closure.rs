@@ -68,6 +68,7 @@ fn convert_expr<'gc>(expr: &L3<'gc>, env: &mut Env) -> L4<'gc> {
                 && let L3::App(op, init_args) = body.as_ref()
                 && **op == L3::Ref(*loop_var)
                 && func.rest.is_none()
+                && func.optional == 0
                 && func.params.len() == init_args.len()
                 && func.params.len() <= MAX_LOOP_PARAMS
                 && !init_args.iter().any(|a| references_var(a, *loop_var))
@@ -158,6 +159,7 @@ fn convert_closure<'gc>(
     Closure {
         id: func.id,
         params: func.params.clone(),
+        optional: func.optional,
         rest: func.rest,
         captures,
         body: Box::new(body),

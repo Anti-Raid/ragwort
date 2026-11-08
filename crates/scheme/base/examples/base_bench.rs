@@ -156,6 +156,35 @@ fn main() {
     println!("countdown on intrinsics:       {:.1} ns per iteration", per(time(&native, true, true)));
     let less = format!("(define (count n) (if (< n 1) 0 (count (- n 1)))) (count {N})");
     println!("countdown testing with <:      {:.1} ns per iteration", per(time(&less, false, true)));
+    let append = format!("(define (count n s) (if (eqv? n 0) (string-length s) (count (- n 1) (string-append \"<@\" (symbol->string 'user) \">\")))) (count {N} \"\")");
+    println!("string-append of 3 short:      {:.1} ns per iteration", per(time(&append, false, true)));
+    let grow = format!("(define (count n s) (if (eqv? n 0) (string-length s) (count (- n 1) (string-append s \"ab\")))) (count {N} \"\")");
+    println!("appending to a growing string: {:.1} ns per iteration", per(time(&grow, false, true)));
+    let loop_on = |body: &str| format!("(define s \"!ping someone about something\") (define (count n) (if (eqv? n 0) 0 (begin {body} (count (- n 1))))) (count {N})");
+    for (name, body) in [
+        ("substring of 5", "(substring s 1 6)"),
+        ("string-ref", "(string-ref s 3)"),
+        ("string=? of a 28-char copy", "(string=? s (string-append \"!ping someone \" \"about something\"))"),
+        ("string<? differing at 7", "(string<? s \"!ping sz\")"),
+        ("number->string of a fixnum", "(number->string n)"),
+        ("string->list of 28", "(string->list s)"),
+        ("string-join of 3 with \", \"", "(string-join '(\"alice\" \"bob\" \"carol\") \", \")"),
+        ("char<? and char->integer", "(if (char<? #\\a #\\b) (char->integer (string-ref s 2)) 0)"),
+    ] {
+        println!("{name:<30} {:.1} ns per iteration", per(time(&loop_on(body), false, true)));
+    }
+    let defs = "(define (pf a b) (+ a b)) (define (of a [b 1]) (+ a b)) (define (kf a #:b [b 1]) (+ a b))
+                (define kv (let ([f (lambda (a #:b [b 1]) (+ a b))]) f))";
+    let summing = |call: &str| format!("{defs} (define (count n acc) (if (eqv? n 0) acc (count (- n 1) (+ acc {call})))) (count {N} 0)");
+    for (name, call) in [
+        ("positional call", "(pf n 1)"),
+        ("optional left out", "(of n)"),
+        ("keyword, direct to the core", "(kf n #:b 1)"),
+        ("keyword, matched at run time", "(kv n #:b 1)"),
+        ("keyword procedure, no keywords", "(kv n)"),
+    ] {
+        println!("{name:<30} {:.1} ns per iteration", per(time(&summing(call), false, true)));
+    }
 
     let switch = format!(
         "(define co (make-coroutine (lambda () (let loop ((i 0)) (co/yield i) (loop (+ i 1))))))

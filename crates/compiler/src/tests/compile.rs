@@ -57,9 +57,14 @@ fn seq<'gc>(v: u32, a: Core<'gc>, b: Core<'gc>) -> Core<'gc> {
 
 /// A lambda, numbered apart from every other the tests make.
 fn lambda<'gc>(params: &[u32], rest: Option<u32>, body: Core<'gc>) -> Core<'gc> {
+    optional_lambda(params, 0, rest, body)
+}
+
+/// A lambda whose last `optional` parameters a call can leave out.
+fn optional_lambda<'gc>(params: &[u32], optional: u32, rest: Option<u32>, body: Core<'gc>) -> Core<'gc> {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    Core::Lambda(Lambda { id, params: params.iter().map(|&v| Var(v)).collect(), rest: rest.map(Var), body: Box::new(body) })
+    Core::Lambda(Lambda { id, params: params.iter().map(|&v| Var(v)).collect(), optional, rest: rest.map(Var), body: Box::new(body) })
 }
 
 fn app<'gc>(f: Core<'gc>, args: Vec<Core<'gc>>) -> Core<'gc> {
@@ -201,6 +206,29 @@ fn rest_parameters() {
 }
 
 #[test]
+fn optional_parameters_are_unsupplied_when_left_out() {
+    // (lambda (a [b] . rest) (if (eq? b #<unsupplied>) (+ a 100) (+ a b))), called on `args`
+    // where cp0 sees the lambda, and through `apply`, where the VM binds them.
+    fn f<'gc>(rest: bool) -> Core<'gc> {
+        let missing = eq(var(1), Core::Quote(Value::UNSUPPLIED));
+        optional_lambda(&[0, 1], 1, rest.then_some(2), when(missing, add(var(0), q(100)), add(var(0), var(1))))
+    }
+    for rest in [false, true] {
+        for (args, expect) in [(vec![1], Ok(101)), (vec![1, 2], Ok(3)), (vec![], Err(Fault::Arity)), (vec![1, 2, 3], if rest { Ok(3) } else { Err(Fault::Arity) })] {
+            let direct = number(|_| app(f(rest), args.iter().map(|&n| q(n)).collect()));
+            let applied = number(|_| {
+                let args = std::iter::once(f(rest)).chain(args.iter().map(|&n| q(n))).chain([Core::Quote(Value::NIL)]).collect();
+                Core::Intrinsic(Prim::Request(Request::Apply), args)
+            });
+            assert_eq!((direct, applied), (expect, expect), "{args:?}, rest {rest}");
+        }
+    }
+    // Optional parameters are bound in registers, so there can't be more than fit.
+    let params: Vec<u32> = (0..=u32::from(MAX_PARAMS)).collect();
+    assert_eq!(error(|_| optional_lambda(&params, 1, None, q(0))), CompileError::TooManyRegisters);
+}
+
+#[test]
 fn requests() {
     // (let ((tag (make-continuation-prompt-tag)))
     //   (call-with-prompt tag (lambda (v) (+ v 1)) (lambda () (+ 100 (abort tag 5)))))
@@ -225,7 +253,7 @@ fn bad_forms_dont_compile() {
     assert_eq!(error(|_| prim(Car, vec![])), CompileError::Arity(Prim::Intrinsic(Car)));
     // ((lambda () 1) (lambda () 2)), both numbered 7.
     fn numbered<'gc>(body: Core<'gc>) -> Core<'gc> {
-        Core::Lambda(Lambda { id: 7, params: Vec::new(), rest: None, body: Box::new(body) })
+        Core::Lambda(Lambda { id: 7, params: Vec::new(), optional: 0, rest: None, body: Box::new(body) })
     }
     assert_eq!(error(|_| app(numbered(q(1)), vec![numbered(q(2))])), CompileError::SameLambda(7));
     assert_eq!(error(|_| Core::Intrinsic(Prim::Request(Request::Capture), vec![q(1)])), CompileError::Arity(Prim::Request(Request::Capture)));
@@ -906,6 +934,23 @@ fn modules_export_what_code_that_requires_them_needs() {
         let rest = imported(mc, lib2, "rest-first").call(mc, vec![q(1), add(q(1), q(1)), q(3)], &mut fresh).unwrap();
         let rest = run_to_end(mc, compile(mc, None, &prim(Car, vec![rest])).unwrap()).unwrap();
         assert_eq!(items(mc, rest), [2, 3]);
+        // An optional parameter a call leaves out is unsupplied, so its default's test folds:
+        // (lambda (a [b]) (let ([c (if (eq? b #<unsupplied>) 100 b)]) (+ a c))).
+        let default = when(eq(var(1), Core::Quote(Value::UNSUPPLIED)), q(100), var(1));
+        let lib3 = exporting(mc, vec![("plus", optional_lambda(&[0, 1], 1, None, let_(vec![(2, default)], add(var(0), var(2)))), false)]);
+        let plus = imported(mc, lib3, "plus");
+        assert!(ragwort_compiler_interface(mc, lib3).get("plus").unwrap().inline.is_some());
+        for (args, want) in [(vec![3], Ok(fix(103))), (vec![3, 4], Ok(fix(7))), (vec![], Err(Fault::Arity)), (vec![3, 4, 5], Err(Fault::Arity))] {
+            let call = plus.call(mc, args.iter().map(|&n| q(n)).collect(), &mut fresh).unwrap();
+            assert_eq!(run_to_end(mc, compile(mc, None, &call).unwrap()), want, "{args:?}");
+        }
+        let one = plus.call(mc, vec![var(0)], &mut fresh).unwrap();
+        let ops = all_ops(mc, compile(mc, None, &lambda(&[0], None, one)).unwrap());
+        assert!(matches!(ops.as_slice(), [.., Op::AddImm { imm: 100, .. }, Op::Return { .. }]), "expected the default to fold: {ops:?}");
+        // A parameter used in an `if`'s test and a branch is used twice, so its argument is bound.
+        let lib4 = exporting(mc, vec![("car-or", lambda(&[0], None, when(prim(ragwort_vm::Intrinsic::IsPair, vec![var(0)]), prim(Car, vec![var(0)]), var(0))), false)]);
+        let call = imported(mc, lib4, "car-or").call(mc, vec![prim(Cons, vec![q(1), q(2)])], &mut fresh).unwrap();
+        assert_eq!(run_to_end(mc, compile(mc, None, &call).unwrap()), Ok(fix(1)));
         // An export its module hasn't defined yet can't be referred to.
         let mut builder = ModuleBuilder::new(Value::FALSE, &[]);
         builder.define(symbol(mc, "x"), 0).unwrap();

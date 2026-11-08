@@ -355,6 +355,87 @@ fn integer_division_keeps_the_sign_it_should() {
 }
 
 #[test]
+fn strings_append_and_count_characters() {
+    let text = "(list (string-length \"\") (string-length \"héllo\") (string-length \"🦀ab\") (string-append) (string-append \"a\")
+                      (string-append \"ab\" \"\" \"cd\" \"é🦀\") (apply string-append (list \"x\" \"y\" \"z\")))";
+    assert_eq!(eval(text), "(0 5 3 \"\" \"a\" \"abcdé🦀\" \"xyz\")");
+    // Long strings join into ropes, which count and compare as their characters.
+    let long = "(define (grow s n) (if (eqv? n 0) s (grow (string-append s s \"!\") (- n 1))))
+                (define s (grow \"ab\" 12))
+                (list (string-length s) (equal? (string-append s \"z\") (string-append s \"z\")) (string-length (string-append s s)))";
+    assert_eq!(eval(long), "(12287 #t 24574)");
+    assert_eq!(uncaught("(string-append \"a\" 'b)"), "#<error WrongType>");
+    assert_eq!(uncaught("(string-length 'a)"), "#<error WrongType>");
+}
+
+#[test]
+fn strings_slice_index_and_compare() {
+    let text = "(list (substring \"hello\" 1 3) (substring \"hello\" 2) (substring \"héllo🦀\" 4 6) (substring \"abc\" 3)
+                      (string-ref \"a🦀b\" 1) (string-ref \"abc\" 0)
+                      (string->list \"abc\") (string->list \"abcd\" 1) (string->list \"abcd\" 1 3) (string->list \"\"))";
+    assert_eq!(eval(text), "(\"el\" \"llo\" \"o🦀\" \"\" #\\🦀 #\\a (#\\a #\\b #\\c) (#\\b #\\c #\\d) (#\\b #\\c) ())");
+    let compared = "(list (string=? \"a\" \"a\" \"a\") (string=? \"a\" \"b\") (string<? \"a\" \"b\" \"c\") (string<? \"ab\" \"abc\") (string<? \"b\" \"a\")
+                          (string>? \"c\" \"b\" \"a\") (string<=? \"a\" \"a\" \"b\") (string>=? \"b\" \"c\") (string<? \"Z\" \"a\" \"é\" \"🦀\") (string=? \"x\"))";
+    assert_eq!(eval(compared), "(#t #f #t #t #f #t #t #f #t #t)");
+    assert_eq!(uncaught("(substring \"abc\" 2 1)"), "#<error Str(OutOfRange)>");
+    assert_eq!(uncaught("(substring \"abc\" 0 4)"), "#<error Str(OutOfRange)>");
+    assert_eq!(uncaught("(string-ref \"abc\" 3)"), "#<error Str(OutOfRange)>");
+    assert_eq!(uncaught("(string-ref \"abc\" -1)"), "#<error OutOfRange>");
+    assert_eq!(uncaught("(string->list \"abc\" 2 1)"), "#<error Str(OutOfRange)>");
+    // Every argument's checked, though the answer's known before it.
+    assert_eq!(uncaught("(string<? \"b\" \"a\" 'c)"), "#<error WrongType>");
+}
+
+#[test]
+fn characters_are_code_points() {
+    let text = "(list (char? #\\a) (char? \"a\") (char->integer #\\a) (char->integer #\\🦀) (integer->char 955) (integer->char 1114111)
+                      (char=? #\\a #\\a #\\a) (char=? #\\a #\\b) (char<? #\\a #\\b #\\é) (char<? #\\b #\\a) (char>? #\\c #\\b #\\a)
+                      (char<=? #\\a #\\a) (char>=? #\\a #\\b) (char=? #\\x) (eqv? (string-ref \"λ\" 0) (integer->char 955)))";
+    assert_eq!(eval(text), "(#t #f 97 129408 #\\λ #\\x10ffff #t #f #t #f #t #t #f #t #t)");
+    // What the printer writes for unseen characters reads back.
+    assert_eq!(eval("(list (char->integer #\\x10ffff) (char->integer #\\x200b) (string->list \"a\\x200b;\\xfeff;\"))"), "(1114111 8203 (#\\a #\\x200b #\\xfeff))");
+    assert_eq!(uncaught("(integer->char 55296)"), "#<error OutOfRange>");
+    assert_eq!(uncaught("(integer->char 1114112)"), "#<error OutOfRange>");
+    assert_eq!(uncaught("(integer->char -1)"), "#<error OutOfRange>");
+    assert_eq!(uncaught("(char->integer \"a\")"), "#<error WrongType>");
+    assert_eq!(uncaught("(char<? #\\b #\\a 'c)"), "#<error WrongType>");
+}
+
+#[test]
+fn strings_join_with_a_separator() {
+    let text = "(list (string-join '(\"a\" \"b\" \"c\")) (string-join '(\"a\" \"b\" \"c\") \", \") (string-join '()) (string-join '(\"solo\") \"-\")
+                      (string-join '(\"<@\" \">\") \"user\") (string-join '(\"é\" \"🦀\") \"\"))";
+    assert_eq!(eval(text), "(\"a b c\" \"a, b, c\" \"\" \"solo\" \"<@user>\" \"é🦀\")");
+    let long = "(define (words n acc) (if (eqv? n 0) acc (words (- n 1) (cons (number->string n) acc))))
+                (string-length (string-join (words 1000 '()) \", \"))";
+    assert_eq!(eval(long), "4891");
+    assert_eq!(uncaught("(string-join '(\"a\" b))"), "#<error WrongType>");
+    assert_eq!(uncaught("(string-join '(\"a\" . \"b\"))"), "#<error WrongType>");
+    assert_eq!(uncaught("(string-join '(\"a\") 'x)"), "#<error WrongType>");
+}
+
+#[test]
+fn numbers_write_as_they_read() {
+    let text = "(list (number->string 42) (number->string -17 16) (number->string 255 16) (number->string 1/3 2) (number->string 1.5)
+                      (number->string 1.5 2) (number->string 0.1 16) (number->string -0.0 2) (number->string 1e21) (number->string +nan.0)
+                      (number->string 1+2i) (number->string 0-1/2i 2) (number->string (expt 2 100) 16) (number->string 6.0 8))";
+    assert_eq!(
+        eval(text),
+        "(\"42\" \"-11\" \"ff\" \"1/11\" \"1.5\" \"1.1\" \"0.1999999999999a\" \"-0.0\" \"1e21\" \"+nan.0\" \"1+2i\" \"-1/10i\" \"10000000000000000000000000\" \"6.0\")"
+    );
+    // Fixnums are written in place, the ends of the range included.
+    let ends = "(list (number->string 0) (number->string 0 2) (number->string -1 16) (number->string 1234567) (number->string 12345678)
+                      (number->string 4611686018427387903) (number->string -4611686018427387904 16) (number->string -4611686018427387904 2)
+                      (number->string 4611686018427387904))";
+    assert_eq!(
+        eval(ends),
+        "(\"0\" \"0\" \"-1\" \"1234567\" \"12345678\" \"4611686018427387903\" \"-4000000000000000\" \"-100000000000000000000000000000000000000000000000000000000000000\" \"4611686018427387904\")"
+    );
+    assert_eq!(uncaught("(number->string 10 3)"), "#<error OutOfRange>");
+    assert_eq!(uncaught("(number->string 'x)"), "#<error WrongType>");
+}
+
+#[test]
 fn symbols_and_strings_name_each_other() {
     let text = "(list (symbol? 'a) (symbol? \"a\") (symbol? '#:a) (string? \"a\") (string? 'a) (symbol->string 'abc) (eq? 'abc (string->symbol \"abc\"))
                       (string->symbol \"two words\") (eq? (string->symbol (symbol->string 'x)) 'x))";
@@ -368,7 +449,7 @@ fn keywords_are_interned_values() {
                       (keyword->string '#:when) (equal? '(#:x 1) '(#:x 1)) (string->keyword \"two words\"))";
     assert_eq!(eval(text), "(#:when #t #f #t #t \"when\" #t #:|two words|)");
     // As in Racket, a keyword isn't an expression by itself.
-    assert_eq!(error("(list #:when 1)"), (BadSyntax, "#:when"));
+    assert_eq!(eval_in(&mut arena(), "(list #:when 1)"), Ok(Err(Fault::Keyword)));
 }
 
 #[test]
@@ -903,6 +984,67 @@ fn guard_takes_what_its_clauses_match_and_raises_the_rest_again() {
     assert_eq!(eval("(let ((e 'outer)) (guard (e (#f e)) e))"), "outer");
     assert_eq!(error("(guard (1 (#t 2)) 3)").0, BadSyntax);
     assert_eq!(error("(guard (e (#t 2)))").0, BadSyntax);
+}
+
+#[test]
+fn optional_parameters_take_defaults() {
+    assert_eq!(eval("(define (f a [b 2]) (list a b)) (list (f 1) (f 1 3))"), "((1 2) (1 3))");
+    // Each default sees the parameters before it, and runs only when its argument is left out.
+    let text = "(define n 0) (define (g [a (begin (set! n (+ n 1)) 1)] [b (* a 2)] . r) (list a b r)) (list (g) (g 5) (g 5 6 7) n)";
+    assert_eq!(eval(text), "((1 2 ()) (5 10 ()) (5 6 (7)) 1)");
+    assert_eq!(eval("(let ([f (lambda (a [b 1]) (+ a b))]) (list (f 1) (apply f '(1 2)) (map f '(1 2))))"), "(2 3 (2 3))");
+    let kind = |call: &str| eval(&format!("(guard (e (#t (error-object-kind e))) (define (f a [b 1]) a) {call})"));
+    assert_eq!((kind("(f)"), kind("(f 1 2 3)")), ("arity".into(), "arity".into()));
+    assert_eq!(error("(lambda ([a 1] b) 1)"), (BadSyntax, "b"));
+    assert_eq!(error("(lambda ([a]) a)"), (BadSyntax, "[a]"));
+}
+
+#[test]
+fn keyword_arguments_go_by_name() {
+    let text = "(define (g #:x x #:y [y 10] . r) (list x y r)) (list (g #:x 1) (g 5 #:y 2 #:x 1) (g 7 8 #:x 0))";
+    assert_eq!(eval(text), "((1 10 ()) (1 2 (5)) (0 10 (7 8)))");
+    assert_eq!(eval("(define (h a #:k [k (+ a 1)]) (list a k)) (list (h 1) (h 1 #:k 9) (h 2))"), "((1 2) (1 9) (2 3))");
+    assert_eq!(eval("(let () (define (z #:a a #:b b) (- a b)) (list (z #:b 1 #:a 10) (z #:a 1 #:b 10)))"), "(9 -9)");
+    // Arguments run in the order they're written, whatever order the keywords sort in.
+    assert_eq!(eval("(define (k #:b b #:a a) (list a b)) (define out '()) (define (note x) (set! out (cons x out)) x) (k #:b (note 1) #:a (note 2)) out"), "(2 1)");
+    // A keyword procedure that isn't called by its definition's name is matched when it runs.
+    let text = "(define h (lambda (a #:k [k 0] . r) (list a k r))) (let ([p h]) (list (p 1 #:k 2) (p 3 4 5) (apply p '(4)) (map p '(1 2))))";
+    assert_eq!(eval(text), "((1 2 ()) (3 0 (4 5)) (4 0 ()) ((1 0 ()) (2 0 ())))");
+    assert_eq!(eval("(define (r #:n n) (if (eqv? n 0) 'done (r #:n (- n 1)))) (r #:n 100000)"), "done");
+    assert_eq!(eval("(list (lambda (#:a a) a) (procedure? (lambda (#:a a) a)))"), "(#<procedure> #t)");
+    let mut arena = arena();
+    assert_eq!(eval_in(&mut arena, "(define (kf a #:k [k 1] #:m m) (list a k m))"), Ok(Ok("#<void>".into())));
+    assert_eq!(eval_in(&mut arena, "(list (kf 1 #:m 2) (kf 1 #:k 3 #:m 4))"), Ok(Ok("((1 1 2) (1 3 4))".into())));
+    assert_eq!(eval_in(&mut arena, "(kf 1)"), Ok(Err(Fault::Keyword)));
+    // A later load requires this one, so it calls the core itself: inlined, here.
+    assert_eq!(eval_in(&mut arena, "(define (small a #:k [k 1]) (+ a k)) (define (none) (small 1))"), Ok(Ok("#<void>".into())));
+    assert_eq!(eval_in(&mut arena, "(list (small 1) (small 1 #:k 5) (none) (map small '(1 2)) (kf 1 #:m 2 #:k 3))"), Ok(Ok("(2 6 2 (2 3) (1 3 2))".into())));
+    assert_eq!(eval_in(&mut arena, "(small 1 #:j 2)"), Ok(Err(Fault::Keyword)));
+    assert_eq!(eval_in(&mut arena, "(small)"), Ok(Err(Fault::Arity)));
+}
+
+#[test]
+fn keyword_mistakes_name_the_keyword() {
+    let caught = |text: &str| eval(&format!("(guard (e (#t (list (error-object-kind e) (error-object-irritants e)))) {text})"));
+    assert_eq!(caught("((lambda (#:a a) a) #:b 1)"), "(keyword (#:b))");
+    assert_eq!(caught("(let ([f (lambda (#:a a) a)]) (f))"), "(keyword (#:a))");
+    assert_eq!(caught("(define (f #:a a) a) (f #:a 1 2)"), "(arity ())");
+    assert_eq!(caught("(car #:a 1)"), "(keyword (#:a))");
+    assert_eq!(caught("(keyword-apply list '(#:b #:a) '(1 2) '())"), "(keyword (#:a))");
+    assert_eq!(error("(define (f #:k k) k) (set! f 1)"), (Immutable, "f"));
+    assert_eq!(error("(let () (define (f #:k k) k) (set! f 1) 2)"), (Immutable, "f"));
+    assert_eq!(error("(define (f #:k k) k) (f #:k 1 #:k 2)"), (Duplicate, "#:k"));
+    assert_eq!(error("(lambda (#:k a #:k b) 1)"), (Duplicate, "#:k"));
+    assert_eq!(error("(lambda (#:k) 1)"), (BadSyntax, "#:k"));
+    assert_eq!(error("(car #:k)"), (BadSyntax, "#:k"));
+}
+
+#[test]
+fn keyword_apply_and_procedure_keywords() {
+    assert_eq!(eval("(keyword-apply (lambda (x #:b b #:a a) (list x a b)) '(#:a #:b) '(1 2) 0 '())"), "(0 1 2)");
+    assert_eq!(eval("(keyword-apply list '() '() 1 '(2 3))"), "(1 2 3)");
+    assert_eq!(eval("(call-with-values (lambda () (procedure-keywords (lambda (#:z z #:a [a 1]) z))) list)"), "((#:z) (#:a #:z))");
+    assert_eq!(eval("(call-with-values (lambda () (procedure-keywords car)) list)"), "(() ())");
 }
 
 #[test]

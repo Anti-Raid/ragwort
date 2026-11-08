@@ -22,14 +22,14 @@ use ragwort_parser_scheme::{ends_name, might_be_number, number, starts_numeric};
 use ragwort_types::Error;
 use ragwort_types::bytevector::Bytevectors;
 use ragwort_types::gc::{Gc, Mutation, Value};
-use ragwort_types::num::{ComplexHost, ComplexView, Nums, RealHost, RealView, rational};
+use ragwort_types::num::{Nums, complex};
 use ragwort_types::pair::Pair;
 use ragwort_types::string::{self, Strings};
 use ragwort_types::symbol::{Keyword, Symbol};
 use ragwort_types::syntax::{Abbreviation, Syntax, SyntaxKind};
 use ragwort_types::vector::{AnyVector, Vector};
 use ragwort_vm::Fault;
-use ragwort_vm::objects::{Closure, Condition, ConditionFields, Continuation, ExternalRef, MultiValue, MultiValueFields, Tag, Task};
+use ragwort_vm::objects::{Closure, Condition, ConditionFields, Continuation, ExternalRef, KeywordProcedure, MultiValue, MultiValueFields, Tag, Task};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -375,7 +375,8 @@ impl<'gc> Printer<'_, 'gc> {
                 Value::FALSE => "#f",
                 Value::VOID => "#<void>",
                 Value::UNDEFINED => "#<undefined>",
-                _ if v.downcast::<Closure>(mc).is_some() => "#<procedure>",
+                Value::UNSUPPLIED => "#<unsupplied>",
+                _ if v.downcast::<Closure>(mc).is_some() || v.downcast::<KeywordProcedure>(mc).is_some() => "#<procedure>",
                 _ if v.downcast::<Continuation>(mc).is_some() => "#<continuation>",
                 _ if v.downcast::<ExternalRef>(mc).is_some() => "#<external>",
                 _ if v.downcast::<Task>(mc).is_some() => "#<coroutine>",
@@ -387,31 +388,7 @@ impl<'gc> Printer<'_, 'gc> {
     }
 
     fn number(&mut self, z: ragwort_types::num::Number<'gc>) -> Result<(), PrintError> {
-        match self.nums.complex_view(z) {
-            ComplexView::Real(x) => self.real(x),
-            ComplexView::Complex { re, im } => {
-                let zero = matches!(self.nums.real_view(re), RealView::Exact(r) if rational::sign(&self.nums, r).is_eq());
-                if !zero {
-                    self.real(re)?;
-                }
-                let at = self.out.len();
-                self.real(im)?;
-                if !self.out[at..].starts_with(['+', '-']) {
-                    self.out.insert(at, '+');
-                }
-                self.out.push('i');
-                Ok(())
-            }
-        }
-    }
-
-    fn real(&mut self, x: ragwort_types::num::Real<'gc>) -> Result<(), PrintError> {
-        match self.nums.real_view(x) {
-            RealView::Exact(r) => self.out.push_str(&rational::to_string(&self.nums, r, 10)?),
-            RealView::Flonum(f) if f.is_nan() => self.out.push_str("+nan.0"),
-            RealView::Flonum(f) if f.is_infinite() => self.out.push_str(if f > 0.0 { "+inf.0" } else { "-inf.0" }),
-            RealView::Flonum(f) => write!(self.out, "{f:?}")?,
-        }
+        self.out.push_str(&complex::to_string(&self.nums, z, 10)?);
         Ok(())
     }
 
@@ -457,7 +434,7 @@ impl<'gc> Printer<'_, 'gc> {
                 '\x07' => self.out.push_str("\\a"),
                 '\x08' => self.out.push_str("\\b"),
                 '\0' => self.out.push_str("\\0"),
-                _ if c.is_control() => _ = write!(self.out, "\\x{:x};", c as u32),
+                _ if unseen(c) => _ = write!(self.out, "\\x{:x};", c as u32),
                 _ => self.out.push(c),
             }
         }
@@ -475,7 +452,8 @@ impl<'gc> Printer<'_, 'gc> {
             '\r' => "return",
             ' ' => "space",
             '\t' => "tab",
-            _ if c.is_control() || c.is_whitespace() => {
+            // Alone, what joins or varies emoji shows nothing either.
+            _ if unseen(c) || c.is_whitespace() || c == '\u{200d}' || ('\u{fe00}'..='\u{fe0f}').contains(&c) => {
                 _ = write!(self.out, "#\\x{:x}", c as u32);
                 return;
             }
@@ -491,6 +469,17 @@ impl<'gc> Printer<'_, 'gc> {
 }
 
 /// What `a` is written as.
+/// Whether `c` shows nothing where it's written: controls, noncharacters, and the marks that
+/// only steer layout, such as zero-width spaces and direction marks. Joiners and variation
+/// selectors are left out, as emoji are made of them.
+fn unseen(c: char) -> bool {
+    let n = c as u32;
+    c.is_control()
+        || (0xFDD0..=0xFDEF).contains(&n)
+        || n & 0xFFFE == 0xFFFE
+        || matches!(n, 0xAD | 0x200B | 0x200C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB)
+}
+
 fn prefix(a: Abbreviation) -> &'static str {
     match a {
         Abbreviation::Quote => "'",

@@ -178,3 +178,29 @@ fn hash_of_in(h: &TestHost, x: TestReal) -> u64 {
     hash(h, x, &mut state);
     std::hash::Hasher::finish(&state)
 }
+
+/// In a power-of-two radix, an inexact number is written digit for digit: the text's value is
+/// exactly the double's.
+#[test]
+fn flonums_write_exactly_in_powers_of_two() {
+    let h = TestHost::new(WIDTHS[0]);
+    let mut rng = Rng(77);
+    let specials = [0.5, 1.0, 1.5, 0.1, 6.0, f64::MIN_POSITIVE, 5e-324, f64::MAX, 1e21, 123.456];
+    let randoms = (0..2000).map(|_| f64::from_bits(rng.u64())).filter(|f| f.is_finite());
+    for f in specials.into_iter().chain(randoms) {
+        for radix in [2u32, 8, 16, 32] {
+            let text = to_string(&h, h.flonum(f).unwrap(), radix).unwrap();
+            let (negative, unsigned) = text.strip_prefix('-').map_or((false, &*text), |t| (true, t));
+            assert_eq!(negative, f.is_sign_negative(), "{text}");
+            let (whole, fraction) = unsigned.split_once('.').expect("a point");
+            assert!(!fraction.is_empty() && (fraction == "0" || !fraction.ends_with('0')), "{text}");
+            let digits = format!("{whole}{fraction}");
+            let n = int::parse(&h, digits.as_bytes(), radix, false).unwrap().expect("digits");
+            let scale = int::expt(&h, int::from_i64(&h, radix as i64).unwrap(), fraction.len() as u64).unwrap();
+            // `n / scale` against `|f|` as `num / den`, crosswise.
+            let q = rational::from_f64(&h, f.abs()).unwrap();
+            let (num, den) = (rational::numerator(&h, q), rational::denominator(&h, q).unwrap());
+            assert_eq!(int::compare(&h, int::mul(&h, n, den).unwrap(), int::mul(&h, num, scale).unwrap()), Ordering::Equal, "{f:e} in {radix}: {text}");
+        }
+    }
+}

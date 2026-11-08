@@ -16,7 +16,57 @@ pub const MAX_PARAMS: u8 = (WINDOW / 4) as u8;
 /// Where the link is in a frame of code that takes `arity`, as `Bytecode` encodes it: after its
 /// parameters' registers.
 pub fn link_slot(arity: i64) -> u8 {
-    ARGS + arity.unsigned_abs().min(u64::from(MAX_PARAMS)) as u8
+    ARGS + Shape::of(arity).slots().min(u64::from(MAX_PARAMS)) as u8
+}
+
+/// The arguments code takes: `required` of them, then up to `optional` more, which are
+/// [`Value::UNSUPPLIED`] when a call leaves them out, then if `rest`, a list of any others.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shape {
+    pub required: u64,
+    pub optional: u64,
+    pub rest: bool,
+}
+
+/// Marks an arity with optional parameters, which has the counts in its low bits.
+const OPTIONAL: i64 = 1 << 48;
+
+impl Shape {
+    /// As `Bytecode` holds it, as Chez encodes it without optional parameters: `n >= 0` for
+    /// exactly `n`, `-(n + 1)` for at least `n`. With them, the counts, 16 bits each, are marked
+    /// with a high bit, so no count of arguments is equal to it, and a call goes the slow way.
+    /// `None` if they don't fit.
+    pub fn encode(self) -> Option<i64> {
+        let n = i64::try_from(self.required).ok()?;
+        Some(match (self.optional, self.rest) {
+            (0, false) => n,
+            (0, true) => -n - 1,
+            (optional, rest) if self.required <= 0xFFFF && optional <= 0xFFFF => {
+                OPTIONAL | n | (optional as i64) << 16 | i64::from(rest) << 32
+            }
+            _ => return None,
+        })
+    }
+
+    pub fn of(arity: i64) -> Self {
+        if arity < 0 {
+            return Self { required: (-(arity + 1)) as u64, optional: 0, rest: true };
+        }
+        if arity & OPTIONAL == 0 {
+            return Self { required: arity as u64, optional: 0, rest: false };
+        }
+        Self { required: (arity & 0xFFFF) as u64, optional: (arity >> 16 & 0xFFFF) as u64, rest: arity >> 32 & 1 == 1 }
+    }
+
+    /// How many parameters it binds, its rest list counted as one.
+    pub fn slots(self) -> u64 {
+        self.required + self.optional + u64::from(self.rest)
+    }
+
+    /// Whether it takes `n` arguments.
+    pub fn takes(self, n: u64) -> bool {
+        n >= self.required && (self.rest || n <= self.required + self.optional)
+    }
 }
 
 /// Where a frame returns to: its caller goes on at `pc`, in its frame `base` slots below this

@@ -121,6 +121,24 @@ pub fn equal<H: ComplexHost>(h: &H, x: H::Number, y: H::Number) -> Result<bool, 
     Ok(same(a, c)? && same(b, d)?)
 }
 
+/// `z` in `radix`, as [`real::to_string`] writes reals, a complex one as `a+bi`, or `bi` with
+/// an exact zero real part.
+pub fn to_string<H: ComplexHost>(h: &H, z: H::Number, radix: u32) -> Result<String, H::Error> {
+    let (re, im) = match h.complex_view(z) {
+        ComplexView::Real(x) => return real::to_string(h, x, radix),
+        ComplexView::Complex { re, im } => (re, im),
+    };
+    let zero = matches!(h.real_view(re), RealView::Exact(r) if rational::sign(h, r).is_eq());
+    let mut out = if zero { String::new() } else { real::to_string(h, re, radix)? };
+    let im = real::to_string(h, im, radix)?;
+    if !im.starts_with(['+', '-']) {
+        out.push('+');
+    }
+    out.push_str(&im);
+    out.push('i');
+    Ok(out)
+}
+
 /// `eqv?`: parts that are [`real::eqv`].
 pub fn eqv<H: ComplexHost>(h: &H, x: H::Number, y: H::Number) -> bool {
     match (h.complex_view(x), h.complex_view(y)) {

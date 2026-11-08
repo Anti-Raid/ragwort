@@ -125,6 +125,9 @@ objects! {
     /// What `(values ...)` makes of other than one value: an object like any other, which the
     /// `values` intrinsics take apart.
     pub struct MultiValue {} items Value
+    /// What a `lambda` with keyword parameters makes: see [`crate::keyword`]. `keywords` are
+    /// the ones it takes and `required` the ones it needs, as sorted lists.
+    pub struct KeywordProcedure { plain: Value, core: Value, keywords: Value, required: Value }
     /// What a frame's code keeps past its registers, which `NewSpill` makes and `LoadSpill` and
     /// `StoreSpill` read and write. Each slot holds one value for one stretch of the code.
     pub struct Spill {} items Value

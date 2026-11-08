@@ -137,7 +137,7 @@ impl Lower {
         for &v in f.params.iter().chain(&f.rest) {
             self.scope.remove(&v);
         }
-        Ok(L1::Lambda(Func { id: f.id, params: f.params.clone(), rest: f.rest, body: Box::new(body) }))
+        Ok(L1::Lambda(Func { id: f.id, params: f.params.clone(), optional: f.optional, rest: f.rest, body: Box::new(body) }))
     }
 
     fn exprs<'gc>(&mut self, exprs: &[Core<'gc>]) -> Result<Vec<L1<'gc>>, CompileError> {

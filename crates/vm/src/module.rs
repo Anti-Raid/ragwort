@@ -190,6 +190,5 @@ pub fn external_data<'gc, T: Any>(mc: &Mutation<'gc>, external: Value<'gc>) -> O
 /// Whether code that takes `arity` arguments, as [`crate::objects::Bytecode`] counts them,
 /// takes `n`.
 pub(crate) fn takes(arity: i64, n: usize) -> bool {
-    let n = i64::try_from(n).unwrap_or(i64::MAX);
-    if arity < 0 { n >= -(arity + 1) } else { n == arity }
+    crate::frame::Shape::of(arity).takes(n as u64)
 }

@@ -52,6 +52,11 @@ fn strings_and_characters_are_escaped_only_by_write() {
         let chars: Vec<_> = ['a', ' ', '\n', '\0', 'λ', '\u{85}'].iter().map(|&c| write(mc, Value::char(c))).collect();
         assert_eq!(chars, ["#\\a", "#\\space", "#\\newline", "#\\null", "#\\λ", "#\\x85"]);
         assert_eq!(display(mc, Value::char('λ')), "λ");
+        // What would show nothing is written by number; emoji keep their joiners and selectors.
+        let s = text(mc, "a\u{200b}b\u{feff}\u{10ffff}👨\u{200d}👩❤\u{fe0f}");
+        assert_eq!(write(mc, s), "\"a\\x200b;b\\xfeff;\\x10ffff;👨\u{200d}👩❤\u{fe0f}\"");
+        let chars: Vec<_> = ['\u{200b}', '\u{200d}', '\u{fe0f}', '\u{10ffff}', '\u{3000}', '🦀'].iter().map(|&c| write(mc, Value::char(c))).collect();
+        assert_eq!(chars, ["#\\x200b", "#\\x200d", "#\\xfe0f", "#\\x10ffff", "#\\x3000", "#\\🦀"]);
     });
 }
 

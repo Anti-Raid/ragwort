@@ -282,3 +282,42 @@ fn integer_op<H: RealHost>(
     let zero_sign = |v| view_f64(h, v);
     h.flonum(if f == 0.0 && negative_zero(zero_sign(vx)?, zero_sign(vy)?) { -0.0 } else { f })
 }
+
+/// `x` in `radix`, which is 10 or a power of two, as a reader reads it back. Inexact numbers are
+/// the shortest that round-trip in radix 10, and exact in a power of two, where their binary
+/// fractions end.
+pub fn to_string<H: RealHost>(h: &H, x: H::Real, radix: u32) -> Result<String, H::Error> {
+    assert!(radix == 10 || radix.is_power_of_two() && (2..=32).contains(&radix), "radix 10 or a power of two");
+    match h.real_view(x) {
+        RealView::Exact(r) => rational::to_string(h, r, radix),
+        RealView::Flonum(f) if f.is_nan() => Ok("+nan.0".into()),
+        RealView::Flonum(f) if f.is_infinite() => Ok(if f > 0.0 { "+inf.0" } else { "-inf.0" }.into()),
+        RealView::Flonum(f) if radix == 10 => Ok(format!("{f:?}")),
+        RealView::Flonum(f) => flonum_in_radix(h, f, radix),
+    }
+}
+
+/// Finite `f` in `radix`, a power of two, digit for digit.
+fn flonum_in_radix<H: RealHost>(h: &H, f: f64, radix: u32) -> Result<String, H::Error> {
+    let sign = if f.is_sign_negative() { "-" } else { "" };
+    let bits = f.abs().to_bits();
+    let (exponent, fraction) = ((bits >> 52) as i64, bits & ((1 << 52) - 1));
+    // `|f|` is `m · 2^e`.
+    let (m, e) = if exponent == 0 { (fraction, -1074) } else { (fraction | 1 << 52, exponent - 1075) };
+    if m == 0 {
+        return Ok(format!("{sign}0.0"));
+    }
+    if e >= 0 {
+        let n = int::arithmetic_shift(h, int::from_u64(h, m)?, e)?;
+        return Ok(format!("{sign}{}.0", int::to_string(h, n, radix)?));
+    }
+    // With the point `places` digits from the right, each digit `log` bits.
+    let log = radix.trailing_zeros() as i64;
+    let places = (-e + log - 1) / log;
+    let n = int::arithmetic_shift(h, int::from_u64(h, m)?, places * log + e)?;
+    let digits = int::to_string(h, n, radix)?;
+    let digits = format!("{}{digits}", "0".repeat((places as usize + 1).saturating_sub(digits.len())));
+    let (whole, fraction) = digits.split_at(digits.len() - places as usize);
+    let fraction = fraction.trim_end_matches('0');
+    Ok(format!("{sign}{whole}.{}", if fraction.is_empty() { "0" } else { fraction }))
+}

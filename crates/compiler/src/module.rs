@@ -45,6 +45,9 @@ pub struct Export {
     pub mutable: bool,
     /// What a call of it inlines to, if its definition is a closed lambda.
     pub inline: Option<Inline>,
+    /// For a keyword procedure, the variable of its core, which a call with keywords that the
+    /// front end matches can call itself.
+    pub core: Option<Box<Export>>,
 }
 
 /// The interface of `module`, once it's built.
@@ -106,6 +109,11 @@ impl<'gc> Import<'gc> {
         let items = self.module.items(mc);
         let value = (slot as usize).lt(&items.len()).then(|| items.get(slot as usize)).filter(|&v| v != Value::UNDEFINED);
         value.map(Core::Quote).ok_or(Uninitialized)
+    }
+
+    /// For a keyword procedure, its core, as [`Export::core`] is.
+    pub fn keyword_core(self) -> Option<Self> {
+        Some(Self { module: self.module, export: self.export.core.as_deref()? })
     }
 
     /// A call of it on `args`, inlined if it can be, with new locals from `fresh`.
@@ -219,7 +227,11 @@ impl<L: Copy> RequireSpec<L> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Inline {
     params: u32,
+    /// How many of the last parameters a call can leave out, which it passes as unsupplied.
+    optional: u32,
     rest: bool,
+    /// How many locals the body binds, which each call has its own of.
+    locals: u32,
     body: Template,
     /// Whether the body uses each parameter once, in order, before it calls anything, so its
     /// arguments go in its place, evaluated as they would be for the call.
@@ -229,6 +241,10 @@ pub struct Inline {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Template {
     Param(u32),
+    /// A local the body binds, by the order its `let`s bind them in.
+    Local(u32),
+    /// A `let` of the locals from the first, to the values, around the body.
+    Let(u32, Vec<Template>, Box<Template>),
     Immediate(Immediate),
     If(Box<[Template; 3]>),
     Prim(Prim, Vec<Template>),
@@ -262,8 +278,8 @@ impl Inline {
     /// What `lambda`'s calls inline to, if it can be inlined.
     pub fn of(lambda: &Lambda<'_>) -> Option<Self> {
         let params: Vec<Var> = lambda.params.iter().copied().chain(lambda.rest).collect();
-        let mut size = 0;
-        let body = Template::of(&lambda.body, &params, &mut size)?;
+        let (mut size, mut locals) = (0, Vec::new());
+        let body = Template::of(&lambda.body, &params, &mut locals, &mut size)?;
         let mut events = Vec::new();
         body.events(&mut events);
         let uses: Vec<u32> = events.iter().filter_map(|e| if let Event::Param(i) = *e { Some(i) } else { None }).collect();
@@ -271,16 +287,21 @@ impl Inline {
         let first_other = events.iter().position(|e| *e == Event::Other);
         let in_order = uses.iter().copied().eq(0..params.len() as u32);
         let linear = in_order && last_use.zip(first_other).is_none_or(|(used, other)| used < other);
-        Some(Self { params: u32::try_from(lambda.params.len()).ok()?, rest: lambda.rest.is_some(), body, linear })
+        let (params, locals) = (u32::try_from(lambda.params.len()).ok()?, u32::try_from(locals.len()).ok()?);
+        Some(Self { params, optional: lambda.optional, rest: lambda.rest.is_some(), locals, body, linear })
     }
 
     pub fn takes(&self, n: usize) -> bool {
-        if self.rest { n >= self.params as usize } else { n == self.params as usize }
+        n >= (self.params - self.optional) as usize && (self.rest || n <= self.params as usize)
     }
 
     /// The body, with its parameters standing for `args`, which it takes, and the rest in a
     /// list. An `apply` of the rest list calls its primitive on them, if it takes that many.
-    fn call<'gc>(&self, args: Vec<Core<'gc>>, fresh: &mut dyn FnMut() -> Var) -> Core<'gc> {
+    fn call<'gc>(&self, mut args: Vec<Core<'gc>>, fresh: &mut dyn FnMut() -> Var) -> Core<'gc> {
+        if args.len() < self.params as usize {
+            args.resize(self.params as usize, Core::Quote(Value::UNSUPPLIED));
+        }
+        let locals: Vec<Var> = (0..self.locals).map(|_| fresh()).collect();
         let mut binds = Vec::new();
         let mut args: Vec<Arg<'gc>> = args
             .into_iter()
@@ -299,7 +320,7 @@ impl Inline {
         let body = if self.rest {
             let mut rest = rest;
             let uses_list = self.body.uses_list(self.params, rest.len());
-            let mut cx = Instance { params: args, rest: Some(&mut rest), list: None };
+            let mut cx = Instance { params: args, rest: Some(&mut rest), list: None, locals: &locals };
             if uses_list {
                 // The rest's list, made once, of the rest, each bound once.
                 let items: Vec<Core<'gc>> = cx.rest.as_deref_mut().into_iter().flatten().map(|a| a.take()).collect();
@@ -314,7 +335,7 @@ impl Inline {
             }
             self.body.core(&mut cx, self.params)
         } else {
-            self.body.core(&mut Instance { params: args, rest: None, list: None }, self.params)
+            self.body.core(&mut Instance { params: args, rest: None, list: None, locals: &locals }, self.params)
         };
         // The list is of the rest's locals, so it's bound inside them.
         let body = match inner {
@@ -330,6 +351,7 @@ struct Instance<'r, 'gc> {
     params: Vec<Arg<'gc>>,
     rest: Option<&'r mut Vec<Arg<'gc>>>,
     list: Option<Arg<'gc>>,
+    locals: &'r [Var],
 }
 
 impl<'gc> Arg<'gc> {
@@ -357,19 +379,32 @@ fn takes(prim: Prim, n: usize) -> bool {
 }
 
 impl Template {
-    fn of(core: &Core<'_>, params: &[Var], size: &mut usize) -> Option<Self> {
+    /// The template of `core`, a body of `params`, in which `locals` are the locals bound so far.
+    fn of(core: &Core<'_>, params: &[Var], locals: &mut Vec<Var>, size: &mut usize) -> Option<Self> {
         *size += 1;
         if *size > MAX_INLINE {
             return None;
         }
         let closed = |prim: &Prim| !matches!(prim, Prim::Slot(..) | Prim::Host(_));
-        let all = |args: &[Core<'_>], size: &mut usize| args.iter().map(|a| Self::of(a, params, size)).collect::<Option<Vec<_>>>();
+        let mut all = |args: &[Core<'_>], locals: &mut Vec<Var>| args.iter().map(|a| Self::of(a, params, locals, size)).collect::<Option<Vec<_>>>();
         Some(match core {
-            Core::Ref(Place::Local(v)) => Self::Param(params.iter().position(|p| p == v)? as u32),
+            Core::Ref(Place::Local(v)) => match params.iter().position(|p| p == v) {
+                Some(i) => Self::Param(i as u32),
+                None => Self::Local(locals.iter().position(|l| l == v)? as u32),
+            },
             Core::Quote(v) => Self::Immediate(v.immediate()?),
-            Core::If(a, b, c) => Self::If(Box::new([Self::of(a, params, size)?, Self::of(b, params, size)?, Self::of(c, params, size)?])),
-            Core::Intrinsic(prim, args) if closed(prim) => Self::Prim(*prim, all(args, size)?),
-            Core::ApplyIntrinsic(prim, args) if closed(prim) => Self::Apply(*prim, all(args, size)?),
+            Core::If(a, b, c) => {
+                let (a, b) = (Self::of(a, params, locals, size)?, Self::of(b, params, locals, size)?);
+                Self::If(Box::new([a, b, Self::of(c, params, locals, size)?]))
+            }
+            Core::Intrinsic(prim, args) if closed(prim) => Self::Prim(*prim, all(args, locals)?),
+            Core::ApplyIntrinsic(prim, args) if closed(prim) => Self::Apply(*prim, all(args, locals)?),
+            Core::Let(binds, body) => {
+                let values = binds.iter().map(|(_, value)| Self::of(value, params, locals, size)).collect::<Option<Vec<_>>>()?;
+                let first = u32::try_from(locals.len()).ok()?;
+                locals.extend(binds.iter().map(|&(var, _)| var));
+                Self::Let(first, values, Box::new(Self::of(body, params, locals, size)?))
+            }
             _ => return None,
         })
     }
@@ -378,15 +413,19 @@ impl Template {
     fn events(&self, out: &mut Vec<Event>) {
         match self {
             Self::Param(i) => out.push(Event::Param(*i)),
-            Self::Immediate(_) => {}
+            Self::Immediate(_) | Self::Local(_) => {}
+            Self::Let(_, values, body) => {
+                for value in values {
+                    value.events(out);
+                }
+                body.events(out);
+            }
             Self::If(parts) => {
                 parts[0].events(out);
+                // A parameter used in a branch is used after this, if at all, so the call isn't linear.
                 out.push(Event::Other);
                 for branch in &parts[1..] {
-                    let mut inner = Vec::new();
-                    branch.events(&mut inner);
-                    // A parameter used in a branch might not be, so the call isn't linear.
-                    out.extend(inner.into_iter().map(|_| Event::Other));
+                    branch.events(out);
                 }
             }
             Self::Prim(_, args) | Self::Apply(_, args) => {
@@ -403,7 +442,8 @@ impl Template {
     fn uses_list(&self, rest: u32, count: usize) -> bool {
         match self {
             Self::Param(i) => *i == rest,
-            Self::Immediate(_) => false,
+            Self::Immediate(_) | Self::Local(_) => false,
+            Self::Let(_, values, body) => values.iter().chain([&**body]).any(|p| p.uses_list(rest, count)),
             Self::If(parts) => parts.iter().any(|p| p.uses_list(rest, count)),
             Self::Prim(_, args) => args.iter().any(|a| a.uses_list(rest, count)),
             Self::Apply(prim, args) => match args.split_last() {
@@ -421,6 +461,11 @@ impl Template {
             Self::Param(i) if *i == rest && cx.rest.is_some() => cx.list.as_mut().expect("the rest's list is made when it's used").take(),
             Self::Param(i) => cx.params[*i as usize].take(),
             Self::Immediate(v) => Core::Quote(v.value()),
+            Self::Local(k) => Core::Ref(Place::Local(cx.locals[*k as usize])),
+            Self::Let(first, values, body) => {
+                let binds = values.iter().zip(*first..).map(|(value, k)| (cx.locals[k as usize], value.core(cx, rest))).collect();
+                Core::Let(binds, Box::new(body.core(cx, rest)))
+            }
             Self::If(parts) => {
                 let [a, b, c] = &**parts;
                 Core::If(Box::new(a.core(cx, rest)), Box::new(b.core(cx, rest)), Box::new(c.core(cx, rest)))
@@ -486,6 +531,8 @@ pub struct ModuleBuilder<'gc> {
     exports: Vec<(Box<str>, u32)>,
     assigned: HashSet<u32>,
     inlines: HashMap<u32, Inline>,
+    /// The cores of the keyword procedures it defines, by their variables.
+    cores: HashMap<u32, u32>,
     module: Option<Gc<'gc, Module>>,
 }
 
@@ -502,6 +549,7 @@ impl<'gc> ModuleBuilder<'gc> {
             exports: Vec::new(),
             assigned: HashSet::new(),
             inlines: HashMap::new(),
+            cores: HashMap::new(),
             module: None,
         }
     }
@@ -611,6 +659,11 @@ impl<'gc> ModuleBuilder<'gc> {
         Place::Slot { slot, checked: !defined }
     }
 
+    /// Notes that variable `procedure` is a keyword procedure whose core is variable `core`.
+    pub fn keyword_core(&mut self, procedure: u32, core: u32) {
+        self.cores.insert(procedure, core);
+    }
+
     /// Notes that code assigns variable `slot`, so it isn't immutable.
     pub fn assign(&mut self, slot: u32) {
         self.assigned.insert(slot);
@@ -636,10 +689,17 @@ impl<'gc> ModuleBuilder<'gc> {
             Some(module) => module,
             None => self.start(mc)?,
         };
-        let exports = self.exports.iter().map(|(name, slot)| {
-            let mutable = self.assigned.contains(slot);
-            let inline = if mutable { None } else { self.inlines.get(slot).cloned() };
-            (name.clone(), Export { slot: *slot, mutable, inline })
+        let export = |slot: u32| {
+            let mutable = self.assigned.contains(&slot);
+            let inline = if mutable { None } else { self.inlines.get(&slot).cloned() };
+            Export { slot, mutable, inline, core: None }
+        };
+        let exports = self.exports.iter().map(|&(ref name, slot)| {
+            let mut out = export(slot);
+            if !out.mutable {
+                out.core = self.cores.get(&slot).map(|&core| Box::new(export(core)));
+            }
+            (name.clone(), out)
         });
         ragwort_vm::module::set_interface(mc, module, Interface { exports: exports.collect() })?;
         Ok(module)

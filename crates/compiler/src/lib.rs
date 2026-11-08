@@ -83,6 +83,9 @@ impl SlotOp {
 pub struct Func<E> {
     /// Distinguishes this lambda from every other in the expression being compiled.
     pub id: u32,
+    /// How many of the last of `params` a call can leave out, which are then
+    /// [`Value::UNSUPPLIED`](ragwort_types::gc::Value::UNSUPPLIED).
+    pub optional: u32,
     pub params: Vec<Var>,
     /// Receives the arguments past `params` as a list, if any.
     pub rest: Option<Var>,

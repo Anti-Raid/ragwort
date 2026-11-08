@@ -5,6 +5,7 @@ mod coroutine;
 mod equal;
 pub mod frame;
 mod intrinsic;
+pub mod keyword;
 mod machine;
 pub mod module;
 pub mod objects;

@@ -73,6 +73,10 @@ named! {
         /// returns the `v`s. In a machine's own task, it ends the run with
         /// [`Outcome::Yielded`](crate::Outcome::Yielded). Returns the values it's resumed with.
         Yield = "co/yield",
+        /// `(keyword-apply f kws vals arg ... list)`: calls `f` with keywords `kws`, a sorted
+        /// list, each passed its value in the list `vals`, and the `arg`s, then the elements of
+        /// `list`. See [`crate::keyword`].
+        KeywordApply = "keyword-apply",
     }
 }
 
@@ -86,6 +90,7 @@ impl Request {
             Request::CallCc | Request::Raise | Request::RaiseContinuable => (1, Some(1)),
             Request::Abort | Request::Resume | Request::TryResume | Request::Compose => (1, None),
             Request::Yield => (0, None),
+            Request::KeywordApply => (4, None),
         };
         args >= least && most.is_none_or(|most| args <= most)
     }
@@ -134,6 +139,7 @@ impl Request {
                 Then::Resume(arg(0)?, args.tail(mc, 1)?)
             }
             Request::Yield => Then::Yield(args.values(mc)?),
+            Request::KeywordApply => crate::keyword::apply(mc, arg(0)?, arg(1)?, arg(2)?, args.tail(mc, 3)?.spread_last(mc)?)?,
         })
     }
 }

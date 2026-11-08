@@ -238,13 +238,15 @@ pub enum Fault {
     /// What `make-syntax-error` makes a condition of: syntax that's malformed, such as a macro
     /// use no clause of its `syntax-case` matches.
     Syntax,
+    /// A call passed a keyword its procedure doesn't take, or left out one it requires.
+    Keyword,
     Num(NumError),
     Str(StrError),
 }
 
 impl Fault {
     /// What [`Fault::kind`] numbers, as the prelude's `error-object-kind` names them.
-    pub const KINDS: [&str; 18] = [
+    pub const KINDS: [&str; 19] = [
         "malformed",
         "out-of-memory",
         "wrong-type",
@@ -263,6 +265,7 @@ impl Fault {
         "not-integer",
         "too-long",
         "syntax",
+        "keyword",
     ];
 
     /// Which of [`Fault::KINDS`] it is.
@@ -286,6 +289,7 @@ impl Fault {
             Fault::Num(NumError::NotInteger) => 15,
             Fault::Str(StrError::TooLong) => 16,
             Fault::Syntax => 17,
+            Fault::Keyword => 18,
         }
     }
 
