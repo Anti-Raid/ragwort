@@ -73,7 +73,7 @@ impl Machine {
         let mut stack = mc.stack(Segment::new(mc, segment)?)?;
         let task = coroutine::root(mc)?;
         let mut regs = Regs { fp: 0, pc: 0, acc: Value::VOID };
-        Outer::new(mc, &mut stack, task, &mut regs, segment).start(procedure, args_of(mc, args)?)?;
+        Outer::new(mc, &mut stack, task, task, &mut regs, segment).start(procedure, args_of(mc, args)?)?;
         let mut machine = Machine { stack, task: Root::new(mc, task)?, fp: 0, pc: 0, segment, fuel: u64::MAX, finished: false, waiting: Waiting::No };
         machine.save(mc, task, &regs);
         Ok(machine)
@@ -88,8 +88,11 @@ impl Machine {
             return Err(Fault::NotPending);
         }
         let task = coroutine::root(mc)?;
+        let last = self.task.get(mc).expect("a machine runs in its own arena");
+        task.set_idle(mc, last.idle(mc));
+        task.set_none(mc, last.none(mc));
         let mut regs = Regs { fp: 0, pc: 0, acc: Value::VOID };
-        Outer::new(mc, &mut self.stack, task, &mut regs, self.segment).start(procedure, args_of(mc, args)?)?;
+        Outer::new(mc, &mut self.stack, task, task, &mut regs, self.segment).start(procedure, args_of(mc, args)?)?;
         (self.task, self.finished, self.waiting) = (Root::new(mc, task)?, false, Waiting::No);
         self.save(mc, task, &regs);
         Ok(())
@@ -181,9 +184,10 @@ impl Machine {
     /// Runs the inner loop, and carries out what it stops for, until the task ends or the run's
     /// fuel runs out. `task` is the running one, which switching coroutines changes.
     fn drive<'gc>(&mut self, mc: &Mutation<'gc>, task: &mut Gc<'gc, Task>, regs: &mut Regs<'gc>, fuel: &mut Fuel) -> Result<Outcome<'gc>, Fault> {
+        let root = self.task.get(mc).expect("a machine runs in its own arena");
         let waiting = std::mem::replace(&mut self.waiting, Waiting::No);
         if waiting != Waiting::No {
-            let mut outer = Outer::new(mc, &mut self.stack, *task, regs, self.segment);
+            let mut outer = Outer::new(mc, &mut self.stack, root, *task, regs, self.segment);
             let step = if waiting == Waiting::Raise { outer.raise(outer.regs.acc, false) } else { outer.resume() };
             *task = outer.task();
             if let Some(outcome) = step? {
@@ -193,7 +197,7 @@ impl Machine {
         let mut deferred = None;
         loop {
             let exit = run::exec(mc, &self.stack, *task, regs, fuel, &mut deferred);
-            let mut outer = Outer::new(mc, &mut self.stack, *task, regs, self.segment);
+            let mut outer = Outer::new(mc, &mut self.stack, root, *task, regs, self.segment);
             let step = outer.exit(exit, &mut deferred);
             *task = outer.task();
             if let Some(outcome) = step? {
@@ -239,11 +243,13 @@ pub(crate) enum Then<'gc> {
 pub(crate) struct Outer<'a, 'gc> {
     pub(crate) segments: Segments<'a, 'gc>,
     pub(crate) regs: &'a mut Regs<'gc>,
+    /// The machine's own task.
+    pub(crate) root: Gc<'gc, Task>,
 }
 
 impl<'a, 'gc> Outer<'a, 'gc> {
-    fn new(mc: &'a Mutation<'gc>, stack: &'a mut Stack, task: Gc<'gc, Task>, regs: &'a mut Regs<'gc>, size: usize) -> Self {
-        Outer { segments: Segments { mc, stack, task, size }, regs }
+    fn new(mc: &'a Mutation<'gc>, stack: &'a mut Stack, root: Gc<'gc, Task>, task: Gc<'gc, Task>, regs: &'a mut Regs<'gc>, size: usize) -> Self {
+        Outer { segments: Segments { mc, stack, task, size }, regs, root }
     }
 
     pub(crate) fn mc(&self) -> &'a Mutation<'gc> {

@@ -196,6 +196,12 @@ fn main() {
          (define (drain n) (if (eqv? n 0) 0 (begin (co/resume co) (drain (+ n -1))))) (drain {N})"
     );
     println!("coroutine resume and yield:    {:.1} ns per round trip", per(time(&switch, false, true)));
+    let turns = format!(
+        "(define (gen) (make-coroutine (lambda () (let loop ((i 0)) (co/yield i) (loop (+ i 1))))))
+         (define a (gen)) (define b (gen))
+         (define (drain n) (if (eqv? n 0) 0 (begin (co/resume a) (co/resume b) (drain (+ n -2))))) (drain {N})"
+    );
+    println!("two coroutines resumed in turn: {:.1} ns per round trip", per(time(&turns, false, true)));
     let spawn = format!("(define (spawn n) (if (eqv? n 0) 0 (begin (co/resume (make-coroutine (lambda () n))) (spawn (+ n -1))))) (spawn {})", N / 100);
     println!("make and finish a coroutine:   {:.1} ns each", per(time(&spawn, false, true)) * 100.0);
 

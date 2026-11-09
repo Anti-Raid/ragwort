@@ -138,7 +138,7 @@ impl Request {
                 outer.guard(Value::FALSE, true)?;
                 Then::Resume(arg(0)?, args.tail(mc, 1)?)
             }
-            Request::Yield => Then::Yield(args.values(mc)?),
+            Request::Yield => Then::Yield(outer.values(args)?),
             Request::KeywordApply => crate::keyword::apply(mc, arg(0)?, arg(1)?, arg(2)?, args.tail(mc, 3)?.spread_last(mc)?)?,
         })
     }

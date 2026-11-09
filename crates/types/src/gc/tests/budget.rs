@@ -186,6 +186,68 @@ fn injected_failures_fail_the_picked_allocation() {
     arena.step(|mc| (0..1000).try_for_each(|_| pair(mc, Value::NIL, Value::NIL).map(drop))).unwrap().unwrap();
 }
 
+/// Minor collections sweep only the pages allocated into since the last, beside an old heap many
+/// times bigger, and the allocator reuses what they free. Old pages that new objects were linked
+/// from keep them alive through their cards.
+#[test]
+fn minor_collections_sweep_only_young_pages() {
+    let mut arena = Arena::new(64 << 20, 1);
+    arena.mutate(|mc| {
+        for _ in 0..300_000 {
+            let list = pair(mc, Value::NIL, mc.root(0)).unwrap();
+            mc.set_root(0, list);
+        }
+    });
+    arena.collect();
+    let (old, pages) = (arena.meta.used.get(), arena.pages_bytes());
+    for round in 0..50 {
+        arena.mutate(|mc| {
+            for _ in 0..20_000 {
+                pair(mc, Value::NIL, Value::NIL).unwrap();
+            }
+            // A new object linked from the old list's head.
+            let head = mc.root(0).downcast::<Pair>(mc).unwrap();
+            head.set_car(mc, pair(mc, Value::fixnum(round).unwrap(), Value::NIL).unwrap());
+        });
+        let young = arena.meta.young_pages.iter(false).count();
+        assert!(young * 10 < old, "{young} young pages of {old}");
+        arena.collect_minor();
+        assert_eq!(arena.meta.young_pages.iter(false).count(), 0);
+    }
+    assert!(arena.pages_bytes() <= pages + (1 << 20), "{} bytes of pages, from {pages}", arena.pages_bytes());
+    let (len, last) = arena.mutate(|mc| {
+        let head = mc.root(0).downcast::<Pair>(mc).unwrap();
+        let last = head.car(mc).downcast::<Pair>(mc).unwrap().car(mc).as_fixnum();
+        let (mut n, mut v) = (0, mc.root(0));
+        while let Some(p) = v.downcast::<Pair>(mc) {
+            n += 1;
+            v = p.cdr(mc);
+        }
+        (n, last)
+    });
+    assert_eq!((len, last), (300_000, Some(49)));
+}
+
+/// A minor collection gives back the pages a burst of garbage left free, past a nursery's worth.
+#[test]
+fn a_minor_collection_gives_back_what_a_burst_freed() {
+    let mut arena = Arena::new(64 << 20, 1);
+    arena.mutate(|mc| {
+        for _ in 0..1_000_000 {
+            pair(mc, Value::NIL, Value::NIL).unwrap();
+        }
+        // Keeps the last page, so the free ones before it are released rather than trimmed.
+        let last = pair(mc, Value::NIL, Value::NIL).unwrap();
+        mc.set_root(0, last);
+    });
+    assert!(arena.committed_bytes() > 20 << 20, "{}", arena.committed_bytes());
+    arena.collect_minor();
+    assert_eq!(arena.collections(), (0, 1));
+    if ragwort_gc_region::Region::releases() {
+        assert!(arena.committed_bytes() <= arena.meta.nursery + (1 << 20), "{} bytes committed", arena.committed_bytes());
+    }
+}
+
 /// Pages given back to the system are refunded, and charged again once reused. A backing that
 /// can't give memory back keeps them charged.
 #[test]

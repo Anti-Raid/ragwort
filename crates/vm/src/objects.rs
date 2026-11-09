@@ -92,6 +92,9 @@ objects! {
     /// it, and `resumed` the one it's resuming, if any. While it's suspended, its frames are on
     /// `segment` from `base` up, or if it has none, its chain holds them all. `state` says
     /// whether it's pending, running, finished or failed.
+    ///
+    /// A machine's own task keeps `idle`, the coroutine that suspended last in it, whose frames
+    /// stay on their segment until another suspends, and `none`, the values of none, made once.
     pub struct Task {
         acc: Value,
         chain: Value,
@@ -103,6 +106,8 @@ objects! {
         body: Value,
         resumer: Value,
         resumed: Value,
+        idle: Value,
+        none: Value,
         segment: Member<Segment>,
         base: u32,
         state: u32,

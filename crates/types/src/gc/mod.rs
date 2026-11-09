@@ -1176,6 +1176,80 @@ struct Page {
     large: Cell<Option<u32>>,
     /// Given back to the system while free.
     released: Cell<bool>,
+    /// Held something when last swept, as `Meta::occupied` counts.
+    counted: Cell<bool>,
+}
+
+/// Gives the free ones of `pages`, in order, back to the system in runs, past the first
+/// nursery's worth. Only pages the system wholly took back stop being charged; the rest stay
+/// committed.
+fn give_back(memory: &mut Region, m: &Meta, pages: impl Iterator<Item = usize>) {
+    let mut warm = m.nursery / (PAGE * 8);
+    let mut run: Option<Range<usize>> = None;
+    for p in pages.map(Some).chain([None]) {
+        let free = p.and_then(|p| m.pages[..m.used.get()].get(p)).is_some_and(|page| page.used.get() == 0 && !page.released.get());
+        let release = if free && warm > 0 {
+            warm -= 1;
+            false
+        } else {
+            free
+        };
+        if let (Some(r), Some(p)) = (&mut run, p)
+            && release
+            && r.end == p
+        {
+            r.end += 1;
+            continue;
+        }
+        if let Some(r) = run.take() {
+            let words = memory.release(r.start * PAGE..r.end * PAGE);
+            let gone = words.start.div_ceil(PAGE).max(r.start)..(words.end / PAGE).min(r.end);
+            for page in m.pages.get(gone).unwrap_or_default() {
+                page.released.set(true);
+                m.budget.refund(PAGE_COST);
+                m.committed.set(m.committed.get() - 1);
+            }
+        }
+        if release {
+            run = p.map(|p| p..p + 1);
+        }
+    }
+}
+
+/// Pages, as bits.
+struct PageSet(Box<[Cell<u64>]>);
+
+impl PageSet {
+    fn new(pages: usize) -> Self {
+        Self((0..pages.div_ceil(64)).map(|_| Cell::new(0)).collect())
+    }
+
+    #[inline]
+    fn insert(&self, page: usize) {
+        if let Some(word) = self.0.get(page / 64) {
+            word.set(word.get() | 1 << (page % 64));
+        }
+    }
+
+    fn insert_all(&self, pages: Range<usize>) {
+        pages.for_each(|p| self.insert(p));
+    }
+
+    /// The pages in order, taken out if `take`.
+    fn iter(&self, take: bool) -> impl Iterator<Item = usize> + '_ {
+        self.0.iter().enumerate().flat_map(move |(i, word)| {
+            let mut bits = if take { word.replace(0) } else { word.get() };
+            std::iter::from_fn(move || {
+                let bit = (bits != 0).then(|| bits.trailing_zeros() as usize)?;
+                bits &= bits - 1;
+                Some(i * 64 + bit)
+            })
+        })
+    }
+
+    fn clear(&self) {
+        self.0.iter().for_each(|w| w.set(0));
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1221,6 +1295,13 @@ struct Meta {
     young: Cell<usize>,
     /// Pages holding something as of the last sweep.
     occupied: Cell<usize>,
+    /// Pages allocated into since the allocator was last reset. Only they can hold what's young:
+    /// the rest hold marked objects only, so a minor collection has nothing to sweep there.
+    young_pages: PageSet,
+    /// Pages with dirty cards.
+    dirty_pages: PageSet,
+    /// Pages a minor collection left free, which settling gives back past a nursery's worth.
+    emptied: RefCell<Vec<u32>>,
     /// Pages charged for: handed out and not given back.
     committed: Cell<usize>,
     /// Pages before this are swept.
@@ -1240,7 +1321,7 @@ struct Meta {
     low: Cell<usize>,
     /// The next number for a type without a fixed one.
     next: Cell<usize>,
-    /// Type numbers of descriptors, by [`cache_slot`] of their types.
+    /// Type numbers of descriptors without a fixed one, by [`cache_slot`] of their types.
     cache: [Cell<Option<(TypeId, u16)>>; 64],
     roots: Box<[Cell<u64>]>,
     stacks: RefCell<Vec<Rc<StackRecord>>>,
@@ -1390,8 +1471,9 @@ impl Arena {
         // Page 0 holds nothing, so index 0 can mean none. Twice the limit leaves evacuation room
         // to copy everything.
         let pages = (limit / (PAGE * 8)).clamp(1, PAGES / 2 - 1);
+        let count = 2 * pages + 2;
         let meta = Meta {
-            pages: (0..2 * pages + 2).map(|_| Page::default()).collect(),
+            pages: (0..count).map(|_| Page::default()).collect(),
             used: Cell::new(1),
             budget: Budget::new(limit),
             cursor: Cell::new(0),
@@ -1402,6 +1484,9 @@ impl Arena {
             to_end: Cell::new(0),
             young: Cell::new(0),
             occupied: Cell::new(0),
+            young_pages: PageSet::new(count),
+            dirty_pages: PageSet::new(count),
+            emptied: RefCell::new(Vec::new()),
             committed: Cell::new(0),
             sweep_cursor: Cell::new(0),
             settle: Cell::new(false),
@@ -1488,49 +1573,25 @@ impl Arena {
         }
     }
 
-    /// Once a collection has swept everything: keeps a nursery's worth of free pages, which
-    /// the next steps would fill again, gives the rest back to the system, and trims the pages
-    /// handed out to the last one kept.
+    /// Once a collection has swept: gives back the free pages it may have made past a nursery's
+    /// worth, which the next steps would fill again, and trims the pages handed out to the last
+    /// one kept. A major cycle may have freed any page; a minor collection, those it emptied.
     fn settle(&mut self) {
-        let m = &self.meta;
-        if m.phase.get() != Phase::Idle || !m.settle.replace(false) {
+        let Self { memory, meta: m } = self;
+        if m.phase.get() != Phase::Idle {
             return;
         }
-        let used = m.used.get();
-        let mut warm = m.nursery / (PAGE * 8);
-        let mut run: Option<usize> = None;
-        for p in 1..=used {
-            let release = m.pages[..used].get(p).is_some_and(|page| {
-                if page.used.get() != 0 || page.released.get() {
-                    return false;
-                }
-                if warm > 0 {
-                    warm -= 1;
-                    return false;
-                }
-                true
-            });
-            match (release, run) {
-                (true, None) => run = Some(p),
-                (false, Some(first)) => {
-                    // Only pages the system wholly took back stop being charged; the rest stay
-                    // committed.
-                    let words = self.memory.release(first * PAGE..p * PAGE);
-                    let gone = words.start.div_ceil(PAGE).max(first)..(words.end / PAGE).min(p);
-                    for page in m.pages.get(gone).unwrap_or_default() {
-                        page.released.set(true);
-                        m.budget.refund(PAGE_COST);
-                        m.committed.set(m.committed.get() - 1);
-                    }
-                    run = None;
-                }
-                _ => {}
-            }
+        let emptied = std::mem::take(&mut *m.emptied.borrow_mut());
+        if m.settle.replace(false) {
+            give_back(memory, m, 1..m.used.get());
+        } else if !emptied.is_empty() {
+            give_back(memory, m, emptied.into_iter().map(|p| p as usize));
+        } else {
+            return;
         }
         // Pages past the last one still committed are handed out again as fresh ones.
-        let used = (1..used).rev().find(|&p| !m.pages[p].released.get()).map_or(1, |p| p + 1);
-        m.used.set(used);
-        m.occupied.set(m.pages[..used].iter().filter(|p| p.used.get() != 0).count());
+        let used = m.used.get();
+        m.used.set((1..used).rev().find(|&p| !m.pages[p].released.get()).map_or(1, |p| p + 1));
     }
 
     pub fn mutate<R>(&mut self, f: impl for<'gc> FnOnce(&Mutation<'gc>) -> R) -> R {
@@ -1880,10 +1941,13 @@ fn cache_slot(t: TypeId) -> usize {
 impl<'a> Heap<'a> {
     #[inline]
     fn type_index(self, desc: &'static Desc) -> Option<u16> {
-        match self.m.cache[cache_slot(desc.type_id)].get() {
-            Some((t, ty)) if t == desc.type_id => Some(ty),
-            _ => self.type_index_slow(desc),
-        }
+        // A type with a number is where its number says, once registered; others are cached.
+        let found = if let Some(ty) = desc.number {
+            self.m.descs.get(usize::from(ty)).and_then(Cell::get).filter(|d| d.type_id == desc.type_id).map(|_| ty)
+        } else {
+            self.m.cache[cache_slot(desc.type_id)].get().filter(|&(t, _)| t == desc.type_id).map(|(_, ty)| ty)
+        };
+        found.or_else(|| self.type_index_slow(desc))
     }
 
     #[inline(never)]
@@ -1914,7 +1978,9 @@ impl<'a> Heap<'a> {
                 }
             }
         };
-        self.m.cache[cache_slot(desc.type_id)].set(Some((desc.type_id, ty as u16)));
+        if desc.number.is_none() {
+            self.m.cache[cache_slot(desc.type_id)].set(Some((desc.type_id, ty as u16)));
+        }
         Some(ty as u16)
     }
 
@@ -2066,6 +2132,7 @@ impl<'a> Heap<'a> {
                 continue;
             }
             self.recommit(page..page + 1)?;
+            self.m.young_pages.insert(page);
             let start = free.trailing_zeros() as usize;
             let end = (used & (u128::MAX << start)).trailing_zeros() as usize;
             p.used.set(used | (u128::MAX >> (LINES - end)) & (u128::MAX << start));
@@ -2100,6 +2167,7 @@ impl<'a> Heap<'a> {
             if run == n {
                 let first = p + 1 - n;
                 self.recommit(first..p + 1)?;
+                self.m.young_pages.insert_all(first..p + 1);
                 return Ok(Some(first));
             }
         }
@@ -2114,6 +2182,7 @@ impl<'a> Heap<'a> {
         self.m.budget.charge(n * PAGE_COST)?;
         self.m.committed.set(self.m.committed.get() + n);
         self.m.used.set(first + n);
+        self.m.young_pages.insert_all(first..first + n);
         // Nothing on them is from before the cycle, so a lazy sweep has nothing to do there.
         for p in &self.m.pages[first..first + n] {
             p.swept.set(true);
@@ -2130,11 +2199,12 @@ impl<'a> Heap<'a> {
         }
     }
 
-    fn reset_allocator(self) {
+    /// Drops the hole, and looks for the next from line `scan`.
+    fn reset_allocator(self, scan: usize) {
         self.m.cursor.set(0);
         self.m.end.set(0);
         self.m.hole_end.set(0);
-        self.m.scan.set(LINES);
+        self.m.scan.set(scan);
         self.m.young.set(0);
     }
 
@@ -2164,7 +2234,11 @@ impl<'a> Heap<'a> {
     #[inline]
     fn dirty(self, slot: usize) {
         if let Some(page) = self.m.pages.get(slot / PAGE) {
-            page.cards.set(page.cards.get() | 1 << (slot % PAGE / CARD));
+            let cards = page.cards.get();
+            if cards == 0 {
+                self.m.dirty_pages.insert(slot / PAGE);
+            }
+            page.cards.set(cards | 1 << (slot % PAGE / CARD));
         }
     }
 
@@ -2201,9 +2275,13 @@ impl<'a> Heap<'a> {
 
     #[inline]
     fn barrier_ref(self, slot: usize, owner: u32, target: u32) {
-        self.dirty(slot);
-        if self.m.phase.get() == Phase::Marking && self.has_bit(owner as usize, |p| &p.marks) {
-            shade(self.words, self.m, slot, owner, target);
+        // Minor collections trace only marked objects from their cards: an unmarked one is young,
+        // and traced anyway if it's reached.
+        if self.has_bit(owner as usize, |p| &p.marks) {
+            self.dirty(slot);
+            if self.m.phase.get() == Phase::Marking {
+                shade(self.words, self.m, slot, owner, target);
+            }
         }
     }
 
@@ -2226,12 +2304,16 @@ impl<'a> Heap<'a> {
     /// Dirties the cards under `slots`, and while marking shades what they refer to, as `refs`
     /// reads them.
     fn barrier_range(self, at: usize, slots: &[Cell<u64>], owner: u32, refs: Refs) {
+        if slots.is_empty() {
+            return;
+        }
         let (mut i, end) = (at, at + slots.len());
         while i < end {
             let Some(page) = self.m.pages.get(i / PAGE) else { return };
             let to = end.min((i / PAGE + 1) * PAGE);
             let (first, last) = (i % PAGE / CARD, (to - 1) % PAGE / CARD);
             page.cards.set(page.cards.get() | ((u64::MAX >> (63 - last)) & (u64::MAX << first)) as u32);
+            self.m.dirty_pages.insert(i / PAGE);
             i = to;
         }
         if self.m.phase.get() == Phase::Marking && matches!(refs, Refs::Values | Refs::Members) {
@@ -2264,9 +2346,7 @@ impl<'a> Heap<'a> {
         work.holders.clear();
         work.weak_runs.clear();
         work.ephemerons.clear();
-        self.sweep();
-        self.reset_allocator();
-        self.m.settle.set(true);
+        self.sweep_young();
         self.m.minors.set(self.m.minors.get() + 1);
         *self.m.work.borrow_mut() = work;
     }
@@ -2296,6 +2376,7 @@ impl<'a> Heap<'a> {
             }
             page.evacuating.set(candidate);
         }
+        m.dirty_pages.clear();
         let evacuating = count > 1 || all && count > 0;
         if !evacuating {
             pages.iter().for_each(|p| p.evacuating.set(false));
@@ -2386,7 +2467,9 @@ impl<'a> Heap<'a> {
             page.evacuating.set(false);
             page.swept.set(false);
         }
-        self.reset_allocator();
+        m.dirty_pages.clear();
+        m.young_pages.clear();
+        self.reset_allocator(LINES);
         m.evacuating.set(false);
         m.sweep_cursor.set(0);
         m.phase.set(Phase::Sweeping);
@@ -2426,7 +2509,13 @@ impl<'a> Heap<'a> {
 
     fn finish_cycle(self) {
         let m = self.m;
-        self.count_occupied();
+        // Pages handed out fresh while sweeping held nothing to sweep, so they're counted here.
+        let mut occupied = 0;
+        for page in &m.pages[..m.used.get()] {
+            page.counted.set(page.used.get() != 0);
+            occupied += usize::from(page.counted.get());
+        }
+        m.occupied.set(occupied);
         let size = m.paced_bytes();
         let limit = m.budget.limit();
         m.threshold.set((size * 2).max(MIN_THRESHOLD).min(size + limit.saturating_sub(size) / 2));
@@ -2434,11 +2523,6 @@ impl<'a> Heap<'a> {
         m.phase.set(Phase::Idle);
         m.settle.set(true);
         m.collections.set(m.collections.get() + 1);
-    }
-
-    fn count_occupied(self) {
-        let pages = &self.m.pages[..self.m.used.get()];
-        self.m.occupied.set(pages.iter().filter(|p| p.used.get() != 0).count());
     }
 
     fn mark_roots(self, work: &mut Work) {
@@ -2462,13 +2546,26 @@ impl<'a> Heap<'a> {
         }
     }
 
-    /// Sweeps every page at once, for a minor collection.
-    fn sweep(self) {
-        for p in 0..self.m.used.get() {
-            self.m.pages[p].cards.set(0);
-            self.sweep_page(p);
+    /// Sweeps the young pages at once, for a minor collection, and clears the cards. The
+    /// allocator looks again from the first young page with a free line: those before it that it
+    /// looked at, it found full, and they still are.
+    fn sweep_young(self) {
+        let m = self.m;
+        for p in m.dirty_pages.iter(true) {
+            m.pages[p].cards.set(0);
         }
-        self.count_occupied();
+        let (mut first, mut emptied) = (None, m.emptied.borrow_mut());
+        for p in m.young_pages.iter(true) {
+            self.sweep_page(p);
+            let used = m.pages[p].used.get();
+            if used != u128::MAX {
+                first = first.or(Some(p));
+            }
+            if used == 0 {
+                emptied.push(p as u32);
+            }
+        }
+        self.reset_allocator(first.map_or(m.scan.get(), |p| m.scan.get().min(p * LINES)));
     }
 
     /// Frees what wasn't marked and gives the allocator the lines that were.
@@ -2479,6 +2576,10 @@ impl<'a> Heap<'a> {
         }
         let lines = page.lines.get();
         page.used.set(lines);
+        if page.counted.replace(lines != 0) != (lines != 0) {
+            let occupied = self.m.occupied.get();
+            self.m.occupied.set(if lines != 0 { occupied + 1 } else { occupied - 1 });
+        }
         // Its last page can hold small objects that outlive it.
         if lines == 0 || page.large.get().is_some_and(|first| !self.has_bit(first as usize * PAGE, |p| &p.marks)) {
             page.large.set(None);
@@ -2877,7 +2978,7 @@ impl<'a> Heap<'a> {
     /// Traces the old objects that overlap dirty cards, for a minor collection.
     fn scan_cards(self, work: &mut Work) {
         let mut last = usize::MAX;
-        for page in 0..self.m.used.get() {
+        for page in self.m.dirty_pages.iter(false) {
             let mut cards = self.m.pages[page].cards.get();
             while cards != 0 {
                 let card = cards.trailing_zeros() as usize;

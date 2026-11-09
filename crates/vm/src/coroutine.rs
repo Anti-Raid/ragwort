@@ -6,10 +6,12 @@
 //! from hands its frames to its chain, keeps where its stack's live part starts, and the stack
 //! moves to the other side's segment, whose chain then goes on in place. Nothing is copied.
 //!
-//! A suspended coroutine needs no room past its frames, so a yield copies them to a segment of
-//! their own size when nothing else holds the segment they were on, which then goes to the
-//! resumer as its spare: the next coroutine it resumes runs there, and the frames of one that
-//! was copied are copied back as it returns into them.
+//! A suspended coroutine needs no room past its frames, so once another has suspended since, its
+//! frames are copied to a segment of their own size when nothing else holds the segment they
+//! were on, which then goes to the task that's running as its spare: the next coroutine it
+//! resumes runs there, and the frames of one that was copied are copied back as it returns into
+//! them. Only the one that suspended last keeps its segment, so one resumed again and again, as a
+//! generator is, isn't copied at all.
 //!
 //! A machine's own task is a coroutine too, which nothing in the arena resumed: a yield in it
 //! ends the run, and the machine is resumed from the host.
@@ -44,7 +46,7 @@ pub(crate) fn root<'gc>(mc: &Mutation<'gc>) -> Result<Gc<'gc, Task>, OutOfMemory
 
 fn task<'gc>(mc: &Mutation<'gc>, body: Value<'gc>, state: u32) -> Result<Gc<'gc, Task>, OutOfMemory> {
     let none = Value::FALSE;
-    Task::new(mc, Value::VOID, none, Value::NIL, Value::NIL, Value::NIL, None, 0, body, none, none, None, 0, state)
+    Task::new(mc, Value::VOID, none, Value::NIL, Value::NIL, Value::NIL, None, 0, body, none, none, none, none, None, 0, state)
 }
 
 pub(crate) fn of<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> Option<Gc<'gc, Task>> {
@@ -80,19 +82,22 @@ impl<'gc> Outer<'_, 'gc> {
         let args = args.detach(mc)?;
         let from = self.task();
         self.leave(from)?;
+        if self.root.idle(mc) == Value::object(mc, co) {
+            self.root.set_idle(mc, Value::FALSE);
+        }
         from.set_resumed(mc, Value::object(mc, co));
         co.set_resumer(mc, Value::object(mc, from));
         co.set_state(mc, RUNNING);
         let body = co.body(mc);
         if body == Value::FALSE && co.segment(mc).is_some() {
             self.enter_task(co)?;
-            return self.then(Then::Return(args.values(mc)?));
+            return self.then(Then::Return(self.values(args)?));
         }
         let segment = self.free_segment(from)?;
         self.segments.stack.switch(mc, segment);
         self.segments.task = co;
         if body == Value::FALSE {
-            return self.then(Then::Return(args.values(mc)?));
+            return self.then(Then::Return(self.values(args)?));
         }
         co.set_body(mc, Value::FALSE);
         self.then(Then::Call(body, args))
@@ -104,7 +109,7 @@ impl<'gc> Outer<'_, 'gc> {
         let mc = self.mc();
         let from = self.task();
         let Some(to) = of(mc, from.resumer(mc)) else {
-            self.regs.acc = values(mc, std::iter::empty())?;
+            self.regs.acc = self.values(Args::none())?;
             return Ok(Some(Outcome::Yielded(yielded)));
         };
         self.leave(from)?;
@@ -112,12 +117,27 @@ impl<'gc> Outer<'_, 'gc> {
         from.set_spare(mc, None);
         from.set_state(mc, PENDING);
         from.set_resumer(mc, Value::FALSE);
-        let freed = self.compact(from)?;
+        let last = of(mc, self.root.idle(mc)).filter(|&task| task != from);
+        self.root.set_idle(mc, Value::object(mc, from));
         self.back(to)?;
-        if let Some(segment) = freed {
+        if let Some(task) = last
+            && let Some(segment) = compact(mc, task)?
+        {
             give(mc, to, segment);
         }
         self.then(Then::Return(yielded))
+    }
+
+    /// `args` as values, which for none are the same each time.
+    pub(crate) fn values(&self, args: Args<'gc>) -> Result<Value<'gc>, Fault> {
+        let (mc, root) = (self.mc(), self.root);
+        if args.len(mc)? != 0 {
+            return args.values(mc);
+        }
+        if root.none(mc) == Value::FALSE {
+            root.set_none(mc, values(mc, std::iter::empty())?);
+        }
+        Ok(root.none(mc))
     }
 
     /// Ends the running coroutine as `state`, finished or failed, and goes back to `to`, which
@@ -141,42 +161,6 @@ impl<'gc> Outer<'_, 'gc> {
             give(mc, to, segment);
         }
         Ok(())
-    }
-
-    /// Copies the frames of `task`, which is suspending, to a segment of their own size, if its
-    /// chain's records hold all the stack's segment has below its base and no continuation
-    /// holds them, and returns that segment, which is then free. Only a few frames are copied,
-    /// a window's worth, as a yield from deeper would copy them each time: their segment is
-    /// mostly theirs anyway.
-    fn compact(&mut self, task: Gc<'gc, Task>) -> Result<Option<Gc<'gc, Segment>>, Fault> {
-        let mc = self.mc();
-        let (segment, base) = (self.segments.stack.segment(mc), self.segments.stack.base());
-        if base > WINDOW {
-            return Ok(None);
-        }
-        let (mut run, mut chain, mut end) = (Vec::new(), task.chain(mc), base);
-        while end > 0 {
-            if let Some(native) = chain.downcast::<Native>(mc) {
-                chain = native.next(mc);
-                continue;
-            }
-            let Some(record) = chain.downcast::<Frames>(mc) else { return Ok(None) };
-            if record.segment(mc) != Some(segment) || !record.one_shot(mc) || record.owns(mc) || record.end(mc) as usize != end {
-                return Ok(None);
-            }
-            end = record.start(mc) as usize;
-            chain = record.next(mc);
-            run.push(record);
-        }
-        if base > 0 {
-            let copy = Segment::new(mc, base)?;
-            let frames = segment.slots(mc).slice(0..base).ok_or(Fault::Malformed)?;
-            copy.slots(mc).copy_from(mc, frames);
-            frames.fill(mc, Value::VOID);
-            run.iter().for_each(|record| record.set_segment(mc, Some(copy)));
-        }
-        task.set_segment(mc, None);
-        Ok(Some(segment))
     }
 
     /// A segment for a coroutine `from` resumes to run on: its spare, if that's free and big
@@ -222,4 +206,44 @@ impl<'gc> Outer<'_, 'gc> {
         self.segments.task = task;
         Ok(())
     }
+}
+
+/// Copies the frames of `task`, suspended, to a segment of their own size, if its chain's
+/// records hold all its segment has below its base and no continuation holds them, and returns
+/// that segment, which is then free. Only a few frames are copied, a window's worth, as a yield
+/// from deeper would copy them each time: their segment is mostly theirs anyway.
+fn compact<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>) -> Result<Option<Gc<'gc, Segment>>, Fault> {
+    let Some(segment) = task.segment(mc).filter(|_| task.state(mc) == PENDING) else { return Ok(None) };
+    let (base, chain) = (task.base(mc) as usize, task.chain(mc));
+    if base > WINDOW || !holds(mc, chain, segment, base, |_| ()) {
+        return Ok(None);
+    }
+    if base > 0 {
+        let copy = Segment::new(mc, base)?;
+        let frames = segment.slots(mc).slice(0..base).ok_or(Fault::Malformed)?;
+        copy.slots(mc).copy_from(mc, frames);
+        frames.fill(mc, Value::VOID);
+        holds(mc, chain, segment, base, |record| record.set_segment(mc, Some(copy)));
+    }
+    task.set_segment(mc, None);
+    Ok(Some(segment))
+}
+
+/// Whether the records on top of `chain`, past natives, hold all of `segment` below `end`,
+/// one-shot and not owning it, as `each` is given them.
+fn holds<'gc>(mc: &Mutation<'gc>, mut chain: Value<'gc>, segment: Gc<'gc, Segment>, mut end: usize, mut each: impl FnMut(Gc<'gc, Frames>)) -> bool {
+    while end > 0 {
+        if let Some(native) = chain.downcast::<Native>(mc) {
+            chain = native.next(mc);
+            continue;
+        }
+        let Some(record) = chain.downcast::<Frames>(mc) else { return false };
+        if record.segment(mc) != Some(segment) || !record.one_shot(mc) || record.owns(mc) || record.end(mc) as usize != end {
+            return false;
+        }
+        each(record);
+        end = record.start(mc) as usize;
+        chain = record.next(mc);
+    }
+    true
 }

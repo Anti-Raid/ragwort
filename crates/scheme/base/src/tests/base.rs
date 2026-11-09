@@ -909,6 +909,36 @@ fn the_host_resumes_a_machine_that_yields() {
 }
 
 #[test]
+fn a_coroutine_two_machines_resume_in_turn_is_copied_where_it_waits() {
+    let mut arena = arena();
+    // Each machine resumes the generator, then a coroutine of its own that suspends, which
+    // copies the generator's frames if it waits in between, as it may have since run elsewhere.
+    let text = "(cons (make-coroutine (lambda () (let loop ((i 0)) (co/yield i) (loop (+ i 1)))))
+                      (lambda (gen) (let loop ()
+                                      (co/yield (co/resume gen))
+                                      (co/resume (make-coroutine (lambda () (co/yield 'x))))
+                                      (loop))))";
+    let mut machines = {
+        let mut made = machine(&mut arena, text);
+        arena.mutate(|mc| {
+            let Ok(Outcome::Done(pair)) = made.run(mc) else { panic!("the pair") };
+            let pair = ragwort_types::pair::Pair::of(pair).unwrap();
+            let (generator, driver) = (pair.head(mc), pair.tail(mc));
+            [0, 1].map(|_| Machine::new(mc, MIN_SEGMENT, driver, &[generator]).unwrap())
+        })
+    };
+    let mut seen = Vec::new();
+    for i in 0..8 {
+        if i % 3 == 0 {
+            arena.collect();
+        }
+        let machine = &mut machines[i % 2];
+        seen.push(arena.mutate(|mc| show_outcome(mc, if i < 2 { machine.run(mc) } else { machine.resume(mc, &[]) })));
+    }
+    assert_eq!(seen, (0..8).map(|i| format!("yielded {i}")).collect::<Vec<_>>());
+}
+
+#[test]
 fn coroutines_survive_collections_between_steps() {
     let mut arena = arena();
     let text = "(let ((gen (make-coroutine (lambda ()

@@ -142,28 +142,34 @@ impl<'a> Heap<'a> {
 
 /// Retires any dropped stack still on `segment`, or panics if another live stack uses it: one
 /// other than the caller's, which is on it if `mine`.
+#[inline]
 fn ensure_free<'gc>(mc: &Mutation<'gc>, segment: Gc<'gc, Segment>, mine: bool) {
     if segment.word(mc, 0) & ATTACHED != 0 {
-        let stacks = mc.heap.m.stacks.borrow();
-        let mut live = 0;
-        for other in stacks.iter().filter(|s| s.segment.get() == segment.index) {
-            if Rc::strong_count(other) == 1 {
-                // A dropped stack still waiting for its last trace. Retiring it now means that
-                // trace can't void what the new stack writes.
-                other.retire(mc.heap);
-                other.parked.set(true);
-            } else {
-                live += 1;
-            }
-        }
-        assert!(live <= usize::from(mine), "segment is already in use by another stack");
+        retire_dropped(mc, segment, mine);
     }
 }
 
-/// Marks `segment` as used by the stack with `record`, loading its retired high-water mark. The
-/// stack is on it already if `mine`.
-fn attach<'gc>(mc: &Mutation<'gc>, segment: Gc<'gc, Segment>, record: &StackRecord, mine: bool) {
-    ensure_free(mc, segment, mine);
+#[cold]
+#[inline(never)]
+fn retire_dropped<'gc>(mc: &Mutation<'gc>, segment: Gc<'gc, Segment>, mine: bool) {
+    let stacks = mc.heap.m.stacks.borrow();
+    let mut live = 0;
+    for other in stacks.iter().filter(|s| s.segment.get() == segment.index) {
+        if Rc::strong_count(other) == 1 {
+            // A dropped stack still waiting for its last trace. Retiring it now means that
+            // trace can't void what the new stack writes.
+            other.retire(mc.heap);
+            other.parked.set(true);
+        } else {
+            live += 1;
+        }
+    }
+    assert!(live <= usize::from(mine), "segment is already in use by another stack");
+}
+
+/// Marks `segment`, which [`ensure_free`] has made free, as used by the stack with `record`,
+/// loading its retired high-water mark.
+fn attach<'gc>(mc: &Mutation<'gc>, segment: Gc<'gc, Segment>, record: &StackRecord) {
     record.written.set(segment.word(mc, 0) as u32);
     segment.set_word(mc, 0, ATTACHED);
 }
@@ -198,7 +204,8 @@ impl<'gc> Mutation<'gc> {
             parked: Cell::new(false),
             written: Cell::new(0),
         });
-        attach(self, segment, &record, false);
+        ensure_free(self, segment, false);
+        attach(self, segment, &record);
         m.stacks.borrow_mut().push(record.clone());
         Ok(Stack { arena: m.id, record })
     }
@@ -342,7 +349,7 @@ impl Stack {
         if !mine {
             old.set_word(mc, 0, old.word(mc, 0) & !ATTACHED);
         }
-        attach(mc, segment, &self.record, mine);
+        attach(mc, segment, &self.record);
         let record = &*self.record;
         record.segment.set(segment.index);
         record.base.set(0);
