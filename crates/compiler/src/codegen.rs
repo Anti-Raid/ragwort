@@ -415,23 +415,24 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
             {
                 let v = self.arg_vreg(x)?;
                 let a = self.arg_reg(v, 0);
-                let t = self.into(want)?;
-                self.write(t, |dst| Op::AddImm { dst, a, imm });
-                if let Want::Tail = want {
-                    let src = self.read(t);
-                    self.ops.push(Op::Return { src });
+                match want {
+                    Want::Reg(t) => self.write(t, |dst| Op::AddImm { dst, a, imm }),
+                    Want::Tail => self.ops.extend([Op::AddImm { dst: SCRATCH, a, imm }, Op::Return { src: SCRATCH }]),
                 }
             }
             L4::Intrinsic(Prim::Slot(op, slot), args) => self.slot(*op, *slot, args, want)?,
             L4::Intrinsic(Prim::Read(read), args) if matches!(want, Want::Reg(_)) && (1..=2).contains(&args.len()) => {
                 let Want::Reg(dst) = want else { unreachable!() };
+                // Both are worked out before either is fetched to scratch, which working out the
+                // second can write.
                 let v0 = self.arg_vreg(&args[0])?;
-                let a = self.arg_reg(v0, 0);
                 if let [_, a1] = args.as_slice() {
                     let v1 = self.arg_vreg(a1)?;
+                    let a = self.arg_reg(v0, 0);
                     let b = self.arg_reg(v1, 1);
                     self.write(dst, |dst| Op::Read2 { dst, a, b, read: *read });
                 } else {
+                    let a = self.arg_reg(v0, 0);
                     self.write(dst, |dst| Op::Read1 { dst, a, read: *read });
                 }
             }

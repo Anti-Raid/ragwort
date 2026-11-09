@@ -1439,7 +1439,7 @@ impl Arena {
         if let Some(boxed) = meta.descs.get_or_grow(0) {
             boxed.set(Some(&Boxed::DESC));
         }
-        meta.budget.force(roots * 8);
+        meta.budget.force((roots + 1) * 8);
         Ok(Self { memory, meta })
     }
 

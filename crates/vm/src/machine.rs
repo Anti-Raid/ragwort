@@ -264,7 +264,11 @@ impl<'a, 'gc> Outer<'a, 'gc> {
             Exit::Underflow => self.resume(),
             Exit::Call { base, argc, rest, tail } => self.call(base, argc, rest, tail),
             Exit::Request { base, args, request, spread, tail } => self.request(base, args, request, spread, tail),
-            Exit::Host { base, tail, then } => self.keep(base, tail).and_then(|()| self.host_then(then, deferred.take())),
+            Exit::Host { base, tail, then } => {
+                // Taken first, so it doesn't outlive a call `keep` fails.
+                let deferred = deferred.take();
+                self.keep(base, tail).and_then(|()| self.host_then(then, deferred))
+            }
         };
         while let Err(fault) = step
             && !fault.is_fatal()

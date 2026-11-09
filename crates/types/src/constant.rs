@@ -10,7 +10,7 @@ use crate::Error;
 use crate::gc::{GcVec, Immediate, Mutation, Root, Value, VecHead, slot};
 use crate::num::{Number, Nums, complex};
 use crate::string::{self, Str, Strings};
-use crate::symbol::Symbol;
+use crate::symbol::{Keyword, Symbol};
 use crate::vector::{ImmutableVector, Vectors};
 
 #[cfg(test)]
@@ -78,6 +78,7 @@ pub struct ConstPool {
 #[derive(Clone, Copy)]
 enum Content<'gc> {
     Symbol(Symbol<'gc>),
+    Keyword(Keyword<'gc>),
     String(Str<'gc>),
     Number(Number<'gc>),
 }
@@ -151,6 +152,7 @@ impl ConstPool {
     fn hash<'gc>(&self, mc: &Mutation<'gc>, c: Content<'gc>) -> Result<u64, Error> {
         Ok(match c {
             Content::Symbol(s) => s.hash(mc),
+            Content::Keyword(k) => k.symbol(mc).hash(mc),
             Content::String(s) => string::hash(&Strings::new(mc), s, self.seed)?,
             Content::Number(x) => {
                 let mut state = self.state.build_hasher();
@@ -165,6 +167,9 @@ fn content<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> Option<Content<'gc>> {
     if let Some(s) = Symbol::of(v) {
         return Some(Content::Symbol(s));
     }
+    if let Some(k) = Keyword::of(v) {
+        return Some(Content::Keyword(k));
+    }
     if let Some(s) = Strings::new(mc).string(v) {
         return Some(Content::String(s));
     }
@@ -174,6 +179,7 @@ fn content<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> Option<Content<'gc>> {
 fn same<'gc>(mc: &Mutation<'gc>, c: Content<'gc>, old: Value<'gc>) -> Result<bool, Error> {
     Ok(match (c, content(mc, old)) {
         (Content::Symbol(a), Some(Content::Symbol(b))) => a == b,
+        (Content::Keyword(a), Some(Content::Keyword(b))) => a == b,
         (Content::String(a), Some(Content::String(b))) => string::equal(&Strings::new(mc), a, b)?,
         (Content::Number(a), Some(Content::Number(b))) => complex::eqv(&Nums::new(mc), a, b),
         _ => false,

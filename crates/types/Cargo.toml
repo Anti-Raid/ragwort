@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 ragwort-derive = { path = "../derive" }
-ragwort-gc-region = { path = "../gc-region" }
+ragwort-gc-region = { path = "../gc-region", default-features = false }
 ragwort-num = { path = "../num" }
 ragwort-string = { path = "../string" }
 

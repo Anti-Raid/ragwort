@@ -353,6 +353,19 @@ fn big_frames_spill() {
         }),
         Ok(349)
     );
+    // A two-argument read whose first argument is spilled and whose second is worked out into a
+    // spilled register: (let ((k (make-box 0))) (with-mark k 7 (lambda () (let ((v1 (make-box 1))
+    // ... (v250 ...)) (+ (mark-value k (unbox v5)) (unbox v1) ... (unbox v250))))))
+    assert_eq!(
+        number(|_| {
+            let boxes: Vec<(u32, Core)> = (1..=250).map(|v| (v, prim(MakeBox, vec![q(i64::from(v))]))).collect();
+            let marked = Core::Intrinsic(Prim::Read(Read::MarkValue), vec![var(0), prim(Unbox, vec![var(5)])]);
+            let all = std::iter::once(marked).chain((1..=250).map(|v| prim(Unbox, vec![var(v)]))).collect();
+            let thunk = lambda(&[], None, let_(boxes, prim(Add, all)));
+            let_(vec![(0, prim(MakeBox, vec![q(0)]))], Core::Intrinsic(Prim::Request(Request::WithMark), vec![var(0), q(7), thunk]))
+        }),
+        Ok(7 + 250 * 251 / 2)
+    );
 }
 
 /// Calls of `argc` values made with `live` boxes held across them, around where the frame's own

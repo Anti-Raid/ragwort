@@ -10,6 +10,7 @@ memmap2 = { version = "0.9.12", optional = true }
 libc = { version = "0.2", optional = true }
 
 [features]
+default = ["mmap"]
 # Maps the region and gives freed pages back to the system. Without it, the region is a plain
 # allocation and the crate has no unsafe code.
 mmap = ["dep:memmap2", "dep:libc"]

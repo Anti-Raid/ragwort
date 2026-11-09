@@ -84,6 +84,20 @@ fn equal_contents_share_a_slot() {
 }
 
 #[test]
+fn keywords_share_a_slot_apart_from_their_symbols() {
+    Arena::new(1 << 20, 1).mutate(|mc| {
+        let symbols = Symbols::of_arena(mc).unwrap();
+        let mut pool = ConstPool::new(mc).unwrap();
+        let name = symbols.intern_str(&Strings::new(mc), "when").unwrap();
+        let keyword = symbols.keyword(mc, name).unwrap().value(mc);
+        let first = pooled(pool.add(mc, keyword).unwrap());
+        assert_eq!(pooled(pool.add(mc, keyword).unwrap()), first);
+        assert_ne!(pooled(pool.add(mc, name.value(mc)).unwrap()), first);
+        assert_eq!(pool.len(), 2);
+    });
+}
+
+#[test]
 fn kinds_and_exactness_stay_apart() {
     Arena::new(1 << 20, 1).mutate(|mc| {
         let (h, n) = (Strings::new(mc), Nums::new(mc));
