@@ -48,9 +48,9 @@ fn wait_host<'s, 'gc>(_: &mut ragwort_vm::HostContext<'s, 'gc>, args: ragwort_vm
 
 /// The host functions every test's code is loaded with.
 static HOSTS: [HostDef; 3] = [
-    HostDef { name: "add", arity: 2, purity: Purity::Pure, function: add_host },
-    HostDef { name: "wait", arity: 1, purity: Purity::Impure, function: wait_host },
-    HostDef { name: "list", arity: -1, purity: Purity::Discardable, function: list_host },
+    ragwort_vm::host!("add", 2, Purity::Pure, add_host),
+    ragwort_vm::host!("wait", 1, Purity::Impure, wait_host),
+    ragwort_vm::host!("list", -1, Purity::Discardable, list_host),
 ];
 
 fn show<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> String {

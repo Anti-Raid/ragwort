@@ -20,3 +20,11 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 unwrap_used = "forbid"
+
+# no `std::ptr`, and no casts to raw pointers
+disallowed_methods = "forbid"
+disallowed_macros = "forbid"
+disallowed_types = "forbid"
+ref_as_ptr = "forbid"
+borrow_as_ptr = "forbid"
+fn_to_numeric_cast_any = "forbid"

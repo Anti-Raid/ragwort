@@ -8,7 +8,7 @@
 //! or of the host's, as an [`ExternalRef`], is passed by the native procedure that wraps it,
 //! which other code calls as it would any other.
 
-use std::any::Any;
+use std::any::{Any, TypeId};
 use std::fmt;
 
 use ragwort_types::gc::{Frame, Gc, Mutation, OutOfMemory, Value};
@@ -21,7 +21,7 @@ use crate::{Fault, Fuel};
 pub type HostFn = for<'s, 'gc> fn(&mut HostContext<'s, 'gc>, HostArgs<'s, 'gc>) -> Result<Reply<'gc>, Fault>;
 
 /// A host function as the host defines it, in a static table, a module's, that every machine
-/// shares.
+/// shares. [`host!`](crate::host!) makes one.
 #[derive(Clone, Copy, Debug)]
 pub struct HostDef {
     pub name: &'static str,
@@ -29,9 +29,25 @@ pub struct HostDef {
     pub arity: i64,
     pub purity: Purity,
     pub function: HostFn,
+    /// What tells `function` apart from other functions: [`HostDef::id_of`] it.
+    pub id: TypeId,
+}
+
+/// A [`HostDef`]: `host!(name, arity, purity, function)`, with `function` a path to a Rust
+/// function, whose `id` it gives.
+#[macro_export]
+macro_rules! host {
+    ($name:expr, $arity:expr, $purity:expr, $function:path $(,)?) => {
+        $crate::HostDef { name: $name, arity: $arity, purity: $purity, function: $function, id: $crate::HostDef::id_of(&$function) }
+    };
 }
 
 impl HostDef {
+    /// The id of `function`, a Rust function: its type's, which no other function has.
+    pub const fn id_of<F: 'static>(_function: &F) -> TypeId {
+        TypeId::of::<F>()
+    }
+
     /// Whether it takes `n` arguments.
     #[inline]
     pub fn takes(&self, n: usize) -> bool {
@@ -42,7 +58,7 @@ impl HostDef {
 /// The same function, as the same host function.
 impl PartialEq for HostDef {
     fn eq(&self, other: &Self) -> bool {
-        (self.name, self.arity, self.purity) == (other.name, other.arity, other.purity) && std::ptr::fn_addr_eq(self.function, other.function)
+        (self.name, self.arity, self.purity, self.id) == (other.name, other.arity, other.purity, other.id)
     }
 }
 
@@ -154,10 +170,10 @@ impl fmt::Debug for Deferred {
     }
 }
 
-/// Only to itself.
+/// To any other, as what it holds is the host's, opaque to the machine.
 impl PartialEq for Deferred {
-    fn eq(&self, other: &Self) -> bool {
-        std::ptr::eq(self, other)
+    fn eq(&self, _: &Self) -> bool {
+        true
     }
 }
 

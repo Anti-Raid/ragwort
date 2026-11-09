@@ -129,8 +129,8 @@ fn defer<'s, 'gc>(_: &mut HostContext<'s, 'gc>, _: HostArgs<'s, 'gc>) -> Result<
     Ok(Reply::Defer(Box::new(())))
 }
 
-static IDENTITY_HOST: [HostDef; 1] = [HostDef { name: "identity", arity: 1, purity: Purity::Impure, function: identity }];
-static DEFER_HOST: [HostDef; 1] = [HostDef { name: "defer", arity: 1, purity: Purity::Impure, function: defer }];
+static IDENTITY_HOST: [HostDef; 1] = [ragwort_vm::host!("identity", 1, Purity::Impure, identity)];
+static DEFER_HOST: [HostDef; 1] = [ragwort_vm::host!("defer", 1, Purity::Impure, defer)];
 
 /// What [`CALLS`] or [`HOST_CALLS`] calls, or where a countdown finds itself.
 #[derive(Clone, Copy)]

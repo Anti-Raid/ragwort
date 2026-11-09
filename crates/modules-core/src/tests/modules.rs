@@ -80,7 +80,7 @@ fn add_host<'s, 'gc>(_: &mut ragwort_vm::HostContext<'s, 'gc>, args: ragwort_vm:
     Ok(ragwort_vm::Reply::Value(Value::fixnum(sum).ok_or(Fault::OutOfRange)?))
 }
 
-static HOSTS: [HostDef; 1] = [HostDef { name: "add", arity: 2, purity: ragwort_vm::Purity::Impure, function: add_host }];
+static HOSTS: [HostDef; 1] = [ragwort_vm::host!("add", 2, ragwort_vm::Purity::Impure, add_host)];
 
 #[test]
 fn host_wrappers_inline_into_the_modules_that_require_them() {

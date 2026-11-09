@@ -1,1 +1,16 @@
 allow-unwrap-in-tests = true
+
+# No `std::ptr` as pointer identity is not very well defined in rust...
+disallowed-methods = [
+    "std::ptr::addr_eq", "std::ptr::copy", "std::ptr::copy_nonoverlapping", "std::ptr::dangling",
+    "std::ptr::dangling_mut", "std::ptr::drop_in_place", "std::ptr::eq", "std::ptr::fn_addr_eq",
+    "std::ptr::from_mut", "std::ptr::from_ref", "std::ptr::hash", "std::ptr::null", "std::ptr::null_mut",
+    "std::ptr::read", "std::ptr::read_unaligned", "std::ptr::read_volatile", "std::ptr::replace",
+    "std::ptr::slice_from_raw_parts", "std::ptr::slice_from_raw_parts_mut", "std::ptr::swap",
+    "std::ptr::swap_nonoverlapping", "std::ptr::with_exposed_provenance",
+    "std::ptr::with_exposed_provenance_mut", "std::ptr::without_provenance",
+    "std::ptr::without_provenance_mut", "std::ptr::write", "std::ptr::write_bytes",
+    "std::ptr::write_unaligned", "std::ptr::write_volatile"
+]
+disallowed-macros = ["std::ptr::addr_of", "std::ptr::addr_of_mut"]
+disallowed-types = ["std::ptr::NonNull"]

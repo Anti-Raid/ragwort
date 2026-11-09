@@ -2,7 +2,6 @@ use std::cell::Cell;
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Range;
-use std::ptr;
 use std::rc::Rc;
 
 use super::raw::Raw;
@@ -141,23 +140,30 @@ impl<'a> Heap<'a> {
     }
 }
 
-/// Retires any dropped stack still on `segment`, or panics if another live stack uses it.
-fn ensure_free<'gc>(mc: &Mutation<'gc>, segment: Gc<'gc, Segment>, record: &StackRecord) {
+/// Retires any dropped stack still on `segment`, or panics if another live stack uses it: one
+/// other than the caller's, which is on it if `mine`.
+fn ensure_free<'gc>(mc: &Mutation<'gc>, segment: Gc<'gc, Segment>, mine: bool) {
     if segment.word(mc, 0) & ATTACHED != 0 {
         let stacks = mc.heap.m.stacks.borrow();
-        for other in stacks.iter().filter(|s| s.segment.get() == segment.index && !ptr::eq(&***s, record)) {
-            assert!(Rc::strong_count(other) == 1, "segment is already in use by another stack");
-            // A dropped stack still waiting for its last trace. Retiring it now means that trace
-            // can't void what the new stack writes.
-            other.retire(mc.heap);
-            other.parked.set(true);
+        let mut live = 0;
+        for other in stacks.iter().filter(|s| s.segment.get() == segment.index) {
+            if Rc::strong_count(other) == 1 {
+                // A dropped stack still waiting for its last trace. Retiring it now means that
+                // trace can't void what the new stack writes.
+                other.retire(mc.heap);
+                other.parked.set(true);
+            } else {
+                live += 1;
+            }
         }
+        assert!(live <= usize::from(mine), "segment is already in use by another stack");
     }
 }
 
-/// Marks `segment` as used by the stack with `record`, loading its retired high-water mark.
-fn attach<'gc>(mc: &Mutation<'gc>, segment: Gc<'gc, Segment>, record: &StackRecord) {
-    ensure_free(mc, segment, record);
+/// Marks `segment` as used by the stack with `record`, loading its retired high-water mark. The
+/// stack is on it already if `mine`.
+fn attach<'gc>(mc: &Mutation<'gc>, segment: Gc<'gc, Segment>, record: &StackRecord, mine: bool) {
+    ensure_free(mc, segment, mine);
     record.written.set(segment.word(mc, 0) as u32);
     segment.set_word(mc, 0, ATTACHED);
 }
@@ -192,7 +198,7 @@ impl<'gc> Mutation<'gc> {
             parked: Cell::new(false),
             written: Cell::new(0),
         });
-        attach(self, segment, &record);
+        attach(self, segment, &record, false);
         m.stacks.borrow_mut().push(record.clone());
         Ok(Stack { arena: m.id, record })
     }
@@ -330,12 +336,13 @@ impl Stack {
     /// stack uses the segment.
     pub fn switch<'gc>(&mut self, mc: &Mutation<'gc>, segment: Gc<'gc, Segment>) {
         let old = self.segment(mc);
-        ensure_free(mc, segment, &self.record);
+        let mine = old == segment;
+        ensure_free(mc, segment, mine);
         self.record.retire(mc.heap);
-        if old != segment {
+        if !mine {
             old.set_word(mc, 0, old.word(mc, 0) & !ATTACHED);
         }
-        attach(mc, segment, &self.record);
+        attach(mc, segment, &self.record, mine);
         let record = &*self.record;
         record.segment.set(segment.index);
         record.base.set(0);

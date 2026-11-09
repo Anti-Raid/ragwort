@@ -653,7 +653,7 @@ fn compiler_micropass_stress_cases() {
     assert_eq!(eval(nested_loops), "126");
 
     // 4. Multi-parameter permutation/rotation in a contified loop (tests parallel-move cycle breaking
-    //    in `L4::Recur`).
+    //    in a jump back to a join).
     let permute_loop = "
         (let loop ((a 1) (b 2) (c 3) (d 4) (n 5))
           (if (eqv? n 0)

@@ -1043,13 +1043,20 @@ fn burn<'s, 'gc>(cx: &mut HostContext<'s, 'gc>, args: HostArgs<'s, 'gc>) -> Resu
 }
 
 static HOSTS: [HostDef; 5] = [
-    HostDef { name: "add", arity: -1, purity: Purity::Pure, function: add_host },
-    HostDef { name: "call-with", arity: 2, purity: Purity::Impure, function: call_with },
-    HostDef { name: "raise", arity: 1, purity: Purity::Impure, function: raise_host },
-    HostDef { name: "defer", arity: 1, purity: Purity::Impure, function: defer_host },
-    HostDef { name: "burn", arity: 1, purity: Purity::Impure, function: burn },
+    crate::host!("add", -1, Purity::Pure, add_host),
+    crate::host!("call-with", 2, Purity::Impure, call_with),
+    crate::host!("raise", 1, Purity::Impure, raise_host),
+    crate::host!("defer", 1, Purity::Impure, defer_host),
+    crate::host!("burn", 1, Purity::Impure, burn),
 ];
 const DEFER: u32 = 3;
+
+#[test]
+fn host_functions_are_the_same_when_their_functions_are() {
+    assert_eq!(HOSTS[0], crate::host!("add", -1, Purity::Pure, add_host));
+    assert_ne!(HOSTS[0], crate::host!("add", -1, Purity::Pure, burn));
+    assert_ne!(HOSTS[0], crate::host!("add", -1, Purity::Impure, add_host));
+}
 const BURN: u32 = 4;
 
 #[test]
@@ -1172,7 +1179,7 @@ fn external_refs_hold_the_hosts_data_and_trace_their_value() {
         n.set(n.get() + 1);
         Ok(Reply::Value(fix(n.get())))
     }
-    static COUNT: [HostDef; 1] = [HostDef { name: "count", arity: 1, purity: Purity::Impure, function: count }];
+    static COUNT: [HostDef; 1] = [crate::host!("count", 1, Purity::Impure, count)];
     let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
     let mut arena = Arena::new(1 << 24, 1);
     arena.mutate(|mc| {

@@ -119,7 +119,8 @@ impl<'gc> L2<'gc> {
     }
 }
 
-/// `L3`: after assignment conversion (`Set` eliminated; all variables are immutable).
+/// `L3`: after assignment conversion (`Set` eliminated; all variables are immutable). `Join` and
+/// `Jump` come only from contification, after it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum L3<'gc> {
     Quote(Value<'gc>),
@@ -132,6 +133,19 @@ pub enum L3<'gc> {
     Lambda(Func<L3<'gc>>),
     Intrinsic(Prim, Vec<L3<'gc>>),
     ApplyIntrinsic(Prim, Vec<L3<'gc>>),
+    /// `scope`, in which [`L3::Jump`]s to one of `group` go to its code, as they do in the
+    /// group's code, as [`L4::Join`].
+    Join { group: Vec<(Var, Func<L3<'gc>>)>, scope: Box<L3<'gc>> },
+    /// A jump to a join of an enclosing `Join` with values for its parameters.
+    Jump(Var, Vec<L3<'gc>>),
+}
+
+/// A join's code: `body`, with `params` bound to the values a jump to `id` has.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JoinCode<'gc> {
+    pub id: Var,
+    pub params: Vec<Var>,
+    pub body: L4<'gc>,
 }
 
 /// Where a closure's upvalue comes from in the immediately enclosing function.
@@ -174,22 +188,10 @@ pub enum L4<'gc> {
     Seq(Box<L4<'gc>>, Box<L4<'gc>>),
     Let(Vec<(Var, L4<'gc>)>, Box<L4<'gc>>),
     Fix(Vec<(Var, Closure<'gc>)>, Box<L4<'gc>>),
-    /// An in-frame tail-recursive loop contified from a single-binding `Fix`.
-    Loop {
-        id: Var,
-        params: Vec<(Var, L4<'gc>)>,
-        body: Box<L4<'gc>>,
-    },
-    /// A tail-recursive jump back to the enclosing `Loop` `id` with updated parameter values.
-    Recur(Var, Vec<L4<'gc>>),
-    /// `scope`, in which [`L4::Jump`]s to `id` go to `body` with `params` bound to their values.
-    Join {
-        id: Var,
-        params: Vec<Var>,
-        body: Box<L4<'gc>>,
-        scope: Box<L4<'gc>>,
-    },
-    /// A jump to the enclosing `Join` `id` with values for its parameters.
+    /// `scope`, in which [`L4::Jump`]s to one of `group` go to its code, as they do in the group's
+    /// code.
+    Join { group: Vec<JoinCode<'gc>>, scope: Box<L4<'gc>> },
+    /// A jump to a join of an enclosing `Join` with values for its parameters.
     Jump(Var, Vec<L4<'gc>>),
     App(Box<L4<'gc>>, Vec<L4<'gc>>),
     Lambda(Closure<'gc>),

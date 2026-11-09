@@ -240,10 +240,126 @@ fn lambdas_only_called_in_tail_position_are_jumps() {
         7_007_007,
         0,
     );
+    // `(let ((k big)) (+ 100 (if ...)))`: in tail position of the `if`, not the `let`, so its
+    // code goes at the `if`.
+    check("under an argument", |_| let_(vec![(1, big(2))], add(q(100), when(eq(var(0), q(0)), app(var(1), vec![q(1)]), when(eq(var(0), q(1)), app(var(1), vec![q(2)]), q(5))))), 103_109_105, 0);
+    // `(let loop ((n 3) (acc 0)) (if (eq? n 0) acc (loop (+ n -1) (+ acc (let ((k big)) (if ...))))))`.
+    check(
+        "in a loop's argument",
+        |_| {
+            let k = let_(vec![(1, big(2))], when(eq(var(0), q(0)), app(var(1), vec![q(1)]), when(eq(var(0), q(1)), app(var(1), vec![q(2)]), q(5))));
+            let body = when(eq(var(3), q(0)), var(4), app(var(6), vec![add(var(3), q(-1)), add(var(4), k)]));
+            letrec(vec![(6, lambda(&[3, 4], None, body))], app(var(6), vec![q(3), q(0)]))
+        },
+        9_027_015,
+        0,
+    );
+    // Calls in two arguments return to two places.
+    check("in two arguments", |_| let_(vec![(1, big(2))], add(app(var(1), vec![q(1)]), app(var(1), vec![q(2)]))), 9_015_021, 1);
+    // `(let ((k big)) (let ((g (lambda (z) (if (eq? z c) (k 1) (k 2)))) (h 0)) (set! h g) (+ (h 0)
+    // (* 10 (h 1)))))`: `k`'s code can go in `g`, which then captures what it uses instead.
+    fn inside<'gc>(k: Core<'gc>, c: Core<'gc>) -> Core<'gc> {
+        let g = lambda(&[4], None, when(eq(var(4), c), app(var(1), vec![q(1)]), app(var(1), vec![q(2)])));
+        let calls = add(app(var(6), vec![q(0)]), prim(Intrinsic::Mul, vec![app(var(6), vec![q(1)]), q(10)]));
+        let_(vec![(1, k)], let_(vec![(3, g), (6, q(0))], seq(10, set(6, var(3)), calls)))
+    }
+    check("in the lambda that calls it", |_| inside(big(2), q(0)), 63_096_129, 1);
+    // `g` capturing `x` already.
+    check("in a lambda capturing what it does", |_| inside(big(2), var(0)), 63_069_132, 1);
+    // `(let ((w (+ x 1))) ...)`, `k` adding `w`: `g` would capture two for one, so it stays.
+    check(
+        "not in a lambda that'd capture more",
+        |_| {
+            let k = lambda(&[2], None, add(add(add(var(2), var(0)), add(var(2), var(2))), add(add(var(0), var(0)), var(5))));
+            let_(vec![(5, add(var(0), q(1)))], inside(k, q(0)))
+        },
+        74_118_162,
+        2,
+    );
     // A lambda that escapes, or that's called other than in tail position, is a closure.
     // `(let ((y 0)) (set! y k) (y 2))`.
     check("escaping", |_| branches(big(2), let_(vec![(3, q(0))], seq(10, set(3, var(1)), app(var(3), vec![q(2)])))), 3_009_012, 1);
     check("not in tail position", |_| branches(big(2), add(q(1), app(var(1), vec![q(2)]))), 3_009_013, 1);
+}
+
+#[test]
+fn letrec_groups_only_called_in_tail_position_are_jumps() {
+    // Runs what `build` makes, through pauses, checking how many closures its code makes and
+    // whether it calls.
+    fn check(name: &str, build: impl for<'gc> Fn(&Mutation<'gc>) -> Core<'gc>, expect: i64, closures: usize, calls: bool) {
+        let mut arena = Arena::new(1 << 24, 0);
+        arena.mutate(|mc| {
+            let thunk = compile(mc, None, &build(mc)).unwrap();
+            let ops = all_ops(mc, thunk);
+            assert_eq!(ops.iter().filter(|op| matches!(op, Op::NewClosure { .. })).count(), closures, "{name}: {ops:?}");
+            assert_eq!(ops.iter().any(|op| matches!(op, Op::Call { .. } | Op::TailCall { .. })), calls, "{name}: {ops:?}");
+            assert!(!ops.contains(&Op::Jump { offset: 0 }), "{name}: {ops:?}");
+            let mut machine = Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap();
+            let value = loop {
+                match machine.run(mc).unwrap() {
+                    Outcome::Paused => {}
+                    Outcome::Done(value) => break value,
+                    _ => panic!("{name}"),
+                }
+            };
+            assert_eq!(value.as_fixnum(), Some(expect), "{name}");
+        });
+    }
+    // `(lambda (n) (if (eq? n 0) done (next (+ n -1))))`, with `n` variable `v`.
+    fn state<'gc>(v: u32, done: i64, next: u32) -> Core<'gc> {
+        lambda(&[v], None, when(eq(var(v), q(0)), q(done), app(var(next), vec![add(var(v), q(-1))])))
+    }
+    check("even and odd", |_| letrec(vec![(0, state(2, 1, 1)), (1, state(3, 0, 0))], app(var(0), vec![q(1_000_001)])), 0, 0, false);
+    // Three states, a to b to c to a, a million steps from a: b's.
+    check("three states", |_| letrec(vec![(0, state(3, 1, 1)), (1, state(4, 2, 2)), (2, state(5, 3, 0))], app(var(0), vec![q(1_000_000)])), 2, 0, false);
+    // `(+ 100 (letrec ((lp (lambda (n acc) (if (eq? n 0) (+ acc x) ...)))) (if (eq? x 1) (lp 10 0)
+    // (lp 3 0))))`, a loop started from two places, for x of 1 and of 0. It captures `x`, so it'd
+    // be a closure made each time if it weren't a join.
+    check(
+        "a loop started twice",
+        |_| {
+            let lp = lambda(&[2, 3], None, when(eq(var(2), q(0)), add(var(3), var(0)), app(var(1), vec![add(var(2), q(-1)), add(var(3), var(2))])));
+            let started = letrec(vec![(1, lp)], when(eq(var(0), q(1)), app(var(1), vec![q(10), q(0)]), app(var(1), vec![q(3), q(0)])));
+            let f = lambda(&[0], None, add(q(100), started));
+            letrec(vec![(9, f)], add(prim(Intrinsic::Mul, vec![app(var(9), vec![q(1)]), q(1000)]), app(var(9), vec![q(0)])))
+        },
+        156_106,
+        0,
+        true,
+    );
+    // `(let loop ((x 0)) (if (eq? x 10) x (let ((w (lambda (y) (let ((u (lambda (z) (loop (+ z
+    // 1))))) (if (eq? y 3) (u (+ y 1)) (u y)))))) (if (eq? x 5) (w (+ x 1)) (w x)))))`: the loop is
+    // called in `u`'s code, which goes in `w`'s, which goes in the loop's.
+    check(
+        "a loop called from a join in a join",
+        |_| {
+            // `(+ (+ z z) (+ z 1) (* (+ z z) -1))`, `(+ z 1)` too big to inline.
+            let next = add(add(add(var(6), var(6)), add(var(6), q(1))), prim(Intrinsic::Mul, vec![add(var(6), var(6)), q(-1)]));
+            let u = lambda(&[6], None, app(var(1), vec![next]));
+            let w = lambda(&[4], None, let_(vec![(5, u)], when(eq(var(4), q(3)), app(var(5), vec![add(var(4), q(1))]), app(var(5), vec![var(4)]))));
+            let body = when(eq(var(2), q(10)), var(2), let_(vec![(3, w)], when(eq(var(2), q(5)), app(var(3), vec![add(var(2), q(1))]), app(var(3), vec![var(2)]))));
+            letrec(vec![(1, lambda(&[2], None, body))], app(var(1), vec![q(0)]))
+        },
+        10,
+        0,
+        false,
+    );
+    // A group one of which escapes stays closures.
+    check(
+        "escaping",
+        |_| letrec(vec![(0, state(2, 1, 1)), (1, state(3, 0, 0))], when(prim(Intrinsic::IsProcedure, vec![var(1)]), app(var(0), vec![q(10)]), q(5))),
+        1,
+        1,
+        true,
+    );
+    // Recursion other than in tail position stays a call.
+    check(
+        "not in tail position",
+        |_| letrec(vec![(0, lambda(&[1], None, when(eq(var(1), q(0)), q(0), add(var(1), app(var(0), vec![add(var(1), q(-1))])))))], app(var(0), vec![q(100)])),
+        5050,
+        0,
+        true,
+    );
 }
 
 #[test]
@@ -365,6 +481,20 @@ fn big_frames_spill() {
             let_(vec![(0, prim(MakeBox, vec![q(0)]))], Core::Intrinsic(Prim::Request(Request::WithMark), vec![var(0), q(7), thunk]))
         }),
         Ok(7 + 250 * 251 / 2)
+    );
+    // A join group in a spilled frame: (let ((v1 (make-box 1)) ... (v250 ...)) (+ (letrec ((even
+    // (lambda (n) (if (eq? n 0) (unbox v250) (odd (+ n -1))))) (odd ...)) (even 4)) (unbox v1) ...
+    // (unbox v250)))
+    assert_eq!(
+        number(|_| {
+            let boxes: Vec<(u32, Core)> = (1..=250).map(|v| (v, prim(MakeBox, vec![q(i64::from(v))]))).collect();
+            let even = lambda(&[302], None, when(eq(var(302), q(0)), prim(Unbox, vec![var(250)]), app(var(301), vec![add(var(302), q(-1))])));
+            let odd = lambda(&[303], None, when(eq(var(303), q(0)), prim(Unbox, vec![var(1)]), app(var(300), vec![add(var(303), q(-1))])));
+            let group = letrec(vec![(300, even), (301, odd)], app(var(300), vec![q(4)]));
+            let all = std::iter::once(group).chain((1..=250).map(|v| prim(Unbox, vec![var(v)]))).collect();
+            let_(boxes, prim(Add, all))
+        }),
+        Ok(250 + 250 * 251 / 2)
     );
 }
 
@@ -516,11 +646,11 @@ fn micropass_optimizations() {
         let ops = all_ops(mc, thunk);
         assert!(!has_box_op(&ops), "immutable captured variable should not be boxed: {ops:?}");
 
-        // 2. Mutually recursive `letrec` lambdas compile to a single `Op::NewClosure { count: 2 }`
-        //    with zero heap boxes (`letrec` fixing pass).
-        let even = lambda(&[2], None, when(eq(var(2), q(0)), Core::Quote(Value::TRUE), app(var(1), vec![add(var(2), q(-1))])));
-        let odd = lambda(&[3], None, when(eq(var(3), q(0)), Core::Quote(Value::FALSE), app(var(0), vec![add(var(3), q(-1))])));
-        let mutual = letrec(vec![(0, even), (1, odd)], app(var(0), vec![q(10)]));
+        // 2. Mutually recursive `letrec` lambdas that escape compile to a single
+        //    `Op::NewClosure { count: 2 }` with zero heap boxes (`letrec` fixing pass).
+        let even = || lambda(&[2], None, when(eq(var(2), q(0)), Core::Quote(Value::TRUE), app(var(1), vec![add(var(2), q(-1))])));
+        let odd = || lambda(&[3], None, when(eq(var(3), q(0)), Core::Quote(Value::FALSE), app(var(0), vec![add(var(3), q(-1))])));
+        let mutual = letrec(vec![(0, even()), (1, odd())], prim(Cons, vec![var(0), var(1)]));
         let thunk = compile(mc, None, &mutual).unwrap();
         let ops = all_ops(mc, thunk);
         assert!(!has_box_op(&ops), "mutually recursive lambdas should not be boxed: {ops:?}");
@@ -1197,14 +1327,14 @@ fn call_with<'s, 'gc>(cx: &mut ragwort_vm::HostContext<'s, 'gc>, args: ragwort_v
 }
 
 static HOSTS: [HostDef; 3] = [
-    HostDef { name: "add", arity: -1, purity: Purity::Impure, function: add_host },
-    HostDef { name: "add", arity: -1, purity: Purity::Discardable, function: add_host },
-    HostDef { name: "call-with", arity: 2, purity: Purity::Impure, function: call_with },
+    ragwort_vm::host!("add", -1, Purity::Impure, add_host),
+    ragwort_vm::host!("add", -1, Purity::Discardable, add_host),
+    ragwort_vm::host!("call-with", 2, Purity::Impure, call_with),
 ];
 static ADD_HOST: &HostDef = &HOSTS[0];
 static ADD_DISCARDABLE: &HostDef = &HOSTS[1];
 static CALL_WITH: &HostDef = &HOSTS[2];
-static ELSEWHERE: HostDef = HostDef { name: "elsewhere", arity: 0, purity: Purity::Impure, function: add_host };
+static ELSEWHERE: HostDef = ragwort_vm::host!("elsewhere", 0, Purity::Impure, add_host);
 
 /// The module tests compile into: three variables, none defined, and code that can call
 /// [`HOSTS`].

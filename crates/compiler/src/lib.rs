@@ -12,13 +12,16 @@
 //! 4. `assign`: assignment conversion (`L2 -> L3`), rewriting only mutated (`Set`) variables into
 //!    explicit `MakeBox` / `Unbox` / `SetBox` intrinsics so all variables in [`ir::L3`] are
 //!    immutable.
-//! 5. `closure`: closure conversion (`L3 -> L4`), resolving lexical references into
+//! 5. `contify`: contification (`L3 -> L3`), turning local functions only ever called in tail
+//!    position of one place, loops among them, into in-frame joins (`L3::Join` / `L3::Jump`).
+//! 6. `closure`: closure conversion (`L3 -> L4`), resolving lexical references into
 //!    [`ir::VarRef::Local`] vs [`ir::VarRef::Upvalue`] and computing each closure's capture table.
-//! 6. `codegen`: scoped virtual register allocation and bytecode emission (`L4 -> Closure`).
+//! 7. `codegen`: scoped virtual register allocation and bytecode emission (`L4 -> Closure`).
 
 mod assign;
 mod closure;
 mod codegen;
+mod contify;
 mod cp0;
 pub mod ir;
 mod letrec;
@@ -182,7 +185,8 @@ pub fn compile<'gc>(mc: &Mutation<'gc>, module: Option<Gc<'gc, Module>>, core: &
     let (l1, supply) = lower::lower(core)?;
     let (l2, supply) = letrec::fix_letrec(l1, supply);
     let (l2, supply) = cp0::optimize(mc, l2, supply);
-    let (l3, _) = assign::assignment_convert(l2, supply);
+    let (mut l3, _) = assign::assignment_convert(l2, supply);
+    contify::contify(&mut l3);
     let l4 = closure::closure_convert(&l3);
     codegen::emit(mc, module, &l4)
 }

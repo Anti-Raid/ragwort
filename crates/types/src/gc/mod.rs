@@ -344,7 +344,7 @@ pub enum Items {
 
 /// How the collector sees a type: its fixed words, which of them hold references, and its items.
 pub struct Desc {
-    pub type_id: fn() -> TypeId,
+    pub type_id: TypeId,
     pub fields: u32,
     /// Fields holding a `Value`.
     pub values: u64,
@@ -373,7 +373,7 @@ pub struct Desc {
 impl Desc {
     pub const fn of<T: 'static>(fields: u32) -> Self {
         Self {
-            type_id: TypeId::of::<T>,
+            type_id: TypeId::of::<T>(),
             fields,
             values: 0,
             members: 0,
@@ -1240,7 +1240,8 @@ struct Meta {
     low: Cell<usize>,
     /// The next number for a type without a fixed one.
     next: Cell<usize>,
-    cache: [Cell<(usize, u16)>; 64],
+    /// Type numbers of descriptors, by [`cache_slot`] of their types.
+    cache: [Cell<Option<(TypeId, u16)>>; 64],
     roots: Box<[Cell<u64>]>,
     stacks: RefCell<Vec<Rc<StackRecord>>>,
     handles: RefCell<Vec<Rc<RootRecord>>>,
@@ -1412,7 +1413,7 @@ impl Arena {
             descs: Chunked::new(),
             low: Cell::new(1),
             next: Cell::new(TYPES - 1),
-            cache: [const { Cell::new((0, 0)) }; 64],
+            cache: [const { Cell::new(None) }; 64],
             // One more, after the program's, for the arena's intern table.
             roots: vec![Cell::new(Value::NIL.word); roots + 1].into_boxed_slice(),
             stacks: RefCell::new(Vec::new()),
@@ -1854,19 +1855,41 @@ impl<'gc> Mutation<'gc> {
     }
 }
 
+/// Where `t`'s type number is cached: by what its hash writes, which is a hash already.
+#[inline]
+fn cache_slot(t: TypeId) -> usize {
+    struct Bits(u64);
+    impl std::hash::Hasher for Bits {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            for &b in bytes {
+                self.0 = self.0.rotate_left(8) ^ u64::from(b);
+            }
+        }
+        fn write_u64(&mut self, n: u64) {
+            self.0 ^= n;
+        }
+    }
+    let mut bits = Bits(0);
+    std::hash::Hash::hash(&t, &mut bits);
+    (bits.0 as usize) % 64
+}
+
 impl<'a> Heap<'a> {
     #[inline]
     fn type_index(self, desc: &'static Desc) -> Option<u16> {
-        let addr = (desc as *const Desc).addr();
-        let (a, ty) = self.m.cache[(addr >> 4) % 64].get();
-        if a == addr { Some(ty) } else { self.type_index_slow(desc) }
+        match self.m.cache[cache_slot(desc.type_id)].get() {
+            Some((t, ty)) if t == desc.type_id => Some(ty),
+            _ => self.type_index_slow(desc),
+        }
     }
 
     #[inline(never)]
     fn type_index_slow(self, desc: &'static Desc) -> Option<u16> {
-        let addr = (desc as *const Desc).addr();
         let (m, next) = (self.m, self.m.next.get());
-        let same = |d: &'static Desc| std::ptr::eq(d, desc) || (d.type_id)() == (desc.type_id)();
+        let same = |d: &'static Desc| d.type_id == desc.type_id;
         let ty = if let Some(ty) = desc.number {
             let ty = usize::from(ty);
             if ty > next {
@@ -1891,7 +1914,7 @@ impl<'a> Heap<'a> {
                 }
             }
         };
-        self.m.cache[(addr >> 4) % 64].set((addr, ty as u16));
+        self.m.cache[cache_slot(desc.type_id)].set(Some((desc.type_id, ty as u16)));
         Some(ty as u16)
     }
 
