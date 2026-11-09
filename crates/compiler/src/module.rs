@@ -499,6 +499,9 @@ pub enum ModuleError {
     Conflict,
     /// A provide of a name the module doesn't define.
     NotDefined,
+    /// An assignment of a keyword procedure the module defines, whose calls the front ends
+    /// that see its definition make of its core.
+    Immutable,
     OutOfMemory,
 }
 
@@ -681,9 +684,14 @@ impl<'gc> ModuleBuilder<'gc> {
         self.cores.insert(procedure, core);
     }
 
-    /// Notes that code assigns variable `slot`, so it isn't immutable.
-    pub fn assign(&mut self, slot: u32) {
+    /// Notes that code assigns variable `slot`, so it isn't immutable, unless it's a keyword
+    /// procedure, which can't be assigned.
+    pub fn assign(&mut self, slot: u32) -> Result<(), ModuleError> {
+        if self.cores.contains_key(&slot) {
+            return Err(ModuleError::Immutable);
+        }
         self.assigned.insert(slot);
+        Ok(())
     }
 
     /// Notes that `value` defines variable `slot`, for what its calls can inline to.

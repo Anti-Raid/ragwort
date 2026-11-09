@@ -2,13 +2,15 @@
 //!
 //! - Contifies single-binding tail-recursive local `Fix` forms into in-frame [`L4::Loop`] /
 //!   [`L4::Recur`] loops (zero closure allocation, zero call frames).
+//! - Contifies `Let`-bound lambdas only ever called in tail position into [`L4::Join`]s, the
+//!   calls into [`L4::Jump`]s within the frame.
 //! - Resolves self-references inside single-binding recursive closures to [`VarRef::SelfClosure`]
 //!   (register `0`, `frame::CLOSURE`), avoiding self-captured upvalues.
 //! - Computes free variables bottom-up, splits variable references into [`VarRef::Local`],
 //!   [`VarRef::Upvalue`], and [`VarRef::SelfClosure`], and attaches an explicit [`UpvalSource`]
 //!   capture table to every [`Closure`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::ir::{Closure, L3, L4, UpvalSource, VarRef};
 use crate::{Func, Var};
@@ -22,6 +24,8 @@ pub(crate) fn closure_convert<'gc>(expr: &L3<'gc>) -> L4<'gc> {
         upvalues: Vec::new(),
         self_closure: None,
         active_loops: HashSet::new(),
+        active_joins: HashSet::new(),
+        contified: HashMap::new(),
     };
     let out = convert_expr(expr, &mut env);
     debug_assert!(env.upvalues.is_empty(), "top-level expression has no free variables");
@@ -33,6 +37,9 @@ struct Env {
     upvalues: Vec<Var>,
     self_closure: Option<Var>,
     active_loops: HashSet<Var>,
+    active_joins: HashSet<Var>,
+    /// Whether each loop or join variable decided on so far is contified.
+    contified: HashMap<Var, bool>,
 }
 
 fn convert_expr<'gc>(expr: &L3<'gc>, env: &mut Env) -> L4<'gc> {
@@ -48,45 +55,22 @@ fn convert_expr<'gc>(expr: &L3<'gc>, env: &mut Env) -> L4<'gc> {
             Box::new(convert_expr(a, env)),
             Box::new(convert_expr(b, env)),
         ),
-        L3::Let(binds, body) => {
-            let converted_binds: Vec<(Var, L4<'gc>)> = binds
-                .iter()
-                .map(|&(v, ref init)| (v, convert_expr(init, env)))
-                .collect();
-            for &(v, _) in &converted_binds {
-                env.locals.insert(v);
-            }
-            let body = convert_expr(body, env);
-            for &(v, _) in &converted_binds {
-                env.locals.remove(&v);
-            }
-            L4::Let(converted_binds, Box::new(body))
-        }
+        L3::Let(binds, body) => convert_let(binds, body, env),
         L3::Fix(binds, body) => {
             // 1. Check if a single-binding `Fix` can be contified into an in-frame `L4::Loop`.
-            if let [(loop_var, func)] = binds.as_slice()
-                && let L3::App(op, init_args) = body.as_ref()
-                && **op == L3::Ref(*loop_var)
-                && func.rest.is_none()
-                && func.optional == 0
-                && func.params.len() == init_args.len()
-                && func.params.len() <= MAX_LOOP_PARAMS
-                && !init_args.iter().any(|a| references_var(a, *loop_var))
-                && references_var(&func.body, *loop_var)
-                && is_tail_loop_body(&func.body, *loop_var, func.params.len())
-            {
+            if let Some((loop_var, func, init_args)) = loop_of(binds, body, &mut env.contified) {
                 let converted_inits: Vec<L4<'gc>> = init_args.iter().map(|a| convert_expr(a, env)).collect();
                 for &p in &func.params {
                     env.locals.insert(p);
                 }
-                env.active_loops.insert(*loop_var);
+                env.active_loops.insert(loop_var);
                 let loop_body = convert_expr(&func.body, env);
-                env.active_loops.remove(loop_var);
+                env.active_loops.remove(&loop_var);
                 for &p in &func.params {
                     env.locals.remove(&p);
                 }
                 let params = func.params.iter().copied().zip(converted_inits).collect();
-                return L4::Loop { id: *loop_var, params, body: Box::new(loop_body) };
+                return L4::Loop { id: loop_var, params, body: Box::new(loop_body) };
             }
 
             // 2. A single-binding `Fix` closure can reference itself via `VarRef::SelfClosure`
@@ -120,6 +104,11 @@ fn convert_expr<'gc>(expr: &L3<'gc>, env: &mut Env) -> L4<'gc> {
                 let converted_args = args.iter().map(|a| convert_expr(a, env)).collect();
                 return L4::Recur(v, converted_args);
             }
+            if let L3::Ref(v) = **f
+                && env.active_joins.contains(&v)
+            {
+                return L4::Jump(v, args.iter().map(|a| convert_expr(a, env)).collect());
+            }
             L4::App(
                 Box::new(convert_expr(f, env)),
                 args.iter().map(|a| convert_expr(a, env)).collect(),
@@ -135,6 +124,41 @@ fn convert_expr<'gc>(expr: &L3<'gc>, env: &mut Env) -> L4<'gc> {
     }
 }
 
+/// A `Let`, its lambdas that are joins as [`L4::Join`]s around its body. Out of line, as it
+/// takes more stack than [`convert_expr`]'s other cases, which deep expressions recurse through.
+#[inline(never)]
+fn convert_let<'gc>(binds: &[(Var, L3<'gc>)], body: &L3<'gc>, env: &mut Env) -> L4<'gc> {
+    let mut converted_binds = Vec::with_capacity(binds.len());
+    let mut joins = Vec::new();
+    for &(v, ref init) in binds {
+        match init {
+            L3::Lambda(func) if is_join(v, func, body, &mut env.contified) => joins.push((v, func)),
+            _ => converted_binds.push((v, convert_expr(init, env))),
+        }
+    }
+    for &(v, _) in &converted_binds {
+        env.locals.insert(v);
+    }
+    let mut converted_joins = Vec::with_capacity(joins.len());
+    for &(v, func) in &joins {
+        env.locals.extend(&func.params);
+        converted_joins.push((v, func.params.clone(), convert_expr(&func.body, env)));
+        for p in &func.params {
+            env.locals.remove(p);
+        }
+    }
+    env.active_joins.extend(joins.iter().map(|&(v, _)| v));
+    let mut body = convert_expr(body, env);
+    for (id, params, code) in converted_joins.into_iter().rev() {
+        env.active_joins.remove(&id);
+        body = L4::Join { id, params, body: Box::new(code), scope: Box::new(body) };
+    }
+    for &(v, _) in &converted_binds {
+        env.locals.remove(&v);
+    }
+    if converted_binds.is_empty() { body } else { L4::Let(converted_binds, Box::new(body)) }
+}
+
 fn convert_closure<'gc>(
     func: &Func<L3<'gc>>,
     self_closure: Option<Var>,
@@ -145,8 +169,11 @@ fn convert_closure<'gc>(
         upvalues: Vec::new(),
         self_closure,
         active_loops: HashSet::new(),
+        active_joins: HashSet::new(),
+        contified: std::mem::take(&mut parent_env.contified),
     };
     let body = convert_expr(&func.body, &mut child_env);
+    parent_env.contified = std::mem::take(&mut child_env.contified);
     let captures = child_env
         .upvalues
         .into_iter()
@@ -195,27 +222,71 @@ fn references_var<'gc>(expr: &L3<'gc>, target: Var) -> bool {
     }
 }
 
-/// Checks that every occurrence of `loop_var` in `expr` is a direct tail call of `arity` arguments
-/// in the current function frame (not inside a nested `Lambda` or `Fix` body).
-fn is_tail_loop_body<'gc>(expr: &L3<'gc>, loop_var: Var, arity: usize) -> bool {
+/// The loop a single-binding `Fix` is, if it's one: its variable, function and first arguments.
+fn loop_of<'a, 'gc>(
+    binds: &'a [(Var, Func<L3<'gc>>)],
+    body: &'a L3<'gc>,
+    contified: &mut HashMap<Var, bool>,
+) -> Option<(Var, &'a Func<L3<'gc>>, &'a [L3<'gc>])> {
+    let [(loop_var, func)] = binds else { return None };
+    let L3::App(op, init_args) = body else { return None };
+    let fits = **op == L3::Ref(*loop_var)
+        && func.rest.is_none()
+        && func.optional == 0
+        && func.params.len() == init_args.len()
+        && func.params.len() <= MAX_LOOP_PARAMS
+        && !init_args.iter().any(|a| references_var(a, *loop_var));
+    let decided = match contified.get(loop_var) {
+        Some(&known) => known,
+        None => {
+            let known = fits && references_var(&func.body, *loop_var) && tail_calls_only(&func.body, *loop_var, func.params.len(), contified);
+            contified.insert(*loop_var, known);
+            known
+        }
+    };
+    decided.then_some((*loop_var, func, init_args.as_slice()))
+}
+
+/// Whether `func`, bound to `var` by a `Let` whose body is `scope`, is a join: called there, only
+/// in tail position, so jumps within the frame can take the place of the calls.
+fn is_join<'gc>(var: Var, func: &Func<L3<'gc>>, scope: &L3<'gc>, contified: &mut HashMap<Var, bool>) -> bool {
+    if let Some(&known) = contified.get(&var) {
+        return known;
+    }
+    let known = func.rest.is_none()
+        && func.optional == 0
+        && func.params.len() <= MAX_LOOP_PARAMS
+        && references_var(scope, var)
+        && tail_calls_only(scope, var, func.params.len(), contified);
+    contified.insert(var, known);
+    known
+}
+
+/// Whether every occurrence of `var` in `expr` is a call of `arity` arguments in tail position
+/// in the current frame: not in a lambda, unless it's a loop's or a join's, which are in-frame.
+fn tail_calls_only<'gc>(expr: &L3<'gc>, var: Var, arity: usize, contified: &mut HashMap<Var, bool>) -> bool {
     match expr {
         L3::If(test, then, other) => {
-            !references_var(test, loop_var)
-                && is_tail_loop_body(then, loop_var, arity)
-                && is_tail_loop_body(other, loop_var, arity)
+            !references_var(test, var) && tail_calls_only(then, var, arity, contified) && tail_calls_only(other, var, arity, contified)
         }
-        L3::Seq(a, b) => !references_var(a, loop_var) && is_tail_loop_body(b, loop_var, arity),
+        L3::Seq(a, b) => !references_var(a, var) && tail_calls_only(b, var, arity, contified),
         L3::Let(binds, body) => {
-            !binds.iter().any(|(_, init)| references_var(init, loop_var))
-                && is_tail_loop_body(body, loop_var, arity)
+            for &(v, ref init) in binds {
+                let fine = match init {
+                    L3::Lambda(func) if is_join(v, func, body, contified) => tail_calls_only(&func.body, var, arity, contified),
+                    _ => !references_var(init, var),
+                };
+                if !fine {
+                    return false;
+                }
+            }
+            tail_calls_only(body, var, arity, contified)
         }
-        L3::Fix(binds, body) => {
-            !binds.iter().any(|(_, f)| references_var(&f.body, loop_var))
-                && is_tail_loop_body(body, loop_var, arity)
-        }
-        L3::App(f, args) if **f == L3::Ref(loop_var) => {
-            args.len() == arity && !args.iter().any(|a| references_var(a, loop_var))
-        }
-        other => !references_var(other, loop_var),
+        L3::Fix(binds, body) => match loop_of(binds, body, contified) {
+            Some((_, func, inits)) => !inits.iter().any(|a| references_var(a, var)) && tail_calls_only(&func.body, var, arity, contified),
+            None => !binds.iter().any(|(_, f)| references_var(&f.body, var)) && tail_calls_only(body, var, arity, contified),
+        },
+        L3::App(f, args) if **f == L3::Ref(var) => args.len() == arity && !args.iter().any(|a| references_var(a, var)),
+        other => !references_var(other, var),
     }
 }

@@ -481,3 +481,26 @@ fn booleans_void_and_bytevectors() {
         assert_eq!(Intrinsic::BytevectorSet.run(mc, &[literal, fix(0), fix(2)], &mut fuel), Err(Fault::Immutable));
     });
 }
+
+#[test]
+fn string_comparisons_spend_fuel_for_what_they_compare() {
+    let mut arena = Arena::new(1 << 24, 0);
+    arena.mutate(|mc| {
+        let strings = Strings::new(mc);
+        let text = |s: &str| string::from_str(&strings, s).unwrap().value();
+        fn spent<'gc>(mc: &Mutation<'gc>, op: Intrinsic, args: &[Value<'gc>]) -> u64 {
+            let mut fuel = Fuel { run: 100, rest: 0 };
+            op.run(mc, args, &mut fuel).unwrap();
+            100 - fuel.left()
+        }
+        // A unit for each 1024 characters of the shorter of each pair.
+        let (long, other) = (text(&"a".repeat(10_240)), text(&"a".repeat(10_240)));
+        for op in [Intrinsic::StringEq, Intrinsic::StringLt, Intrinsic::StringGe] {
+            assert_eq!(spent(mc, op, &[long, other]), 10, "{op:?}");
+        }
+        assert_eq!(spent(mc, Intrinsic::StringEq, &[long, other, long]), 20);
+        assert_eq!(spent(mc, Intrinsic::StringEq, &[long, text("a")]), 0);
+        let mut fuel = Fuel { run: 3, rest: 0 };
+        assert_eq!(Intrinsic::StringEq.run(mc, &[long, other], &mut fuel), Err(Fault::OutOfFuel));
+    });
+}

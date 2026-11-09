@@ -154,6 +154,7 @@ impl<'a, 'gc> Module<'a, 'gc> {
             ops: Vec::new(),
             env: HashMap::new(),
             loops: HashMap::new(),
+            joins: HashMap::new(),
             next: u32::from(link) + 1,
             spill: None,
             slots: Vec::new(),
@@ -194,11 +195,18 @@ impl<'a, 'gc> Module<'a, 'gc> {
     }
 }
 
+/// A join being compiled: its parameters and the jumps to it, which land where its code is.
+struct Join {
+    params: Vec<(Var, VReg)>,
+    jumps: Vec<usize>,
+}
+
 struct Compiler<'m, 'a, 'gc> {
     module: &'m mut Module<'a, 'gc>,
     ops: Vec<Op>,
     env: HashMap<Var, VReg>,
     loops: HashMap<Var, (usize, Vec<(Var, VReg)>)>,
+    joins: HashMap<Var, Join>,
     next: VReg,
     spill: Option<u8>,
     slots: Vec<u32>,
@@ -247,7 +255,7 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
                 };
                 let to_target = self.branch(test, invert, mark)?;
                 self.expr(fallthrough, want)?;
-                let to_end = (matches!(want, Want::Reg(_)) && !l4_always_recurs(fallthrough))
+                let to_end = (matches!(want, Want::Reg(_)) && !l4_leaves(fallthrough))
                     .then(|| self.jump(Op::Jump { offset: 0 }));
                 self.land(to_target)?;
                 self.expr(target, want)?;
@@ -362,6 +370,8 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
                     .expect("functions are shorter than 2^31 ops");
                 self.ops.push(Op::Jump { offset });
             }
+            L4::Join { id, params, body, scope } => self.join(*id, params, body, scope, want)?,
+            L4::Jump(id, args) => self.jump_to(*id, args)?,
             L4::Lambda(clos) => {
                 // `Op::NewClosure` writes the new closure to `dst` before reading its captures, so if
                 // `want` is a local register that `clos` itself captures, allocate a fresh register first.
@@ -758,6 +768,46 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
         SCRATCH
     }
 
+    /// `scope`, then the join's code, `body`, which the scope's jumps to `id` land on. Out of
+    /// line, as it takes more stack than [`Compiler::expr`]'s other cases.
+    #[inline(never)]
+    fn join(&mut self, id: Var, params: &[Var], body: &L4<'gc>, scope: &L4<'gc>, want: Want) -> Result<(), Stop> {
+        let mut bound = Vec::with_capacity(params.len());
+        for &v in params {
+            bound.push((v, self.reg()?));
+        }
+        let after = self.next;
+        self.joins.insert(id, Join { params: bound.clone(), jumps: Vec::new() });
+        self.expr(scope, want)?;
+        let Join { jumps, .. } = self.joins.remove(&id).ok_or(CompileError::Unbound(id))?;
+        let to_end = (matches!(want, Want::Reg(_)) && !l4_leaves(scope)).then(|| self.jump(Op::Jump { offset: 0 }));
+        for at in jumps {
+            self.land(at)?;
+        }
+        self.next = after;
+        for &(v, r) in &bound {
+            self.env.insert(v, r);
+        }
+        self.expr(body, want)?;
+        for &(v, _) in &bound {
+            self.env.remove(&v);
+        }
+        if let Some(at) = to_end {
+            self.land(at)?;
+        }
+        Ok(())
+    }
+
+    /// A jump to join `id`, with `args` for its parameters.
+    #[inline(never)]
+    fn jump_to(&mut self, id: Var, args: &[L4<'gc>]) -> Result<(), Stop> {
+        let params = self.joins.get(&id).map(|join| join.params.clone()).ok_or(CompileError::Unbound(id))?;
+        self.emit_recur(&params, args)?;
+        let at = self.jump(Op::Jump { offset: 0 });
+        self.joins.get_mut(&id).ok_or(CompileError::Unbound(id))?.jumps.push(at);
+        Ok(())
+    }
+
     fn list(&mut self, base: VReg, n: usize, tail: Option<VReg>) -> Result<u8, Stop> {
         let list = SCRATCH + 1;
         match tail {
@@ -1085,6 +1135,17 @@ fn l4_always_recurs<'gc>(expr: &L4<'gc>) -> bool {
     }
 }
 
+/// Whether `expr` never finishes where it is, always jumping to a loop's start or a join.
+fn l4_leaves<'gc>(expr: &L4<'gc>) -> bool {
+    match expr {
+        L4::Recur(_, _) | L4::Jump(_, _) => true,
+        L4::Seq(_, b) | L4::Let(_, b) | L4::Fix(_, b) | L4::Loop { body: b, .. } => l4_leaves(b),
+        L4::If(_, then, other) => l4_leaves(then) && l4_leaves(other),
+        L4::Join { body, scope, .. } => l4_leaves(body) && l4_leaves(scope),
+        _ => false,
+    }
+}
+
 fn l4_clobbers_self<'gc>(arg: &L4<'gc>, param_var: Var) -> bool {
     l4_reads_local(arg, param_var)
         && !matches!(arg, L4::Intrinsic(_, _) | L4::ApplyIntrinsic(_, _) | L4::App(_, _))
@@ -1137,9 +1198,10 @@ fn l4_reads_local<'gc>(expr: &L4<'gc>, target: Var) -> bool {
                 .any(|(_, clos)| clos.captures.contains(&UpvalSource::Local(target)))
                 || l4_reads_local(body, target)
         }
-        L4::Recur(_, args) | L4::Intrinsic(_, args) | L4::ApplyIntrinsic(_, args) => {
+        L4::Recur(_, args) | L4::Jump(_, args) | L4::Intrinsic(_, args) | L4::ApplyIntrinsic(_, args) => {
             args.iter().any(|a| l4_reads_local(a, target))
         }
+        L4::Join { body, scope, .. } => l4_reads_local(body, target) || l4_reads_local(scope, target),
         L4::App(f, args) => l4_reads_local(f, target) || args.iter().any(|a| l4_reads_local(a, target)),
         L4::Lambda(clos) => clos.captures.contains(&UpvalSource::Local(target)),
     }

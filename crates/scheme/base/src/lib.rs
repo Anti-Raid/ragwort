@@ -30,6 +30,7 @@ mod convert;
 mod derived;
 mod expand;
 mod formals;
+mod matching;
 mod scope;
 mod transformer;
 mod tree;

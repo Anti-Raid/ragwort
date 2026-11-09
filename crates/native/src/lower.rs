@@ -250,9 +250,10 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             return Ok(RequireSpec::Module(name, spec));
         }
         let items = self.list(spec)?;
-        let word = items.first().and_then(|&head| self.text(head).filter(|_| head.kind(self.mc) == Some(SyntaxKind::Identifier)));
+        let Some((&head, args)) = items.split_first() else { return Err(self.error(LowerErrorKind::BadShape, spec)) };
+        let word = self.text(head).filter(|_| head.kind(self.mc) == Some(SyntaxKind::Identifier));
         let named = |n: &Syntax<'gc>| -> Result<(String, Syntax<'gc>), LowerError> { Ok((self.identifier(*n)?, *n)) };
-        Ok(match (word.as_deref(), &items[1..]) {
+        Ok(match (word.as_deref(), args) {
             (Some("only-in"), &[inner, ref names @ ..]) => RequireSpec::Only(Box::new(self.spec(inner)?), names.iter().map(named).collect::<Result<_, _>>()?),
             (Some("except-in"), &[inner, ref names @ ..]) => RequireSpec::Except(Box::new(self.spec(inner)?), names.iter().map(named).collect::<Result<_, _>>()?),
             (Some("prefix-in"), &[prefix, inner]) => RequireSpec::Prefix(self.identifier(prefix)?, Box::new(self.spec(inner)?)),
@@ -271,8 +272,9 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             return builder.provide(&name, spec.datum(self.mc)).map_err(|e| self.module_error(e, spec));
         }
         let items = self.list(spec)?;
-        let word = items.first().filter(|head| head.kind(self.mc) == Some(SyntaxKind::Identifier)).and_then(|&head| self.text(head));
-        match (word.as_deref(), &items[1..]) {
+        let Some((&head, args)) = items.split_first() else { return Err(self.error(LowerErrorKind::BadShape, spec)) };
+        let word = if head.kind(self.mc) == Some(SyntaxKind::Identifier) { self.text(head) } else { None };
+        match (word.as_deref(), args) {
             (Some("all-defined-out"), []) => builder.provide_all(self.mc).map_err(|e| self.module_error(e, spec)),
             (Some("rename-out"), renames) => {
                 for &rename in renames {
@@ -316,6 +318,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             ModuleError::Duplicate => LowerErrorKind::Duplicate,
             ModuleError::Conflict => LowerErrorKind::Conflict,
             ModuleError::NotDefined => LowerErrorKind::NotDefined,
+            ModuleError::Immutable => LowerErrorKind::Immutable,
             ModuleError::OutOfMemory => OutOfMemory.into(),
         };
         self.error(kind, node)
@@ -541,7 +544,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         match self.resolve(builder, name)? {
             Ok(var) => Ok(Place::Local(var)),
             Err(Binding::Slot(slot)) => {
-                builder.assign(slot);
+                builder.assign(slot).map_err(|e| self.module_error(e, name))?;
                 Ok(builder.place(slot, self.top, self.defining))
             }
             Err(Binding::Import(_)) => Err(self.error(LowerErrorKind::Immutable, name)),

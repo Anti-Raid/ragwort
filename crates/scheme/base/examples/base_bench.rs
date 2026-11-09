@@ -173,6 +173,11 @@ fn main() {
     ] {
         println!("{name:<30} {:.1} ns per iteration", per(time(&loop_on(body), false, true)));
     }
+    let command = |body: &str| format!("(define cmd '(\"!echo\" \"a\" \"b\")) (define (count n acc) (if (eqv? n 0) acc (count (- n 1) (+ acc {body})))) (count {N} 0)");
+    let matched = r#"(match cmd [(list "!ping") 1] [(list "!echo" args ...) (length args)] [_ 0])"#;
+    let by_hand = r#"(cond [(and (pair? cmd) (equal? (car cmd) "!ping") (null? (cdr cmd))) 1] [(and (pair? cmd) (equal? (car cmd) "!echo")) (length (cdr cmd))] [else 0])"#;
+    println!("command by match:              {:.1} ns per iteration", per(time(&command(matched), false, true)));
+    println!("command by cond:               {:.1} ns per iteration", per(time(&command(by_hand), false, true)));
     let defs = "(define (pf a b) (+ a b)) (define (of a [b 1]) (+ a b)) (define (kf a #:b [b 1]) (+ a b))
                 (define kv (let ([f (lambda (a #:b [b 1]) (+ a b))]) f))";
     let summing = |call: &str| format!("{defs} (define (count n acc) (if (eqv? n 0) acc (count (- n 1) (+ acc {call})))) (count {N} 0)");

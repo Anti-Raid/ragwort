@@ -791,7 +791,7 @@ impl Intrinsic {
                 return Err(Fault::Arity);
             }
             Intrinsic::StringEq | Intrinsic::StringLt | Intrinsic::StringGt | Intrinsic::StringLe | Intrinsic::StringGe => {
-                boolean(compare_strings(mc, self, (0..args).map(&arg))?)
+                boolean(compare_strings(mc, self, (0..args).map(&arg), fuel)?)
             }
             Intrinsic::StringJoin if !(1..=2).contains(&args) => return Err(Fault::Arity),
             Intrinsic::StringJoin => string_join(mc, arg(0), (args == 2).then(|| arg(1)), fuel)?,
@@ -1214,8 +1214,9 @@ fn string_join<'gc>(mc: &Mutation<'gc>, strs: Value<'gc>, sep: Option<Value<'gc>
     Ok(made(mc, fuel, joined.value()))
 }
 
-/// Whether each of `xs` is as `op` says of the next, all of them strings.
-fn compare_strings<'gc>(mc: &Mutation<'gc>, op: Intrinsic, xs: impl Iterator<Item = Value<'gc>>) -> Result<bool, Fault> {
+/// Whether each of `xs` is as `op` says of the next, all of them strings. Each pair compared is
+/// charged for the shorter one's characters first, as many as the comparison can look at.
+fn compare_strings<'gc>(mc: &Mutation<'gc>, op: Intrinsic, xs: impl Iterator<Item = Value<'gc>>, fuel: &mut Fuel) -> Result<bool, Fault> {
     let strings = Strings::new(mc);
     let (mut before, mut so_far) = (None, true);
     for x in xs {
@@ -1223,6 +1224,7 @@ fn compare_strings<'gc>(mc: &Mutation<'gc>, op: Intrinsic, xs: impl Iterator<Ite
         if let Some(b) = before
             && so_far
         {
+            fuel.spend(string::len(&strings, b).min(string::len(&strings, x)) as u64 / equal::PER_FUEL)?;
             so_far = match op {
                 Intrinsic::StringEq => string::equal(&strings, b, x)?,
                 Intrinsic::StringLt => string::compare(&strings, b, x)?.is_lt(),

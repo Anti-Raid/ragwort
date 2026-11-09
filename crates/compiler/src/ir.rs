@@ -182,6 +182,15 @@ pub enum L4<'gc> {
     },
     /// A tail-recursive jump back to the enclosing `Loop` `id` with updated parameter values.
     Recur(Var, Vec<L4<'gc>>),
+    /// `scope`, in which [`L4::Jump`]s to `id` go to `body` with `params` bound to their values.
+    Join {
+        id: Var,
+        params: Vec<Var>,
+        body: Box<L4<'gc>>,
+        scope: Box<L4<'gc>>,
+    },
+    /// A jump to the enclosing `Join` `id` with values for its parameters.
+    Jump(Var, Vec<L4<'gc>>),
     App(Box<L4<'gc>>, Vec<L4<'gc>>),
     Lambda(Closure<'gc>),
     Intrinsic(Prim, Vec<L4<'gc>>),

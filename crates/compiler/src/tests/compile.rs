@@ -197,6 +197,55 @@ fn letrec_and_tail_calls() {
     );
 }
 
+/// `(lambda (a) (+ (+ a x) (+ (+ a a) (+ x x))))`, with `x` variable 0: too big to inline at
+/// each call.
+fn big<'gc>(a: u32) -> Core<'gc> {
+    lambda(&[a], None, add(add(var(a), var(0)), add(add(var(a), var(a)), add(var(0), var(0)))))
+}
+
+#[test]
+fn lambdas_only_called_in_tail_position_are_jumps() {
+    // `(letrec ((f (lambda (x) body))) (f 0), (f 1) and (f 2))`, as one number in base 1000, and
+    // how many closures `f` makes.
+    fn check(name: &str, body: impl for<'gc> Fn(&Mutation<'gc>) -> Core<'gc>, expect: i64, closures: usize) {
+        let mut arena = Arena::new(1 << 24, 0);
+        arena.mutate(|mc| {
+            let call = |n| app(var(9), vec![q(n)]);
+            let all = add(prim(Intrinsic::Mul, vec![call(0), q(1_000_000)]), add(prim(Intrinsic::Mul, vec![call(1), q(1000)]), call(2)));
+            let thunk = compile(mc, None, &letrec(vec![(9, lambda(&[0], None, body(mc)))], all)).unwrap();
+            let ops = all_ops(mc, thunk);
+            let made = ops.iter().filter(|op| matches!(op, Op::NewClosure { .. })).count();
+            assert_eq!(made, closures, "{name}: {ops:?}");
+            let mut machine = Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap();
+            let Outcome::Done(value) = machine.run(mc).unwrap() else { panic!("{name}") };
+            assert_eq!(value.as_fixnum(), Some(expect), "{name}");
+        });
+    }
+    // `(let ((k big)) (if (eq? x 0) (k 1) (if (eq? x 1) (k 2) other)))`; `(k a)` is `3a + 3x`.
+    fn branches<'gc>(k: Core<'gc>, other: Core<'gc>) -> Core<'gc> {
+        let_(vec![(1, k)], when(eq(var(0), q(0)), app(var(1), vec![q(1)]), when(eq(var(0), q(1)), app(var(1), vec![q(2)]), other)))
+    }
+    check("tail", |_| branches(big(2), q(5)), 3_009_005, 0);
+    // In the `let`'s tail position, not the function's.
+    check("in an argument", |_| add(q(100), branches(big(2), q(5))), 103_109_105, 0);
+    // `(let loop ((n x)) (let ((k (lambda (m) (if (eq? m 0) 7 (loop (+ m -1)))))) (if (eq? n 0)
+    // (k 0) (k n))))`: a loop's body jumps to a join, and the join to the loop.
+    check(
+        "with a loop",
+        |_| {
+            let k = lambda(&[3], None, when(eq(var(3), q(0)), q(7), app(var(4), vec![add(var(3), q(-1))])));
+            let body = let_(vec![(5, k)], when(eq(var(6), q(0)), app(var(5), vec![q(0)]), app(var(5), vec![var(6)])));
+            letrec(vec![(4, lambda(&[6], None, body))], app(var(4), vec![var(0)]))
+        },
+        7_007_007,
+        0,
+    );
+    // A lambda that escapes, or that's called other than in tail position, is a closure.
+    // `(let ((y 0)) (set! y k) (y 2))`.
+    check("escaping", |_| branches(big(2), let_(vec![(3, q(0))], seq(10, set(3, var(1)), app(var(3), vec![q(2)])))), 3_009_012, 1);
+    check("not in tail position", |_| branches(big(2), add(q(1), app(var(1), vec![q(2)]))), 3_009_013, 1);
+}
+
 #[test]
 fn rest_parameters() {
     // ((lambda (a . rest) (cons a rest)) 1 2 3)
@@ -871,7 +920,7 @@ fn exporting_with<'gc>(mc: &Mutation<'gc>, hosts: &'static [HostDef], imports: &
         let slot = slot as u32;
         builder.defined(slot, &value);
         if assigned {
-            builder.assign(slot);
+            builder.assign(slot).unwrap();
         }
         let thunk = builder.compile(mc, &Core::Set(Place::Slot { slot, checked: false }, Box::new(value))).unwrap();
         run_to_end(mc, thunk).unwrap();

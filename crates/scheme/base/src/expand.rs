@@ -69,6 +69,7 @@ pub(crate) enum Macro {
     WithMark,
     SyntaxRules,
     WithSyntax,
+    Match,
     /// A `let` with a name, which nothing binds by itself.
     NamedLet,
 }
@@ -91,7 +92,7 @@ pub(crate) enum Keyword {
     Aux(Aux),
 }
 
-const KEYWORDS: [(&str, Keyword); 39] = [
+const KEYWORDS: [(&str, Keyword); 40] = [
     ("quote", Keyword::Form(Form::Quote)),
     ("if", Keyword::Form(Form::If)),
     ("lambda", Keyword::Form(Form::Lambda)),
@@ -113,6 +114,7 @@ const KEYWORDS: [(&str, Keyword); 39] = [
     ("unsyntax", Keyword::Form(Form::Unsupported)),
     ("unsyntax-splicing", Keyword::Form(Form::Unsupported)),
     ("syntax-rules", Keyword::Macro(Macro::SyntaxRules)),
+    ("match", Keyword::Macro(Macro::Match)),
     ("with-syntax", Keyword::Macro(Macro::WithSyntax)),
     ("let*", Keyword::Macro(Macro::LetStar)),
     ("and", Keyword::Macro(Macro::And)),
@@ -383,8 +385,9 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                     continue;
                 }
                 let items = self.proper(spec)?;
-                let word = items.first().filter(|&&head| self.is_id(head)).and_then(|&head| self.text(head));
-                match (word.as_deref(), &items[1..]) {
+                let Some((&head, args)) = items.split_first() else { return Err(self.error(ExpandErrorKind::BadSyntax, spec)) };
+                let word = if self.is_id(head) { self.text(head) } else { None };
+                match (word.as_deref(), args) {
                     (Some("all-defined-out"), []) => self.builder.provide_all(self.mc).map_err(|e| self.module_error(e, spec))?,
                     (Some("rename-out"), renames) => {
                         for &rename in renames {
@@ -406,11 +409,12 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             return Ok(RequireSpec::Module(name, spec));
         }
         let items = self.proper(spec)?;
-        let word = items.first().filter(|&&head| self.is_id(head)).and_then(|&head| self.text(head));
+        let Some((&head, args)) = items.split_first() else { return Err(self.error(ExpandErrorKind::BadSyntax, spec)) };
+        let word = if self.is_id(head) { self.text(head) } else { None };
         let named = |this: &mut Self, ids: &[Stx]| -> Result<Vec<(String, Stx)>, ExpandError> {
             ids.iter().map(|&id| Ok((this.identifier(id)?, id))).collect()
         };
-        Ok(match (word.as_deref(), &items[1..]) {
+        Ok(match (word.as_deref(), args) {
             (Some("only-in"), &[inner, ref ids @ ..]) => RequireSpec::Only(Box::new(self.spec(inner)?), named(self, ids)?),
             (Some("except-in"), &[inner, ref ids @ ..]) => RequireSpec::Except(Box::new(self.spec(inner)?), named(self, ids)?),
             (Some("prefix-in"), &[prefix, inner]) => RequireSpec::Prefix(self.identifier(prefix)?, Box::new(self.spec(inner)?)),
@@ -459,6 +463,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             ModuleError::Duplicate => ExpandErrorKind::Duplicate,
             ModuleError::Conflict => ExpandErrorKind::Conflict,
             ModuleError::NotDefined => ExpandErrorKind::NotDefined,
+            ModuleError::Immutable => ExpandErrorKind::Immutable,
             ModuleError::OutOfMemory => OutOfMemory.into(),
         };
         self.error(kind, stx)
@@ -779,12 +784,12 @@ impl<'a, 'gc> Expander<'a, 'gc> {
 
     fn set(&mut self, id: Stx, value: Stx) -> Result<Core<'gc>, ExpandError> {
         let place = match self.resolve(id)? {
-            // Calls of a keyword procedure a definition made go to its core, as if it can't change.
+            // Calls of a keyword procedure a definition made go to its core, as if it can't change:
+            // the module builder rules out assigning a module variable that is one.
             Binding::Local(var) if self.keyword_defs.contains_key(&Def::Local(var)) => return Err(self.error(ExpandErrorKind::Immutable, id)),
-            Binding::Slot(slot) if self.keyword_defs.contains_key(&Def::Slot(slot)) => return Err(self.error(ExpandErrorKind::Immutable, id)),
             Binding::Local(var) => Place::Local(var),
             Binding::Slot(slot) => {
-                self.builder.assign(slot);
+                self.builder.assign(slot).map_err(|e| self.module_error(e, id))?;
                 self.builder.place(slot, self.form, self.defining)
             }
             Binding::Import(_) => return Err(self.error(ExpandErrorKind::Immutable, id)),

@@ -1048,6 +1048,76 @@ fn keyword_apply_and_procedure_keywords() {
 }
 
 #[test]
+fn match_takes_the_first_clause_that_matches() {
+    assert_eq!(eval("(match 5 [1 'one] [5 'five] [_ 'other])"), "five");
+    assert_eq!(eval("(match '(1 2) [(list a b c) 'three] [(list a b) (list b a)])"), "(2 1)");
+    assert_eq!(eval("(match \"hi\" [\"no\" 1] [\"hi\" 2])"), "2");
+    assert_eq!(eval("(list (match 'x ['x 1]) (match '() [() 2]) (match '#:k [#:k 3]) (match #(1 2) [#(1 2) 4]))"), "(1 2 3 4)");
+    assert_eq!(eval("(match '(1 . 2) [(cons a b) (list a b)])"), "(1 2)");
+    assert_eq!(eval("(match '(1 2 3 4) [(list-rest a b r) (list a b r)])"), "(1 2 (3 4))");
+    assert_eq!(eval("(match (vector 1 2) [(vector a) 1] [(vector a b) (+ a b)])"), "3");
+    assert_eq!(eval("(match '(1 (2 3)) [(list x (list y z)) (match x [1 (+ y z)])])"), "5");
+    // A variable bound twice matches what's equal? to what it's bound to first.
+    assert_eq!(eval("(list (match '(1 1) [(list a a) 'same] [_ 'diff]) (match '(1 2) [(list a a) 'same] [_ 'diff]))"), "(same diff)");
+    // Clauses are in tail position.
+    assert_eq!(eval("(define (count n) (match n [0 'done] [n (count (- n 1))])) (count 100000)"), "done");
+    assert_eq!(eval("(define (len l) (match l [() 0] [(cons _ r) (+ 1 (len r))])) (len '(1 2 3 4))"), "4");
+}
+
+#[test]
+fn match_repeats_the_last_pattern_of_a_list() {
+    assert_eq!(eval(r#"(match '("!ping" "a" "b") [(list "!ping" args ...) args])"#), r#"("a" "b")"#);
+    assert_eq!(eval("(match '((1 2) (3 4)) [(list (list a b) ...) (list a b)])"), "((1 3) (2 4))");
+    assert_eq!(eval("(match '(1 (2 3) (4 5)) [(list x (list ys zs) ...) (list x ys zs)])"), "(1 (2 4) (3 5))");
+    assert_eq!(eval("(list (match '() [(list x ...) x]) (match '(1 . 2) [(list x ...) x] [_ 'improper]))"), "(() improper)");
+    assert_eq!(eval("(match (vector 1 2) [(list x ...) x] [_ 'not-a-list])"), "not-a-list");
+    assert_eq!(error("(match '(1 2) [(list x ... y) x])"), (Unsupported, "..."));
+    assert_eq!(error("(match '(1 2) [(list ... x) x])"), (BadSyntax, "..."));
+    assert_eq!(error("(match '(1 2) [(list a (list a ...)) a])"), (Duplicate, "a"));
+}
+
+#[test]
+fn match_clauses_share_what_they_start_by_looking_at() {
+    let each = |clauses: &str, values: &str| eval(&format!("(map (lambda (v) (match v {clauses})) '{values})"));
+    let lists = "[(list 1 a) (list 'one a)] [(list 2 a) (list 'two a)] [(cons x _) (list 'pair x)] [_ 'other]";
+    assert_eq!(each(lists, "((1 5) (2 6) (3 7) (1 2 3) (2) 9)"), "((one 5) (two 6) (pair 3) (pair 1) (pair 2) other)");
+    let vectors = "[(vector 1 b) (list 'one b)] [(vector a b) (list a b)] [(vector a) (list a)] [_ 'other]";
+    assert_eq!(each(vectors, "(#(1 2) #(3 4) #(5) #(1 2 3) (1 2))"), "((one 2) (3 4) (5) other other)");
+    let guarded = "[(list a b) #:when (> a b) 'more] [(list a b) (=> next) (if (eqv? a b) (next) 'less)] [(list _ _) 'same] [_ 'other]";
+    assert_eq!(each(guarded, "((2 1) (1 2) (3 3) (1))"), "(more less same other)");
+    // The pattern's variables are bound in the body, not in its expressions.
+    assert_eq!(eval("(let ([a 10]) (match '(1 2) [(list a (? (lambda (y) (> y a)))) 'more] [_ 'not]))"), "not");
+    assert_eq!(eval("(map (lambda (v) (match v [(list (or (list a _) a) a) a] [_ 'no])) '(((1 2) 1) (1 1) ((3 2) 1)))"), "(1 1 no)");
+    assert_eq!(eval("(match '((1 2) (3 4)) [(list (list a b) ...) #:when (equal? a '(1 3)) b])"), "(2 4)");
+}
+
+#[test]
+fn match_patterns_combine() {
+    assert_eq!(eval("(list (match 4 [(? pair? n) 'pair] [n 'other]) (match '(1) [(? pair? (list n)) n]))"), "(other 1)");
+    assert_eq!(eval("(match '(1 2) [(or (list a 1) (list a 2)) a])"), "1");
+    assert_eq!(eval("(match 5 [(and n (not (? pair?) 3)) (list 'neither n)])"), "(neither 5)");
+    assert_eq!(eval("(match 3 [(not 3) 'not-three] [_ 'three])"), "three");
+    assert_eq!(eval("(match '(1 2) [(app length 2) 'two])"), "two");
+    // As in Racket, `(== v same?)` is true of `x` if `(same? v x)` is.
+    assert_eq!(eval("(list (match 7 [(== 7) 'seven]) (match 7 [(== 8 <) 'less] [_ 'not]) (match 7 [(== 8 >) 'more]))"), "(seven not more)");
+    assert_eq!(error("(match '(1 2) [(or (list a) (list a b)) a])"), (BadSyntax, "(list a b)"));
+    assert_eq!(error("(match 1 [`(a) 1])"), (Unsupported, "`(a)"));
+    assert_eq!(error("(match 1 [(lister a) 1])"), (BadSyntax, "(lister a)"));
+}
+
+#[test]
+fn match_guards_and_escapes_go_on_to_the_next_clause() {
+    assert_eq!(eval("(map (lambda (n) (match n [n #:when (> n 10) 'big] [n 'small])) '(5 50))"), "(small big)");
+    assert_eq!(eval("(match 5 [n (=> skip) (if (eqv? n 5) (skip) 'kept)] [_ 'skipped])"), "skipped");
+    let caught = "(guard (e (#t (list (error-object-kind e) (error-object-message e) (error-object-irritants e)))) (match 9 [1 1]))";
+    assert_eq!(eval(caught), r#"(error "match: no matching clause for" (9))"#);
+    let none = "(guard (e (#t (error-object-irritants e))) (match 1))";
+    assert_eq!(eval(none), "(1)");
+    assert_eq!(error("(match 1 [x #:when])"), (BadSyntax, "[x #:when]"));
+    assert_eq!(error("(match 1 [x])"), (BadSyntax, "[x]"));
+}
+
+#[test]
 fn vm_faults_and_errors_are_error_objects() {
     let caught = |body: &str| {
         eval(&format!(
@@ -1266,3 +1336,14 @@ mod macros;
 
 #[path = "modules.rs"]
 mod modules;
+
+#[test]
+fn leak_scratch() {
+    for t in [
+        "(let ([a 10]) (match '(1 2) [(list (or a a) (? (lambda (y) (> y a)))) 'more] [_ 'not]))",
+        "(let ([a 10]) (match '(((1)) 2) [(list (list (list a) ...) (? (lambda (y) (> y a)))) 'more] [_ 'not]))",
+        "(let ([a 10]) (match '(1 2) [(not (list a (? (lambda (y) (> y a))))) 'not-list] [_ 'list]))",
+    ] {
+        eprintln!("{t} => {:?}", std::panic::catch_unwind(|| eval(t)));
+    }
+}

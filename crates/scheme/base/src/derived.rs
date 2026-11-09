@@ -91,6 +91,7 @@ impl<'gc> Expander<'_, 'gc> {
                 Some(built) => Ok(built),
                 None => self.quoted(template, stx),
             },
+            (Macro::Match, &[e, ref clauses @ ..]) => self.match_form(stx, e, clauses),
             (Macro::NamedLet, &[name, binds, ref body @ ..]) => {
                 let (vars, inits) = self.bindings_of(binds)?;
                 let formals = self.list(&vars, stx)?;
@@ -105,27 +106,27 @@ impl<'gc> Expander<'_, 'gc> {
     }
 
     /// `(name part ...)`, `name` introduced, with the parts of each of `parts` in order.
-    fn build(&mut self, at: Stx, name: &str, parts: &[&[Stx]]) -> Result<Stx, ExpandError> {
+    pub(crate) fn build(&mut self, at: Stx, name: &str, parts: &[&[Stx]]) -> Result<Stx, ExpandError> {
         let head = self.introduce(name, at)?;
         self.list(&[&[head], parts.concat().as_slice()].concat(), at)
     }
 
-    fn list(&mut self, items: &[Stx], at: Stx) -> Result<Stx, ExpandError> {
+    pub(crate) fn list(&mut self, items: &[Stx], at: Stx) -> Result<Stx, ExpandError> {
         let span = self.tree.span(at);
         Ok(self.tree.list(items, None, span)?)
     }
 
-    fn value(&mut self, value: Value<'gc>, at: Stx) -> Result<Stx, ExpandError> {
+    pub(crate) fn value(&mut self, value: Value<'gc>, at: Stx) -> Result<Stx, ExpandError> {
         let span = self.tree.span(at);
         Ok(self.tree.datum(value, span)?)
     }
 
-    fn quoted(&mut self, datum: Stx, at: Stx) -> Result<Stx, ExpandError> {
+    pub(crate) fn quoted(&mut self, datum: Stx, at: Stx) -> Result<Stx, ExpandError> {
         self.build(at, "quote", &[&[datum]])
     }
 
     /// `(let ((t value)) body)`.
-    fn with_temp(&mut self, at: Stx, t: Stx, value: Stx, body: Stx) -> Result<Stx, ExpandError> {
+    pub(crate) fn with_temp(&mut self, at: Stx, t: Stx, value: Stx, body: Stx) -> Result<Stx, ExpandError> {
         let bind = self.list(&[t, value], at)?;
         let binds = self.list(&[bind], at)?;
         self.build(at, "let", &[&[binds, body]])

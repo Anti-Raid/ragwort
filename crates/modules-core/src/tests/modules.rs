@@ -119,6 +119,17 @@ fn a_modules_files_are_one_body_across_languages() {
 }
 
 #[test]
+fn no_language_assigns_a_keyword_procedure() {
+    // Scheme calls of it go to its core, so assigning it would leave them calling the old one.
+    let mut arena = arena();
+    let native = module_in(&mut arena, "main", &[(Scheme, "(define (f #:k k) k)"), (Native, "(%set! f 1)")]);
+    assert!(matches!(native, Err(Error::Lower(e)) if e.kind == ragwort_native::LowerErrorKind::Immutable), "{native:?}");
+    let scheme = module_in(&mut arena, "main", &[(Scheme, "(define (f #:k k) k) (set! f 1)")]);
+    assert!(matches!(scheme, Err(Error::Expand(e)) if e.kind == ragwort_scheme::ExpandErrorKind::Immutable), "{scheme:?}");
+    assert_eq!(module_in(&mut arena, "main", &[(Scheme, "(define (f k) k)"), (Native, "(%set! f 1) f")]), Ok(Ok("1".into())));
+}
+
+#[test]
 fn errors_say_which_language_they_are_in() {
     let mut arena = arena();
     let scheme = module_in(&mut arena, "main", &[(Scheme, "(define x"), (Native, "1")]);
@@ -127,4 +138,11 @@ fn errors_say_which_language_they_are_in() {
     assert!(matches!(native, Err(Error::Lower(e)) if e.kind == ragwort_native::LowerErrorKind::NotAForm), "{native:?}");
     let expand = module_in(&mut arena, "main", &[(Native, "1"), (Scheme, "(if)")]);
     assert!(matches!(expand, Err(Error::Expand(_))), "{expand:?}");
+    // An empty require or provide spec is bad syntax, in either language.
+    for text in ["(require ())", "(provide ())"] {
+        let scheme = module_in(&mut arena, "main", &[(Scheme, text)]);
+        assert!(matches!(scheme, Err(Error::Expand(e)) if e.kind == ragwort_scheme::ExpandErrorKind::BadSyntax), "{text}: {scheme:?}");
+        let native = module_in(&mut arena, "main", &[(Native, &format!("(%{})", &text[1..text.len() - 1]))]);
+        assert!(matches!(native, Err(Error::Lower(e)) if e.kind == ragwort_native::LowerErrorKind::BadShape), "{text}: {native:?}");
+    }
 }
