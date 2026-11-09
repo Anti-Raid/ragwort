@@ -32,6 +32,22 @@ impl<'gc> Bytevector<'gc> {
         items.set(mc, index / 8, word);
         true
     }
+
+    /// Sets the `size` bytes from `index`, 1 to 8, to `value`'s low ones, least significant
+    /// first, or returns `false` if they're not all there.
+    pub fn set_uint(self, mc: &Mutation<'gc>, index: usize, size: usize, value: u64) -> bool {
+        if index.checked_add(size).is_none_or(|end| end as u64 > self.0.bytes(mc)) {
+            return false;
+        }
+        let (items, at, shift, mask) = (self.0.items(mc), index / 8, index % 8 * 8, low_bytes(size));
+        let value = value & mask;
+        items.set(mc, at, items.get(at) & !(mask << shift) | value << shift);
+        if shift + size * 8 > 64 {
+            let rest = 64 - shift;
+            items.set(mc, at + 1, items.get(at + 1) & !(mask >> rest) | value >> rest);
+        }
+        true
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -86,6 +102,20 @@ impl<'gc> AnyBytevector<'gc> {
     #[inline]
     pub fn get(self, mc: &Mutation<'gc>, index: usize) -> Option<u8> {
         (index < self.len(mc)).then(|| (self.word(mc, index / 8) >> (index % 8 * 8)) as u8)
+    }
+
+    /// The `size` bytes from `index`, 1 to 8, least significant first, if they're all there.
+    #[inline]
+    pub fn get_uint(self, mc: &Mutation<'gc>, index: usize, size: usize) -> Option<u64> {
+        if index.checked_add(size)? > self.len(mc) {
+            return None;
+        }
+        let (at, shift) = (index / 8, index % 8 * 8);
+        let mut value = self.word(mc, at) >> shift;
+        if shift + size * 8 > 64 {
+            value |= self.word(mc, at + 1) << (64 - shift);
+        }
+        Some(value & low_bytes(size))
     }
 
     pub fn to_vec(self, mc: &Mutation<'gc>) -> Vec<u8> {
@@ -144,6 +174,11 @@ impl<'a, 'gc> Bytevectors<'a, 'gc> {
         pack(bytes, |i, w| v.items(self.mc).set(self.mc, i, w));
         Ok(AnyBytevector::Immutable(ImmutableBytevector(v)))
     }
+}
+
+/// A mask of the low `size` bytes of a word, `size` 1 to 8.
+fn low_bytes(size: usize) -> u64 {
+    u64::MAX >> (64 - size * 8)
 }
 
 fn pack(bytes: &[u8], mut set: impl FnMut(usize, u64)) {

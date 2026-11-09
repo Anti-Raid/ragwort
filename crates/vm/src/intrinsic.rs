@@ -226,10 +226,13 @@ named! {
         MakeBytevector = "make-bytevector",
         /// `(bytevector-length bv)`.
         BytevectorLength = "bytevector-length",
-        /// `(bytevector-u8-ref bv k)`.
-        BytevectorRef = "bytevector-u8-ref",
-        /// `(bytevector-u8-set! bv k byte)` of a mutable bytevector, returning void.
-        BytevectorSet = "bytevector-u8-set!",
+        /// `(bytevector-int-ref bv k big kind)`: the integer in the bytes from `k`, most
+        /// significant first if `big` is `#t` or last if it's `#f`. `kind` is how many bytes, 1 to
+        /// 8, negated if the integer is signed.
+        BytevectorRef = "bytevector-int-ref",
+        /// `(bytevector-int-set! bv k n big kind)` of a mutable bytevector, `n` an exact integer
+        /// that fits, returning void.
+        BytevectorSet = "bytevector-int-set!",
         /// `vector?`.
         IsVector = "vector?",
         /// `(make-vector k [fill])`: a mutable vector of `k` copies of `fill`, or of 0.
@@ -384,8 +387,9 @@ impl Intrinsic {
             Intrinsic::IsSyntax | Intrinsic::IsIdentifier | Intrinsic::SyntaxE | Intrinsic::SyntaxToDatum => Some(1),
             Intrinsic::DatumToSyntax | Intrinsic::BoundIdentifierEq | Intrinsic::FreeIdentifierEq | Intrinsic::GenerateTemporaries | Intrinsic::SyntaxMatch => Some(2),
             Intrinsic::Caar | Intrinsic::Cadr | Intrinsic::Cdar | Intrinsic::Cddr | Intrinsic::Caaar | Intrinsic::Caadr | Intrinsic::Cadar | Intrinsic::Caddr | Intrinsic::Cdaar | Intrinsic::Cdadr | Intrinsic::Cddar | Intrinsic::Cdddr | Intrinsic::Caaaar | Intrinsic::Caaadr | Intrinsic::Caadar | Intrinsic::Caaddr | Intrinsic::Cadaar | Intrinsic::Cadadr | Intrinsic::Caddar | Intrinsic::Cadddr | Intrinsic::Cdaaar | Intrinsic::Cdaadr | Intrinsic::Cdadar | Intrinsic::Cdaddr | Intrinsic::Cddaar | Intrinsic::Cddadr | Intrinsic::Cdddar | Intrinsic::Cddddr => Some(1),
-            Intrinsic::BytevectorRef | Intrinsic::ListTail | Intrinsic::ListRef | Intrinsic::Memq | Intrinsic::Memv | Intrinsic::Member | Intrinsic::Assq | Intrinsic::Assv | Intrinsic::Assoc => Some(2),
-            Intrinsic::BytevectorSet => Some(3),
+            Intrinsic::BytevectorRef => Some(4),
+            Intrinsic::ListTail | Intrinsic::ListRef | Intrinsic::Memq | Intrinsic::Memv | Intrinsic::Member | Intrinsic::Assq | Intrinsic::Assv | Intrinsic::Assoc => Some(2),
+            Intrinsic::BytevectorSet => Some(5),
             Intrinsic::Cons | Intrinsic::Eq | Intrinsic::Eqv | Intrinsic::Equal | Intrinsic::SetBox | Intrinsic::ValuesRef | Intrinsic::MakeWinder | Intrinsic::ModuleRef => Some(2),
         }
     }
@@ -874,15 +878,27 @@ impl Intrinsic {
             Intrinsic::BitwiseNot | Intrinsic::ArithmeticShift | Intrinsic::BitField | Intrinsic::BitFieldReplace => {
                 let h = Nums::new(mc);
                 let n = h.integer(arg(0)).ok_or(Fault::WrongType)?;
+                let (len, negative) = (int::integer_length(&h, n), int::sign(&h, n) == Ordering::Less);
                 let made_of = match self {
                     Intrinsic::BitwiseNot => int::bitwise_not(&h, n)?,
-                    Intrinsic::ArithmeticShift => int::arithmetic_shift(&h, n, arg(1).as_fixnum().ok_or(Fault::WrongType)?)?,
+                    Intrinsic::ArithmeticShift => {
+                        let count = arg(1).as_fixnum().ok_or(Fault::WrongType)?;
+                        // 0 stays 0, though -1, as long, doesn't.
+                        if n.value() != fixnum(0) {
+                            charge_bits(mc, fuel, len.saturating_add(count.max(0) as u64))?;
+                        }
+                        int::arithmetic_shift(&h, n, count)?
+                    }
                     Intrinsic::BitField => {
                         let (start, end) = bit_range(arg(1), arg(2))?;
+                        charge_bits(mc, fuel, if negative { end - start } else { len.saturating_sub(start).min(end - start) })?;
                         int::bit_field(&h, n, start, end)?
                     }
                     _ => {
                         let (source, (start, end)) = (h.integer(arg(1)).ok_or(Fault::WrongType)?, bit_range(arg(2), arg(3))?);
+                        let field = if int::sign(&h, source) == Ordering::Less { end - start } else { int::integer_length(&h, source).min(end - start) };
+                        let bits = if negative { end } else if field == 0 { len } else { len.max(start + field) };
+                        charge_bits(mc, fuel, bits)?;
                         int::bit_field_replace(&h, n, source, start, end)?
                     }
                 };
@@ -891,12 +907,22 @@ impl Intrinsic {
             Intrinsic::IntegerLength | Intrinsic::BitCount => {
                 let h = Nums::new(mc);
                 let n = h.integer(arg(0)).ok_or(Fault::WrongType)?;
-                let bits = if self == Intrinsic::IntegerLength { int::integer_length(&h, n) } else { int::bit_count(&h, n)? };
+                let bits = if self == Intrinsic::IntegerLength {
+                    int::integer_length(&h, n)
+                } else {
+                    fuel.spend(int::integer_length(&h, n) / 64 / equal::PER_FUEL)?;
+                    int::bit_count(&h, n)?
+                };
                 fixnum(i64::try_from(bits).map_err(|_| Fault::OutOfRange)?)
             }
             Intrinsic::IsBitSet => {
                 let h = Nums::new(mc);
-                boolean(int::bit_set(&h, h.integer(arg(1)).ok_or(Fault::WrongType)?, index(arg(0))? as u64))
+                let n = h.integer(arg(1)).ok_or(Fault::WrongType)?;
+                // A negative one is read past its lowest one, which may be far up.
+                if int::sign(&h, n) == Ordering::Less {
+                    fuel.spend(int::integer_length(&h, n) / 64 / equal::PER_FUEL)?;
+                }
+                boolean(int::bit_set(&h, n, index(arg(0))? as u64))
             }
             Intrinsic::SymbolToString => Symbol::of(arg(0)).ok_or(Fault::WrongType)?.name(mc).value(),
             Intrinsic::StringToSymbol => {
@@ -934,14 +960,39 @@ impl Intrinsic {
             }
             Intrinsic::BytevectorRef => {
                 let bytes = AnyBytevector::of(arg(0)).ok_or(Fault::WrongType)?;
-                let byte = bytes.get(mc, index(arg(1))?).ok_or(Fault::OutOfRange)?;
-                Value::fixnum(i64::from(byte)).expect("bytes are fixnums")
+                let (big, (size, signed)) = (big_endian(arg(2))?, int_kind(arg(3))?);
+                let n = bytes.get_uint(mc, index(arg(1))?, size).ok_or(Fault::OutOfRange)?;
+                let unused = 64 - size as u32 * 8;
+                let n = if big { n.swap_bytes() >> unused } else { n };
+                let h = Nums::new(mc);
+                if signed {
+                    let n = ((n << unused) as i64) >> unused;
+                    match Value::fixnum(n) {
+                        Some(n) => n,
+                        None => made(mc, fuel, int::from_i64(&h, n)?.value()),
+                    }
+                } else {
+                    match i64::try_from(n).ok().and_then(Value::fixnum) {
+                        Some(n) => n,
+                        None => made(mc, fuel, int::from_u64(&h, n)?.value()),
+                    }
+                }
             }
             Intrinsic::BytevectorSet => {
                 let bytes = AnyBytevector::of(arg(0)).ok_or(Fault::WrongType)?;
-                let byte = byte(arg(2))?;
+                let h = Nums::new(mc);
+                let n = h.integer(arg(2)).ok_or(Fault::WrongType)?;
+                let (big, (size, signed)) = (big_endian(arg(3))?, int_kind(arg(4))?);
+                let unused = 64 - size as u32 * 8;
+                let n = if signed {
+                    int::to_i64(&h, n).filter(|&n| (n << unused) >> unused == n).map(|n| n as u64)
+                } else {
+                    int::to_u64(&h, n).filter(|&n| n <= u64::MAX >> unused)
+                };
+                let n = n.ok_or(Fault::OutOfRange)?;
                 let AnyBytevector::Mutable(bytes) = bytes else { return Err(Fault::Immutable) };
-                if !bytes.set(mc, index(arg(1))?, byte) {
+                let n = if big { (n << unused).swap_bytes() } else { n };
+                if !bytes.set_uint(mc, index(arg(1))?, size, n) {
                     return Err(Fault::OutOfRange);
                 }
                 Value::VOID
@@ -1190,6 +1241,17 @@ fn bitwise<'gc>(
     Ok(acc)
 }
 
+/// Spends what making an integer of about `bits` bits takes, as a count can make one far larger
+/// than what it's made from, once there's room for it.
+fn charge_bits(mc: &Mutation<'_>, fuel: &mut Fuel, bits: u64) -> Result<(), Fault> {
+    let words = bits / 64;
+    if words < equal::PER_FUEL {
+        return Ok(());
+    }
+    mc.ensure(usize::try_from(words.saturating_mul(8)).unwrap_or(usize::MAX))?;
+    fuel.spend(words / equal::PER_FUEL)
+}
+
 /// The bits from `start` to `end`, which can't be before it.
 fn bit_range(start: Value<'_>, end: Value<'_>) -> Result<(u64, u64), Fault> {
     let (start, end) = (index(start)? as u64, index(end)? as u64);
@@ -1197,6 +1259,21 @@ fn bit_range(start: Value<'_>, end: Value<'_>) -> Result<(u64, u64), Fault> {
         return Err(Fault::OutOfRange);
     }
     Ok((start, end))
+}
+
+/// Whether an integer in a bytevector is big-endian, as `#t` or `#f`.
+fn big_endian(v: Value<'_>) -> Result<bool, Fault> {
+    if v == Value::TRUE || v == Value::FALSE { Ok(v == Value::TRUE) } else { Err(Fault::WrongType) }
+}
+
+/// How many bytes an integer in a bytevector takes, 1 to 8, and whether it's signed.
+fn int_kind(v: Value<'_>) -> Result<(usize, bool), Fault> {
+    let kind = v.as_fixnum().ok_or(Fault::WrongType)?;
+    let size = kind.unsigned_abs() as usize;
+    if !(1..=8).contains(&size) {
+        return Err(Fault::OutOfRange);
+    }
+    Ok((size, kind < 0))
 }
 
 /// `quotient`, `remainder` or `modulo` of `n` and `m`, in place if they're fixnums.

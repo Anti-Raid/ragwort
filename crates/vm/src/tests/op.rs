@@ -456,6 +456,36 @@ fn every_cxr_follows_its_name_from_the_last_letter() {
 }
 
 #[test]
+fn shifts_and_bit_fields_are_charged_for_what_their_counts_make() {
+    let mut arena = Arena::new(1 << 24, 0);
+    arena.mutate(|mc| {
+        let bits = fix(12_800_000);
+        let calls = [
+            (Intrinsic::ArithmeticShift, vec![fix(1), bits]),
+            (Intrinsic::BitField, vec![fix(-1), fix(0), bits]),
+            (Intrinsic::BitFieldReplace, vec![fix(-1), fix(0), fix(0), bits]),
+        ];
+        for (intrinsic, args) in calls {
+            let mut fuel = Fuel { run: 100, rest: 0 };
+            assert_eq!(intrinsic.run(mc, &args, &mut fuel), Err(Fault::OutOfFuel), "{intrinsic:?}");
+            let mut fuel = Fuel { run: 1000, rest: 0 };
+            assert!(intrinsic.run(mc, &args, &mut fuel).is_ok(), "{intrinsic:?}");
+            assert_eq!(fuel.left(), 1000 - 12_800_000 / 64 / 1024, "{intrinsic:?}");
+        }
+        // Wide fields of narrow numbers cost nothing past the call.
+        let mut fuel = Fuel { run: 100, rest: 0 };
+        assert_eq!(Intrinsic::BitField.run(mc, &[fix(5), fix(0), bits], &mut fuel), Ok(fix(5)));
+        assert_eq!(Intrinsic::BitFieldReplace.run(mc, &[fix(1), fix(2), fix(0), bits], &mut fuel), Ok(fix(2)));
+        assert_eq!(Intrinsic::BitFieldReplace.run(mc, &[fix(1), fix(0), bits, fix(25_600_000)], &mut fuel), Ok(fix(1)));
+        assert_eq!(Intrinsic::BitFieldReplace.run(mc, &[fix(1), fix(-1), bits, bits], &mut fuel), Ok(fix(1)));
+        assert_eq!(Intrinsic::ArithmeticShift.run(mc, &[fix(0), bits], &mut fuel), Ok(fix(0)));
+        assert_eq!(fuel.left(), 100);
+        // -1 is as long as 0, but shifts into a number as long as the count.
+        assert_eq!(Intrinsic::ArithmeticShift.run(mc, &[fix(-1), bits], &mut fuel), Err(Fault::OutOfFuel));
+    });
+}
+
+#[test]
 fn booleans_void_and_bytevectors() {
     let mut arena = Arena::new(1 << 20, 0);
     arena.mutate(|mc| {
@@ -466,19 +496,25 @@ fn booleans_void_and_bytevectors() {
         assert_eq!(Intrinsic::Void.run(mc, &[fix(1), fix(2)], &mut fuel), Ok(Value::VOID));
         let h = ragwort_types::bytevector::Bytevectors::new(mc);
         let bytes = h.from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap().value(mc);
-        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(8)], &mut fuel), Ok(fix(9)));
-        assert_eq!(Intrinsic::BytevectorSet.run(mc, &[bytes, fix(8), fix(255)], &mut fuel), Ok(Value::VOID));
-        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(8)], &mut fuel), Ok(fix(255)));
-        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(7)], &mut fuel), Ok(fix(8)));
-        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(9)], &mut fuel), Err(Fault::OutOfRange));
-        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(-1)], &mut fuel), Err(Fault::OutOfRange));
-        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, Value::NIL], &mut fuel), Err(Fault::WrongType));
-        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[fix(0), fix(0)], &mut fuel), Err(Fault::WrongType));
-        assert_eq!(Intrinsic::BytevectorSet.run(mc, &[bytes, fix(0), fix(256)], &mut fuel), Err(Fault::WrongType));
-        assert_eq!(Intrinsic::BytevectorSet.run(mc, &[bytes, fix(9), fix(0)], &mut fuel), Err(Fault::OutOfRange));
+        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(8), Value::FALSE, fix(1)], &mut fuel), Ok(fix(9)));
+        assert_eq!(Intrinsic::BytevectorSet.run(mc, &[bytes, fix(8), fix(255), Value::FALSE, fix(1)], &mut fuel), Ok(Value::VOID));
+        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(8), Value::FALSE, fix(1)], &mut fuel), Ok(fix(255)));
+        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(7), Value::FALSE, fix(1)], &mut fuel), Ok(fix(8)));
+        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(9), Value::FALSE, fix(1)], &mut fuel), Err(Fault::OutOfRange));
+        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(-1), Value::FALSE, fix(1)], &mut fuel), Err(Fault::OutOfRange));
+        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, Value::NIL, Value::FALSE, fix(1)], &mut fuel), Err(Fault::WrongType));
+        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[fix(0), fix(0), Value::FALSE, fix(1)], &mut fuel), Err(Fault::WrongType));
+        assert_eq!(Intrinsic::BytevectorSet.run(mc, &[bytes, fix(0), fix(256), Value::FALSE, fix(1)], &mut fuel), Err(Fault::OutOfRange));
+        // Two bytes across a word, most significant first, and signed.
+        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(7), Value::TRUE, fix(2)], &mut fuel), Ok(fix(0x08ff)));
+        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(7), Value::FALSE, fix(-2)], &mut fuel), Ok(fix(-248)));
+        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(0), Value::FALSE, fix(0)], &mut fuel), Err(Fault::OutOfRange));
+        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(0), Value::FALSE, fix(9)], &mut fuel), Err(Fault::OutOfRange));
+        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(0), Value::NIL, fix(1)], &mut fuel), Err(Fault::WrongType));
+        assert_eq!(Intrinsic::BytevectorSet.run(mc, &[bytes, fix(9), fix(0), Value::FALSE, fix(1)], &mut fuel), Err(Fault::OutOfRange));
         let literal = h.immutable_from_slice(&[1]).unwrap().value(mc);
-        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[literal, fix(0)], &mut fuel), Ok(fix(1)));
-        assert_eq!(Intrinsic::BytevectorSet.run(mc, &[literal, fix(0), fix(2)], &mut fuel), Err(Fault::Immutable));
+        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[literal, fix(0), Value::FALSE, fix(1)], &mut fuel), Ok(fix(1)));
+        assert_eq!(Intrinsic::BytevectorSet.run(mc, &[literal, fix(0), fix(2), Value::FALSE, fix(1)], &mut fuel), Err(Fault::Immutable));
     });
 }
 

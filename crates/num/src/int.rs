@@ -206,6 +206,13 @@ pub fn from_i128<H: Host>(h: &H, n: i128) -> Res<H> {
     from_digits(h, n < 0, Digits::of_mut(&mut [m as Digit, (m >> DIGIT_BITS) as Digit]))
 }
 
+pub fn to_u64<H: Host>(h: &H, x: H::Int) -> Option<u64> {
+    match h.view(x) {
+        IntView::Small(n) => u64::try_from(n).ok(),
+        IntView::Big { negative, digits } => (!negative && digits.len() == 1).then(|| digits.at(0)),
+    }
+}
+
 pub fn to_i64<H: Host>(h: &H, x: H::Int) -> Option<i64> {
     match h.view(x) {
         IntView::Small(n) => Some(n),
@@ -699,7 +706,11 @@ pub fn bit_field<H: Host>(h: &H, x: H::Int, start: u64, end: u64) -> Res<H> {
     {
         return from_i64(h, n >> start.min(63) & ((1 << width) - 1));
     }
-    let low = arithmetic_shift(h, x, -i64::try_from(start).unwrap_or(i64::MAX))?;
+    let low = arithmetic_shift(h, x, -shift_count(start))?;
+    // Past its length, a non-negative `x` has only zeros, so needs no mask.
+    if sign(h, x) != Ordering::Less && integer_length(h, x) <= end {
+        return Ok(low);
+    }
     bitwise_and(h, low, ones(h, width)?)
 }
 
@@ -712,16 +723,22 @@ pub fn bit_field_replace<H: Host>(h: &H, dest: H::Int, source: H::Int, start: u6
         let low = (1 << width) - 1;
         return from_i64(h, d & !(low << start) | (s & low) << start);
     }
-    let (ones, at) = (ones(h, width)?, i64::try_from(start).unwrap_or(i64::MAX));
-    let field = arithmetic_shift(h, bitwise_and(h, source, ones)?, at)?;
-    let kept = bitwise_and(h, dest, bitwise_not(h, arithmetic_shift(h, ones, at)?)?)?;
-    bitwise_or(h, kept, field)
+    // Made of the bits under `start` and over `end`, it takes no mask wider than the result.
+    let low = bit_field(h, dest, 0, start)?;
+    let high = arithmetic_shift(h, arithmetic_shift(h, dest, -shift_count(end))?, shift_count(end))?;
+    let field = arithmetic_shift(h, bit_field(h, source, 0, width)?, shift_count(start))?;
+    bitwise_or(h, bitwise_or(h, low, high)?, field)
 }
 
 /// `2^width - 1`.
 fn ones<H: Host>(h: &H, width: u64) -> Res<H> {
     let one = from_i64(h, 1)?;
-    sub(h, arithmetic_shift(h, one, i64::try_from(width).unwrap_or(i64::MAX))?, one)
+    sub(h, arithmetic_shift(h, one, shift_count(width))?, one)
+}
+
+/// A bit position as a shift count, those past an `i64` as far as one goes.
+fn shift_count(bits: u64) -> i64 {
+    i64::try_from(bits).unwrap_or(i64::MAX)
 }
 
 /// The zeros under the lowest one of a magnitude that isn't zero.

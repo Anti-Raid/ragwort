@@ -370,6 +370,69 @@ fn bitwise_operations_work_on_any_exact_integer() {
 }
 
 #[test]
+fn bit_fields_wider_than_their_numbers_cost_no_more() {
+    // Each would take a mask of 125 MB, far more than the arena has, if it made one.
+    let text = "(list (bit-field 5 0 1000000000) (bit-field-replace 1 2 0 1000000000) (logical-shift-right 5 0 1000000000)
+                      (bit-field-replace 5 -1 1 2) (bit-field-replace -1 0 1 3) (bit-field (arithmetic-shift 1 100) 0 1000000000))";
+    assert_eq!(eval(text), "(5 2 5 7 -7 1267650600228229401496703205376)");
+    arena().mutate(|mc| {
+        let [thunk] = load_text(mc, "(arithmetic-shift 1 (expt 10 15))").unwrap()[..] else { panic!("one form") };
+        assert_eq!(Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap().run(mc), Err(Fault::OutOfMemory));
+    });
+}
+
+#[test]
+fn logical_shifts_treat_a_number_as_so_many_bits() {
+    let text = "(list (logical-shift-right -1 28 32) (logical-shift-right -16 2 8) (logical-shift-right -1 40 32) (logical-shift-right 5 0 64)
+                      (logical-shift-left -1 28 32) (logical-shift-left 255 4 8) (logical-shift-left 1 70 64) (logical-shift-left 3 63 64))";
+    assert_eq!(eval(text), "(15 60 0 5 4026531840 240 0 9223372036854775808)");
+    assert_eq!(uncaught("(logical-shift-right 1 -1 32)"), "#<error OutOfRange>");
+    assert_eq!(uncaught("(logical-shift-left 1 -1 32)"), "#<error OutOfRange>");
+    for text in ["(logical-shift-right 5 40.0 32)", "(logical-shift-left 5 81/2 32)", "(logical-shift-right 5 40 2.5)", "(logical-shift-left 'x 40 32)"] {
+        assert_eq!(uncaught(text), "#<error WrongType>", "{text}");
+    }
+}
+
+#[test]
+fn bytevectors_hold_multibyte_integers_little_or_big_endian() {
+    let text = "(let ((b (make-bytevector 12 0)))
+                  (bytevector-u16be-set! b 0 #x1234)
+                  (bytevector-u32le-set! b 2 #xdeadbeef)
+                  (bytevector-u64be-set! b 3 #xfedcba9876543210)
+                  (list (bytevector-u8-ref b 0) (bytevector-u8-ref b 1) (bytevector-u16le-ref b 0) (bytevector-u8-ref b 2)
+                        (bytevector-u64be-ref b 3) (bytevector-u64le-ref b 3) (bytevector-u32be-ref b 7)
+                        (bytevector-u16be-ref b 10) (bytevector-u64be-ref b 4)))";
+    let want = "(18 52 13330 239 18364758544493064720 1167088121787636990 1985229328 4096 15905192667998457856)";
+    assert_eq!(eval(text), want);
+    assert_eq!(eval("(bytevector-u32be-ref #u8(1 2 3 4 5) 1)"), "33752069");
+    assert_eq!(eval_in(&mut arena(), "(bytevector-u32be-ref #u8(1 2 3 4) 1)"), Ok(Err(Fault::OutOfRange)));
+    assert_eq!(eval_in(&mut arena(), "(bytevector-u16be-set! (make-bytevector 2 0) 0 65536)"), Ok(Err(Fault::OutOfRange)));
+    assert_eq!(eval_in(&mut arena(), "(bytevector-u16be-set! (make-bytevector 2 0) 0 -1)"), Ok(Err(Fault::OutOfRange)));
+    assert_eq!(eval_in(&mut arena(), "(bytevector-u16be-set! #u8(1 2) 0 1)"), Ok(Err(Fault::Immutable)));
+}
+
+#[test]
+fn bytevectors_hold_signed_integers_too() {
+    let text = "(let ((b (make-bytevector 16 0)))
+                  (bytevector-s32be-set! b 0 -1)
+                  (bytevector-s64le-set! b 4 -9223372036854775808)
+                  (bytevector-s16be-set! b 12 -32768)
+                  (bytevector-s8-set! b 14 -128)
+                  (bytevector-u8-set! b 15 127)
+                  (list (bytevector-u32be-ref b 0) (bytevector-s64le-ref b 4) (bytevector-u64le-ref b 4)
+                        (bytevector-s64be-ref b 4) (bytevector-s16be-ref b 12) (bytevector-s16le-ref b 12)
+                        (bytevector-s8-ref b 14) (bytevector-s8-ref b 15) (bytevector-u8-ref b 14) (bytevector-s16be-ref b 0)))";
+    let want = "(4294967295 -9223372036854775808 9223372036854775808 128 -32768 128 -128 127 128 -1)";
+    assert_eq!(eval(text), want);
+    assert_eq!(eval("(bytevector-s16le-ref #u8(255 254) 0)"), "-257");
+    for bad in ["(bytevector-s8-set! (make-bytevector 1 0) 0 128)", "(bytevector-s8-set! (make-bytevector 1 0) 0 -129)",
+                "(bytevector-u8-set! (make-bytevector 1 0) 0 256)", "(bytevector-s64be-set! (make-bytevector 8 0) 0 (expt 2 63))"] {
+        assert_eq!(eval_in(&mut arena(), bad), Ok(Err(Fault::OutOfRange)), "{bad}");
+    }
+    assert_eq!(eval_in(&mut arena(), "(bytevector-s8-ref #u8(1) 0.0)"), Ok(Err(Fault::WrongType)));
+}
+
+#[test]
 fn strings_append_and_count_characters() {
     let text = "(list (string-length \"\") (string-length \"héllo\") (string-length \"🦀ab\") (string-append) (string-append \"a\")
                       (string-append \"ab\" \"\" \"cd\" \"é🦀\") (apply string-append (list \"x\" \"y\" \"z\")))";
@@ -902,6 +965,15 @@ fn show_outcome<'gc>(mc: &Mutation<'gc>, outcome: Result<Outcome<'gc>, Fault>) -
     }
 }
 
+/// How a run that `first` starts ends, past any pauses for the collector.
+fn settled<'gc>(mc: &Mutation<'gc>, machine: &mut Machine, first: impl FnOnce(&mut Machine) -> Result<Outcome<'gc>, Fault>) -> String {
+    let mut outcome = first(machine);
+    while let Ok(Outcome::Paused) = outcome {
+        outcome = machine.run(mc);
+    }
+    show_outcome(mc, outcome)
+}
+
 #[test]
 fn the_host_resumes_a_machine_that_yields() {
     let mut arena = arena();
@@ -910,17 +982,17 @@ fn the_host_resumes_a_machine_that_yields() {
                     (list a b c)))";
     let mut machine = machine(&mut arena, text);
     assert_eq!(arena.mutate(|mc| show_outcome(mc, machine.resume(mc, &[]))), "Err(NotPending)");
-    assert_eq!(arena.mutate(|mc| show_outcome(mc, machine.run(mc))), "yielded (1 a)");
+    assert_eq!(arena.mutate(|mc| settled(mc, &mut machine, |m| m.run(mc))), "yielded (1 a)");
     // What the coroutines hold stays alive while they wait.
     arena.collect();
-    assert_eq!(arena.mutate(|mc| show_outcome(mc, machine.resume(mc, &[Value::fixnum(10).unwrap()]))), "yielded (1 b)");
+    assert_eq!(arena.mutate(|mc| settled(mc, &mut machine, |m| m.resume(mc, &[Value::fixnum(10).unwrap()]))), "yielded (1 b)");
     arena.collect();
-    assert_eq!(arena.mutate(|mc| show_outcome(mc, machine.resume(mc, &[Value::fixnum(20).unwrap()]))), "done (10 20 (done 1))");
+    assert_eq!(arena.mutate(|mc| settled(mc, &mut machine, |m| m.resume(mc, &[Value::fixnum(20).unwrap()]))), "done (10 20 (done 1))");
     assert_eq!(arena.mutate(|mc| show_outcome(mc, machine.resume(mc, &[]))), "Err(Finished)");
     // Plain `run` goes on from a yield with no values.
     let mut machine = self::machine(&mut arena, "(call-with-values (lambda () (co/yield 'x)) list)");
-    assert_eq!(arena.mutate(|mc| show_outcome(mc, machine.run(mc))), "yielded x");
-    assert_eq!(arena.mutate(|mc| show_outcome(mc, machine.run(mc))), "done ()");
+    assert_eq!(arena.mutate(|mc| settled(mc, &mut machine, |m| m.run(mc))), "yielded x");
+    assert_eq!(arena.mutate(|mc| settled(mc, &mut machine, |m| m.run(mc))), "done ()");
 }
 
 #[test]
