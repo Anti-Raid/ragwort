@@ -355,6 +355,25 @@ fn integer_division_keeps_the_sign_it_should() {
 }
 
 #[test]
+fn a_continuation_reentered_in_a_loop_sees_its_own_spilled_values() {
+    // 60 values live across a `call/cc` in the loop's first pass, more than a frame's registers
+    // hold. Re-entered once the loop has gone round again, that pass must see its own.
+    let names: Vec<String> = (0..60).map(|j| format!("a{j}")).collect();
+    let binds: String = names.iter().enumerate().map(|(j, a)| format!("({a} (+ i {j}))")).collect();
+    let text = format!(
+        "(define k #f) (define again #f)
+         (define (f)
+           (let loop ((i 0))
+             (let ({binds})
+               (when (= i 0) (call/cc (lambda (c) (set! k c))))
+               (if (or again (= i 3)) (+ {}) (loop (+ i 1))))))
+         (let ((result (f))) (if again result (begin (set! again #t) (k #f))))",
+        names.join(" ")
+    );
+    assert_eq!(eval(&text), "1770");
+}
+
+#[test]
 fn assigned_variables_mean_the_same_kept_in_registers_or_boxes() {
     let text = "(list (let ((total 0)) (let loop ((i 0)) (when (< i 10) (set! total (+ total i)) (loop (+ i 1)))) total)
                       (let ((x 1)) (list x (begin (set! x 2) x)))

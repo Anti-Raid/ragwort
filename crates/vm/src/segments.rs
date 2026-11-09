@@ -18,7 +18,7 @@ use ragwort_types::pair::{Pair, Pairs};
 
 use crate::Fault;
 use crate::frame::{self, Kept, Link};
-use crate::objects::{Frames, FramesFields, Native, NativeFields, Task, TaskFields};
+use crate::objects::{Frames, FramesFields, Native, NativeFields, Spill, SpillFields, Task, TaskFields};
 use crate::wind::Kind;
 
 /// The most slots of a record copied back onto the stack at once. The top frame is always
@@ -143,9 +143,30 @@ impl<'gc> Segments<'_, 'gc> {
         if !self.stack.write(mc, at, slots.slice(split..end).ok_or(Fault::Malformed)?) {
             return Err(Fault::Malformed);
         }
+        self.own_spills(at..at + (end - split))?;
         frame::set_link(mc, self.frame(at)?, Link::BOTTOM)?;
         task.set_chain(mc, rest);
         Ok(Some(Resume { fp: at + (top - split), pc: link.pc }))
+    }
+
+    /// Gives the frames just copied to `slots` spills of their own. A spill holds what its frame's
+    /// registers can't, and the record they're copied from, which a continuation may resume
+    /// again, keeps its frames' as they were.
+    fn own_spills(&self, slots: std::ops::Range<usize>) -> Result<(), Fault> {
+        let mc = self.mc;
+        for i in slots {
+            let Some(spill) = self.stack.get(mc, i).and_then(|v| v.downcast::<Spill>(mc)) else { continue };
+            let items = spill.items(mc);
+            let copy = Spill::new(mc, items.len(), Value::VOID)?;
+            let copied = copy.items(mc);
+            for slot in 0..items.len() {
+                copied.set(mc, slot, items.get(slot));
+            }
+            if !self.stack.set(mc, i, Value::object(mc, copy)) {
+                return Err(Fault::Malformed);
+            }
+        }
+        Ok(())
     }
 
     /// Whether a bottom frame with `len` slots under it fits on this segment.
