@@ -74,13 +74,13 @@ enum Step {
     Bind(Temp, Stx),
     /// Binds a pattern variable to the expression for what's after.
     Var(Stx, Stx),
-    /// Goes on, with `vars` bound, if any of `alts` matches.
-    Or { alts: Vec<Vec<Step>>, vars: Vec<Stx> },
+    /// Goes on if any of `alts` matches, with `results` bound to that alternative's `values`.
+    Or { alts: Vec<Vec<Step>>, values: Vec<Vec<Stx>>, results: Vec<Stx> },
     /// Goes on if the steps don't match.
     Not(Vec<Step>),
     /// Goes on if `list` is a list each element of which, in `item`, matches `steps`, with each
-    /// of `vars` bound to the list of what it was bound to for each.
-    Each { list: Temp, item: Temp, steps: Vec<Step>, vars: Vec<Stx> },
+    /// of `results` bound to the list of what its `values` was for each.
+    Each { list: Temp, item: Temp, steps: Vec<Step>, values: Vec<Stx>, results: Vec<Stx> },
 }
 
 impl Step {
@@ -275,6 +275,24 @@ impl<'gc> Expander<'_, 'gc> {
         Ok(steps)
     }
 
+    /// The steps of matching `p` against `x` within another pattern, which binds none of its
+    /// variables: what they're bound to is in `m.seen`.
+    fn inner_pattern(&mut self, m: &mut Matcher<'gc>, x: Temp, p: Stx) -> Result<Vec<Step>, ExpandError> {
+        let mut steps = Vec::new();
+        self.pattern_into(m, x, p, &mut steps)?;
+        steps.retain(|step| !matches!(step, Step::Var(..)));
+        Ok(steps)
+    }
+
+    /// Binds the variables `m.seen` has from `first` on to `results`, temporaries for what they're
+    /// bound to once an `or` or a repeat has matched.
+    fn bind_results(&mut self, m: &mut Matcher<'gc>, first: usize, results: &[Stx], out: &mut Vec<Step>) {
+        for (seen, &result) in m.seen[first..].iter_mut().zip(results) {
+            seen.value = result;
+            out.push(Step::Var(seen.id, result));
+        }
+    }
+
     /// Adds what matching `p` against `x` does to `out`.
     fn pattern_into(&mut self, m: &mut Matcher<'gc>, x: Temp, p: Stx, out: &mut Vec<Step>) -> Result<(), ExpandError> {
         let bad = |this: &Self, at| Err(this.error(ExpandErrorKind::BadSyntax, at));
@@ -337,30 +355,31 @@ impl<'gc> Expander<'_, 'gc> {
             ("or", alts) => {
                 let before = m.seen.clone();
                 let mut steps = Vec::with_capacity(alts.len());
-                let mut first: Option<Vec<Key<'gc>>> = None;
+                let mut bound: Vec<Vec<Seen<'gc>>> = Vec::with_capacity(alts.len());
                 for &alt in alts {
                     m.seen.clone_from(&before);
-                    steps.push(self.match_pattern(m, x, alt)?);
-                    let vars: Vec<_> = m.seen[before.len()..].iter().map(Seen::key).collect();
+                    steps.push(self.inner_pattern(m, x, alt)?);
+                    let vars = m.seen[before.len()..].to_vec();
                     // Each alternative binds the same variables, in any order.
-                    match &first {
-                        Some(first) if first.len() != vars.len() || !vars.iter().all(|v| first.contains(v)) => return bad(self, alt),
-                        Some(_) => {}
-                        None => first = Some(vars),
+                    if let Some(first) = bound.first()
+                        && (first.len() != vars.len() || !vars.iter().all(|v| first.iter().any(|f| f.key() == v.key())))
+                    {
+                        return bad(self, alt);
                     }
+                    bound.push(vars);
                 }
-                // Past the `or`, its variables are bound to what the alternative that matched
-                // bound them to.
-                for seen in &mut m.seen[before.len()..] {
-                    seen.value = seen.id;
-                }
-                let vars: Vec<Stx> = m.seen[before.len()..].iter().map(|v| v.id).collect();
-                out.push(Step::Or { alts: steps, vars });
+                let results = (before.len()..m.seen.len()).map(|_| Ok(self.temp(m)?.stx)).collect::<Result<Vec<_>, ExpandError>>()?;
+                let values = bound
+                    .iter()
+                    .map(|vars| m.seen[before.len()..].iter().map(|v| vars.iter().find(|w| w.key() == v.key()).expect("checked").value).collect())
+                    .collect();
+                out.push(Step::Or { alts: steps, values, results: results.clone() });
+                self.bind_results(m, before.len(), &results, out);
             }
             ("not", pats) => {
                 for &pat in pats {
                     let before = m.seen.clone();
-                    let steps = self.match_pattern(m, x, pat)?;
+                    let steps = self.inner_pattern(m, x, pat)?;
                     m.seen = before;
                     out.push(Step::Not(steps));
                 }
@@ -420,18 +439,17 @@ impl<'gc> Expander<'_, 'gc> {
                 }
                 let element = self.temp(m)?;
                 let before = std::mem::take(&mut m.seen);
-                let steps = self.match_pattern(m, element, item)?;
-                let mut inner = std::mem::replace(&mut m.seen, before);
+                let steps = self.inner_pattern(m, element, item)?;
+                let inner = std::mem::replace(&mut m.seen, before);
                 if let Some(seen) = inner.iter().find(|seen| m.seen.iter().any(|other| other.key() == seen.key())) {
                     return Err(self.error(ExpandErrorKind::Duplicate, seen.id));
                 }
-                let vars = inner.iter().map(|v| v.id).collect();
-                // Past the loop, each variable is bound to the list of what it was for each.
-                for seen in &mut inner {
-                    seen.value = seen.id;
-                }
+                let values = inner.iter().map(|v| v.value).collect();
+                let results = inner.iter().map(|_| Ok(self.temp(m)?.stx)).collect::<Result<Vec<_>, ExpandError>>()?;
+                let first = m.seen.len();
                 m.seen.extend(inner);
-                out.push(Step::Each { list: at, item: element, steps, vars });
+                out.push(Step::Each { list: at, item: element, steps, values, results: results.clone() });
+                self.bind_results(m, first, &results, out);
                 return Ok(());
             }
             out.push(Step::Is(Shape::Pair, at));
@@ -501,16 +519,16 @@ impl<'gc> Expander<'_, 'gc> {
                 let rest = self.emit(m, rest, done, fail)?;
                 self.build(at, "if", &[&[test, fail, rest]])
             }
-            // `(let ((k (lambda (var ...) rest))) alt)`, each alt but the last trying the next
-            // if it fails.
-            Step::Or { alts, vars } => {
+            // `(let ((k (lambda (result ...) rest))) alt)`, each alt calling `k` with its values,
+            // and each but the last trying the next if it fails.
+            Step::Or { alts, values, results } => {
                 let k = self.temp(m)?.stx;
-                let formals = self.list(vars, at)?;
+                let formals = self.list(results, at)?;
                 let rest = self.emit(m, rest, done, fail)?;
                 let lambda = self.build(at, "lambda", &[&[formals, rest]])?;
-                let matched = self.list(&[&[k], vars.as_slice()].concat(), at)?;
                 let mut next: Option<Stx> = None;
-                for alt in alts.iter().rev() {
+                for (alt, values) in alts.iter().zip(values).rev() {
+                    let matched = self.list(&[&[k], values.as_slice()].concat(), at)?;
                     next = Some(match next {
                         None => self.emit(m, alt, matched, fail)?,
                         Some(next) => {
@@ -526,20 +544,20 @@ impl<'gc> Expander<'_, 'gc> {
                 let alts = next.expect("an `or` of no patterns is a test");
                 self.with_temp(at, k, lambda, alts)
             }
-            // `(let loop ((xs list) (acc '()) ...) (if (null? xs) (let ((var (reverse acc)) ...)
-            // rest) (if (pair? xs) (let ((item (car xs))) steps, then (loop (cdr xs) (cons var
+            // `(let loop ((xs list) (acc '()) ...) (if (null? xs) (let ((result (reverse acc)) ...)
+            // rest) (if (pair? xs) (let ((item (car xs))) steps, then (loop (cdr xs) (cons value
             // acc) ...)) fail)))`.
-            Step::Each { list, item, steps, vars } => {
+            Step::Each { list, item, steps, values, results } => {
                 let (again, xs) = (self.temp(m)?.stx, self.temp(m)?.stx);
-                let accs = vars.iter().map(|_| Ok(self.temp(m)?.stx)).collect::<Result<Vec<_>, ExpandError>>()?;
+                let accs = values.iter().map(|_| Ok(self.temp(m)?.stx)).collect::<Result<Vec<_>, ExpandError>>()?;
                 let mut finished = self.emit(m, rest, done, fail)?;
-                for (&var, &acc) in vars.iter().zip(&accs).rev() {
+                for (&result, &acc) in results.iter().zip(&accs).rev() {
                     let reversed = self.build(at, "reverse", &[&[acc]])?;
-                    finished = self.with_temp(at, var, reversed, finished)?;
+                    finished = self.with_temp(at, result, reversed, finished)?;
                 }
                 let mut next = vec![again, self.build(at, "cdr", &[&[xs]])?];
-                for (&var, &acc) in vars.iter().zip(&accs) {
-                    next.push(self.build(at, "cons", &[&[var, acc]])?);
+                for (&value, &acc) in values.iter().zip(&accs) {
+                    next.push(self.build(at, "cons", &[&[value, acc]])?);
                 }
                 let next = self.list(&next, at)?;
                 let each = self.emit(m, steps, next, fail)?;

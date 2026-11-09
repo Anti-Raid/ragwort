@@ -1085,8 +1085,15 @@ fn match_clauses_share_what_they_start_by_looking_at() {
     assert_eq!(each(vectors, "(#(1 2) #(3 4) #(5) #(1 2 3) (1 2))"), "((one 2) (3 4) (5) other other)");
     let guarded = "[(list a b) #:when (> a b) 'more] [(list a b) (=> next) (if (eqv? a b) (next) 'less)] [(list _ _) 'same] [_ 'other]";
     assert_eq!(each(guarded, "((2 1) (1 2) (3 3) (1))"), "(more less same other)");
-    // The pattern's variables are bound in the body, not in its expressions.
+    // The pattern's variables are bound in the body, not in its expressions, even those an `or`
+    // or a repeat binds.
     assert_eq!(eval("(let ([a 10]) (match '(1 2) [(list a (? (lambda (y) (> y a)))) 'more] [_ 'not]))"), "not");
+    assert_eq!(eval("(let ([a 10]) (match '(1 2) [(list (or a a) (? (lambda (y) (> y a)))) 'more] [_ 'not]))"), "not");
+    assert_eq!(eval("(let ([a 10]) (match '(((1)) 2) [(list (list (list a) ...) (? (lambda (y) (> y a)))) 'more] [_ 'not]))"), "not");
+    assert_eq!(eval("(let ([a 10]) (match '(1 2) [(not (list a (? (lambda (y) (> y a))))) 'not-list] [_ 'list]))"), "not-list");
+    assert_eq!(eval("(match '((1 2) (3)) [(list (or (list a _) (list a)) ...) a])"), "(1 3)");
+    assert_eq!(eval("(match '(1 (2) (3)) [(or (list 0 (list a) ...) (list 1 (list a) ...)) a])"), "(2 3)");
+    assert_eq!(eval("(map (lambda (v) (match v [(list (list (list a) ...) a) a] [_ 'no])) '((((1) (2)) (1 2)) (((1)) (2))))"), "((1 2) no)");
     assert_eq!(eval("(map (lambda (v) (match v [(list (or (list a _) a) a) a] [_ 'no])) '(((1 2) 1) (1 1) ((3 2) 1)))"), "(1 1 no)");
     assert_eq!(eval("(match '((1 2) (3 4)) [(list (list a b) ...) #:when (equal? a '(1 3)) b])"), "(2 4)");
 }
@@ -1336,14 +1343,3 @@ mod macros;
 
 #[path = "modules.rs"]
 mod modules;
-
-#[test]
-fn leak_scratch() {
-    for t in [
-        "(let ([a 10]) (match '(1 2) [(list (or a a) (? (lambda (y) (> y a)))) 'more] [_ 'not]))",
-        "(let ([a 10]) (match '(((1)) 2) [(list (list (list a) ...) (? (lambda (y) (> y a)))) 'more] [_ 'not]))",
-        "(let ([a 10]) (match '(1 2) [(not (list a (? (lambda (y) (> y a))))) 'not-list] [_ 'list]))",
-    ] {
-        eprintln!("{t} => {:?}", std::panic::catch_unwind(|| eval(t)));
-    }
-}
