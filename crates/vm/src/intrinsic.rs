@@ -8,7 +8,7 @@ use ragwort_types::Error;
 use ragwort_types::bytevector::{AnyBytevector, Bytevectors};
 use ragwort_types::gc::{Frame, Mutation, ScratchVec, Value};
 use ragwort_types::named;
-use ragwort_types::num::{ComplexHost, ComplexView, Number, Nums, RationalHost, RationalView, RealHost, RealView, complex, int, real};
+use ragwort_types::num::{ComplexHost, ComplexView, Integer, Number, Nums, RationalHost, RationalView, RealHost, RealView, complex, int, real};
 use ragwort_types::pair::{Pair, Pairs};
 use ragwort_types::string::{self, Strings};
 use ragwort_types::symbol::{Keyword, Symbol, Symbols};
@@ -54,6 +54,27 @@ named! {
         Remainder = "remainder",
         /// `(modulo n m)`: `n` mod `m`, with `m`'s sign.
         Modulo = "modulo",
+        /// `(bitwise-and n ...)`: of exact integers, in two's complement; `-1` of none.
+        BitwiseAnd = "bitwise-and",
+        /// `(bitwise-ior n ...)`; `0` of none.
+        BitwiseIor = "bitwise-ior",
+        /// `(bitwise-xor n ...)`; `0` of none.
+        BitwiseXor = "bitwise-xor",
+        /// `(bitwise-not n)`: `-n - 1`.
+        BitwiseNot = "bitwise-not",
+        /// `(arithmetic-shift n count)`: `n` times `2^count`, rounded down when `count` is negative.
+        ArithmeticShift = "arithmetic-shift",
+        /// `(integer-length n)`: the bits `n` takes in two's complement, but its sign.
+        IntegerLength = "integer-length",
+        /// `(bit-count n)`: the bits set in `n`, or clear if it's negative.
+        BitCount = "bit-count",
+        /// `(bit-set? index n)`: whether bit `index` of `n` is set.
+        IsBitSet = "bit-set?",
+        /// `(bit-field n start end)`: bits `start` to `end` of `n`, as a non-negative integer.
+        BitField = "bit-field",
+        /// `(bit-field-replace dest source start end)`: `dest` with bits `start` to `end`
+        /// replaced by the low bits of `source`.
+        BitFieldReplace = "bit-field-replace",
         /// (cons a d)
         Cons = "cons",
         /// (car lst)
@@ -346,6 +367,11 @@ impl Intrinsic {
             Intrinsic::KeywordToString | Intrinsic::StringToKeyword | Intrinsic::IsSymbol => Some(1),
             Intrinsic::SymbolToString | Intrinsic::StringToSymbol => Some(1),
             Intrinsic::Expt | Intrinsic::Quotient | Intrinsic::Remainder | Intrinsic::Modulo => Some(2),
+            Intrinsic::BitwiseAnd | Intrinsic::BitwiseIor | Intrinsic::BitwiseXor => None,
+            Intrinsic::BitwiseNot | Intrinsic::IntegerLength | Intrinsic::BitCount => Some(1),
+            Intrinsic::ArithmeticShift | Intrinsic::IsBitSet => Some(2),
+            Intrinsic::BitField => Some(3),
+            Intrinsic::BitFieldReplace => Some(4),
             Intrinsic::IsString | Intrinsic::StringLength => Some(1),
             Intrinsic::StringAppend | Intrinsic::Substring | Intrinsic::StringToList | Intrinsic::NumberToString => None,
             Intrinsic::StringEq | Intrinsic::StringLt | Intrinsic::StringGt | Intrinsic::StringLe | Intrinsic::StringGe => None,
@@ -383,6 +409,16 @@ impl Intrinsic {
                 | Quotient
                 | Remainder
                 | Modulo
+                | BitwiseAnd
+                | BitwiseIor
+                | BitwiseXor
+                | BitwiseNot
+                | ArithmeticShift
+                | IntegerLength
+                | BitCount
+                | IsBitSet
+                | BitField
+                | BitFieldReplace
                 | StringLength
                 | StringRef
                 | StringEq
@@ -556,6 +592,15 @@ impl Intrinsic {
                 | Quotient
                 | Remainder
                 | Modulo
+                | BitwiseAnd
+                | BitwiseIor
+                | BitwiseXor
+                | BitwiseNot
+                | ArithmeticShift
+                | IntegerLength
+                | BitCount
+                | BitField
+                | BitFieldReplace
                 | StringLength
                 | StringAppend
                 | Substring
@@ -598,7 +643,7 @@ impl Intrinsic {
     /// Whether a 2-argument call of `self` is commutative (`f(a, b) == f(b, a)`).
     pub const fn is_commutative_binary(self) -> bool {
         use Intrinsic::*;
-        matches!(self, Add | Mul | Eq | Eqv | Equal)
+        matches!(self, Add | Mul | Eq | Eqv | Equal | BitwiseAnd | BitwiseIor | BitwiseXor)
     }
 
     /// Decomposes `car`..`cddddr` into `(first_is_car, remaining_cxr)`.
@@ -823,6 +868,36 @@ impl Intrinsic {
                 made(mc, fuel, string::from_str(&Strings::new(mc), &text)?.value())
             }
             Intrinsic::Quotient | Intrinsic::Remainder | Intrinsic::Modulo => divide(mc, fuel, self, arg(0), arg(1))?,
+            Intrinsic::BitwiseAnd => bitwise(mc, fuel, -1, (0..args).map(&arg), |a, b| a & b, |h, a, b| int::bitwise_and(h, a, b))?,
+            Intrinsic::BitwiseIor => bitwise(mc, fuel, 0, (0..args).map(&arg), |a, b| a | b, |h, a, b| int::bitwise_or(h, a, b))?,
+            Intrinsic::BitwiseXor => bitwise(mc, fuel, 0, (0..args).map(&arg), |a, b| a ^ b, |h, a, b| int::bitwise_xor(h, a, b))?,
+            Intrinsic::BitwiseNot | Intrinsic::ArithmeticShift | Intrinsic::BitField | Intrinsic::BitFieldReplace => {
+                let h = Nums::new(mc);
+                let n = h.integer(arg(0)).ok_or(Fault::WrongType)?;
+                let made_of = match self {
+                    Intrinsic::BitwiseNot => int::bitwise_not(&h, n)?,
+                    Intrinsic::ArithmeticShift => int::arithmetic_shift(&h, n, arg(1).as_fixnum().ok_or(Fault::WrongType)?)?,
+                    Intrinsic::BitField => {
+                        let (start, end) = bit_range(arg(1), arg(2))?;
+                        int::bit_field(&h, n, start, end)?
+                    }
+                    _ => {
+                        let (source, (start, end)) = (h.integer(arg(1)).ok_or(Fault::WrongType)?, bit_range(arg(2), arg(3))?);
+                        int::bit_field_replace(&h, n, source, start, end)?
+                    }
+                };
+                made(mc, fuel, made_of.value())
+            }
+            Intrinsic::IntegerLength | Intrinsic::BitCount => {
+                let h = Nums::new(mc);
+                let n = h.integer(arg(0)).ok_or(Fault::WrongType)?;
+                let bits = if self == Intrinsic::IntegerLength { int::integer_length(&h, n) } else { int::bit_count(&h, n)? };
+                fixnum(i64::try_from(bits).map_err(|_| Fault::OutOfRange)?)
+            }
+            Intrinsic::IsBitSet => {
+                let h = Nums::new(mc);
+                boolean(int::bit_set(&h, h.integer(arg(1)).ok_or(Fault::WrongType)?, index(arg(0))? as u64))
+            }
             Intrinsic::SymbolToString => Symbol::of(arg(0)).ok_or(Fault::WrongType)?.name(mc).value(),
             Intrinsic::StringToSymbol => {
                 let strings = Strings::new(mc);
@@ -1089,6 +1164,39 @@ fn arith<'gc>(
         };
     }
     Ok(acc)
+}
+
+/// `op` of `first` and each of `rest`, all exact integers, in place while they're fixnums.
+fn bitwise<'gc>(
+    mc: &Mutation<'gc>,
+    fuel: &mut Fuel,
+    first: i64,
+    rest: impl Iterator<Item = Value<'gc>>,
+    fast: fn(i64, i64) -> i64,
+    generic: impl Fn(&Nums<'_, 'gc>, Integer<'gc>, Integer<'gc>) -> Result<Integer<'gc>, Error>,
+) -> Result<Value<'gc>, Fault> {
+    let h = Nums::new(mc);
+    let mut acc = fixnum(first);
+    for x in rest {
+        acc = match (acc.as_fixnum(), x.as_fixnum()) {
+            // Of two fixnums, it's one too.
+            (Some(a), Some(b)) => fixnum(fast(a, b)),
+            _ => {
+                let (a, b) = (h.integer(acc).ok_or(Fault::WrongType)?, h.integer(x).ok_or(Fault::WrongType)?);
+                made(mc, fuel, generic(&h, a, b)?.value())
+            }
+        };
+    }
+    Ok(acc)
+}
+
+/// The bits from `start` to `end`, which can't be before it.
+fn bit_range(start: Value<'_>, end: Value<'_>) -> Result<(u64, u64), Fault> {
+    let (start, end) = (index(start)? as u64, index(end)? as u64);
+    if end < start {
+        return Err(Fault::OutOfRange);
+    }
+    Ok((start, end))
 }
 
 /// `quotient`, `remainder` or `modulo` of `n` and `m`, in place if they're fixnums.

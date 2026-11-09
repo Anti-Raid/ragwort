@@ -355,6 +355,21 @@ fn integer_division_keeps_the_sign_it_should() {
 }
 
 #[test]
+fn bitwise_operations_work_on_any_exact_integer() {
+    let text = "(list (bitwise-and) (bitwise-ior) (bitwise-xor) (bitwise-and 12 10) (bitwise-ior 12 10) (bitwise-xor 12 10 1)
+                      (bitwise-not -5) (arithmetic-shift 1 70) (arithmetic-shift -5 -1) (integer-length -256) (bit-count -8)
+                      (bit-set? 2 5) (bit-set? 1 5) (bit-set? 100 -1) (bit-field 13 1 3) (bit-field -1 0 70) (bit-field-replace 0 7 2 4)
+                      (bitwise-and (arithmetic-shift 1 100) (- (arithmetic-shift 1 101) 1)) (bitwise-and (arithmetic-shift 1 100) 5)
+                      (bitwise-xor 4611686018427387903 -4611686018427387904) (bit-field-replace (arithmetic-shift 1 80) -1 0 3))";
+    let want = "(-1 0 0 8 14 7 4 1180591620717411303424 -3 8 3 #t #f #t 2 1180591620717411303423 12 \
+                1267650600228229401496703205376 0 -1 1208925819614629174706183)";
+    assert_eq!(eval(text), want.split_whitespace().collect::<Vec<_>>().join(" "));
+    assert_eq!(uncaught("(bitwise-and 1.0 2)"), "#<error WrongType>");
+    assert_eq!(uncaught("(bit-field 5 3 1)"), "#<error OutOfRange>");
+    assert_eq!(uncaught("(bit-set? -1 5)"), "#<error OutOfRange>");
+}
+
+#[test]
 fn strings_append_and_count_characters() {
     let text = "(list (string-length \"\") (string-length \"héllo\") (string-length \"🦀ab\") (string-append) (string-append \"a\")
                       (string-append \"ab\" \"\" \"cd\" \"é🦀\") (apply string-append (list \"x\" \"y\" \"z\")))";

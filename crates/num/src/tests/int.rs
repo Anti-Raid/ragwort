@@ -171,6 +171,26 @@ fn equal_integers_hash_the_same_however_they_are_held() {
 }
 
 #[test]
+fn bit_counts_tests_and_fields() {
+    let (mut rng, mut oracle) = (Rng(26), Oracle::default());
+    for bits in WIDTHS {
+        let h = TestHost::new(bits);
+        for _ in 0..ROUNDS / WIDTHS.len() {
+            let (x, y) = (h.random(&mut rng, 4), h.random(&mut rng, 4));
+            let (xs, ys) = (h.show(x), h.show(y));
+            let (index, start) = (rng.below(300), rng.below(150));
+            let end = start + rng.below(150);
+            let at = |n: u64| hex_i64(n as i64);
+            oracle.case("popcount", std::slice::from_ref(&xs), format!("{:x}", bit_count(&h, x).unwrap()));
+            oracle.case("bitset", &[at(index), xs.clone()], u8::from(bit_set(&h, x, index)).to_string());
+            oracle.case("bitfield", &[xs.clone(), at(start), at(end)], h.show(bit_field(&h, x, start, end).unwrap()));
+            oracle.case("bfreplace", &[xs, ys, at(start), at(end)], h.show(bit_field_replace(&h, x, y, start, end).unwrap()));
+        }
+    }
+    oracle.check();
+}
+
+#[test]
 fn shifts() {
     let (mut rng, mut oracle) = (Rng(25), Oracle::default());
     for bits in WIDTHS {

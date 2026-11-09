@@ -656,6 +656,80 @@ pub fn integer_length<H: Host>(h: &H, x: H::Int) -> u64 {
     }
 }
 
+/// The bits set in `x` if it isn't negative, or else those clear.
+pub fn bit_count<H: Host>(h: &H, x: H::Int) -> Result<u64, H::Error> {
+    let ones = |d: Digits<'_>| d.iter().map(|d| u64::from(d.count_ones())).sum::<u64>();
+    Ok(match h.view(x) {
+        IntView::Small(n) => u64::from(if n < 0 { !n } else { n }.count_ones()),
+        IntView::Big { negative, digits } => {
+            h.charge(digits.len() as u64)?;
+            // `-m` is `!(m - 1)`, and `m - 1` is `m` with its lowest one cleared and the zeros
+            // under it set.
+            if negative { ones(digits) - 1 + trailing_zeros(digits) } else { ones(digits) }
+        }
+    })
+}
+
+/// Whether bit `index` of `x` is set, in two's complement.
+pub fn bit_set<H: Host>(h: &H, x: H::Int, index: u64) -> bool {
+    match h.view(x) {
+        IntView::Small(n) => n >> index.min(63) & 1 == 1,
+        IntView::Big { negative, digits } => {
+            let at = usize::try_from(index / DIGIT_BITS as u64).unwrap_or(usize::MAX);
+            let bit = digits.get(at) >> (index % DIGIT_BITS as u64) & 1 == 1;
+            if !negative {
+                return bit;
+            }
+            // Of `!(m - 1)`: under `m`'s lowest one, `m - 1` has ones, at it a zero, and over it
+            // `m`'s bits.
+            match index.cmp(&trailing_zeros(digits)) {
+                Ordering::Less => false,
+                Ordering::Equal => true,
+                Ordering::Greater => !bit,
+            }
+        }
+    }
+}
+
+/// Bits `start..end` of `x`, as a non-negative integer. `start` is at most `end`.
+pub fn bit_field<H: Host>(h: &H, x: H::Int, start: u64, end: u64) -> Res<H> {
+    let width = end - start;
+    if let IntView::Small(n) = h.view(x)
+        && width < 63
+    {
+        return from_i64(h, n >> start.min(63) & ((1 << width) - 1));
+    }
+    let low = arithmetic_shift(h, x, -i64::try_from(start).unwrap_or(i64::MAX))?;
+    bitwise_and(h, low, ones(h, width)?)
+}
+
+/// `dest` with bits `start..end` replaced by the low bits of `source`. `start` is at most `end`.
+pub fn bit_field_replace<H: Host>(h: &H, dest: H::Int, source: H::Int, start: u64, end: u64) -> Res<H> {
+    let width = end - start;
+    if let (IntView::Small(d), IntView::Small(s)) = (h.view(dest), h.view(source))
+        && end < 63
+    {
+        let low = (1 << width) - 1;
+        return from_i64(h, d & !(low << start) | (s & low) << start);
+    }
+    let (ones, at) = (ones(h, width)?, i64::try_from(start).unwrap_or(i64::MAX));
+    let field = arithmetic_shift(h, bitwise_and(h, source, ones)?, at)?;
+    let kept = bitwise_and(h, dest, bitwise_not(h, arithmetic_shift(h, ones, at)?)?)?;
+    bitwise_or(h, kept, field)
+}
+
+/// `2^width - 1`.
+fn ones<H: Host>(h: &H, width: u64) -> Res<H> {
+    let one = from_i64(h, 1)?;
+    sub(h, arithmetic_shift(h, one, i64::try_from(width).unwrap_or(i64::MAX))?, one)
+}
+
+/// The zeros under the lowest one of a magnitude that isn't zero.
+fn trailing_zeros(digits: Digits<'_>) -> u64 {
+    let zeros = digits.iter().take_while(|&d| d == 0).count();
+    (zeros * DIGIT_BITS) as u64 + u64::from(digits.get(zeros).trailing_zeros())
+}
+
 /// The host's error for an integer larger than any memory holds.
 pub(crate) fn too_big<H: Host>(h: &H) -> H::Error {
     match h.big(false, usize::MAX, |_| 0) {
