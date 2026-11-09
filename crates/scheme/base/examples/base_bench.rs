@@ -156,6 +156,10 @@ fn main() {
     println!("countdown on intrinsics:       {:.1} ns per iteration", per(time(&native, true, true)));
     let less = format!("(define (count n) (if (< n 1) 0 (count (- n 1)))) (count {N})");
     println!("countdown testing with <:      {:.1} ns per iteration", per(time(&less, false, true)));
+    let summed = format!("(define (sum n) (let ((total 0)) (let loop ((i n)) (if (eqv? i 0) total (begin (set! total (+ total i)) (loop (- i 1))))))) (sum {N})");
+    println!("set! in a loop, in a register: {:.1} ns per iteration", per(time(&summed, false, true)));
+    let boxed = format!("(define keep #f) (define (sum n) (let ((total 0)) (set! keep (lambda () total)) (let loop ((i n)) (if (eqv? i 0) total (begin (set! total (+ total i)) (loop (- i 1))))))) (sum {N})");
+    println!("set! in a loop, boxed:         {:.1} ns per iteration", per(time(&boxed, false, true)));
     let append = format!("(define (count n s) (if (eqv? n 0) (string-length s) (count (- n 1) (string-append \"<@\" (symbol->string 'user) \">\")))) (count {N} \"\")");
     println!("string-append of 3 short:      {:.1} ns per iteration", per(time(&append, false, true)));
     let grow = format!("(define (count n s) (if (eqv? n 0) (string-length s) (count (- n 1) (string-append s \"ab\")))) (count {N} \"\")");

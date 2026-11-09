@@ -43,6 +43,12 @@ fn convert_expr<'gc>(expr: &L3<'gc>, env: &mut Env) -> L4<'gc> {
         L3::Fix(binds, body) => convert_fix(binds, body, env),
         L3::Join { group, scope } => convert_join(group, scope, env),
         L3::Jump(v, args) => L4::Jump(*v, args.iter().map(|a| convert_expr(a, env)).collect()),
+        L3::Set(v, value) => {
+            let VarRef::Local(v) = resolve_var(*v, env) else {
+                unreachable!("assignment conversion boxes what closures assign")
+            };
+            L4::Set(v, Box::new(convert_expr(value, env)))
+        }
         L3::App(f, args) => L4::App(
             Box::new(convert_expr(f, env)),
             args.iter().map(|a| convert_expr(a, env)).collect(),

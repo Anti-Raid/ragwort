@@ -264,10 +264,22 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
                 }
             }
             L4::Seq(a, b) => {
-                let t = self.reg()?;
-                self.expr(a, Want::Reg(t))?;
+                // An assignment's void goes unused here.
+                if let L4::Set(v, value) = &**a {
+                    self.assign(*v, value)?;
+                } else {
+                    let t = self.reg()?;
+                    self.expr(a, Want::Reg(t))?;
+                }
                 self.next = mark;
                 self.expr(b, want)?;
+            }
+            L4::Set(v, value) => {
+                self.assign(*v, value)?;
+                self.next = mark;
+                let t = self.into(want)?;
+                self.load(t, Value::VOID)?;
+                self.done(t, want);
             }
             L4::Let(binds, body) => {
                 let mut bound = Vec::with_capacity(binds.len());
@@ -870,6 +882,18 @@ impl<'m, 'a, 'gc> Compiler<'m, 'a, 'gc> {
         Ok(self.jump(Op::JumpIfFalse { test: test_reg, offset: 0 }))
     }
 
+    /// Sets `v` to `value`, worked out in its register where that can't change what it reads.
+    fn assign(&mut self, v: Var, value: &L4<'gc>) -> Result<(), Stop> {
+        let at = self.loc(v)?;
+        if !l4_clobbers_self(value, v) {
+            return self.expr(value, Want::Reg(at));
+        }
+        let t = self.reg()?;
+        self.expr(value, Want::Reg(t))?;
+        self.copy(at, t);
+        Ok(())
+    }
+
     fn arg_vreg(&mut self, arg: &L4<'gc>) -> Result<VReg, Stop> {
         match arg {
             L4::Ref(VarRef::Local(v)) => Ok(self.loc(*v)?),
@@ -1202,6 +1226,7 @@ fn l4_reads_local<'gc>(expr: &L4<'gc>, target: Var) -> bool {
     match expr {
         L4::Quote(_) => false,
         L4::Ref(VarRef::Local(v)) => *v == target,
+        L4::Set(v, value) => *v == target || l4_reads_local(value, target),
         L4::Ref(_) => false,
         L4::If(a, b, c) => l4_reads_local(a, target) || l4_reads_local(b, target) || l4_reads_local(c, target),
         L4::Seq(a, b) => l4_reads_local(a, target) || l4_reads_local(b, target),

@@ -149,6 +149,12 @@ impl<'a, 'gc> Survey<'a, 'gc> {
                     c.called = false;
                 }
             }
+            L3::Set(v, value) => {
+                if let Some(c) = self.candidates.get_mut(v) {
+                    c.called = false;
+                }
+                self.fresh(value);
+            }
             L3::If(test, then, other) => {
                 self.fresh(test);
                 self.tail(then);
@@ -323,6 +329,10 @@ fn walk<'gc>(e: &L3<'gc>, uses: &mut HashSet<Var, Quick>, bound: &mut HashSet<Va
         L3::Ref(v) => {
             uses.insert(*v);
         }
+        L3::Set(v, value) => {
+            uses.insert(*v);
+            walk(value, uses, bound);
+        }
         L3::If(a, b, c) => {
             walk(a, uses, bound);
             walk(b, uses, bound);
@@ -380,6 +390,7 @@ impl<'gc> Rewrite<'gc> {
         self.next += 1;
         match e {
             L3::Quote(_) | L3::Ref(_) => {}
+            L3::Set(_, value) => self.visit(value),
             L3::If(a, b, c) => {
                 self.visit(a);
                 self.visit(b);

@@ -601,6 +601,59 @@ fn has_box_op(ops: &[Op]) -> bool {
 }
 
 #[test]
+fn assigned_variables_stay_in_registers_where_nothing_else_sees_them() {
+    fn ops_of(build: impl for<'gc> FnOnce(&Mutation<'gc>) -> Core<'gc>) -> Vec<Op> {
+        let mut arena = Arena::new(1 << 24, 0);
+        arena.mutate(|mc| all_ops(mc, compile(mc, Some(hosting(mc)), &build(mc)).unwrap()))
+    }
+    // A call cp0 can't see into, where a continuation could be captured.
+    fn call<'gc>() -> Core<'gc> {
+        app(Core::Ref(Place::Slot { slot: 0, checked: false }), vec![])
+    }
+    // (let ((x 1) (y 2)) (set! x (+ x y)) (+ x y))
+    fn plain<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
+        let_(vec![(0, q(1)), (1, q(2))], seq(2, set(0, add(var(0), var(1))), add(var(0), var(1))))
+    }
+    assert_eq!(number(plain), Ok(5));
+    assert!(!has_box_op(&ops_of(plain)));
+    // (let ((total 0)) (let loop ((i 10)) (if (eq? i 0) total (begin (set! total (+ total i)) (loop (+ i -1))))))
+    fn summed<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
+        let step = seq(3, set(0, add(var(0), var(2))), app(var(1), vec![add(var(2), q(-1))]));
+        let_(vec![(0, q(0))], letrec(vec![(1, lambda(&[2], None, when(eq(var(2), q(0)), var(0), step)))], app(var(1), vec![q(10)])))
+    }
+    assert_eq!(number(summed), Ok(55));
+    let ops = ops_of(summed);
+    assert!(!has_box_op(&ops) && !ops.iter().any(|op| matches!(op, Op::NewClosure { .. })), "{ops:?}");
+    // (let ((n 0)) (set! n 1) (f) n): assigned only before the call.
+    assert!(!has_box_op(&ops_of(|_| let_(vec![(0, q(0))], seq(1, set(0, q(1)), seq(2, call(), var(0)))))));
+    // (let ((n 0)) (f) (set! n 1) n): a continuation the call captures holds n as it was.
+    assert!(has_box_op(&ops_of(|_| let_(vec![(0, q(0))], seq(1, call(), seq(2, set(0, q(1)), var(0)))))));
+    // (let ((n 0)) (let loop ((i 3)) (if (eq? i 0) n (begin (set! n (+ n 1)) (f) (loop (+ i -1)))))):
+    // assigned before the call, but again after it, round the loop.
+    fn around<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
+        let step = seq(3, set(0, add(var(0), q(1))), seq(4, call(), app(var(1), vec![add(var(2), q(-1))])));
+        let_(vec![(0, q(0))], letrec(vec![(1, lambda(&[2], None, when(eq(var(2), q(0)), var(0), step)))], app(var(1), vec![q(3)])))
+    }
+    assert!(has_box_op(&ops_of(around)));
+    // (let ((x 1)) (cons x (begin (set! x 2) x))): an argument read before a later one assigns it.
+    fn argument<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
+        let_(vec![(0, q(1))], prim(Cons, vec![var(0), seq(1, set(0, q(2)), var(0))]))
+    }
+    eval(argument, |mc, result| {
+        let pair = Pair::of(result.unwrap()).unwrap();
+        assert_eq!((pair.head(mc), pair.tail(mc)), (fix(1), fix(2)));
+    });
+    assert!(has_box_op(&ops_of(argument)));
+    // (let ((v0 0) ... (v299 299)) (set! v299 (+ v299 v0 1)) (set! v299 (+ v299 1)) v299), in a spill slot.
+    fn spilled<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
+        let body = seq(300, set(299, prim(Add, vec![var(299), var(0), q(1)])), seq(301, set(299, add(var(299), q(1))), var(299)));
+        let_(many(300), body)
+    }
+    assert_eq!(number(spilled), Ok(301));
+    assert!(!has_box_op(&ops_of(spilled)));
+}
+
+#[test]
 fn forwarded_pairs_mean_what_they_did() {
     // (let ((p (cons 1 2))) (+ (car p) (cdr p)))
     fn sum<'gc>() -> Core<'gc> {

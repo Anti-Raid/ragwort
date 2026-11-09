@@ -184,9 +184,10 @@ impl std::error::Error for CompileError {}
 pub fn compile<'gc>(mc: &Mutation<'gc>, module: Option<Gc<'gc, Module>>, core: &Core<'gc>) -> Result<Value<'gc>, CompileError> {
     let (l1, supply) = lower::lower(core)?;
     let (l2, supply) = letrec::fix_letrec(l1, supply);
-    let (l2, supply) = cp0::optimize(mc, l2, supply);
-    let (mut l3, _) = assign::assignment_convert(l2, supply);
+    let (l2, mut supply) = cp0::optimize(mc, l2, supply);
+    let (mut l3, assigned) = assign::lower(l2);
     contify::contify(&mut l3);
+    assign::convert(&mut l3, &assigned, &mut supply);
     let l4 = closure::closure_convert(&l3);
     codegen::emit(mc, module, &l4)
 }

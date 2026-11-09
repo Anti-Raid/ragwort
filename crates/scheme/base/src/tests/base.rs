@@ -355,6 +355,17 @@ fn integer_division_keeps_the_sign_it_should() {
 }
 
 #[test]
+fn assigned_variables_mean_the_same_kept_in_registers_or_boxes() {
+    let text = "(list (let ((total 0)) (let loop ((i 0)) (when (< i 10) (set! total (+ total i)) (loop (+ i 1)))) total)
+                      (let ((x 1)) (list x (begin (set! x 2) x)))
+                      (let ((n 0) (k #f))
+                        (let ((r (call/cc (lambda (c) (set! k c) 0))))
+                          (set! n (+ n 1))
+                          (if (< n 3) (k r) n))))";
+    assert_eq!(eval(text), "(45 (1 2) 3)");
+}
+
+#[test]
 fn bitwise_operations_work_on_any_exact_integer() {
     let text = "(list (bitwise-and) (bitwise-ior) (bitwise-xor) (bitwise-and 12 10) (bitwise-ior 12 10) (bitwise-xor 12 10 1)
                       (bitwise-not -5) (arithmetic-shift 1 70) (arithmetic-shift -5 -1) (integer-length -256) (bit-count -8)

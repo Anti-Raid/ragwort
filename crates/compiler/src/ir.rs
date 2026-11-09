@@ -7,8 +7,9 @@
 //!   lexical [`Var`]s.
 //! - [`L2`]: `Letrec` eliminated via Waddell–Sarkar–Dybvig fixing in favor of `Let`, `Fix`
 //!   (mutually recursive unassigned lambdas), `Seq`, and `Set`.
-//! - [`L3`]: `Set` eliminated via assignment conversion (`MakeBox`, `Unbox`, `SetBox`); all
-//!   variables are immutable.
+//! - [`L3`]: assignment conversion boxes (`MakeBox`, `Unbox`, `SetBox`) the assigned variables a
+//!   closure or a re-entered continuation could see, after contification; the rest keep
+//!   [`L3::Set`], assigned in their frame's registers.
 //! - [`L4`]: closures converted; variable references are split into [`VarRef::Local`] and
 //!   [`VarRef::Upvalue`], and every [`Closure`] carries its [`UpvalSource`] capture table.
 
@@ -119,8 +120,8 @@ impl<'gc> L2<'gc> {
     }
 }
 
-/// `L3`: after assignment conversion (`Set` eliminated; all variables are immutable). `Join` and
-/// `Jump` come only from contification, after it.
+/// `L3`: assigned variables as [`L3::Set`]s, which assignment conversion leaves, after
+/// contification, only for those it doesn't box. `Join` and `Jump` come only from contification.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum L3<'gc> {
     Quote(Value<'gc>),
@@ -138,6 +139,8 @@ pub enum L3<'gc> {
     Join { group: Vec<(Var, Func<L3<'gc>>)>, scope: Box<L3<'gc>> },
     /// A jump to a join of an enclosing `Join` with values for its parameters.
     Jump(Var, Vec<L3<'gc>>),
+    /// An assignment of a variable, which evaluates to void.
+    Set(Var, Box<L3<'gc>>),
 }
 
 /// A join's code: `body`, with `params` bound to the values a jump to `id` has.
@@ -193,6 +196,8 @@ pub enum L4<'gc> {
     Join { group: Vec<JoinCode<'gc>>, scope: Box<L4<'gc>> },
     /// A jump to a join of an enclosing `Join` with values for its parameters.
     Jump(Var, Vec<L4<'gc>>),
+    /// An assignment of a local of the frame, which evaluates to void.
+    Set(Var, Box<L4<'gc>>),
     App(Box<L4<'gc>>, Vec<L4<'gc>>),
     Lambda(Closure<'gc>),
     Intrinsic(Prim, Vec<L4<'gc>>),
