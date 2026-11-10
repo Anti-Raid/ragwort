@@ -6,51 +6,67 @@
 use ragwort_types::gc::{OutOfMemory, Value};
 use ragwort_types::pair::{Pair, Pairs};
 use ragwort_types::symbol::Symbol;
-use ragwort_types::syntax::{Syntax, SyntaxContext, SyntaxKind, SyntaxMeta, SyntaxScope};
+use ragwort_types::syntax::{Syntax, SyntaxContext, SyntaxKind, SyntaxMeta, SyntaxScope, SyntaxSpan};
 use ragwort_types::vector::{AnyVector, Vectors};
 
 use ragwort_compiler::module;
 use ragwort_vm::objects::ModuleFields;
 
-use crate::expand::{Binding, Expander, MAX_DATA_DEPTH, Stamp};
+use crate::expand::{Binding, Expander, Stamp};
 use crate::scope::{Scope, Set};
 use crate::tree::{Stx, View};
 use crate::{ExpandError, ExpandErrorKind};
 
 impl<'gc> Expander<'_, 'gc> {
-    /// `stx` as a syntax object.
-    pub(crate) fn wrap(&mut self, stx: Stx) -> Result<Value<'gc>, ExpandError> {
-        self.wrap_in(stx, MAX_DATA_DEPTH)
-    }
-
-    fn wrap_in(&mut self, stx: Stx, depth: usize) -> Result<Value<'gc>, ExpandError> {
-        let depth = depth.checked_sub(1).ok_or_else(|| self.error(ExpandErrorKind::TooDeep, stx))?;
-        let (mc, span) = (self.mc, self.tree.span(stx));
-        let (datum, kind) = match self.tree.view(stx)? {
-            View::Id => (self.tree.symbol(stx).expect("an identifier").value(mc), SyntaxKind::Identifier),
-            View::Datum(value) => (value, SyntaxKind::Literal),
-            View::List(items, tail) => {
-                let items = items.into_iter().map(|item| self.wrap_in(item, depth)).collect::<Result<Vec<_>, _>>()?;
-                let tail = tail.map_or(Ok(Value::NIL), |tail| self.wrap_in(tail, depth))?;
-                (Pairs::new(mc).list_with_tail(items, tail)?, SyntaxKind::List)
-            }
-            View::Vector(items) => {
-                let items = items.into_iter().map(|item| self.wrap_in(item, depth)).collect::<Result<Vec<_>, _>>()?;
-                (Vectors::new(mc).immutable_from_slice(&items)?.value(mc), SyntaxKind::Vector)
-            }
-        };
-        let meta = match kind {
-            SyntaxKind::Literal => None,
-            _ => {
-                let set = self.tree.scopes_of(stx)?;
-                Some(self.meta(set, kind)?)
-            }
-        };
-        let binding = if kind == SyntaxKind::Identifier { self.binding_value(stx)? } else { None };
-        let value = Syntax::bound(mc, datum, span, meta, binding)?.value(mc);
-        self.tree.scopes.charge(size_of::<(u64, Stx)>())?;
-        self.unwrapped.insert(value.to_bits(), stx);
-        Ok(value)
+    /// `stx` as a syntax object. A list or vector is made of its items', from a stack of their
+    /// own.
+    pub(crate) fn wrap(&mut self, root: Stx) -> Result<Value<'gc>, ExpandError> {
+        enum Task {
+            Visit(Stx),
+            /// A list of the last items wrapped, after its tail if it has one, or a vector of
+            /// them.
+            Make(Stx, usize, bool, SyntaxKind),
+        }
+        let mc = self.mc;
+        let (mut todo, mut done) = (vec![Task::Visit(root)], Vec::new());
+        while let Some(task) = todo.pop() {
+            let (stx, datum, kind) = match task {
+                Task::Visit(stx) => match self.tree.view(stx)? {
+                    View::Id => (stx, self.tree.symbol(stx).expect("an identifier").value(mc), SyntaxKind::Identifier),
+                    View::Datum(value) => (stx, value, SyntaxKind::Literal),
+                    View::List(items, tail) => {
+                        todo.push(Task::Make(stx, items.len(), tail.is_some(), SyntaxKind::List));
+                        todo.extend(tail.map(Task::Visit));
+                        todo.extend(items.into_iter().rev().map(Task::Visit));
+                        continue;
+                    }
+                    View::Vector(items) => {
+                        todo.push(Task::Make(stx, items.len(), false, SyntaxKind::Vector));
+                        todo.extend(items.into_iter().rev().map(Task::Visit));
+                        continue;
+                    }
+                },
+                Task::Make(stx, n, tail, kind) => {
+                    let tail = if tail { done.pop().expect("a tail") } else { Value::NIL };
+                    let items = done.split_off(done.len() - n);
+                    let datum = if kind == SyntaxKind::Vector { Vectors::new(mc).immutable_from_slice(&items)?.value(mc) } else { Pairs::new(mc).list_with_tail(items, tail)? };
+                    (stx, datum, kind)
+                }
+            };
+            let meta = match kind {
+                SyntaxKind::Literal => None,
+                _ => {
+                    let set = self.tree.scopes_of(stx)?;
+                    Some(self.meta(set, kind)?)
+                }
+            };
+            let binding = if kind == SyntaxKind::Identifier { self.binding_value(stx)? } else { None };
+            let value = Syntax::bound(mc, datum, self.tree.span(stx), meta, binding)?.value(mc);
+            self.tree.scopes.charge(size_of::<(u64, Stx)>())?;
+            self.unwrapped.insert(value.to_bits(), stx);
+            done.push(value);
+        }
+        Ok(done.pop().expect("the root's wrapped"))
     }
 
     /// The metadata of syntax of `kind` with the scopes `set`, made once for each.
@@ -150,55 +166,78 @@ impl<'gc> Expander<'_, 'gc> {
     }
 
     /// The syntax a transformer made, `value`, in the tree. What it has that isn't syntax is as
-    /// if it were, at `at`, the use it's the output of; a symbol in it is an error.
+    /// if it were, at `at`, the use it's the output of; a symbol in it is an error. A list or
+    /// vector's items are made before it, from a stack charged as it grows, as data that
+    /// contains itself would grow it forever.
     pub(crate) fn unwrap(&mut self, value: Value<'gc>, at: Stx) -> Result<Stx, ExpandError> {
-        self.unwrap_in(value, at, MAX_DATA_DEPTH)
-    }
-
-    fn unwrap_in(&mut self, value: Value<'gc>, at: Stx, depth: usize) -> Result<Stx, ExpandError> {
-        if let Some(&stx) = self.unwrapped.get(&value.to_bits()) {
-            return Ok(stx);
+        enum Task<'gc> {
+            Visit(Value<'gc>),
+            /// A list of the last items made, after its tail if it has one, or a vector of them.
+            Make(SyntaxSpan<'gc>, usize, bool, bool),
         }
-        let depth = depth.checked_sub(1).ok_or_else(|| self.error(ExpandErrorKind::TooDeep, at))?;
         let mc = self.mc;
         let bad = |this: &Self| this.error(ExpandErrorKind::BadSyntax, at);
-        let (datum, span, kind, context) = match Syntax::of(value) {
-            Some(s) => (s.datum(mc), s.span(mc), s.kind(mc).ok_or_else(|| bad(self))?, s.context(mc)),
-            None if value == Value::NIL || Pair::of(value).is_some() => (value, self.tree.span(at), SyntaxKind::List, None),
-            None if AnyVector::of(value).is_some() => (value, self.tree.span(at), SyntaxKind::Vector, None),
-            None if Symbol::of(value).is_some() => return Err(bad(self)),
-            None => (value, self.tree.span(at), SyntaxKind::Literal, None),
-        };
-        Ok(match kind {
-            SyntaxKind::Identifier => {
-                let symbol = Symbol::of(datum).ok_or_else(|| bad(self))?;
-                let set = self.set_of(context)?;
-                self.tree.id(symbol, set, span)?
-            }
-            SyntaxKind::List => {
-                let (mut items, mut rest) = (Vec::new(), datum);
-                loop {
-                    if let Some(pair) = Pair::of(rest) {
-                        items.push(self.unwrap_in(pair.head(mc), at, depth)?);
-                        rest = pair.tail(mc);
-                    } else if let Some(list) = Syntax::of(rest).filter(|s| s.kind(mc) == Some(SyntaxKind::List)) {
-                        // A tail that's the syntax of a list goes on with its items.
-                        rest = list.datum(mc);
-                    } else {
-                        break;
-                    }
+        let (mut todo, mut done) = (vec![Task::Visit(value)], Vec::new());
+        while let Some(task) = todo.pop() {
+            let value = match task {
+                Task::Visit(value) => value,
+                Task::Make(span, n, tail, vector) => {
+                    let tail = if tail { done.pop() } else { None };
+                    let items = done.split_off(done.len() - n);
+                    done.push(if vector { self.tree.vector(&items, span)? } else { self.tree.list(&items, tail, span)? });
+                    continue;
                 }
-                let tail = if rest == Value::NIL { None } else { Some(self.unwrap_in(rest, at, depth)?) };
-                self.tree.list(&items, tail, span)?
+            };
+            if let Some(&stx) = self.unwrapped.get(&value.to_bits()) {
+                done.push(stx);
+                continue;
             }
-            SyntaxKind::Vector => {
-                let vector = AnyVector::of(datum).ok_or_else(|| bad(self))?;
-                let items = (0..vector.len(mc)).filter_map(|i| vector.get(mc, i));
-                let items = items.map(|item| self.unwrap_in(item, at, depth)).collect::<Result<Vec<_>, _>>()?;
-                self.tree.vector(&items, span)?
+            self.tree.scopes.charge(size_of::<Task<'gc>>())?;
+            let (datum, span, kind, context) = match Syntax::of(value) {
+                Some(s) => (s.datum(mc), s.span(mc), s.kind(mc).ok_or_else(|| bad(self))?, s.context(mc)),
+                None if value == Value::NIL || Pair::of(value).is_some() => (value, self.tree.span(at), SyntaxKind::List, None),
+                None if AnyVector::of(value).is_some() => (value, self.tree.span(at), SyntaxKind::Vector, None),
+                None if Symbol::of(value).is_some() => return Err(bad(self)),
+                None => (value, self.tree.span(at), SyntaxKind::Literal, None),
+            };
+            match kind {
+                SyntaxKind::Identifier => {
+                    let symbol = Symbol::of(datum).ok_or_else(|| bad(self))?;
+                    let set = self.set_of(context)?;
+                    done.push(self.tree.id(symbol, set, span)?);
+                }
+                SyntaxKind::List => {
+                    let (mut items, mut rest) = (Vec::new(), datum);
+                    loop {
+                        if let Some(pair) = Pair::of(rest) {
+                            self.tree.scopes.charge(size_of::<Task<'gc>>())?;
+                            items.push(Task::Visit(pair.head(mc)));
+                            rest = pair.tail(mc);
+                        } else if let Some(list) = Syntax::of(rest).filter(|s| s.kind(mc) == Some(SyntaxKind::List)) {
+                            // A tail that's the syntax of a list goes on with its items.
+                            rest = list.datum(mc);
+                        } else {
+                            break;
+                        }
+                    }
+                    let tail = rest != Value::NIL;
+                    todo.push(Task::Make(span, items.len(), tail, false));
+                    if tail {
+                        todo.push(Task::Visit(rest));
+                    }
+                    todo.extend(items.into_iter().rev());
+                }
+                SyntaxKind::Vector => {
+                    let vector = AnyVector::of(datum).ok_or_else(|| bad(self))?;
+                    let items: Vec<_> = (0..vector.len(mc)).filter_map(|i| vector.get(mc, i)).collect();
+                    self.tree.scopes.charge(items.len() * size_of::<Task<'gc>>())?;
+                    todo.push(Task::Make(span, items.len(), false, true));
+                    todo.extend(items.into_iter().rev().map(Task::Visit));
+                }
+                SyntaxKind::Literal if Symbol::of(datum).is_none() => done.push(self.tree.datum(datum, span)?),
+                _ => return Err(bad(self)),
             }
-            SyntaxKind::Literal if Symbol::of(datum).is_none() => self.tree.datum(datum, span)?,
-            _ => return Err(bad(self)),
-        })
+        }
+        Ok(done.pop().expect("the root's made"))
     }
 }

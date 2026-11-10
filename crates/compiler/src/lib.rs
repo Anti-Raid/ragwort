@@ -36,6 +36,7 @@ mod l5;
 mod letrec;
 mod lower;
 pub mod module;
+pub mod steps;
 
 #[cfg(test)]
 #[path = "tests/compile.rs"]

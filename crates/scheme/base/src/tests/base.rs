@@ -11,7 +11,12 @@ use crate::ExpandErrorKind::*;
 /// prelude's module, which has run, and root 3 the modules other modules can require, as a list
 /// of `(name . module)`.
 fn arena() -> Arena {
-    let mut arena = Arena::new(1 << 24, 4);
+    arena_of(1 << 24)
+}
+
+/// An arena as [`arena`] makes, of `bytes`.
+fn arena_of(bytes: usize) -> Arena {
+    let mut arena = Arena::new(bytes, 4);
     arena.mutate(|mc| {
         let symbols = Symbols::with_seed(mc, 1).unwrap();
         mc.set_root(0, symbols.value(mc));
@@ -580,8 +585,60 @@ fn bad_syntax_points_at_itself() {
     assert_eq!(error("(f . x)"), (BadSyntax, "(f . x)"));
     assert_eq!(error("else"), (BadSyntax, "else"));
     let deep = |n| format!("{}1{}", "(car ".repeat(n), ")".repeat(n));
-    assert_eq!(error(&deep(300)).0, TooDeep);
-    assert_eq!(eval_in(&mut arena(), &deep(200)), Ok(Err(Fault::WrongType)));
+    assert_eq!(eval_in(&mut arena(), &deep(20_000)), Ok(Err(Fault::WrongType)));
+}
+
+/// Source nested however deeply reads, expands, compiles and runs on a small stack.
+#[test]
+fn deep_source_runs_on_a_small_stack() {
+    let n = 20_000;
+    let nest = |open: &str, inner: &str| format!("{}{inner}{}", open.repeat(n), ")".repeat(n));
+    let cases = vec![
+        (nest("(car ", "1"), Err(Fault::WrongType)),
+        // Each `let` adds scopes to all inside it, so their sets grow as they nest, as do those of
+        // the `let`s a `list` pattern matches with.
+        (format!("{}x{}", "(let ((x 1)) ".repeat(1000), ")".repeat(1000)), Ok("1".to_string())),
+        (format!("(match 1 [{}x{} 2] [_ 3])", "(list ".repeat(1000), ")".repeat(1000)), Ok("3".to_string())),
+        (format!("(car '{})", nest("(", "x")), Ok(nest("(", "x")[1..n * 2].to_string())),
+        (format!("`{}", nest("(", ",(+ 1 2)")), Ok(nest("(", "3"))),
+        (format!("(match 1 [{} 2] [_ 3])", nest("(not ", "_")), Ok("2".to_string())),
+        (format!("(match 1 [{} 2] [_ 3])", nest("(and ", "x")), Ok("2".to_string())),
+    ];
+    let small = std::thread::Builder::new().stack_size(1 << 20).spawn(move || {
+        let mut arena = arena_of(1 << 28);
+        cases.into_iter().map(|(text, want)| (eval_in(&mut arena, &text), want)).find(|(got, want)| got.as_ref() != Ok(want))
+    });
+    let wrong = small.unwrap().join().unwrap();
+    assert!(wrong.is_none(), "{:?}", wrong.map(|(got, _)| got.map(|r| r.map(|s| s.len()))));
+}
+
+/// Syntax of data that holds itself stops rather than going on forever: out of fuel if the
+/// task has a little, or else once what it's made fills the arena.
+#[test]
+fn syntax_of_cyclic_data_stops() {
+    let cyclic = "(define v (vector 1)) (vector-set! v 0 v)";
+    for op in ["(datum->syntax #f v)", "(syntax->datum (datum->syntax #f (vector v)))"] {
+        for (fuel, want) in [(Some(20), Fault::OutOfFuel), (None, Fault::OutOfMemory)] {
+            arena().mutate(|mc| {
+                let thunks = load_text(mc, &format!("{cyclic} {op}")).unwrap();
+                let (&last, before) = thunks.split_last().unwrap();
+                for &thunk in before {
+                    run(mc, thunk).unwrap();
+                }
+                let mut machine = Machine::new(mc, MIN_SEGMENT, last, &[]).unwrap();
+                if let Some(fuel) = fuel {
+                    machine.set_fuel(fuel);
+                }
+                let stopped = loop {
+                    match machine.run(mc) {
+                        Ok(Outcome::Paused) => {}
+                        other => break other.err(),
+                    }
+                };
+                assert_eq!(stopped, Some(want), "{op}");
+            });
+        }
+    }
 }
 
 /// A call of the prelude's `list` with more arguments than it inlines is a call, rather than

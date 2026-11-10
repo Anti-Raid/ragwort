@@ -11,13 +11,14 @@
 //! requires, which it calls the core of itself, as Racket does.
 
 use ragwort_compiler::module::{Import, Uninitialized};
+use ragwort_compiler::steps::Step;
 use ragwort_compiler::{Core, Lambda, Place, Prim, Var};
 use ragwort_types::gc::Value;
 use ragwort_types::pair::Pairs;
 use ragwort_types::symbol::Keyword;
 use ragwort_vm::{Intrinsic, Request, keyword};
 
-use crate::expand::{Binding, Expander};
+use crate::expand::{Binding, Ex, Expander};
 use crate::scope::Scope;
 use crate::tree::{Stx, View};
 use crate::{ExpandError, ExpandErrorKind};
@@ -91,7 +92,7 @@ impl<'gc> Formals<'gc> {
     }
 }
 
-impl<'gc> Expander<'_, 'gc> {
+impl<'a, 'gc> Expander<'a, 'gc> {
     /// Whether `formals` are plain: identifiers, or a list of them with one as its tail.
     pub(crate) fn plain_formals(&mut self, formals: Stx) -> Result<bool, ExpandError> {
         Ok(match self.tree.view(formals)? {
@@ -150,11 +151,18 @@ impl<'gc> Expander<'_, 'gc> {
         Ok(formals.has_keywords().then(|| formals.shape(self)))
     }
 
-    /// The procedure `formals` and `body` make, which `formals`, scoped with `scope`, take. Its
-    /// optional parameters' defaults are worked out in order, each seeing the parameters before
-    /// it. With keyword parameters it's the core of a keyword procedure, which takes the
-    /// keywords' values first, sorted.
-    pub(crate) fn optional_lambda(&mut self, stx: Stx, formals: &Formals<'gc>, body: &[Stx], scope: Scope) -> Result<(Lambda<'gc>, CallShape<'gc>), ExpandError> {
+    /// The procedure `formals` and `body` make, which `formals`, scoped with `scope`, take, and
+    /// its shape, to `then`. Its optional parameters' defaults are worked out in order, each
+    /// seeing the parameters before it. With keyword parameters it's the core of a keyword
+    /// procedure, which takes the keywords' values first, sorted.
+    pub(crate) fn optional_lambda(
+        &mut self,
+        stx: Stx,
+        formals: Formals<'gc>,
+        body: Vec<Stx>,
+        scope: Scope,
+        then: impl FnOnce(&mut Self, Lambda<'gc>, CallShape<'gc>) -> Result<Ex<'a, 'gc>, ExpandError> + 'a,
+    ) -> Result<Ex<'a, 'gc>, ExpandError> {
         let ids: Vec<Stx> = formals.params.iter().map(|p| p.id).chain(formals.rest).collect();
         self.distinct(&ids)?;
         let shape = formals.shape(self);
@@ -163,26 +171,39 @@ impl<'gc> Expander<'_, 'gc> {
         let mc = self.mc;
         order.sort_by(|&a, &b| keyword::order(mc, formals.params[a].keyword.expect("a keyword"), formals.params[b].keyword.expect("a keyword")));
         order.extend((0..raws.len()).filter(|&i| formals.params[i].keyword.is_none()));
-        let mut inits = Vec::new();
-        for (param, &raw) in formals.params.iter().zip(&raws) {
+        let lambda = Optional { stx, formals, body, scope, shape, raws, order, inits: Vec::new(), next: 0 };
+        self.defaults(lambda, Box::new(then))
+    }
+
+    /// Binds the rest of an optional lambda's parameters, each with a default after what that
+    /// expands to, then expands its body.
+    fn defaults(&mut self, mut f: Optional<'gc>, then: Made<'a, 'gc>) -> Result<Ex<'a, 'gc>, ExpandError> {
+        while let Some(param) = f.formals.params.get(f.next) {
+            let raw = f.raws[f.next];
+            f.next += 1;
             let Some(default) = param.default else {
                 self.bind(param.id, Binding::Local(raw))?;
                 continue;
             };
-            let default = self.expr(default)?;
-            let var = self.local(param.id)?;
-            let missing = Core::Intrinsic(Prim::Intrinsic(Intrinsic::Eq), vec![Core::Ref(Place::Local(raw)), Core::Quote(Value::UNSUPPLIED)]);
-            inits.push((var, Core::If(Box::new(missing), Box::new(default), Box::new(Core::Ref(Place::Local(raw))))));
+            let id = param.id;
+            return Self::expr(default, move |this, default| {
+                let var = this.local(id)?;
+                let missing = Core::Intrinsic(Prim::Intrinsic(Intrinsic::Eq), vec![Core::Ref(Place::Local(raw)), Core::Quote(Value::UNSUPPLIED)]);
+                f.inits.push((var, Core::If(Box::new(missing), Box::new(default), Box::new(Core::Ref(Place::Local(raw))))));
+                this.defaults(f, then)
+            });
         }
-        let rest = formals.rest.map(|id| self.local(id)).transpose()?;
-        let body = self.scoped(body, scope)?;
-        let mut body = self.body(stx, &body)?;
-        for bind in inits.into_iter().rev() {
-            body = Core::Let(vec![bind], Box::new(body));
-        }
-        let params = order.into_iter().map(|i| raws[i]).collect();
-        let optional = u32::try_from(shape.optional).map_err(|_| self.error(ExpandErrorKind::BadSyntax, stx))?;
-        Ok((Lambda { id: self.lambda_id(), optional, params, rest, body: Box::new(body) }, shape))
+        let rest = f.formals.rest.map(|id| self.local(id)).transpose()?;
+        let body = self.scoped(&f.body, f.scope)?;
+        Self::body_then(f.stx, body, move |this, mut body| {
+            for bind in f.inits.into_iter().rev() {
+                body = Core::Let(vec![bind], Box::new(body));
+            }
+            let params = f.order.into_iter().map(|i| f.raws[i]).collect();
+            let optional = u32::try_from(f.shape.optional).map_err(|_| this.error(ExpandErrorKind::BadSyntax, f.stx))?;
+            let lambda = Lambda { id: this.lambda_id(), optional, params, rest, body: Box::new(body) };
+            then(this, lambda, f.shape)
+        })
     }
 
     /// The keyword procedure of `core`, whose shape is `shape`.
@@ -212,15 +233,17 @@ impl<'gc> Expander<'_, 'gc> {
     }
 
     /// A `lambda` whose `formals` aren't plain.
-    pub(crate) fn lambda_with(&mut self, stx: Stx, formals: Stx, body: &[Stx], scope: Scope) -> Result<Core<'gc>, ExpandError> {
+    pub(crate) fn lambda_with(&mut self, stx: Stx, formals: Stx, body: Vec<Stx>, scope: Scope) -> Result<Ex<'a, 'gc>, ExpandError> {
         let formals = self.formals(formals)?;
-        let (lambda, shape) = self.optional_lambda(stx, &formals, body, scope)?;
-        if !formals.has_keywords() {
-            return Ok(Core::Lambda(lambda));
-        }
-        let core = self.fresh();
-        let procedure = self.keyword_procedure(&shape, Core::Ref(Place::Local(core)))?;
-        Ok(Core::Let(vec![(core, Core::Lambda(lambda))], Box::new(procedure)))
+        let keywords = formals.has_keywords();
+        self.optional_lambda(stx, formals, body, scope, move |this, lambda, shape| {
+            if !keywords {
+                return Ok(Step::Done(Core::Lambda(lambda)));
+            }
+            let core = this.fresh();
+            let procedure = this.keyword_procedure(&shape, Core::Ref(Place::Local(core)))?;
+            Ok(Step::Done(Core::Let(vec![(core, Core::Lambda(lambda))], Box::new(procedure))))
+        })
     }
 
     /// Whether any of a call's `args` is a keyword.
@@ -230,7 +253,7 @@ impl<'gc> Expander<'_, 'gc> {
 
     /// A call of `head` on `args`, which has keyword arguments, or calls a keyword procedure
     /// `def` says a definition made.
-    pub(crate) fn keyword_call(&mut self, head: Stx, args: &[Stx], def: Option<KeywordDef<'gc>>) -> Result<Core<'gc>, ExpandError> {
+    pub(crate) fn keyword_call(&mut self, head: Stx, args: Vec<Stx>, def: Option<KeywordDef<'gc>>) -> Result<Ex<'a, 'gc>, ExpandError> {
         let mut parsed = Vec::with_capacity(args.len());
         let mut items = args.iter().copied();
         while let Some(arg) = items.next() {
@@ -251,31 +274,42 @@ impl<'gc> Expander<'_, 'gc> {
         // The arguments, in the order they're written, each in a local, and the procedure first
         // unless it's called directly.
         let direct = def.filter(|def| def.shape.matches(&given, positional));
-        let mut binds = Vec::with_capacity(parsed.len() + 1);
-        let f = match &direct {
-            Some(_) => None,
-            None => {
-                let f = self.expr(head)?;
-                let var = self.fresh();
-                binds.push((var, f));
-                Some(var)
-            }
-        };
-        let mut keyword_vars = Vec::new();
-        let mut positional_vars = Vec::new();
-        for arg in &parsed {
-            let (stx, k) = match *arg {
-                Arg::Positional(stx) => (stx, None),
-                Arg::Keyword(k, stx) => (stx, Some(k)),
-            };
-            let value = self.expr(stx)?;
-            let var = self.fresh();
-            binds.push((var, value));
-            match k {
-                Some(k) => keyword_vars.push((k, var)),
-                None => positional_vars.push(var),
-            }
+        let call = KeywordCall { head, given, direct, binds: Vec::with_capacity(parsed.len() + 1), f: None, keyword_vars: Vec::new(), positional_vars: Vec::new() };
+        let parsed = parsed.into_iter();
+        if call.direct.is_some() {
+            return self.keyword_args(call, parsed);
         }
+        Self::expr(head, move |this, f| {
+            let mut call = call;
+            let var = this.fresh();
+            call.binds.push((var, f));
+            call.f = Some(var);
+            this.keyword_args(call, parsed)
+        })
+    }
+
+    /// Expands the rest of a keyword call's arguments, `args`, each into a local, then makes
+    /// the call.
+    fn keyword_args(&mut self, mut call: KeywordCall<'gc>, mut args: std::vec::IntoIter<Arg<'gc>>) -> Result<Ex<'a, 'gc>, ExpandError> {
+        let Some(arg) = args.next() else { return self.keyword_called(call).map(Step::Done) };
+        let (stx, k) = match arg {
+            Arg::Positional(stx) => (stx, None),
+            Arg::Keyword(k, stx) => (stx, Some(k)),
+        };
+        Self::expr(stx, move |this, value| {
+            let var = this.fresh();
+            call.binds.push((var, value));
+            match k {
+                Some(k) => call.keyword_vars.push((k, var)),
+                None => call.positional_vars.push(var),
+            }
+            this.keyword_args(call, args)
+        })
+    }
+
+    /// A keyword call whose arguments are all expanded.
+    fn keyword_called(&mut self, call: KeywordCall<'gc>) -> Result<Core<'gc>, ExpandError> {
+        let KeywordCall { head, given, direct, binds, f, keyword_vars, positional_vars } = call;
         let refs = |vars: &[Var]| vars.iter().map(|&v| Core::Ref(Place::Local(v))).collect::<Vec<_>>();
         let value_of = |k: Keyword<'gc>| keyword_vars.iter().find(|&&(other, _)| other == k).map(|&(_, v)| Core::Ref(Place::Local(v)));
         let call = match (direct, f) {
@@ -307,6 +341,37 @@ impl<'gc> Expander<'_, 'gc> {
         };
         Ok(if binds.is_empty() { call } else { Core::Let(binds, Box::new(call)) })
     }
+}
+
+/// A lambda with optional or keyword parameters being expanded: its parameters' variables, as
+/// its formals have them, in the order it takes them, and the defaults so far, each binding the
+/// parameter it's for, `next` the parameter after them.
+struct Optional<'gc> {
+    stx: Stx,
+    formals: Formals<'gc>,
+    body: Vec<Stx>,
+    scope: Scope,
+    shape: CallShape<'gc>,
+    raws: Vec<Var>,
+    order: Vec<usize>,
+    inits: Vec<(Var, Core<'gc>)>,
+    next: usize,
+}
+
+/// What goes on with an optional lambda once it's made.
+type Made<'a, 'gc> = Box<dyn FnOnce(&mut Expander<'a, 'gc>, Lambda<'gc>, CallShape<'gc>) -> Result<Ex<'a, 'gc>, ExpandError> + 'a>;
+
+/// A keyword call being expanded: what it calls, the keywords it gives, sorted, the definition
+/// it calls the core of directly, if any, and the arguments so far, each bound to a local, the
+/// procedure's first if it isn't called directly.
+struct KeywordCall<'gc> {
+    head: Stx,
+    given: Vec<Keyword<'gc>>,
+    direct: Option<KeywordDef<'gc>>,
+    binds: Vec<(Var, Core<'gc>)>,
+    f: Option<Var>,
+    keyword_vars: Vec<(Keyword<'gc>, Var)>,
+    positional_vars: Vec<Var>,
 }
 
 impl<'gc> Expander<'_, 'gc> {

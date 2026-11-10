@@ -7,6 +7,7 @@
 //! identifiers refers to, and its patterns and templates are values of the VM's. A syntax error
 //! it raises, that it doesn't catch, is bad syntax where the error says.
 
+use ragwort_compiler::steps::Step;
 use ragwort_compiler::{CompileError, Core, compile};
 use ragwort_types::gc::Value;
 use ragwort_types::pair::Pair;
@@ -15,23 +16,30 @@ use ragwort_vm::objects::{Closure, Condition, ConditionFields};
 use ragwort_types::gc::OutOfMemory;
 use ragwort_vm::{Fault, MIN_SEGMENT, Machine, Outcome};
 
-use crate::expand::{Binding, Expander};
-use crate::scope::Op;
+use crate::expand::{Binding, Call, Ex, Expander};
+use crate::scope::{Op, Scope};
 use crate::tree::Stx;
 use crate::{ExpandError, ExpandErrorKind};
 
-impl<'gc> Expander<'_, 'gc> {
-    /// The identifier a `define-syntax` binds, and its transformer.
-    pub(crate) fn define_syntax(&mut self, form: Stx) -> Result<(Stx, u32), ExpandError> {
+impl<'a, 'gc> Expander<'a, 'gc> {
+    /// The identifier a `define-syntax` binds, and its transformer's expression.
+    pub(crate) fn syntax_definition(&mut self, form: Stx) -> Result<(Stx, Stx), ExpandError> {
         match *self.proper(form)?.as_slice() {
-            [_, id, expr] if self.is_id(id) => Ok((id, self.transformer(expr, form)?)),
+            [_, id, expr] if self.is_id(id) => Ok((id, expr)),
             _ => Err(self.error(ExpandErrorKind::BadSyntax, form)),
         }
     }
 
+    /// The identifier a `define-syntax` at the top level binds, and its transformer.
+    pub(crate) fn define_syntax_now(&mut self, form: Stx) -> Result<(Stx, u32), ExpandError> {
+        let (id, expr) = self.syntax_definition(form)?;
+        let core = self.expand_now(expr)?;
+        Ok((id, self.made_transformer(&core, expr, form)?))
+    }
+
     /// A `let-syntax`, or if `recursive`, a `letrec-syntax`, whose transformers see what it
     /// binds.
-    pub(crate) fn let_syntax(&mut self, stx: Stx, binds: Stx, body: &[Stx], recursive: bool) -> Result<Core<'gc>, ExpandError> {
+    pub(crate) fn let_syntax(&mut self, stx: Stx, binds: Stx, body: Vec<Stx>, recursive: bool) -> Result<Ex<'a, 'gc>, ExpandError> {
         let scope = self.tree.scopes.fresh()?;
         let (mut ids, mut exprs) = (Vec::new(), Vec::new());
         for bind in self.proper(binds)? {
@@ -44,18 +52,35 @@ impl<'gc> Expander<'_, 'gc> {
             }
         }
         self.distinct(&ids)?;
-        for (id, expr) in ids.into_iter().zip(exprs) {
-            let m = self.transformer(expr, stx)?;
-            self.bind(id, Binding::Macro(m))?;
-        }
-        let body = self.scoped(body, scope)?;
-        self.body(stx, &body)
+        let macros: Vec<_> = ids.into_iter().zip(exprs).collect();
+        self.let_macros(stx, macros.into_iter(), body, scope)
     }
 
-    /// Expands, compiles and runs `expr`, the transformer of a macro `at` defines, and keeps it.
-    fn transformer(&mut self, expr: Stx, at: Stx) -> Result<u32, ExpandError> {
-        let core = self.expr(expr)?;
-        let thunk = compile(self.mc, None, &core).map_err(|e| match e {
+    /// Binds each of `macros` to its transformer, made in turn, then expands `body`.
+    fn let_macros(&mut self, stx: Stx, mut macros: std::vec::IntoIter<(Stx, Stx)>, body: Vec<Stx>, scope: Scope) -> Result<Ex<'a, 'gc>, ExpandError> {
+        let Some((id, expr)) = macros.next() else {
+            let body = self.scoped(&body, scope)?;
+            return Ok(Step::Tail(Call::Run(Box::new(move |this: &mut Self| this.body(stx, body)))));
+        };
+        self.transformer(expr, stx, move |this, m| {
+            this.bind(id, Binding::Macro(m))?;
+            this.let_macros(stx, macros, body, scope)
+        })
+    }
+
+    /// Expands `expr`, the transformer of a macro `at` defines, then compiles, runs and keeps
+    /// it, and goes on with `then`.
+    pub(crate) fn transformer(&mut self, expr: Stx, at: Stx, then: impl FnOnce(&mut Self, u32) -> Result<Ex<'a, 'gc>, ExpandError> + 'a) -> Result<Ex<'a, 'gc>, ExpandError> {
+        Self::expr(expr, move |this, core| {
+            let m = this.made_transformer(&core, expr, at)?;
+            then(this, m)
+        })
+    }
+
+    /// Compiles and runs `core`, the expansion of `expr`, the transformer of a macro `at`
+    /// defines, and keeps it.
+    fn made_transformer(&mut self, core: &Core<'gc>, expr: Stx, at: Stx) -> Result<u32, ExpandError> {
+        let thunk = compile(self.mc, None, core).map_err(|e| match e {
             // It refers to a variable of the code around it, which isn't there yet.
             CompileError::Unbound(_) | CompileError::UnknownSlot(_) => self.error(ExpandErrorKind::Phase, expr),
             _ => self.error(ExpandErrorKind::Transformer, at),

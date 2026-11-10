@@ -177,15 +177,23 @@ impl<'gc> Imports<'gc> {
 }
 
 /// A require spec, with where each part of it is written, `L`: what a front end reads one as.
+/// It's what the module of a name exports, through each of its filters in turn, the innermost
+/// first, as `(prefix-in p: (only-in m a))` has `only-in` then `prefix-in`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RequireSpec<L> {
-    /// All of what the module of this name exports.
-    Module(String, L),
-    Only(Box<Self>, Vec<(String, L)>),
-    Except(Box<Self>, Vec<(String, L)>),
-    Prefix(String, Box<Self>),
+pub struct RequireSpec<L> {
+    pub module: String,
+    pub at: L,
+    pub filters: Vec<Filter<L>>,
+}
+
+/// What a require spec keeps of what's inside it, and what it names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Filter<L> {
+    Only(Vec<(String, L)>),
+    Except(Vec<(String, L)>),
+    Prefix(String),
     /// Each old name, renamed to the new.
-    Rename(Box<Self>, Vec<(String, String, L)>),
+    Rename(Vec<(String, String, L)>),
 }
 
 /// What's wrong with a require spec, and where.
@@ -201,25 +209,24 @@ impl<L: Copy> RequireSpec<L> {
     /// What it imports, of the modules `resolver` finds for the module named `from`.
     pub fn imports<'gc>(&self, mc: &Mutation<'gc>, resolver: &mut dyn Resolver<'gc>, from: Value<'gc>) -> Result<Imports<'gc>, SpecError<L>> {
         let at = |names: &[(String, L)], missing: String| names.iter().find(|(n, _)| *n == missing).map(|&(_, at)| SpecError::NotProvided(at));
-        Ok(match self {
-            Self::Module(name, at) => {
-                let module = resolver.resolve(mc, name, from).ok_or(SpecError::Resolve(*at))?;
-                Imports::all(mc, module).ok_or(SpecError::Resolve(*at))?
-            }
-            Self::Only(inner, names) | Self::Except(inner, names) => {
-                let imports = inner.imports(mc, resolver, from)?;
-                let just: Vec<String> = names.iter().map(|(n, _)| n.clone()).collect();
-                let kept = if matches!(self, Self::Only(..)) { imports.only(&just) } else { imports.except(&just) };
-                kept.map_err(|missing| at(names, missing).expect("a missing name is one of the spec's"))?
-            }
-            Self::Prefix(prefix, inner) => inner.imports(mc, resolver, from)?.prefix(prefix),
-            Self::Rename(inner, renames) => {
-                let pairs: Vec<(String, String)> = renames.iter().map(|(old, new, _)| (old.clone(), new.clone())).collect();
-                let olds: Vec<(String, L)> = renames.iter().map(|(old, _, at)| (old.clone(), *at)).collect();
-                let imports = inner.imports(mc, resolver, from)?;
-                imports.rename(&pairs).map_err(|missing| at(&olds, missing).expect("a missing name is one of the spec's"))?
-            }
-        })
+        let module = resolver.resolve(mc, &self.module, from).ok_or(SpecError::Resolve(self.at))?;
+        let mut imports = Imports::all(mc, module).ok_or(SpecError::Resolve(self.at))?;
+        for filter in &self.filters {
+            imports = match filter {
+                Filter::Only(names) | Filter::Except(names) => {
+                    let just: Vec<String> = names.iter().map(|(n, _)| n.clone()).collect();
+                    let kept = if matches!(filter, Filter::Only(..)) { imports.only(&just) } else { imports.except(&just) };
+                    kept.map_err(|missing| at(names, missing).expect("a missing name is one of the spec's"))?
+                }
+                Filter::Prefix(prefix) => imports.prefix(prefix),
+                Filter::Rename(renames) => {
+                    let pairs: Vec<(String, String)> = renames.iter().map(|(old, new, _)| (old.clone(), new.clone())).collect();
+                    let olds: Vec<(String, L)> = renames.iter().map(|(old, _, at)| (old.clone(), *at)).collect();
+                    imports.rename(&pairs).map_err(|missing| at(&olds, missing).expect("a missing name is one of the spec's"))?
+                }
+            };
+        }
+        Ok(imports)
     }
 }
 

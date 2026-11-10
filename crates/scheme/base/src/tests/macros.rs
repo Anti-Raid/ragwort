@@ -185,9 +185,10 @@ fn macro_mistakes_point_at_themselves() {
     assert_eq!(error("(define-syntax p (lambda (s) (syntax-case s () ((_ x) x))))"), (BadSyntax, "x"));
     assert_eq!(error("(define-syntax two-dots (syntax-rules () ((_ a ... b ...) 1)))"), (BadSyntax, "(_ a ... b ...)"));
     assert_eq!(error("(define-syntax zip (syntax-rules () ((_ (a ...) (b ...)) '((a b) ...)))) (zip (1 2) (3))"), (BadSyntax, "(zip (1 2) (3))"));
-    // A macro that expands to itself stops, at the top level and in an expression.
-    assert_eq!(error("(define-syntax loop (syntax-rules () ((_) (loop)))) (loop)").0, TooDeep);
-    assert_eq!(error("(define-syntax loop (syntax-rules () ((_) (+ 1 (loop))))) (loop)").0, TooDeep);
+    // A macro that expands to itself stops when what it makes fills the arena, at the top level
+    // and in an expression.
+    assert_eq!(error("(define-syntax loop (syntax-rules () ((_) (loop)))) (loop)"), (OutOfMemory.into(), "(loop)"));
+    assert_eq!(error("(define-syntax loop (syntax-rules () ((_) (+ 1 (loop))))) (loop)"), (OutOfMemory.into(), "(+ 1 (loop))"));
     // One that runs forever runs out of fuel.
     assert_eq!(error("(define-syntax spin (lambda (s) (let f () (f)))) (spin)"), (Transformer, "(spin)"));
 }

@@ -3,6 +3,7 @@
 //! bindings, which the code they're given can't shadow, and the expander's flipped scope keeps
 //! the temporaries they bind apart from the code's own.
 
+use ragwort_compiler::steps::{self, Step};
 use ragwort_types::gc::Value;
 
 use crate::expand::{Aux, Binding, Expander, Keyword, Macro};
@@ -17,7 +18,22 @@ enum Tag {
     Quasiquote,
 }
 
-impl<'gc> Expander<'_, 'gc> {
+/// What building a quasiquoted template does next: see [`steps`]. Each call builds a template at
+/// a quasiquote nesting, as [`Expander::quasi`] does.
+type Quasi<'a, 'gc> = Step<'a, Expander<'a, 'gc>, (Stx, usize), Option<Stx>, ExpandError>;
+
+/// A quasiquoted list being built at nesting `depth`: what each of its items so far builds to,
+/// or the expression it splices in, and whether any isn't constant.
+struct Built {
+    template: Stx,
+    depth: usize,
+    items: Vec<Stx>,
+    tail: Option<Stx>,
+    built: Vec<Result<Option<Stx>, Stx>>,
+    any: bool,
+}
+
+impl<'a, 'gc> Expander<'a, 'gc> {
     pub(crate) fn derived(&mut self, m: Macro, stx: Stx) -> Result<Stx, ExpandError> {
         let items = self.proper(stx)?;
         let args = &items[1..];
@@ -87,7 +103,7 @@ impl<'gc> Expander<'_, 'gc> {
                 let thunk = self.build(stx, "lambda", &[&[none, body]])?;
                 self.build(stx, "call-with-mark", &[&[key, value, thunk]])
             }
-            (Macro::Quasiquote, &[template]) => match self.quasi(template, 0)? {
+            (Macro::Quasiquote, &[template]) => match steps::run(self, (template, 0), Self::quasi)? {
                 Some(built) => Ok(built),
                 None => self.quoted(template, stx),
             },
@@ -298,21 +314,24 @@ impl<'gc> Expander<'_, 'gc> {
 
     /// An expression that builds `template` at quasiquote nesting `depth`, or `None` if it has
     /// nothing unquoted and can be quoted as it is.
-    fn quasi(&mut self, template: Stx, depth: usize) -> Result<Option<Stx>, ExpandError> {
+    fn quasi(&mut self, (template, depth): (Stx, usize)) -> Result<Quasi<'a, 'gc>, ExpandError> {
         match self.tree.view(template)? {
             View::List(items, tail) => {
                 if tail.is_none()
                     && let Some((tag, x)) = self.tag(&items)?
                 {
                     let depth = match (tag, depth) {
-                        (Tag::Unquote, 0) => return Ok(Some(x)),
+                        (Tag::Unquote, 0) => return Ok(Step::Done(Some(x))),
                         (Tag::UnquoteSplicing, 0) => return Err(self.error(ExpandErrorKind::BadSyntax, template)),
                         (Tag::Unquote | Tag::UnquoteSplicing, d) => d - 1,
                         (Tag::Quasiquote, d) => d + 1,
                     };
-                    let Some(x) = self.quasi(x, depth)? else { return Ok(None) };
-                    let name = self.quoted(items[0], template)?;
-                    return Ok(Some(self.build(template, "list", &[&[name, x]])?));
+                    let name = items[0];
+                    return Ok(Step::then((x, depth), move |this: &mut Self, x| {
+                        let Some(x) = x else { return Ok(Step::Done(None)) };
+                        let name = this.quoted(name, template)?;
+                        Ok(Step::Done(Some(this.build(template, "list", &[&[name, x]])?)))
+                    }));
                 }
                 // `(a . ,b)` reads as `(a unquote b)`.
                 let (items, tail) = match items.len() {
@@ -322,61 +341,84 @@ impl<'gc> Expander<'_, 'gc> {
                     }
                     _ => (items, tail),
                 };
-                let mut built = Vec::with_capacity(items.len());
-                let mut any = false;
-                for &item in &items {
-                    let spliced = match self.tree.view(item)? {
-                        View::List(parts, None) if depth == 0 => match self.tag(&parts)? {
-                            Some((Tag::UnquoteSplicing, x)) => Some(x),
-                            _ => None,
-                        },
-                        _ => None,
-                    };
-                    let part = match spliced {
-                        Some(x) => Err(x),
-                        None => Ok(self.quasi(item, depth)?),
-                    };
-                    any |= !matches!(part, Ok(None));
-                    built.push(part);
-                }
-                let rest = match tail {
-                    Some(tail) => self.quasi(tail, depth)?.ok_or(tail),
-                    None => Err(self.list(&[], template)?),
-                };
-                if !any && rest.is_err() {
-                    return Ok(None);
-                }
-                let mut acc = match rest {
-                    Ok(built) => built,
-                    Err(constant) => self.quoted(constant, template)?,
-                };
-                for (part, &item) in built.into_iter().zip(&items).rev() {
-                    acc = match part {
-                        Err(spliced) => self.build(template, "append", &[&[spliced, acc]])?,
-                        Ok(built) => {
-                            let head = match built {
-                                Some(built) => built,
-                                None => self.quoted(item, item)?,
-                            };
-                            self.build(template, "cons", &[&[head, acc]])?
-                        }
-                    };
-                }
-                Ok(Some(acc))
+                let built = Vec::with_capacity(items.len());
+                self.quasi_items(Built { template, depth, items, tail, built, any: false })
             }
-            View::Vector(items) => {
-                for item in items {
-                    let spliced = match self.tree.view(item)? {
-                        View::List(parts, None) => self.tag(&parts)?.is_some_and(|(tag, _)| tag == Tag::UnquoteSplicing),
-                        _ => false,
-                    };
-                    if spliced || self.quasi(item, depth)?.is_some() {
-                        return Err(self.error(ExpandErrorKind::Unsupported, template));
-                    }
-                }
-                Ok(None)
-            }
-            _ => Ok(None),
+            View::Vector(items) => self.quasi_vector(template, depth, items, 0),
+            _ => Ok(Step::Done(None)),
         }
+    }
+
+    /// Builds the rest of a quasiquoted list's items, then its tail.
+    fn quasi_items(&mut self, mut b: Built) -> Result<Quasi<'a, 'gc>, ExpandError> {
+        while let Some(&item) = b.items.get(b.built.len()) {
+            let spliced = match self.tree.view(item)? {
+                View::List(parts, None) if b.depth == 0 => match self.tag(&parts)? {
+                    Some((Tag::UnquoteSplicing, x)) => Some(x),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(x) = spliced else {
+                return Ok(Step::then((item, b.depth), move |this: &mut Self, part: Option<Stx>| {
+                    b.any |= part.is_some();
+                    b.built.push(Ok(part));
+                    this.quasi_items(b)
+                }));
+            };
+            b.any = true;
+            b.built.push(Err(x));
+        }
+        match b.tail {
+            Some(tail) => Ok(Step::then((tail, b.depth), move |this: &mut Self, rest: Option<Stx>| this.quasi_list(b, rest.ok_or(tail)))),
+            None => {
+                let empty = self.list(&[], b.template)?;
+                self.quasi_list(b, Err(empty))
+            }
+        }
+    }
+
+    /// A quasiquoted list whose items are built, with its tail `rest` built or constant.
+    fn quasi_list(&mut self, b: Built, rest: Result<Stx, Stx>) -> Result<Quasi<'a, 'gc>, ExpandError> {
+        let Built { template, items, built, any, .. } = b;
+        if !any && rest.is_err() {
+            return Ok(Step::Done(None));
+        }
+        let mut acc = match rest {
+            Ok(built) => built,
+            Err(constant) => self.quoted(constant, template)?,
+        };
+        for (part, &item) in built.into_iter().zip(&items).rev() {
+            acc = match part {
+                Err(spliced) => self.build(template, "append", &[&[spliced, acc]])?,
+                Ok(built) => {
+                    let head = match built {
+                        Some(built) => built,
+                        None => self.quoted(item, item)?,
+                    };
+                    self.build(template, "cons", &[&[head, acc]])?
+                }
+            };
+        }
+        Ok(Step::Done(Some(acc)))
+    }
+
+    /// Checks a quasiquoted vector's items from `i` on have nothing unquoted, which isn't
+    /// supported.
+    fn quasi_vector(&mut self, template: Stx, depth: usize, items: Vec<Stx>, i: usize) -> Result<Quasi<'a, 'gc>, ExpandError> {
+        let Some(&item) = items.get(i) else { return Ok(Step::Done(None)) };
+        let spliced = match self.tree.view(item)? {
+            View::List(parts, None) => self.tag(&parts)?.is_some_and(|(tag, _)| tag == Tag::UnquoteSplicing),
+            _ => false,
+        };
+        if spliced {
+            return Err(self.error(ExpandErrorKind::Unsupported, template));
+        }
+        Ok(Step::then((item, depth), move |this: &mut Self, part: Option<Stx>| {
+            if part.is_some() {
+                return Err(this.error(ExpandErrorKind::Unsupported, template));
+            }
+            this.quasi_vector(template, depth, items, i + 1)
+        }))
     }
 }

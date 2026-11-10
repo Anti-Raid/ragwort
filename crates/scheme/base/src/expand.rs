@@ -6,7 +6,8 @@
 
 
 
-use ragwort_compiler::module::{self, Import, Imports, ModuleBuilder, ModuleError, RequireSpec, Resolver, SpecError, Uninitialized};
+use ragwort_compiler::module::{self, Filter, Import, Imports, ModuleBuilder, ModuleError, RequireSpec, Resolver, SpecError, Uninitialized};
+use ragwort_compiler::steps::{self, Step};
 use ragwort_compiler::{Core, Lambda, Place, Var};
 use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Value};
 use ragwort_types::string::{Strings, chars};
@@ -17,14 +18,9 @@ use ragwort_vm::objects::Module;
 
 use crate::formals::{CallShape, CoreAt, Def, KeywordDef};
 use crate::scope::{BASE, Map, Op, Scope, Set, TOP};
-use crate::tree::{Stx, Tree, TreeError, View};
+use crate::tree::{Stx, Tree, View};
 use crate::{ExpandError, ExpandErrorKind};
 
-/// How deeply expressions can nest before expanding them would take too much of the native
-/// stack.
-const MAX_DEPTH: usize = 256;
-/// How deeply data can nest, which takes less of it.
-pub(crate) const MAX_DATA_DEPTH: usize = 1024;
 /// How much fuel the transformers of a load's macros have, between them, so a macro that
 /// expands forever ends.
 const MACRO_FUEL: u64 = 1 << 26;
@@ -171,6 +167,29 @@ enum Item {
     Expr(Stx),
 }
 
+/// A body's forms still to look at, last first, and what's been found in those before them.
+struct Scan {
+    stx: Stx,
+    queue: Vec<Stx>,
+    items: Vec<Item>,
+    defined: Vec<Stx>,
+    names: Vec<Stx>,
+}
+
+/// What expanding an expression does next: see [`steps`]. Each call makes core forms.
+pub(crate) type Ex<'a, 'gc> = Step<'a, Expander<'a, 'gc>, Call<'a, 'gc>, Core<'gc>, ExpandError>;
+
+/// What an expression's expansion needs made first.
+pub(crate) enum Call<'a, 'gc> {
+    /// The expression.
+    Expr(Stx),
+    /// What the function makes.
+    Run(Work<'a, 'gc>),
+}
+
+/// Expansion that goes on from the state it's given.
+pub(crate) type Work<'a, 'gc> = Box<dyn FnOnce(&mut Expander<'a, 'gc>) -> Result<Ex<'a, 'gc>, ExpandError> + 'a>;
+
 /// A form at the top level or in a body, expanded far enough to tell what it is.
 enum Head {
     Define(Stx),
@@ -222,7 +241,6 @@ pub struct Expander<'a, 'gc> {
     base: Set,
     vars: u32,
     lambdas: u32,
-    depth: usize,
     /// The transformers of the load's macros.
     pub(crate) macros: Vec<Value<'gc>>,
     /// What runs the transformers, once one has, and the fuel they have between them till then.
@@ -289,7 +307,6 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             base,
             vars: 0,
             lambdas: 0,
-            depth: 0,
             macros: Vec::new(),
             machine: None,
             fuel: MACRO_FUEL,
@@ -310,13 +327,6 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         ExpandError { kind: kind.into(), start: span.start(), end: span.end() }
     }
 
-    fn tree_error(&self, e: TreeError, stx: Stx) -> ExpandError {
-        match e {
-            TreeError::TooDeep => self.error(ExpandErrorKind::TooDeep, stx),
-            TreeError::OutOfMemory => self.error(OutOfMemory, stx),
-        }
-    }
-
     /// The module, which the other front ends build it with.
     pub fn builder(&mut self) -> &mut ModuleBuilder<'gc> {
         &mut self.builder
@@ -325,10 +335,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     /// What the reader read, in the top-level scope.
     fn read(&mut self, node: Syntax<'gc>) -> Result<Stx, ExpandError> {
         let span = node.span(self.mc);
-        let stx = self.tree.read(node, MAX_DATA_DEPTH).map_err(|e| {
-            let kind = if e == TreeError::TooDeep { ExpandErrorKind::TooDeep } else { OutOfMemory.into() };
-            ExpandError { kind, start: span.start(), end: span.end() }
-        })?;
+        let stx = self.tree.read(node).map_err(|e| ExpandError { kind: e.into(), start: span.start(), end: span.end() })?;
         Ok(self.tree.with(stx, TOP, Op::Add)?)
     }
 
@@ -354,7 +361,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                     }
                 }
                 Head::DefineSyntax(form) => {
-                    let (id, m) = self.define_syntax(form)?;
+                    let (id, m) = self.define_syntax_now(form)?;
                     self.bind(id, Binding::Macro(m))?;
                 }
                 Head::Require(form) => {
@@ -403,31 +410,38 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         Ok(())
     }
 
-    /// The require spec `spec`.
-    fn spec(&mut self, spec: Stx) -> Result<RequireSpec<Stx>, ExpandError> {
-        if let Some(name) = self.text(spec) {
-            return Ok(RequireSpec::Module(name, spec));
-        }
-        let items = self.proper(spec)?;
-        let Some((&head, args)) = items.split_first() else { return Err(self.error(ExpandErrorKind::BadSyntax, spec)) };
-        let word = if self.is_id(head) { self.text(head) } else { None };
-        let named = |this: &mut Self, ids: &[Stx]| -> Result<Vec<(String, Stx)>, ExpandError> {
-            ids.iter().map(|&id| Ok((this.identifier(id)?, id))).collect()
-        };
-        Ok(match (word.as_deref(), args) {
-            (Some("only-in"), &[inner, ref ids @ ..]) => RequireSpec::Only(Box::new(self.spec(inner)?), named(self, ids)?),
-            (Some("except-in"), &[inner, ref ids @ ..]) => RequireSpec::Except(Box::new(self.spec(inner)?), named(self, ids)?),
-            (Some("prefix-in"), &[prefix, inner]) => RequireSpec::Prefix(self.identifier(prefix)?, Box::new(self.spec(inner)?)),
-            (Some("rename-in"), &[inner, ref renames @ ..]) => {
-                let mut pairs = Vec::with_capacity(renames.len());
-                for &rename in renames {
-                    let (old, new) = self.pair_of_names(rename)?;
-                    pairs.push((self.text(old).expect("an identifier"), new, rename));
-                }
-                RequireSpec::Rename(Box::new(self.spec(inner)?), pairs)
+    /// The require spec `spec`: its filters, outermost first as they're written, then the
+    /// module inside them.
+    fn spec(&mut self, mut spec: Stx) -> Result<RequireSpec<Stx>, ExpandError> {
+        let mut filters = Vec::new();
+        loop {
+            if let Some(module) = self.text(spec) {
+                filters.reverse();
+                return Ok(RequireSpec { module, at: spec, filters });
             }
-            _ => return Err(self.error(ExpandErrorKind::BadSyntax, spec)),
-        })
+            let items = self.proper(spec)?;
+            let Some((&head, args)) = items.split_first() else { return Err(self.error(ExpandErrorKind::BadSyntax, spec)) };
+            let word = if self.is_id(head) { self.text(head) } else { None };
+            let named = |this: &mut Self, ids: &[Stx]| -> Result<Vec<(String, Stx)>, ExpandError> {
+                ids.iter().map(|&id| Ok((this.identifier(id)?, id))).collect()
+            };
+            let (filter, inner) = match (word.as_deref(), args) {
+                (Some("only-in"), &[inner, ref ids @ ..]) => (Filter::Only(named(self, ids)?), inner),
+                (Some("except-in"), &[inner, ref ids @ ..]) => (Filter::Except(named(self, ids)?), inner),
+                (Some("prefix-in"), &[prefix, inner]) => (Filter::Prefix(self.identifier(prefix)?), inner),
+                (Some("rename-in"), &[inner, ref renames @ ..]) => {
+                    let mut pairs = Vec::with_capacity(renames.len());
+                    for &rename in renames {
+                        let (old, new) = self.pair_of_names(rename)?;
+                        pairs.push((self.text(old).expect("an identifier"), new, rename));
+                    }
+                    (Filter::Rename(pairs), inner)
+                }
+                _ => return Err(self.error(ExpandErrorKind::BadSyntax, spec)),
+            };
+            filters.push(filter);
+            spec = inner;
+        }
     }
 
     /// The identifiers in `(old new)`.
@@ -471,7 +485,6 @@ impl<'a, 'gc> Expander<'a, 'gc> {
 
     /// Expands `top`, the module's top-level form `form`, once it's started.
     pub fn lower(&mut self, top: Top, form: u32) -> Result<Core<'gc>, ExpandError> {
-        self.depth = 0;
         self.form = form;
         match top.0 {
             TopForm::Define(slot, value) => {
@@ -479,7 +492,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                     self.is_id(head) && matches!(self.resolve(head), Ok(Binding::Keyword(Keyword::Form(Form::Lambda))))
                 }));
                 self.defining = lambda.then_some(slot);
-                let value = self.expr(value);
+                let value = self.expand_now(value);
                 self.defining = None;
                 let value = value?;
                 self.builder.defined(slot, &value);
@@ -487,28 +500,32 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             }
             TopForm::DefineKeyword { procedure, core, lambda } => {
                 self.defining = Some(core);
-                let made = self.keyword_definition(lambda);
+                let made = self.run_now(move |this| {
+                    this.keyword_definition(lambda, move |this, lambda, shape| {
+                        let lambda = Core::Lambda(lambda);
+                        this.builder.defined(core, &lambda);
+                        let place = this.builder.place(core, this.form, None);
+                        let value = this.keyword_procedure(&shape, Core::Ref(place))?;
+                        let core = Core::Set(Place::Slot { slot: core, checked: false }, Box::new(lambda));
+                        let procedure = Core::Set(Place::Slot { slot: procedure, checked: false }, Box::new(value));
+                        Ok(Step::Done(Core::Let(vec![(this.fresh(), core)], Box::new(procedure))))
+                    })
+                });
                 self.defining = None;
-                let (lambda, shape) = made?;
-                let lambda = Core::Lambda(lambda);
-                self.builder.defined(core, &lambda);
-                let place = self.builder.place(core, self.form, None);
-                let value = self.keyword_procedure(&shape, Core::Ref(place))?;
-                let core = Core::Set(Place::Slot { slot: core, checked: false }, Box::new(lambda));
-                let procedure = Core::Set(Place::Slot { slot: procedure, checked: false }, Box::new(value));
-                Ok(Core::Let(vec![(self.fresh(), core)], Box::new(procedure)))
+                made
             }
-            TopForm::Expr(e) => self.expr(e),
+            TopForm::Expr(e) => self.expand_now(e),
         }
     }
 
-    /// The core of the keyword procedure `lambda`, a `lambda` form with keyword parameters.
-    fn keyword_definition(&mut self, lambda: Stx) -> Result<(Lambda<'gc>, CallShape<'gc>), ExpandError> {
+    /// The core of the keyword procedure `lambda`, a `lambda` form with keyword parameters, and
+    /// its shape, to `then`.
+    fn keyword_definition(&mut self, lambda: Stx, then: impl FnOnce(&mut Self, Lambda<'gc>, CallShape<'gc>) -> Result<Ex<'a, 'gc>, ExpandError> + 'a) -> Result<Ex<'a, 'gc>, ExpandError> {
         let items = self.proper(lambda)?;
         let scope = self.tree.scopes.fresh()?;
         let formals = self.tree.with(items[1], scope, Op::Add)?;
         let formals = self.formals(formals)?;
-        self.optional_lambda(lambda, &formals, &items[2..], scope)
+        self.optional_lambda(lambda, formals, items[2..].to_vec(), scope, then)
     }
 
     /// The module, once its forms are compiled.
@@ -516,10 +533,19 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         self.builder.finish(self.mc)
     }
 
+    /// `e`, or if it says nowhere, as running out of room does, `e` where `stx` is.
+    fn placed(&self, e: ExpandError, stx: Stx) -> ExpandError {
+        if e.start == e.end { self.error(e.kind, stx) } else { e }
+    }
+
     /// Whether `form` is a definition, of a variable or a macro, a `begin`, or some other
     /// expression, once the macro uses it is are expanded.
-    fn head(&mut self, mut form: Stx) -> Result<Head, ExpandError> {
-        for _ in 0..MAX_DEPTH {
+    fn head(&mut self, form: Stx) -> Result<Head, ExpandError> {
+        self.head_of(form).map_err(|e| self.placed(e, form))
+    }
+
+    fn head_of(&mut self, mut form: Stx) -> Result<Head, ExpandError> {
+        loop {
             let (head, alone) = match self.tree.view(form)? {
                 View::Id => (form, true),
                 View::List(items, None) if items.first().is_some_and(|&head| self.is_id(head)) => (items[0], false),
@@ -537,7 +563,6 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 _ => return Ok(Head::Expr(form)),
             };
         }
-        Err(self.error(ExpandErrorKind::TooDeep, form))
     }
 
     /// The identifier a `define` binds and the expression it binds it to. `(define (f . formals)
@@ -678,44 +703,70 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         Ok(self.tree.with(output, intro, Op::Flip)?)
     }
 
-    pub(crate) fn expr(&mut self, stx: Stx) -> Result<Core<'gc>, ExpandError> {
-        self.depth += 1;
-        if self.depth > MAX_DEPTH {
-            return Err(self.error(ExpandErrorKind::TooDeep, stx));
-        }
-        let core = match self.tree.view(stx)? {
-            View::Id => self.reference(stx)?,
-            // A keyword isn't an expression, as in Racket: it's quoted to be a value.
-            View::Datum(value) if ragwort_types::symbol::Keyword::of(value).is_some() => return Err(self.error(ExpandErrorKind::BadSyntax, stx)),
-            View::Datum(value) => Core::Quote(value),
-            View::Vector(_) => Core::Quote(self.strip(stx)?),
-            View::List(items, tail) => self.compound(stx, &items, tail)?,
-        };
-        self.depth -= 1;
-        Ok(core)
+    /// The core forms of the expression `stx`, made from a stack of what's waiting on each
+    /// part, so expanding it takes no more of the machine's stack however deeply it nests.
+    pub(crate) fn expand_now(&mut self, stx: Stx) -> Result<Core<'gc>, ExpandError> {
+        steps::run(self, Call::Expr(stx), Self::step)
     }
 
-    fn compound(&mut self, stx: Stx, items: &[Stx], tail: Option<Stx>) -> Result<Core<'gc>, ExpandError> {
+    /// What `f` makes, as [`expand_now`](Self::expand_now) makes it.
+    pub(crate) fn run_now(&mut self, f: impl FnOnce(&mut Self) -> Result<Ex<'a, 'gc>, ExpandError> + 'a) -> Result<Core<'gc>, ExpandError> {
+        steps::run(self, Call::Run(Box::new(f)), Self::step)
+    }
+
+    /// A step of expansion. An error that says nowhere, as running out of room does, is where
+    /// the expression being expanded is.
+    fn step(&mut self, call: Call<'a, 'gc>) -> Result<Ex<'a, 'gc>, ExpandError> {
+        match call {
+            Call::Expr(stx) => self.expand(stx).map_err(|e| self.placed(e, stx)),
+            Call::Run(f) => f(self),
+        }
+    }
+
+    /// The expression `stx`, expanded, then `then`.
+    pub(crate) fn expr(stx: Stx, then: impl FnOnce(&mut Self, Core<'gc>) -> Result<Ex<'a, 'gc>, ExpandError> + 'a) -> Result<Ex<'a, 'gc>, ExpandError> {
+        Ok(Step::then(Call::Expr(stx), then))
+    }
+
+    /// Each of `stxs`, expanded in order, then `then`.
+    pub(crate) fn exprs(stxs: Vec<Stx>, then: impl FnOnce(&mut Self, Vec<Core<'gc>>) -> Result<Ex<'a, 'gc>, ExpandError> + 'a) -> Result<Ex<'a, 'gc>, ExpandError> {
+        steps::all(stxs.into_iter().map(Call::Expr).collect(), then)
+    }
+
+    /// The body `forms` of the form `stx`, expanded, then `then`.
+    pub(crate) fn body_then(stx: Stx, forms: Vec<Stx>, then: impl FnOnce(&mut Self, Core<'gc>) -> Result<Ex<'a, 'gc>, ExpandError> + 'a) -> Result<Ex<'a, 'gc>, ExpandError> {
+        Ok(Step::then(Call::Run(Box::new(move |this: &mut Self| this.body(stx, forms))), then))
+    }
+
+    /// The step `stx` takes: what it is if it's done, or what it needs expanded first.
+    fn expand(&mut self, stx: Stx) -> Result<Ex<'a, 'gc>, ExpandError> {
+        match self.tree.view(stx)? {
+            View::Id => self.reference(stx),
+            // A keyword isn't an expression, as in Racket: it's quoted to be a value.
+            View::Datum(value) if ragwort_types::symbol::Keyword::of(value).is_some() => Err(self.error(ExpandErrorKind::BadSyntax, stx)),
+            View::Datum(value) => Ok(Step::Done(Core::Quote(value))),
+            View::Vector(_) => Ok(Step::Done(Core::Quote(self.strip(stx)?))),
+            View::List(items, tail) => self.compound(stx, items, tail),
+        }
+    }
+
+    fn compound(&mut self, stx: Stx, items: Vec<Stx>, tail: Option<Stx>) -> Result<Ex<'a, 'gc>, ExpandError> {
         let Some(&head) = items.first() else { return Err(self.error(ExpandErrorKind::BadSyntax, stx)) };
         let mut def = None;
         if self.is_id(head) {
             match self.resolve(head)? {
                 Binding::Keyword(Keyword::Form(form)) => return self.form(form, stx, items, tail),
-                Binding::Keyword(Keyword::Macro(m)) => {
-                    let out = self.transform(m, stx)?;
-                    return self.expr(out);
-                }
+                Binding::Keyword(Keyword::Macro(m)) => return Ok(Step::Tail(Call::Expr(self.transform(m, stx)?))),
                 Binding::Keyword(Keyword::Aux(_)) => return Err(self.error(ExpandErrorKind::BadSyntax, head)),
-                Binding::Macro(m) => {
-                    let out = self.expand_macro(m, stx)?;
-                    return self.expr(out);
-                }
+                Binding::Macro(m) => return Ok(Step::Tail(Call::Expr(self.expand_macro(m, stx)?))),
                 Binding::Import(import) if tail.is_none() => {
                     def = self.imported_keyword_def(import);
                     if def.is_none() && !self.has_keyword_args(&items[1..]) {
-                        let args = self.exprs(&items[1..])?;
-                        let mc = self.mc;
-                        return import.call(mc, args, &mut || self.fresh()).map_err(|Uninitialized| self.error(ExpandErrorKind::Unbound, head));
+                        return Self::exprs(items[1..].to_vec(), move |this, args| {
+                            let mc = this.mc;
+                            let call = import.call(mc, args, &mut || this.fresh());
+                            call.map(Step::Done).map_err(|Uninitialized| this.error(ExpandErrorKind::Unbound, head))
+                        });
                     }
                 }
                 Binding::Local(var) => def = self.keyword_defs.get(&Def::Local(var)).cloned(),
@@ -727,62 +778,55 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             return Err(self.error(ExpandErrorKind::BadSyntax, stx));
         }
         if def.is_some() || self.has_keyword_args(&items[1..]) {
-            return self.keyword_call(head, &items[1..], def);
+            return self.keyword_call(head, items[1..].to_vec(), def);
         }
-        let f = self.expr(head)?;
-        Ok(Core::App(Box::new(f), self.exprs(&items[1..])?))
+        Self::expr(head, move |_, f| Self::exprs(items[1..].to_vec(), move |_, args| Ok(Step::Done(Core::App(Box::new(f), args)))))
     }
 
-    fn exprs(&mut self, stxs: &[Stx]) -> Result<Vec<Core<'gc>>, ExpandError> {
-        stxs.iter().map(|&stx| self.expr(stx)).collect()
-    }
-
-    fn form(&mut self, form: Form, stx: Stx, items: &[Stx], tail: Option<Stx>) -> Result<Core<'gc>, ExpandError> {
+    fn form(&mut self, form: Form, stx: Stx, items: Vec<Stx>, tail: Option<Stx>) -> Result<Ex<'a, 'gc>, ExpandError> {
         let bad = |this: &Self| Err(this.error(ExpandErrorKind::BadSyntax, stx));
         if tail.is_some() {
             return bad(self);
         }
         match (form, &items[1..]) {
-            (Form::Quote, &[datum]) => Ok(Core::Quote(self.strip(datum)?)),
-            (Form::If, &[test, then]) => Ok(Core::If(Box::new(self.expr(test)?), Box::new(self.expr(then)?), Box::new(Core::Quote(Value::VOID)))),
-            (Form::If, &[test, then, other]) => {
-                Ok(Core::If(Box::new(self.expr(test)?), Box::new(self.expr(then)?), Box::new(self.expr(other)?)))
-            }
-            (Form::Lambda, &[formals, ref body @ ..]) => self.lambda(stx, formals, body),
+            (Form::Quote, &[datum]) => Ok(Step::Done(Core::Quote(self.strip(datum)?))),
+            (Form::If, &[test, then]) => Self::exprs(vec![test, then], |_, parts| {
+                let [test, then] = <[Core<'gc>; 2]>::try_from(parts).map_err(|_| ()).expect("two parts");
+                Ok(Step::Done(Core::If(Box::new(test), Box::new(then), Box::new(Core::Quote(Value::VOID)))))
+            }),
+            (Form::If, &[test, then, other]) => Self::exprs(vec![test, then, other], |_, parts| {
+                let [test, then, other] = <[Core<'gc>; 3]>::try_from(parts).map_err(|_| ()).expect("three parts");
+                Ok(Step::Done(Core::If(Box::new(test), Box::new(then), Box::new(other))))
+            }),
+            (Form::Lambda, &[formals, ref body @ ..]) => self.lambda(stx, formals, body.to_vec()),
             (Form::Define | Form::Require | Form::Provide, _) => Err(self.error(ExpandErrorKind::Definition, stx)),
             (Form::Set, &[id, value]) if self.is_id(id) => self.set(id, value),
-            (Form::Begin, &[_, ..]) => self.sequence(&items[1..]),
-            (Form::Let, &[name, _, _, ..]) if self.is_id(name) => {
-                let out = self.transform(Macro::NamedLet, stx)?;
-                self.expr(out)
-            }
-            (Form::Let | Form::Letrec, &[binds, ref body @ ..]) => self.binding(stx, binds, body, form == Form::Letrec),
+            (Form::Begin, &[_, ..]) => self.sequence(items[1..].to_vec()),
+            (Form::Let, &[name, _, _, ..]) if self.is_id(name) => Ok(Step::Tail(Call::Expr(self.transform(Macro::NamedLet, stx)?))),
+            (Form::Let | Form::Letrec, &[binds, ref body @ ..]) => self.binding(stx, binds, body.to_vec(), form == Form::Letrec),
             (Form::DefineSyntax, _) => Err(self.error(ExpandErrorKind::Definition, stx)),
-            (Form::LetSyntax | Form::LetrecSyntax, &[binds, ref body @ ..]) => self.let_syntax(stx, binds, body, form == Form::LetrecSyntax),
-            (Form::SyntaxCase, &[input, literals, ref clauses @ ..]) => self.syntax_case(input, literals, clauses),
-            (Form::Syntax, &[template]) => self.syntax(template),
-            (Form::QuoteSyntax, &[datum]) => Ok(Core::Quote(self.wrap(datum)?)),
+            (Form::LetSyntax | Form::LetrecSyntax, &[binds, ref body @ ..]) => self.let_syntax(stx, binds, body.to_vec(), form == Form::LetrecSyntax),
+            (Form::SyntaxCase, &[input, literals, ref clauses @ ..]) => self.syntax_case(input, literals, clauses.to_vec()),
+            (Form::Syntax, &[template]) => Ok(Step::Done(self.syntax(template)?)),
+            (Form::QuoteSyntax, &[datum]) => Ok(Step::Done(Core::Quote(self.wrap(datum)?))),
             (Form::Unsupported, _) => Err(self.error(ExpandErrorKind::Unsupported, stx)),
             _ => bad(self),
         }
     }
 
-    fn reference(&mut self, id: Stx) -> Result<Core<'gc>, ExpandError> {
+    fn reference(&mut self, id: Stx) -> Result<Ex<'a, 'gc>, ExpandError> {
         let place = match self.resolve(id)? {
             Binding::Local(var) => Place::Local(var),
             Binding::Slot(slot) => self.builder.place(slot, self.form, self.defining),
-            Binding::Import(import) => return import.reference(self.mc).map_err(|Uninitialized| self.error(ExpandErrorKind::Unbound, id)),
+            Binding::Import(import) => return import.reference(self.mc).map(Step::Done).map_err(|Uninitialized| self.error(ExpandErrorKind::Unbound, id)),
             Binding::Free => return Err(self.error(ExpandErrorKind::Unbound, id)),
-            Binding::Macro(m) => {
-                let out = self.expand_macro(m, id)?;
-                return self.expr(out);
-            }
+            Binding::Macro(m) => return Ok(Step::Tail(Call::Expr(self.expand_macro(m, id)?))),
             Binding::Keyword(_) | Binding::Pattern { .. } => return Err(self.error(ExpandErrorKind::BadSyntax, id)),
         };
-        Ok(Core::Ref(place))
+        Ok(Step::Done(Core::Ref(place)))
     }
 
-    fn set(&mut self, id: Stx, value: Stx) -> Result<Core<'gc>, ExpandError> {
+    fn set(&mut self, id: Stx, value: Stx) -> Result<Ex<'a, 'gc>, ExpandError> {
         let place = match self.resolve(id)? {
             // Calls of a keyword procedure a definition made go to its core, as if it can't change:
             // the module builder rules out assigning a module variable that is one.
@@ -796,18 +840,28 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             Binding::Free => return Err(self.error(ExpandErrorKind::Unbound, id)),
             Binding::Keyword(_) | Binding::Macro(_) | Binding::Pattern { .. } => return Err(self.error(ExpandErrorKind::BadSyntax, id)),
         };
-        Ok(Core::Set(place, Box::new(self.expr(value)?)))
+        Self::expr(value, move |_, value| Ok(Step::Done(Core::Set(place, Box::new(value)))))
     }
 
     /// Expressions run in order, with the last one's value.
-    fn sequence(&mut self, stxs: &[Stx]) -> Result<Core<'gc>, ExpandError> {
-        let (&last, before) = stxs.split_last().expect("sequences aren't empty");
-        let mut binds = Vec::with_capacity(before.len());
-        for &stx in before {
-            binds.push((self.fresh(), self.expr(stx)?));
+    fn sequence(&mut self, mut stxs: Vec<Stx>) -> Result<Ex<'a, 'gc>, ExpandError> {
+        let last = stxs.pop().expect("sequences aren't empty");
+        self.sequence_from(stxs.into_iter(), Vec::new(), last)
+    }
+
+    /// The rest of a sequence: the expressions `before` its `last`, each bound to a variable no
+    /// one reads, after those of `binds`.
+    fn sequence_from(&mut self, mut before: std::vec::IntoIter<Stx>, mut binds: Vec<(Var, Core<'gc>)>, last: Stx) -> Result<Ex<'a, 'gc>, ExpandError> {
+        match before.next() {
+            Some(stx) => {
+                let var = self.fresh();
+                Self::expr(stx, move |this, core| {
+                    binds.push((var, core));
+                    this.sequence_from(before, binds, last)
+                })
+            }
+            None => Self::expr(last, move |_, last| Ok(Step::Done(if binds.is_empty() { last } else { Core::Let(binds, Box::new(last)) }))),
         }
-        let last = self.expr(last)?;
-        Ok(if binds.is_empty() { last } else { Core::Let(binds, Box::new(last)) })
     }
 
     pub(crate) fn lambda_id(&mut self) -> u32 {
@@ -816,7 +870,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         id
     }
 
-    fn lambda(&mut self, stx: Stx, formals: Stx, body: &[Stx]) -> Result<Core<'gc>, ExpandError> {
+    fn lambda(&mut self, stx: Stx, formals: Stx, body: Vec<Stx>) -> Result<Ex<'a, 'gc>, ExpandError> {
         let scope = self.tree.scopes.fresh()?;
         let formals = self.tree.with(formals, scope, Op::Add)?;
         if !self.plain_formals(formals)? {
@@ -833,13 +887,12 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         self.distinct(&[ids.as_slice(), rest.as_slice()].concat())?;
         let params = ids.iter().map(|&id| self.local(id)).collect::<Result<_, _>>()?;
         let rest = rest.map(|id| self.local(id)).transpose()?;
-        let body = self.scoped(body, scope)?;
-        let body = self.body(stx, &body)?;
-        Ok(Core::Lambda(Lambda { id: self.lambda_id(), params, optional: 0, rest, body: Box::new(body) }))
+        let body = self.scoped(&body, scope)?;
+        Self::body_then(stx, body, move |this, body| Ok(Step::Done(Core::Lambda(Lambda { id: this.lambda_id(), params, optional: 0, rest, body: Box::new(body) }))))
     }
 
     /// A `let`, or if `recursive`, a `letrec`.
-    fn binding(&mut self, stx: Stx, binds: Stx, body: &[Stx], recursive: bool) -> Result<Core<'gc>, ExpandError> {
+    fn binding(&mut self, stx: Stx, binds: Stx, body: Vec<Stx>, recursive: bool) -> Result<Ex<'a, 'gc>, ExpandError> {
         let scope = self.tree.scopes.fresh()?;
         let mut ids = Vec::new();
         let mut inits = Vec::new();
@@ -853,73 +906,96 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             }
         }
         self.distinct(&ids)?;
-        let (vars, inits) = if recursive {
+        let finish = move |this: &mut Self, vars: Vec<Var>, inits: Vec<Core<'gc>>| {
+            let body = this.scoped(&body, scope)?;
+            Self::body_then(stx, body, move |_, body| {
+                let binds = vars.into_iter().zip(inits).collect();
+                let body = Box::new(body);
+                Ok(Step::Done(if recursive { Core::Letrec(binds, body) } else { Core::Let(binds, body) }))
+            })
+        };
+        if recursive {
             let vars: Vec<_> = ids.iter().map(|&id| self.local(id)).collect::<Result<_, _>>()?;
             let inits = self.scoped(&inits, scope)?;
-            (vars, self.exprs(&inits)?)
+            Self::exprs(inits, move |this, inits| finish(this, vars, inits))
         } else {
-            let inits = self.exprs(&inits)?;
-            (ids.iter().map(|&id| self.local(id)).collect::<Result<_, _>>()?, inits)
-        };
-        let body = self.scoped(body, scope)?;
-        let body = Box::new(self.body(stx, &body)?);
-        let binds = vars.into_iter().zip(inits).collect();
-        Ok(if recursive { Core::Letrec(binds, body) } else { Core::Let(binds, body) })
+            Self::exprs(inits, move |this, inits| {
+                let vars = ids.iter().map(|&id| this.local(id)).collect::<Result<_, _>>()?;
+                finish(this, vars, inits)
+            })
+        }
     }
 
     /// A body: definitions and expressions in any order, as `letrec*` binds them, then an
     /// expression for its value. `stx` is the form it's the body of.
-    pub(crate) fn body(&mut self, stx: Stx, body: &[Stx]) -> Result<Core<'gc>, ExpandError> {
+    pub(crate) fn body(&mut self, stx: Stx, body: Vec<Stx>) -> Result<Ex<'a, 'gc>, ExpandError> {
         let scope = self.tree.scopes.fresh()?;
-        let mut queue = self.scoped(body, scope)?;
+        let mut queue = self.scoped(&body, scope)?;
         queue.reverse();
-        let mut items: Vec<Item> = Vec::new();
-        let (mut defined, mut names) = (Vec::new(), Vec::new());
-        while let Some(form) = queue.pop() {
+        self.scan(Scan { stx, queue, items: Vec::new(), defined: Vec::new(), names: Vec::new() })
+    }
+
+    /// Goes on looking at a body's forms till they're all found, each macro one defines made
+    /// before those after it are looked at, then expands what they define and do.
+    fn scan(&mut self, mut s: Scan) -> Result<Ex<'a, 'gc>, ExpandError> {
+        while let Some(form) = s.queue.pop() {
             match self.head(form)? {
                 Head::Define(form) => {
                     let (id, value) = self.definition(form)?;
-                    defined.push(id);
-                    names.push(id);
+                    s.defined.push(id);
+                    s.names.push(id);
                     match self.keyword_lambda(value)? {
                         Some(shape) => {
                             let (procedure, core) = (self.local(id)?, self.fresh());
                             self.keyword_defs.insert(Def::Local(procedure), KeywordDef { core: CoreAt::Local(core), shape });
-                            items.push(Item::Keyword(procedure, core, value));
+                            s.items.push(Item::Keyword(procedure, core, value));
                         }
-                        None => items.push(Item::Define(self.local(id)?, value)),
+                        None => s.items.push(Item::Define(self.local(id)?, value)),
                     }
                 }
                 Head::DefineSyntax(form) => {
-                    let (id, m) = self.define_syntax(form)?;
-                    names.push(id);
-                    self.bind(id, Binding::Macro(m))?;
+                    let (id, expr) = self.syntax_definition(form)?;
+                    return self.transformer(expr, form, move |this, m| {
+                        s.names.push(id);
+                        this.bind(id, Binding::Macro(m))?;
+                        this.scan(s)
+                    });
                 }
                 Head::Require(form) | Head::Provide(form) => return Err(self.error(ExpandErrorKind::Definition, form)),
-                Head::Begin(forms) => queue.extend(forms.into_iter().rev()),
-                Head::Expr(e) => items.push(Item::Expr(e)),
+                Head::Begin(forms) => s.queue.extend(forms.into_iter().rev()),
+                Head::Expr(e) => s.items.push(Item::Expr(e)),
             }
         }
-        self.distinct(&names)?;
-        let Some(Item::Expr(last)) = items.pop() else { return Err(self.error(ExpandErrorKind::NoExpression, stx)) };
-        if defined.is_empty() {
-            let mut stxs: Vec<Stx> = items.into_iter().filter_map(|item| if let Item::Expr(e) = item { Some(e) } else { None }).collect();
+        self.distinct(&s.names)?;
+        let Some(Item::Expr(last)) = s.items.pop() else { return Err(self.error(ExpandErrorKind::NoExpression, s.stx)) };
+        if s.defined.is_empty() {
+            let mut stxs: Vec<Stx> = s.items.into_iter().filter_map(|item| if let Item::Expr(e) = item { Some(e) } else { None }).collect();
             stxs.push(last);
-            return self.sequence(&stxs);
+            return self.sequence(stxs);
         }
-        let mut binds = Vec::with_capacity(items.len());
-        for item in items {
-            match item {
-                Item::Define(var, value) => binds.push((var, self.expr(value)?)),
-                Item::Expr(e) => binds.push((self.fresh(), self.expr(e)?)),
-                Item::Keyword(procedure, core, lambda) => {
-                    let (lambda, shape) = self.keyword_definition(lambda)?;
+        let n = s.items.len();
+        self.defines(s.items.into_iter(), Vec::with_capacity(n), last)
+    }
+
+    /// The rest of a body's definitions and expressions, `items`, bound after `binds`, then its
+    /// `last` expression.
+    fn defines(&mut self, mut items: std::vec::IntoIter<Item>, mut binds: Vec<(Var, Core<'gc>)>, last: Stx) -> Result<Ex<'a, 'gc>, ExpandError> {
+        let (var, value) = match items.next() {
+            None => return Self::expr(last, move |_, last| Ok(Step::Done(Core::Letrec(binds, Box::new(last))))),
+            Some(Item::Define(var, value)) => (var, value),
+            Some(Item::Expr(e)) => (self.fresh(), e),
+            Some(Item::Keyword(procedure, core, lambda)) => {
+                return self.keyword_definition(lambda, move |this, lambda, shape| {
                     binds.push((core, Core::Lambda(lambda)));
-                    binds.push((procedure, self.keyword_procedure(&shape, Core::Ref(Place::Local(core)))?));
-                }
+                    binds.push((procedure, this.keyword_procedure(&shape, Core::Ref(Place::Local(core)))?));
+                    this.defines(items, binds, last)
+                });
             }
-        }
-        Ok(Core::Letrec(binds, Box::new(self.expr(last)?)))
+        };
+        Self::expr(value, move |this, value| {
+            binds.push((var, value));
+            this.defines(items, binds, last)
+        })
     }
 
     /// `stxs` with `scope` added.
@@ -928,7 +1004,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     }
 
     pub(crate) fn strip(&mut self, stx: Stx) -> Result<Value<'gc>, ExpandError> {
-        self.tree.strip(stx, MAX_DATA_DEPTH).map_err(|e| self.tree_error(e, stx))
+        self.tree.strip(stx).map_err(|e| self.error(e, stx))
     }
 
     pub(crate) fn is_id(&self, stx: Stx) -> bool {

@@ -89,8 +89,6 @@ pub enum ExpandErrorKind {
     /// A macro's transformer that refers to a variable of the code around it, which doesn't
     /// exist yet when the transformer runs, as the code is still being expanded.
     Phase,
-    /// Expressions nested more than 256 deep, or data more than 1024.
-    TooDeep,
     /// The arena couldn't make a value expanding needed.
     Arena(ragwort_types::Error),
 }
@@ -144,7 +142,6 @@ impl fmt::Display for ExpandError {
             ExpandErrorKind::Unsupported => "syntax that isn't supported yet",
             ExpandErrorKind::Transformer => "a macro's transformer that failed",
             ExpandErrorKind::Phase => "a macro's transformer that refers to a variable that doesn't exist yet",
-            ExpandErrorKind::TooDeep => "forms nested too deeply",
             ExpandErrorKind::Arena(_) => "running out of memory",
         };
         write!(f, "{what} at bytes {}..{}", self.start, self.end)

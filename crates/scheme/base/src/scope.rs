@@ -138,8 +138,9 @@ impl<T: Eq + Hash + Clone> Interned<T> {
         &self.all[id as usize]
     }
 
-    fn intern(&mut self, charge: &mut Charge<'_>, items: Vec<T>) -> Result<u32, OutOfMemory> {
-        let hash = self.hasher.hash_one(items.as_slice());
+    /// The number of `items`, which are copied only if they're new.
+    fn intern(&mut self, charge: &mut Charge<'_>, items: &[T]) -> Result<u32, OutOfMemory> {
+        let hash = self.hasher.hash_one(items);
         let first = self.by_hash.get(&hash).copied().unwrap_or(NO_MORE);
         let mut id = first;
         while id != NO_MORE {
@@ -148,9 +149,9 @@ impl<T: Eq + Hash + Clone> Interned<T> {
             }
             id = self.same[id as usize];
         }
-        charge.grow(size_of_val(items.as_slice()) + 48)?;
+        charge.grow(size_of_val(items) + 48)?;
         let id = u32::try_from(self.all.len()).ok().filter(|&id| id != NO_MORE).ok_or(OutOfMemory)?;
-        self.all.push(items.into_boxed_slice());
+        self.all.push(items.into());
         self.same.push(first);
         self.by_hash.insert(hash, id);
         Ok(id)
@@ -164,11 +165,14 @@ pub(crate) struct Scopes<'gc> {
     applied: Map<(Set, Ops), Set>,
     composed: Map<(Ops, Ops), Ops>,
     next: Scope,
+    /// What a set or changes being worked out is made in, kept from one to the next.
+    scratch_set: Vec<Scope>,
+    scratch_ops: Vec<(Scope, Op)>,
 }
 
 impl<'gc> Scopes<'gc> {
     pub(crate) fn new(mc: &Mutation<'gc>) -> Self {
-        Self { charge: mc.charge(), sets: Interned::new(), ops: Interned::new(), applied: Map::default(), composed: Map::default(), next: BASE + 1 }
+        Self { charge: mc.charge(), sets: Interned::new(), ops: Interned::new(), applied: Map::default(), composed: Map::default(), next: BASE + 1, scratch_set: Vec::new(), scratch_ops: Vec::new() }
     }
 
     pub(crate) fn charge(&mut self, bytes: usize) -> Result<(), OutOfMemory> {
@@ -184,7 +188,7 @@ impl<'gc> Scopes<'gc> {
     pub(crate) fn set(&mut self, mut scopes: Vec<Scope>) -> Result<Set, OutOfMemory> {
         scopes.sort_unstable();
         scopes.dedup();
-        self.sets.intern(&mut self.charge, scopes).map(Set)
+        self.sets.intern(&mut self.charge, &scopes).map(Set)
     }
 
     pub(crate) fn scopes(&self, set: Set) -> &[Scope] {
@@ -203,7 +207,7 @@ impl<'gc> Scopes<'gc> {
     }
 
     pub(crate) fn op(&mut self, scope: Scope, op: Op) -> Result<Ops, OutOfMemory> {
-        self.ops.intern(&mut self.charge, vec![(scope, op)]).map(Ops)
+        self.ops.intern(&mut self.charge, &[(scope, op)]).map(Ops)
     }
 
     /// `first`'s changes, then `then`'s.
@@ -215,7 +219,8 @@ impl<'gc> Scopes<'gc> {
             return Ok(ops);
         }
         let (a, b) = (self.ops.get(first.0), self.ops.get(then.0));
-        let mut merged: Vec<(Scope, Op)> = Vec::with_capacity(a.len() + b.len());
+        let mut merged = std::mem::take(&mut self.scratch_ops);
+        merged.clear();
         let (mut i, mut j) = (0, 0);
         while i < a.len() && j < b.len() {
             let ((x, earlier), (y, later)) = (a[i], b[j]);
@@ -232,7 +237,9 @@ impl<'gc> Scopes<'gc> {
         }
         merged.extend_from_slice(&a[i..]);
         merged.extend_from_slice(&b[j..]);
-        let ops = Ops(self.ops.intern(&mut self.charge, merged)?);
+        let ops = self.ops.intern(&mut self.charge, &merged).map(Ops);
+        self.scratch_ops = merged;
+        let ops = ops?;
         self.charge.grow(32)?;
         self.composed.insert((first, then), ops);
         Ok(ops)
@@ -246,8 +253,9 @@ impl<'gc> Scopes<'gc> {
         if let Some(&applied) = self.applied.get(&(set, ops)) {
             return Ok(applied);
         }
-        let (have, changes) = (self.scopes(set), self.ops.get(ops.0));
-        let mut scopes = Vec::with_capacity(have.len() + changes.len());
+        let (have, changes) = (self.sets.get(set.0), self.ops.get(ops.0));
+        let mut scopes = std::mem::take(&mut self.scratch_set);
+        scopes.clear();
         let (mut i, mut j) = (0, 0);
         // A scope the set has stays unless removed or flipped; one it lacks comes in if added or
         // flipped.
@@ -270,7 +278,9 @@ impl<'gc> Scopes<'gc> {
         }
         scopes.extend_from_slice(&have[i..]);
         scopes.extend(changes[j..].iter().filter(|&&(_, op)| op != Op::Remove).map(|&(y, _)| y));
-        let applied = Set(self.sets.intern(&mut self.charge, scopes)?);
+        let applied = self.sets.intern(&mut self.charge, &scopes).map(Set);
+        self.scratch_set = scopes;
+        let applied = applied?;
         self.charge.grow(32)?;
         self.applied.insert((set, ops), applied);
         Ok(applied)

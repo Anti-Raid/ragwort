@@ -424,7 +424,6 @@ fn bad_forms_dont_compile() {
     // A lambda of one parameter, two of them optional.
     assert_eq!(error(|_| Core::Lambda(Lambda { id: 7, params: vec![Var(0)], optional: 2, rest: None, body: Box::new(q(1)) })), CompileError::TooManyOptional(7));
     assert_eq!(error(|_| Core::Intrinsic(Prim::Request(Request::Capture), vec![q(1)])), CompileError::Arity(Prim::Request(Request::Capture)));
-    assert_eq!(error(|_| (0..2000).fold(q(0), |e, _| add(q(1), e))), CompileError::TooDeep);
 }
 
 
@@ -679,6 +678,34 @@ fn many_effects_fold_without_deep_recursion() {
         let_(vec![(0, q(0))], seq(1, prim(Intrinsic::MakeVectorOf, effects), var(0)))
     });
     assert_eq!(n, Ok(10_000));
+}
+
+#[test]
+fn deep_expressions_compile_on_a_small_stack() {
+    const N: i64 = 100_000;
+    // ((lambda (x) (+ 1 (+ 1 ... (+ 1 x)))) 0), with nothing in it to fold.
+    fn sum<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
+        app(lambda(&[0], None, (0..N).fold(var(0), |e, _| add(q(1), e))), vec![q(0)])
+    }
+    // ((lambda (x) (if (eq? x 0) (if (eq? x 0) ... 7 1) 1) 1)) 0)
+    fn ifs<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
+        app(lambda(&[0], None, (0..N).fold(q(7), |e, _| when(eq(var(0), q(0)), e, q(1)))), vec![q(0)])
+    }
+    // (lambda () (lambda () ... (lambda () 0))), each its own closure.
+    fn lambdas<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
+        (0..10_000).fold(q(0), |e, _| lambda(&[], None, e))
+    }
+    let run = || {
+        let mut arena = Arena::new(1 << 26, 0);
+        arena.mutate(|mc| {
+            for core in [sum(mc), ifs(mc), lambdas(mc)] {
+                compile(mc, None, &core).unwrap();
+            }
+        });
+    };
+    std::thread::Builder::new().stack_size(256 << 10).spawn(run).expect("spawned").join().expect("ran");
+    assert_eq!(number(sum), Ok(N));
+    assert_eq!(number(ifs), Ok(7));
 }
 
 #[test]

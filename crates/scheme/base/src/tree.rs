@@ -44,18 +44,6 @@ pub(crate) enum View<'gc> {
     Vector(Vec<Stx>),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TreeError {
-    TooDeep,
-    OutOfMemory,
-}
-
-impl From<OutOfMemory> for TreeError {
-    fn from(_: OutOfMemory) -> Self {
-        TreeError::OutOfMemory
-    }
-}
-
 pub(crate) struct Tree<'a, 'gc> {
     mc: &'a Mutation<'gc>,
     nodes: ScratchVec<'gc, Node<'gc>>,
@@ -159,65 +147,106 @@ impl<'a, 'gc> Tree<'a, 'gc> {
         Ok(kids)
     }
 
-    /// The tree of what the reader read, its nodes in no scopes.
-    pub(crate) fn read(&mut self, node: Syntax<'gc>, depth: usize) -> Result<Stx, TreeError> {
-        let depth = depth.checked_sub(1).ok_or(TreeError::TooDeep)?;
+    /// The tree of what the reader read, its nodes in no scopes. Each node's parts are made
+    /// before it, from a stack of their own.
+    pub(crate) fn read(&mut self, root: Syntax<'gc>) -> Result<Stx, OutOfMemory> {
+        enum Task<'gc> {
+            Visit(Syntax<'gc>),
+            /// A list or vector of the last parts made, after the tail if it's dotted.
+            Make(Syntax<'gc>, usize, bool),
+        }
         let mc = self.mc;
-        let span = node.span(mc);
-        let part = |this: &mut Self, v: Value<'gc>| this.read(Syntax::of(v).expect("the reader wraps every part"), depth);
-        let shape = match node.kind(mc) {
-            Some(SyntaxKind::Identifier) => Shape::Id(Symbol::of(node.datum(mc)).expect("identifiers are symbols")),
-            Some(SyntaxKind::List) => {
-                let mut elements = Pairs::new(mc).elements(node.datum(mc));
-                let mut items = elements.by_ref().map(|v| part(self, v)).collect::<Result<Vec<_>, _>>()?;
-                let tail = elements.rest();
-                let dotted = tail != Value::NIL;
-                if dotted {
-                    items.push(part(self, tail)?);
+        let part = |v: Value<'gc>| Task::Visit(Syntax::of(v).expect("the reader wraps every part"));
+        let (mut todo, mut done) = (vec![Task::Visit(root)], Vec::new());
+        while let Some(task) = todo.pop() {
+            let node = match task {
+                Task::Visit(node) => node,
+                Task::Make(node, n, dotted) => {
+                    let items = done.split_off(done.len() - n);
+                    let (first, len) = self.parts(items)?;
+                    let shape = match node.kind(mc) {
+                        Some(SyntaxKind::Vector) => Shape::Vector { first, len },
+                        _ => Shape::List { first, len, dotted },
+                    };
+                    done.push(self.make(shape, Set::EMPTY, node.span(mc))?);
+                    continue;
                 }
-                let (first, len) = self.parts(items)?;
-                Shape::List { first, len, dotted }
+            };
+            let at = todo.len();
+            match node.kind(mc) {
+                Some(SyntaxKind::Identifier) => {
+                    let symbol = Symbol::of(node.datum(mc)).expect("identifiers are symbols");
+                    done.push(self.make(Shape::Id(symbol), Set::EMPTY, node.span(mc))?);
+                }
+                Some(SyntaxKind::List) => {
+                    let mut elements = Pairs::new(mc).elements(node.datum(mc));
+                    todo.extend(elements.by_ref().map(part));
+                    let tail = elements.rest();
+                    let dotted = tail != Value::NIL;
+                    if dotted {
+                        todo.push(part(tail));
+                    }
+                    todo.push(Task::Make(node, todo.len() - at, dotted));
+                }
+                Some(SyntaxKind::Vector) => {
+                    let vector = Vectors::new(mc).vector(node.datum(mc)).expect("vector nodes hold vectors");
+                    todo.extend((0..vector.len(mc)).filter_map(|i| vector.get(mc, i)).map(part));
+                    todo.push(Task::Make(node, todo.len() - at, false));
+                }
+                Some(SyntaxKind::Abbreviation(a)) => {
+                    let name = self.abbreviations[a as usize];
+                    done.push(self.id(name, Set::EMPTY, node.span(mc))?);
+                    // A list of the abbreviation's name, made already, and what it abbreviates.
+                    todo.extend([part(node.datum(mc)), Task::Make(node, 2, false)]);
+                }
+                Some(SyntaxKind::Literal) | None => done.push(self.make(Shape::Datum(node.datum(mc)), Set::EMPTY, node.span(mc))?),
             }
-            Some(SyntaxKind::Vector) => {
-                let vector = Vectors::new(mc).vector(node.datum(mc)).expect("vector nodes hold vectors");
-                let items = (0..vector.len(mc)).filter_map(|i| vector.get(mc, i)).map(|v| part(self, v)).collect::<Result<Vec<_>, _>>()?;
-                let (first, len) = self.parts(items)?;
-                Shape::Vector { first, len }
-            }
-            Some(SyntaxKind::Abbreviation(a)) => {
-                let name = self.abbreviations[a as usize];
-                let name = self.id(name, Set::EMPTY, span)?;
-                let inner = part(self, node.datum(mc))?;
-                let (first, len) = self.parts([name, inner])?;
-                Shape::List { first, len, dotted: false }
-            }
-            Some(SyntaxKind::Literal) | None => Shape::Datum(node.datum(mc)),
-        };
-        Ok(self.make(shape, Set::EMPTY, span)?)
+            todo[at..].reverse();
+        }
+        Ok(done.pop().expect("the root's made"))
     }
 
-    /// The datum `stx` stands for, without its scopes and spans.
-    pub(crate) fn strip(&mut self, stx: Stx, depth: usize) -> Result<Value<'gc>, TreeError> {
-        let depth = depth.checked_sub(1).ok_or(TreeError::TooDeep)?;
+    /// The datum `stx` stands for, without its scopes and spans. Each list or vector is made of
+    /// its items' data, from a stack of their own.
+    pub(crate) fn strip(&mut self, root: Stx) -> Result<Value<'gc>, OutOfMemory> {
+        enum Task {
+            Visit(Stx),
+            /// A list of the last items stripped, the last of them its tail if it's dotted.
+            List(u32, bool),
+            Vector(u32),
+        }
         let mc = self.mc;
-        Ok(match self.node(stx).shape {
-            Shape::Id(symbol) => symbol.value(mc),
-            Shape::Datum(value) => value,
-            Shape::List { first, len, dotted } => {
-                let mut items = Vec::with_capacity(len as usize);
-                for i in first..first + len {
-                    items.push(self.strip(self.kids[i as usize], depth)?);
+        let (mut todo, mut done) = (vec![Task::Visit(root)], Vec::new());
+        while let Some(task) = todo.pop() {
+            let stx = match task {
+                Task::Visit(stx) => stx,
+                Task::List(len, dotted) => {
+                    let mut items = done.split_off(done.len() - len as usize);
+                    let tail = if dotted { items.pop().expect("a dotted list has a tail") } else { Value::NIL };
+                    done.push(Pairs::new(mc).list_with_tail(items, tail)?);
+                    continue;
                 }
-                let tail = if dotted { items.pop().expect("a dotted list has a tail") } else { Value::NIL };
-                Pairs::new(mc).list_with_tail(items, tail)?
-            }
-            Shape::Vector { first, len } => {
-                let mut items = Vec::with_capacity(len as usize);
-                for i in first..first + len {
-                    items.push(self.strip(self.kids[i as usize], depth)?);
+                Task::Vector(len) => {
+                    let items = done.split_off(done.len() - len as usize);
+                    done.push(Vectors::new(mc).immutable_from_slice(&items)?.value(mc));
+                    continue;
                 }
-                Vectors::new(mc).immutable_from_slice(&items)?.value(mc)
-            }
-        })
+            };
+            let (first, len, made) = match self.node(stx).shape {
+                Shape::Id(symbol) => {
+                    done.push(symbol.value(mc));
+                    continue;
+                }
+                Shape::Datum(value) => {
+                    done.push(value);
+                    continue;
+                }
+                Shape::List { first, len, dotted } => (first, len, Task::List(len, dotted)),
+                Shape::Vector { first, len } => (first, len, Task::Vector(len)),
+            };
+            todo.push(made);
+            todo.extend((first..first + len).rev().map(|i| Task::Visit(self.kids[i as usize])));
+        }
+        Ok(done.pop().expect("the root's stripped"))
     }
 }
