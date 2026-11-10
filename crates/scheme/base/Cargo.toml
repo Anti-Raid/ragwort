@@ -14,8 +14,10 @@ ragwort-native = { path = "../../native", default-features = false }
 ragwort-printer-scheme = { path = "../printer", default-features = false }
 
 [features]
-default = ["mmap"]
+default = ["mmap", "arena"]
 mmap = ["ragwort-types/mmap", "ragwort-reader-scheme/mmap", "ragwort-vm/mmap", "ragwort-compiler/mmap"]
+# Keeps each compile's trees in an arena; see ragwort-compiler.
+arena = ["ragwort-compiler/arena"]
 
 [lints]
 workspace = true

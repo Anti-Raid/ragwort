@@ -8,7 +8,7 @@
 //! immutable, so a module requiring it quotes its value, and if its definition is a closed lambda,
 //! inlines its calls. Code reads an export its module assigns with `module-ref`.
 
-use std::collections::{HashMap, HashSet};
+use crate::hash::{HashMap, HashSet};
 
 use ragwort_types::gc::{Gc, Immediate, Mutation, OutOfMemory, Value};
 use ragwort_types::string::{Strings, chars};
@@ -20,6 +20,8 @@ use crate::{CompileError, Core, Lambda, Place, Prim, Var, compile};
 
 /// How many forms an inlined export's body can have.
 const MAX_INLINE: usize = 16;
+/// How long a rest list an inlined call can make, a `cons` in another for each.
+const MAX_REST: usize = 16;
 
 /// What a module exports, by the names other modules require them by.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -119,7 +121,7 @@ impl<'gc> Import<'gc> {
     /// A call of it on `args`, inlined if it can be, with new locals from `fresh`.
     pub fn call(self, mc: &Mutation<'gc>, args: Vec<Core<'gc>>, fresh: &mut dyn FnMut() -> Var) -> Result<Core<'gc>, Uninitialized> {
         match &self.export.inline {
-            Some(inline) if inline.takes(args.len()) => Ok(inline.call(args, fresh)),
+            Some(inline) if inline.inlines(args.len()) => Ok(inline.call(args, fresh)),
             _ => Ok(Core::App(Box::new(self.reference(mc)?), args)),
         }
     }
@@ -293,6 +295,13 @@ impl Inline {
 
     pub fn takes(&self, n: usize) -> bool {
         n >= (self.params - self.optional) as usize && (self.rest || n <= self.params as usize)
+    }
+
+    /// Whether a call of `n` arguments is inlined: if it takes them, and any rest list it makes
+    /// nests no deeper than [`MAX_REST`].
+    fn inlines(&self, n: usize) -> bool {
+        let rest = n.saturating_sub(self.params as usize);
+        self.takes(n) && (!self.rest || rest <= MAX_REST || !self.body.uses_list(self.params, rest))
     }
 
     /// The body, with its parameters standing for `args`, which it takes, and the rest in a
@@ -548,12 +557,12 @@ impl<'gc> ModuleBuilder<'gc> {
             hosts,
             names: Vec::new(),
             defined_by: Vec::new(),
-            bindings: HashMap::new(),
-            implicit: HashMap::new(),
+            bindings: HashMap::default(),
+            implicit: HashMap::default(),
             exports: Vec::new(),
-            assigned: HashSet::new(),
-            inlines: HashMap::new(),
-            cores: HashMap::new(),
+            assigned: HashSet::default(),
+            inlines: HashMap::default(),
+            cores: HashMap::default(),
             module: None,
         }
     }

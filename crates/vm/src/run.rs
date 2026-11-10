@@ -131,8 +131,14 @@ impl<'s, 'gc> Run<'s, 'gc> {
             match op.step(&mut self.cx)? {
                 Control::Next => {}
                 Control::Jump(offset) => {
-                    self.charge()?;
                     self.pc = self.pc.checked_add_signed(offset as isize).ok_or(Fault::Malformed)?;
+                    // A jump pauses past itself, so a branch's intrinsic test, which can be what
+                    // has the step end, isn't run again when the run goes on.
+                    if self.cx.fuel.run == 0 {
+                        self.cx.fuel.rest = self.cx.fuel.rest.saturating_sub(1);
+                        return Err(Exit::Paused);
+                    }
+                    self.cx.fuel.run -= 1;
                 }
                 Control::Return => self.ret()?,
                 Control::Call { base, args } => {

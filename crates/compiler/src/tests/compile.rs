@@ -4,7 +4,7 @@ use ragwort_types::constant::Constants;
 use ragwort_types::gc::{Arena, Gc, Mutation, Value, WINDOW};
 use ragwort_types::pair::{Pair, Pairs};
 use ragwort_vm::Intrinsic::{Add, Car, Cons, Eq, MakeBox, MakePromptTag, ModuleRef, Not, SetBox, Unbox};
-use ragwort_vm::frame::MAX_PARAMS;
+use ragwort_vm::frame::{ARGS, MAX_PARAMS};
 use ragwort_vm::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Condition, ConditionFields};
 use ragwort_vm::{Fault, HostDef, Intrinsic, MIN_SEGMENT, Machine, Op, Outcome, Purity, Read, Request};
 
@@ -421,6 +421,8 @@ fn bad_forms_dont_compile() {
         Core::Lambda(Lambda { id: 7, params: Vec::new(), optional: 0, rest: None, body: Box::new(body) })
     }
     assert_eq!(error(|_| app(numbered(q(1)), vec![numbered(q(2))])), CompileError::SameLambda(7));
+    // A lambda of one parameter, two of them optional.
+    assert_eq!(error(|_| Core::Lambda(Lambda { id: 7, params: vec![Var(0)], optional: 2, rest: None, body: Box::new(q(1)) })), CompileError::TooManyOptional(7));
     assert_eq!(error(|_| Core::Intrinsic(Prim::Request(Request::Capture), vec![q(1)])), CompileError::Arity(Prim::Request(Request::Capture)));
     assert_eq!(error(|_| (0..2000).fold(q(0), |e, _| add(q(1), e))), CompileError::TooDeep);
 }
@@ -651,6 +653,109 @@ fn assigned_variables_stay_in_registers_where_nothing_else_sees_them() {
     }
     assert_eq!(number(spilled), Ok(301));
     assert!(!has_box_op(&ops_of(spilled)));
+}
+
+#[test]
+fn long_sequences_compile_without_deep_recursion() {
+    // (lambda (f) (f) (f) ... 0), as a body of many forms is: one wide `let` of results unused.
+    let mut arena = Arena::new(1 << 26, 0);
+    arena.mutate(|mc| {
+        let calls = (1..100_000).map(|i| (i, app(var(0), vec![]))).collect();
+        compile(mc, None, &lambda(&[0], None, let_(calls, q(0)))).unwrap();
+    });
+}
+
+#[test]
+fn many_effects_fold_without_deep_recursion() {
+    // (let ((n 0)) (void (set! n (+ n 1)) ...) n): the effects of `void`'s arguments stay flat.
+    let n = number(|_| {
+        let effects = (0..10_000).map(|_| set(0, add(var(0), q(1)))).collect();
+        let_(vec![(0, q(0))], seq(1, prim(Intrinsic::Void, effects), var(0)))
+    });
+    assert_eq!(n, Ok(10_000));
+    // (let ((n 0)) (vector (set! n (+ n 1)) ...) n): a vector unused is only its elements' effects.
+    let n = number(|_| {
+        let effects = (0..10_000).map(|_| set(0, add(var(0), q(1)))).collect();
+        let_(vec![(0, q(0))], seq(1, prim(Intrinsic::MakeVectorOf, effects), var(0)))
+    });
+    assert_eq!(n, Ok(10_000));
+}
+
+#[test]
+fn long_chains_of_definitions_compile_without_deep_recursion() {
+    // (letrec ((f0 (lambda (x) (f1 x))) (f1 (lambda (x) (f2 x))) ... (fn (lambda (x) x))) f0),
+    // as a body's definitions are, each referring to the next.
+    let n = 20_000;
+    let mut arena = Arena::new(1 << 26, 0);
+    arena.mutate(|mc| {
+        let x = |i: u32| n + 1 + i;
+        let mut binds: Vec<_> = (0..n).map(|i| (i, lambda(&[x(i)], None, app(var(i + 1), vec![var(x(i))])))).collect();
+        binds.push((n, lambda(&[x(n)], None, var(x(n)))));
+        compile(mc, None, &letrec(binds, var(0))).unwrap();
+    });
+    // (letrec ((f0 (lambda (x) (+ 1 (f1 x)))) ... (fn (lambda (x) x))) (f0 0)): inlining each
+    // function into the one before would nest as deep as the chain is long.
+    let n = 10_000;
+    let x = |i: u32| n + 1 + i;
+    let chain = number(move |_| {
+        let mut binds: Vec<_> = (0..n).map(|i| (i, lambda(&[x(i)], None, add(q(1), app(var(i + 1), vec![var(x(i))]))))).collect();
+        binds.push((n, lambda(&[x(n)], None, var(x(n)))));
+        letrec(binds, app(var(0), vec![q(0)]))
+    });
+    assert_eq!(chain, Ok(i64::from(n)));
+    // (letrec ((a0 0) (g0 (lambda (k) (if (eq? k 0) (+ a0 1) (g0 (+ k -1))))) (a1 (g0 1)) (g1 ...)
+    // ... (an (g(n-1) 1))) an): values and loops defined in turn, each loop a join.
+    let (a, g, k) = (|i: u32| 3 * i, |i: u32| 3 * i + 1, |i: u32| 3 * i + 2);
+    let interleaved = number(move |_| {
+        let mut binds = vec![(a(0), q(0))];
+        for i in 0..n {
+            let again = app(var(g(i)), vec![add(var(k(i)), q(-1))]);
+            binds.push((g(i), lambda(&[k(i)], None, when(eq(var(k(i)), q(0)), add(var(a(i)), q(1)), again))));
+            binds.push((a(i + 1), app(var(g(i)), vec![q(1)])));
+        }
+        letrec(binds, var(a(n)))
+    });
+    assert_eq!(interleaved, Ok(i64::from(n)));
+}
+
+#[test]
+fn deeply_nested_loops_compile_quickly() {
+    // (let ((x 0)) (let l0 ((k0 1)) (if (eq? k0 0) (let l1 ((k1 1)) ... (begin (set! x (+ x 1)) x)
+    // ...) (l0 (+ k0 -1))))): each loop a join in the one around it's code.
+    let x = number(|_| {
+        let mut inner = seq(1000, set(0, add(var(0), q(1))), var(0));
+        for i in (0..60).rev() {
+            let (l, k) = (1 + 2 * i, 2 + 2 * i);
+            let body = when(eq(var(k), q(0)), inner, app(var(l), vec![add(var(k), q(-1))]));
+            inner = letrec(vec![(l, lambda(&[k], None, body))], app(var(l), vec![q(1)]));
+        }
+        let_(vec![(0, q(0))], inner)
+    });
+    assert_eq!(x, Ok(1));
+}
+
+#[test]
+fn values_are_made_where_they_go() {
+    fn ops_of(build: impl for<'gc> FnOnce(&Mutation<'gc>) -> Core<'gc>) -> Vec<Op> {
+        let mut arena = Arena::new(1 << 24, 0);
+        arena.mutate(|mc| all_ops(mc, compile(mc, None, &build(mc)).unwrap()))
+    }
+    let moves = |ops: &[Op]| ops.iter().filter(|op| matches!(op, Op::Move { .. } | Op::Move2 { .. })).count();
+    // (lambda (x) (car x)): the argument is already where the intrinsic takes it.
+    let ops = ops_of(|_| lambda(&[0], None, prim(Car, vec![var(0)])));
+    assert!(moves(&ops) == 0 && ops.contains(&Op::TailCallIntrinsic { base: ARGS, args: 1, intrinsic: Car }), "{ops:?}");
+    // (let loop ((xs '(1 2 3)) (acc '())) (if (null? xs) acc (loop (cdr xs) (cons (car xs) acc)))):
+    // each new value is made in its parameter's register, the new xs once the old is read.
+    fn reverse<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
+        let nil = || Core::Quote(Value::NIL);
+        let list = prim(Cons, vec![q(1), prim(Cons, vec![q(2), prim(Cons, vec![q(3), nil()])])]);
+        let step = app(var(0), vec![prim(Intrinsic::Cdr, vec![var(1)]), prim(Cons, vec![prim(Car, vec![var(1)]), var(2)])]);
+        let body = when(prim(Intrinsic::IsNull, vec![var(1)]), var(2), step);
+        letrec(vec![(0, lambda(&[1, 2], None, body))], app(var(0), vec![list, nil()]))
+    }
+    eval(reverse, |mc, result| assert_eq!(items(mc, result.unwrap()), [3, 2, 1]));
+    let ops = ops_of(reverse);
+    assert_eq!(moves(&ops), 0, "{ops:?}");
 }
 
 #[test]

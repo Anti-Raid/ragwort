@@ -8,57 +8,60 @@
 //!   [`VarRef::Upvalue`], and [`VarRef::SelfClosure`], and attaches an explicit [`UpvalSource`]
 //!   capture table to every [`Closure`].
 
-use std::collections::HashSet;
+use crate::hash::HashSet;
 
-use crate::ir::{Closure, JoinCode, L3, L4, UpvalSource, VarRef};
-use crate::{Func, Var};
+use ragwort_alloc::{Arena, CollectIn, Vec, vec_in};
 
-pub(crate) fn closure_convert<'gc>(expr: &L3<'gc>) -> L4<'gc> {
-    let mut env = Env { locals: HashSet::new(), upvalues: Vec::new(), self_closure: None };
+use crate::Var;
+use crate::ir::{Bind, Bind3, Closure, Func, JoinCode, L3, L4, UpvalSource, VarRef};
+
+pub(crate) fn closure_convert<'a, 'gc>(arena: &'a Arena, expr: &L3<'a, 'gc>) -> L4<'a, 'gc> {
+    let mut env = Env { arena, locals: HashSet::default(), upvalues: std::vec::Vec::new(), self_closure: None };
     let out = convert_expr(expr, &mut env);
     debug_assert!(env.upvalues.is_empty(), "top-level expression has no free variables");
     out
 }
 
-struct Env {
+struct Env<'a> {
+    arena: &'a Arena,
     locals: HashSet<Var>,
-    upvalues: Vec<Var>,
+    upvalues: std::vec::Vec<Var>,
     self_closure: Option<Var>,
 }
 
-fn convert_expr<'gc>(expr: &L3<'gc>, env: &mut Env) -> L4<'gc> {
+fn convert_expr<'a, 'gc>(expr: &L3<'a, 'gc>, env: &mut Env<'a>) -> L4<'a, 'gc> {
+    let arena = env.arena;
     match expr {
         L3::Quote(v) => L4::Quote(*v),
         L3::Ref(v) => L4::Ref(resolve_var(*v, env)),
         L3::If(test, then, other) => L4::If(
-            Box::new(convert_expr(test, env)),
-            Box::new(convert_expr(then, env)),
-            Box::new(convert_expr(other, env)),
+            env.arena.boxed(convert_expr(test, env)),
+            env.arena.boxed(convert_expr(then, env)),
+            env.arena.boxed(convert_expr(other, env)),
         ),
         L3::Seq(a, b) => L4::Seq(
-            Box::new(convert_expr(a, env)),
-            Box::new(convert_expr(b, env)),
+            env.arena.boxed(convert_expr(a, env)),
+            env.arena.boxed(convert_expr(b, env)),
         ),
         L3::Let(binds, body) => convert_let(binds, body, env),
-        L3::Fix(binds, body) => convert_fix(binds, body, env),
         L3::Join { group, scope } => convert_join(group, scope, env),
-        L3::Jump(v, args) => L4::Jump(*v, args.iter().map(|a| convert_expr(a, env)).collect()),
+        L3::Jump(v, args) => L4::Jump(*v, args.iter().map(|a| convert_expr(a, env)).collect_in(arena)),
         L3::Set(v, value) => {
             let VarRef::Local(v) = resolve_var(*v, env) else {
                 unreachable!("assignment conversion boxes what closures assign")
             };
-            L4::Set(v, Box::new(convert_expr(value, env)))
+            L4::Set(v, env.arena.boxed(convert_expr(value, env)))
         }
         L3::App(f, args) => L4::App(
-            Box::new(convert_expr(f, env)),
-            args.iter().map(|a| convert_expr(a, env)).collect(),
+            env.arena.boxed(convert_expr(f, env)),
+            args.iter().map(|a| convert_expr(a, env)).collect_in(arena),
         ),
         L3::Lambda(f) => L4::Lambda(convert_closure(f, None, env)),
         L3::Intrinsic(prim, args) => {
-            L4::Intrinsic(*prim, args.iter().map(|a| convert_expr(a, env)).collect())
+            L4::Intrinsic(*prim, args.iter().map(|a| convert_expr(a, env)).collect_in(arena))
         }
         L3::ApplyIntrinsic(prim, args) => {
-            L4::ApplyIntrinsic(*prim, args.iter().map(|a| convert_expr(a, env)).collect())
+            L4::ApplyIntrinsic(*prim, args.iter().map(|a| convert_expr(a, env)).collect_in(arena))
         }
     }
 }
@@ -66,59 +69,65 @@ fn convert_expr<'gc>(expr: &L3<'gc>, env: &mut Env) -> L4<'gc> {
 /// A group of joins, their code in the frame. Out of line, as are the other cases that take more
 /// stack than [`convert_expr`]'s others, which deep expressions recurse through.
 #[inline(never)]
-fn convert_join<'gc>(group: &[(Var, Func<L3<'gc>>)], scope: &L3<'gc>, env: &mut Env) -> L4<'gc> {
-    let mut code = Vec::with_capacity(group.len());
+fn convert_join<'a, 'gc>(group: &[(Var, Func<'a, L3<'a, 'gc>>)], scope: &L3<'a, 'gc>, env: &mut Env<'a>) -> L4<'a, 'gc> {
+    let mut code = Vec::with_capacity_in(group.len(), env.arena);
     for (id, func) in group {
         env.locals.extend(&func.params);
-        code.push(JoinCode { id: *id, params: func.params.clone(), body: convert_expr(&func.body, env) });
+        let params = func.params.clone();
+        code.push(JoinCode { id: *id, params, body: convert_expr(&func.body, env) });
         for p in &func.params {
             env.locals.remove(p);
         }
     }
-    L4::Join { group: code, scope: Box::new(convert_expr(scope, env)) }
+    L4::Join { group: code, scope: env.arena.boxed(convert_expr(scope, env)) }
 }
 
 #[inline(never)]
-fn convert_let<'gc>(binds: &[(Var, L3<'gc>)], body: &L3<'gc>, env: &mut Env) -> L4<'gc> {
-    let converted_binds: Vec<_> = binds.iter().map(|&(v, ref init)| (v, convert_expr(init, env))).collect();
-    for &(v, _) in &converted_binds {
-        env.locals.insert(v);
+fn convert_let<'a, 'gc>(binds: &[Bind3<'a, 'gc>], body: &L3<'a, 'gc>, env: &mut Env<'a>) -> L4<'a, 'gc> {
+    let mut out = Vec::with_capacity_in(binds.len(), env.arena);
+    for bind in binds {
+        match bind {
+            Bind::Val(v, init) => {
+                let init = convert_expr(init, env);
+                env.locals.insert(*v);
+                out.push(Bind::Val(*v, init));
+            }
+            Bind::Fix(group) => out.push(Bind::Fix(convert_fix(group, env))),
+        }
     }
     let body = convert_expr(body, env);
-    for &(v, _) in &converted_binds {
-        env.locals.remove(&v);
+    for bind in &out {
+        for v in bind.vars() {
+            env.locals.remove(&v);
+        }
     }
-    L4::Let(converted_binds, Box::new(body))
+    L4::Let(out, env.arena.boxed(body))
 }
 
-#[inline(never)]
-fn convert_fix<'gc>(binds: &[(Var, Func<L3<'gc>>)], body: &L3<'gc>, env: &mut Env) -> L4<'gc> {
+/// A group of closures, which binds them as locals of the frame.
+fn convert_fix<'a, 'gc>(group: &[(Var, Func<'a, L3<'a, 'gc>>)], env: &mut Env<'a>) -> Vec<'a, (Var, Closure<'a, 'gc>)> {
     // 1. A single-binding `Fix` closure can reference itself via `VarRef::SelfClosure`
     //    (register 0) instead of capturing itself as an upvalue.
-    if let [(self_var, func)] = binds {
+    if let [(self_var, func)] = group {
         let clos = convert_closure(func, Some(*self_var), env);
         env.locals.insert(*self_var);
-        let body = convert_expr(body, env);
-        env.locals.remove(self_var);
-        return L4::Fix(vec![(*self_var, clos)], Box::new(body));
+        return vec_in![env.arena; (*self_var, clos)];
     }
 
     // 2. General mutually recursive `Fix` SCC.
-    for &(v, _) in binds {
+    for &(v, _) in group {
         env.locals.insert(v);
     }
-    let converted_binds: Vec<(Var, Closure<'gc>)> = binds.iter().map(|&(v, ref f)| (v, convert_closure(f, None, env))).collect();
-    let body = convert_expr(body, env);
-    for &(v, _) in binds {
-        env.locals.remove(&v);
-    }
-    L4::Fix(converted_binds, Box::new(body))
+    let arena = env.arena;
+    group.iter().map(|&(v, ref f)| (v, convert_closure(f, None, env))).collect_in(arena)
 }
 
-fn convert_closure<'gc>(func: &Func<L3<'gc>>, self_closure: Option<Var>, parent_env: &mut Env) -> Closure<'gc> {
+fn convert_closure<'a, 'gc>(func: &Func<'a, L3<'a, 'gc>>, self_closure: Option<Var>, parent_env: &mut Env<'a>) -> Closure<'a, 'gc> {
+    let arena = parent_env.arena;
     let mut child_env = Env {
+        arena,
         locals: func.params.iter().chain(&func.rest).copied().collect(),
-        upvalues: Vec::new(),
+        upvalues: std::vec::Vec::new(),
         self_closure,
     };
     let body = convert_expr(&func.body, &mut child_env);
@@ -130,18 +139,18 @@ fn convert_closure<'gc>(func: &Func<L3<'gc>>, self_closure: Option<Var>, parent_
             VarRef::Upvalue(idx) => UpvalSource::Upvalue(idx),
             VarRef::SelfClosure => UpvalSource::SelfClosure,
         })
-        .collect();
+        .collect_in(arena);
     Closure {
         id: func.id,
         params: func.params.clone(),
         optional: func.optional,
         rest: func.rest,
         captures,
-        body: Box::new(body),
+        body: arena.boxed(body),
     }
 }
 
-fn resolve_var(v: Var, env: &mut Env) -> VarRef {
+fn resolve_var(v: Var, env: &mut Env<'_>) -> VarRef {
     if env.locals.contains(&v) {
         return VarRef::Local(v);
     }

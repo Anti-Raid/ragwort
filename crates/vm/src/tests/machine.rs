@@ -962,6 +962,26 @@ fn equal_spends_fuel_as_it_goes() {
 }
 
 #[test]
+fn a_branch_whose_test_ends_the_step_runs_it_once() {
+    // (if (make-vector 50000 0) 50000 0): making the vector has the step end, so the run pauses at
+    // the branch, and goes on past it rather than making another.
+    let main = [
+        Op::LoadConst { dst: 2, index: 0 },
+        Op::LoadConst { dst: 3, index: 1 },
+        Op::BranchIntrinsic2 { a: 2, b: 3, intrinsic: crate::Intrinsic::MakeVector, branch_if: true, offset: 1 },
+        Op::Return { src: 3 },
+        Op::Return { src: 2 },
+    ];
+    let mut arena = Arena::new(1 << 20, 0);
+    arena.mutate(|mc| {
+        let codes = module(mc, &[fix(50_000), fix(0)], &[(0, &[], &main)]);
+        let mut machine = Machine::new(mc, MIN_SEGMENT, closure(mc, codes[0]), &[]).unwrap();
+        assert_eq!(machine.run(mc), Ok(Outcome::Paused));
+        assert_eq!(machine.run(mc), Ok(Outcome::Done(fix(50_000))));
+    });
+}
+
+#[test]
 fn running_out_of_fuel_finishes_the_task() {
     let mut arena = Arena::new(1 << 24, 0);
     arena.mutate(|mc| {

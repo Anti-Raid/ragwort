@@ -351,6 +351,9 @@ fn bad_forms_point_at_themselves() {
     assert_eq!(error(&deep(300)).0, TooDeep);
     // Just under the limit, it lowers and compiles, and only fails as it runs.
     assert_eq!(fault(&deep(250)), Fault::WrongType);
+    // A body of many forms is one `let`, however many there are.
+    let long = format!("(%let ((n '())) {} (%intrinsic length n))", "(%set! n (%intrinsic cons 'a n)) ".repeat(10_000));
+    assert_eq!(eval(&long), "10000");
     assert!(matches!(eval_in(&mut arena(), "(%if"), Err(Error::Read(_))));
 }
 

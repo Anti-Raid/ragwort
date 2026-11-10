@@ -4,12 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+ragwort-alloc = { path = "../alloc" }
 ragwort-types = { path = "../types", default-features = false }
 ragwort-vm = { path = "../vm", default-features = false }
 
 [features]
-default = ["mmap"]
+default = ["mmap", "arena"]
 mmap = ["ragwort-types/mmap", "ragwort-vm/mmap"]
+# Keeps each compile's trees in one arena, freed at once, rather than one allocation each.
+arena = ["ragwort-alloc/bumpalo"]
 
 [lints]
 workspace = true

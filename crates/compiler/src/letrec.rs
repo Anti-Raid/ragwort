@@ -1,25 +1,33 @@
 //! Pass 2 (`L1 -> L2`): Waddell–Sarkar–Dybvig `letrec` / `letrec*` fixing.
 //!
-//! Eliminates [`L1::Letrec`] in favor of:
-//! - [`L2::Seq`] for unreferenced side-effecting bindings,
-//! - [`L2::Let`] for non-recursive bindings and non-self-recursive lambdas,
-//! - [`L2::Fix`] for strongly connected components of unassigned mutually recursive lambdas,
-//! - [`L2::Let`] (`#<void>`) + [`L2::Set`] only for complex bindings with true forward value
-//!   dependencies.
+//! Eliminates [`L1::Letrec`] in favor of one [`L2::Let`], in order, of:
+//! - [`Bind::Val`] for non-recursive bindings, non-self-recursive lambdas, and unreferenced
+//!   side-effecting bindings,
+//! - [`Bind::Fix`] for strongly connected components of unassigned mutually recursive lambdas,
+//! - [`Bind::Val`]s of `#<void>` and of [`L2::Set`]s only for complex bindings with true forward
+//!   value dependencies.
 
-use std::collections::{HashMap, HashSet};
-
+use ragwort_alloc::{Arena, Box, CollectIn, Vec as AVec, vec_in};
 use ragwort_types::gc::Value;
 
-use crate::Func;
-use crate:: Var;
-use crate::ir::{L1, L2, Supply};
+use crate::Var;
+use crate::hash::{HashMap, HashSet};
+use crate::ir::{Bind, Bind2, Func, L1, L2, Supply};
+
 
 /// Maximum number of closures in a single `Fix` group (must fit in `STAGE` scratch registers).
 const MAX_FIX_GROUP: usize = 30;
 
-pub(crate) fn fix_letrec<'gc>(l1: L1<'gc>, supply: Supply) -> (L2<'gc>, Supply) {
-    (transform(l1, &mut Usage::default()), supply)
+pub(crate) fn fix_letrec<'a, 'gc>(arena: &'a Arena, l1: L1<'a, 'gc>, mut supply: Supply) -> (L2<'a, 'gc>, Supply) {
+    let mut cx = Cx { arena, supply: &mut supply };
+    let out = cx.transform(l1, &mut Usage::default());
+    (out, supply)
+}
+
+struct Cx<'a, 's> {
+    arena: &'a Arena,
+    /// For the variables the results of a fallback's assignments are bound to.
+    supply: &'s mut Supply,
 }
 
 /// The variables an expression refers to and assigns, outside the binding forms within it.
@@ -50,10 +58,14 @@ impl Usage {
     /// What's left outside a form binding `vars`.
     fn bind(mut self, vars: impl IntoIterator<Item = Var>) -> Self {
         for v in vars {
-            self.used.remove(&v);
-            self.assigned.remove(&v);
+            self.forget(v);
         }
         self
+    }
+
+    fn forget(&mut self, v: Var) {
+        self.used.remove(&v);
+        self.assigned.remove(&v);
     }
 
     /// Those of `vars` this uses, and those it assigns.
@@ -72,365 +84,323 @@ impl Usage {
 // The walks below recurse once per level of nesting, so they keep their frames small: binding
 // forms, which need more, are handled out of line.
 
-/// `expr` as `L2`, with what it uses added to `usage`.
-fn transform<'gc>(expr: L1<'gc>, usage: &mut Usage) -> L2<'gc> {
-    match expr {
-        L1::Quote(v) => L2::Quote(v),
-        L1::Ref(v) => {
-            usage.used.insert(v);
-            L2::Ref(v)
+impl<'a> Cx<'a, '_> {
+    /// `expr` as `L2`, with what it uses added to `usage`.
+    fn transform<'gc>(&mut self, expr: L1<'a, 'gc>, usage: &mut Usage) -> L2<'a, 'gc> {
+        let arena = self.arena;
+        match expr {
+            L1::Quote(v) => L2::Quote(v),
+            L1::Ref(v) => {
+                usage.used.insert(v);
+                L2::Ref(v)
+            }
+            L1::If(test, then, other) => {
+                let test = self.transform(Box::into_inner(test), usage);
+                let then = self.transform(Box::into_inner(then), usage);
+                L2::If(arena.boxed(test), arena.boxed(then), arena.boxed(self.transform(Box::into_inner(other), usage)))
+            }
+            L1::Let(binds, body) => self.binding(binds, Box::into_inner(body), false, usage),
+            L1::Letrec(binds, body) => self.binding(binds, Box::into_inner(body), true, usage),
+            L1::Set(v, value) => {
+                usage.assigned.insert(v);
+                L2::Set(v, arena.boxed(self.transform(Box::into_inner(value), usage)))
+            }
+            L1::App(f, args) => {
+                let f = self.transform(Box::into_inner(f), usage);
+                L2::App(arena.boxed(f), self.all(args, usage))
+            }
+            L1::Lambda(f) => {
+                let mut inner = Usage::default();
+                let body = self.transform(Box::into_inner(f.body), &mut inner);
+                usage.absorb(inner.bind(f.params.iter().copied().chain(f.rest)));
+                L2::Lambda(Func { id: f.id, params: f.params, optional: f.optional, rest: f.rest, body: arena.boxed(body) })
+            }
+            L1::Intrinsic(prim, args) => L2::Intrinsic(prim, self.all(args, usage)),
+            L1::ApplyIntrinsic(prim, args) => L2::ApplyIntrinsic(prim, self.all(args, usage)),
         }
-        L1::If(test, then, other) => {
-            let test = transform(*test, usage);
-            let then = transform(*then, usage);
-            L2::If(Box::new(test), Box::new(then), Box::new(transform(*other, usage)))
-        }
-        L1::Let(binds, body) => transform_binding(binds, *body, false, usage),
-        L1::Letrec(binds, body) => transform_binding(binds, *body, true, usage),
-        L1::Set(v, value) => {
-            usage.assigned.insert(v);
-            L2::Set(v, Box::new(transform(*value, usage)))
-        }
-        L1::App(f, args) => {
-            let f = transform(*f, usage);
-            L2::App(Box::new(f), transform_all(args, usage))
-        }
-        L1::Lambda(f) => {
-            let mut inner = Usage::default();
-            let body = transform(*f.body, &mut inner);
-            usage.absorb(inner.bind(f.params.iter().copied().chain(f.rest)));
-            L2::Lambda(Func { id: f.id, params: f.params, optional: f.optional, rest: f.rest, body: Box::new(body) })
-        }
-        L1::Intrinsic(prim, args) => L2::Intrinsic(prim, transform_all(args, usage)),
-        L1::ApplyIntrinsic(prim, args) => L2::ApplyIntrinsic(prim, transform_all(args, usage)),
     }
-}
 
-fn transform_all<'gc>(exprs: Vec<L1<'gc>>, usage: &mut Usage) -> Vec<L2<'gc>> {
-    let mut out = Vec::with_capacity(exprs.len());
-    for e in exprs {
-        out.push(transform(e, usage));
+    fn all<'gc>(&mut self, exprs: AVec<'a, L1<'a, 'gc>>, usage: &mut Usage) -> AVec<'a, L2<'a, 'gc>> {
+        let mut out = AVec::with_capacity_in(exprs.len(), self.arena);
+        for e in exprs {
+            out.push(self.transform(e, usage));
+        }
+        out
     }
-    out
-}
 
-#[inline(never)]
-fn transform_binding<'gc>(binds: Vec<(Var, L1<'gc>)>, body: L1<'gc>, rec: bool, usage: &mut Usage) -> L2<'gc> {
-    let mut out = Vec::with_capacity(binds.len());
-    for (v, e) in binds {
-        let mut u = Usage::default();
-        let e = transform(e, &mut u);
-        out.push((v, e, u));
+    #[inline(never)]
+    fn binding<'gc>(&mut self, binds: AVec<'a, (Var, L1<'a, 'gc>)>, body: L1<'a, 'gc>, rec: bool, usage: &mut Usage) -> L2<'a, 'gc> {
+        let mut out = Vec::with_capacity(binds.len());
+        for (v, e) in binds {
+            let mut u = Usage::default();
+            let e = self.transform(e, &mut u);
+            out.push((v, e, u));
+        }
+        let mut body_usage = Usage::default();
+        let body = self.transform(body, &mut body_usage);
+        let (expr, u) = if rec { self.fix_block(out, body, body_usage) } else { simplify_let_with(self.arena, out, body, body_usage) };
+        usage.absorb(u);
+        expr
     }
-    let mut body_usage = Usage::default();
-    let body = transform(body, &mut body_usage);
-    let (expr, u) = if rec { fix_block(out, body, body_usage) } else { simplify_let_with(out, body, body_usage) };
-    usage.absorb(u);
-    expr
 }
 
 /// Drops the bindings in `expr` nothing uses, as [`simplify_let_with`] does for one `let`, for a
 /// whole tree in one walk: inside out, so a binding only a dropped one used goes too.
-pub(crate) fn prune<'gc>(mut expr: L2<'gc>) -> L2<'gc> {
-    prune_into(&mut expr, &mut Usage::default());
+pub(crate) fn prune<'a, 'gc>(arena: &'a Arena, mut expr: L2<'a, 'gc>) -> L2<'a, 'gc> {
+    prune_into(arena, &mut expr, &mut Usage::default());
     expr
 }
 
 /// Prunes `expr` in place, adding what's left of it uses to `usage`.
-fn prune_into<'gc>(expr: &mut L2<'gc>, usage: &mut Usage) {
+fn prune_into<'a, 'gc>(arena: &'a Arena, expr: &mut L2<'a, 'gc>, usage: &mut Usage) {
     match expr {
         L2::Quote(_) => {}
         L2::Ref(v) => _ = usage.used.insert(*v),
         L2::If(a, b, c) => {
-            prune_into(a, usage);
-            prune_into(b, usage);
-            prune_into(c, usage);
+            prune_into(arena, a, usage);
+            prune_into(arena, b, usage);
+            prune_into(arena, c, usage);
         }
         L2::Seq(a, b) => {
-            prune_into(a, usage);
-            prune_into(b, usage);
+            prune_into(arena, a, usage);
+            prune_into(arena, b, usage);
         }
-        L2::Let(..) | L2::Fix(..) => prune_binding(expr, usage),
+        L2::Let(..) => prune_binding(arena, expr, usage),
         L2::Set(v, value) => {
             usage.assigned.insert(*v);
-            prune_into(value, usage);
+            prune_into(arena, value, usage);
         }
         L2::App(f, args) => {
-            prune_into(f, usage);
+            prune_into(arena, f, usage);
             for a in args {
-                prune_into(a, usage);
+                prune_into(arena, a, usage);
             }
         }
-        L2::Lambda(f) => prune_func(f, usage),
+        L2::Lambda(f) => prune_func(arena, f, usage),
         L2::Intrinsic(_, args) | L2::ApplyIntrinsic(_, args) => {
             for a in args {
-                prune_into(a, usage);
+                prune_into(arena, a, usage);
             }
         }
     }
 }
 
-fn prune_func<'gc>(f: &mut Func<L2<'gc>>, usage: &mut Usage) {
+fn prune_func<'a, 'gc>(arena: &'a Arena, f: &mut Func<'a, L2<'a, 'gc>>, usage: &mut Usage) {
     let mut inner = Usage::default();
-    prune_into(&mut f.body, &mut inner);
+    prune_into(arena, &mut f.body, &mut inner);
     usage.absorb(inner.bind(f.params.iter().copied().chain(f.rest)));
 }
 
 #[inline(never)]
-fn prune_binding<'gc>(expr: &mut L2<'gc>, usage: &mut Usage) {
-    let pruned = match std::mem::replace(expr, L2::Quote(Value::VOID)) {
-        L2::Let(binds, mut body) => {
-            let mut out = Vec::with_capacity(binds.len());
-            for (v, mut e) in binds {
-                let mut u = Usage::default();
-                prune_into(&mut e, &mut u);
-                out.push((v, e, u));
-            }
-            let mut body_usage = Usage::default();
-            prune_into(&mut body, &mut body_usage);
-            let (pruned, u) = simplify_let_with(out, *body, body_usage);
-            usage.absorb(u);
-            pruned
-        }
-        L2::Fix(mut binds, mut body) => {
-            let mut body_usage = Usage::default();
-            prune_into(&mut body, &mut body_usage);
-            if binds.iter().any(|&(v, _)| body_usage.mentions(v)) {
-                for (_, f) in &mut binds {
-                    prune_func(f, &mut body_usage);
+fn prune_binding<'a, 'gc>(arena: &'a Arena, expr: &mut L2<'a, 'gc>, usage: &mut Usage) {
+    let L2::Let(binds, mut body) = expr.take() else { return };
+    let mut u = Usage::default();
+    prune_into(arena, &mut body, &mut u);
+    // Last first, as each binding is in scope in those after it.
+    let mut kept = Vec::with_capacity(binds.len());
+    for bind in binds.into_iter().rev() {
+        match bind {
+            Bind::Val(v, mut e) => {
+                if u.mentions(v) || !e.is_pure() {
+                    u.forget(v);
+                    prune_into(arena, &mut e, &mut u);
+                    kept.push(Bind::Val(v, e));
                 }
-                usage.absorb(body_usage.bind(binds.iter().map(|&(v, _)| v)));
-                L2::Fix(binds, body)
-            } else {
-                usage.absorb(body_usage);
-                *body
+            }
+            Bind::Fix(mut group) => {
+                if group.iter().any(|&(v, _)| u.mentions(v)) {
+                    for (_, f) in &mut group {
+                        prune_func(arena, f, &mut u);
+                    }
+                    for &(v, _) in &group {
+                        u.forget(v);
+                    }
+                    kept.push(Bind::Fix(group));
+                }
             }
         }
-        other => other,
-    };
-    *expr = pruned;
+    }
+    usage.absorb(u);
+    *expr = if kept.is_empty() { Box::into_inner(body) } else { L2::Let(kept.into_iter().rev().collect_in(arena), body) };
 }
 
-/// Converts a `Let` whose bindings may be unused in `body` into `Seq`s and smaller `Let`s while
-/// strictly preserving left-to-right binding evaluation order, given what `body` and each init
-/// use, and says what the result uses.
-fn simplify_let_with<'gc>(binds: Vec<(Var, L2<'gc>, Usage)>, body: L2<'gc>, body_usage: Usage) -> (L2<'gc>, Usage) {
-    if binds.is_empty() {
-        return (body, body_usage);
-    }
-    let vars: Vec<Var> = binds.iter().map(|&(v, _, _)| v).collect();
-    let mut kept = Vec::new();
-    let mut acc = body;
-    let mut pending_let: Vec<(Var, L2<'gc>)> = Vec::new();
-    for (v, init, usage) in binds.into_iter().rev() {
-        if body_usage.mentions(v) {
-            pending_let.push((v, init));
-            kept.push(usage);
-        } else if !init.is_pure() {
-            if !pending_let.is_empty() {
-                pending_let.reverse();
-                acc = L2::Let(std::mem::take(&mut pending_let), Box::new(acc));
-            }
-            acc = L2::seq(init, acc);
-            kept.push(usage);
-        }
-    }
-    if !pending_let.is_empty() {
-        pending_let.reverse();
-        acc = L2::Let(pending_let, Box::new(acc));
-    }
+/// Drops the pure bindings of a `Let` unused in `body`, given what `body` and each init use, and
+/// says what the result uses. The rest stay in it, in order, so a body of many forms, a `Let` of
+/// results unused, stays as flat as it was.
+fn simplify_let_with<'a, 'gc>(arena: &'a Arena, binds: Vec<(Var, L2<'a, 'gc>, Usage)>, body: L2<'a, 'gc>, body_usage: Usage) -> (L2<'a, 'gc>, Usage) {
     let mut usage = body_usage;
-    for u in kept {
-        usage.absorb(u);
-    }
-    (acc, usage.bind(vars))
-}
-
-enum Step<'gc> {
-    Seq(L2<'gc>),
-    Let(Var, L2<'gc>),
-    Fix(Vec<(Var, Func<L2<'gc>>)>),
-    Boxed { vars: Vec<Var>, inits: Vec<L2<'gc>> },
-}
-
-fn fix_block<'gc>(binds: Vec<(Var, L2<'gc>, Usage)>, body: L2<'gc>, body_usage: Usage) -> (L2<'gc>, Usage) {
-    if binds.is_empty() {
-        return (body, body_usage);
-    }
-    let letrec_vars: HashSet<Var> = binds.iter().map(|&(v, _, _)| v).collect();
-    let mut used = HashSet::new();
-    let mut assigned = HashSet::new();
-    let mut fv: HashMap<Var, HashSet<Var>> = HashMap::with_capacity(binds.len());
-
-    for (v, _, usage) in &binds {
-        let (init_used, init_assigned) = usage.among(&letrec_vars);
-        used.extend(init_used.iter().copied());
-        assigned.extend(init_assigned.iter().copied());
-        fv.insert(*v, init_used.into_iter().chain(init_assigned).collect());
-    }
-    let (body_used, body_assigned) = body_usage.among(&letrec_vars);
-    used.extend(body_used);
-    assigned.extend(body_assigned);
-
-    // Filter out completely unused pure bindings; what's left is all the block uses.
-    let mut usage = body_usage;
-    let indexed: Vec<(usize, Var, L2<'gc>)> = binds
-        .into_iter()
-        .enumerate()
-        .filter(|&(_, (v, ref init, _))| used.contains(&v) || !init.is_pure())
-        .map(|(i, (v, init, u))| {
-            usage.absorb(u);
-            (i, v, init)
-        })
-        .collect();
-    let usage = usage.bind(letrec_vars.iter().copied());
-
-    let mut bound: HashSet<Var> = HashSet::new();
-    let mut pending_fix: Vec<(usize, Var, Func<L2<'gc>>)> = Vec::new();
-    let mut steps: Vec<Step<'gc>> = Vec::new();
-    let mut iter = indexed.into_iter().peekable();
-
-    while let Some((idx, v, init)) = iter.next() {
-        if !assigned.contains(&v)
-            && used.contains(&v)
-            && let L2::Lambda(func) = init
-        {
-            pending_fix.push((idx, v, func));
-            continue;
-        }
-
-        flush_ready_fix(&mut pending_fix, &mut bound, &fv, &mut steps);
-
-        if fv[&v].is_subset(&bound) {
-            if used.contains(&v) {
-                bound.insert(v);
-                steps.push(Step::Let(v, init));
-            } else {
-                steps.push(Step::Seq(init));
-            }
-        } else {
-            // Forward reference to an uninitialized variable: fall back to `<void>` + `Set` for
-            // the remaining bindings in their original lexical order.
-            let mut rest: Vec<(usize, Var, L2<'gc>)> =
-                pending_fix.drain(..).map(|(i, var, f)| (i, var, L2::Lambda(f))).collect();
-            rest.push((idx, v, init));
-            rest.extend(iter);
-            rest.sort_by_key(|&(i, _, _)| i);
-            emit_fallback(rest, &used, &mut steps);
-            break;
+    let mut kept = Vec::with_capacity(binds.len());
+    for (v, init, init_usage) in binds.into_iter().rev() {
+        if usage.mentions(v) || !init.is_pure() {
+            usage.forget(v);
+            usage.absorb(init_usage);
+            kept.push(Bind::Val(v, init));
         }
     }
-
-    if !pending_fix.is_empty() {
-        flush_ready_fix(&mut pending_fix, &mut bound, &fv, &mut steps);
-        if !pending_fix.is_empty() {
-            let mut rest: Vec<(usize, Var, L2<'gc>)> =
-                pending_fix.drain(..).map(|(i, var, f)| (i, var, L2::Lambda(f))).collect();
-            rest.sort_by_key(|&(i, _, _)| i);
-            emit_fallback(rest, &used, &mut steps);
-        }
-    }
-
-    let out = steps.into_iter().rfold(body, |acc, step| match step {
-        Step::Seq(e) => L2::seq(e, acc),
-        Step::Let(v, e) => L2::Let(vec![(v, e)], Box::new(acc)),
-        Step::Fix(group) => L2::Fix(group, Box::new(acc)),
-        Step::Boxed { vars, inits } => {
-            let body = inits.into_iter().rfold(acc, |acc, e| L2::seq(e, acc));
-            if vars.is_empty() {
-                body
-            } else {
-                let binds = vars.into_iter().map(|v| (v, L2::Quote(Value::VOID))).collect();
-                L2::Let(binds, Box::new(body))
-            }
-        }
-    });
+    let out = if kept.is_empty() { body } else { L2::Let(kept.into_iter().rev().collect_in(arena), arena.boxed(body)) };
     (out, usage)
 }
 
-fn emit_fallback<'gc>(rest: Vec<(usize, Var, L2<'gc>)>, used: &HashSet<Var>, steps: &mut Vec<Step<'gc>>) {
-    let mut vars = Vec::new();
-    let mut inits = Vec::new();
-    for (_, v, init) in rest {
-        if used.contains(&v) {
-            vars.push(v);
-            inits.push(L2::Set(v, Box::new(init)));
-        } else if !init.is_pure() {
-            inits.push(init);
-        }
-    }
-    steps.push(Step::Boxed { vars, inits });
-}
+/// A binding still to be fixed, with its place among them.
+type Pending<'a, 'gc> = (usize, Var, L2<'a, 'gc>);
 
-/// Flushes all functions in `pending_fix` whose transitive dependencies in `letrec_vars` are
-/// satisfied by `bound` and other ready functions in `pending_fix`.
-fn flush_ready_fix<'gc>(
-    pending_fix: &mut Vec<(usize, Var, Func<L2<'gc>>)>,
-    bound: &mut HashSet<Var>,
-    fv: &HashMap<Var, HashSet<Var>>,
-    steps: &mut Vec<Step<'gc>>,
-) {
-    if pending_fix.is_empty() {
-        return;
-    }
-    let mut cand: HashSet<Var> = pending_fix.iter().map(|&(_, v, _)| v).collect();
-    loop {
-        let next: HashSet<Var> = cand
-            .iter()
-            .copied()
-            .filter(|v| fv[v].iter().all(|dep| bound.contains(dep) || cand.contains(dep)))
+impl<'a> Cx<'a, '_> {
+    fn fix_block<'gc>(&mut self, binds: Vec<(Var, L2<'a, 'gc>, Usage)>, body: L2<'a, 'gc>, body_usage: Usage) -> (L2<'a, 'gc>, Usage) {
+        if binds.is_empty() {
+            return (body, body_usage);
+        }
+        let letrec_vars: HashSet<Var> = binds.iter().map(|&(v, _, _)| v).collect();
+        let mut used = HashSet::default();
+        let mut assigned = HashSet::default();
+        let mut fv: HashMap<Var, HashSet<Var>> = HashMap::with_capacity_and_hasher(binds.len(), Default::default());
+
+        for (v, _, usage) in &binds {
+            let (init_used, init_assigned) = usage.among(&letrec_vars);
+            used.extend(init_used.iter().copied());
+            assigned.extend(init_assigned.iter().copied());
+            fv.insert(*v, init_used.into_iter().chain(init_assigned).collect());
+        }
+        let (body_used, body_assigned) = body_usage.among(&letrec_vars);
+        used.extend(body_used);
+        assigned.extend(body_assigned);
+
+        // Filter out completely unused pure bindings; what's left is all the block uses.
+        let mut usage = body_usage;
+        let indexed: Vec<Pending<'a, 'gc>> = binds
+            .into_iter()
+            .enumerate()
+            .filter(|&(_, (v, ref init, _))| used.contains(&v) || !init.is_pure())
+            .map(|(i, (v, init, u))| {
+                usage.absorb(u);
+                (i, v, init)
+            })
             .collect();
-        if next.len() == cand.len() {
-            break;
-        }
-        cand = next;
-    }
-    if cand.is_empty() {
-        return;
-    }
+        let usage = usage.bind(letrec_vars.iter().copied());
 
-    let mut ready = Vec::with_capacity(cand.len());
-    let mut kept = Vec::new();
-    for item in pending_fix.drain(..) {
-        if cand.contains(&item.1) {
-            ready.push((item.1, item.2));
-        } else {
-            kept.push(item);
-        }
-    }
-    *pending_fix = kept;
+        let mut bound: HashSet<Var> = HashSet::default();
+        let mut pending_fix: Vec<(usize, Var, Func<'a, L2<'a, 'gc>>)> = Vec::new();
+        let mut out = AVec::with_capacity_in(indexed.len(), self.arena);
+        let mut iter = indexed.into_iter().peekable();
 
-    // Decompose `ready` into Tarjan strongly-connected components in topological order.
-    for scc in tarjan_sccs(ready, fv) {
-        if scc.len() == 1 {
-            let (v, func) = scc.into_iter().next().expect("single-element SCC");
-            bound.insert(v);
-            if fv[&v].contains(&v) {
-                steps.push(Step::Fix(vec![(v, func)]));
-            } else {
-                steps.push(Step::Let(v, L2::Lambda(func)));
+        while let Some((idx, v, init)) = iter.next() {
+            if !assigned.contains(&v)
+                && used.contains(&v)
+                && let L2::Lambda(func) = init
+            {
+                pending_fix.push((idx, v, func));
+                continue;
             }
-        } else if scc.len() <= MAX_FIX_GROUP {
+
+            self.flush_ready_fix(&mut pending_fix, &mut bound, &fv, &mut out);
+
+            if fv[&v].is_subset(&bound) {
+                if used.contains(&v) {
+                    bound.insert(v);
+                }
+                out.push(Bind::Val(v, init));
+            } else {
+                // Forward reference to an uninitialized variable: fall back to `<void>` + `Set` for
+                // the remaining bindings in their original lexical order.
+                let mut rest: Vec<Pending<'a, 'gc>> = pending_fix.drain(..).map(|(i, var, f)| (i, var, L2::Lambda(f))).collect();
+                rest.push((idx, v, init));
+                rest.extend(iter);
+                rest.sort_by_key(|&(i, _, _)| i);
+                self.fallback(rest.into_iter().map(|(_, v, init)| (v, init)), &used, &mut out);
+                break;
+            }
+        }
+
+        if !pending_fix.is_empty() {
+            self.flush_ready_fix(&mut pending_fix, &mut bound, &fv, &mut out);
+            if !pending_fix.is_empty() {
+                let mut rest: Vec<Pending<'a, 'gc>> = pending_fix.drain(..).map(|(i, var, f)| (i, var, L2::Lambda(f))).collect();
+                rest.sort_by_key(|&(i, _, _)| i);
+                self.fallback(rest.into_iter().map(|(_, v, init)| (v, init)), &used, &mut out);
+            }
+        }
+
+        let expr = if out.is_empty() { body } else { L2::Let(out, self.arena.boxed(body)) };
+        (expr, usage)
+    }
+
+    /// Binds those of `rest` used to `#<void>`, then assigns each its init, or evaluates it if
+    /// it's unused, in order.
+    fn fallback<'gc>(&mut self, rest: impl IntoIterator<Item = (Var, L2<'a, 'gc>)>, used: &HashSet<Var>, out: &mut AVec<'a, Bind2<'a, 'gc>>) {
+        let rest: Vec<(Var, L2<'a, 'gc>)> = rest.into_iter().collect();
+        out.extend(rest.iter().filter(|(v, _)| used.contains(v)).map(|&(v, _)| Bind::Val(v, L2::Quote(Value::VOID))));
+        for (v, init) in rest {
+            if used.contains(&v) {
+                out.push(Bind::Val(self.supply.fresh_var(), L2::Set(v, self.arena.boxed(init))));
+            } else if !init.is_pure() {
+                out.push(Bind::Val(v, init));
+            }
+        }
+    }
+
+    /// Flushes all functions in `pending_fix` whose transitive dependencies in `letrec_vars` are
+    /// satisfied by `bound` and other ready functions in `pending_fix`.
+    fn flush_ready_fix<'gc>(
+        &mut self,
+        pending_fix: &mut Vec<(usize, Var, Func<'a, L2<'a, 'gc>>)>,
+        bound: &mut HashSet<Var>,
+        fv: &HashMap<Var, HashSet<Var>>,
+        out: &mut AVec<'a, Bind2<'a, 'gc>>,
+    ) {
+        if pending_fix.is_empty() {
+            return;
+        }
+        let mut cand: HashSet<Var> = pending_fix.iter().map(|&(_, v, _)| v).collect();
+        loop {
+            let next: HashSet<Var> = cand
+                .iter()
+                .copied()
+                .filter(|v| fv[v].iter().all(|dep| bound.contains(dep) || cand.contains(dep)))
+                .collect();
+            if next.len() == cand.len() {
+                break;
+            }
+            cand = next;
+        }
+        if cand.is_empty() {
+            return;
+        }
+
+        let mut ready = Vec::with_capacity(cand.len());
+        let mut kept = Vec::new();
+        for item in pending_fix.drain(..) {
+            if cand.contains(&item.1) {
+                ready.push((item.1, item.2));
+            } else {
+                kept.push(item);
+            }
+        }
+        *pending_fix = kept;
+
+        // Decompose `ready` into Tarjan strongly-connected components in topological order.
+        for scc in tarjan_sccs(self.arena, ready, fv) {
             for &(v, _) in &scc {
                 bound.insert(v);
             }
-            steps.push(Step::Fix(scc));
-        } else {
-            // Very large mutually recursive SCC (> 30 functions): fall back to boxed assignment.
-            let mut vars = Vec::with_capacity(scc.len());
-            let mut inits = Vec::with_capacity(scc.len());
-            for (v, func) in scc {
-                bound.insert(v);
-                vars.push(v);
-                inits.push(L2::Set(v, Box::new(L2::Lambda(func))));
+            if scc.len() == 1 {
+                let (v, func) = scc.into_iter().next().expect("single-element SCC");
+                if fv[&v].contains(&v) {
+                    out.push(Bind::Fix(vec_in![self.arena; (v, func)]));
+                } else {
+                    out.push(Bind::Val(v, L2::Lambda(func)));
+                }
+            } else if scc.len() <= MAX_FIX_GROUP {
+                out.push(Bind::Fix(scc));
+            } else {
+                // Very large mutually recursive SCC (> 30 functions): fall back to boxed assignment.
+                let members: HashSet<Var> = scc.iter().map(|&(v, _)| v).collect();
+                self.fallback(scc.into_iter().map(|(v, func)| (v, L2::Lambda(func))), &members, out);
             }
-            steps.push(Step::Boxed { vars, inits });
         }
     }
 }
 
 /// Computes strongly connected components of `nodes` in dependency order (callees before callers).
-fn tarjan_sccs<'gc>(nodes: Vec<(Var, Func<L2<'gc>>)>, fv: &HashMap<Var, HashSet<Var>>) -> Vec<Vec<(Var, Func<L2<'gc>>)>> {
+fn tarjan_sccs<'a, 'gc>(arena: &'a Arena, nodes: Vec<(Var, Func<'a, L2<'a, 'gc>>)>, fv: &HashMap<Var, HashSet<Var>>) -> Vec<AVec<'a, (Var, Func<'a, L2<'a, 'gc>>)>> {
     let n = nodes.len();
     let index_of: HashMap<Var, usize> = nodes.iter().enumerate().map(|(i, &(v, _))| (v, i)).collect();
     let edges: Vec<Vec<usize>> = nodes
@@ -453,37 +423,50 @@ fn tarjan_sccs<'gc>(nodes: Vec<(Var, Func<L2<'gc>>)>, fv: &HashMap<Var, HashSet<
     }
 
     impl Tarjan<'_> {
-        fn visit(&mut self, v: usize) {
+        /// Visits `root` and what it reaches, with a stack of where each visit is in its edges
+        /// in place of recursion, as a long chain of definitions would go deep.
+        fn visit(&mut self, root: usize) {
+            let mut calls = vec![(root, 0)];
+            self.enter(root);
+            while let Some(&mut (v, ref mut next)) = calls.last_mut() {
+                if let Some(&w) = self.edges[v].get(*next) {
+                    *next += 1;
+                    match self.indices[w] {
+                        Some(w_idx) if self.on_stack[w] => self.lowlink[v] = self.lowlink[v].min(w_idx),
+                        Some(_) => {}
+                        None => {
+                            self.enter(w);
+                            calls.push((w, 0));
+                        }
+                    }
+                    continue;
+                }
+                calls.pop();
+                if let Some(&(parent, _)) = calls.last() {
+                    self.lowlink[parent] = self.lowlink[parent].min(self.lowlink[v]);
+                }
+                if Some(self.lowlink[v]) == self.indices[v] {
+                    let mut scc = Vec::new();
+                    while let Some(w) = self.stack.pop() {
+                        self.on_stack[w] = false;
+                        scc.push(w);
+                        if w == v {
+                            break;
+                        }
+                    }
+                    scc.sort_unstable();
+                    self.sccs.push(scc);
+                }
+            }
+        }
+
+        fn enter(&mut self, v: usize) {
             let idx = self.index;
             self.index += 1;
             self.indices[v] = Some(idx);
             self.lowlink[v] = idx;
             self.stack.push(v);
             self.on_stack[v] = true;
-
-            for &w in &self.edges[v] {
-                if let Some(w_idx) = self.indices[w] {
-                    if self.on_stack[w] {
-                        self.lowlink[v] = self.lowlink[v].min(w_idx);
-                    }
-                } else {
-                    self.visit(w);
-                    self.lowlink[v] = self.lowlink[v].min(self.lowlink[w]);
-                }
-            }
-
-            if self.lowlink[v] == idx {
-                let mut scc = Vec::new();
-                while let Some(w) = self.stack.pop() {
-                    self.on_stack[w] = false;
-                    scc.push(w);
-                    if w == v {
-                        break;
-                    }
-                }
-                scc.sort_unstable();
-                self.sccs.push(scc);
-            }
         }
     }
 
@@ -502,15 +485,15 @@ fn tarjan_sccs<'gc>(nodes: Vec<(Var, Func<L2<'gc>>)>, fv: &HashMap<Var, HashSet<
         }
     }
 
-    let mut opt_nodes: Vec<Option<(Var, Func<L2<'gc>>)>> = nodes.into_iter().map(Some).collect();
+    let mut opt_nodes: Vec<Option<(Var, Func<'a, L2<'a, 'gc>>)>> = nodes.into_iter().map(Some).collect();
     state
         .sccs
         .into_iter()
-        .map(|scc| scc.into_iter().map(|i| opt_nodes[i].take().expect("each node belongs to one SCC")).collect())
+        .map(|scc| scc.into_iter().map(|i| opt_nodes[i].take().expect("each node belongs to one SCC")).collect_in(arena))
         .collect()
 }
 
-pub(crate) fn collect_usage<'gc>(expr: &L2<'gc>, used: &mut HashSet<Var>, assigned: &mut HashSet<Var>) {
+pub(crate) fn collect_usage(expr: &L2<'_, '_>, used: &mut HashSet<Var>, assigned: &mut HashSet<Var>) {
     match expr {
         L2::Quote(_) => {}
         L2::Ref(v) => {
@@ -526,14 +509,11 @@ pub(crate) fn collect_usage<'gc>(expr: &L2<'gc>, used: &mut HashSet<Var>, assign
             collect_usage(b, used, assigned);
         }
         L2::Let(binds, body) => {
-            for (_, init) in binds {
-                collect_usage(init, used, assigned);
-            }
-            collect_usage(body, used, assigned);
-        }
-        L2::Fix(binds, body) => {
-            for (_, f) in binds {
-                collect_usage(&f.body, used, assigned);
+            for bind in binds {
+                match bind {
+                    Bind::Val(_, init) => collect_usage(init, used, assigned),
+                    Bind::Fix(group) => group.iter().for_each(|(_, f)| collect_usage(&f.body, used, assigned)),
+                }
             }
             collect_usage(body, used, assigned);
         }

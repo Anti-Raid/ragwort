@@ -584,6 +584,15 @@ fn bad_syntax_points_at_itself() {
     assert_eq!(eval_in(&mut arena(), &deep(200)), Ok(Err(Fault::WrongType)));
 }
 
+/// A call of the prelude's `list` with more arguments than it inlines is a call, rather than
+/// `cons`es nested as deep as it's long.
+#[test]
+fn long_calls_of_inlined_functions_compile() {
+    let nums = (0..1000).map(|i| i.to_string()).collect::<Vec<_>>().join(" ");
+    assert_eq!(eval(&format!("(length (list {nums}))")), "1000");
+    assert_eq!(eval("(list 1 2 3)"), "(1 2 3)");
+}
+
 /// The rest lists of calls to the prelude's `+` are the loop's only garbage, and binding them
 /// pauses the run for the collector, so it doesn't run out of room.
 #[test]

@@ -2,7 +2,7 @@
 //! written to; an immutable one, such as a literal, can only be read. [`AnyBytevector`] reads
 //! either.
 
-use crate::gc::{Gc, Mutation, OutOfMemory, Value};
+use crate::gc::{Gc, Mutation, OutOfMemory, Slots, Value, slot};
 use crate::objects::{self, BytevectorFields, Data, ImmutableBytevectorFields};
 
 #[cfg(test)]
@@ -159,19 +159,19 @@ impl<'a, 'gc> Bytevectors<'a, 'gc> {
     pub fn make(&self, len: usize, fill: u8) -> Result<Bytevector<'gc>, OutOfMemory> {
         let word = u64::from_le_bytes([fill; 8]);
         let v = objects::Bytevector::new(self.mc, len as u64, words(len), word)?;
-        clear_slack(len, |i, w| v.items(self.mc).set(self.mc, i, w), word);
+        clear_slack(self.mc, v.items(self.mc), len, word);
         Ok(Bytevector(v))
     }
 
     pub fn from_slice(&self, bytes: &[u8]) -> Result<Bytevector<'gc>, OutOfMemory> {
         let v = objects::Bytevector::new(self.mc, bytes.len() as u64, words(bytes.len()), 0)?;
-        pack(bytes, |i, w| v.items(self.mc).set(self.mc, i, w));
+        pack(self.mc, v.items(self.mc), bytes);
         Ok(Bytevector(v))
     }
 
     pub fn immutable_from_slice(&self, bytes: &[u8]) -> Result<AnyBytevector<'gc>, OutOfMemory> {
         let v = objects::ImmutableBytevector::new(self.mc, bytes.len() as u64, words(bytes.len()), 0)?;
-        pack(bytes, |i, w| v.items(self.mc).set(self.mc, i, w));
+        pack(self.mc, v.items(self.mc), bytes);
         Ok(AnyBytevector::Immutable(ImmutableBytevector(v)))
     }
 }
@@ -181,17 +181,19 @@ fn low_bytes(size: usize) -> u64 {
     u64::MAX >> (64 - size * 8)
 }
 
-fn pack(bytes: &[u8], mut set: impl FnMut(usize, u64)) {
+/// Packs `bytes` into `words`, 8 to a word.
+fn pack<'gc>(mc: &Mutation<'gc>, words: Slots<'gc, slot::u64>, bytes: &[u8]) {
     for (i, chunk) in bytes.chunks(8).enumerate() {
         let mut word = [0; 8];
         word[..chunk.len()].copy_from_slice(chunk);
-        set(i, u64::from_le_bytes(word));
+        words.set(mc, i, u64::from_le_bytes(word));
     }
 }
 
-/// Zeroes the bytes past `len` in the last word, so equal bytevectors have equal words.
-fn clear_slack(len: usize, mut set: impl FnMut(usize, u64), fill: u64) {
+/// Zeroes the bytes past `len` in the last of `words`, each a `fill`, so equal bytevectors have
+/// equal words.
+fn clear_slack<'gc>(mc: &Mutation<'gc>, words: Slots<'gc, slot::u64>, len: usize, fill: u64) {
     if !len.is_multiple_of(8) {
-        set(len / 8, fill & (u64::MAX >> (64 - len % 8 * 8)));
+        words.set(mc, len / 8, fill & (u64::MAX >> (64 - len % 8 * 8)));
     }
 }

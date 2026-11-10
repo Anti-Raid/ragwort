@@ -5,7 +5,8 @@
 //! 1. `lower`: validates [`Core`] and lowers module variables (`Place::Slot`) to slot
 //!    primitives, producing [`ir::L1`].
 //! 2. `letrec`: Waddell–Sarkar–Dybvig `letrec` / `letrec*` fixing (`L1 -> L2`), replacing
-//!    `Letrec` with `Let`, `Fix` (SCCs of unassigned mutually recursive lambdas), `Seq`, and `Set`.
+//!    `Letrec` with one `Let` of bindings in order, values and `Fix` groups (SCCs of unassigned
+//!    mutually recursive lambdas), so a body's definitions nest no deeper however many there are.
 //! 3. `cp0`: source-level optimizer (`L2 -> L2`) performing copy/constant propagation,
 //!    pure intrinsic constant folding, beta-reduction, local procedure
 //!    inlining, conditional simplification, and dead-binding elimination.
@@ -16,14 +17,18 @@
 //!    position of one place, loops among them, into in-frame joins (`L3::Join` / `L3::Jump`).
 //! 6. `closure`: closure conversion (`L3 -> L4`), resolving lexical references into
 //!    [`ir::VarRef::Local`] vs [`ir::VarRef::Upvalue`] and computing each closure's capture table.
-//! 7. `codegen`: scoped virtual register allocation and bytecode emission (`L4 -> Closure`).
+//! 7. `l5`: each function as a graph of basic blocks in SSA form (`L4 -> L5`). A debug build
+//!    checks the L5 of everything it compiles.
+//! 8. `emit`: register allocation and bytecode emission from L5 (`L5 -> Closure`).
 
 mod assign;
 mod closure;
-mod codegen;
 mod contify;
 mod cp0;
+mod emit;
+mod hash;
 pub mod ir;
+mod l5;
 mod letrec;
 mod lower;
 pub mod module;
@@ -33,6 +38,8 @@ pub mod module;
 mod tests;
 
 use std::fmt;
+
+use ragwort_alloc::Arena;
 
 use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Value};
 use ragwort_vm::objects::Module;
@@ -81,9 +88,9 @@ impl SlotOp {
     }
 }
 
-/// A function parameterization and body parameterized over an IR expression type `E`.
+/// A lambda expression in [`Core`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Func<E> {
+pub struct Lambda<'gc> {
     /// Distinguishes this lambda from every other in the expression being compiled.
     pub id: u32,
     /// How many of the last of `params` a call can leave out, which are then
@@ -92,11 +99,8 @@ pub struct Func<E> {
     pub params: Vec<Var>,
     /// Receives the arguments past `params` as a list, if any.
     pub rest: Option<Var>,
-    pub body: Box<E>,
+    pub body: Box<Core<'gc>>,
 }
-
-/// A lambda expression in [`Core`].
-pub type Lambda<'gc> = Func<Core<'gc>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Core<'gc> {
@@ -125,6 +129,8 @@ pub enum CompileError {
     Rebound(Var),
     /// Two [`Lambda`]s with the same `id`.
     SameLambda(u32),
+    /// A [`Lambda`], by `id`, with more optional parameters than parameters.
+    TooManyOptional(u32),
     /// A [`Core::Intrinsic`] with a number of arguments the [`Prim`] doesn't take.
     Arity(Prim),
     /// More constants than a [`u32`] index can name.
@@ -137,7 +143,7 @@ pub enum CompileError {
     TooManyRegisters,
     /// A call of a host function with more arguments than fit a frame.
     TooManyArguments,
-    /// Expressions nested more than 1024 deep.
+    /// Expressions nested more than 256 deep.
     TooDeep,
     OutOfMemory,
 }
@@ -160,6 +166,7 @@ impl fmt::Display for CompileError {
             Self::Unbound(v) => write!(f, "unbound variable {}", v.0),
             Self::Rebound(v) => write!(f, "variable {} bound more than once", v.0),
             Self::SameLambda(id) => write!(f, "lambda {id} appears more than once"),
+            Self::TooManyOptional(id) => write!(f, "lambda {id} has more optional parameters than parameters"),
             Self::Arity(Prim::Intrinsic(i)) => write!(f, "wrong number of arguments to {}", i.name()),
             Self::Arity(Prim::Read(r)) => write!(f, "wrong number of arguments to {}", r.name()),
             Self::Arity(Prim::Request(r)) => write!(f, "wrong number of arguments to {}", r.name()),
@@ -182,12 +189,21 @@ impl std::error::Error for CompileError {}
 /// [`Closure`](ragwort_vm::objects::Closure) of no arguments, ready to pass to
 /// [`ragwort_vm::Machine::new`].
 pub fn compile<'gc>(mc: &Mutation<'gc>, module: Option<Gc<'gc, Module>>, core: &Core<'gc>) -> Result<Value<'gc>, CompileError> {
-    let (l1, supply) = lower::lower(core)?;
-    let (l2, supply) = letrec::fix_letrec(l1, supply);
-    let (l2, mut supply) = cp0::optimize(mc, l2, supply);
-    let (mut l3, assigned) = assign::lower(l2);
-    contify::contify(&mut l3);
-    assign::convert(&mut l3, &assigned, &mut supply);
-    let l4 = closure::closure_convert(&l3);
-    codegen::emit(mc, module, &l4)
+    let arena = Arena::new();
+    let l4 = to_l4(mc, &arena, core)?;
+    let l5 = l5::lower(&arena, &l4)?;
+    #[cfg(debug_assertions)]
+    l5::check(&l5);
+    emit::emit(mc, module, &l5)
+}
+
+/// `core` through the passes to closure conversion.
+fn to_l4<'a, 'gc>(mc: &Mutation<'gc>, arena: &'a Arena, core: &Core<'gc>) -> Result<ir::L4<'a, 'gc>, CompileError> {
+    let (l1, supply) = lower::lower(arena, core)?;
+    let (l2, supply) = letrec::fix_letrec(arena, l1, supply);
+    let (l2, mut supply) = cp0::optimize(mc, arena, l2, supply);
+    let (mut l3, assigned) = assign::lower(arena, l2);
+    contify::contify(arena, &mut l3);
+    assign::convert(arena, &mut l3, &assigned, &mut supply);
+    Ok(closure::closure_convert(arena, &l3))
 }

@@ -1,0 +1,15 @@
+[package]
+name = "ragwort-alloc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bumpalo = { version = "3.20.3", optional = true, features = ["boxed", "collections"] }
+
+[features]
+# Puts boxes and vectors in a bump arena, freed all at once when it goes; without it they're the
+# standard ones.
+bumpalo = ["dep:bumpalo"]
+
+[lints]
+workspace = true

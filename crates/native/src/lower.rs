@@ -477,11 +477,13 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
     /// A body's expressions, in order, as one.
     fn body(&mut self, builder: &mut ModuleBuilder<'gc>, nodes: &[Syntax<'gc>]) -> Result<Core<'gc>, LowerError> {
         let mut cores = self.exprs(builder, nodes)?;
-        let mut body = cores.pop().expect("bodies aren't empty");
-        while let Some(core) = cores.pop() {
-            body = Core::Let(vec![(self.fresh(), core)], Box::new(body));
+        let body = cores.pop().expect("bodies aren't empty");
+        if cores.is_empty() {
+            return Ok(body);
         }
-        Ok(body)
+        // One `let` of what the forms before the last return, however many there are.
+        let binds = cores.into_iter().map(|core| (self.fresh(), core)).collect();
+        Ok(Core::Let(binds, Box::new(body)))
     }
 
     fn exprs(&mut self, builder: &mut ModuleBuilder<'gc>, nodes: &[Syntax<'gc>]) -> Result<Vec<Core<'gc>>, LowerError> {
