@@ -7,7 +7,8 @@ use std::vec::Vec;
 use ragwort_alloc::{Arena as Trees, CollectIn};
 
 use super::*;
-use crate::{Core, Lambda, Place, to_l4};
+use crate::ir::l4::{self, Closure};
+use crate::{Core, Lambda, Place, to_l5};
 
 fn q<'gc>(n: i64) -> Core<'gc> {
     Core::Quote(Value::fixnum(n).unwrap())
@@ -64,7 +65,7 @@ fn l5_of(build: impl for<'gc> FnOnce(&Mutation<'gc>) -> Core<'gc>) -> String {
     let mut arena = Arena::new(1 << 24, 0);
     arena.mutate(|mc| {
         let trees = ragwort_alloc::Arena::new();
-        let f = lower(&trees, &to_l4(mc, &trees, &build(mc)).unwrap()).unwrap();
+        let f = to_l5(mc, &trees, &build(mc)).unwrap();
         verify(&f).unwrap_or_else(|e| panic!("{e}\n{f}"));
         f.to_string()
     })
@@ -259,8 +260,8 @@ fn the_verifier_finds_what_is_malformed() {
     let vals = |vs: &[Val]| vs.iter().copied().collect_in(a);
     let one = || Inst::Const(Val(1), Value::fixnum(1).unwrap());
     let ok = function(a, 2, vec![block(a, &[], vec![one()], End::Return(Val(1)))]);
-    assert_eq!(verify(&ok), Ok(()));
-    let check = |f: Function<'_, '_>| verify(&f).unwrap_err();
+    assert_eq!(verify_function(&ok, &[]), Ok(()));
+    let check = |f: Function<'_, '_>| verify_function(&f, &[]).unwrap_err();
     assert_eq!(check(function(a, 2, vec![block(a, &[], vec![], End::Return(Val(1)))])), "v1, used in b0, isn't defined");
     assert_eq!(check(function(a, 2, vec![block(a, &[], vec![one(), one()], End::Return(Val(1)))])), "v1 is defined twice");
     assert_eq!(check(function(a, 1, vec![block(a, &[], vec![one()], End::Return(Val(0)))])), "v1 is past the function's values");
@@ -276,10 +277,10 @@ fn the_verifier_finds_what_is_malformed() {
             block(a, &[], vec![], End::Return(Val(returned))),
         ])
     };
-    assert_eq!(verify(&diamond(1)), Ok(()));
+    assert_eq!(verify_function(&diamond(1), &[]), Ok(()));
     assert_eq!(check(diamond(2)), "v2, used in b3, isn't defined on every way there");
     let jumps = |args: Vec<Val>| function(a, 3, vec![block(a, &[], vec![one()], End::Jump(Block(1), vals(&args))), block(a, &[2], vec![], End::Return(Val(2)))]);
-    assert_eq!(verify(&jumps(vec![Val(1)])), Ok(()));
+    assert_eq!(verify_function(&jumps(vec![Val(1)]), &[]), Ok(()));
     assert_eq!(check(jumps(vec![])), "b0 jumps to b1 with 0 values, not 1");
     let branch = function(a, 3, vec![
         block(a, &[], vec![one()], End::Branch { test: Val(1), then: Block(1), other: Block(1) }),
@@ -292,4 +293,68 @@ fn the_verifier_finds_what_is_malformed() {
     assert_eq!(check(entry), "b0 goes to the entry");
     let upvalue = function(a, 2, vec![block(a, &[], vec![Inst::Upvalue(Val(1), 0)], End::Return(Val(1)))]);
     assert_eq!(check(upvalue), "b0 loads upvalue 0 of 0");
+}
+
+fn quote<'id, 'gc>(t: &mut L4<'id, 'gc>, v: Value<'gc>) -> Id<'id> {
+    t.add(Node::Quote(v))
+}
+
+/// `(if #f (lambda () (lambda () ... 0)) (+ (if #t (+ ... 1) 0) 1))`, far deeper than the front
+/// end makes, which returns `ADDS`.
+fn deep<'id, 'gc>(t: &mut L4<'id, 'gc>) -> Id<'id> {
+    let mut adds = quote(t, Value::fixnum(0).unwrap());
+    for i in 0..ADDS {
+        if i % 10 == 0 {
+            let (test, other) = (quote(t, Value::TRUE), quote(t, Value::fixnum(0).unwrap()));
+            adds = t.add(Node::If(test, adds, other));
+        }
+        let one = quote(t, Value::fixnum(1).unwrap());
+        let args = t.list([adds, one]);
+        adds = t.add(Node::Intrinsic(Prim::Intrinsic(Add), args));
+    }
+    let mut lambdas = quote(t, Value::fixnum(0).unwrap());
+    for id in 0..LAMBDAS {
+        let (params, captures) = (t.list([]), t.list([]));
+        let fun = t.closure(Closure { id, optional: 0, params, rest: None, captures, body: lambdas });
+        lambdas = t.add(Node::Lambda(fun));
+    }
+    let test = quote(t, Value::FALSE);
+    t.add(Node::If(test, lambdas, adds))
+}
+
+const ADDS: u32 = 100_000;
+const LAMBDAS: u32 = 10_000;
+
+/// Deep code is checked, lowered and emitted, and its trees dropped, on a small stack, and runs.
+#[test]
+fn deep_code_needs_no_stack() {
+    let compile = |run: bool| {
+        let mut arena = Arena::new(1 << 26, 0);
+        arena.mutate(|mc| {
+            let trees = Trees::new();
+            l4::scope(|mut t| {
+                let root = deep(&mut t);
+                t.verify(root).unwrap();
+                let program = lower(&trees, &t, root).unwrap();
+                verify(&program).unwrap();
+                assert_eq!(program.functions.len(), LAMBDAS as usize + 1);
+                let thunk = crate::emit::emit(mc, None, &program).unwrap();
+                if !run {
+                    return;
+                }
+                let mut machine = ragwort_vm::Machine::new(mc, ragwort_vm::MIN_SEGMENT, thunk, &[]).unwrap();
+                let value = loop {
+                    match machine.run(mc).unwrap() {
+                        ragwort_vm::Outcome::Paused => {}
+                        ragwort_vm::Outcome::Done(value) => break value,
+                        _ => panic!("the code only adds"),
+                    }
+                };
+                assert_eq!(value, Value::fixnum(i64::from(ADDS)).unwrap());
+            });
+        });
+    };
+    std::thread::Builder::new().stack_size(256 << 10).spawn(move || compile(false)).expect("spawned").join().expect("compiled");
+    // The machine takes more than the small stack in a debug build, whatever it runs.
+    compile(true);
 }

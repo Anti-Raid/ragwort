@@ -1,74 +1,111 @@
 //! Pass 1 (`Core -> L1`): validates the input AST and lowers module variables (`Place::Slot`)
 //! into slot primitives.
 
-use ragwort_alloc::{Arena, CollectIn, Vec, vec_in};
-
 use crate::hash::HashSet;
-use crate::ir::{Func, L1, Supply};
-use crate::{CompileError, Core, Lambda, Place, Prim, SlotOp, Var};
+use crate::ir::Supply;
+use crate::ir::l1::{Function, Id, L1, Node};
+use crate::{CompileError, Core, Place, Prim, SlotOp, Var};
 
-/// How deeply expressions can nest before compiling them would take too much of the native stack.
-pub(crate) const MAX_DEPTH: usize = 256;
-
-pub(crate) fn lower<'a, 'gc>(arena: &'a Arena, core: &Core<'gc>) -> Result<(L1<'a, 'gc>, Supply), CompileError> {
-    let mut pass = Lower {
-        arena,
-        bound: HashSet::default(),
-        scope: HashSet::default(),
-        lambdas: HashSet::default(),
-        max_var: 0,
-        max_lambda: 0,
-        depth: 0,
-    };
-    let l1 = pass.expr(core)?;
+/// `core` into `tree`, its root there, and what makes variables and lambdas fresh after it.
+///
+/// It's a loop over a stack of tasks, the lowered nodes on a stack of their own, so it takes no
+/// more of the machine's stack however deeply `core` nests.
+pub(crate) fn lower<'id, 'gc>(tree: &mut L1<'id, 'gc>, core: &Core<'gc>) -> Result<(Id<'id>, Supply), CompileError> {
+    let mut pass = Lower { tree, bound: HashSet::default(), scope: HashSet::default(), lambdas: HashSet::default(), max_var: 0, max_lambda: 0 };
+    let mut vals = Vec::new();
+    let mut todo = vec![Task::Expr(core)];
+    let mut then = Vec::new();
+    while let Some(task) = todo.pop() {
+        match task {
+            Task::Expr(core) => {
+                if let Some(leaf) = pass.enter(core, &mut then)? {
+                    vals.push(pass.tree.add(leaf));
+                }
+                todo.extend(then.drain(..).rev());
+            }
+            Task::Scope(binds) => pass.scope.extend(binds.iter().map(|&(v, _)| v)),
+            Task::Make(core) => {
+                let node = pass.make(core, &mut vals);
+                vals.push(pass.tree.add(node));
+            }
+        }
+    }
     let supply = Supply { next_var: pass.max_var, next_lambda: pass.max_lambda };
-    Ok((l1, supply))
+    Ok((vals.pop().expect("the root's lowered"), supply))
 }
 
-struct Lower<'a> {
-    arena: &'a Arena,
+/// A form to lower, or what to make of what its parts lowered to.
+enum Task<'c, 'gc> {
+    Expr(&'c Core<'gc>),
+    /// A `let`'s variables, in scope in its body.
+    Scope(&'c [(Var, Core<'gc>)]),
+    Make(&'c Core<'gc>),
+}
+
+struct Lower<'t, 'id, 'gc> {
+    tree: &'t mut L1<'id, 'gc>,
     bound: HashSet<Var>,
     scope: HashSet<Var>,
     lambdas: HashSet<u32>,
     max_var: u32,
     max_lambda: u32,
-    depth: usize,
 }
 
-impl<'a> Lower<'a> {
-    fn expr<'gc>(&mut self, core: &Core<'gc>) -> Result<L1<'a, 'gc>, CompileError> {
-        self.depth += 1;
-        if self.depth > MAX_DEPTH {
-            return Err(CompileError::TooDeep);
-        }
-        let out = match core {
-            Core::Quote(v) => L1::Quote(*v),
+impl<'id, 'gc> Lower<'_, 'id, 'gc> {
+    /// Checks `core` as it's reached, and lowers it if it has no parts; else pushes the tasks
+    /// that lower them and then it onto `then`, in order.
+    fn enter<'c>(&mut self, core: &'c Core<'gc>, then: &mut Vec<Task<'c, 'gc>>) -> Result<Option<Node<'id, 'gc>>, CompileError> {
+        let all = |args: &'c [Core<'gc>], then: &mut Vec<Task<'c, 'gc>>| then.extend(args.iter().map(Task::Expr));
+        match core {
+            Core::Quote(v) => return Ok(Some(Node::Quote(*v))),
             Core::Ref(Place::Local(v)) => {
                 self.check_bound(*v)?;
-                L1::Ref(*v)
+                return Ok(Some(Node::Ref(*v)));
             }
             Core::Ref(Place::Slot { slot, checked }) => {
-                L1::Intrinsic(Prim::Slot(if *checked { SlotOp::LoadChecked } else { SlotOp::Load }, *slot), self.arena.vec())
+                let op = if *checked { SlotOp::LoadChecked } else { SlotOp::Load };
+                return Ok(Some(Node::Intrinsic(Prim::Slot(op, *slot), self.tree.list([]))));
             }
-            Core::If(test, then, other) => {
-                let (test, then) = (self.expr(test)?, self.expr(then)?);
-                L1::If(self.arena.boxed(test), self.arena.boxed(then), self.arena.boxed(self.expr(other)?))
-            },
-            Core::Let(binds, body) => self.let_form(binds, body)?,
-            Core::Letrec(binds, body) => self.letrec_form(binds, body)?,
-            Core::Set(Place::Local(v), value) => {
-                self.check_bound(*v)?;
-                L1::Set(*v, self.arena.boxed(self.expr(value)?))
+            Core::If(test, t, other) => then.extend([Task::Expr(test), Task::Expr(t), Task::Expr(other)]),
+            Core::Let(binds, body) => {
+                for &(v, _) in binds {
+                    self.reserve_var(v)?;
+                }
+                then.extend(binds.iter().map(|(_, init)| Task::Expr(init)));
+                then.extend([Task::Scope(binds), Task::Expr(body)]);
             }
-            Core::Set(Place::Slot { slot, checked }, value) => {
-                let op = if *checked { SlotOp::StoreChecked } else { SlotOp::Store };
-                L1::Intrinsic(Prim::Slot(op, *slot), vec_in![self.arena; self.expr(value)?])
+            Core::Letrec(binds, body) => {
+                for &(v, _) in binds {
+                    self.reserve_var(v)?;
+                    self.scope.insert(v);
+                }
+                then.extend(binds.iter().map(|(_, init)| Task::Expr(init)));
+                then.push(Task::Expr(body));
+            }
+            Core::Set(place, value) => {
+                if let Place::Local(v) = place {
+                    self.check_bound(*v)?;
+                }
+                then.push(Task::Expr(value));
             }
             Core::App(f, args) => {
-                let f = self.expr(f)?;
-                L1::App(self.arena.boxed(f), self.exprs(args)?)
+                then.push(Task::Expr(f));
+                all(args, then);
             }
-            Core::Lambda(f) => self.lambda_form(f)?,
+            Core::Lambda(f) => {
+                if !self.lambdas.insert(f.id) {
+                    return Err(CompileError::SameLambda(f.id));
+                }
+                if f.optional as usize > f.params.len() {
+                    return Err(CompileError::TooManyOptional(f.id));
+                }
+                self.max_lambda = self.max_lambda.max(f.id.saturating_add(1));
+                for &v in f.params.iter().chain(&f.rest) {
+                    self.reserve_var(v)?;
+                    self.scope.insert(v);
+                }
+                then.push(Task::Expr(&f.body));
+            }
             Core::Intrinsic(prim, args) => {
                 let takes = match *prim {
                     Prim::Intrinsic(i) => i.arity().is_none_or(|n| usize::from(n) == args.len()),
@@ -80,7 +117,7 @@ impl<'a> Lower<'a> {
                 if !takes {
                     return Err(CompileError::Arity(*prim));
                 }
-                L1::Intrinsic(*prim, self.exprs(args)?)
+                all(args, then);
             }
             Core::ApplyIntrinsic(prim, args) => {
                 // A read takes a fixed number of arguments, so its prelude wrapper spreads them, and
@@ -88,73 +125,53 @@ impl<'a> Lower<'a> {
                 if args.is_empty() || matches!(prim, Prim::Read(_) | Prim::Host(_) | Prim::Slot(..)) {
                     return Err(CompileError::Arity(*prim));
                 }
-                L1::ApplyIntrinsic(*prim, self.exprs(args)?)
+                all(args, then);
             }
-        };
-        self.depth -= 1;
-        Ok(out)
+        }
+        then.push(Task::Make(core));
+        Ok(None)
     }
 
-    #[inline(never)]
-    fn let_form<'gc>(&mut self, binds: &[(Var, Core<'gc>)], body: &Core<'gc>) -> Result<L1<'a, 'gc>, CompileError> {
-        for &(v, _) in binds {
-            self.reserve_var(v)?;
+    /// `core`'s node, of its parts last lowered, which leave `vals`; what it bound leaves scope.
+    fn make(&mut self, core: &Core<'gc>, vals: &mut Vec<Id<'id>>) -> Node<'id, 'gc> {
+        let mut last = |n: usize| vals.split_off(vals.len() - n);
+        match core {
+            Core::If(..) => {
+                let [test, t, other] = last(3)[..] else { unreachable!("an if has three parts") };
+                Node::If(test, t, other)
+            }
+            Core::Let(binds, _) | Core::Letrec(binds, _) => {
+                let mut ids = last(binds.len() + 1);
+                let body = ids.pop().expect("a body");
+                for &(v, _) in binds {
+                    self.scope.remove(&v);
+                }
+                let binds = self.tree.list(binds.iter().map(|&(v, _)| v).zip(ids));
+                if matches!(core, Core::Let(..)) { Node::Let(binds, body) } else { Node::Letrec(binds, body) }
+            }
+            Core::Set(Place::Local(v), _) => Node::Set(*v, last(1)[0]),
+            Core::Set(Place::Slot { slot, checked }, _) => {
+                let op = if *checked { SlotOp::StoreChecked } else { SlotOp::Store };
+                let value = last(1);
+                Node::Intrinsic(Prim::Slot(op, *slot), self.tree.list(value))
+            }
+            Core::App(_, args) => {
+                let mut ids = last(args.len() + 1);
+                let args = self.tree.list(ids.drain(1..));
+                Node::App(ids[0], args)
+            }
+            Core::Lambda(f) => {
+                let body = last(1)[0];
+                for &v in f.params.iter().chain(&f.rest) {
+                    self.scope.remove(&v);
+                }
+                let params = self.tree.list(f.params.iter().copied());
+                Node::Lambda(self.tree.function(Function { id: f.id, params, optional: f.optional, rest: f.rest, body }))
+            }
+            Core::Intrinsic(prim, args) => Node::Intrinsic(*prim, self.tree.list(last(args.len()))),
+            Core::ApplyIntrinsic(prim, args) => Node::ApplyIntrinsic(*prim, self.tree.list(last(args.len()))),
+            Core::Quote(_) | Core::Ref(_) => unreachable!("leaves are lowered as they're reached"),
         }
-        let mut lowered = Vec::with_capacity_in(binds.len(), self.arena);
-        for &(v, ref init) in binds {
-            lowered.push((v, self.expr(init)?));
-        }
-        for &(v, _) in &lowered {
-            self.scope.insert(v);
-        }
-        let body = self.expr(body)?;
-        for &(v, _) in &lowered {
-            self.scope.remove(&v);
-        }
-        Ok(L1::Let(lowered, self.arena.boxed(body)))
-    }
-
-    #[inline(never)]
-    fn letrec_form<'gc>(&mut self, binds: &[(Var, Core<'gc>)], body: &Core<'gc>) -> Result<L1<'a, 'gc>, CompileError> {
-        for &(v, _) in binds {
-            self.reserve_var(v)?;
-            self.scope.insert(v);
-        }
-        let mut lowered = Vec::with_capacity_in(binds.len(), self.arena);
-        for &(v, ref init) in binds {
-            lowered.push((v, self.expr(init)?));
-        }
-        let body = self.expr(body)?;
-        for &(v, _) in &lowered {
-            self.scope.remove(&v);
-        }
-        Ok(L1::Letrec(lowered, self.arena.boxed(body)))
-    }
-
-    #[inline(never)]
-    fn lambda_form<'gc>(&mut self, f: &Lambda<'gc>) -> Result<L1<'a, 'gc>, CompileError> {
-        if !self.lambdas.insert(f.id) {
-            return Err(CompileError::SameLambda(f.id));
-        }
-        if f.optional as usize > f.params.len() {
-            return Err(CompileError::TooManyOptional(f.id));
-        }
-        self.max_lambda = self.max_lambda.max(f.id.saturating_add(1));
-        for &v in f.params.iter().chain(&f.rest) {
-            self.reserve_var(v)?;
-            self.scope.insert(v);
-        }
-        let body = self.expr(&f.body)?;
-        for &v in f.params.iter().chain(&f.rest) {
-            self.scope.remove(&v);
-        }
-        let params = f.params.iter().copied().collect_in(self.arena);
-        Ok(L1::Lambda(Func { id: f.id, params, optional: f.optional, rest: f.rest, body: self.arena.boxed(body) }))
-    }
-
-    fn exprs<'gc>(&mut self, exprs: &[Core<'gc>]) -> Result<Vec<'a, L1<'a, 'gc>>, CompileError> {
-        let arena = self.arena;
-        exprs.iter().map(|e| self.expr(e)).try_collect_in(arena)
     }
 
     fn reserve_var(&mut self, v: Var) -> Result<(), CompileError> {

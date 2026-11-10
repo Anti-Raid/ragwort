@@ -703,6 +703,14 @@ fn long_chains_of_definitions_compile_without_deep_recursion() {
         letrec(binds, app(var(0), vec![q(0)]))
     });
     assert_eq!(chain, Ok(i64::from(n)));
+    // Each is called once, so all of it's inlined, however deep that nests, and folds to `n`.
+    let mut arena = Arena::new(1 << 26, 0);
+    arena.mutate(|mc| {
+        let mut binds: Vec<_> = (0..n).map(|i| (i, lambda(&[x(i)], None, add(q(1), app(var(i + 1), vec![var(x(i))]))))).collect();
+        binds.push((n, lambda(&[x(n)], None, var(x(n)))));
+        let ops = all_ops(mc, compile(mc, None, &letrec(binds, app(var(0), vec![q(0)]))).unwrap());
+        assert!(matches!(ops[..], [Op::LoadConst { .. }, Op::Return { .. }]), "{} ops", ops.len());
+    });
     // (letrec ((a0 0) (g0 (lambda (k) (if (eq? k 0) (+ a0 1) (g0 (+ k -1))))) (a1 (g0 1)) (g1 ...)
     // ... (an (g(n-1) 1))) an): values and loops defined in turn, each loop a join.
     let (a, g, k) = (|i: u32| 3 * i, |i: u32| 3 * i + 1, |i: u32| 3 * i + 2);
@@ -732,6 +740,32 @@ fn deeply_nested_loops_compile_quickly() {
         let_(vec![(0, q(0))], inner)
     });
     assert_eq!(x, Ok(1));
+}
+
+#[test]
+fn joins_go_where_they_are_called_however_deep() {
+    // (let ((x 1)) (set! x 2) (let ((k (lambda (a) (+ x (+ x ... (+ x a)))))) (if (eq? x -1) -1
+    // (if (eq? x -2) -2 ... (if (eq? x 0) (k 1) (k 2)))))): the ifs and k's code each nearly as
+    // deep as the front end takes, so k's code is deeper still where it goes, as a join.
+    let (ifs, height) = (200, 150);
+    let mut arena = Arena::new(1 << 24, 0);
+    arena.mutate(|mc| {
+        let mut code = var(2);
+        for _ in 0..height {
+            code = add(var(0), code);
+        }
+        let mut body = when(eq(var(0), q(0)), app(var(1), vec![q(1)]), app(var(1), vec![q(2)]));
+        for i in 1..=ifs {
+            body = when(eq(var(0), q(-i)), q(-i), body);
+        }
+        let expr = let_(vec![(0, q(1))], seq(3, set(0, q(2)), let_(vec![(1, lambda(&[2], None, code))], body)));
+        let thunk = compile(mc, None, &expr).unwrap();
+        let ops = all_ops(mc, thunk);
+        assert!(!ops.iter().any(|op| matches!(op, Op::NewClosure { .. })) && !has_box_op(&ops), "{ops:?}");
+        let mut machine = Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap();
+        let Outcome::Done(value) = machine.run(mc).unwrap() else { panic!("the code only adds") };
+        assert_eq!(value.as_fixnum(), Some(2 * height + 2));
+    });
 }
 
 #[test]

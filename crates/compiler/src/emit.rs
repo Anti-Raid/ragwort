@@ -15,7 +15,7 @@ use ragwort_vm::objects::{self, Bytecode, BytecodeFields, Closure, ModuleFields}
 use ragwort_vm::{Capture, HostDef, Intrinsic, Op, Request};
 
 use crate::hash::HashMap;
-use crate::l5::{self, Block, Captured, Code, End, Function, Inst, Val};
+use crate::l5::{self, Block, Captured, Code, End, Function, Inst, Program, Val};
 use crate::{CompileError, Prim, SlotOp};
 
 /// How many scratch registers there are, the last of a frame's, so how many values a call made
@@ -25,9 +25,15 @@ const STAGE: usize = WINDOW / 4;
 const LIMIT: u8 = (WINDOW - STAGE) as u8;
 const SCRATCH: u8 = LIMIT;
 
-pub(crate) fn emit<'gc>(mc: &Mutation<'gc>, owner: Option<Gc<'gc, objects::Module>>, f: &Function<'_, 'gc>) -> Result<Value<'gc>, CompileError> {
-    let mut module = Module { mc, owner, constants: Vec::new(), index: HashMap::default(), codes: Vec::new() };
-    let code = module.function(f, &[])?;
+pub(crate) fn emit<'gc>(mc: &Mutation<'gc>, owner: Option<Gc<'gc, objects::Module>>, program: &Program<'_, 'gc>) -> Result<Value<'gc>, CompileError> {
+    let mut module = Module { mc, owner, constants: Vec::new(), index: HashMap::default(), codes: Vec::new(), pending: Vec::new() };
+    let code = module.function(program.root(), &[])?;
+    while let Some(Pending { slot, function, captures, closure }) = module.pending.pop() {
+        let bytecode = module.function(&program.functions[function as usize], &captures)?;
+        let value = if closure { Value::object(mc, Closure::new(mc, Some(bytecode), 0, Value::VOID)?) } else { Value::object(mc, bytecode) };
+        module.constants[slot as usize] = value;
+        module.index.insert(value.to_bits(), slot);
+    }
     let table = Vectors::new(mc).immutable_from_slice(&module.constants)?.value(mc);
     for &c in &module.codes {
         c.set_constants(mc, table);
@@ -323,6 +329,17 @@ impl Colouring<'_, '_> {
     }
 }
 
+/// A closure's code, function `function` of the program, to be emitted after the function that
+/// makes the closure, into constant `slot`: its bytecode, or, if `closure`, a closure of it that
+/// captures nothing.
+struct Pending {
+    slot: u32,
+    function: u32,
+    captures: Vec<Capture>,
+    closure: bool,
+}
+
+/// The constants and bytecode the code compiled makes.
 struct Module<'a, 'gc> {
     mc: &'a Mutation<'gc>,
     /// The module the code is from, whose variables and host functions it uses.
@@ -330,6 +347,8 @@ struct Module<'a, 'gc> {
     constants: Vec<Value<'gc>>,
     index: HashMap<u64, u32>,
     codes: Vec<Gc<'gc, Bytecode>>,
+    /// The codes of closures of the functions emitted, not yet emitted, the next last.
+    pending: Vec<Pending>,
 }
 
 impl<'a, 'gc> Module<'a, 'gc> {
@@ -350,29 +369,30 @@ impl<'a, 'gc> Module<'a, 'gc> {
         u32::try_from(i).map_err(|_| CompileError::TooManyConstants)
     }
 
-    /// `codes`' bytecodes as constants one after another, as `NewClosure` takes them.
-    fn contiguous(&mut self, codes: &[Gc<'gc, Bytecode>]) -> Result<u32, CompileError> {
-        let first = u32::try_from(self.constants.len()).map_err(|_| CompileError::TooManyConstants)?;
-        for &code in codes {
-            let i = u32::try_from(self.constants.len()).map_err(|_| CompileError::TooManyConstants)?;
-            let value = Value::object(self.mc, code);
-            self.constants.push(value);
-            self.index.insert(value.to_bits(), i);
-        }
-        Ok(first)
+    /// A constant for `function`'s code, or a closure of it if `closure`, which is emitted later.
+    /// Those of one call after another are one after another, as `NewClosure` takes them.
+    fn defer(&mut self, function: u32, captures: Vec<Capture>, closure: bool) -> Result<u32, CompileError> {
+        let slot = u32::try_from(self.constants.len()).map_err(|_| CompileError::TooManyConstants)?;
+        self.constants.push(Value::VOID);
+        self.pending.push(Pending { slot, function, captures, closure });
+        Ok(slot)
     }
 
     /// `f`'s bytecode, with 1- and 2-argument intrinsic tests fused into their branches unless one
     /// lands past an `i16` offset.
     fn function(&mut self, f: &Function<'_, 'gc>, captures: &[Capture]) -> Result<Gc<'gc, Bytecode>, CompileError> {
-        let (constants, codes) = (self.constants.len(), self.codes.len());
+        let (constants, codes, pending) = (self.constants.len(), self.codes.len(), self.pending.len());
         if let Some(code) = self.attempt(f, captures, true)? {
             return Ok(code);
         }
         for constant in self.constants.drain(constants..) {
-            self.index.remove(&constant.to_bits());
+            let bits = constant.to_bits();
+            if self.index.get(&bits).is_some_and(|&i| i as usize >= constants) {
+                self.index.remove(&bits);
+            }
         }
         self.codes.truncate(codes);
+        self.pending.truncate(pending);
         Ok(self.attempt(f, captures, false)?.expect("without fused branches every jump has an i32 offset"))
     }
 
@@ -940,14 +960,12 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
     }
 
     #[inline(never)]
-    fn closures(&mut self, dsts: &[Val], codes: &[Code<'_, 'gc>]) -> Result<(), CompileError> {
-        let mc = self.module.mc;
+    fn closures(&mut self, dsts: &[Val], codes: &[Code<'_>]) -> Result<(), CompileError> {
         // Code that captures nothing is a constant closure.
         if codes.iter().all(|code| code.captures.is_empty()) {
             for (&dst, code) in dsts.iter().zip(codes) {
                 if self.used(dst) {
-                    let bytecode = self.module.function(&code.function, &[])?;
-                    let index = self.module.constant(Value::object(mc, Closure::new(mc, Some(bytecode), 0, Value::VOID)?))?;
+                    let index = self.module.defer(code.function, Vec::new(), true)?;
                     self.write(dst, |dst| Op::LoadConst { dst, index });
                 }
             }
@@ -955,8 +973,7 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         }
         if let (&[dst], [code]) = (dsts, codes) {
             let captures = self.captures(&code.captures, &[]);
-            let bytecode = self.module.function(&code.function, &captures)?;
-            let index = self.module.constant(Value::object(mc, bytecode))?;
+            let index = self.module.defer(code.function, captures, false)?;
             self.write(dst, |dst| Op::NewClosure { dst, count: 1, code: index });
             return Ok(());
         }
@@ -965,12 +982,13 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
             return Err(CompileError::TooManyRegisters);
         }
         let peers: Vec<(Val, u8)> = dsts.iter().copied().zip(SCRATCH..).collect();
-        let mut bytecodes = Vec::with_capacity(codes.len());
-        for code in codes {
-            let captures = self.captures(&code.captures, &peers);
-            bytecodes.push(self.module.function(&code.function, &captures)?);
+        let all: Vec<Vec<Capture>> = codes.iter().map(|code| self.captures(&code.captures, &peers)).collect();
+        let mut first = None;
+        for (code, captures) in codes.iter().zip(all) {
+            let slot = self.module.defer(code.function, captures, false)?;
+            first.get_or_insert(slot);
         }
-        let code = self.module.contiguous(&bytecodes)?;
+        let code = first.expect("a group has closures");
         self.ops.push(Op::NewClosure { dst: SCRATCH, count: codes.len() as u8, code });
         for (dst, r) in peers {
             if self.used(dst) {

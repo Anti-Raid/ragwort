@@ -545,6 +545,14 @@ impl Intrinsic {
         )
     }
 
+    /// Whether a direct call with valid arity has no side effects and reads nothing that can
+    /// change, so calls of it and others like it can be made in any order: one that can fault,
+    /// as `car` of a non-pair does, only changes which of them faults first.
+    pub const fn is_reorderable(self) -> bool {
+        use Intrinsic::*;
+        self.is_discardable() || matches!(self, Add | Sub | Mul | Car | Cdr | Caar | Cadr | Cdar | Cddr | Unbox)
+    }
+
     /// Whether `self` is a 1-argument type predicate.
     pub const fn is_type_predicate(self) -> bool {
         use Intrinsic::*;

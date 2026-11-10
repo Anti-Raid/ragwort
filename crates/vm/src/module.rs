@@ -76,6 +76,14 @@ pub enum Purity {
     Discardable,
 }
 
+impl Purity {
+    /// Whether calls of it and others like it can be made in any order: one that can fault only
+    /// changes which of them faults first.
+    pub const fn is_reorderable(self) -> bool {
+        !matches!(self, Purity::Impure)
+    }
+}
+
 /// What a host function's call returns, or does instead.
 pub enum Reply<'gc> {
     Value(Value<'gc>),

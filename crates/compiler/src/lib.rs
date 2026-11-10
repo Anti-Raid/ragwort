@@ -3,7 +3,7 @@
 //! Each pass either simplifies within an intermediate representation or reduces the grammar by
 //! eliminating forms:
 //! 1. `lower`: validates [`Core`] and lowers module variables (`Place::Slot`) to slot
-//!    primitives, producing [`ir::L1`].
+//!    primitives, producing `L1`.
 //! 2. `letrec`: Waddell–Sarkar–Dybvig `letrec` / `letrec*` fixing (`L1 -> L2`), replacing
 //!    `Letrec` with one `Let` of bindings in order, values and `Fix` groups (SCCs of unassigned
 //!    mutually recursive lambdas), so a body's definitions nest no deeper however many there are.
@@ -11,7 +11,7 @@
 //!    pure intrinsic constant folding, beta-reduction, local procedure
 //!    inlining, conditional simplification, and dead-binding elimination.
 //! 4. `assign`: assignment conversion (`L2 -> L3`), rewriting only mutated (`Set`) variables into
-//!    explicit `MakeBox` / `Unbox` / `SetBox` intrinsics so all variables in [`ir::L3`] are
+//!    explicit `MakeBox` / `Unbox` / `SetBox` intrinsics so all variables in `L3` are
 //!    immutable.
 //! 5. `contify`: contification (`L3 -> L3`), turning local functions only ever called in tail
 //!    position of one place, loops among them, into in-frame joins (`L3::Join` / `L3::Jump`).
@@ -20,6 +20,10 @@
 //! 7. `l5`: each function as a graph of basic blocks in SSA form (`L4 -> L5`). A debug build
 //!    checks the L5 of everything it compiles.
 //! 8. `emit`: register allocation and bytecode emission from L5 (`L5 -> Closure`).
+//!
+//! Each IR is a table of nodes, and every pass after `lower` is a loop over a stack of its own,
+//! so how deeply code nests, or inlining makes it nest, takes no more of the machine's stack.
+//! A debug build checks each table a pass makes.
 
 mod assign;
 mod closure;
@@ -121,6 +125,48 @@ pub enum Core<'gc> {
     ApplyIntrinsic(Prim, Vec<Core<'gc>>),
 }
 
+impl Core<'_> {
+    fn is_leaf(&self) -> bool {
+        matches!(self, Core::Quote(_) | Core::Ref(_))
+    }
+
+    /// Moves the parts of `self` that have parts of their own onto `out`, leaving leaves.
+    fn take_parts(&mut self, out: &mut std::vec::Vec<Self>) {
+        let mut take = |part: &mut Self| {
+            if !part.is_leaf() {
+                out.push(std::mem::replace(part, Core::Quote(Value::VOID)));
+            }
+        };
+        match self {
+            Core::Quote(_) | Core::Ref(_) => {}
+            Core::If(a, b, c) => [a, b, c].into_iter().for_each(|part| take(part)),
+            Core::Let(binds, body) | Core::Letrec(binds, body) => {
+                binds.iter_mut().for_each(|(_, init)| take(init));
+                take(body);
+            }
+            Core::Set(_, value) => take(value),
+            Core::App(f, args) => {
+                take(f);
+                args.iter_mut().for_each(take);
+            }
+            Core::Lambda(f) => take(&mut f.body),
+            Core::Intrinsic(_, args) | Core::ApplyIntrinsic(_, args) => args.iter_mut().for_each(take),
+        }
+    }
+}
+
+/// Drops the parts of a form from a stack of its own, so dropping it takes no more of the
+/// machine's stack however deeply it nests.
+impl Drop for Core<'_> {
+    fn drop(&mut self) {
+        let mut parts = std::vec::Vec::new();
+        self.take_parts(&mut parts);
+        while let Some(mut part) = parts.pop() {
+            part.take_parts(&mut parts);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompileError {
     /// A [`Var`] used where no enclosing binding bound it.
@@ -143,8 +189,6 @@ pub enum CompileError {
     TooManyRegisters,
     /// A call of a host function with more arguments than fit a frame.
     TooManyArguments,
-    /// Expressions nested more than 256 deep.
-    TooDeep,
     OutOfMemory,
 }
 
@@ -177,7 +221,6 @@ impl fmt::Display for CompileError {
             Self::UnknownSlot(slot) => write!(f, "variable {slot} isn't one of the module's"),
             Self::TooManyRegisters => write!(f, "more than 2^32 locals"),
             Self::TooManyArguments => write!(f, "a host call with more arguments than fit a frame"),
-            Self::TooDeep => write!(f, "expressions nested too deeply"),
             Self::OutOfMemory => write!(f, "out of memory"),
         }
     }
@@ -190,20 +233,48 @@ impl std::error::Error for CompileError {}
 /// [`ragwort_vm::Machine::new`].
 pub fn compile<'gc>(mc: &Mutation<'gc>, module: Option<Gc<'gc, Module>>, core: &Core<'gc>) -> Result<Value<'gc>, CompileError> {
     let arena = Arena::new();
-    let l4 = to_l4(mc, &arena, core)?;
-    let l5 = l5::lower(&arena, &l4)?;
+    let l5 = to_l5(mc, &arena, core)?;
     #[cfg(debug_assertions)]
     l5::check(&l5);
     emit::emit(mc, module, &l5)
 }
 
-/// `core` through the passes to closure conversion.
-fn to_l4<'a, 'gc>(mc: &Mutation<'gc>, arena: &'a Arena, core: &Core<'gc>) -> Result<ir::L4<'a, 'gc>, CompileError> {
-    let (l1, supply) = lower::lower(arena, core)?;
-    let (l2, supply) = letrec::fix_letrec(arena, l1, supply);
-    let (l2, mut supply) = cp0::optimize(mc, arena, l2, supply);
-    let (mut l3, assigned) = assign::lower(arena, l2);
-    contify::contify(arena, &mut l3);
-    assign::convert(arena, &mut l3, &assigned, &mut supply);
-    Ok(closure::closure_convert(arena, &l3))
+/// `core` through the passes to L5.
+fn to_l5<'a, 'gc>(mc: &Mutation<'gc>, arena: &'a Arena, core: &Core<'gc>) -> Result<l5::Program<'a, 'gc>, CompileError> {
+    // Each table is dropped once the next is made from it.
+    ir::l1::scope(|mut l1| {
+        let (root, supply) = lower::lower(&mut l1, core)?;
+        ir::l2::scope(move |mut src| {
+            let (root, supply) = letrec::fix_letrec(&l1, root, &mut src, supply);
+            drop(l1);
+            #[cfg(debug_assertions)]
+            src.check(root);
+            ir::l2::scope(move |mut l2| {
+                let (root, mut supply) = cp0::optimize(mc, &mut src, root, &mut l2, supply);
+                drop(src);
+                letrec::prune(&mut l2, root);
+                #[cfg(debug_assertions)]
+                l2.check(root);
+                ir::l3::scope(move |mut l3| {
+                    let (root, assigned) = assign::lower(&mut l3, &l2, root);
+                    drop(l2);
+                    #[cfg(debug_assertions)]
+                    l3.check(root);
+                    contify::contify(&mut l3, root);
+                    #[cfg(debug_assertions)]
+                    l3.check(root);
+                    assign::convert(&mut l3, root, &assigned, &mut supply);
+                    #[cfg(debug_assertions)]
+                    l3.check(root);
+                    ir::l4::scope(move |mut l4| {
+                        let root = closure::closure_convert(&mut l4, &l3, root);
+                        drop(l3);
+                        #[cfg(debug_assertions)]
+                        l4.check(root);
+                        l5::lower(arena, &l4, root)
+                    })
+                })
+            })
+        })
+    })
 }

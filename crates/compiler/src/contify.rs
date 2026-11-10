@@ -10,226 +10,293 @@
 //! inside the one that binds the function, when every call is in it, if that doesn't have the
 //! lambdas between capture more: their captures of the function go, its code's come.
 //!
-//! The analysis walks the tree once, numbering its nodes in order and noting each one's *chain*:
-//! the nodes from the top of the run of tail positions it's at the bottom of down to it. Calls
-//! whose chains start at the same node are in tail position of each node their chains share, so
-//! `P` is the last of those. Functions are decided innermost first, as one can only call those
-//! it's inside the scope of. A second walk, numbering the nodes the same way, moves each join's
-//! code to its `P`, as an [`L3::Join`], and makes the calls [`L3::Jump`]s.
+//! The survey walks the tree once, noting each node's *chain*: the nodes from the top of the run
+//! of tail positions it's at the bottom of down to it. Calls whose chains start at the same node
+//! are in tail position of each node their chains share, so `P` is the last of those. Functions
+//! are decided innermost first, as one can only call those it's inside the scope of. Then the
+//! calls become [`Node::Jump`]s, each `P` a [`Node::Join`] of the code there, its node moved into
+//! the join's scope, and the bindings of the joins go, the functions now the joins' code.
 
 use crate::hash::{HashMap, HashSet};
 
-
-use ragwort_alloc::{Arena, CollectIn};
-
 use crate::Var;
-use crate::ir::{Bind, Bind3, Func, L3};
-use crate::lower::MAX_DEPTH;
+use crate::ir::l3::{Bind, Fun, Id, JoinCode, L3, Node};
 
 /// Most parameters a group of joins can have, as their values move in its own registers.
 const MAX_PARAMS: usize = 32;
 
-pub(crate) fn contify<'a>(arena: &'a Arena, expr: &mut L3<'a, '_>) {
-    let mut survey = Survey::default();
-    survey.tail(expr);
+pub(crate) fn contify<'id>(tree: &mut L3<'id, '_>, root: Id<'id>) {
+    let mut survey = Survey {
+        tree,
+        candidates: HashMap::default(),
+        funs: HashMap::default(),
+        bodies: HashMap::default(),
+        bindings: Vec::new(),
+        mine: Vec::new(),
+        chain: Vec::new(),
+        base: 0,
+        bases: Vec::new(),
+        frame: 0,
+        outer: Vec::new(),
+        frames: Vec::new(),
+    };
+    let mut todo = vec![Task::Fresh(root)];
+    while let Some(task) = todo.pop() {
+        survey.run(task, &mut todo);
+    }
     let plan = survey.decide();
-    if !plan.joins.is_empty() {
-        let mut rewrite = Rewrite { arena, plan, next: 0, moved: HashMap::default(), depth: 0, refused: HashMap::default(), doomed: HashSet::default() };
-        rewrite.visit(expr);
+    if plan.joins.is_empty() {
+        return;
+    }
+    let Survey { candidates, bindings, .. } = survey;
+    for v in &plan.joins {
+        for call in &candidates[v].calls {
+            let at = *call.chain.last().expect("a chain has its call");
+            let Node::App(_, args) = tree[at] else { unreachable!("a call of a join") };
+            tree.set(at, Node::Jump(*v, args));
+        }
+    }
+    // Where the node each join goes at is now: in its scope.
+    let mut moved = HashMap::default();
+    for (at, groups) in plan.at {
+        let codes: Vec<JoinCode<'id>> = groups.iter().flatten().map(|&v| JoinCode { id: v, fun: plan.funs[&v] }).collect();
+        let (scope, codes) = (tree.add(tree[at]), tree.list(codes));
+        tree.set(at, Node::Join(scope, codes));
+        moved.insert(at, scope);
+    }
+    // Innermost first, as a `Let` left with no bindings takes its body's place.
+    let mut done = HashSet::default();
+    for binding in bindings.iter().filter(|b| plan.joins.contains(&b.members[0])) {
+        if !done.insert(binding.at) {
+            continue;
+        }
+        let at = moved.get(&binding.at).copied().unwrap_or(binding.at);
+        let Node::Let(binds, body) = tree[at] else { unreachable!("joins are bound by a let") };
+        let kept: Vec<Bind<'id>> = tree[binds]
+            .iter()
+            .copied()
+            .filter(|&bind| match bind {
+                Bind::Val(v, _) => !plan.joins.contains(&v),
+                // A group's members are joins together, or none are.
+                Bind::Fix(group) => !plan.joins.contains(&tree[group][0].0),
+            })
+            .collect();
+        let node = if kept.is_empty() { tree[body] } else { Node::Let(tree.list(kept), body) };
+        tree.set(at, node);
     }
 }
 
 /// What contification decided.
-#[derive(Default)]
-struct Plan {
-    /// The groups of joins whose code goes at each node, by number, those decided first innermost.
-    at: HashMap<u32, Vec<Vec<Var>>>,
+struct Plan<'id> {
+    /// The groups of joins whose code goes at each node, those decided first innermost.
+    at: HashMap<Id<'id>, Vec<Vec<Var>>>,
     joins: HashSet<Var>,
+    /// Each join's code.
+    funs: HashMap<Var, Fun<'id>>,
 }
 
 /// A local function that could be a join.
-struct Candidate {
+struct Candidate<'id> {
     arity: usize,
     /// Whether every use so far is a call of `arity` arguments.
     called: bool,
-    calls: Vec<Site<Box<[u32]>>>,
+    calls: Vec<Site<Box<[Id<'id>]>>>,
 }
 
-/// Where a call is, or a join goes: the chain down to it, as node numbers, and the frame it's in.
+/// Where a call is, or a join goes: the chain down to it, and the frame it's in.
 struct Site<C> {
     chain: C,
     frame: u32,
 }
 
-/// A binding of candidates, which are decided together.
-struct Binding {
+/// A binding of candidates, which are decided together, and the `Let` it's in.
+struct Binding<'id> {
     members: Vec<Var>,
     frame: u32,
+    at: Id<'id>,
 }
 
 /// A lambda body's frame.
-struct Frame<'s, 't, 'gc> {
+struct Frame<'id> {
     /// The frame the lambda is in.
     outer: u32,
-    lambda: &'s Func<'t, L3<'t, 'gc>>,
+    lambda: Fun<'id>,
     /// The candidate it's the code of.
     of: Option<Var>,
 }
 
-#[derive(Default)]
-struct Survey<'s, 't, 'gc> {
-    candidates: HashMap<Var, Candidate>,
-    funcs: HashMap<Var, &'s Func<'t, L3<'t, 'gc>>>,
-    /// The candidate whose code each function body is, by the body's number.
-    bodies: HashMap<u32, Var>,
-    /// Bindings, innermost first.
-    bindings: Vec<Binding>,
-    /// The nodes from the walk's top to where it is; the current chain is `chain[base..]`.
-    chain: Vec<u32>,
-    base: usize,
-    frame: u32,
-    /// Frame `n`'s at `n - 1`.
-    frames: Vec<Frame<'s, 't, 'gc>>,
-    /// The next node's number.
-    next: u32,
+/// What's left of the survey's walk.
+enum Task<'id> {
+    /// A node in tail position of the one above it.
+    Tail(Id<'id>),
+    /// A node that starts a chain.
+    Fresh(Id<'id>),
+    /// Back from a node's children.
+    Pop,
+    /// Back from a node that started a chain.
+    Restore,
+    /// The body of a function, a frame of its own, which is candidate `of`'s code.
+    Body(Fun<'id>, Option<Var>),
+    Leave,
+    /// A `Let`'s binding, once those before it are walked.
+    Bind(Id<'id>, Bind<'id>),
+    /// After a `Let`'s body: its bindings of candidates, decided after those inside it.
+    Bound,
 }
 
-impl<'s, 't, 'gc> Survey<'s, 't, 'gc> {
-    /// `e`, in tail position of the node above it.
-    fn tail(&mut self, e: &'s L3<'t, 'gc>) {
-        self.chain.push(self.next);
-        self.next += 1;
-        self.node(e);
-        self.chain.pop();
-    }
+struct Survey<'t, 'id, 'gc> {
+    tree: &'t L3<'id, 'gc>,
+    candidates: HashMap<Var, Candidate<'id>>,
+    funs: HashMap<Var, Fun<'id>>,
+    /// The candidate whose code each function body is.
+    bodies: HashMap<Id<'id>, Var>,
+    /// Bindings, innermost first.
+    bindings: Vec<Binding<'id>>,
+    /// Those of each `Let` the walk is in.
+    mine: Vec<Vec<Binding<'id>>>,
+    /// The nodes from the walk's top to where it is; the current chain is `chain[base..]`.
+    chain: Vec<Id<'id>>,
+    base: usize,
+    bases: Vec<usize>,
+    frame: u32,
+    outer: Vec<u32>,
+    /// Frame `n`'s at `n - 1`.
+    frames: Vec<Frame<'id>>,
+}
 
-    /// `e`, which starts a chain.
-    fn fresh(&mut self, e: &'s L3<'t, 'gc>) {
-        let base = std::mem::replace(&mut self.base, self.chain.len());
-        self.tail(e);
-        self.base = base;
-    }
-
-    /// The body of `func`, a frame of its own, which is candidate `of`'s code.
-    fn body(&mut self, func: &'s Func<'t, L3<'t, 'gc>>, of: Option<Var>) {
-        if let Some(v) = of {
-            self.bodies.insert(self.next, v);
+impl<'id> Survey<'_, 'id, '_> {
+    fn run(&mut self, task: Task<'id>, todo: &mut Vec<Task<'id>>) {
+        let at = todo.len();
+        match task {
+            Task::Tail(id) => {
+                self.chain.push(id);
+                self.node(id, todo);
+                todo.push(Task::Pop);
+            }
+            Task::Fresh(id) => {
+                self.bases.push(std::mem::replace(&mut self.base, self.chain.len()));
+                todo.extend([Task::Tail(id), Task::Restore]);
+            }
+            Task::Pop => _ = self.chain.pop(),
+            Task::Restore => self.base = self.bases.pop().expect("a chain was started"),
+            Task::Body(fun, of) => {
+                let body = self.tree[fun].body;
+                if let Some(v) = of {
+                    self.bodies.insert(body, v);
+                }
+                self.frames.push(Frame { outer: self.frame, lambda: fun, of });
+                self.outer.push(std::mem::replace(&mut self.frame, self.frames.len() as u32));
+                todo.extend([Task::Fresh(body), Task::Leave]);
+            }
+            Task::Leave => self.frame = self.outer.pop().expect("a function was entered"),
+            Task::Bind(at, bind) => self.bind(at, bind, todo),
+            Task::Bound => {
+                let mine = self.mine.pop().expect("a let was entered");
+                // The last first, as it's in the scope of those before.
+                self.bindings.extend(mine.into_iter().rev());
+            }
         }
-        self.frames.push(Frame { outer: self.frame, lambda: func, of });
-        let frame = std::mem::replace(&mut self.frame, self.frames.len() as u32);
-        self.fresh(&func.body);
-        self.frame = frame;
+        todo[at..].reverse();
     }
 
-    fn node(&mut self, e: &'s L3<'t, 'gc>) {
-        match e {
-            L3::Quote(_) => {}
-            L3::Ref(v) => {
-                if let Some(c) = self.candidates.get_mut(v) {
-                    c.called = false;
-                }
+    /// Pushes the tasks of `id`'s children, in the order they're walked.
+    fn node(&mut self, id: Id<'id>, todo: &mut Vec<Task<'id>>) {
+        let tree = self.tree;
+        let fresh = |ids: &[Id<'id>], todo: &mut Vec<Task<'id>>| todo.extend(ids.iter().map(|&a| Task::Fresh(a)));
+        match tree[id] {
+            Node::Quote(_) => {}
+            Node::Ref(v) => self.unfit(v),
+            Node::Set(v, value) => {
+                self.unfit(v);
+                todo.push(Task::Fresh(value));
             }
-            L3::Set(v, value) => {
-                if let Some(c) = self.candidates.get_mut(v) {
-                    c.called = false;
-                }
-                self.fresh(value);
+            Node::If(test, then, other) => todo.extend([Task::Fresh(test), Task::Tail(then), Task::Tail(other)]),
+            Node::Seq(a, b) => todo.extend([Task::Fresh(a), Task::Tail(b)]),
+            Node::Let(binds, body) => {
+                self.mine.push(Vec::new());
+                todo.extend(tree[binds].iter().map(|&bind| Task::Bind(id, bind)));
+                todo.extend([Task::Tail(body), Task::Bound]);
             }
-            L3::If(test, then, other) => {
-                self.fresh(test);
-                self.tail(then);
-                self.tail(other);
-            }
-            L3::Seq(a, b) => {
-                self.fresh(a);
-                self.tail(b);
-            }
-            L3::Let(binds, body) => self.binds(binds, body),
-            L3::App(f, args) => {
-                match **f {
-                    L3::Ref(v) if self.candidates.contains_key(&v) => {
-                        self.next += 1;
+            Node::App(f, args) => {
+                match tree[f] {
+                    Node::Ref(v) if self.candidates.contains_key(&v) => {
                         let chain = self.chain[self.base..].into();
                         let c = self.candidates.get_mut(&v).expect("a candidate");
-                        if c.arity == args.len() {
+                        if c.arity == tree[args].len() {
                             c.calls.push(Site { chain, frame: self.frame });
                         } else {
                             c.called = false;
                         }
                     }
-                    _ => self.fresh(f),
+                    _ => todo.push(Task::Fresh(f)),
                 }
-                for a in args {
-                    self.fresh(a);
-                }
+                fresh(&tree[args], todo);
             }
-            L3::Lambda(func) => self.body(func, None),
-            L3::Intrinsic(_, args) | L3::ApplyIntrinsic(_, args) | L3::Jump(_, args) => {
-                for a in args {
-                    self.fresh(a);
-                }
-            }
-            L3::Join { group, scope } => {
-                for (_, func) in group {
-                    self.fresh(&func.body);
-                }
-                self.tail(scope);
+            Node::Lambda(fun) => todo.push(Task::Body(fun, None)),
+            Node::Intrinsic(_, args) | Node::ApplyIntrinsic(_, args) | Node::Jump(_, args) => fresh(&tree[args], todo),
+            Node::Join(scope, codes) => {
+                todo.extend(tree[codes].iter().map(|code| Task::Fresh(tree[code.fun].body)));
+                todo.push(Task::Tail(scope));
             }
         }
     }
 
-    /// Notes `var`, bound to `func`, as a candidate if it can be one.
-    fn candidate(&mut self, var: Var, func: &'s Func<'t, L3<'t, 'gc>>) -> bool {
-        let fits = func.rest.is_none() && func.optional == 0 && func.params.len() <= MAX_PARAMS;
+    /// Notes that `v` is used other than called, if it's a candidate.
+    fn unfit(&mut self, v: Var) {
+        if let Some(c) = self.candidates.get_mut(&v) {
+            c.called = false;
+        }
+    }
+
+    /// Notes `var`, bound to `fun`, as a candidate if it can be one.
+    fn candidate(&mut self, var: Var, fun: Fun<'id>) -> bool {
+        let f = self.tree[fun];
+        let params = self.tree[f.params].len();
+        let fits = f.rest.is_none() && f.optional == 0 && params <= MAX_PARAMS;
         if fits {
-            self.candidates.insert(var, Candidate { arity: func.params.len(), called: true, calls: Vec::new() });
-            self.funcs.insert(var, func);
+            self.candidates.insert(var, Candidate { arity: params, called: true, calls: Vec::new() });
+            self.funs.insert(var, fun);
         }
         fits
     }
 
-    #[inline(never)]
-    fn binds(&mut self, binds: &'s [Bind3<'t, 'gc>], body: &'s L3<'t, 'gc>) {
-        let mut mine = Vec::new();
-        for bind in binds {
-            match bind {
-                Bind::Val(v, L3::Lambda(func)) => {
-                    self.next += 1;
-                    let fits = self.candidate(*v, func);
+    fn bind(&mut self, at: Id<'id>, bind: Bind<'id>, todo: &mut Vec<Task<'id>>) {
+        let tree = self.tree;
+        let frame = self.frame;
+        match bind {
+            Bind::Val(v, init) => match tree[init] {
+                Node::Lambda(fun) => {
+                    let fits = self.candidate(v, fun);
                     if fits {
-                        mine.push(Binding { members: vec![*v], frame: self.frame });
+                        self.mine.last_mut().expect("in a let").push(Binding { members: vec![v], frame, at });
                     }
-                    self.body(func, fits.then_some(*v));
+                    todo.push(Task::Body(fun, fits.then_some(v)));
                 }
-                Bind::Val(_, init) => self.fresh(init),
-                Bind::Fix(group) => {
-                    let fits: Vec<bool> = group.iter().map(|(v, func)| self.candidate(*v, func)).collect();
-                    for ((v, func), &fits) in group.iter().zip(&fits) {
-                        self.body(func, fits.then_some(*v));
-                    }
-                    // The group's parameters all have registers across the code the joins are placed at.
-                    if fits.iter().all(|&f| f) && group.iter().map(|(_, f)| f.params.len()).sum::<usize>() <= MAX_PARAMS {
-                        mine.push(Binding { members: group.iter().map(|(v, _)| *v).collect(), frame: self.frame });
-                    }
+                _ => todo.push(Task::Fresh(init)),
+            },
+            Bind::Fix(group) => {
+                let group = &tree[group];
+                let fits: Vec<bool> = group.iter().map(|&(v, fun)| self.candidate(v, fun)).collect();
+                // The group's parameters all have registers across the code the joins are placed at.
+                let params: usize = group.iter().map(|&(_, fun)| tree[tree[fun].params].len()).sum();
+                if fits.iter().all(|&f| f) && params <= MAX_PARAMS {
+                    self.mine.last_mut().expect("in a let").push(Binding { members: group.iter().map(|&(v, _)| v).collect(), frame, at });
                 }
+                todo.extend(group.iter().zip(&fits).map(|(&(v, fun), &fits)| Task::Body(fun, fits.then_some(v))));
             }
         }
-        self.tail(body);
-        // After those inside it, which are decided first, and the last first, as it's in the
-        // scope of those before.
-        self.bindings.extend(mine.into_iter().rev());
     }
 
-    fn decide(self) -> Plan {
-        let mut plan = Plan::default();
+    fn decide(&self) -> Plan<'id> {
+        let mut plan = Plan { at: HashMap::default(), joins: HashSet::default(), funs: HashMap::default() };
         // Where each join decided on is.
-        let mut placed: HashMap<Var, Site<Vec<u32>>> = HashMap::default();
+        let mut placed: HashMap<Var, Site<Vec<Id<'id>>>> = HashMap::default();
         for binding in &self.bindings {
             let members = &binding.members;
             if !members.iter().all(|v| self.candidates[v].called) {
                 continue;
             }
-            let mut common: Option<Site<Vec<u32>>> = None;
+            let mut common: Option<Site<Vec<Id<'id>>>> = None;
             let mut fits = true;
             'calls: for v in members {
                 for call in &self.candidates[v].calls {
@@ -263,6 +330,7 @@ impl<'s, 't, 'gc> Survey<'s, 't, 'gc> {
             plan.at.entry(*chain.last().expect("a chain has its call")).or_default().push(members.clone());
             plan.joins.extend(members);
             for &v in members {
+                plan.funs.insert(v, self.funs[&v]);
                 placed.insert(v, Site { chain: chain.clone(), frame });
             }
         }
@@ -271,11 +339,11 @@ impl<'s, 't, 'gc> Survey<'s, 't, 'gc> {
 
     /// Whether `binding`'s functions' code can go in `frame`, inside the frame that binds them and
     /// not in their own: if none of the lambdas between captures more than it does now.
-    fn moves(&self, binding: &Binding, frame: u32) -> bool {
+    fn moves(&self, binding: &Binding<'id>, frame: u32) -> bool {
         let (mut uses, mut bound) = (HashSet::default(), HashSet::default());
         for v in &binding.members {
             bound.insert(*v);
-            vars(self.funcs[v], &mut uses, &mut bound);
+            self.vars(self.funs[v], &mut uses, &mut bound);
         }
         let uses: Vec<Var> = uses.difference(&bound).copied().collect();
         let mut at = frame;
@@ -285,7 +353,7 @@ impl<'s, 't, 'gc> Survey<'s, 't, 'gc> {
                 return false;
             }
             let (mut captured, mut inside) = (HashSet::default(), HashSet::default());
-            vars(between.lambda, &mut captured, &mut inside);
+            self.vars(between.lambda, &mut captured, &mut inside);
             let gone = binding.members.iter().filter(|v| captured.contains(v)).count();
             let come = uses.iter().filter(|v| !captured.contains(v)).count();
             if come > gone {
@@ -295,342 +363,31 @@ impl<'s, 't, 'gc> Survey<'s, 't, 'gc> {
         }
         true
     }
-}
 
-/// Adds the variables `func` refers to to `uses`, and those it binds to `bound`.
-fn vars(func: &Func<'_, L3<'_, '_>>, uses: &mut HashSet<Var>, bound: &mut HashSet<Var>) {
-    bound.extend(func.params.iter().chain(&func.rest));
-    walk(&func.body, uses, bound);
-}
-
-fn walk(e: &L3<'_, '_>, uses: &mut HashSet<Var>, bound: &mut HashSet<Var>) {
-    match e {
-        L3::Quote(_) => {}
-        L3::Ref(v) => {
-            uses.insert(*v);
-        }
-        L3::Set(v, value) => {
-            uses.insert(*v);
-            walk(value, uses, bound);
-        }
-        L3::If(a, b, c) => {
-            walk(a, uses, bound);
-            walk(b, uses, bound);
-            walk(c, uses, bound);
-        }
-        L3::Seq(a, b) => {
-            walk(a, uses, bound);
-            walk(b, uses, bound);
-        }
-        L3::Let(binds, body) => {
-            for bind in binds {
-                match bind {
-                    Bind::Val(v, init) => {
-                        bound.insert(*v);
-                        walk(init, uses, bound);
-                    }
-                    Bind::Fix(group) => {
-                        for (v, func) in group {
-                            bound.insert(*v);
-                            vars(func, uses, bound);
+    /// Adds the variables `fun` refers to to `uses`, and those it binds to `bound`.
+    fn vars(&self, fun: Fun<'id>, uses: &mut HashSet<Var>, bound: &mut HashSet<Var>) {
+        let tree = self.tree;
+        bound.extend(tree.params(fun));
+        for id in tree.deep(tree[fun].body) {
+            match tree[id] {
+                Node::Ref(v) | Node::Set(v, _) => _ = uses.insert(v),
+                Node::Let(binds, _) => {
+                    for &bind in &tree[binds] {
+                        bound.extend(tree.vars(bind));
+                        if let Bind::Fix(group) = bind {
+                            tree[group].iter().for_each(|&(_, f)| bound.extend(tree.params(f)));
                         }
                     }
                 }
-            }
-            walk(body, uses, bound);
-        }
-        L3::Join { group: binds, scope: body } => {
-            for (v, func) in binds {
-                bound.insert(*v);
-                vars(func, uses, bound);
-            }
-            walk(body, uses, bound);
-        }
-        L3::App(f, args) => {
-            walk(f, uses, bound);
-            for a in args {
-                walk(a, uses, bound);
-            }
-        }
-        L3::Lambda(func) => vars(func, uses, bound),
-        L3::Intrinsic(_, args) | L3::ApplyIntrinsic(_, args) | L3::Jump(_, args) => {
-            for a in args {
-                walk(a, uses, bound);
-            }
-        }
-    }
-}
-
-/// The second walk, which numbers the nodes as [`Survey`] does.
-struct Rewrite<'a, 'gc> {
-    arena: &'a Arena,
-    plan: Plan,
-    next: u32,
-    /// The joins' code, taken from where they're bound, until it goes where they're placed.
-    moved: HashMap<Var, Moved<'a, 'gc>>,
-    /// How deeply the node being visited is nested.
-    depth: usize,
-    /// The code of joins that would nest too deeply where they go, so stay functions, until it's
-    /// back where they're bound.
-    refused: HashMap<Var, Moved<'a, 'gc>>,
-    /// Joins code that stays a function jumps to, which can't be joins either.
-    doomed: HashSet<Var>,
-}
-
-/// A join's code, how tall it is, and how deeply it's nested where it's bound.
-struct Moved<'a, 'gc> {
-    code: Func<'a, L3<'a, 'gc>>,
-    height: usize,
-    site: usize,
-}
-
-impl<'a, 'gc> Rewrite<'a, 'gc> {
-    /// Rewrites `e`, and returns how tall it is.
-    fn visit(&mut self, e: &mut L3<'a, 'gc>) -> usize {
-        let n = self.next;
-        self.next += 1;
-        self.depth += 1;
-        let height = 1 + match e {
-            L3::Quote(_) | L3::Ref(_) => 0,
-            L3::Set(_, value) => self.visit(value),
-            L3::If(a, b, c) => {
-                let (a, b) = (self.visit(a), self.visit(b));
-                a.max(b).max(self.visit(c))
-            }
-            L3::Seq(a, b) => {
-                let a = self.visit(a);
-                a.max(self.visit(b))
-            }
-            L3::Let(..) => self.binds(e),
-            L3::App(..) => self.app(e),
-            L3::Lambda(func) => self.visit(&mut func.body),
-            L3::Intrinsic(_, args) | L3::ApplyIntrinsic(_, args) | L3::Jump(_, args) => args.iter_mut().map(|a| self.visit(a)).fold(0, usize::max),
-            L3::Join { group, scope } => {
-                let code = group.iter_mut().map(|(_, func)| self.visit(&mut func.body)).fold(0, usize::max);
-                code.max(self.visit(scope))
-            }
-        };
-        let height = match self.plan.at.remove(&n) {
-            Some(groups) => self.place(e, groups, height),
-            None => height,
-        };
-        self.depth -= 1;
-        height
-    }
-
-    /// Puts `groups`' code around `e`, of `height`, as one group, so however many go there it's
-    /// one `Join`, and returns how tall that is. A group whose code would go deeper than source
-    /// can nest, and than it was, stays where it's bound, as later passes recurse through it.
-    #[inline(never)]
-    fn place(&mut self, e: &mut L3<'a, 'gc>, groups: Vec<Vec<Var>>, height: usize) -> usize {
-        let groups: std::vec::Vec<(Vec<Var>, std::vec::Vec<Moved<'a, 'gc>>)> = groups
-            .into_iter()
-            .map(|members| {
-                let codes = members.iter().map(|v| self.moved.remove(v).expect("a join is bound before where it goes")).collect();
-                (members, codes)
-            })
-            .collect();
-        let fits = |codes: &[Moved<'_, '_>]| codes.iter().all(|m| self.depth + 1 + m.height <= MAX_DEPTH.max(m.site + 1 + m.height));
-        let mut kept: std::vec::Vec<bool> =
-            groups.iter().map(|(members, codes)| fits(codes) && !members.iter().any(|v| self.doomed.contains(v))).collect();
-        // What code that stays jumps to from outside it can't be a join either, here or above.
-        let mut back = HashSet::default();
-        let mut gone = vec![false; groups.len()];
-        while let Some(i) = (0..groups.len()).find(|&i| !kept[i] && !gone[i]) {
-            gone[i] = true;
-            back.extend(groups[i].0.iter().copied());
-            let (mut targets, mut joined) = (HashSet::default(), HashSet::default());
-            for m in &groups[i].1 {
-                jumps(&m.code.body, &mut targets, &mut joined);
-            }
-            for v in targets.difference(&joined) {
-                self.doomed.insert(*v);
-                for (j, (members, _)) in groups.iter().enumerate() {
-                    if members.contains(v) {
-                        kept[j] = false;
+                Node::Join(_, codes) => {
+                    for code in &tree[codes] {
+                        bound.insert(code.id);
+                        bound.extend(tree.params(code.fun));
                     }
                 }
+                Node::Lambda(f) => bound.extend(tree.params(f)),
+                _ => {}
             }
-        }
-        let mut group = self.arena.vec();
-        let mut tallest = height;
-        for ((members, codes), kept) in groups.into_iter().zip(kept) {
-            for (v, mut m) in members.into_iter().zip(codes) {
-                if kept {
-                    tallest = tallest.max(m.height + 1);
-                    group.push((v, m.code));
-                } else {
-                    self.plan.joins.remove(&v);
-                    let doomed = &self.doomed;
-                    unjump(self.arena, &mut m.code.body, &|w| back.contains(&w) || doomed.contains(&w));
-                    self.refused.insert(v, m);
-                }
-            }
-        }
-        if !back.is_empty() {
-            unjump(self.arena, e, &|w| back.contains(&w));
-            for (_, code) in group.iter_mut() {
-                unjump(self.arena, &mut code.body, &|w| back.contains(&w));
-            }
-        }
-        if group.is_empty() {
-            return height;
-        }
-        let scope = self.arena.boxed(e.take());
-        *e = L3::Join { group, scope };
-        tallest + 1
-    }
-
-    #[inline(never)]
-    fn binds(&mut self, e: &mut L3<'a, 'gc>) -> usize {
-        let L3::Let(binds, body) = e else { return 0 };
-        let arena = self.arena;
-        let site = self.depth;
-        let mut height = 0;
-        // Where each binding of joins was among those left, to put back those refused.
-        let mut slots = std::vec::Vec::new();
-        for mut bind in std::mem::replace(binds, arena.vec()) {
-            let heights: std::vec::Vec<usize> = match &mut bind {
-                Bind::Val(_, init) => vec![self.visit(init)],
-                Bind::Fix(group) => group.iter_mut().map(|(_, func)| self.visit(&mut func.body)).collect(),
-            };
-            height = heights.iter().copied().fold(height, usize::max);
-            // Out now, as the code can go in a later binding.
-            match bind {
-                Bind::Val(v, L3::Lambda(code)) if self.plan.joins.contains(&v) => {
-                    self.moved.insert(v, Moved { code, height: heights[0], site });
-                    slots.push((binds.len(), vec![v], false));
-                }
-                // A group's members are joins together, or none are.
-                Bind::Fix(group) if self.plan.joins.contains(&group[0].0) => {
-                    let mut members = Vec::with_capacity(group.len());
-                    for ((v, code), height) in group.into_iter().zip(heights) {
-                        self.moved.insert(v, Moved { code, height, site });
-                        members.push(v);
-                    }
-                    slots.push((binds.len(), members, true));
-                }
-                bind => binds.push(bind),
-            }
-        }
-        height = height.max(self.visit(body));
-        for (at, members, fix) in slots.into_iter().rev() {
-            let codes: std::vec::Vec<(Var, Moved<'a, 'gc>)> = members.iter().filter_map(|v| self.refused.remove(v).map(|m| (*v, m))).collect();
-            if codes.is_empty() {
-                continue;
-            }
-            height = codes.iter().map(|(_, m)| m.height).fold(height, usize::max);
-            let bind = if fix {
-                Bind::Fix(codes.into_iter().map(|(v, m)| (v, m.code)).collect_in(arena))
-            } else {
-                let (v, m) = codes.into_iter().next().expect("not empty");
-                Bind::Val(v, L3::Lambda(m.code))
-            };
-            binds.insert(at, bind);
-        }
-        if binds.is_empty() {
-            *e = body.take();
-        }
-        height
-    }
-
-    #[inline(never)]
-    fn app(&mut self, e: &mut L3<'a, 'gc>) -> usize {
-        let L3::App(f, args) = e else { return 0 };
-        let join = match **f {
-            L3::Ref(v) if self.plan.joins.contains(&v) => Some(v),
-            _ => None,
-        };
-        let mut height = match join {
-            Some(_) => {
-                self.next += 1;
-                1
-            }
-            None => self.visit(f),
-        };
-        for a in args.iter_mut() {
-            height = height.max(self.visit(a));
-        }
-        if let Some(v) = join {
-            *e = L3::Jump(v, std::mem::replace(args, self.arena.vec()));
-        }
-        height
-    }
-}
-
-/// Adds the joins `e` jumps to to `targets`, and those it has the code of to `joined`.
-fn jumps(e: &L3<'_, '_>, targets: &mut HashSet<Var>, joined: &mut HashSet<Var>) {
-    match e {
-        L3::Jump(v, _) => _ = targets.insert(*v),
-        L3::Join { group, .. } => joined.extend(group.iter().map(|(v, _)| *v)),
-        _ => {}
-    }
-    each_child(e, &mut |c| jumps(c, targets, joined));
-}
-
-/// `e` with its jumps to the joins `to` picks calls again.
-fn unjump<'a, 'gc>(arena: &'a Arena, e: &mut L3<'a, 'gc>, to: &dyn Fn(Var) -> bool) {
-    if let L3::Jump(v, args) = e
-        && to(*v)
-    {
-        let args = std::mem::replace(args, arena.vec());
-        *e = L3::App(arena.boxed(L3::Ref(*v)), args);
-    }
-    each_child_mut(e, &mut |c| unjump(arena, c, to));
-}
-
-fn each_child<'t, 'gc>(e: &L3<'t, 'gc>, f: &mut dyn FnMut(&L3<'t, 'gc>)) {
-    match e {
-        L3::Quote(_) | L3::Ref(_) => {}
-        L3::Set(_, value) => f(value),
-        L3::If(a, b, c) => [a, b, c].into_iter().for_each(|e| f(e)),
-        L3::Seq(a, b) => [a, b].into_iter().for_each(|e| f(e)),
-        L3::Let(binds, body) => {
-            for bind in binds {
-                match bind {
-                    Bind::Val(_, init) => f(init),
-                    Bind::Fix(group) => group.iter().for_each(|(_, func)| f(&func.body)),
-                }
-            }
-            f(body);
-        }
-        L3::Lambda(func) => f(&func.body),
-        L3::App(callee, args) => {
-            f(callee);
-            args.iter().for_each(&mut *f);
-        }
-        L3::Intrinsic(_, args) | L3::ApplyIntrinsic(_, args) | L3::Jump(_, args) => args.iter().for_each(&mut *f),
-        L3::Join { group, scope } => {
-            group.iter().for_each(|(_, func)| f(&func.body));
-            f(scope);
-        }
-    }
-}
-
-fn each_child_mut<'t, 'gc>(e: &mut L3<'t, 'gc>, f: &mut dyn FnMut(&mut L3<'t, 'gc>)) {
-    match e {
-        L3::Quote(_) | L3::Ref(_) => {}
-        L3::Set(_, value) => f(value),
-        L3::If(a, b, c) => [a, b, c].into_iter().for_each(|e| f(e)),
-        L3::Seq(a, b) => [a, b].into_iter().for_each(|e| f(e)),
-        L3::Let(binds, body) => {
-            for bind in binds.iter_mut() {
-                match bind {
-                    Bind::Val(_, init) => f(init),
-                    Bind::Fix(group) => group.iter_mut().for_each(|(_, func)| f(&mut func.body)),
-                }
-            }
-            f(body);
-        }
-        L3::Lambda(func) => f(&mut func.body),
-        L3::App(callee, args) => {
-            f(callee);
-            args.iter_mut().for_each(&mut *f);
-        }
-        L3::Intrinsic(_, args) | L3::ApplyIntrinsic(_, args) | L3::Jump(_, args) => args.iter_mut().for_each(&mut *f),
-        L3::Join { group, scope } => {
-            group.iter_mut().for_each(|(_, func)| f(&mut func.body));
-            f(scope);
         }
     }
 }

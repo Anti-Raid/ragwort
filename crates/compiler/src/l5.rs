@@ -15,11 +15,11 @@ use std::iter;
 
 use ragwort_alloc::{Arena, CollectIn, Vec};
 use ragwort_types::gc::Value;
-use ragwort_vm::{Intrinsic, Purity};
 
 use crate::hash::{HashMap, HashSet};
 
-use crate::ir::{Bind, Bind4, Closure, JoinCode, L4, UpvalSource, VarRef};
+use crate::ir::l4::{Bind, Fun, Id, JoinCode, L4, Node, Span};
+use crate::ir::{UpvalSource, VarRef};
 use crate::{CompileError, Prim, SlotOp, Var};
 
 #[cfg(test)]
@@ -33,6 +33,19 @@ pub(crate) struct Val(pub(crate) u32);
 /// A block of a function, an index of its [`Function::blocks`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Block(pub(crate) u32);
+
+/// The code compiled, as its functions: the last the code's own, and each other one the code of
+/// closures a function after it makes, which refer to it by its index.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Program<'a, 'gc> {
+    pub(crate) functions: Vec<'a, Function<'a, 'gc>>,
+}
+
+impl<'a, 'gc> Program<'a, 'gc> {
+    pub(crate) fn root(&self) -> &Function<'a, 'gc> {
+        self.functions.last().expect("a program has the code's own function")
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Function<'a, 'gc> {
@@ -70,13 +83,14 @@ pub(crate) enum Inst<'a, 'gc> {
     Call { dst: Val, f: Val, args: Vec<'a, Val> },
     /// A closure of each of `codes`, all made before any captures anything, so they can capture
     /// each other.
-    Closures { dsts: Vec<'a, Val>, codes: Vec<'a, Code<'a, 'gc>> },
+    Closures { dsts: Vec<'a, Val>, codes: Vec<'a, Code<'a>> },
 }
 
-/// A closure's code and what it captures, in the order its upvalues are.
+/// A closure's code, the index of its function in the [`Program`], and what it captures, in the
+/// order its upvalues are.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Code<'a, 'gc> {
-    pub(crate) function: Function<'a, 'gc>,
+pub(crate) struct Code<'a> {
+    pub(crate) function: u32,
     pub(crate) captures: Vec<'a, Captured>,
 }
 
@@ -154,16 +168,34 @@ impl End<'_> {
     }
 }
 
-/// The code compiled, of no parameters, as [`L5`](self).
-pub(crate) fn lower<'a, 'gc>(arena: &'a Arena, l4: &L4<'_, 'gc>) -> Result<Function<'a, 'gc>, CompileError> {
-    function(arena, None, Formals { params: &[], optional: 0, rest: None }, 0, l4)
+/// The code compiled, of no parameters, from `root` of `tree`, as [`L5`](self). Each function
+/// is lowered by a [`Builder`] of its own, those of closures being made on a stack above theirs.
+pub(crate) fn lower<'a, 'id, 'gc>(arena: &'a Arena, tree: &L4<'id, 'gc>, root: Id<'id>) -> Result<Program<'a, 'gc>, CompileError> {
+    let top = Formals { params: &[], optional: 0, rest: None };
+    let mut stack = vec![Builder::new(arena, tree, None, top, 0, root)];
+    let mut functions = std::vec::Vec::new();
+    loop {
+        let builder = stack.last_mut().expect("lowering until the code is done");
+        if let Some((fun, upvalues)) = builder.run()? {
+            let clos = tree[fun];
+            let formals = Formals { params: &tree[clos.params], optional: clos.optional, rest: clos.rest };
+            stack.push(Builder::new(arena, tree, Some(clos.id), formals, upvalues, clos.body));
+            continue;
+        }
+        let index = u32::try_from(functions.len()).map_err(|_| CompileError::TooManyConstants)?;
+        functions.push(stack.pop().expect("lowered").finish());
+        match stack.last_mut() {
+            Some(parent) => parent.give(index),
+            None => return Ok(Program { functions: functions.into_iter().collect_in(arena) }),
+        }
+    }
 }
 
-/// Panics if `f` isn't well-formed, as a debug build checks.
+/// Panics if `program` isn't well-formed, as a debug build checks.
 #[cfg(debug_assertions)]
-pub(crate) fn check(f: &Function<'_, '_>) {
-    if let Err(e) = verify(f) {
-        panic!("malformed L5: {e}\n{f}");
+pub(crate) fn check(program: &Program<'_, '_>) {
+    if let Err(e) = verify(program) {
+        panic!("malformed L5: {e}\n{program}");
     }
 }
 
@@ -174,72 +206,9 @@ struct Formals<'a> {
     rest: Option<Var>,
 }
 
-fn function<'a, 'gc>(
-    arena: &'a Arena,
-    id: Option<u32>,
-    formals: Formals<'_>,
-    upvalues: u32,
-    body: &L4<'_, 'gc>,
-) -> Result<Function<'a, 'gc>, CompileError> {
-    let mut sets = HashSet::default();
-    sets_in(body, &mut sets);
-    let mut b = Builder {
-        arena,
-        blocks: vec![Building { params: arena.vec(), insts: arena.vec(), end: None }],
-        cur: Block(0),
-        next: 0,
-        env: HashMap::default(),
-        voids: HashSet::default(),
-        assigned: std::vec::Vec::new(),
-        sets,
-        joins: HashMap::default(),
-        groups: std::vec::Vec::new(),
-        this: Val(0),
-    };
-    let this = b.fresh();
-    b.this = this;
-    let params = formals.params.iter().map(|&v| b.bind(v)).collect_in(arena);
-    let rest = formals.rest.map(|v| b.bind(v));
-    b.expr(body, Ctx::Tail)?;
-    let blocks = b.blocks.into_iter().map(|block| BlockData {
-        params: block.params,
-        insts: block.insts,
-        end: block.end.expect("every block made ends"),
-    });
-    Ok(Function { id, this, params, optional: formals.optional, rest, upvalues, blocks: blocks.collect_in(arena), values: b.next })
-}
-
-/// Adds the locals `expr` assigns in its frame to `sets`.
-fn sets_in(expr: &L4<'_, '_>, sets: &mut HashSet<Var>) {
-    match expr {
-        L4::Quote(_) | L4::Ref(_) | L4::Lambda(_) => {}
-        L4::Set(v, value) => {
-            sets.insert(*v);
-            sets_in(value, sets);
-        }
-        L4::If(a, b, c) => [a, b, c].into_iter().for_each(|e| sets_in(e, sets)),
-        L4::Seq(a, b) => {
-            sets_in(a, sets);
-            sets_in(b, sets);
-        }
-        L4::Let(binds, body) => {
-            for bind in binds {
-                if let Bind::Val(_, init) = bind {
-                    sets_in(init, sets);
-                }
-            }
-            sets_in(body, sets);
-        }
-        L4::Join { group, scope } => {
-            group.iter().for_each(|code| sets_in(&code.body, sets));
-            sets_in(scope, sets);
-        }
-        L4::App(f, args) => {
-            sets_in(f, sets);
-            args.iter().for_each(|a| sets_in(a, sets));
-        }
-        L4::Jump(_, args) | L4::Intrinsic(_, args) | L4::ApplyIntrinsic(_, args) => args.iter().for_each(|a| sets_in(a, sets)),
-    }
+/// Adds the locals the frame from `root` assigns to `sets`.
+fn sets_in<'id>(tree: &L4<'id, '_>, root: Id<'id>, sets: &mut HashSet<Var>) {
+    sets.extend(tree.frame(root).filter_map(|id| if let Node::Set(v, _) = tree[id] { Some(v) } else { None }));
 }
 
 struct Building<'a, 'gc> {
@@ -263,8 +232,14 @@ struct Join<'a> {
     group: usize,
 }
 
-struct Builder<'a, 'gc> {
+struct Builder<'a, 't, 'id, 'gc> {
     arena: &'a Arena,
+    tree: &'t L4<'id, 'gc>,
+    id: Option<u32>,
+    params: Vec<'a, Val>,
+    optional: u32,
+    rest: Option<Val>,
+    upvalues: u32,
     blocks: std::vec::Vec<Building<'a, 'gc>>,
     /// Where code goes.
     cur: Block,
@@ -280,9 +255,64 @@ struct Builder<'a, 'gc> {
     /// For each join group, the variables in scope it assigns.
     groups: std::vec::Vec<std::vec::Vec<Var>>,
     this: Val,
+    /// What's left to do, the next last.
+    todo: std::vec::Vec<Task<'a, 'id>>,
+    /// The value of the expression lowered last, if control goes on past it, which the task after
+    /// it takes.
+    ret: Option<Val>,
 }
 
-impl<'a, 'gc> Builder<'a, 'gc> {
+/// What lowering a function does next: an expression, or going on from one with its [`Builder::ret`].
+enum Task<'a, 'id> {
+    Expr(Id<'id>, Ctx),
+    /// An `if`'s arms, after its test.
+    Test { then: Id<'id>, other: Id<'id>, ctx: Ctx },
+    /// The other arm, from `other`, after the first, with the assigned variables' values before it.
+    Then { other: Id<'id>, ctx: Ctx, b: Block, vars: std::vec::Vec<Var>, before: std::vec::Vec<Val> },
+    /// Where the arms meet: the first's value, where it ended and the assigned variables there.
+    Else { x: Option<Val>, end_a: Block, env_a: std::vec::Vec<Val>, vars: std::vec::Vec<Var> },
+    /// A `Seq`'s second, after its first.
+    Seq(Id<'id>, Ctx),
+    Bind(Rest<'id>),
+    /// `v` bound to the value made, or as void to what an assignment made, then the next.
+    Bound { v: Var, void: bool, next: Rest<'id> },
+    /// A `Let`'s variables out of scope.
+    Unbind { binds: Span<'id, Bind<'id>>, assigned: usize },
+    Assign(Var),
+    /// Void, as an assignment's value.
+    Void,
+    Return,
+    /// A join group's scope or one of its codes, the `code`th with `n` assigned variables, done.
+    Join { codes: Span<'id, JoinCode<'id>>, carried: std::vec::Vec<Var>, rest: Option<Block>, lowered: std::vec::Vec<bool>, ctx: Ctx, code: Option<(usize, usize)> },
+    /// A call's arguments, after its callee.
+    Callee { args: Span<'id, Id<'id>>, tail: bool },
+    /// The `at`th of `args`, in `order` if any, after those before, whose values `vals` has.
+    Args { args: Span<'id, Id<'id>>, order: Option<Vec<'a, usize>>, at: usize, vals: Vec<'a, Val>, then: Use },
+    /// Closures of `funs`, bound to `dsts`, as many of whose codes as are lowered, and the
+    /// captures of the one being lowered.
+    Closures { funs: std::vec::Vec<Fun<'id>>, dsts: Vec<'a, Val>, codes: Vec<'a, Code<'a>>, captures: Option<Vec<'a, Captured>> },
+}
+
+/// A `Let`'s bindings from the `i`th, then its body.
+#[derive(Clone, Copy)]
+struct Rest<'id> {
+    binds: Span<'id, Bind<'id>>,
+    i: usize,
+    body: Id<'id>,
+    ctx: Ctx,
+}
+
+/// What arguments' values are for.
+#[derive(Clone, Copy)]
+enum Use {
+    Call(Val),
+    TailCall(Val),
+    Prim(Prim, bool),
+    TailPrim(Prim, bool),
+    Jump(Var),
+}
+
+impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
     fn fresh(&mut self) -> Val {
         let v = Val(self.next);
         self.next = self.next.checked_add(1).expect("fewer than 2^32 values");
@@ -346,103 +376,241 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         }
     }
 
-    /// Lowers `expr`, and returns its value if `ctx` is a value and control goes on past it.
-    fn expr(&mut self, expr: &L4<'_, 'gc>, ctx: Ctx) -> Result<Option<Val>, CompileError> {
-        match (expr, ctx) {
-            (L4::If(test, then, other), _) => self.branch(test, then, other, ctx),
-            (L4::Seq(a, b), _) => {
-                if self.effect(a)? {
-                    self.expr(b, ctx)
-                } else {
-                    Ok(None)
+    fn new(arena: &'a Arena, tree: &'t L4<'id, 'gc>, id: Option<u32>, formals: Formals<'_>, upvalues: u32, body: Id<'id>) -> Self {
+        let mut sets = HashSet::default();
+        sets_in(tree, body, &mut sets);
+        let mut b = Builder {
+            arena,
+            tree,
+            id,
+            params: arena.vec(),
+            optional: formals.optional,
+            rest: None,
+            upvalues,
+            blocks: vec![Building { params: arena.vec(), insts: arena.vec(), end: None }],
+            cur: Block(0),
+            next: 0,
+            env: HashMap::default(),
+            voids: HashSet::default(),
+            assigned: std::vec::Vec::new(),
+            sets,
+            joins: HashMap::default(),
+            groups: std::vec::Vec::new(),
+            this: Val(0),
+            todo: vec![Task::Expr(body, Ctx::Tail)],
+            ret: None,
+        };
+        b.this = b.fresh();
+        b.params = formals.params.iter().map(|&v| b.bind(v)).collect_in(arena);
+        b.rest = formals.rest.map(|v| b.bind(v));
+        b
+    }
+
+    fn finish(self) -> Function<'a, 'gc> {
+        let blocks = self.blocks.into_iter().map(|block| BlockData {
+            params: block.params,
+            insts: block.insts,
+            end: block.end.expect("every block made ends"),
+        });
+        let (id, this, params, optional, rest, upvalues) = (self.id, self.this, self.params, self.optional, self.rest, self.upvalues);
+        Function { id, this, params, optional, rest, upvalues, blocks: blocks.collect_in(self.arena), values: self.next }
+    }
+
+    /// Lowers until the function is done, or until the code of one of its closures is wanted,
+    /// which [`Builder::give`] gives it.
+    fn run(&mut self) -> Result<Option<(Fun<'id>, u32)>, CompileError> {
+        let (arena, tree) = (self.arena, self.tree);
+        while let Some(task) = self.todo.pop() {
+            match task {
+                Task::Expr(expr, ctx) => self.start(expr, ctx)?,
+                Task::Test { then, other, ctx } => {
+                    let Some(test) = self.ret else { continue };
+                    let (a, b) = (self.block(arena.vec()), self.block(arena.vec()));
+                    self.end(End::Branch { test, then: a, other: b });
+                    let vars = self.assigned.clone();
+                    let before = self.snapshot(vars.len());
+                    self.cur = a;
+                    self.todo.push(Task::Then { other, ctx, b, vars, before });
+                    self.todo.push(Task::Expr(then, ctx));
+                }
+                Task::Then { other, ctx, b, vars, before } => {
+                    let (x, end_a, env_a) = (self.ret, self.cur, self.snapshot(vars.len()));
+                    self.restore(&vars, &before);
+                    self.cur = b;
+                    self.todo.push(Task::Else { x, end_a, env_a, vars });
+                    self.todo.push(Task::Expr(other, ctx));
+                }
+                Task::Else { x, end_a, env_a, vars } => self.meet(x, end_a, &env_a, &vars),
+                Task::Seq(b, ctx) => {
+                    if self.ret.is_some() {
+                        self.todo.push(Task::Expr(b, ctx));
+                    }
+                }
+                Task::Bind(rest) => self.bind_next(rest),
+                Task::Bound { v, void, next } => {
+                    let Some(val) = self.ret else { continue };
+                    if void {
+                        self.voids.insert(v);
+                    } else {
+                        self.bind_to(v, val);
+                    }
+                    self.todo.push(Task::Bind(next));
+                }
+                Task::Unbind { binds, assigned } => self.unbind(tree[binds].iter().flat_map(|&bind| tree.vars(bind)), assigned),
+                Task::Assign(v) => {
+                    let Some(val) = self.ret else { continue };
+                    self.lookup(v)?;
+                    self.env.insert(v, val);
+                }
+                Task::Void => {
+                    if self.ret.is_some() {
+                        self.ret = Some(self.def(|dst| Inst::Const(dst, Value::VOID)));
+                    }
+                }
+                Task::Return => {
+                    if let Some(v) = self.ret.take() {
+                        self.end(End::Return(v));
+                    }
+                }
+                Task::Join { codes, carried, rest, lowered, ctx, code } => self.join_next(codes, carried, rest, lowered, ctx, code),
+                Task::Callee { args, tail } => {
+                    let Some(f) = self.ret else { continue };
+                    self.args(args, None, if tail { Use::TailCall(f) } else { Use::Call(f) });
+                }
+                Task::Args { args, order, at, mut vals, then } => {
+                    if at > 0 {
+                        let Some(val) = self.ret else { continue };
+                        match &order {
+                            Some(order) => vals[order[at - 1]] = val,
+                            None => vals.push(val),
+                        }
+                    }
+                    let list = &tree[args];
+                    if at == list.len() {
+                        self.finish_args(then, vals)?;
+                        continue;
+                    }
+                    let next = order.as_ref().map_or(at, |order| order[at]);
+                    self.todo.push(Task::Args { args, order, at: at + 1, vals, then });
+                    self.todo.push(Task::Expr(list[next], Ctx::Value));
+                }
+                Task::Closures { funs, dsts, codes, captures } => {
+                    debug_assert!(captures.is_none(), "the code of a closure is given before going on");
+                    let Some(&fun) = funs.get(codes.len()) else {
+                        self.ret = dsts.first().copied();
+                        self.push(Inst::Closures { dsts, codes });
+                        continue;
+                    };
+                    let clos = tree[fun];
+                    let mut captures = Vec::with_capacity_in(tree[clos.captures].len(), arena);
+                    for &src in &tree[clos.captures] {
+                        captures.push(match src {
+                            UpvalSource::Local(v) => Captured::Val(self.lookup(v)?),
+                            UpvalSource::Upvalue(u) => Captured::Upvalue(u),
+                            UpvalSource::SelfClosure => Captured::Val(self.this),
+                        });
+                    }
+                    let upvalues = u32::try_from(captures.len()).map_err(|_| CompileError::TooManyConstants)?;
+                    self.todo.push(Task::Closures { funs, dsts, codes, captures: Some(captures) });
+                    return Ok(Some((fun, upvalues)));
                 }
             }
-            (L4::Let(binds, body), _) => {
-                let n = self.assigned.len();
-                let out = if self.binds(binds)? { self.expr(body, ctx)? } else { None };
-                self.unbind(binds.iter().flat_map(Bind::vars), n);
-                Ok(out)
+        }
+        Ok(None)
+    }
+
+    /// The code of the closure [`Builder::run`] wanted last, by its index in the program.
+    fn give(&mut self, function: u32) {
+        let Some(Task::Closures { codes, captures, .. }) = self.todo.last_mut() else {
+            unreachable!("a closure's code is lowered when its closures want it")
+        };
+        codes.push(Code { function, captures: captures.take().expect("captured before its code was lowered") });
+    }
+
+    /// Starts lowering `expr`, whose value, if `ctx` is a value and control goes on past it, the
+    /// task after its own takes.
+    fn start(&mut self, expr: Id<'id>, ctx: Ctx) -> Result<(), CompileError> {
+        self.ret = None;
+        match (self.tree[expr], ctx) {
+            (Node::If(test, then, other), _) => {
+                self.todo.push(Task::Test { then, other, ctx });
+                self.todo.push(Task::Expr(test, Ctx::Value));
             }
-            (L4::Join { group, scope }, _) => self.join(group, scope, ctx),
-            (L4::Jump(id, args), _) => {
-                self.jump(*id, args)?;
-                Ok(None)
+            (Node::Seq(a, b), _) => {
+                self.todo.push(Task::Seq(b, ctx));
+                self.effect(a);
             }
-            (L4::App(f, args), Ctx::Tail) => {
-                let Some(f) = self.expr(f, Ctx::Value)? else { return Ok(None) };
-                let Some(args) = self.args(args)? else { return Ok(None) };
-                self.end(End::TailCall { f, args });
-                Ok(None)
+            (Node::Let(binds, body), _) => {
+                self.todo.push(Task::Unbind { binds, assigned: self.assigned.len() });
+                self.todo.push(Task::Bind(Rest { binds, i: 0, body, ctx }));
             }
-            (L4::Intrinsic(prim @ (Prim::Request(_) | Prim::Host(_)), args), Ctx::Tail) => self.tail_prim(*prim, args, false),
-            (L4::ApplyIntrinsic(prim @ Prim::Request(_), args), Ctx::Tail) => self.tail_prim(*prim, args, true),
+            (Node::Join(scope, codes), _) => self.join(codes, scope, ctx),
+            (Node::Jump(id, args), _) => self.jump(id, args)?,
+            (Node::App(f, args), _) => {
+                self.todo.push(Task::Callee { args, tail: ctx == Ctx::Tail });
+                self.todo.push(Task::Expr(f, Ctx::Value));
+            }
+            (Node::Intrinsic(prim @ (Prim::Request(_) | Prim::Host(_)), args), Ctx::Tail) => self.args(args, None, Use::TailPrim(prim, false)),
+            (Node::ApplyIntrinsic(prim @ Prim::Request(_), args), Ctx::Tail) => self.args(args, None, Use::TailPrim(prim, true)),
             (_, Ctx::Tail) => {
-                if let Some(v) = self.expr(expr, Ctx::Value)? {
-                    self.end(End::Return(v));
-                }
-                Ok(None)
+                self.todo.push(Task::Return);
+                self.todo.push(Task::Expr(expr, Ctx::Value));
             }
-            (L4::Quote(value), Ctx::Value) => Ok(Some(self.def(|dst| Inst::Const(dst, *value)))),
-            (L4::Ref(VarRef::Local(v)), Ctx::Value) => Ok(Some(self.lookup(*v)?)),
-            (L4::Ref(VarRef::Upvalue(index)), Ctx::Value) => Ok(Some(self.def(|dst| Inst::Upvalue(dst, *index)))),
-            (L4::Ref(VarRef::SelfClosure), Ctx::Value) => Ok(Some(self.this)),
-            (L4::Set(v, value), Ctx::Value) => {
-                if !self.assign(*v, value)? {
-                    return Ok(None);
-                }
-                Ok(Some(self.def(|dst| Inst::Const(dst, Value::VOID))))
+            (Node::Quote(value), Ctx::Value) => self.ret = Some(self.def(|dst| Inst::Const(dst, value))),
+            (Node::Ref(VarRef::Local(v)), Ctx::Value) => self.ret = Some(self.lookup(v)?),
+            (Node::Ref(VarRef::Upvalue(index)), Ctx::Value) => self.ret = Some(self.def(|dst| Inst::Upvalue(dst, index))),
+            (Node::Ref(VarRef::SelfClosure), Ctx::Value) => self.ret = Some(self.this),
+            (Node::Set(v, value), Ctx::Value) => {
+                self.todo.push(Task::Void);
+                self.todo.push(Task::Assign(v));
+                self.todo.push(Task::Expr(value, Ctx::Value));
             }
-            (L4::Lambda(clos), Ctx::Value) => Ok(self.closures(&[clos], &[])?.first().copied()),
-            (L4::App(f, args), Ctx::Value) => {
-                let Some(f) = self.expr(f, Ctx::Value)? else { return Ok(None) };
-                let Some(args) = self.args(args)? else { return Ok(None) };
-                Ok(Some(self.def(|dst| Inst::Call { dst, f, args })))
-            }
-            (L4::Intrinsic(prim, args), Ctx::Value) => self.prim(*prim, args, false),
-            (L4::ApplyIntrinsic(prim, args), Ctx::Value) => self.prim(*prim, args, true),
+            (Node::Lambda(fun), Ctx::Value) => self.closures(vec![fun], &[]),
+            (Node::Intrinsic(prim, args), Ctx::Value) => self.args(args, None, Use::Prim(prim, false)),
+            (Node::ApplyIntrinsic(prim, args), Ctx::Value) => self.args(args, None, Use::Prim(prim, true)),
+        }
+        Ok(())
+    }
+
+    /// Starts lowering `expr` for what it does, after which control goes on if the value the next
+    /// task takes is something.
+    fn effect(&mut self, expr: Id<'id>) {
+        if let Node::Set(v, value) = self.tree[expr] {
+            self.todo.push(Task::Assign(v));
+            self.todo.push(Task::Expr(value, Ctx::Value));
+        } else {
+            self.todo.push(Task::Expr(expr, Ctx::Value));
         }
     }
 
-    /// Lowers `expr` for what it does, and returns whether control goes on past it.
-    fn effect(&mut self, expr: &L4<'_, 'gc>) -> Result<bool, CompileError> {
-        if let L4::Set(v, value) = expr {
-            return self.assign(*v, value);
-        }
-        Ok(self.expr(expr, Ctx::Value)?.is_some())
-    }
-
-    /// Binds each of `binds` in turn, and returns whether control goes on past them.
-    #[inline(never)]
-    fn binds(&mut self, binds: &[Bind4<'_, 'gc>]) -> Result<bool, CompileError> {
-        for bind in binds {
-            match bind {
+    /// The `rest.i`th binding, control having gone on past those before, or the body after the last.
+    fn bind_next(&mut self, rest: Rest<'id>) {
+        let tree = self.tree;
+        let Some(&bind) = tree[rest.binds].get(rest.i) else {
+            self.todo.push(Task::Expr(rest.body, rest.ctx));
+            return;
+        };
+        let next = Rest { i: rest.i + 1, ..rest };
+        match bind {
+            Bind::Val(v, init) => match tree[init] {
                 // A body's forms before its last are bound to what they return, as often an
                 // assignment's, which is void.
-                Bind::Val(v, L4::Set(target, value)) if !self.sets.contains(v) => {
-                    if !self.assign(*target, value)? {
-                        return Ok(false);
-                    }
-                    self.voids.insert(*v);
+                Node::Set(target, value) if !self.sets.contains(&v) => {
+                    self.todo.push(Task::Bound { v, void: true, next });
+                    self.todo.push(Task::Assign(target));
+                    self.todo.push(Task::Expr(value, Ctx::Value));
                 }
-                Bind::Val(v, init) => {
-                    let Some(val) = self.expr(init, Ctx::Value)? else { return Ok(false) };
-                    self.bind_to(*v, val);
+                _ => {
+                    self.todo.push(Task::Bound { v, void: false, next });
+                    self.todo.push(Task::Expr(init, Ctx::Value));
                 }
-                Bind::Fix(group) => {
-                    let codes: std::vec::Vec<&Closure<'_, 'gc>> = group.iter().map(|(_, c)| c).collect();
-                    let vars: std::vec::Vec<Var> = group.iter().map(|(v, _)| *v).collect();
-                    self.closures(&codes, &vars)?;
-                }
+            },
+            Bind::Fix(group) => {
+                self.todo.push(Task::Bind(next));
+                let vars: std::vec::Vec<Var> = tree[group].iter().map(|&(v, _)| v).collect();
+                self.closures(tree[group].iter().map(|&(_, fun)| fun).collect(), &vars);
             }
         }
-        Ok(true)
-    }
-
-    fn assign(&mut self, v: Var, value: &L4<'_, 'gc>) -> Result<bool, CompileError> {
-        let Some(val) = self.expr(value, Ctx::Value)? else { return Ok(false) };
-        self.lookup(v)?;
-        self.env.insert(v, val);
-        Ok(true)
     }
 
     fn unbind(&mut self, vars: impl IntoIterator<Item = Var>, assigned: usize) {
@@ -453,59 +621,47 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         self.assigned.truncate(assigned);
     }
 
-    fn args(&mut self, args: &[L4<'_, 'gc>]) -> Result<Option<Vec<'a, Val>>, CompileError> {
-        let mut vals = Vec::with_capacity_in(args.len(), self.arena);
-        for arg in args {
-            let Some(val) = self.expr(arg, Ctx::Value)? else { return Ok(None) };
-            vals.push(val);
-        }
-        Ok(Some(vals))
+    /// Starts lowering `args`, in `order` if any, for `then`.
+    fn args(&mut self, args: Span<'id, Id<'id>>, order: Option<Vec<'a, usize>>, then: Use) {
+        let n = self.tree[args].len();
+        let vals = if order.is_some() { self.arena.vec_of(self.this, n) } else { Vec::with_capacity_in(n, self.arena) };
+        self.todo.push(Task::Args { args, order, at: 0, vals, then });
     }
 
-    /// `args`' values, evaluated in `order`.
-    fn args_in(&mut self, args: &[L4<'_, 'gc>], order: &[usize]) -> Result<Option<Vec<'a, Val>>, CompileError> {
-        let mut vals = self.arena.vec_of(self.this, args.len());
-        for &i in order {
-            let Some(val) = self.expr(&args[i], Ctx::Value)? else { return Ok(None) };
-            vals[i] = val;
-        }
-        Ok(Some(vals))
+    fn finish_args(&mut self, then: Use, args: Vec<'a, Val>) -> Result<(), CompileError> {
+        self.ret = match then {
+            Use::Call(f) => Some(self.def(|dst| Inst::Call { dst, f, args })),
+            Use::TailCall(f) => {
+                self.end(End::TailCall { f, args });
+                None
+            }
+            Use::Prim(prim, spread) => Some(self.def(|dst| Inst::Prim { dst, prim, args, spread })),
+            Use::TailPrim(prim, spread) => {
+                self.end(End::TailPrim { prim, args, spread });
+                None
+            }
+            Use::Jump(id) => {
+                self.jump_with(id, args)?;
+                None
+            }
+        };
+        Ok(())
     }
 
-    fn prim(&mut self, prim: Prim, args: &[L4<'_, 'gc>], spread: bool) -> Result<Option<Val>, CompileError> {
-        let Some(args) = self.args(args)? else { return Ok(None) };
-        Ok(Some(self.def(|dst| Inst::Prim { dst, prim, args, spread })))
-    }
-
-    fn tail_prim(&mut self, prim: Prim, args: &[L4<'_, 'gc>], spread: bool) -> Result<Option<Val>, CompileError> {
-        let Some(args) = self.args(args)? else { return Ok(None) };
-        self.end(End::TailPrim { prim, args, spread });
-        Ok(None)
-    }
-
-    #[inline(never)]
-    fn branch(&mut self, test: &L4<'_, 'gc>, then: &L4<'_, 'gc>, other: &L4<'_, 'gc>, ctx: Ctx) -> Result<Option<Val>, CompileError> {
-        let Some(test) = self.expr(test, Ctx::Value)? else { return Ok(None) };
-        let (a, b) = (self.block(self.arena.vec()), self.block(self.arena.vec()));
-        self.end(End::Branch { test, then: a, other: b });
-        let n = self.assigned.len();
-        let vars = self.assigned.clone();
-        let before = self.snapshot(n);
-        self.cur = a;
-        let x = self.expr(then, ctx)?;
-        let (end_a, env_a) = (self.cur, self.snapshot(n));
-        self.restore(&vars, &before);
-        self.cur = b;
-        let y = self.expr(other, ctx)?;
-        let (end_b, env_b) = (self.cur, self.snapshot(n));
+    /// Where an `if`'s arms meet, the first having ended in `end_a` with `x` and `env_a` the values
+    /// of `vars`, the second where control is.
+    fn meet(&mut self, x: Option<Val>, end_a: Block, env_a: &[Val], vars: &[Var]) {
+        let y = self.ret;
+        let (end_b, env_b) = (self.cur, self.snapshot(vars.len()));
         let (x, y) = match (x, y) {
-            (None, None) => return Ok(None),
+            (None, None) => return,
             (Some(x), None) => {
                 self.cur = end_a;
-                self.restore(&vars, &env_a);
-                return Ok(Some(x));
+                self.restore(vars, env_a);
+                self.ret = Some(x);
+                return;
             }
-            (None, Some(y)) => return Ok(Some(y)),
+            (None, Some(_)) => return,
             (Some(x), Some(y)) => (x, y),
         };
         let mut params = self.arena.vec();
@@ -535,55 +691,67 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         for (v, p) in merged {
             self.env.insert(v, p);
         }
-        Ok(Some(result))
+        self.ret = Some(result);
     }
 
-    /// `scope`, then the code of each join of `group` something jumps to. In a value's place, they
-    /// all go on to one block, taking the value and the group's assigned variables.
-    #[inline(never)]
-    fn join(&mut self, group: &[JoinCode<'_, 'gc>], scope: &L4<'_, 'gc>, ctx: Ctx) -> Result<Option<Val>, CompileError> {
+    /// Starts on `scope`, then the code of each join of `codes` something jumps to. In a value's
+    /// place, they all go on to one block, taking the value and the group's assigned variables.
+    fn join(&mut self, codes: Span<'id, JoinCode<'id>>, scope: Id<'id>, ctx: Ctx) {
+        let tree = self.tree;
+        let group = &tree[codes];
         let carried: std::vec::Vec<Var> = if self.assigned.is_empty() {
             std::vec::Vec::new()
         } else {
             let mut sets = HashSet::default();
-            sets_in(scope, &mut sets);
-            group.iter().for_each(|code| sets_in(&code.body, &mut sets));
+            sets_in(tree, scope, &mut sets);
+            group.iter().for_each(|code| sets_in(tree, code.body, &mut sets));
             self.assigned.iter().copied().filter(|v| sets.contains(v)).collect()
         };
         let index = self.groups.len();
         self.groups.push(carried.clone());
         for code in group {
-            let params = code.params.iter().copied().collect_in(self.arena);
+            let params = tree[code.params].iter().copied().collect_in(self.arena);
             self.joins.insert(code.id, Join { block: None, params, group: index });
         }
-        let mut rest = None;
-        let out = self.expr(scope, ctx)?;
-        self.go_on(out, &carried, &mut rest);
-        let mut lowered = vec![false; group.len()];
-        while let Some(i) = (0..group.len()).find(|&i| !lowered[i] && self.joins[&group[i].id].block.is_some()) {
+        let lowered = vec![false; group.len()];
+        self.todo.push(Task::Join { codes, carried, rest: None, lowered, ctx, code: None });
+        self.todo.push(Task::Expr(scope, ctx));
+    }
+
+    /// After a join group's scope or one of its codes: the next code something jumps to, or what
+    /// they go on to.
+    fn join_next(&mut self, codes: Span<'id, JoinCode<'id>>, carried: std::vec::Vec<Var>, mut rest: Option<Block>, mut lowered: std::vec::Vec<bool>, ctx: Ctx, code: Option<(usize, usize)>) {
+        let tree = self.tree;
+        let group = &tree[codes];
+        if let Some((i, n)) = code {
+            self.unbind(tree[group[i].params].iter().copied(), n);
+        }
+        self.go_on(self.ret, &carried, &mut rest);
+        if let Some(i) = (0..group.len()).find(|&i| !lowered[i] && self.joins[&group[i].id].block.is_some()) {
             lowered[i] = true;
-            let code = &group[i];
+            let code = group[i];
             let block = self.joins[&code.id].block.expect("found jumped to");
             self.cur = block;
             let params = self.blocks[block.0 as usize].params.to_vec();
-            let (declared, assigned) = params.split_at(code.params.len());
+            let (declared, assigned) = params.split_at(tree[code.params].len());
             let n = self.assigned.len();
             self.restore(&carried, assigned);
-            for (&v, &p) in code.params.iter().zip(declared) {
+            for (&v, &p) in tree[code.params].iter().zip(declared) {
                 self.bind_to(v, p);
             }
-            let out = self.expr(&code.body, ctx)?;
-            self.unbind(code.params.iter().copied(), n);
-            self.go_on(out, &carried, &mut rest);
+            self.todo.push(Task::Join { codes, carried, rest, lowered, ctx, code: Some((i, n)) });
+            self.todo.push(Task::Expr(code.body, ctx));
+            return;
         }
         for code in group {
             self.joins.remove(&code.id);
         }
-        let Some(rest) = rest else { return Ok(None) };
-        self.cur = rest;
-        let params = self.blocks[rest.0 as usize].params.to_vec();
-        self.restore(&carried, &params[1..]);
-        Ok(Some(params[0]))
+        self.ret = rest.map(|rest| {
+            self.cur = rest;
+            let params = self.blocks[rest.0 as usize].params.to_vec();
+            self.restore(&carried, &params[1..]);
+            params[0]
+        });
     }
 
     /// Jumps from where control is, with `out`, if it goes on, to `rest`, made if it isn't yet.
@@ -603,16 +771,16 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         self.end(End::Jump(to, args));
     }
 
-    #[inline(never)]
-    fn jump(&mut self, id: Var, args: &[L4<'_, 'gc>]) -> Result<(), CompileError> {
+    fn jump(&mut self, id: Var, args: Span<'id, Id<'id>>) -> Result<(), CompileError> {
+        let tree = self.tree;
         let join = self.joins.get(&id).ok_or(CompileError::Unbound(id))?;
-        let order = order(self.arena, args, &join.params);
-        let Some(mut vals) = (match order {
-            Some(order) => self.args_in(args, &order)?,
-            None => self.args(args)?,
-        }) else {
-            return Ok(());
-        };
+        let order = order(self.arena, tree, &tree[args], &join.params);
+        self.args(args, order, Use::Jump(id));
+        Ok(())
+    }
+
+    /// A jump to join `id` with `vals` for its parameters.
+    fn jump_with(&mut self, id: Var, mut vals: Vec<'a, Val>) -> Result<(), CompileError> {
         let join = self.joins.get(&id).ok_or(CompileError::Unbound(id))?;
         let (block, params, group) = (join.block, join.params.len(), join.group);
         let carried = &self.groups[group];
@@ -631,45 +799,30 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         Ok(())
     }
 
-    /// Closures of `codes`, bound to `vars` if they're a group's, before they capture them.
-    #[inline(never)]
-    fn closures(&mut self, codes: &[&Closure<'_, 'gc>], vars: &[Var]) -> Result<Vec<'a, Val>, CompileError> {
+    /// Starts on closures of `funs`, bound to `vars` if they're a group's, before they capture them.
+    fn closures(&mut self, funs: std::vec::Vec<Fun<'id>>, vars: &[Var]) {
         let arena = self.arena;
-        let dsts: Vec<'a, Val> = codes.iter().map(|_| self.fresh()).collect_in(arena);
+        let dsts: Vec<'a, Val> = funs.iter().map(|_| self.fresh()).collect_in(arena);
         for (&v, &dst) in vars.iter().zip(&dsts) {
             self.bind_to(v, dst);
         }
-        let mut lowered = Vec::with_capacity_in(codes.len(), arena);
-        for clos in codes {
-            let mut captures = Vec::with_capacity_in(clos.captures.len(), arena);
-            for &src in &clos.captures {
-                captures.push(match src {
-                    UpvalSource::Local(v) => Captured::Val(self.lookup(v)?),
-                    UpvalSource::Upvalue(u) => Captured::Upvalue(u),
-                    UpvalSource::SelfClosure => Captured::Val(self.this),
-                });
-            }
-            let upvalues = u32::try_from(captures.len()).map_err(|_| CompileError::TooManyConstants)?;
-            let formals = Formals { params: &clos.params, optional: clos.optional, rest: clos.rest };
-            lowered.push(Code { function: function(arena, Some(clos.id), formals, upvalues, &clos.body)?, captures });
-        }
-        self.push(Inst::Closures { dsts: dsts.clone(), codes: lowered });
-        Ok(dsts)
+        let codes = Vec::with_capacity_in(funs.len(), arena);
+        self.todo.push(Task::Closures { funs, dsts, codes, captures: None });
     }
 }
 
 /// The order to evaluate a jump's `args` to `params` in, if they can go in any: each after the
 /// others that read the parameter it's for where it can be, so the value it replaces is dead by
 /// the time it's made, and can make way for it.
-fn order<'a>(arena: &'a Arena, args: &[L4<'_, '_>], params: &[Var]) -> Option<Vec<'a, usize>> {
+fn order<'a, 'id>(arena: &'a Arena, tree: &L4<'id, '_>, args: &[Id<'id>], params: &[Var]) -> Option<Vec<'a, usize>> {
     let n = args.len();
-    if !(2..=16).contains(&n) || n != params.len() || !args.iter().all(reorderable) {
+    if !(2..=16).contains(&n) || n != params.len() || !args.iter().all(|&arg| reorderable(tree, arg)) {
         return None;
     }
     let mut done = arena.vec_of(false, n);
     let mut order = Vec::with_capacity_in(n, arena);
     while order.len() < n {
-        let ready = |i: usize| !done[i] && !(0..n).any(|j| j != i && !done[j] && reads_local(&args[j], params[i]));
+        let ready = |i: usize| !done[i] && !(0..n).any(|j| j != i && !done[j] && reads_local(tree, args[j], params[i]));
         let i = (0..n).find(|&i| ready(i)).or_else(|| (0..n).find(|&i| !done[i])).expect("one is left");
         done[i] = true;
         order.push(i);
@@ -678,57 +831,26 @@ fn order<'a>(arena: &'a Arena, args: &[L4<'_, '_>], params: &[Var]) -> Option<Ve
 }
 
 /// Whether `expr` can be evaluated before or after others like it, doing nothing but make a value.
-pub(crate) fn reorderable<'gc>(expr: &L4<'_, 'gc>) -> bool {
-    match expr {
-        L4::Quote(_) | L4::Ref(_) | L4::Lambda(_) => true,
-        L4::If(a, b, c) => reorderable(a) && reorderable(b) && reorderable(c),
-        L4::Seq(a, b) => reorderable(a) && reorderable(b),
-        L4::Let(binds, body) => binds.iter().all(|b| matches!(b, Bind::Val(_, init) if reorderable(init))) && reorderable(body),
-        L4::Intrinsic(Prim::Host(h), args) => h.purity != Purity::Impure && args.iter().all(reorderable),
-        L4::Intrinsic(Prim::Slot(SlotOp::Load | SlotOp::LoadChecked, _), _) => true,
-        L4::Intrinsic(Prim::Intrinsic(i), args) => {
-            (i.is_discardable()
-                || matches!(
-                    i,
-                    Intrinsic::Add
-                        | Intrinsic::Sub
-                        | Intrinsic::Mul
-                        | Intrinsic::Car
-                        | Intrinsic::Cdr
-                        | Intrinsic::Caar
-                        | Intrinsic::Cadr
-                        | Intrinsic::Cdar
-                        | Intrinsic::Cddr
-                        | Intrinsic::Unbox
-                ))
-                && args.iter().all(reorderable)
-        }
+pub(crate) fn reorderable<'id>(tree: &L4<'id, '_>, expr: Id<'id>) -> bool {
+    tree.frame(expr).all(|id| match tree[id] {
+        Node::Quote(_) | Node::Ref(_) | Node::Lambda(_) | Node::If(..) | Node::Seq(..) => true,
+        Node::Let(binds, _) => tree[binds].iter().all(|bind| matches!(bind, Bind::Val(..))),
+        Node::Intrinsic(Prim::Host(h), _) => h.purity.is_reorderable(),
+        Node::Intrinsic(Prim::Slot(SlotOp::Load | SlotOp::LoadChecked, _), _) => true,
+        Node::Intrinsic(Prim::Intrinsic(i), _) => i.is_reorderable(),
         _ => false,
-    }
+    })
 }
 
 /// Whether `expr` reads or assigns local `target`, or captures it.
-pub(crate) fn reads_local<'gc>(expr: &L4<'_, 'gc>, target: Var) -> bool {
-    match expr {
-        L4::Quote(_) => false,
-        L4::Ref(VarRef::Local(v)) => *v == target,
-        L4::Set(v, value) => *v == target || reads_local(value, target),
-        L4::Ref(_) => false,
-        L4::If(a, b, c) => reads_local(a, target) || reads_local(b, target) || reads_local(c, target),
-        L4::Seq(a, b) => reads_local(a, target) || reads_local(b, target),
-        L4::Let(binds, body) => {
-            binds.iter().any(|b| match b {
-                Bind::Val(_, init) => reads_local(init, target),
-                Bind::Fix(group) => group.iter().any(|(_, clos)| clos.captures.contains(&UpvalSource::Local(target))),
-            }) || reads_local(body, target)
-        }
-        L4::Jump(_, args) | L4::Intrinsic(_, args) | L4::ApplyIntrinsic(_, args) => {
-            args.iter().any(|a| reads_local(a, target))
-        }
-        L4::Join { group, scope } => reads_local(scope, target) || group.iter().any(|code| reads_local(&code.body, target)),
-        L4::App(f, args) => reads_local(f, target) || args.iter().any(|a| reads_local(a, target)),
-        L4::Lambda(clos) => clos.captures.contains(&UpvalSource::Local(target)),
-    }
+pub(crate) fn reads_local<'id>(tree: &L4<'id, '_>, expr: Id<'id>, target: Var) -> bool {
+    let captures = |fun: Fun<'id>| tree[tree[fun].captures].contains(&UpvalSource::Local(target));
+    tree.frame(expr).any(|id| match tree[id] {
+        Node::Ref(VarRef::Local(v)) | Node::Set(v, _) => v == target,
+        Node::Lambda(fun) => captures(fun),
+        Node::Let(binds, _) => tree[binds].iter().any(|&bind| matches!(bind, Bind::Fix(group) if tree[group].iter().any(|&(_, fun)| captures(fun)))),
+        _ => false,
+    })
 }
 
 /// Where a value is defined: its block, and 0 for the block's start or 1 past the instruction.
@@ -770,7 +892,35 @@ impl Defs {
 /// Checks that `f` and the functions of its closures are well-formed: each value defined once,
 /// where it's used, and every block reached, jumped to with as many values as it takes.
 #[cfg(any(debug_assertions, test))]
-pub(crate) fn verify(f: &Function<'_, '_>) -> Result<(), String> {
+/// Whether each of `program`'s functions is well-formed, and is the code of closures of one
+/// function after it, but the last.
+#[cfg(any(debug_assertions, test))]
+pub(crate) fn verify(program: &Program<'_, '_>) -> Result<(), String> {
+    let functions = &program.functions;
+    if functions.is_empty() {
+        return Err("no functions".into());
+    }
+    let mut made = vec![0usize; functions.len()];
+    for (i, f) in functions.iter().enumerate() {
+        verify_function(f, &functions[..i]).map_err(|e| format!("function {i}: {e}"))?;
+        for block in &f.blocks {
+            for inst in &block.insts {
+                if let Inst::Closures { codes, .. } = inst {
+                    codes.iter().for_each(|code| made[code.function as usize] += 1);
+                }
+            }
+        }
+    }
+    let last = functions.len() - 1;
+    match made.iter().enumerate().find(|&(i, &n)| n != usize::from(i < last)) {
+        Some((i, n)) => Err(format!("function {i} is the code of closures {n} functions make")),
+        None => Ok(()),
+    }
+}
+
+/// Whether `f` is well-formed, its closures' codes among `before`.
+#[cfg(any(debug_assertions, test))]
+pub(crate) fn verify_function(f: &Function<'_, '_>, before: &[Function<'_, '_>]) -> Result<(), String> {
     let n = f.blocks.len();
     if n == 0 {
         return Err("no blocks".into());
@@ -832,10 +982,12 @@ pub(crate) fn verify(f: &Function<'_, '_>) -> Result<(), String> {
                         if let Some(&Captured::Upvalue(u)) = code.captures.iter().find(|c| matches!(c, Captured::Upvalue(u) if *u >= f.upvalues)) {
                             return Err(format!("b{b} captures upvalue {u} of {}", f.upvalues));
                         }
-                        if code.function.upvalues as usize != code.captures.len() {
-                            return Err(format!("a closure in b{b} captures {} values for {} upvalues", code.captures.len(), code.function.upvalues));
+                        let Some(function) = before.get(code.function as usize) else {
+                            return Err(format!("a closure in b{b} has the code of function {}, which isn't before it", code.function));
+                        };
+                        if function.upvalues as usize != code.captures.len() {
+                            return Err(format!("a closure in b{b} captures {} values for {} upvalues", code.captures.len(), function.upvalues));
                         }
-                        verify(&code.function)?;
                     }
                 }
                 _ => {}
@@ -999,9 +1151,22 @@ fn args(args: &[Val]) -> String {
     if args.is_empty() { String::new() } else { format!(" {}", Vals(args)) }
 }
 
-/// Prints the function, then those of its closures.
-impl fmt::Display for Function<'_, '_> {
+/// Prints the code's function, then those of its closures, each before those of its own.
+impl fmt::Display for Program<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut todo = vec![self.root()];
+        while let Some(function) = todo.pop() {
+            let at = todo.len();
+            function.print(f, &self.functions, &mut todo)?;
+            todo[at..].reverse();
+        }
+        Ok(())
+    }
+}
+
+impl<'a, 'gc> Function<'a, 'gc> {
+    /// Prints the function, adding those of its closures, among `functions`, to `nested`.
+    fn print<'p>(&self, f: &mut fmt::Formatter<'_>, functions: &'p [Function<'a, 'gc>], nested: &mut std::vec::Vec<&'p Function<'a, 'gc>>) -> fmt::Result {
         match self.id {
             Some(id) => write!(f, "function {id}")?,
             None => write!(f, "function")?,
@@ -1015,7 +1180,6 @@ impl fmt::Display for Function<'_, '_> {
             write!(f, " . {rest}")?;
         }
         writeln!(f, ") closure {}:", self.this)?;
-        let mut nested = std::vec::Vec::new();
         for (b, block) in self.blocks.iter().enumerate() {
             if block.params.is_empty() {
                 writeln!(f, "b{b}:")?;
@@ -1031,7 +1195,8 @@ impl fmt::Display for Function<'_, '_> {
                     Inst::Closures { dsts, codes } => {
                         write!(f, "  {} = closures", Vals(dsts))?;
                         for code in codes {
-                            write!(f, " [{}", code.function.id.unwrap_or(0))?;
+                            let function = &functions[code.function as usize];
+                            write!(f, " [{}", function.id.unwrap_or(0))?;
                             for c in &code.captures {
                                 match c {
                                     Captured::Val(v) => write!(f, " {v}")?,
@@ -1039,7 +1204,7 @@ impl fmt::Display for Function<'_, '_> {
                                 }
                             }
                             write!(f, "]")?;
-                            nested.push(&code.function);
+                            nested.push(function);
                         }
                         writeln!(f)?;
                     }
@@ -1052,9 +1217,6 @@ impl fmt::Display for Function<'_, '_> {
                 End::TailCall { f: callee, args: a } => writeln!(f, "  tail-call {callee}{}", args(a))?,
                 End::TailPrim { prim, args: a, spread: s } => writeln!(f, "  tail {}{}{}", spread(*s), PrimName(*prim), args(a))?,
             }
-        }
-        for function in nested {
-            write!(f, "{function}")?;
         }
         Ok(())
     }
