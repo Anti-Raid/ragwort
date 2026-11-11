@@ -91,18 +91,35 @@ enum Aim {
     Reg(u8),
 }
 
-/// For each value an add of a small constant defines, the constant, which `AddImm` has without
-/// it in a register.
-type Imms<'t> = AVec<'t, Option<i16>>;
+/// The constants an instruction has in itself, in place of registers that hold them. Its
+/// first argument is the only one it reads.
+#[derive(Clone, Copy)]
+enum Imm<'gc> {
+    /// `(+ a k)` of a small `k`, which `AddImm` has.
+    Add(i16),
+    /// `(struct-field s k)`, which `StructField` has the index of.
+    Field(u16),
+    /// `(struct-ref s type k)`, which `StructRef` has the type and the index of.
+    FieldOf(Value<'gc>, u8),
+}
 
-fn imms<'t>(arena: &'t Arena, f: &Function<'_, '_>) -> Imms<'t> {
-    let mut small = arena.vec_of(None, f.values as usize);
+/// For each value an instruction with constants in itself defines, the constants.
+type Imms<'t, 'gc> = AVec<'t, Option<Imm<'gc>>>;
+
+fn imms<'t, 'gc>(arena: &'t Arena, f: &Function<'_, 'gc>) -> Imms<'t, 'gc> {
+    let mut constants: AVec<'t, Option<Value<'gc>>> = arena.vec_of(None, f.values as usize);
     let mut imms = arena.vec_of(None, f.values as usize);
     for inst in f.blocks.iter().flat_map(|block| &block.insts) {
         match inst {
-            Inst::Const(dst, value) => small[dst.0 as usize] = value.as_fixnum().and_then(|k| i16::try_from(k).ok()),
-            Inst::Prim { dst, prim: Prim::Intrinsic(Intrinsic::Add), args, spread: false } if let [_, k] = args.as_slice() => {
-                imms[dst.0 as usize] = small[k.0 as usize];
+            Inst::Const(dst, value) => constants[dst.0 as usize] = Some(*value),
+            Inst::Prim { dst, prim: Prim::Intrinsic(intrinsic), args, spread: false } => {
+                let fixnum = |v: &Val| constants[v.0 as usize].and_then(|k| k.as_fixnum());
+                imms[dst.0 as usize] = match (intrinsic, args.as_slice()) {
+                    (Intrinsic::Add, [_, k]) => fixnum(k).and_then(|k| i16::try_from(k).ok()).map(Imm::Add),
+                    (Intrinsic::StructField, [_, k]) => fixnum(k).and_then(|k| u16::try_from(k).ok()).map(Imm::Field),
+                    (Intrinsic::StructRef, [_, kind, k]) => constants[kind.0 as usize].zip(fixnum(k).and_then(|k| u8::try_from(k).ok())).map(|(kind, k)| Imm::FieldOf(kind, k)),
+                    _ => None,
+                };
             }
             _ => {}
         }
@@ -111,8 +128,8 @@ fn imms<'t>(arena: &'t Arena, f: &Function<'_, '_>) -> Imms<'t> {
 }
 
 /// What an instruction reads before it defines anything: a group's closures capture each other
-/// once they're all made, and an add of a small constant has it in the instruction.
-fn each_read(inst: &Inst<'_, '_>, imms: &Imms<'_>, mut f: impl FnMut(Val)) {
+/// once they're all made, and one with constants in itself reads only its first argument.
+fn each_read(inst: &Inst<'_, '_>, imms: &Imms<'_, '_>, mut f: impl FnMut(Val)) {
     match inst {
         Inst::Prim { dst, args, .. } if imms[dst.0 as usize].is_some() => f(args[0]),
         Inst::Closures { dsts, .. } => inst.each_use(|v| {
@@ -146,7 +163,7 @@ const NOWHERE: u32 = u32::MAX;
 /// What's live out of each block, found by walking back from each block a value's used in
 /// through those before it, as far as where it's defined, so it takes as much room as is live
 /// rather than blocks times values.
-fn liveness<'t>(arena: &'t Arena, f: &Function<'_, '_>, imms: &Imms<'_>) -> Live<'t> {
+fn liveness<'t>(arena: &'t Arena, f: &Function<'_, '_>, imms: &Imms<'_, '_>) -> Live<'t> {
     let (n, values) = (f.blocks.len(), f.values as usize);
     let mut preds = arena.vec_of(arena.vec(), n);
     for (b, block) in f.blocks.iter().enumerate() {
@@ -217,7 +234,7 @@ fn colour<'t>(
     arena: &'t Arena,
     f: &Function<'_, '_>,
     live: &Live<'_>,
-    imms: &Imms<'_>,
+    imms: &Imms<'_, '_>,
     pinned: &[bool],
     uses: &[u32],
     defined: &[Val],
@@ -526,7 +543,7 @@ impl<'a, 'gc> Module<'a, 'gc> {
 
 /// The 1- or 2-argument intrinsic test that `block` makes last for its branch alone, which can be
 /// the branch.
-fn fused_test<'b>(block: &'b l5::BlockData<'_, '_>, uses: &[u32], imms: &Imms<'_>) -> Option<(Intrinsic, &'b [Val])> {
+fn fused_test<'b>(block: &'b l5::BlockData<'_, '_>, uses: &[u32], imms: &Imms<'_, '_>) -> Option<(Intrinsic, &'b [Val])> {
     let (Some(Inst::Prim { dst, prim: Prim::Intrinsic(intrinsic), args, spread: false }), End::Branch { test, .. }) = (block.insts.last(), &block.end) else {
         return None;
     };
@@ -617,7 +634,7 @@ struct Emitter<'m, 'a, 't, 'gc> {
     ops: Vec<Op>,
     locs: AVec<'t, Option<Loc>>,
     uses: AVec<'t, u32>,
-    imms: Imms<'t>,
+    imms: Imms<'t, 'gc>,
     to: AVec<'t, usize>,
     /// Buffers kept from block to block and move to move.
     /// What's live where the walk back through a block is, as bits, clear between blocks, and
@@ -876,8 +893,16 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
             return self.slot(dst, op, slot, args);
         }
         if let Some(imm) = self.imms[dst.0 as usize] {
+            let kind = match imm {
+                Imm::FieldOf(kind, _) => self.module.constant(kind)?,
+                Imm::Add(_) | Imm::Field(_) => 0,
+            };
             let a = self.read(args[0], 0);
-            self.write(dst, |dst| Op::AddImm { dst, a, imm });
+            self.write(dst, |dst| match imm {
+                Imm::Add(imm) => Op::AddImm { dst, a, imm },
+                Imm::Field(k) => Op::StructField { dst, a, k },
+                Imm::FieldOf(_, k) => Op::StructRef { dst, a, k, kind },
+            });
             return Ok(());
         }
         if !spread {

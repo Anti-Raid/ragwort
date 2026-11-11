@@ -10,7 +10,7 @@ use ragwort_types::string::StrError;
 
 use crate::frame::CLOSURE;
 use crate::objects::{self, BytecodeFields, ClosureFields, ModuleFields, SpillFields, Task};
-use crate::{Intrinsic, Read, Request};
+use crate::{Intrinsic, Read, Request, structs};
 
 #[cfg(test)]
 #[path = "tests/op.rs"]
@@ -68,6 +68,14 @@ named! {
         /// anything else by the generic add, as `(+ a imm)`. The compiler emits it for `(+ x k)`
         /// and `(- x k)` with a small fixnum `k`, so the constant needs no register.
         AddImm { dst: u8, a: u8, imm: i16 } = "add-imm",
+        /// Stores field `k` of the struct in register `a` in `dst`, as `(struct-field a k)`
+        /// does. The compiler emits it where it has proved that `a` holds a struct with the
+        /// field, so the index needs no register.
+        StructField { dst: u8, a: u8, k: u16 } = "struct-field",
+        /// Stores field `k` of the struct in register `a` in `dst`, as `(struct-ref a type k)`
+        /// does, the type being constant `kind`: `a` has to hold an instance of it. The type
+        /// and the index need no registers.
+        StructRef { dst: u8, a: u8, k: u8, kind: u32 } = "struct-ref",
         /// Runs 3-argument `intrinsic` on registers `(a, b, c)` and stores its result in `dst`.
         CallIntrinsic3 { dst: u8, a: u8, b: u8, c: u8, intrinsic: Intrinsic } = "call-intrinsic3",
         /// Runs `intrinsic` like `CallIntrinsic`, then returns its result. A built-in used as a value
@@ -431,6 +439,11 @@ impl Op {
                     None => Intrinsic::Add.run(mc, &[x, k], &mut cx.fuel)?,
                 };
                 frame.set(dst, sum);
+            }
+            Op::StructField { dst, a, k } => frame.set(dst, structs::field(mc, frame.get(a), usize::from(k))?),
+            Op::StructRef { dst, a, k, kind } => {
+                let kind = cx.constants.get(mc, kind).ok_or(Fault::Malformed)?;
+                frame.set(dst, structs::field_of(mc, frame.get(a), kind, usize::from(k))?);
             }
             Op::CallIntrinsic3 { dst, a, b, c, intrinsic } => {
                 if intrinsic.arity().is_some_and(|n| n != 3) {

@@ -1607,24 +1607,8 @@ impl Intrinsic {
             | Intrinsic::Magnitude
             | Intrinsic::Angle => self.numeric(mc, arg, args, fuel)?,
             Intrinsic::IsStructDerivedFrom => boolean(structs::of(mc, arg(0), structs::type_of(mc, arg(1))?).is_some()),
-            Intrinsic::StructRef => {
-                let kind = structs::type_of(mc, arg(1))?;
-                let fields = structs::of(mc, arg(0), kind).ok_or(Fault::WrongType)?.items(mc);
-                // A struct of the type has at least the type's fields.
-                let k = index(arg(2))?;
-                if k >= kind.fields(mc) as usize {
-                    return Err(Fault::OutOfRange);
-                }
-                fields.get(k)
-            }
-            Intrinsic::StructField => {
-                let fields = arg(0).downcast::<objects::Struct>(mc).ok_or(Fault::WrongType)?.items(mc);
-                let k = index(arg(1))?;
-                if k >= fields.len() {
-                    return Err(Fault::OutOfRange);
-                }
-                fields.get(k)
-            }
+            Intrinsic::StructRef => structs::field_of(mc, arg(0), arg(1), index(arg(2))?)?,
+            Intrinsic::StructField => structs::field(mc, arg(0), index(arg(1))?)?,
             Intrinsic::MakeStructType
             | Intrinsic::MakeStruct
             | Intrinsic::IsStruct

@@ -147,6 +147,29 @@ pub fn is_mutable<'gc>(mc: &Mutation<'gc>, kind: Gc<'gc, StructType>, k: usize) 
     field_flags(mc, kind, k).contains(FieldFlags::MUTABLE)
 }
 
+/// Field `k` of `s`, which has to be an instance of the struct type `kind` with that field, as
+/// `struct-ref` reads it.
+#[inline]
+pub fn field_of<'gc>(mc: &Mutation<'gc>, s: Value<'gc>, kind: Value<'gc>, k: usize) -> Result<Value<'gc>, Fault> {
+    let kind = type_of(mc, kind)?;
+    let fields = of(mc, s, kind).ok_or(Fault::WrongType)?.items(mc);
+    // A struct of the type has at least the type's fields.
+    if k >= kind.fields(mc) as usize {
+        return Err(Fault::OutOfRange);
+    }
+    Ok(fields.get(k))
+}
+
+/// Field `k` of `s`, a struct of any type with that many fields, as `struct-field` reads it.
+#[inline]
+pub fn field<'gc>(mc: &Mutation<'gc>, s: Value<'gc>, k: usize) -> Result<Value<'gc>, Fault> {
+    let fields = s.downcast::<Struct>(mc).ok_or(Fault::WrongType)?.items(mc);
+    if k >= fields.len() {
+        return Err(Fault::OutOfRange);
+    }
+    Ok(fields.get(k))
+}
+
 /// `v` as a struct type, which it must be.
 pub fn type_of<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> Result<Gc<'gc, StructType>, Fault> {
     v.downcast::<StructType>(mc).ok_or(Fault::WrongType)

@@ -169,9 +169,14 @@ fn closure_ops(arena: &mut Arena, name: &str, text: &str) -> String {
     })
 }
 
+/// How many times `ops` has `name` as a whole word, as an instruction's or an intrinsic's is.
+fn count(ops: &str, name: &str) -> usize {
+    ops.split(|c: char| !c.is_alphanumeric()).filter(|&word| word == name).count()
+}
+
 /// How many procedure calls `ops` has, not counting calls of intrinsics.
 fn calls(ops: &str) -> usize {
-    ops.split(|c: char| !c.is_alphanumeric()).filter(|&word| word == "Call" || word == "TailCall").count()
+    count(ops, "Call") + count(ops, "TailCall")
 }
 
 #[test]
@@ -287,4 +292,90 @@ fn errors_say_which_language_they_are_in() {
         let native = module_in(&mut arena, "main", &[(Native, &format!("(%{})", &text[1..text.len() - 1]))]);
         assert!(matches!(native, Err(Error::Lower(e)) if e.kind == ragwort_native::LowerErrorKind::BadShape), "{text}: {native:?}");
     }
+}
+
+/// What the compiler knows of a struct value it uses, and no more than that.
+#[test]
+fn struct_code_is_optimized() {
+    let mut arena = arena();
+    let kinds = "(provide (struct-out point) (struct-out point3) (struct-out circle) (struct-out cell))
+                 (struct point (x y)) (struct point3 point (z)) (struct circle (r)) (struct cell ([v #:mutable]))";
+    module_in(&mut arena, "kinds", &[(Scheme, kinds)]).unwrap().unwrap();
+    let mut n = 0;
+    let mut ops_of = |arena: &mut Arena, text: &str| {
+        n += 1;
+        closure_ops(arena, &format!("user{n}"), &format!("(require kinds) {text}"))
+    };
+    let made = |ops: &str| count(ops, "MakeStruct");
+    let (checked, unchecked, tests) = (|ops: &str| count(ops, "StructRef"), |ops: &str| count(ops, "StructField"), |ops: &str| count(ops, "IsStructDerivedFrom"));
+
+    // A struct made only to be read isn't made: its fields are what it was given, whether
+    // they're variables or have to be evaluated first.
+    let ops = ops_of(&mut arena, "(define (f a b) (let ((p (point a b))) (+ (point-x p) (point-y p))))");
+    assert!(made(&ops) == 0 && checked(&ops) == 0 && unchecked(&ops) == 0, "{ops}");
+    let ops = ops_of(&mut arena, "(define (f g) (let ((p (point (g) (g)))) (point? p) (point-y p)))");
+    assert!(made(&ops) == 0 && checked(&ops) == 0 && tests(&ops) == 0 && calls(&ops) == 2, "{ops}");
+    let ops = ops_of(&mut arena, "(define (f a b) (point-x (point a b)))");
+    assert!(made(&ops) == 0 && checked(&ops) == 0, "{ops}");
+    // One that's kept is made, and its fields that can't be set are still what it was given.
+    let ops = ops_of(&mut arena, "(define (f a b g) (let ((p (point a b))) (g p) (point-x p)))");
+    assert!(made(&ops) == 1 && checked(&ops) == 0 && unchecked(&ops) == 0, "{ops}");
+    // A field that can be set is read, as what the struct is given to may set it: but its type
+    // is known.
+    let ops = ops_of(&mut arena, "(define (f n g) (let ((c (cell n))) (g c) (cell-v c)))");
+    assert!(made(&ops) == 1 && checked(&ops) == 0 && unchecked(&ops) == 1, "{ops}");
+
+    // The first read of a value by a type checks the type, and those after it don't.
+    let ops = ops_of(&mut arena, "(define (f p) (+ (point-x p) (point-y p)))");
+    assert!(checked(&ops) == 1 && unchecked(&ops) == 1, "{ops}");
+    let ops = ops_of(&mut arena, "(define (f p) (if (point? p) (+ (point-x p) (point-y p)) 0))");
+    assert!(tests(&ops) == 1 && checked(&ops) == 0 && unchecked(&ops) == 2, "{ops}");
+    // A read by a supertype is known of what's known to be of the subtype, and not the other
+    // way.
+    let ops = ops_of(&mut arena, "(define (f p) (if (point3? p) (point-x p) 0))");
+    assert!(checked(&ops) == 0 && unchecked(&ops) == 1, "{ops}");
+    let ops = ops_of(&mut arena, "(define (f p) (if (point? p) (point3-z p) 0))");
+    assert!(checked(&ops) == 1 && unchecked(&ops) == 0, "{ops}");
+    // What one branch or one procedure learns, the code after it doesn't know.
+    let ops = ops_of(&mut arena, "(define (f p c) (if c (point-x p) 0) (point-y p))");
+    assert!(checked(&ops) == 2 && unchecked(&ops) == 0, "{ops}");
+    let ops = ops_of(&mut arena, "(define (f p h) (h (lambda () (point-x p))) (point-y p))");
+    assert!(checked(&ops) == 1 && unchecked(&ops) == 0, "{ops}");
+    let ops = ops_of(&mut arena, "(define (f p) (if (point? p) 1 (point-x p)))");
+    assert!(checked(&ops) == 1 && unchecked(&ops) == 0, "{ops}");
+    // A variable that's assigned is known nothing of.
+    let ops = ops_of(&mut arena, "(define (f p q) (let ((a (point-x p))) (set! p q) (+ a (point-y p))))");
+    assert!(checked(&ops) == 2 && unchecked(&ops) == 0, "{ops}");
+
+    // A value of one type is of its supertypes, of no type apart from them, and of no other
+    // kind: a test of a subtype still has to be made.
+    let ops = ops_of(&mut arena, "(define (f v) (if (point3? v) (list (point? v) (circle? v) (struct? v) (pair? v) (procedure? v)) 0))");
+    assert!(tests(&ops) == 1 && count(&ops, "IsStruct") == 0 && count(&ops, "IsPair") == 0 && count(&ops, "IsProcedure") == 0, "{ops}");
+    let ops = ops_of(&mut arena, "(define (f v) (if (point? v) (point3? v) 0))");
+    assert!(tests(&ops) == 2, "{ops}");
+    let ops = ops_of(&mut arena, "(define (f a) (let ((p (point3 a a a))) (list (point? p) (point3? p) (circle? p) (struct? p) (vector? p))))");
+    assert!(tests(&ops) == 0 && made(&ops) == 0, "{ops}");
+    // A match reads the fields it binds, with the one test of the type.
+    let ops = ops_of(&mut arena, "(define (f p) (match p [(point x _) x]))");
+    assert!(tests(&ops) == 1 && checked(&ops) == 0 && unchecked(&ops) == 1, "{ops}");
+    let ops = ops_of(&mut arena, "(define (f p) (match p [(point3 _ _ z) z] [(point x y) (+ x y)] [(circle r) r]))");
+    assert!(tests(&ops) == 3 && checked(&ops) == 0 && unchecked(&ops) == 4, "{ops}");
+
+    // It all does what the code says.
+    let run = "(require kinds)
+        (define (sum a b) (let ((p (point a b))) (+ (point-x p) (point-y p))))
+        (define (twice g) (let ((p (point (g) (g)))) (list (point? p) (point-y p) (point-x p))))
+        (define (kept n g) (let ((c (cell n))) (g c) (cell-v c)))
+        (define (both p) (+ (point-x p) (point-y p)))
+        (define (after p c) (if c (point-x p) 0) (point-y p))
+        (define (kind v) (if (point? v) (list (point3? v) (circle? v) (struct? v) (pair? v)) (if (circle? v) 'circle 'other)))
+        (define (area v) (match v [(point3 _ _ z) z] [(point x y) (+ x y)] [(circle r) r] [_ 'none]))
+        (define n 0) (define (next) (set! n (+ n 1)) n)
+        (define (caught thunk) (guard (e (#t (error-object-kind e))) (thunk)))
+        (list (sum 1 2) (twice next) (kept 1 (lambda (c) (set-cell-v! c 9))) (both (point3 1 2 3)) (after (point 1 2) #f)
+              (kind (point 1 2)) (kind (point3 1 2 3)) (kind (circle 1)) (kind 5)
+              (map area (list (point3 1 2 3) (point 1 2) (circle 4) 'x))
+              (caught (lambda () (both 5))) (caught (lambda () (both (circle 1)))) (caught (lambda () (after (circle 1) #f))))";
+    let expected = "(3 (#t 2 1) 9 3 2 (#f #f #t #f) (#t #f #t #f) circle other (3 3 4 none) wrong-type wrong-type wrong-type)";
+    assert_eq!(module_in(&mut arena, "runs", &[(Scheme, run)]), Ok(Ok(expected.into())));
 }
