@@ -17,10 +17,12 @@
 //! one, but for those given.
 //!
 //! Code that has a type, as `struct:name` is, can use it itself: `(struct-fields type)` lists its
-//! fields' names, and `(make-struct type v ...)`, `(struct? v type)`, `(struct-ref s type k)` and
+//! fields' names, and `(make-struct type v ...)`, `(struct-derived-from? v type)`,
+//! `(struct-ref s type k)` and
 //! `(struct-set! s type k v)` make, tell, and read and set a field of a struct of it, field `k`
-//! being the one whose name is `k`th in that list. `struct-set!` sets any field: a field that
-//! isn't mutable is one the form defines no mutator for.
+//! being the one whose name is `k`th in that list. Only a mutable field can be set, which
+//! `(struct-field-mutable? type k)` says it is: `struct-set!` of another is an error, so a field
+//! that isn't mutable keeps the value it was made with.
 //!
 //! What a form defines is made as [`ragwort_compiler::structs`] says, as native ragwort's is. A
 //! form in a body makes a new type each time the body runs.
@@ -29,7 +31,6 @@ use ragwort_compiler::module::{Field, Inline, StructDef};
 use ragwort_compiler::structs::{self, Declared, Member};
 use ragwort_compiler::{Core, Place, Var};
 use ragwort_types::gc::{OutOfMemory, Value};
-use ragwort_types::pair::Pairs;
 use ragwort_types::string::chars;
 use ragwort_vm::Fault;
 
@@ -190,12 +191,11 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         Ok(Parts { parent, fields, members })
     }
 
-    /// The symbol of a struct form's name, and the list of its own fields' names, as its type
-    /// is made of them.
-    fn struct_names(&mut self, form: &Form) -> Result<(Value<'gc>, Value<'gc>), ExpandError> {
-        let symbol = |this: &Self, id: Stx| this.tree.symbol(id).expect("an identifier").value(this.mc);
-        let own: Vec<Value<'gc>> = form.fields.iter().map(|&(id, _)| symbol(self, id)).collect();
-        Ok((symbol(self, form.name), Pairs::new(self.mc).list(&own)?))
+    /// The symbol of a struct form's name, and those of its own fields' names, each with whether
+    /// it's mutable, as its type is made of them.
+    fn struct_names(&self, form: &Form) -> (Value<'gc>, Vec<(Value<'gc>, bool)>) {
+        let symbol = |id: Stx| self.tree.symbol(id).expect("an identifier").value(self.mc);
+        (symbol(form.name), form.fields.iter().map(|&(id, mutable)| (symbol(id), mutable)).collect())
     }
 
     /// Declares what `form`, a struct form that's the module's top-level form `index`, defines,
@@ -208,8 +208,8 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             Some(Kind::Constant(kind)) => kind,
             Some(Kind::Local(_)) => return Err(self.error(ExpandErrorKind::BadSyntax, form)),
         };
-        let (name, own) = self.struct_names(&parts)?;
-        let kind = structs::make_type(self.mc, name, above, own, parts.identity).map_err(|fault| match fault {
+        let (name, own) = self.struct_names(&parts);
+        let kind = structs::make_type(self.mc, name, above, &own, parts.identity).map_err(|fault| match fault {
             Fault::OutOfMemory => self.error(OutOfMemory, form),
             _ => self.error(ExpandErrorKind::BadSyntax, form),
         })?;
@@ -231,7 +231,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     pub(crate) fn local_struct(&mut self, form: Stx) -> Result<Vec<(Stx, Var, Core<'gc>)>, ExpandError> {
         let parts = self.struct_form(form)?;
         let Parts { parent, fields, members } = self.struct_parts(&parts)?;
-        let (name, own) = self.struct_names(&parts)?;
+        let (name, own) = self.struct_names(&parts);
         let count = u32::try_from(fields.len()).map_err(|_| self.error(OutOfMemory, form))?;
         let above = parent.map_or(Core::Quote(Value::FALSE), |parent| parent.kind.core());
         let mut made = Vec::with_capacity(members.len());
@@ -240,7 +240,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             let var = self.local(id)?;
             let (kind, holder) = *holder.get_or_insert((var, id));
             let value = match member {
-                Member::Type => structs::type_maker(name, above.clone(), own, parts.identity),
+                Member::Type => structs::type_maker(self.mc, name, above.clone(), &own, parts.identity)?,
                 _ => structs::value(member, Core::Ref(Place::Local(kind)), count, self),
             };
             let local = match structs::inline(member, 0, count) {
@@ -274,7 +274,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     pub(crate) fn struct_copy(&mut self, stx: Stx, name: Stx, e: Stx, updates: &[Stx]) -> Result<Stx, ExpandError> {
         let bad = ExpandErrorKind::BadSyntax;
         let Some(info) = self.struct_info(name)? else { return Err(self.error(bad, name)) };
-        let (make, is, get) = ("make-struct", "struct?", "struct-ref");
+        let (make, is, get) = ("make-struct", "struct-derived-from?", "struct-ref");
         let kind = self.struct_type(&info, stx)?;
         let source = self.introduce("t", stx)?;
         let mut given: Vec<Option<Stx>> = vec![None; info.fields.len()];

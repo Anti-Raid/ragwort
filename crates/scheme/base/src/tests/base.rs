@@ -890,12 +890,24 @@ fn structs_by_their_types() {
     let fields = format!("{shapes} (list (struct-fields struct:point) (struct-fields struct:point3) (struct-fields struct:session))");
     assert_eq!(eval(&fields), "((x y) (x y z) (token user))");
     let used = format!("{shapes} (define q (point3 1 2 3)) (define s (session 'tok 'al))
-        (list (make-struct struct:point 1 2) (struct? q struct:point) (struct? (point 1 2) struct:point3) (struct-ref q struct:point 1) (struct-ref q struct:point3 2)
-              (make-struct struct:session 1 2) (struct? s struct:session) (struct? q struct:session) (struct-ref s struct:session 1))");
+        (list (make-struct struct:point 1 2) (struct-derived-from? q struct:point) (struct-derived-from? (point 1 2) struct:point3) (struct-ref q struct:point 1) (struct-ref q struct:point3 2)
+              (make-struct struct:session 1 2) (struct-derived-from? s struct:session) (struct-derived-from? q struct:session) (struct-ref s struct:session 1))");
     assert_eq!(eval(&used), "(#(struct:point 1 2) #t #f 2 3 #(struct:session 1 2) #t #f al)");
-    // A field is set by its type too, whether or not its form made it mutable.
-    let set = format!("{shapes} (define p (point 1 2)) (define q (point3 1 2 3)) (struct-set! p struct:point 1 20) (struct-set! q struct:point 0 10) (struct-set! q struct:point3 2 30) (list p q)");
-    assert_eq!(eval(&set), "(#(struct:point 1 20) #(struct:point3 10 2 30))");
+    let any = format!("{shapes} (list (struct? (point 1 2)) (struct? (point3 1 2 3)) (struct? (session 1 2)) (struct? struct:point) (struct? 5) (struct? (vector 1)) (struct? point)
+                                  (map struct? (list (point 1 2) 'a)))");
+    assert_eq!(eval(&any), "(#t #t #t #f #f #f #f (#t #f))");
+    // A mutable field is set by its type too, and no other is.
+    let cells = "(struct cell (label [value #:mutable])) (struct cell3 cell (extra) #:mutable)";
+    let set = format!("{cells} (define c (cell3 'a 1 2)) (struct-set! c struct:cell 1 10) (struct-set! c struct:cell3 2 20) (list c (cell-value c))");
+    assert_eq!(eval(&set), "(#(struct:cell3 a 10 20) 10)");
+    for fixed in ["(struct-set! (cell 'a 1) struct:cell 0 'b)", "(struct-set! (cell3 'a 1 2) struct:cell3 0 'b)", "(struct-set! (point 1 2) struct:point 1 20)"] {
+        assert_eq!(eval_in(&mut arena(), &format!("{shapes} {cells} {fixed}")), Ok(Err(Fault::Immutable)), "{fixed}");
+    }
+    let mutable = format!("{cells} (list (struct-field-mutable? struct:cell 0) (struct-field-mutable? struct:cell 1) (struct-field-mutable? struct:cell3 0)
+                                      (struct-field-mutable? struct:cell3 1) (struct-field-mutable? struct:cell3 2))");
+    assert_eq!(eval(&mutable), "(#f #t #f #t #t)");
+    let kind = format!("{shapes} (guard (e (#t (error-object-kind e))) (struct-set! (point 1 2) struct:point 0 9))");
+    assert_eq!(eval(&kind), "immutable");
     // A field is found by its name's place among the type's.
     let by_name = format!("{shapes}
         (define (field s type name)
@@ -910,11 +922,14 @@ fn structs_by_their_types() {
         ("(struct-ref (point 1 2) struct:point 2)", Fault::OutOfRange),
         ("(struct-set! (point 1 2) struct:point 2 0)", Fault::OutOfRange),
         ("(struct-set! (point 1 2) struct:point3 0 0)", Fault::WrongType),
+        ("(struct-set! (point 1 2) struct:point 0 0)", Fault::Immutable),
+        ("(struct-field-mutable? struct:point 2)", Fault::OutOfRange),
+        ("(struct-field-mutable? (point 1 2) 0)", Fault::WrongType),
         ("(struct-ref (point 1 2) struct:point3 0)", Fault::WrongType),
         ("(struct-ref (point 1 2) struct:session 0)", Fault::WrongType),
         ("(make-struct struct:point 1)", Fault::Arity),
         ("(make-struct 5 1 2)", Fault::WrongType),
-        ("(struct? 1 2)", Fault::WrongType),
+        ("(struct-derived-from? 1 2)", Fault::WrongType),
     ] {
         assert_eq!(eval_in(&mut arena(), &format!("{shapes} {wrong}")), Ok(Err(fault)), "{wrong}");
     }

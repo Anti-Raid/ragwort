@@ -871,17 +871,14 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                 if let Some(&known) = self.pred_facts.get(&(intrinsic, v)) {
                     return self.truth(known);
                 }
-                if (intrinsic == Intrinsic::IsProcedure && self.pred_facts.get(&(Intrinsic::IsContinuation, v)) == Some(&true))
-                    || (intrinsic == Intrinsic::IsList && self.pred_facts.get(&(Intrinsic::IsNull, v)) == Some(&true))
-                {
+                // What's known of `v` by another predicate says this one's answer if that one
+                // implies it and is true, or it implies that one, which is false, or the two
+                // are never both true.
+                let known = |holds: bool, tells: &dyn Fn(Intrinsic) -> bool| self.pred_facts.iter().any(|(&(other, u), &val)| u == v && val == holds && tells(other));
+                if known(true, &|other| other.implies(intrinsic)) {
                     return self.truth(true);
                 }
-                if (intrinsic == Intrinsic::IsContinuation && self.pred_facts.get(&(Intrinsic::IsProcedure, v)) == Some(&false))
-                    || (intrinsic == Intrinsic::IsNull && self.pred_facts.get(&(Intrinsic::IsList, v)) == Some(&false))
-                {
-                    return self.truth(false);
-                }
-                if self.pred_facts.iter().any(|(&(other_pred, u), &val)| u == v && val && intrinsic.is_disjoint_predicate(other_pred)) {
+                if known(false, &|other| intrinsic.implies(other)) || known(true, &|other| intrinsic.is_disjoint_predicate(other)) {
                     return self.truth(false);
                 }
             }

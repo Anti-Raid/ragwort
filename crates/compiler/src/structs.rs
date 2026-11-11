@@ -8,7 +8,8 @@
 //! have run yet, the call reads the procedure's variable first, and so fails as a call of the
 //! procedure would.
 
-use ragwort_types::gc::{Mutation, Value};
+use ragwort_types::gc::{Mutation, OutOfMemory, Value};
+use ragwort_types::pair::Pairs;
 use ragwort_vm::{Fault, Intrinsic, structs};
 
 use crate::keyword::Fresh;
@@ -44,18 +45,29 @@ pub fn members(name: &str, fields: &[Field], inherited: usize) -> Option<Vec<(St
     Some(members)
 }
 
-/// A new type named by the symbol `name`, with the fields the list `fields` names after those of
-/// its supertype `parent`, or `#f`, whose structs are `equal?` only to themselves if `identity`,
-/// or if the supertype's are.
-pub fn make_type<'gc>(mc: &Mutation<'gc>, name: Value<'gc>, parent: Value<'gc>, fields: Value<'gc>, identity: bool) -> Result<Value<'gc>, Fault> {
+/// The lists a type is made of: the names of `fields`, its own, each a symbol, and whether each
+/// is mutable.
+fn listed<'gc>(mc: &Mutation<'gc>, fields: &[(Value<'gc>, bool)]) -> Result<(Value<'gc>, Value<'gc>), OutOfMemory> {
+    let pairs = Pairs::new(mc);
+    let names: Vec<Value<'gc>> = fields.iter().map(|&(name, _)| name).collect();
+    let mutable: Vec<Value<'gc>> = fields.iter().map(|&(_, mutable)| if mutable { Value::TRUE } else { Value::FALSE }).collect();
+    Ok((pairs.list(&names)?, pairs.list(&mutable)?))
+}
+
+/// A new type named by the symbol `name`, with `fields`, each its name and whether it's mutable,
+/// after those of its supertype `parent`, or `#f`. Its structs are `equal?` only to themselves
+/// if `identity`, or if the supertype's are.
+pub fn make_type<'gc>(mc: &Mutation<'gc>, name: Value<'gc>, parent: Value<'gc>, fields: &[(Value<'gc>, bool)], identity: bool) -> Result<Value<'gc>, Fault> {
+    let (names, mutable) = listed(mc, fields)?;
     let identity = if identity { Value::TRUE } else { Value::FALSE };
-    structs::make_type(mc, name, parent, fields, identity).map(|kind| Value::object(mc, kind))
+    structs::make_type(mc, name, parent, names, mutable, identity).map(|kind| Value::object(mc, kind))
 }
 
 /// Code that makes such a type each time it runs, as a form in a body does.
-pub fn type_maker<'gc>(name: Value<'gc>, parent: Core<'gc>, fields: Value<'gc>, identity: bool) -> Core<'gc> {
+pub fn type_maker<'gc>(mc: &Mutation<'gc>, name: Value<'gc>, parent: Core<'gc>, fields: &[(Value<'gc>, bool)], identity: bool) -> Result<Core<'gc>, OutOfMemory> {
+    let (names, mutable) = listed(mc, fields)?;
     let identity = Core::Quote(if identity { Value::TRUE } else { Value::FALSE });
-    Core::Intrinsic(Prim::Intrinsic(Intrinsic::MakeStructType), vec![Core::Quote(name), parent, Core::Quote(fields), identity])
+    Ok(Core::Intrinsic(Prim::Intrinsic(Intrinsic::MakeStructType), vec![Core::Quote(name), parent, Core::Quote(names), Core::Quote(mutable), identity]))
 }
 
 /// What a call of the procedure `member` of a struct type of `fields` fields does, the type
@@ -65,7 +77,7 @@ pub fn inline(member: Member, kind: u32, fields: u32) -> Option<Inline> {
     Some(match member {
         Member::Type => return None,
         Member::Make => Inline::of_call(Intrinsic::MakeStruct, fields, &std::iter::once(kind).chain((0..fields).map(Operand::Param)).collect::<Vec<_>>()),
-        Member::Is => Inline::of_call(Intrinsic::IsStruct, 1, &[Operand::Param(0), kind]),
+        Member::Is => Inline::of_call(Intrinsic::IsStructDerivedFrom, 1, &[Operand::Param(0), kind]),
         Member::Ref(k) => Inline::of_call(Intrinsic::StructRef, 1, &[Operand::Param(0), kind, Operand::Index(k)]),
         Member::Set(k) => Inline::of_call(Intrinsic::StructSet, 2, &[Operand::Param(0), kind, Operand::Index(k), Operand::Param(1)]),
     })
@@ -85,7 +97,7 @@ pub fn value<'gc>(member: Member, kind: Core<'gc>, fields: u32, fresh: &mut impl
         }
         Member::Is => {
             let v = fresh.var();
-            (vec![v], Intrinsic::IsStruct, vec![local(&v), kind])
+            (vec![v], Intrinsic::IsStructDerivedFrom, vec![local(&v), kind])
         }
         Member::Ref(k) => {
             let s = fresh.var();

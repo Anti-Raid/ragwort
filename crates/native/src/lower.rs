@@ -337,9 +337,8 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             fields.push(Field { name: self.identifier(id)?.into(), mutable });
         }
         let named = structs::members(&self.identifier(name)?, &fields[inherited..], inherited).ok_or_else(|| self.error(OutOfMemory, node))?;
-        let names: Vec<Value<'gc>> = own.iter().map(|&(id, _)| id.datum(self.mc)).collect();
-        let names = self.pairs.list(&names).map_err(|e| self.error(e, node))?;
-        let kind = structs::make_type(self.mc, name.datum(self.mc), above, names, identity).map_err(|fault| match fault {
+        let names: Vec<(Value<'gc>, bool)> = own.iter().map(|&(id, mutable)| (id.datum(self.mc), mutable)).collect();
+        let kind = structs::make_type(self.mc, name.datum(self.mc), above, &names, identity).map_err(|fault| match fault {
             Fault::OutOfMemory => self.error(OutOfMemory, node),
             _ => self.error(bad, node),
         })?;

@@ -403,7 +403,9 @@
 ; Structs by their types, which `match` and `struct-copy` are made of. A field's index is where
 ; its name is in what `struct-fields` lists.
 (%define make-struct (%lambda (type . fields) (%apply-intrinsic make-struct type fields)))
-(%define struct? (%lambda (v type) (%intrinsic struct? v type)))
+(%define struct-derived-from? (%lambda (v type) (%intrinsic struct-derived-from? v type)))
 (%define struct-ref (%lambda (s type k) (%intrinsic struct-ref s type k)))
 (%define struct-fields (%lambda (type) (%intrinsic struct-fields type)))
 (%define struct-set! (%lambda (s type k v) (%intrinsic struct-set! s type k v)))
+(%define struct-field-mutable? (%lambda (type k) (%intrinsic struct-field-mutable? type k)))
+(%define struct? (%lambda (v) (%intrinsic struct? v)))

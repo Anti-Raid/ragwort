@@ -1477,6 +1477,11 @@ fn folds<'gc>(mc: &Mutation<'gc>, core: Core<'gc>) -> bool {
     matches!(all_ops(mc, compile(mc, None, &core).unwrap()).as_slice(), [Op::LoadConst { .. }, Op::Return { .. }])
 }
 
+/// How many calls of `asked` are left in a procedure of one parameter whose body is `test`.
+fn asked_in<'gc>(mc: &Mutation<'gc>, test: Core<'gc>, asked: Intrinsic) -> usize {
+    calls(&all_ops(mc, compile(mc, None, &lambda(&[0], None, test)).unwrap()), asked)
+}
+
 #[test]
 fn reads_of_constant_vectors_fold() {
     use Intrinsic::{IsPair, IsVector, MakeVectorOf, VectorLength, VectorRef};
@@ -1502,6 +1507,31 @@ fn reads_of_constant_vectors_fold() {
         let tests = when(is(IsPair), is(IsVector), when(is(IsVector), is(IsVector), q(0)));
         let ops = all_ops(mc, compile(mc, None, &lambda(&[0], None, tests)).unwrap());
         assert_eq!(calls(&ops, IsVector), 1, "{ops:?}");
+
+        // What one type predicate says of a value tells what others would: under `(integer? x)`,
+        // `x` is a number and a real, and no pair; where it's no number, it's no integer either.
+        // But an integer may or may not be exact, and a number may or may not be an integer.
+        use Intrinsic::{IsExactInteger, IsIdentifier, IsInteger, IsList, IsNull, IsNumber, IsReal, IsSyntax};
+        for (known, asked) in [
+            (IsInteger, IsNumber),
+            (IsInteger, IsReal),
+            (IsExactInteger, IsInteger),
+            (IsIdentifier, IsSyntax),
+            (IsNull, IsList),
+            (IsInteger, IsPair),
+            (IsSyntax, IsNumber),
+            (Intrinsic::IsStruct, IsPair),
+            (IsVector, Intrinsic::IsStruct),
+        ] {
+            assert_eq!(asked_in(mc, when(is(known), is(asked), q(0)), asked), 0, "{asked:?} under {known:?}");
+        }
+        for (known, asked) in [(IsNumber, IsInteger), (IsSyntax, IsIdentifier), (IsReal, IsExactInteger)] {
+            assert_eq!(asked_in(mc, when(is(known), q(0), is(asked)), asked), 0, "{asked:?} where not {known:?}");
+            assert_eq!(asked_in(mc, when(is(known), is(asked), q(0)), asked), 1, "{asked:?} under {known:?}");
+        }
+        for (known, asked) in [(IsInteger, IsExactInteger), (IsList, IsPair), (IsPair, IsList)] {
+            assert_eq!(asked_in(mc, when(is(known), is(asked), q(0)), asked), 1, "{asked:?} under {known:?}");
+        }
     });
     assert_eq!(number(|mc| prim(VectorRef, vec![constant(mc, &[1, 2]), q(1)])), Ok(2));
     assert_eq!(number(|mc| prim(VectorLength, vec![constant(mc, &[1, 2, 3])])), Ok(3));

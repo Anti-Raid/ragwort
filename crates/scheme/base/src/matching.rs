@@ -656,7 +656,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
                     }
                     Shape::Struct(of) => {
                         let kind = self.m.structs[of].kind;
-                        self.ex.build(at, "struct?", &[&[x.stx, kind]])?
+                        self.ex.build(at, "struct-derived-from?", &[&[x.stx, kind]])?
                     }
                 };
                 Next::then(rest, move |s: &mut Self, rest| Ok(Next::Done(s.ex.build(at, "if", &[&[test, rest, fail]])?)))

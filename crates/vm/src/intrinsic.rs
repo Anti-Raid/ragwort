@@ -377,24 +377,31 @@ named! {
         /// `(%keyword-procedure plain core keywords required)`: a keyword procedure, as a `lambda`
         /// with keyword parameters makes. See [`crate::keyword`].
         MakeKeywordProcedure = "%keyword-procedure",
-        /// `(make-struct-type name parent fields identity?)`: a new struct type named by the
-        /// symbol `name`, whose structs have the fields the list `fields` names after those of
-        /// `parent`'s, its supertype, or `#f`, and are `equal?` only to themselves if `identity?`
-        /// isn't `#f` or the supertype's are. See [`crate::structs`].
+        /// `(make-struct-type name parent fields mutable identity?)`: a new struct type named by
+        /// the symbol `name`, whose structs have the fields the list `fields` names after those of
+        /// `parent`'s, its supertype, or `#f`. Each can be set if what's at its place in the list
+        /// `mutable` isn't `#f`. They're `equal?` only to themselves if `identity?` isn't `#f` or
+        /// the supertype's are. See [`crate::structs`].
         MakeStructType = "make-struct-type",
         /// `(make-struct type v ...)`: a struct of the type, with the values as its fields, which
         /// must be as many as it has.
         MakeStruct = "make-struct",
-        /// `(struct? v type)`: whether `v` is a struct of the type or of a subtype of it.
+        /// `(struct? v)`: whether `v` is a struct, of any type.
         IsStruct = "struct?",
+        /// `(struct-derived-from? v type)`: whether `v` is a struct of the type or of a subtype
+        /// of it.
+        IsStructDerivedFrom = "struct-derived-from?",
         /// `(struct-ref s type k)`: field `k` of `s`, a struct of the type, as `struct-fields`
         /// numbers its fields.
         StructRef = "struct-ref",
-        /// `(struct-set! s type k v)`: sets field `k` of `s`, a struct of the type, to `v`.
+        /// `(struct-set! s type k v)`: sets field `k` of `s`, a struct of the type, to `v`, if the
+        /// type says it can be set.
         StructSet = "struct-set!",
         /// `(struct-fields type)`: a list of the names of the fields a struct of the type has, in
         /// order, its supertype's first.
         StructFields = "struct-fields",
+        /// `(struct-field-mutable? type k)`: whether field `k` of a struct of the type can be set.
+        IsStructFieldMutable = "struct-field-mutable?",
         /// `(procedure-keywords f)`: the keywords `f` requires and those it takes, as two sorted
         /// lists, both empty for a procedure without keyword parameters.
         ProcedureKeywords = "procedure-keywords",
@@ -577,9 +584,11 @@ impl Intrinsic {
             Intrinsic::StringEq | Intrinsic::StringLt | Intrinsic::StringGt | Intrinsic::StringLe | Intrinsic::StringGe => None,
             Intrinsic::StringRef => Some(2),
             Intrinsic::StringJoin => None,
-            Intrinsic::MakeKeywordProcedure | Intrinsic::MakeStructType | Intrinsic::StructSet => Some(4),
+            Intrinsic::MakeKeywordProcedure | Intrinsic::StructSet => Some(4),
+            Intrinsic::MakeStructType => Some(5),
             Intrinsic::StructRef => Some(3),
-            Intrinsic::IsStruct => Some(2),
+            Intrinsic::IsStructDerivedFrom | Intrinsic::IsStructFieldMutable => Some(2),
+            Intrinsic::IsStruct => Some(1),
             Intrinsic::MakeStruct => None,
             Intrinsic::StructFields => Some(1),
             Intrinsic::ProcedureKeywords => Some(1),
@@ -668,6 +677,9 @@ impl Intrinsic {
                 | IsStringContains
                 | StringFind
                 | StringFindLast
+                | IsStruct
+                | IsStructDerivedFrom
+                | IsStructFieldMutable
                 | CharEq
                 | CharLt
                 | CharGt
@@ -781,6 +793,7 @@ impl Intrinsic {
                 | IsContinuation
                 | IsCoroutine
                 | IsErrorObject
+                | IsStruct
                 | IsSyntax
                 | IsIdentifier
         )
@@ -791,10 +804,12 @@ impl Intrinsic {
     /// as `car` of a non-pair does, only changes which of them faults first.
     pub const fn is_reorderable(self) -> bool {
         use Intrinsic::*;
-        self.is_discardable() || matches!(self, Add | Sub | Mul | Car | Cdr | Caar | Cadr | Cdar | Cddr | Unbox)
+        self.is_discardable() || matches!(self, Add | Sub | Mul | Car | Cdr | Caar | Cadr | Cdar | Cddr | Unbox | IsStructDerivedFrom | IsStructFieldMutable)
     }
 
-    /// Whether `self` is a 1-argument type predicate.
+    /// Whether `self` is a type predicate: one of one argument, any value, that says what kind
+    /// of value it is and never faults. What one is true of, one it doesn't
+    /// [imply](Intrinsic::implies) or share values with is false of.
     pub const fn is_type_predicate(self) -> bool {
         use Intrinsic::*;
         matches!(
@@ -802,6 +817,12 @@ impl Intrinsic {
             IsNull
                 | IsPair
                 | IsNumber
+                | IsReal
+                | IsRational
+                | IsInteger
+                | IsExactInteger
+                | IsSyntax
+                | IsIdentifier
                 | IsBoolean
                 | IsKeyword
                 | IsSymbol
@@ -816,22 +837,31 @@ impl Intrinsic {
                 | IsContinuation
                 | IsCoroutine
                 | IsErrorObject
+                | IsStruct
         )
     }
 
-    /// Whether no value can satisfy both `self` and `other`.
+    /// Whether every value the type predicate `self` is true of, the type predicate `other` is
+    /// true of too, as a null is a list and an integer is a number.
+    pub const fn implies(self, other: Self) -> bool {
+        use Intrinsic::*;
+        matches!(
+            (self, other),
+            (IsNull, IsList)
+                | (IsContinuation, IsProcedure)
+                | (IsIdentifier, IsSyntax)
+                | (IsReal | IsRational | IsInteger | IsExactInteger, IsNumber)
+                | (IsRational | IsInteger | IsExactInteger, IsReal)
+                | (IsInteger | IsExactInteger, IsRational)
+                | (IsExactInteger, IsInteger)
+        )
+    }
+
+    /// Whether no value can satisfy both of the type predicates `self` and `other`: unless one
+    /// implies the other, or they're `list?` and `pair?`, which a pair that ends a list is both.
     pub fn is_disjoint_predicate(self, other: Self) -> bool {
         use Intrinsic::*;
-        if self == other {
-            return false;
-        }
-        !matches!(
-            (self, other),
-            (IsList, IsNull | IsPair)
-                | (IsNull | IsPair, IsList)
-                | (IsProcedure, IsContinuation)
-                | (IsContinuation, IsProcedure)
-        )
+        self != other && !self.implies(other) && !other.implies(self) && !matches!((self, other), (IsList, IsPair) | (IsPair, IsList))
     }
 
     /// Whether any normal return value of `self` is guaranteed not to be `#f`.
@@ -965,7 +995,7 @@ impl Intrinsic {
     fn structs<'gc>(self, mc: &Mutation<'gc>, arg: impl Fn(usize) -> Value<'gc>, args: usize, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
         let boolean = |b: bool| if b { Value::TRUE } else { Value::FALSE };
         Ok(match self {
-            Intrinsic::MakeStructType => made(mc, fuel, Value::object(mc, structs::make_type(mc, arg(0), arg(1), arg(2), arg(3))?)),
+            Intrinsic::MakeStructType => made(mc, fuel, Value::object(mc, structs::make_type(mc, arg(0), arg(1), arg(2), arg(3), arg(4))?)),
             Intrinsic::MakeStruct if args == 0 => return Err(Fault::Arity),
             Intrinsic::MakeStruct => {
                 let kind = structs::type_of(mc, arg(0))?;
@@ -980,7 +1010,16 @@ impl Intrinsic {
                 }
                 made(mc, fuel, Pairs::new(mc).list(&listed)?)
             }
-            Intrinsic::IsStruct => boolean(structs::of(mc, arg(0), structs::type_of(mc, arg(1))?).is_some()),
+            Intrinsic::IsStruct => boolean(arg(0).downcast::<objects::Struct>(mc).is_some()),
+            Intrinsic::IsStructDerivedFrom => boolean(structs::of(mc, arg(0), structs::type_of(mc, arg(1))?).is_some()),
+            Intrinsic::IsStructFieldMutable => {
+                let kind = structs::type_of(mc, arg(0))?;
+                let k = index(arg(1))?;
+                if k >= kind.fields(mc) as usize {
+                    return Err(Fault::OutOfRange);
+                }
+                boolean(structs::is_mutable(mc, kind, k))
+            }
             Intrinsic::StructRef | Intrinsic::StructSet => {
                 let kind = structs::type_of(mc, arg(1))?;
                 let fields = structs::of(mc, arg(0), kind).ok_or(Fault::WrongType)?.items(mc);
@@ -991,9 +1030,11 @@ impl Intrinsic {
                 }
                 if self == Intrinsic::StructRef {
                     fields.get(k)
-                } else {
+                } else if structs::is_mutable(mc, kind, k) {
                     fields.set(mc, k, arg(3));
                     Value::VOID
+                } else {
+                    return Err(Fault::Immutable);
                 }
             }
             _ => unreachable!("{self:?} isn't a struct procedure"),
@@ -1520,7 +1561,9 @@ impl Intrinsic {
             | Intrinsic::ImagPart
             | Intrinsic::Magnitude
             | Intrinsic::Angle => self.numeric(mc, arg, args, fuel)?,
-            Intrinsic::MakeStructType | Intrinsic::MakeStruct | Intrinsic::IsStruct | Intrinsic::StructRef | Intrinsic::StructSet | Intrinsic::StructFields => self.structs(mc, arg, args, fuel)?,
+            Intrinsic::MakeStructType | Intrinsic::MakeStruct | Intrinsic::IsStruct | Intrinsic::IsStructDerivedFrom | Intrinsic::StructRef | Intrinsic::StructSet | Intrinsic::StructFields | Intrinsic::IsStructFieldMutable => {
+                self.structs(mc, arg, args, fuel)?
+            }
             Intrinsic::IsCharAlphabetic
             | Intrinsic::IsCharNumeric
             | Intrinsic::IsCharWhitespace

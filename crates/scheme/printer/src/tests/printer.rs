@@ -96,9 +96,9 @@ fn run<'gc>(mc: &Mutation<'gc>, op: Intrinsic, args: &[Value<'gc>]) -> Value<'gc
 fn structs_are_written_with_their_fields() {
     with(|mc| {
         let pairs = Pairs::new(mc);
-        let fields = pairs.list(&[symbol(mc, "x"), symbol(mc, "y")]).unwrap();
-        let point = run(mc, Intrinsic::MakeStructType, &[symbol(mc, "point"), Value::FALSE, fields, Value::FALSE]);
-        let unit = run(mc, Intrinsic::MakeStructType, &[symbol(mc, "unit"), Value::FALSE, Value::NIL, Value::FALSE]);
+        let (fields, mutable) = (pairs.list(&[symbol(mc, "x"), symbol(mc, "y")]).unwrap(), pairs.list(&[Value::TRUE, Value::TRUE]).unwrap());
+        let point = run(mc, Intrinsic::MakeStructType, &[symbol(mc, "point"), Value::FALSE, fields, mutable, Value::FALSE]);
+        let unit = run(mc, Intrinsic::MakeStructType, &[symbol(mc, "unit"), Value::FALSE, Value::NIL, Value::NIL, Value::FALSE]);
         let p = run(mc, Intrinsic::MakeStruct, &[point, number(mc, "1"), text(mc, "two")]);
         let nested = run(mc, Intrinsic::MakeStruct, &[point, p, run(mc, Intrinsic::MakeStruct, &[unit])]);
         assert_eq!(write(mc, nested), r#"#(struct:point #(struct:point 1 "two") #(struct:unit))"#);
@@ -107,7 +107,7 @@ fn structs_are_written_with_their_fields() {
         run(mc, Intrinsic::StructSet, &[p, point, number(mc, "1"), p]);
         assert_eq!(write(mc, p), "#0=#(struct:point 1 #0#)");
         // One of an identity type is written no differently.
-        let session = run(mc, Intrinsic::MakeStructType, &[symbol(mc, "session"), Value::FALSE, fields, Value::TRUE]);
+        let session = run(mc, Intrinsic::MakeStructType, &[symbol(mc, "session"), Value::FALSE, fields, mutable, Value::TRUE]);
         let s = run(mc, Intrinsic::MakeStruct, &[session, text(mc, "tok"), number(mc, "7")]);
         assert_eq!(write(mc, pairs.list(&[s, point, session]).unwrap()), r#"(#(struct:session "tok" 7) #<struct-type:point> #<struct-type:session>)"#);
     });
