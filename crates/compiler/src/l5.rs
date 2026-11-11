@@ -140,6 +140,22 @@ impl Inst<'_, '_> {
             }
         }
     }
+
+    /// Each value it uses, to change.
+    pub(crate) fn each_use_mut(&mut self, mut f: impl FnMut(&mut Val)) {
+        match self {
+            Inst::Const(..) | Inst::Upvalue(..) => {}
+            Inst::Prim { args, .. } => args.iter_mut().for_each(f),
+            Inst::Call { f: callee, args, .. } => iter::once(callee).chain(args).for_each(f),
+            Inst::Closures { codes, .. } => {
+                for c in codes.iter_mut().flat_map(|code| &mut code.captures) {
+                    if let Captured::Val(v) = c {
+                        f(v);
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl End<'_> {
@@ -164,6 +180,15 @@ impl End<'_> {
             End::Jump(_, args) | End::TailPrim { args, .. } => args.iter().for_each(|&v| f(v)),
             End::Branch { test, .. } | End::Return(test) => f(*test),
             End::TailCall { f: callee, args } => iter::once(callee).chain(args).for_each(|&v| f(v)),
+        }
+    }
+
+    /// Each value it uses, to change.
+    pub(crate) fn each_use_mut(&mut self, mut f: impl FnMut(&mut Val)) {
+        match self {
+            End::Jump(_, args) | End::TailPrim { args, .. } => args.iter_mut().for_each(f),
+            End::Branch { test, .. } | End::Return(test) => f(test),
+            End::TailCall { f: callee, args } => iter::once(callee).chain(args).for_each(f),
         }
     }
 }

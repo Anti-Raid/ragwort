@@ -35,7 +35,9 @@ pub mod ir;
 pub mod keyword;
 mod l5;
 mod letrec;
+mod locals;
 mod lower;
+mod merge;
 pub mod module;
 pub mod steps;
 pub mod structs;
@@ -236,7 +238,8 @@ impl std::error::Error for CompileError {}
 /// [`ragwort_vm::Machine::new`].
 pub fn compile<'gc>(mc: &Mutation<'gc>, module: Option<Gc<'gc, Module>>, core: &Core<'gc>) -> Result<Value<'gc>, CompileError> {
     let arena = Arena::new();
-    let l5 = to_l5(mc, &arena, core)?;
+    let mut l5 = to_l5(mc, &arena, core)?;
+    merge::merge(mc, &mut l5);
     #[cfg(debug_assertions)]
     l5::check(&l5);
     emit::emit(mc, module, &l5)
@@ -255,6 +258,7 @@ fn to_l5<'a, 'gc>(mc: &Mutation<'gc>, arena: &'a Arena, core: &Core<'gc>) -> Res
             ir::l2::scope(move |mut l2| {
                 let (root, mut supply) = cp0::optimize(mc, &mut src, root, &mut l2, supply);
                 drop(src);
+                locals::replace(mc, &mut l2, root, &mut supply);
                 letrec::prune(mc, &mut l2, root);
                 #[cfg(debug_assertions)]
                 l2.check(root);

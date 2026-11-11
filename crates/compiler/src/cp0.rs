@@ -5,11 +5,14 @@
 //! - Pure intrinsic constant folding
 //! - Direct beta-reduction (`((lambda (x ...) body) a ...)`)
 //! - Single-use and small local procedure inlining
+//! - A call of a small procedure that only picks which procedure to call, where what's known
+//!   decides the pick, is a call of the one picked: `match` makes one for each clause
 //! - Conditional (`if`) and negation (`not`) simplification
 //! - Dead `Let` binding elimination and effect sequencing (`Seq`)
-//! - What's known of struct values: a test or a field read that succeeded says what type a
-//!   variable's value is of, so later tests fold and later reads check nothing, and a variable
-//!   bound to a new struct has its fields' values
+//! - What's known of struct values:
+//!   - a test or a field read says what type a value is or isn't of, so later tests fold and
+//!     later reads check nothing;
+//!   - a variable bound to a new struct has the values of its fields that can't be set
 //!
 //! It reads one table, the source, and makes what it optimizes to in another, so what's still to
 //! optimize and what's done are of different tables. The one code it optimizes again, a small
@@ -26,7 +29,7 @@ use ragwort_vm::{Fuel, Intrinsic, Purity, structs};
 
 use crate::ir::Supply;
 use crate::ir::l2::{Bind, Fun, Function, Id, L2, Node, Span};
-use crate::{Prim, Var};
+use crate::{Prim, SlotOp, Var};
 
 /// The most fuel a constant fold may spend.
 const FOLD_FUEL: u64 = 1 << 16;
@@ -73,10 +76,14 @@ pub(crate) fn optimize<'s, 'd, 'gc>(mc: &Mutation<'gc>, src: &mut L2<'s, 'gc>, r
         truthy_vars: HashSet::default(),
         pred_facts: HashMap::default(),
         single_use: HashMap::default(),
+        small_bodies: Vec::new(),
+        next_small: false,
         small_funcs: HashMap::default(),
         known_pairs: HashMap::default(),
         known_structs: HashMap::default(),
         derived: HashMap::default(),
+        slot_derived: HashMap::default(),
+        hidden: Vec::new(),
         learned: Vec::new(),
         inline_depth: 0,
         arms: Vec::new(),
@@ -91,6 +98,21 @@ pub(crate) fn optimize<'s, 'd, 'gc>(mc: &Mutation<'gc>, src: &mut L2<'s, 'gc>, r
     }
     let root = pass.pop();
     (root, pass.supply)
+}
+
+/// What a fact about a struct value is a fact about: an unassigned variable, or one of the
+/// module's variables, which a call can change.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Subject {
+    Local(Var),
+    Slot(u32),
+}
+
+/// The struct types a value is known to be an instance of, and those it's known not to be.
+#[derive(Default)]
+struct Known<'gc> {
+    is: Vec<Gc<'gc, StructType>>,
+    isnt: Vec<Gc<'gc, StructType>>,
 }
 
 /// A branch of an `if`, in [`Cp0::arms`]: source still to optimize, or an `if` whose test is
@@ -145,13 +167,27 @@ enum Task<'s, 'd, 'gc> {
     /// The `then` of `(if (pred v) ...)` made; `other` next, with the fact false.
     PredElse { pred: Intrinsic, v: Var, newly: bool, prev_subst: Option<Subst<'gc>>, prev_fact: Option<bool>, other: usize, test: Id<'d> },
     PredDone { pred: Intrinsic, v: Var, prev_fact: Option<bool>, test: Id<'d> },
-    /// The `then` of `(if (struct-derived-from? v type) ...)` made; `other` next.
-    DerivedElse { v: Var, newly: bool, other: usize, test: Id<'d> },
-    /// The branch of an `if` taken when `v` is an instance of the struct type.
-    ArmOf(usize, Var, Gc<'gc, StructType>),
+    /// The `then` of `(if (struct-derived-from? x type) ...)` made; `other` next, where `x`
+    /// isn't an instance of the type, and `truthy` is no longer known to be true.
+    DerivedElse { truthy: Option<Var>, subject: Subject, kind: Gc<'gc, StructType>, other: usize, test: Id<'d> },
+    /// The branch of an `if` taken when the subject is an instance of the struct type, if
+    /// `is`, or when it isn't.
+    ArmOf(usize, Subject, Gc<'gc, StructType>, bool),
     /// Out of an `if`'s branch or a function's body: what [`Cp0::learned`] has past its first
     /// `n` is forgotten, as it's only known where that code has run.
     Forget(usize),
+    /// Into a function's body, which runs after any code might have: what's known of the
+    /// module's variables is put aside.
+    Hide,
+    /// Out of a function's body: what was put aside is known again.
+    Show,
+    /// Into the body of a function, which is one of [`Cp0::small_bodies`] if it says so, and
+    /// out of it.
+    Enter(bool),
+    Leave,
+    /// The lambda made last is bound to the variable, in the `let` that's that deep in
+    /// [`Cp0::lets`]: one called once that wasn't inlined at its call.
+    LateBind(usize, Var),
     /// Both branches of an `if` made.
     If(Id<'d>),
     /// The innermost `let`'s binding.
@@ -190,7 +226,14 @@ struct Cp0<'m, 't, 's, 'd, 'gc> {
     /// Dominating type-predicate facts `(pred, var) -> bool` for unassigned variables.
     pred_facts: HashMap<(Intrinsic, Var), bool>,
     /// Unassigned `Let`-bound lambdas referenced exactly once, in call position, still source.
-    single_use: HashMap<Var, Fun<'s>>,
+    single_use: HashMap<Var, (Fun<'s>, usize)>,
+    /// For each function's body being optimized, innermost last, whether the function is one
+    /// that's small as it's written and called in several places: a procedure called once
+    /// isn't inlined in it and a small one isn't copied into it, so that it stays small enough
+    /// to be copied to its calls, where more is known.
+    small_bodies: Vec<bool>,
+    /// Whether the lambda about to be optimized is such a function.
+    next_small: bool,
     /// Small unassigned `Let`-bound lambdas with no nested lambdas, eligible for cloning at call sites.
     small_funcs: HashMap<Var, Fun<'d>>,
     /// Unassigned variables bound to `(cons a b)` of constants and unassigned variables. Pairs
@@ -200,12 +243,17 @@ struct Cp0<'m, 't, 's, 'd, 'gc> {
     /// constant or an unassigned variable. A field that can't be set is its part wherever the
     /// variable's in scope.
     known_structs: HashMap<Var, (Gc<'gc, StructType>, Vec<Node<'d, 'gc>>)>,
-    /// Unassigned variables whose value is known to be an instance of each of some struct
-    /// types, or of a subtype: a test said so, or a field read by the type didn't fault. A
-    /// value's type never changes, so it holds in all the code that runs after.
-    derived: HashMap<Var, Vec<Gc<'gc, StructType>>>,
-    /// The variables `derived` was told a type of, in order.
-    learned: Vec<Var>,
+    /// What's known of the values of unassigned variables: a test said what struct type each is
+    /// or isn't of, or a field read by a type didn't fault. A value's type never changes, so
+    /// it holds in all the code that runs after.
+    derived: HashMap<Var, Known<'gc>>,
+    /// The same of the module's variables, which holds only till code that could assign one
+    /// runs: a call, or a function's body, which `hidden` keeps it from, innermost last.
+    slot_derived: HashMap<u32, Known<'gc>>,
+    hidden: Vec<HashMap<u32, Known<'gc>>>,
+    /// What `derived` and `slot_derived` were told, in order: of what, and whether it's a type
+    /// it is of.
+    learned: Vec<(Subject, bool)>,
     inline_depth: usize,
     arms: Vec<Arm<'s, 'd>>,
     /// The `let`s being optimized, innermost last.
@@ -245,27 +293,46 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                 self.arm(arm, then);
                 return then.push(Task::Forget(mark));
             }
-            Task::ArmOf(arm, v, kind) => {
+            Task::ArmOf(arm, subject, kind, is) => {
                 let mark = self.learned.len();
-                self.learn(v, kind);
+                self.learn(subject, kind, is);
                 self.arm(arm, then);
                 return then.push(Task::Forget(mark));
             }
             Task::Forget(mark) => {
-                for v in self.learned.split_off(mark) {
-                    let known = self.derived.get_mut(&v).expect("a variable learned of");
-                    known.pop();
-                    if known.is_empty() {
-                        self.derived.remove(&v);
+                for (subject, is) in self.learned.split_off(mark) {
+                    // A call may have forgotten what was known of a module's variable since.
+                    let Some(known) = self.known_mut(subject) else { continue };
+                    if is {
+                        known.is.pop();
+                    } else {
+                        known.isnt.pop();
                     }
                 }
                 return;
             }
-            Task::DerivedElse { v, newly, other, test } => {
-                if newly {
+            Task::Enter(small) => return self.small_bodies.push(small),
+            Task::Leave => {
+                self.small_bodies.pop();
+                return;
+            }
+            Task::LateBind(frame, v) => {
+                let lambda = self.pop();
+                if let Node::Lambda(fun) = self.out[lambda]
+                    && self.inline_depth < MAX_INLINE_DEPTH
+                    && self.is_small_inlinable(fun)
+                {
+                    self.small_funcs.insert(v, fun);
+                }
+                return self.lets[frame].kept.push(Bind::Val(v, lambda));
+            }
+            Task::Hide => return self.hidden.push(std::mem::take(&mut self.slot_derived)),
+            Task::Show => return self.slot_derived = self.hidden.pop().expect("hidden"),
+            Task::DerivedElse { truthy, subject, kind, other, test } => {
+                if let Some(v) = truthy {
                     self.truthy_vars.remove(&v);
                 }
-                return then.extend([Task::Arm(other), Task::If(test)]);
+                return then.extend([Task::ArmOf(other, subject, kind, false), Task::If(test)]);
             }
             Task::Test(t, o) => {
                 let test = self.pop();
@@ -365,6 +432,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             Task::App(n) => {
                 let args = self.last(n);
                 let (f, args) = (self.pop(), self.out.list(args));
+                self.slot_derived.clear();
                 self.out.add(Node::App(f, args))
             }
             Task::Intrinsic(prim, n) => {
@@ -374,6 +442,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             Task::ApplyIntrinsic(prim, n) => {
                 let args = self.last(n);
                 let args = self.out.list(args);
+                self.ran(prim);
                 self.out.add(Node::ApplyIntrinsic(prim, args))
             }
             Task::Inlined => return self.inline_depth -= 1,
@@ -407,7 +476,10 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             }
             Node::Set(v, value) => return then.extend([Task::Expr(value), Task::Set(v)]),
             Node::App(f, args) => return self.app(f, args, then),
-            Node::Lambda(fun) => return then.extend([Task::Expr(self.src[fun].body), Task::Forget(self.learned.len()), Task::Function(fun)]),
+            Node::Lambda(fun) => {
+                let small = std::mem::take(&mut self.next_small);
+                return then.extend(self.body_tasks(fun, small).into_iter().chain([Task::Function(fun)]));
+            }
             Node::Intrinsic(prim, args) => {
                 then.extend(self.src[args].iter().map(|&a| Task::Expr(a)));
                 return then.push(Task::Intrinsic(prim, self.src[args].len()));
@@ -497,15 +569,18 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                     let newly = self.truthy_vars.insert(v);
                     then.extend([Task::Arm(t), Task::VarElse { v, newly, other: o, test }]);
                 }
-                // Dominating struct test: in `then`, `v` is an instance of the type.
+                // Dominating struct test: in `then`, the value is an instance of the type, and in
+                // `other` it isn't.
                 Node::Intrinsic(Prim::Intrinsic(Intrinsic::IsStructDerivedFrom), args)
-                    if let [subject, kind] = self.out[args]
-                        && let Node::Ref(v) = self.out[subject]
-                        && !self.assigned.contains(&v)
+                    if let [tested, kind] = self.out[args]
+                        && let Some(subject) = self.subject(tested)
                         && let Some(kind) = self.struct_type(kind) =>
                 {
-                    let newly = self.truthy_vars.insert(v);
-                    then.extend([Task::ArmOf(t, v, kind), Task::DerivedElse { v, newly, other: o, test }]);
+                    let truthy = match subject {
+                        Subject::Local(v) => self.truthy_vars.insert(v).then_some(v),
+                        Subject::Slot(_) => None,
+                    };
+                    then.extend([Task::ArmOf(t, subject, kind, true), Task::DerivedElse { truthy, subject, kind, other: o, test }]);
                 }
                 // Dominating type-predicate test: `(if (pair? v) then other)` records `(IsPair, v)` in branches.
                 Node::Intrinsic(Prim::Intrinsic(pred), args)
@@ -538,9 +613,8 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         let (v, init) = match self.frame().binds[i] {
             BindIn::Val(v, init) => (v, init),
             BindIn::Fix(group) => {
-                let mark = self.learned.len();
                 for &(_, fun) in &self.src[group] {
-                    then.extend([Task::Expr(self.src[fun].body), Task::Forget(mark)]);
+                    then.extend(self.body_tasks(fun, false));
                 }
                 return then.push(Task::Fix(group));
             }
@@ -557,9 +631,12 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                 return;
             }
             if stats.total == 1 && stats.valid_calls == 1 && takes(self.src, fun, stats.call_arity) {
-                self.single_use.insert(v, fun);
+                self.single_use.insert(v, (fun, self.lets.len() - 1));
                 return;
             }
+            // One that's only called, in several places, and is small as it's written is kept
+            // small, to be copied to those places.
+            self.next_small = stats.valid_calls == stats.total && self.small_as_written(fun);
         }
         match init {
             Init::Src(e) => then.extend([Task::Expr(e), Task::Val(v)]),
@@ -688,19 +765,35 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         let f = self.pop();
         let n = self.src[args].len();
         if let Node::Ref(v) = self.out[f]
-            && let Some(fun) = self.single_use.remove(&v)
+            && let Some((fun, frame)) = self.single_use.remove(&v)
         {
+            // In a function that's to stay small, it's called: it's bound where it was, to
+            // what its body is made into here, its one call. It's called wherever that
+            // function is copied to, so it stays small too, if it's small as it's written.
+            if self.small_bodies.last() == Some(&true) {
+                self.vals.push(f);
+                let small = self.small_as_written(fun);
+                then.extend(self.body_tasks(fun, small).into_iter().chain([Task::Function(fun), Task::LateBind(frame, v)]));
+                then.extend(self.src[args].iter().map(|&a| Task::Expr(a)));
+                return then.push(Task::Call(n));
+            }
             if takes(self.src, fun, n) {
                 let binds = self.bind_src(fun, args);
                 return self.open_let(binds, self.src[fun].body, then);
             }
-            then.extend([Task::Expr(self.src[fun].body), Task::Forget(self.learned.len()), Task::Function(fun)]);
+            then.extend(self.body_tasks(fun, false).into_iter().chain([Task::Function(fun)]));
             then.extend(self.src[args].iter().map(|&a| Task::Expr(a)));
             return then.push(Task::App(n));
         }
         self.vals.push(f);
         then.extend(self.src[args].iter().map(|&a| Task::Expr(a)));
         then.push(Task::Call(n));
+    }
+
+    /// What optimizes the body of `fun`, which runs after any code might have, as its own: what's
+    /// known of the module's variables is put aside for it, and what it learns is forgotten.
+    fn body_tasks(&self, fun: Fun<'s>, small: bool) -> [Task<'s, 'd, 'gc>; 6] {
+        [Task::Enter(small), Task::Hide, Task::Expr(self.src[fun].body), Task::Forget(self.learned.len()), Task::Show, Task::Leave]
     }
 
     /// `fun`'s parameters bound to `args`, all source.
@@ -755,6 +848,16 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                 _ => break,
             }
         }
+        // A call of a small function that only picks which procedure to call is a call of the
+        // one picked, and so on from that one. Each is bound before the one that calls it, so
+        // this ends, however many there are.
+        while args.is_empty()
+            && let Node::Ref(v) = self.out[f]
+            && let Some(&fun) = self.small_funcs.get(&v)
+            && let Some(to) = self.picked(fun)
+        {
+            f = to;
+        }
         let made = match self.out[f] {
             // An optimized lambda applied directly binds its parameters around its body as it is,
             // rather than optimizing the body again.
@@ -762,12 +865,16 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                 let func = self.out[fun];
                 let params = self.out[func.params].to_vec();
                 let binds = self.bind_done(params, func.rest, args).into_iter().map(|(v, e)| Bind::Val(v, e)).collect();
+                // Its body, made already, may call anything.
+                self.slot_derived.clear();
                 self.finish_let(binds, func.body)
             }
             // A small local lambda is copied in at each call, with its parameters renamed, and the
-            // copy optimized again with the arguments it's given.
+            // copy optimized again with the arguments it's given: but not into a function
+            // that's to stay small.
             Node::Ref(v)
                 if self.inline_depth < MAX_INLINE_DEPTH
+                    && self.small_bodies.last() != Some(&true)
                     && let Some(&fun) = self.small_funcs.get(&v)
                     && takes(self.out, fun, args.len()) =>
             {
@@ -782,6 +889,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             }
             _ => {
                 let args = self.out.list(args);
+                self.slot_derived.clear();
                 self.out.add(Node::App(f, args))
             }
         };
@@ -792,6 +900,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
     fn opt_intrinsic(&mut self, prim: Prim, mut args: Vec<Id<'d>>) -> Id<'d> {
         let Prim::Intrinsic(intrinsic) = prim else {
             let args = self.out.list(args);
+            self.ran(prim);
             return self.out.add(Node::Intrinsic(prim, args));
         };
         // Float leading `Seq`s and `let`s out of the first argument, which runs before the rest
@@ -945,23 +1054,8 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
 
         // 5. Type predicates on dominating variables or freshly constructed values.
         if intrinsic.is_type_predicate() && args.len() == 1 {
-            if let Node::Ref(v) = self.out[args[0]] {
-                if let Some(&known) = self.pred_facts.get(&(intrinsic, v)) {
-                    return self.truth(known);
-                }
-                if self.known_structs.contains_key(&v) || self.derived.contains_key(&v) {
-                    return self.truth(intrinsic == Intrinsic::IsStruct);
-                }
-                // What's known of `v` by another predicate says this one's answer if that one
-                // implies it and is true, or it implies that one, which is false, or the two
-                // are never both true.
-                let known = |holds: bool, tells: &dyn Fn(Intrinsic) -> bool| self.pred_facts.iter().any(|(&(other, u), &val)| u == v && val == holds && tells(other));
-                if known(true, &|other| other.implies(intrinsic)) {
-                    return self.truth(true);
-                }
-                if known(false, &|other| intrinsic.implies(other)) || known(true, &|other| intrinsic.is_disjoint_predicate(other)) {
-                    return self.truth(false);
-                }
+            if let Some(known) = self.of_kind(intrinsic, args[0]) {
+                return self.truth(known);
             }
             match self.out[args[0]] {
                 Node::Intrinsic(Prim::Intrinsic(Intrinsic::Cons), c) if self.out[c].len() == 2 => {
@@ -1018,12 +1112,72 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             return made;
         }
         if matches!(intrinsic, Intrinsic::StructRef | Intrinsic::StructSet)
-            && let Node::Ref(v) = self.out[args[0]]
+            && let Some(subject) = self.subject(args[0])
             && let Some(kind) = self.struct_type(args[1])
         {
-            self.learn(v, kind);
+            self.learn(subject, kind, true);
         }
         self.make(prim, args)
+    }
+
+    /// Whether the value of `e` is of the kind the type predicate `pred` tests for, if what's
+    /// known of it says.
+    fn of_kind(&self, pred: Intrinsic, e: Id<'d>) -> Option<bool> {
+        // What's an instance of a struct type is a struct, and of no other kind.
+        if let Some(subject) = self.subject(e)
+            && self.known(subject).is_some_and(|known| !known.is.is_empty())
+        {
+            return Some(pred == Intrinsic::IsStruct);
+        }
+        let Node::Ref(v) = self.out[e] else { return None };
+        if let Some(&known) = self.pred_facts.get(&(pred, v)) {
+            return Some(known);
+        }
+        if self.known_structs.contains_key(&v) {
+            return Some(pred == Intrinsic::IsStruct);
+        }
+        // What's known of `v` by another predicate says this one's answer if that one implies
+        // it and is true, or it implies that one, which is false, or the two are never both
+        // true.
+        let known = |holds: bool, tells: &dyn Fn(Intrinsic) -> bool| self.pred_facts.iter().any(|(&(other, u), &val)| u == v && val == holds && tells(other));
+        if known(true, &|other| other.implies(pred)) {
+            return Some(true);
+        }
+        if known(false, &|other| pred.implies(other)) || known(true, &|other| pred.is_disjoint_predicate(other)) {
+            return Some(false);
+        }
+        None
+    }
+
+    /// Whether `test`, made, is true, if what's known here says so either way.
+    fn decided(&self, test: Id<'d>) -> Option<bool> {
+        match self.out[test] {
+            Node::Quote(v) => Some(v != Value::FALSE),
+            Node::Ref(v) if self.truthy_vars.contains(&v) => Some(true),
+            Node::Intrinsic(Prim::Intrinsic(Intrinsic::IsStructDerivedFrom), args) if let [tested, kind] = self.out[args] => self.derives(self.subject(tested)?, self.struct_type(kind)?),
+            Node::Intrinsic(Prim::Intrinsic(pred), args) if pred.is_type_predicate() && let [tested] = self.out[args] => self.of_kind(pred, tested),
+            _ => None,
+        }
+    }
+
+    /// The procedure a call of `fun` with no arguments is a call of, if `fun` only picks one
+    /// to call, by tests that what's known here decides.
+    ///
+    /// `(lambda () (if (point? x) (matched) (next)))` is such a function: where `x` is known
+    /// not to be a point, a call of it is `(next)`.
+    fn picked(&self, fun: Fun<'d>) -> Option<Id<'d>> {
+        let f = self.out[fun];
+        if !self.out[f.params].is_empty() || f.rest.is_some() {
+            return None;
+        }
+        let mut e = f.body;
+        while let Node::If(test, t, o) = self.out[e] {
+            e = if self.decided(test)? { t } else { o };
+        }
+        match self.out[e] {
+            Node::App(to, args) if self.out[args].is_empty() && matches!(self.out[to], Node::Ref(_)) => Some(to),
+            _ => None,
+        }
     }
 
     /// The struct type `e` is, if it's one as a constant.
@@ -1034,24 +1188,73 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         }
     }
 
-    /// Notes that the value of `v` is an instance of `kind`, in the code that runs from here.
-    fn learn(&mut self, v: Var, kind: Gc<'gc, StructType>) {
-        if self.assigned.contains(&v) || self.derives(v, kind) == Some(true) {
-            return;
+    /// What `e` reads, if facts are kept of it: an unassigned variable, or one of the module's.
+    fn subject(&self, e: Id<'d>) -> Option<Subject> {
+        match self.out[e] {
+            Node::Ref(v) if !self.assigned.contains(&v) => Some(Subject::Local(v)),
+            Node::Intrinsic(Prim::Slot(SlotOp::Load | SlotOp::LoadChecked, slot), _) => Some(Subject::Slot(slot)),
+            _ => None,
         }
-        self.derived.entry(v).or_default().push(kind);
-        self.learned.push(v);
     }
 
-    /// Whether the value of `v` is an instance of `kind`, if that's known either way.
-    fn derives(&self, v: Var, kind: Gc<'gc, StructType>) -> Option<bool> {
-        if let Some(&(made_as, _)) = self.known_structs.get(&v) {
-            return Some(structs::derives(self.mc, made_as, kind));
+    fn known(&self, subject: Subject) -> Option<&Known<'gc>> {
+        match subject {
+            Subject::Local(v) => self.derived.get(&v),
+            Subject::Slot(slot) => self.slot_derived.get(&slot),
         }
-        self.derived.get(&v)?.iter().find_map(|&known| {
-            if structs::derives(self.mc, known, kind) {
+    }
+
+    fn known_mut(&mut self, subject: Subject) -> Option<&mut Known<'gc>> {
+        match subject {
+            Subject::Local(v) => self.derived.get_mut(&v),
+            Subject::Slot(slot) => self.slot_derived.get_mut(&slot),
+        }
+    }
+
+    /// Notes that code which isn't an intrinsic's has run: a request or a host function, which
+    /// can call a procedure, or an assignment of a module's variable. What's known of the
+    /// module's variables may no longer hold.
+    fn ran(&mut self, prim: Prim) {
+        if !matches!(prim, Prim::Intrinsic(_) | Prim::Read(_) | Prim::Slot(SlotOp::Load | SlotOp::LoadChecked, _)) {
+            self.slot_derived.clear();
+        }
+    }
+
+    /// Notes that the value of `subject` is an instance of `kind`, if `is`, or that it isn't,
+    /// in the code that runs from here.
+    fn learn(&mut self, subject: Subject, kind: Gc<'gc, StructType>, is: bool) {
+        if self.derives(subject, kind).is_some() {
+            return;
+        }
+        let known = match subject {
+            Subject::Local(v) => self.derived.entry(v).or_default(),
+            Subject::Slot(slot) => self.slot_derived.entry(slot).or_default(),
+        };
+        if is {
+            known.is.push(kind);
+        } else {
+            known.isnt.push(kind);
+        }
+        self.learned.push((subject, is));
+    }
+
+    /// Whether the value of `subject` is an instance of `kind`, if that's known either way.
+    fn derives(&self, subject: Subject, kind: Gc<'gc, StructType>) -> Option<bool> {
+        let mc = self.mc;
+        if let Subject::Local(v) = subject
+            && let Some(&(made_as, _)) = self.known_structs.get(&v)
+        {
+            return Some(structs::derives(mc, made_as, kind));
+        }
+        let known = self.known(subject)?;
+        // What isn't an instance of a type isn't one of its subtypes.
+        if known.isnt.iter().any(|&isnt| structs::derives(mc, kind, isnt)) {
+            return Some(false);
+        }
+        known.is.iter().find_map(|&is| {
+            if structs::derives(mc, is, kind) {
                 Some(true)
-            } else if structs::derives(self.mc, kind, known) {
+            } else if structs::derives(mc, kind, is) {
                 None
             } else {
                 // A value of two types is of one that derives from both, so one of the two
@@ -1070,40 +1273,43 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             _ => None,
         };
         match (intrinsic, args) {
-            (Intrinsic::IsStructDerivedFrom, &[subject, kind]) => {
+            (Intrinsic::IsStructDerivedFrom, &[tested, kind]) => {
                 let kind = self.struct_type(kind)?;
-                if let Node::Ref(v) = self.out[subject] {
-                    return self.derives(v, kind).map(|known| self.truth(known));
+                if let Some(subject) = self.subject(tested) {
+                    return self.derives(subject, kind).map(|known| self.truth(known));
                 }
-                let (made_as, made) = self.out.made_struct(mc, subject)?;
+                let (made_as, made) = self.out.made_struct(mc, tested)?;
                 let res = self.truth(structs::derives(mc, made_as, kind));
                 Some(self.seq_all(self.out[made][1..].to_vec(), res))
             }
-            // A field of a variable bound to a new struct is what it was made with, if nothing
-            // can have set it since.
-            (Intrinsic::StructField, &[subject, k]) => {
-                let Node::Ref(v) = self.out[subject] else { return None };
+            // A field that can't be set, of a variable bound to a new struct, is what the
+            // struct was made with.
+            (Intrinsic::StructField | Intrinsic::StructFixedField, &[read, at]) => {
+                let (Node::Ref(v), k) = (self.out[read], index(self, at)?) else { return None };
                 let (made_as, parts) = self.known_structs.get(&v)?;
-                let part = *parts.get(index(self, k)?)?;
-                if structs::is_mutable(mc, *made_as, index(self, k)?) {
+                if structs::is_mutable(mc, *made_as, k) {
                     return None;
                 }
+                let part = *parts.get(k)?;
                 Some(self.out.add(part))
             }
-            (Intrinsic::StructRef, &[subject, kind, at]) => {
+            (Intrinsic::StructRef, &[read, kind, at]) => {
                 let (kind, k) = (self.struct_type(kind)?, index(self, at)?);
                 if k >= kind.fields(mc) as usize {
                     return None;
                 }
-                if let Node::Ref(v) = self.out[subject] {
-                    if self.derives(v, kind) != Some(true) {
+                if let Some(subject) = self.subject(read) {
+                    if self.derives(subject, kind) != Some(true) {
                         return None;
                     }
-                    return Some(self.opt_intrinsic(Prim::Intrinsic(Intrinsic::StructField), vec![subject, at]));
+                    // The type's known, so the read checks nothing: and a field that can't be
+                    // set is the same whenever it's read.
+                    let unchecked = if structs::is_mutable(mc, kind, k) { Intrinsic::StructField } else { Intrinsic::StructFixedField };
+                    return Some(self.opt_intrinsic(Prim::Intrinsic(unchecked), vec![read, at]));
                 }
                 // A struct made only to be read is the value it was given for the field, once
                 // the others are evaluated, in order.
-                let (made_as, made) = self.out.made_struct(mc, subject)?;
+                let (made_as, made) = self.out.made_struct(mc, read)?;
                 if !structs::derives(mc, made_as, kind) {
                     return None;
                 }
@@ -1130,35 +1336,17 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         }
     }
 
+    /// Whether `fun`, still source, is small enough to copy to its calls as it's written.
+    fn small_as_written(&self, fun: Fun<'s>) -> bool {
+        let params_unassigned = !self.src.params(fun).any(|param| self.assigned.contains(&param));
+        params_unassigned && small(self.src, &self.assigned, self.src[fun].body, &mut 0)
+    }
+
     fn is_small_inlinable(&self, fun: Fun<'d>) -> bool {
         if self.out.params(fun).any(|v| self.assigned.contains(&v)) {
             return false;
         }
-        let mut size = 0;
-        self.check_small(self.out[fun].body, &mut size)
-    }
-
-    /// Whether `e` is small enough, which it stops looking at as soon as it isn't, so it goes no
-    /// deeper than [`MAX_INLINE_SIZE`].
-    fn check_small(&self, e: Id<'d>, size: &mut usize) -> bool {
-        *size += 1;
-        if *size > MAX_INLINE_SIZE {
-            return false;
-        }
-        let all = |this: &Self, args: Span<'d, Id<'d>>, size: &mut usize| this.out[args].iter().all(|&a| this.check_small(a, size));
-        match self.out[e] {
-            Node::Quote(_) => true,
-            Node::Ref(v) => !self.assigned.contains(&v),
-            Node::If(a, b, c) => self.check_small(a, size) && self.check_small(b, size) && self.check_small(c, size),
-            Node::Seq(a, b) => self.check_small(a, size) && self.check_small(b, size),
-            Node::Let(binds, body) => {
-                self.out[binds].iter().all(|&b| matches!(b, Bind::Val(v, init) if !self.assigned.contains(&v) && self.check_small(init, size)))
-                    && self.check_small(body, size)
-            }
-            Node::Set(..) | Node::Lambda(_) => false,
-            Node::App(f, args) => self.check_small(f, size) && all(self, args, size),
-            Node::Intrinsic(_, args) | Node::ApplyIntrinsic(_, args) => all(self, args, size),
-        }
+        small(self.out, &self.assigned, self.out[fun].body, &mut 0)
     }
 
     /// A copy of `fun`, a small function, into the source, its variables fresh.
@@ -1223,6 +1411,28 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
     fn rename_all(&mut self, args: Span<'d, Id<'d>>, map: &mut HashMap<Var, Var>) -> Span<'s, Id<'s>> {
         let renamed: Vec<Id<'s>> = (0..self.out[args].len()).map(|i| self.rename(self.out[args][i], map)).collect();
         self.src.list(renamed)
+    }
+}
+
+/// Whether `e` of `tree` is small enough to copy to where it's used, `size` being how much has
+/// been counted already. It stops looking as soon as it isn't, so it goes no deeper than
+/// [`MAX_INLINE_SIZE`].
+fn small<'x>(tree: &L2<'x, '_>, assigned: &HashSet<Var>, e: Id<'x>, size: &mut usize) -> bool {
+    *size += 1;
+    if *size > MAX_INLINE_SIZE {
+        return false;
+    }
+    match tree[e] {
+        Node::Quote(_) => true,
+        Node::Ref(v) => !assigned.contains(&v),
+        Node::If(a, b, c) => [a, b, c].into_iter().all(|part| small(tree, assigned, part, size)),
+        Node::Seq(a, b) => small(tree, assigned, a, size) && small(tree, assigned, b, size),
+        Node::Let(binds, body) => {
+            tree[binds].iter().all(|&b| matches!(b, Bind::Val(v, init) if !assigned.contains(&v) && small(tree, assigned, init, size))) && small(tree, assigned, body, size)
+        }
+        Node::Set(..) | Node::Lambda(_) => false,
+        Node::App(f, args) => small(tree, assigned, f, size) && tree[args].iter().all(|&a| small(tree, assigned, a, size)),
+        Node::Intrinsic(_, args) | Node::ApplyIntrinsic(_, args) => tree[args].iter().all(|&a| small(tree, assigned, a, size)),
     }
 }
 

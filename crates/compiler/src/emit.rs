@@ -97,7 +97,7 @@ enum Aim {
 enum Imm<'gc> {
     /// `(+ a k)` of a small `k`, which `AddImm` has.
     Add(i16),
-    /// `(struct-field s k)`, which `StructField` has the index of.
+    /// `(struct-field s k)` or `(struct-fixed-field s k)`, which `StructField` has the index of.
     Field(u16),
     /// `(struct-ref s type k)`, which `StructRef` has the type and the index of.
     FieldOf(Value<'gc>, u8),
@@ -116,7 +116,7 @@ fn imms<'t, 'gc>(arena: &'t Arena, f: &Function<'_, 'gc>) -> Imms<'t, 'gc> {
                 let fixnum = |v: &Val| constants[v.0 as usize].and_then(|k| k.as_fixnum());
                 imms[dst.0 as usize] = match (intrinsic, args.as_slice()) {
                     (Intrinsic::Add, [_, k]) => fixnum(k).and_then(|k| i16::try_from(k).ok()).map(Imm::Add),
-                    (Intrinsic::StructField, [_, k]) => fixnum(k).and_then(|k| u16::try_from(k).ok()).map(Imm::Field),
+                    (Intrinsic::StructField | Intrinsic::StructFixedField, [_, k]) => fixnum(k).and_then(|k| u16::try_from(k).ok()).map(Imm::Field),
                     (Intrinsic::StructRef, [_, kind, k]) => constants[kind.0 as usize].zip(fixnum(k).and_then(|k| u8::try_from(k).ok())).map(|(kind, k)| Imm::FieldOf(kind, k)),
                     _ => None,
                 };

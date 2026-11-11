@@ -279,6 +279,12 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
     /// The code of `clauses`: the body of the first whose steps match, or else `(fail)`. Each
     /// run of clauses that start with the same step that has no effects share it, and the run
     /// fails by calling a procedure that tries what's after it.
+    ///
+    /// A run that starts with a test, such as `(point? x)`, is in two procedures: `matched`,
+    /// which is the rest of the run, and one that's just `(if test (matched) (next))`. The
+    /// optimizer takes a call of that small one to be a call of the procedure it picks,
+    /// wherever what's known decides the test: a clause that failed for not being a `point`
+    /// goes past the later `point` clauses without testing again, however many there are.
     fn tries<'s>(&mut self, clauses: Vec<Clause<'s>>, fail: Stx) -> Result<Em<'s, 'e, 'a, 'gc>, ExpandError> {
         let mut runs = Vec::new();
         let mut rest = clauses.as_slice();
@@ -291,26 +297,68 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
             runs.push(run.to_vec());
             rest = after;
         }
-        self.runs(runs, None, fail)
+        if runs.is_empty() {
+            return Ok(Next::Done(self.ex.list(&[fail], self.m.at)?));
+        }
+        self.runs(runs, Vec::new(), fail)
     }
 
-    /// The code of the `runs` left, from the last, the code after them `code`.
-    fn runs<'s>(&mut self, mut runs: Vec<Vec<Clause<'s>>>, code: Option<Stx>, fail: Stx) -> Result<Em<'s, 'e, 'a, 'gc>, ExpandError> {
+    /// The code of the `runs` left, from the last. A run that fails calls `next`, and the
+    /// procedures the runs after these are in are `later`, each with its name, from the last
+    /// run's: each is bound around those after it in `later` and the code of the first run.
+    fn runs<'s>(&mut self, mut runs: Vec<Vec<Clause<'s>>>, mut later: Vec<(Stx, Stx)>, next: Stx) -> Result<Em<'s, 'e, 'a, 'gc>, ExpandError> {
         let at = self.m.at;
-        let Some(run) = runs.pop() else {
-            return Ok(Next::Done(match code {
-                Some(code) => code,
-                None => self.ex.list(&[fail], at)?,
+        let run = runs.pop().expect("a run left");
+        // The first run is tried where the match is.
+        if runs.is_empty() {
+            return Ok(Next::then(Code::Run(run, next), move |s: &mut Self, mut code| {
+                for (name, body) in later.into_iter().rev() {
+                    code = s.let_thunk(at, name, body, code)?;
+                }
+                Ok(Next::Done(code))
+            }));
+        }
+        let tries = self.temp()?.stx;
+        let Some(&Step::Is(shape, x)) = run[0].0.first() else {
+            return Ok(Next::then(Code::Run(run, next), move |s: &mut Self, this| {
+                later.push((tries, this));
+                s.runs(runs, later, tries)
             }));
         };
-        let next = if code.is_some() { self.temp()?.stx } else { fail };
-        Ok(Next::then(Code::Run(run, next), move |s: &mut Self, this| {
-            let code = match code {
-                Some(later) => s.let_thunk(at, next, later, this)?,
-                None => this,
-            };
-            s.runs(runs, Some(code), fail)
+        // A run that starts with a test is the test, which picks a procedure, and the rest.
+        let matched = self.temp()?.stx;
+        let test = self.shape_test(shape, x)?;
+        let (to_matched, to_next) = (self.ex.list(&[matched], at)?, self.ex.list(&[next], at)?);
+        let pick = self.ex.build(at, "if", &[&[test, to_matched, to_next]])?;
+        let rest = match *run.as_slice() {
+            [(steps, body)] => Code::Emit(&steps[1..], self.match_body(body, next)?, to_next),
+            _ => Code::Tries(run.iter().map(|&(steps, body)| (&steps[1..], body)).collect(), next),
+        };
+        Ok(Next::then(rest, move |s: &mut Self, rest| {
+            later.extend([(matched, rest), (tries, pick)]);
+            s.runs(runs, later, tries)
         }))
+    }
+
+    /// The test of whether `x` has `shape`.
+    fn shape_test(&mut self, shape: Shape, x: Temp) -> Result<Stx, ExpandError> {
+        let at = self.m.at;
+        Ok(match shape {
+            Shape::Pair => self.ex.build(at, "pair?", &[&[x.stx]])?,
+            Shape::Null => self.ex.build(at, "null?", &[&[x.stx]])?,
+            Shape::List => self.ex.build(at, "list?", &[&[x.stx]])?,
+            Shape::Vector => self.ex.build(at, "vector?", &[&[x.stx]])?,
+            Shape::Length(n) => {
+                let n = Value::fixnum(n as i64).ok_or_else(|| self.ex.error(ExpandErrorKind::BadSyntax, at))?;
+                let n = self.ex.value(n, at)?;
+                let len = self.ex.build(at, "vector-length", &[&[x.stx]])?;
+                self.ex.build(at, "eqv?", &[&[len, n]])?
+            }
+            Shape::Struct(of) => {
+                let kind = self.m.structs[of].kind;
+                self.ex.build(at, "struct-derived-from?", &[&[x.stx, kind]])?
+            }
+        })
     }
 
     /// The code of `run`, clauses that all start with the same step if there's more than one.
@@ -644,21 +692,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         let fixnum = |this: &Self, n: usize| Value::fixnum(n as i64).ok_or_else(|| this.ex.error(ExpandErrorKind::BadSyntax, at));
         Ok(match *step {
             Step::Is(shape, x) => {
-                let test = match shape {
-                    Shape::Pair => self.ex.build(at, "pair?", &[&[x.stx]])?,
-                    Shape::Null => self.ex.build(at, "null?", &[&[x.stx]])?,
-                    Shape::List => self.ex.build(at, "list?", &[&[x.stx]])?,
-                    Shape::Vector => self.ex.build(at, "vector?", &[&[x.stx]])?,
-                    Shape::Length(n) => {
-                        let n = self.ex.value(fixnum(self, n)?, at)?;
-                        let len = self.ex.build(at, "vector-length", &[&[x.stx]])?;
-                        self.ex.build(at, "eqv?", &[&[len, n]])?
-                    }
-                    Shape::Struct(of) => {
-                        let kind = self.m.structs[of].kind;
-                        self.ex.build(at, "struct-derived-from?", &[&[x.stx, kind]])?
-                    }
-                };
+                let test = self.shape_test(shape, x)?;
                 Next::then(rest, move |s: &mut Self, rest| Ok(Next::Done(s.ex.build(at, "if", &[&[test, rest, fail]])?)))
             }
             Step::Get(temp, part, x) => {

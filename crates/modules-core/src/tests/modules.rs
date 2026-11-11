@@ -361,6 +361,101 @@ fn struct_code_is_optimized() {
     let ops = ops_of(&mut arena, "(define (f p) (match p [(point3 _ _ z) z] [(point x y) (+ x y)] [(circle r) r]))");
     assert!(tests(&ops) == 3 && checked(&ops) == 0 && unchecked(&ops) == 4, "{ops}");
 
+    // A struct that's only read, set and tested where it's made isn't made, whatever of its
+    // fields are set: each field is a variable. That's so of one passed to procedures that are
+    // inlined, too. One that's passed on is made.
+    let ops = ops_of(&mut arena, "(define (f n) (let ((c (cell n)) (get (lambda (x) (cell-v x)))) (set-cell-v! c (+ (get c) 1)) (get c)))");
+    assert!(made(&ops) == 0 && count(&ops, "StructSet") == 0 && calls(&ops) == 0, "{ops}");
+    let ops = ops_of(&mut arena, "(define (f n) (let ((c (cell n)) (bump! (lambda (x) (set-cell-v! x 5)))) (bump! c) (cell-v c)))");
+    assert!(made(&ops) == 0 && count(&ops, "StructSet") == 0, "{ops}");
+    let ops = ops_of(&mut arena, "(define (f n) (let ((c (cell n))) (set-cell-v! c (+ (cell-v c) 1)) (if (cell? c) (cell-v c) 0)))");
+    assert!(made(&ops) == 0 && checked(&ops) == 0 && unchecked(&ops) == 0 && count(&ops, "StructSet") == 0 && tests(&ops) == 0, "{ops}");
+    let ops = ops_of(&mut arena, "(define (f n) (let ((c (cell n))) (lambda () (set-cell-v! c (+ (cell-v c) 1)) (cell-v c))))");
+    assert!(made(&ops) == 0, "{ops}");
+    let ops = ops_of(&mut arena, "(define (f n) (let ((c (cell n))) (set-cell-v! c (+ (cell-v c) 1)) c))");
+    assert!(made(&ops) == 1 && count(&ops, "StructSet") == 1, "{ops}");
+    let ops = ops_of(&mut arena, "(define (f n) (let ((c (cell n))) (set-cell-v! c c) (cell-v c)))");
+    assert!(made(&ops) == 1 && count(&ops, "StructSet") == 1, "{ops}");
+    let ops = ops_of(&mut arena, "(define (f n) (let ((c (cell n))) (if c (cell-v c) 0)))");
+    assert!(made(&ops) == 1, "{ops}");
+
+    // A test that fails says what a value isn't: not the type, nor a subtype of it.
+    let ops = ops_of(&mut arena, "(define (f v) (if (point? v) 1 (if (point3? v) 2 (if (point? v) 3 4))))");
+    assert!(tests(&ops) == 1, "{ops}");
+    let ops = ops_of(&mut arena, "(define (f v) (cond [(point3? v) 1] [(point? v) 2] [(point3? v) 3] [else 4]))");
+    assert!(tests(&ops) == 2, "{ops}");
+    let ops = ops_of(&mut arena, "(define (f v) (if (point? v) 1 0) (point? v))");
+    assert!(tests(&ops) == 2, "{ops}");
+
+    // A field that can't be set is read once, by the first read that the others come after,
+    // whatever is between them. A field that can be set is read again.
+    let ops = ops_of(&mut arena, "(define (f p) (let ((a (point-x p))) (+ a (point-x p))))");
+    assert!(checked(&ops) + unchecked(&ops) == 1, "{ops}");
+    let ops = ops_of(&mut arena, "(define (f p) (* (point-x p) (point-x p)))");
+    assert!(checked(&ops) + unchecked(&ops) == 1, "{ops}");
+    let ops = ops_of(&mut arena, "(define (f p g) (if (> (point-x p) 0) (begin (g) (point-x p)) (- (point-x p))))");
+    assert!(checked(&ops) + unchecked(&ops) == 1, "{ops}");
+    let ops = ops_of(&mut arena, "(define (f p) (match p [(point x _) (+ x (point-x p) (point-y p))]))");
+    assert!(checked(&ops) == 0 && unchecked(&ops) == 2, "{ops}");
+    let ops = ops_of(&mut arena, "(define (f p c) (if c (point-x p) 0) (point-x p))");
+    assert!(checked(&ops) == 2, "{ops}");
+    let ops = ops_of(&mut arena, "(define (f p q) (+ (point-x p) (point-x q)))");
+    assert!(checked(&ops) == 2, "{ops}");
+    let ops = ops_of(&mut arena, "(define (f c g) (let ((a (cell-v c))) (g) (+ a (cell-v c))))");
+    assert!(checked(&ops) == 1 && unchecked(&ops) == 1, "{ops}");
+
+    // What's known of a variable of the module holds till code that could assign it runs: a
+    // call, or an assignment.
+    // It's loaded once for the reads with no such code between them, and a field of it that
+    // can't be set is read once for them.
+    let loads = |ops: &str| count(ops, "LoadSlot") + count(ops, "LoadSlotChecked");
+    let ops = ops_of(&mut arena, "(define origin (point 1 2)) (define (f) (+ (point-x origin) (point-y origin)))");
+    assert!(checked(&ops) == 1 && unchecked(&ops) == 1 && loads(&ops) == 1, "{ops}");
+    let ops = ops_of(&mut arena, "(define origin (point 1 2)) (define (f) (* (point-x origin) (point-x origin)))");
+    assert!(checked(&ops) + unchecked(&ops) == 1 && loads(&ops) == 1, "{ops}");
+    let ops = ops_of(&mut arena, "(define origin (point 1 2)) (define (f h) (let ((a (point-x origin))) (h) (+ a (point-x origin))))");
+    assert!(checked(&ops) == 2 && loads(&ops) == 2, "{ops}");
+    let ops = ops_of(&mut arena, "(define origin (point 1 2)) (define (f) (if (point? origin) (point-x origin) 0))");
+    assert!(tests(&ops) == 1 && checked(&ops) == 0 && unchecked(&ops) == 1 && loads(&ops) == 1, "{ops}");
+    // That's so across branches: a read in a branch is of what was loaded before the branch,
+    // and one after the branches isn't of what only one of them loaded.
+    let ops = ops_of(&mut arena, "(define origin (point 1 2)) (define (f c) (let ((a (point-x origin))) (+ a (if c (point-y origin) (point-x origin)))))");
+    assert!(checked(&ops) == 1 && unchecked(&ops) == 1 && loads(&ops) == 1, "{ops}");
+    let ops = ops_of(&mut arena, "(define origin (point 1 2)) (define (f h) (if (point? origin) (begin (h) (point-x origin)) 0))");
+    assert!(loads(&ops) == 2, "{ops}");
+    let ops = ops_of(&mut arena, "(define origin (point 1 2)) (define (f c) (if c (point-x origin) 0) (point-y origin))");
+    assert!(loads(&ops) == 2, "{ops}");
+    let ops = ops_of(&mut arena, "(define origin (point 1 2)) (define (f c h) (let ((a (point-x origin))) (if c (h) 0) (+ a (point-y origin))))");
+    assert!(loads(&ops) == 2, "{ops}");
+
+    // Two loads of a variable a closure captured are of one struct, so a field of it that
+    // can't be set is read once, and the load that's left with no use goes.
+    let captured = |ops: &str| count(ops, "LoadUpvalue");
+    let ops = ops_of(&mut arena, "(define (make p) (lambda () (* (point-x p) (point-x p)))) (define g (make (point 1 2)))");
+    assert!(captured(&ops) == 1 && checked(&ops) + unchecked(&ops) == 1, "{ops}");
+    let ops = ops_of(&mut arena, "(define (make p h) (lambda () (let ((a (point-x p))) (h) (+ a (point-x p))))) (define g (make (point 1 2) list))");
+    assert!(captured(&ops) == 2 && checked(&ops) + unchecked(&ops) == 1, "{ops}");
+    let ops = ops_of(&mut arena, "(define (make c) (lambda () (+ (cell-v c) (cell-v c)))) (define g (make (cell 1)))");
+    assert!(captured(&ops) == 2 && checked(&ops) == 1 && unchecked(&ops) == 1, "{ops}");
+    let ops = ops_of(&mut arena, "(define origin (point 1 2)) (define (f h) (let ((a (point-x origin))) (h) (+ a (point-y origin))))");
+    assert!(checked(&ops) == 2 && unchecked(&ops) == 0, "{ops}");
+    let ops = ops_of(&mut arena, "(define origin (point 1 2)) (define (f v) (let ((a (point-x origin))) (set! origin v) (+ a (point-y origin))))");
+    assert!(checked(&ops) == 2 && unchecked(&ops) == 0, "{ops}");
+    let ops = ops_of(&mut arena, "(define origin (point 1 2)) (define (f h) (if (point? origin) (h (lambda () (point-x origin))) 0))");
+    assert!(unchecked(&ops) == 0, "{ops}");
+
+    // A clause that fails goes on knowing why: one that wasn't a point skips the later point
+    // clauses, and one that was skips the clauses for other types, with no test made twice on
+    // any way through.
+    let ops = ops_of(&mut arena, "(define (f v) (match v [(point 0 y) y] [(circle r) r] [(point x y) (+ x y)] [_ 'none]))");
+    assert!(tests(&ops) == 2, "{ops}");
+    let ops = ops_of(&mut arena, "(define (f v) (match v [(point3 0 _ z) z] [(circle 0) 'dot] [(point3 x _ _) x] [(circle r) r] [(point x y) (+ x y)]))");
+    assert!(tests(&ops) <= 4, "{ops}");
+    // That's so however many clauses there are: thirty of three types test for each type once.
+    let long: String = (0..30).map(|i| [format!("[(point {i} y) (+ y {i})]"), format!("[(circle {i}) {i}]"), format!("[(cell {i}) {i}]")][i % 3].clone()).collect();
+    let ops = ops_of(&mut arena, &format!("(define (f v) (match v {long} [_ 'none]))"));
+    assert!(tests(&ops) == 3, "{ops}");
+
     // It all does what the code says.
     let run = "(require kinds)
         (define (sum a b) (let ((p (point a b))) (+ (point-x p) (point-y p))))
@@ -372,10 +467,38 @@ fn struct_code_is_optimized() {
         (define (area v) (match v [(point3 _ _ z) z] [(point x y) (+ x y)] [(circle r) r] [_ 'none]))
         (define n 0) (define (next) (set! n (+ n 1)) n)
         (define (caught thunk) (guard (e (#t (error-object-kind e))) (thunk)))
+        (define (bump n) (let ((c (cell n))) (set-cell-v! c (+ (cell-v c) 1)) (if (cell? c) (cell-v c) 0)))
+        (define (counter n) (let ((c (cell n))) (lambda () (set-cell-v! c (+ (cell-v c) 1)) (cell-v c))))
+        (define count (counter 10))
+        (define (which v) (cond [(point3? v) 1] [(point? v) 2] [(point3? v) 3] [else 4]))
+        (define (twice-x p) (let ((a (point-x p))) (+ a (point-x p))))
+        (define (square-x p) (* (point-x p) (point-x p)))
+        (define (helped n) (let ((c (cell n)) (get (lambda (x) (cell-v x)))) (set-cell-v! c (+ (get c) 1)) (get c)))
+        (define (origin-sum) (+ (* (point-x origin) (point-x origin)) (point-y origin)))
+        (define (stale c g) (let ((a (cell-v c))) (g c) (+ a (cell-v c))))
+        (define (pick v) (match v [(point 0 y) y] [(circle r) r] [(point x y) (+ x y)] [_ 'none]))
+        (define (deep v) (match v [(point3 0 _ z) z] [(circle 0) 'dot] [(point3 x _ _) x] [(circle r) r] [(point x y) (+ x y)] [(cell (? pair?)) 'pair] [(cell v) v] [_ 'other]))
+        (define (long v) (match v LONG [_ 'none]))
+        (define (through p) (lambda (h) (let ((a (point-x p))) (h) (+ a (point-x p) (point-y p)))))
+        (define (branched c h) (let ((a (point-x origin))) (if c (h) 0) (+ a (if c (point-y origin) (point-x origin)))))
+        (define picked (list (map pick (list (point 0 7) (point 1 2) (circle 3) (point3 0 1 2) 5))
+                             (map deep (list (point3 0 1 2) (point3 4 5 6) (circle 0) (circle 9) (point 1 2) (cell '(1)) (cell 8) 'x))))
+        (define origin (point 1 2))
+        (define (moved v) (let ((a (point-x origin))) (set! origin v) (list a (caught (lambda () (point-y origin))))))
+        (define (swapped) (let ((a (point-x origin))) (set! origin (point 5 6)) (+ a (point-y origin))))
+        (define more
+          (list (map long (list (point 27 1) (point 0 1) (circle 28) (cell 29) (cell 2) (point 5 5) (point3 9 1 1) 'x))
+                ((through (point 3 4)) list) (branched #f list) (branched #t (lambda () (set! origin (point 5 60)))) (begin (set! origin (point 1 2)) 'reset)
+                (bump 4) (count) (count) (map which (list (point3 1 2 3) (point 1 2) (circle 1))) (twice-x (point 4 5))
+                (stale (cell 1) (lambda (c) (set-cell-v! c 10))) (square-x (point 3 0)) (helped 6) (origin-sum) (swapped) (moved 'gone)
+                (caught (lambda () (twice-x 5))) (caught (lambda () (square-x 'x)))))
         (list (sum 1 2) (twice next) (kept 1 (lambda (c) (set-cell-v! c 9))) (both (point3 1 2 3)) (after (point 1 2) #f)
               (kind (point 1 2)) (kind (point3 1 2 3)) (kind (circle 1)) (kind 5)
               (map area (list (point3 1 2 3) (point 1 2) (circle 4) 'x))
-              (caught (lambda () (both 5))) (caught (lambda () (both (circle 1)))) (caught (lambda () (after (circle 1) #f))))";
-    let expected = "(3 (#t 2 1) 9 3 2 (#f #f #t #f) (#t #f #t #f) circle other (3 3 4 none) wrong-type wrong-type wrong-type)";
-    assert_eq!(module_in(&mut arena, "runs", &[(Scheme, run)]), Ok(Ok(expected.into())));
+              (caught (lambda () (both 5))) (caught (lambda () (both (circle 1)))) (caught (lambda () (after (circle 1) #f)))
+              more picked)";
+    let expected = "(3 (#t 2 1) 9 3 2 (#f #f #t #f) (#t #f #t #f) circle other (3 3 4 none) wrong-type wrong-type wrong-type \
+                    ((28 1 28 29 2 none 10 none) 10 2 61 reset 5 11 12 (1 2 4) 8 11 9 7 3 7 (5 wrong-type) wrong-type wrong-type) \
+                    ((7 3 3 1 none) (2 4 dot 9 3 pair 8 other)))";
+    assert_eq!(module_in(&mut arena, "runs", &[(Scheme, &run.replace("LONG", &long))]), Ok(Ok(expected.into())));
 }

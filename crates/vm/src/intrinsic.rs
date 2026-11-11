@@ -399,6 +399,10 @@ named! {
         /// instance of a type with that field, so it can't fault there.
         /// [Internal](Intrinsic::is_internal).
         StructField = "struct-field",
+        /// `(struct-fixed-field s k)`: as `struct-field`, of a field that can't be set. A
+        /// compiler emits it where it knows that too, so that it can read the field once for
+        /// all the reads of it. [Internal](Intrinsic::is_internal).
+        StructFixedField = "struct-fixed-field",
         /// `(struct-set! s type k v)`: sets field `k` of `s`, which must be an instance of the
         /// type, to `v`. It faults with `immutable` if the field is not mutable.
         /// [Internal](Intrinsic::is_internal).
@@ -597,7 +601,7 @@ impl Intrinsic {
             Intrinsic::MakeKeywordProcedure | Intrinsic::StructSet => Some(4),
             Intrinsic::MakeStructType => Some(5),
             Intrinsic::StructRef => Some(3),
-            Intrinsic::IsStructDerivedFrom | Intrinsic::IsStructFieldMutable | Intrinsic::StructField => Some(2),
+            Intrinsic::IsStructDerivedFrom | Intrinsic::IsStructFieldMutable | Intrinsic::StructField | Intrinsic::StructFixedField => Some(2),
             Intrinsic::IsStruct | Intrinsic::IsStructType | Intrinsic::StructType | Intrinsic::StructToList => Some(1),
             Intrinsic::MakeStruct => None,
             Intrinsic::StructFields => Some(1),
@@ -808,6 +812,7 @@ impl Intrinsic {
                 | IsStruct
                 | IsStructType
                 | StructField
+                | StructFixedField
                 | IsSyntax
                 | IsIdentifier
         )
@@ -969,13 +974,14 @@ impl Intrinsic {
     /// - `make-struct-type`, which the form makes its type with.
     /// - `make-struct`, `struct-ref` and `struct-set!`, which the constructor, the accessors
     ///   and the mutators it defines are.
-    /// - `struct-field`, which a compiler reads a field with once it knows the struct's type.
+    /// - `struct-field` and `struct-fixed-field`, which a compiler reads a field with once it
+    ///   knows the struct's type.
     ///
     /// Used directly, they would make an instance or reach a field by a number, where a struct's
     /// own procedures are the only way to.
     pub const fn is_internal(self) -> bool {
         use Intrinsic::*;
-        matches!(self, MakeStructType | MakeStruct | StructRef | StructField | StructSet)
+        matches!(self, MakeStructType | MakeStruct | StructRef | StructField | StructFixedField | StructSet)
     }
 
     /// Whether a 2-argument call of `self` is commutative (`f(a, b) == f(b, a)`).
@@ -1608,7 +1614,7 @@ impl Intrinsic {
             | Intrinsic::Angle => self.numeric(mc, arg, args, fuel)?,
             Intrinsic::IsStructDerivedFrom => boolean(structs::of(mc, arg(0), structs::type_of(mc, arg(1))?).is_some()),
             Intrinsic::StructRef => structs::field_of(mc, arg(0), arg(1), index(arg(2))?)?,
-            Intrinsic::StructField => structs::field(mc, arg(0), index(arg(1))?)?,
+            Intrinsic::StructField | Intrinsic::StructFixedField => structs::field(mc, arg(0), index(arg(1))?)?,
             Intrinsic::MakeStructType
             | Intrinsic::MakeStruct
             | Intrinsic::IsStruct
