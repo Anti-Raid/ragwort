@@ -830,38 +830,8 @@ fn structs_equal_only_to_themselves() {
 }
 
 #[test]
-fn struct_fields_are_guarded() {
-    let account = "(struct account (id [balance #:mutable #:guard (lambda (v) (and (number? v) (>= v 0)))] [owner #:guard string?]))";
-    let caught = |body: &str| eval(&format!("{account} (guard (e (#t (list (error-object-kind e) (error-object-message e) (error-object-irritants e)))) {body})"));
-    assert_eq!(eval(&format!("{account} (define a (account 1 10 \"al\")) (set-account-balance! a 25) (list a (account-balance a))")), "(#(struct:account 1 25 \"al\") 25)");
-    // The constructor, the setter and a copy all call the guard.
-    assert_eq!(caught("(account 1 -5 \"al\")"), r#"(error "struct account: the guard of field balance rejected" (-5))"#);
-    assert_eq!(caught("(account 1 5 'al)"), r#"(error "struct account: the guard of field owner rejected" (al))"#);
-    assert_eq!(caught("(set-account-balance! (account 1 5 \"al\") 'lots)"), r#"(error "struct account: the guard of field balance rejected" (lots))"#);
-    assert_eq!(caught("(struct-copy account (account 1 5 \"al\") [balance -2])"), r#"(error "struct account: the guard of field balance rejected" (-2))"#);
-    assert_eq!(caught("(apply account '(1 -5 \"al\"))"), r#"(error "struct account: the guard of field balance rejected" (-5))"#);
-    let fine = format!("{account} (define a (account 1 2 \"al\")) (set-account-balance! a 30)
-                        (list a (struct-copy account a [owner \"bo\"]) (map account-id (list a)))");
-    assert_eq!(eval(&fine), r#"(#(struct:account 1 30 "al") #(struct:account 1 30 "bo") (1))"#);
-    // A subtype's constructor calls the guards of the fields it inherits, and its own.
-    let savings = format!("{account} (struct savings account ([rate #:guard real?]))");
-    assert_eq!(eval(&format!("{savings} (savings 1 10 \"al\" 0.5)")), r#"#(struct:savings 1 10 "al" 0.5)"#);
-    let caught_sub = |body: &str| eval(&format!("{savings} (guard (e (#t (error-object-message e))) {body})"));
-    assert_eq!(caught_sub("(savings 1 -10 \"al\" 0.5)"), r#""struct savings: the guard of field balance rejected""#);
-    assert_eq!(caught_sub("(savings 1 10 \"al\" 'high)"), r#""struct savings: the guard of field rate rejected""#);
-    assert_eq!(caught_sub("(set-account-balance! (savings 1 10 \"al\" 0.5) -1)"), r#""struct account: the guard of field balance rejected""#);
-    // The guard is evaluated once, when the form runs, and called with each value in order.
-    let order = "(define log '()) (define (note x) (set! log (cons x log)) #t)
-                 (struct pair2 ([a #:guard (begin (note 'made-a) note)] [b #:guard (begin (note 'made-b) note)]))
-                 (pair2 1 2) (pair2 3 4) (reverse log)";
-    assert_eq!(eval(order), "(made-a made-b 1 2 3 4)");
-    // In a body, each run of the body makes the type and its guards again.
-    let local = "(define (accepts? make v) (guard (e (#t #f)) (make v) #t))
-                 (define (make limit) (struct capped ([n #:guard (lambda (v) (< v limit))])) capped)
-                 (list (accepts? (make 10) 5) (accepts? (make 3) 5))";
-    assert_eq!(eval(local), "(#t #f)");
-    let cell = "(define (f) (struct cell ([v #:mutable #:guard number?])) (define c (cell 1)) (set-cell-v! c 2) (guard (e (#t (list c 'rejected))) (set-cell-v! c 'x))) (f)";
-    assert_eq!(eval(cell), "(#(struct:cell 2) rejected)");
+fn struct_parts_are_the_forms_alone() {
+    let account = "(struct account (id [balance #:mutable] owner))";
     // A macro can't name the read `match` and `struct-copy` are made of, even with the scopes
     // of syntax a built-in macro introduced, which do reach the prelude's `car`.
     let borrowed = |name: &str, args: &str| {
@@ -871,23 +841,24 @@ fn struct_fields_are_guarded() {
     };
     assert_eq!(eval(&borrowed("car", "'(1 2)")), "1");
     assert_eq!(error(&borrowed("struct-ref", "a struct:account 0")).0, ExpandErrorKind::Unbound);
-    // Only the form's own procedures reach a guard, so nothing makes a struct or sets a field
-    // without one being called.
-    for name in ["make-struct-type", "make-struct", "struct-ref", "struct-set!", "struct-guarded?", "struct-field-guard", "struct-set-field-guard!", "make-struct-guard-error"] {
+    // Nothing but the form's own procedures makes a struct, or reads or sets a field of one.
+    for name in ["make-struct-type", "make-struct", "struct-ref", "struct-field", "struct-set!"] {
         assert_eq!(error(&format!("{account} ({name} struct:account 1 2 3)")), (ExpandErrorKind::Unbound, name), "{name}");
     }
-    // A guard that isn't a procedure is an error when the form runs.
-    assert_eq!(eval_in(&mut arena(), "(struct bad ([x #:guard 5]))"), Ok(Err(Fault::WrongType)));
+    // A struct has no guard: a procedure that checks what it's given makes one.
+    let checked = format!("{account} (define (make-account id balance owner) (if (>= balance 0) (account id balance owner) (error \"negative balance:\" balance)))
+                           (list (make-account 1 5 \"al\") (guard (e (#t (error-object-irritants e))) (make-account 1 -5 \"al\")))");
+    assert_eq!(eval(&checked), r#"(#(struct:account 1 5 "al") (-5))"#);
     for (bad, at) in [
-        ("(struct p ([x #:guard]))", "[x #:guard]"),
-        ("(struct p ([x #:guard a #:guard b]))", "[x #:guard a #:guard b]"),
+        ("(struct p (x) #:guard number?)", "#:guard"),
+        ("(struct p ([x #:guard number?]))", "[x #:guard number?]"),
         ("(struct p ([x #:nope]))", "[x #:nope]"),
     ] {
         assert_eq!(error(bad), (ExpandErrorKind::BadSyntax, at), "{bad}");
     }
-    // A guarded procedure is still one of the form's, which can't be assigned.
-    assert_eq!(error("(struct p ([x #:guard number?])) (set! p car)"), (ExpandErrorKind::Immutable, "p"));
-    assert_eq!(error("(define (f) (struct p ([x #:guard number?])) (set! p car) 1)"), (ExpandErrorKind::Immutable, "p"));
+    // What the form defines can't be assigned.
+    assert_eq!(error("(struct p (x)) (set! p car)"), (ExpandErrorKind::Immutable, "p"));
+    assert_eq!(error("(define (f) (struct p ([x #:mutable])) (set! set-p-x! car) 1)"), (ExpandErrorKind::Immutable, "set-p-x!"));
 }
 
 #[test]

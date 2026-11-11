@@ -62,8 +62,6 @@ pub struct Export {
 pub struct Field {
     pub name: Box<str>,
     pub mutable: bool,
-    /// Whether the field has a guard, which code that makes an instance or sets the field calls.
-    pub guarded: bool,
 }
 
 /// A struct type, as code that uses its name knows it.
@@ -339,14 +337,8 @@ pub enum Operand {
 impl Inline {
     /// What `lambda`'s calls inline to, if it can be inlined.
     pub fn of(lambda: &Lambda<'_>) -> Option<Self> {
-        Self::of_at_most(lambda, MAX_INLINE)
-    }
-
-    /// What `lambda`'s calls inline to, if it can be inlined and its body has at most `most`
-    /// forms.
-    pub fn of_at_most(lambda: &Lambda<'_>, most: usize) -> Option<Self> {
         let params: Vec<Var> = lambda.params.iter().copied().chain(lambda.rest).collect();
-        let (mut left, mut locals) = (most, Vec::new());
+        let (mut left, mut locals) = (MAX_INLINE, Vec::new());
         let body = Template::of(&lambda.body, &params, &mut locals, &mut left)?;
         let (params, locals) = (u32::try_from(lambda.params.len()).ok()?, u32::try_from(locals.len()).ok()?);
         Some(Self::new(params, lambda.optional, lambda.rest.is_some(), locals, body))
@@ -668,10 +660,8 @@ pub struct ModuleBuilder<'gc> {
     /// form defines, and by the constructors named as they are, what they are.
     kinds: HashMap<u32, (Value<'gc>, Vec<u32>)>,
     structs: HashMap<u32, StructDef>,
-    /// What a call of each procedure a struct form defines does, and its type, and the
-    /// procedures such forms define that are called as they are.
+    /// What a call of each procedure a struct form defines does, and its type.
     procedures: HashMap<u32, (Inline, Value<'gc>)>,
-    guarded: HashSet<u32>,
     module: Option<Gc<'gc, Module>>,
 }
 
@@ -692,7 +682,6 @@ impl<'gc> ModuleBuilder<'gc> {
             kinds: HashMap::default(),
             structs: HashMap::default(),
             procedures: HashMap::default(),
-            guarded: HashSet::default(),
             module: None,
         }
     }
@@ -860,12 +849,6 @@ impl<'gc> ModuleBuilder<'gc> {
         self.procedures.insert(slot, (inline, kind));
     }
 
-    /// Notes that variable `slot` is a procedure a struct form defines whose calls are ordinary
-    /// calls, as it calls a guard. Like the form's other variables, it can't be assigned.
-    pub fn struct_variable(&mut self, slot: u32) {
-        self.guarded.insert(slot);
-    }
-
     /// The struct type variable `slot` is the constructor named for, and the type itself.
     pub fn struct_def(&self, slot: u32) -> Option<(&StructDef, Value<'gc>)> {
         let def = self.structs.get(&slot)?;
@@ -891,7 +874,7 @@ impl<'gc> ModuleBuilder<'gc> {
     /// Notes that code assigns variable `slot`, so it isn't immutable, unless it's a keyword
     /// procedure or one a struct form defines, which can't be assigned.
     pub fn assign(&mut self, slot: u32) -> Result<(), ModuleError> {
-        if self.cores.contains_key(&slot) || self.procedures.contains_key(&slot) || self.guarded.contains(&slot) || self.kinds.contains_key(&slot) {
+        if self.cores.contains_key(&slot) || self.procedures.contains_key(&slot) || self.kinds.contains_key(&slot) {
             return Err(ModuleError::Immutable);
         }
         self.assigned.insert(slot);

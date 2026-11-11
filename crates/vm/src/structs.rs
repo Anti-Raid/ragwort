@@ -20,15 +20,15 @@
 //! - A field's index is the position of its name in that list. Only the code a `struct` form
 //!   compiles to uses indexes.
 //! - Setting a field that is not mutable faults with [`Fault::Immutable`], whatever code asks.
-//! - A guarded field has a guard: a procedure of one argument that must return true for every
-//!   value the field is given. The VM stores guards but cannot call them, so the constructor
-//!   and the mutators a `struct` form defines call the guard first.
 //!
 //! # What code can do with a struct
 //!
 //! Only the procedures a `struct` form defines make an instance, read one field or set one.
-//! The intrinsics they are built from are [internal](crate::Intrinsic::is_internal), so a
-//! guard cannot be skipped.
+//! The intrinsics they are built from are [internal](crate::Intrinsic::is_internal).
+//!
+//! A read by `struct-ref` checks that the value is an instance of the type it names. Where a
+//! compiler has proved that already, as after `(point? p)`, it reads with `struct-field`, which
+//! checks nothing about the type.
 //!
 //! Any code can look at a struct as a whole, without changing it:
 //!
@@ -43,12 +43,10 @@
 use ragwort_types::bytevector::{AnyBytevector, Bytevectors};
 use ragwort_types::gc::{Gc, Mutation, ScratchVec, Value};
 use ragwort_types::pair::Pairs;
-use ragwort_types::string::{self, Strings};
 use ragwort_types::symbol::Symbol;
 use ragwort_types::vector::{AnyVector, Vectors};
 
 use crate::Fault;
-use crate::machine::condition;
 use crate::objects::{Struct, StructFields, StructType, StructTypeFields};
 
 bitflags::bitflags! {
@@ -66,8 +64,6 @@ bitflags::bitflags! {
     pub struct FieldFlags: u8 {
         /// The field can be set.
         const MUTABLE = 1;
-        /// The field has a guard.
-        const GUARDED = 1 << 1;
     }
 }
 
@@ -137,11 +133,7 @@ pub fn make_type<'gc>(
     }
     flags |= above & TypeFlags::IDENTITY;
     let (names, field_flags, count) = fields_of(mc, parent, fields, field_flags)?;
-    let inherited = parent.map_or(0, |parent| parent.fields(mc) as usize);
-    // The type has a place for the guard of each guarded field it declares itself.
-    let guarded = (inherited..count as usize).any(|k| flags_at(mc, field_flags, k).contains(FieldFlags::GUARDED));
-    let guards = if guarded { Vectors::new(mc).make(count as usize, Value::FALSE)?.value(mc) } else { Value::FALSE };
-    let made = |supertypes: usize, last: Value<'gc>| StructType::new(mc, name, names, field_flags, guards, count, flags.bits(), supertypes, last);
+    let made = |supertypes: usize, last: Value<'gc>| StructType::new(mc, name, names, field_flags, count, flags.bits(), supertypes, last);
     let Some(parent) = parent else { return Ok(made(0, Value::VOID)?) };
     let above = parent.items(mc);
     let kind = made(above.len() + 1, Value::object(mc, parent))?;
@@ -153,57 +145,6 @@ pub fn make_type<'gc>(
 /// Whether field `k` of `kind`, which it has, can be set.
 pub fn is_mutable<'gc>(mc: &Mutation<'gc>, kind: Gc<'gc, StructType>, k: usize) -> bool {
     field_flags(mc, kind, k).contains(FieldFlags::MUTABLE)
-}
-
-/// The type that declares field `k` of `kind`, which it has: `kind`, or one of its supertypes.
-fn declarer<'gc>(mc: &Mutation<'gc>, kind: Gc<'gc, StructType>, k: usize) -> Gc<'gc, StructType> {
-    let supertypes = kind.items(mc);
-    let above = (0..supertypes.len()).filter_map(|i| supertypes.get(i).downcast::<StructType>(mc));
-    above.into_iter().find(|above| k < above.fields(mc) as usize).unwrap_or(kind)
-}
-
-/// The guard of field `k` of `kind`, or `#f` if the field isn't guarded. It faults with
-/// [`Fault::Unbound`] if the type's form hasn't installed the guard yet.
-pub fn guard<'gc>(mc: &Mutation<'gc>, kind: Gc<'gc, StructType>, k: usize) -> Result<Value<'gc>, Fault> {
-    if k >= kind.fields(mc) as usize {
-        return Err(Fault::OutOfRange);
-    }
-    if !field_flags(mc, kind, k).contains(FieldFlags::GUARDED) {
-        return Ok(Value::FALSE);
-    }
-    let guards = AnyVector::of(declarer(mc, kind, k).guards(mc)).ok_or(Fault::Malformed)?;
-    match guards.get(mc, k) {
-        Some(Value::FALSE) | None => Err(Fault::Unbound),
-        Some(guard) => Ok(guard),
-    }
-}
-
-/// Installs `guard` as the guard of field `k` of `kind`: a guarded field the type itself
-/// declares, whose guard isn't installed yet.
-pub fn set_guard<'gc>(mc: &Mutation<'gc>, kind: Gc<'gc, StructType>, k: usize, guard: Value<'gc>) -> Result<(), Fault> {
-    if k >= kind.fields(mc) as usize {
-        return Err(Fault::OutOfRange);
-    }
-    if !field_flags(mc, kind, k).contains(FieldFlags::GUARDED) || declarer(mc, kind, k) != kind {
-        return Err(Fault::WrongType);
-    }
-    let guards = Vectors::new(mc).mutable(kind.guards(mc)).ok_or(Fault::Malformed)?;
-    if guards.items(mc).get(k) != Value::FALSE {
-        return Err(Fault::Immutable);
-    }
-    guards.items(mc).set(mc, k, guard);
-    Ok(())
-}
-
-/// The error a guard's rejection of `v` for field `k` of `kind` raises: an error object whose
-/// message names the type and the field, with `v` as its irritant.
-pub fn guard_error<'gc>(mc: &Mutation<'gc>, kind: Gc<'gc, StructType>, k: usize, v: Value<'gc>) -> Result<Value<'gc>, Fault> {
-    let strings = Strings::new(mc);
-    let text = |symbol: Option<Value<'gc>>| symbol.and_then(Symbol::of).map_or(String::new(), |symbol| string::display(&strings, symbol.name(mc)).to_string());
-    let field = AnyVector::of(kind.names(mc)).and_then(|names| names.get(mc, k)).ok_or(Fault::OutOfRange)?;
-    let message = format!("struct {}: the guard of field {} rejected", text(Some(kind.name(mc))), text(Some(field)));
-    let message = string::from_str(&strings, &message)?.value();
-    condition(mc, Fault::Error, message, Pairs::new(mc).cons(v, Value::NIL)?.value(mc))
 }
 
 /// `v` as a struct type, which it must be.
@@ -222,15 +163,20 @@ pub fn make<'gc>(mc: &Mutation<'gc>, kind: Gc<'gc, StructType>, fields: impl Exa
     Ok(made)
 }
 
+/// Whether `kind` is `from` or a subtype of it.
+#[inline]
+pub fn derives<'gc>(mc: &Mutation<'gc>, kind: Gc<'gc, StructType>, from: Gc<'gc, StructType>) -> bool {
+    if kind == from {
+        return true;
+    }
+    // A subtype has the type among its supertypes, as far in as the type has supertypes itself.
+    let (supertypes, depth) = (kind.items(mc), from.items(mc).len());
+    depth < supertypes.len() && supertypes.get(depth) == Value::object(mc, from)
+}
+
 /// `v` as a struct of `kind` or of a subtype of it, if it's one.
 #[inline]
 pub fn of<'gc>(mc: &Mutation<'gc>, v: Value<'gc>, kind: Gc<'gc, StructType>) -> Option<Gc<'gc, Struct>> {
     let made = v.downcast::<Struct>(mc)?;
-    let made_as = made.kind(mc)?;
-    if made_as == kind {
-        return Some(made);
-    }
-    // A subtype has the type among its supertypes, as far in as the type has supertypes itself.
-    let (supertypes, depth) = (made_as.items(mc), kind.items(mc).len());
-    (depth < supertypes.len() && supertypes.get(depth) == Value::object(mc, kind)).then_some(made)
+    derives(mc, made.kind(mc)?, kind).then_some(made)
 }

@@ -139,13 +139,10 @@ objects! {
     /// - `names`: an immutable vector of the field names, the supertype's first.
     /// - `field_flags`: an immutable bytevector with one byte per field, the bits of its
     ///   [`FieldFlags`](crate::structs::FieldFlags).
-    /// - `guards`: `#f` if the type declares no guarded field. Otherwise a vector with one
-    ///   entry per field, holding the guard of each guarded field the type itself declares once
-    ///   its form has installed it, and `#f` everywhere else.
     /// - `fields`: how many fields there are.
     /// - `flags`: the bits of its [`TypeFlags`](crate::structs::TypeFlags).
     /// - The items are the supertypes, outermost first.
-    pub struct StructType { name: Value, names: Value, field_flags: Value, guards: Value, fields: u32, flags: u32 } items Value
+    pub struct StructType { name: Value, names: Value, field_flags: Value, fields: u32, flags: u32 } items Value
     /// An instance of a struct type. `kind` is the type it was created with, and the items are
     /// its fields.
     pub struct Struct { kind: Member<StructType> } items Value

@@ -254,18 +254,9 @@ fn structs() {
     assert_eq!(error("(%struct point (x)) (%set! point-x 1)"), (LowerErrorKind::Immutable, "point-x"));
     assert_eq!(error("(%if 1 (%struct point (x)) 2)"), (LowerErrorKind::Definition, "(%struct point (x))"));
 
-    // A guarded field's guard is called by the constructor, a subtype's, and the mutator.
-    let positive = "(%define positive? (%lambda (v) (%intrinsic < 0 v)))";
-    let account = format!("{positive} (%struct account (id (balance #:mutable #:guard positive?))) (%struct savings account ((rate #:guard positive?)))");
-    let fine = format!("{account} (%define a (%app savings 1 10 2)) (%app set-account-balance! a 20) a");
-    assert_eq!(eval(&fine), "#(struct:savings 1 20 2)");
-    for rejected in ["(%app account 1 -5)", "(%app savings 1 -5 2)", "(%app savings 1 5 -2)", "(%app set-account-balance! (%app account 1 5) -1)"] {
-        assert_eq!(fault(&format!("{account} {rejected}")), Fault::Error, "{rejected}");
-    }
-    assert_eq!(fault("(%struct bad ((x #:guard 5)))"), Fault::WrongType);
-    assert_eq!(error("(%struct p ((x #:guard)))"), (LowerErrorKind::BadShape, "(x #:guard)"));
-    assert_eq!(error("(%struct p ((x #:guard a #:guard b)))").0, LowerErrorKind::BadShape);
-    assert_eq!(error(&format!("{positive} (%struct p ((x #:guard positive?))) (%set! p 1)")).0, LowerErrorKind::Immutable);
+    // A struct has no guard: a procedure that checks what it's given makes one.
+    assert_eq!(error("(%struct p (x) #:guard car)"), (LowerErrorKind::BadShape, "#:guard"));
+    assert_eq!(error("(%struct p ((x #:guard car)))"), (LowerErrorKind::BadShape, "(x #:guard car)"));
     // A sealed struct has no subtypes.
     assert_eq!(eval("(%struct leaf (v) #:sealed) (%app leaf-v (%app leaf 4))"), "4");
     assert_eq!(error("(%struct leaf (v) #:sealed) (%struct more leaf (w))"), (LowerErrorKind::BadShape, "leaf"));

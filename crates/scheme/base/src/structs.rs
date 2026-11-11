@@ -8,12 +8,7 @@
 //! The second form makes a subtype of the struct `super`. Its instances have `super`'s fields
 //! followed by its own.
 //!
-//! A field is written as its name, or as `(name option ...)` with these options:
-//!
-//! - `#:mutable`: the field can be set.
-//! - `#:guard expr`: `expr` is a procedure of one argument, evaluated once when the form runs.
-//!   Every value the field is given, by a constructor or a setter, must make it return true.
-//!   Otherwise an error is raised that names the struct and the field.
+//! A field is written as its name, or as `(name #:mutable)` for one that can be set.
 //!
 //! # What it defines
 //!
@@ -70,9 +65,11 @@
 //! ```
 //!
 //! Nothing else makes a struct, reads one field or sets one: only the constructor, accessors
-//! and mutators the form defines do. So a guard is always called, and code that needs to build
-//! or update structs of a type it is handed takes the constructor or a mutator as an argument,
-//! as in `(apply point fields)`.
+//! and mutators the form defines do. Code that needs to build or update structs of a type it
+//! is handed takes the constructor or a mutator as an argument, as in `(apply point fields)`.
+//!
+//! A struct has no guard or contract of its own. To check the values a struct is made with,
+//! write a procedure that checks them and then calls the constructor, and provide that.
 //!
 //! # How it is built
 //!
@@ -82,7 +79,6 @@
 //! each time the body runs.
 
 use ragwort_compiler::module::{Field, Inline, StructDef};
-use ragwort_compiler::steps::Step;
 use ragwort_compiler::structs::{self, Declaration, Declared, Member};
 use ragwort_compiler::{Core, Place, Var};
 use ragwort_types::gc::{OutOfMemory, Value};
@@ -98,7 +94,6 @@ use crate::{ExpandError, ExpandErrorKind};
 struct FieldSpec {
     id: Stx,
     mutable: bool,
-    guard: Option<Stx>,
 }
 
 /// A struct form's parts: its fields, the names of its constructors besides its own, and the
@@ -119,18 +114,6 @@ struct Parts<'gc> {
     /// What the form defines, each with its identifier: the type, then the constructor that has
     /// the struct's name, then the rest.
     members: Vec<(Stx, Member)>,
-    /// The guard expression of each guarded field the form declares, with the field's index.
-    guards: Vec<(u32, Stx)>,
-}
-
-/// What a struct form in a body adds to the body, in order.
-pub(crate) enum LocalItem<'gc> {
-    /// A local the form defines, with its identifier and its value.
-    Defined(Stx, Var, Core<'gc>),
-    /// A local that holds the value of an expression, such as a guard.
-    Evaluated(Var, Stx),
-    /// Code to run for its effect.
-    Run(Core<'gc>),
 }
 
 /// Where a struct type is, to code that uses it.
@@ -161,11 +144,10 @@ pub(crate) struct Info<'gc> {
 }
 
 /// What a local that a struct form in a body defines is: the type, or a procedure of the type
-/// in the given local. A procedure has what a call of it does, unless it calls a guard, in which
-/// case it is called as it is.
+/// in the given local, with what a call of it does.
 pub(crate) enum Local {
     Type,
-    Procedure(Option<Inline>, Var),
+    Procedure(Inline, Var),
 }
 
 impl<'a, 'gc> Expander<'a, 'gc> {
@@ -202,17 +184,16 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let mut fields = Vec::with_capacity(specs.len());
         for spec in specs {
             if self.is_id(spec) {
-                fields.push(FieldSpec { id: spec, mutable: false, guard: None });
+                fields.push(FieldSpec { id: spec, mutable: false });
                 continue;
             }
             let parts = self.proper(spec)?;
             let mut options = parts.iter().copied();
             let Some(id) = options.next().filter(|&id| self.is_id(id)) else { return Err(self.error(bad, spec)) };
-            let mut field = FieldSpec { id, mutable: false, guard: None };
-            while let Some(option) = options.next() {
+            let mut field = FieldSpec { id, mutable: false };
+            for option in options {
                 match self.keyword_name(option).as_deref() {
                     Some("mutable") => field.mutable = true,
-                    Some("guard") if field.guard.is_none() => field.guard = Some(options.next().ok_or_else(|| self.error(bad, spec))?),
                     _ => return Err(self.error(bad, spec)),
                 }
             }
@@ -262,12 +243,8 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let name = self.text(form.name).expect("an identifier");
         let mut fields = parent.as_ref().map_or(Vec::new(), |parent| parent.fields.clone());
         let inherited = fields.len();
-        let mut guards = Vec::new();
         for field in &form.fields {
-            if let Some(guard) = field.guard {
-                guards.push((u32::try_from(fields.len()).map_err(|_| self.error(OutOfMemory, field.id))?, guard));
-            }
-            fields.push(Field { name: self.text(field.id).expect("an identifier").into(), mutable: field.mutable, guarded: field.guard.is_some() });
+            fields.push(Field { name: self.text(field.id).expect("an identifier").into(), mutable: field.mutable });
         }
         let Some(named) = structs::members(&name, &fields[inherited..], inherited) else { return Err(self.error(OutOfMemory, form.name)) };
         let mut members = Vec::with_capacity(named.len() + form.constructors.len());
@@ -278,23 +255,22 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 members.extend(form.constructors.iter().map(|&id| (id, Member::Make)));
             }
         }
-        Ok(Parts { parent, fields, members, guards })
+        Ok(Parts { parent, fields, members })
     }
 
     /// The symbol of a struct form's name, and the fields it declares, as its type is made of
     /// them.
     fn struct_names(&self, form: &Form) -> (Value<'gc>, Vec<Declaration<'gc>>) {
         let symbol = |id: Stx| self.tree.symbol(id).expect("an identifier").value(self.mc);
-        let declared = |field: &FieldSpec| Declaration { name: symbol(field.id), mutable: field.mutable, guarded: field.guard.is_some() };
+        let declared = |field: &FieldSpec| Declaration { name: symbol(field.id), mutable: field.mutable };
         (symbol(form.name), form.fields.iter().map(declared).collect())
     }
 
     /// Declares what `form`, a struct form that's the module's top-level form `index`, defines,
-    /// and makes its type, which the module's code has as a constant. It gives the form's guard
-    /// expressions too, each with its field's index.
-    pub(crate) fn declare_struct(&mut self, form: Stx, index: u32) -> Result<(Declared, Vec<(u32, Stx)>), ExpandError> {
+    /// and makes its type, which the module's code has as a constant.
+    pub(crate) fn declare_struct(&mut self, form: Stx, index: u32) -> Result<Declared, ExpandError> {
         let parts = self.struct_form(form)?;
-        let Parts { parent, fields, members, guards } = self.struct_parts(&parts)?;
+        let Parts { parent, fields, members } = self.struct_parts(&parts)?;
         let above = match parent.map(|parent| parent.kind) {
             None => Value::FALSE,
             Some(Kind::Constant(kind)) => kind,
@@ -310,40 +286,36 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             slots.push((self.define_top(id, index)?, member));
         }
         let sealed = parts.flags.contains(TypeFlags::SEALED);
-        Ok((Declared::new(&mut self.builder, kind, fields, sealed, slots), guards))
+        Ok(Declared::new(&mut self.builder, kind, fields, sealed, slots))
     }
 
-    /// The code of a struct form at the top level: it evaluates the guards and installs them,
-    /// then defines each of the form's variables.
-    pub(crate) fn lower_struct(&mut self, declared: Declared, guards: Vec<(u32, Stx)>) -> Result<Core<'gc>, ExpandError> {
-        let (def, kind) = self.builder.struct_def(declared.constructor()).expect("a declared struct");
-        let fields = def.fields.to_vec();
-        let (indexes, exprs): (Vec<u32>, Vec<Stx>) = guards.into_iter().unzip();
-        self.run_now(move |_| {
-            Self::exprs(exprs, move |this, guards| Ok(Step::Done(declared.define(kind, &fields, indexes.into_iter().zip(guards).collect(), this))))
-        })
+    /// The code of a struct form at the top level, which defines each of the form's variables.
+    pub(crate) fn lower_struct(&mut self, declared: Declared) -> Core<'gc> {
+        let (_, kind) = self.builder.struct_def(declared.constructor()).expect("a declared struct");
+        declared.define(kind, self)
     }
 
-    /// Binds what `form`, a struct form in a body, defines, each to a local, and gives what the
-    /// form adds to the body: the type, made when the body runs, then its guards, then its
-    /// procedures.
-    pub(crate) fn local_struct(&mut self, form: Stx) -> Result<Vec<LocalItem<'gc>>, ExpandError> {
+    /// Binds what `form`, a struct form in a body, defines, each to a local, and gives each
+    /// with its identifier and its value, in order: the type, made when the body runs, then
+    /// its procedures.
+    pub(crate) fn local_struct(&mut self, form: Stx) -> Result<Vec<(Stx, Var, Core<'gc>)>, ExpandError> {
         let parts = self.struct_form(form)?;
-        let Parts { parent, fields, members, guards } = self.struct_parts(&parts)?;
+        let Parts { parent, fields, members } = self.struct_parts(&parts)?;
         let (name, own) = self.struct_names(&parts);
         let above = parent.map_or(Core::Quote(Value::FALSE), |parent| parent.kind.core());
-        let mut items = Vec::with_capacity(members.len() + 2 * guards.len());
+        let count = u32::try_from(fields.len()).expect("a type's fields are counted");
+        let mut items = Vec::with_capacity(members.len());
         let mut holder = None;
         for (i, (id, member)) in members.into_iter().enumerate() {
             let var = self.local(id)?;
             let (kind, holder) = *holder.get_or_insert((var, id));
             let value = match member {
                 Member::Type => structs::type_maker(self.mc, name, above.clone(), &own, parts.flags)?,
-                _ => structs::value(member, Core::Ref(Place::Local(kind)), &fields, self),
+                _ => structs::value(member, Core::Ref(Place::Local(kind)), count, self),
             };
-            let local = match member {
-                Member::Type => Local::Type,
-                _ => Local::Procedure(structs::inline(member, 0, &fields), kind),
+            let local = match structs::inline(member, 0, count) {
+                Some(inline) => Local::Procedure(inline, kind),
+                None => Local::Type,
             };
             self.struct_locals.insert(var, local);
             // The first constructor is the one that has the struct's name.
@@ -351,15 +323,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 let sealed = parts.flags.contains(TypeFlags::SEALED);
                 self.struct_infos.insert(var, Info { kind: Kind::Local(kind), holder: Some(holder), fields: fields.clone(), sealed });
             }
-            items.push(LocalItem::Defined(id, var, value));
-            // The guards are installed once the type is made, before anything can call them.
-            if member == Member::Type {
-                for &(k, guard) in &guards {
-                    let made = self.fresh();
-                    items.push(LocalItem::Evaluated(made, guard));
-                    items.push(LocalItem::Run(structs::guard_installer(Core::Ref(Place::Local(kind)), k, Core::Ref(Place::Local(made)))));
-                }
-            }
+            items.push((id, var, value));
         }
         Ok(items)
     }

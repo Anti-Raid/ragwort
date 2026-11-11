@@ -127,9 +127,8 @@ pub struct Lowerer<'a, 'gc> {
     symbols: Symbols<'gc>,
     /// The `%provide`s, which name what the module defines anywhere.
     provides: Vec<Syntax<'gc>>,
-    /// The struct forms declared, by which top-level form each is, till they're lowered, each
-    /// with its guard expressions and their fields' indexes.
-    structs: HashMap<u32, (Declared, Vec<(u32, Syntax<'gc>)>)>,
+    /// The struct forms declared, by which top-level form each is, till they're lowered.
+    structs: HashMap<u32, Declared>,
     /// The top-level form being lowered, and the variable whose lambda it's in, if it's one.
     top: u32,
     defining: Option<u32>,
@@ -274,11 +273,9 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         match self.head(node) {
             Some(Form::Require | Form::Provide) => Ok(None),
             Some(Form::Struct) => {
-                let (declared, guards) = self.structs.remove(&top).expect("a declared struct");
-                let guards = guards.into_iter().map(|(k, guard)| Ok((k, self.expr(builder, guard)?))).collect::<Result<Vec<_>, LowerError>>()?;
-                let (def, kind) = builder.struct_def(declared.constructor()).expect("a declared struct");
-                let fields = def.fields.to_vec();
-                Ok(Some(declared.define(kind, &fields, guards, self)))
+                let declared = self.structs.remove(&top).expect("a declared struct");
+                let (_, kind) = builder.struct_def(declared.constructor()).expect("a declared struct");
+                Ok(Some(declared.define(kind, self)))
             }
             Some(Form::Define) => {
                 let items = self.list(node)?;
@@ -301,9 +298,8 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
     /// Declares what a `%struct` form defines: `node`, whose parts after its head are `parts`,
     /// the module's top-level form `top`. It's written as Scheme's `struct` is, and defines what
     /// that does, as [`structs`] says: `(%struct name (field ...) option ...)`, with a
-    /// supertype's name before the fields for a subtype of it. It gives the form's guard
-    /// expressions too, each with its field's index.
-    fn declare_struct(&mut self, builder: &mut ModuleBuilder<'gc>, node: Syntax<'gc>, parts: &[Syntax<'gc>], top: u32) -> Result<(Declared, Vec<(u32, Syntax<'gc>)>), LowerError> {
+    /// supertype's name before the fields for a subtype of it.
+    fn declare_struct(&mut self, builder: &mut ModuleBuilder<'gc>, node: Syntax<'gc>, parts: &[Syntax<'gc>], top: u32) -> Result<Declared, LowerError> {
         let bad = LowerErrorKind::BadShape;
         let is_name = |node: &Syntax<'gc>| node.kind(self.mc) == Some(SyntaxKind::Identifier);
         let option = |node: Syntax<'gc>| self.keyword(node).map(|k| chars(&self.strings, k.symbol(self.mc).name(self.mc)).collect::<String>());
@@ -315,31 +311,26 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             parent = Some(next);
             next = rest.next().ok_or_else(|| self.error(bad, node))?;
         }
-        // Each field the form declares: its name, whether it's mutable, and its guard.
-        let mut own: Vec<(Syntax<'gc>, bool, Option<Syntax<'gc>>)> = Vec::new();
+        // Each field the form declares: its name, and whether it's mutable.
+        let mut own: Vec<(Syntax<'gc>, bool)> = Vec::new();
         for spec in self.list(next)? {
             if is_name(&spec) {
-                own.push((spec, false, None));
+                own.push((spec, false));
                 continue;
             }
             let written = self.list(spec)?;
             let mut options = written.iter().copied();
             let Some(id) = options.next().filter(is_name) else { return Err(self.error(bad, spec)) };
-            let (mut mutable, mut guard) = (false, None);
-            while let Some(at) = options.next() {
-                match option(at).as_deref() {
-                    Some("mutable") => mutable = true,
-                    Some("guard") if guard.is_none() => guard = Some(options.next().ok_or_else(|| self.error(bad, spec))?),
-                    _ => return Err(self.error(bad, spec)),
-                }
+            if !options.all(|at| option(at).as_deref() == Some("mutable")) {
+                return Err(self.error(bad, spec));
             }
-            own.push((id, mutable, guard));
+            own.push((id, written.len() > 1));
         }
-        self.distinct(&own.iter().map(|&(id, ..)| id).collect::<Vec<_>>())?;
+        self.distinct(&own.iter().map(|&(id, _)| id).collect::<Vec<_>>())?;
         let (mut constructors, mut flags) = (Vec::new(), TypeFlags::empty());
         while let Some(at) = rest.next() {
             match option(at).as_deref() {
-                Some("mutable") => own.iter_mut().for_each(|(_, mutable, _)| *mutable = true),
+                Some("mutable") => own.iter_mut().for_each(|(_, mutable)| *mutable = true),
                 Some("identity-eq?") => flags |= TypeFlags::IDENTITY,
                 Some("sealed") => flags |= TypeFlags::SEALED,
                 Some("transparent") => {}
@@ -367,15 +358,11 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             }
         };
         let inherited = fields.len();
-        let mut guards = Vec::new();
-        for &(id, mutable, guard) in &own {
-            if let Some(guard) = guard {
-                guards.push((u32::try_from(fields.len()).map_err(|_| self.error(OutOfMemory, id))?, guard));
-            }
-            fields.push(Field { name: self.identifier(id)?.into(), mutable, guarded: guard.is_some() });
+        for &(id, mutable) in &own {
+            fields.push(Field { name: self.identifier(id)?.into(), mutable });
         }
         let named = structs::members(&self.identifier(name)?, &fields[inherited..], inherited).ok_or_else(|| self.error(OutOfMemory, node))?;
-        let declared: Vec<Declaration<'gc>> = own.iter().map(|&(id, mutable, guard)| Declaration { name: id.datum(self.mc), mutable, guarded: guard.is_some() }).collect();
+        let declared: Vec<Declaration<'gc>> = own.iter().map(|&(id, mutable)| Declaration { name: id.datum(self.mc), mutable }).collect();
         let kind = structs::make_type(self.mc, name.datum(self.mc), above, &declared, flags).map_err(|fault| match fault {
             Fault::OutOfMemory => self.error(OutOfMemory, node),
             _ => self.error(bad, node),
@@ -391,7 +378,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
                 }
             }
         }
-        Ok((Declared::new(builder, kind, fields, flags.contains(TypeFlags::SEALED), members), guards))
+        Ok(Declared::new(builder, kind, fields, flags.contains(TypeFlags::SEALED), members))
     }
 
     /// A call of the procedure of a struct type that `f` names, if it names one of the module's

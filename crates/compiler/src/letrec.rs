@@ -9,7 +9,7 @@
 //!
 //! It's a loop over a stack of tasks, what each node uses on a stack of its own.
 
-use ragwort_types::gc::Value;
+use ragwort_types::gc::{Mutation, Value};
 
 use crate::Var;
 use crate::hash::{HashMap, HashSet};
@@ -21,7 +21,7 @@ use crate::ir::Supply;
 const MAX_FIX_GROUP: usize = 30;
 
 /// `root` of `from` into `tree`, `letrec`s fixed, and its root there.
-pub(crate) fn fix_letrec<'s, 'id, 'gc>(from: &L1<'s, 'gc>, root: l1::Id<'s>, tree: &mut L2<'id, 'gc>, mut supply: Supply) -> (Id<'id>, Supply) {
+pub(crate) fn fix_letrec<'s, 'id, 'gc>(mc: &Mutation<'gc>, from: &L1<'s, 'gc>, root: l1::Id<'s>, tree: &mut L2<'id, 'gc>, mut supply: Supply) -> (Id<'id>, Supply) {
     /// A node to fix, or what to make of what its children fixed to.
     enum Task<'s> {
         Expr(l1::Id<'s>),
@@ -32,7 +32,7 @@ pub(crate) fn fix_letrec<'s, 'id, 'gc>(from: &L1<'s, 'gc>, root: l1::Id<'s>, tre
         Keep,
         Make(l1::Id<'s>),
     }
-    let mut cx = Cx { tree, supply: &mut supply };
+    let mut cx = Cx { mc, tree, supply: &mut supply };
     let mut usages = vec![Usage::default()];
     let mut vals: Vec<Id<'id>> = Vec::new();
     // The inits fixed of each binding form the walk is in, with what they use.
@@ -114,6 +114,7 @@ pub(crate) fn fix_letrec<'s, 'id, 'gc>(from: &L1<'s, 'gc>, root: l1::Id<'s>, tre
 }
 
 struct Cx<'t, 's, 'id, 'gc> {
+    mc: &'t Mutation<'gc>,
     tree: &'t mut L2<'id, 'gc>,
     /// For the variables the results of a fallback's assignments are bound to.
     supply: &'s mut Supply,
@@ -173,7 +174,7 @@ impl Usage {
 /// Drops the bindings from `root` nothing uses, as `simplify_let_with` does for one `let`, for
 /// a whole tree in one walk: inside out, so a binding only a dropped one used goes too. A `let`
 /// left with none takes its body's place.
-pub(crate) fn prune<'id>(tree: &mut l2::L2<'id, '_>, root: l2::Id<'id>) {
+pub(crate) fn prune<'id, 'gc>(mc: &Mutation<'gc>, tree: &mut l2::L2<'id, 'gc>, root: l2::Id<'id>) {
     /// What's left of the walk, which takes what each node uses in on the top of `usages`.
     enum Task<'id> {
         Expr(l2::Id<'id>),
@@ -207,7 +208,7 @@ pub(crate) fn prune<'id>(tree: &mut l2::L2<'id, '_>, root: l2::Id<'id>) {
                 let l2::Node::Let(binds, _) = tree[at] else { unreachable!("a let's binding") };
                 match tree[binds][i] {
                     l2::Bind::Val(v, e) => {
-                        if usage.mentions(v) || !tree.is_pure(e) {
+                        if usage.mentions(v) || !tree.is_pure(mc, e) {
                             usage.forget(v);
                             kept.last_mut().expect("in a let").push(l2::Bind::Val(v, e));
                             then.push(Task::Expr(e));
@@ -269,7 +270,7 @@ impl<'id> Cx<'_, '_, 'id, '_> {
         let mut usage = body_usage;
         let mut kept = Vec::with_capacity(binds.len());
         for (v, init, init_usage) in binds.into_iter().rev() {
-            if usage.mentions(v) || !self.tree.is_pure(init) {
+            if usage.mentions(v) || !self.tree.is_pure(self.mc, init) {
                 usage.forget(v);
                 usage.absorb(init_usage);
                 kept.push(Bind::Val(v, init));
@@ -316,7 +317,7 @@ impl<'id> Cx<'_, '_, 'id, '_> {
         let mut usage = body_usage;
         let mut indexed: Vec<Pending<'id>> = Vec::with_capacity(binds.len());
         for (i, (v, init, u)) in binds.into_iter().enumerate() {
-            if used.contains(&v) || !self.tree.is_pure(init) {
+            if used.contains(&v) || !self.tree.is_pure(self.mc, init) {
                 usage.absorb(u);
                 indexed.push((i, v, init));
             }
@@ -376,7 +377,7 @@ impl<'id> Cx<'_, '_, 'id, '_> {
             if used.contains(&v) {
                 let set = self.tree.add(Node::Set(v, init));
                 out.push(Bind::Val(self.supply.fresh_var(), set));
-            } else if !self.tree.is_pure(init) {
+            } else if !self.tree.is_pure(self.mc, init) {
                 out.push(Bind::Val(v, init));
             }
         }

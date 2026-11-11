@@ -248,14 +248,14 @@ fn to_l5<'a, 'gc>(mc: &Mutation<'gc>, arena: &'a Arena, core: &Core<'gc>) -> Res
     ir::l1::scope(|mut l1| {
         let (root, supply) = lower::lower(&mut l1, core)?;
         ir::l2::scope(move |mut src| {
-            let (root, supply) = letrec::fix_letrec(&l1, root, &mut src, supply);
+            let (root, supply) = letrec::fix_letrec(mc, &l1, root, &mut src, supply);
             drop(l1);
             #[cfg(debug_assertions)]
             src.check(root);
             ir::l2::scope(move |mut l2| {
                 let (root, mut supply) = cp0::optimize(mc, &mut src, root, &mut l2, supply);
                 drop(src);
-                letrec::prune(&mut l2, root);
+                letrec::prune(mc, &mut l2, root);
                 #[cfg(debug_assertions)]
                 l2.check(root);
                 ir::l3::scope(move |mut l3| {

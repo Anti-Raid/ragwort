@@ -214,33 +214,26 @@ fn structs_are_used_across_modules() {
     assert_eq!(module_in(&mut arena, "mixed", &mixed), Ok(Ok("4".into())));
     let native_user = "(%require shapes) (%struct tagged point (tag)) (%app point-y (%app tagged 1 2 'tag))";
     assert_eq!(module_in(&mut arena, "native-user", &[(Native, native_user)]), Ok(Ok("2".into())));
-    // Guards and sealing go with a struct to the modules that require it.
+    // Sealing goes with a struct to the modules that require it.
     let bank = "(provide (struct-out account) (struct-out receipt))
-                (struct account (id [balance #:mutable #:guard (lambda (v) (>= v 0))]))
+                (struct account (id [balance #:mutable]))
                 (struct receipt (amount) #:sealed)";
     module_in(&mut arena, "bank", &[(Scheme, bank)]).unwrap().unwrap();
-    let rejected = |body: &str| format!("(require bank) (struct savings account (rate)) (guard (e (#t (error-object-message e))) {body})");
-    for body in ["(account 1 -1)", "(savings 1 -1 2)", "(set-account-balance! (savings 1 1 2) -5)", "(struct-copy account (account 1 1) [balance -1])"] {
-        let message = "\"struct account: the guard of field balance rejected\"";
-        let message = if body.starts_with("(savings") { message.replace("struct account", "struct savings") } else { message.to_string() };
-        assert_eq!(module_in(&mut arena, "customer", &[(Scheme, &rejected(body))]), Ok(Ok(message)), "{body}");
-    }
-    let accepted = "(require bank) (struct savings account (rate)) (define s (savings 1 5 2)) (set-account-balance! s 9) (list s (receipt-amount (receipt 3)))";
-    assert_eq!(module_in(&mut arena, "customer", &[(Scheme, accepted)]), Ok(Ok("(#(struct:savings 1 9 2) 3)".into())));
-    let native_rejected = module_in(&mut arena, "native-customer", &[(Native, "(%require bank) (%app account 1 -1)")]);
-    assert_eq!(native_rejected, Ok(Err(Fault::Error)));
+    let customer = "(require bank) (struct savings account (rate)) (define s (savings 1 5 2)) (set-account-balance! s 9) (list s (receipt-amount (receipt 3)))";
+    assert_eq!(module_in(&mut arena, "customer", &[(Scheme, customer)]), Ok(Ok("(#(struct:savings 1 9 2) 3)".into())));
     let sealed = module_in(&mut arena, "sealed", &[(Scheme, "(require bank) (struct more receipt (x))")]);
     assert!(matches!(sealed, Err(Error::Expand(e)) if e.kind == ragwort_scheme::ExpandErrorKind::BadSyntax), "{sealed:?}");
     let sealed = module_in(&mut arena, "sealed", &[(Native, "(%require bank) (%struct more receipt (x))")]);
     assert!(matches!(sealed, Err(Error::Lower(e)) if e.kind == ragwort_native::LowerErrorKind::BadShape), "{sealed:?}");
-    // A match or a copy of another module's struct reads the fields itself too.
+    // A match or a copy of another module's struct reads the fields itself too: a match
+    // without checking the type again, once its test has.
     let ops = closure_ops(&mut arena, "matcher", "(require shapes) (define (f p) (match p [(point x y) (+ x y)]))");
-    assert!(ops.contains("IsStructDerivedFrom") && ops.contains("StructRef") && calls(&ops) == 0, "{ops}");
+    assert!(ops.contains("IsStructDerivedFrom") && ops.contains("StructField") && !ops.contains("StructRef") && calls(&ops) == 0, "{ops}");
     let ops = closure_ops(&mut arena, "copier", "(require shapes) (define (f p n) (struct-copy point p [y n]))");
     assert!(ops.contains("StructRef") && ops.contains("MakeStruct") && calls(&ops) == 0, "{ops}");
     // What the form is built from isn't written directly, in either language, unless the
     // embedder lets a module's native code.
-    for name in ["make-struct", "struct-ref", "struct-set!", "struct-field-guard"] {
+    for name in ["make-struct-type", "make-struct", "struct-ref", "struct-field", "struct-set!"] {
         let scheme = module_in(&mut arena, "direct", &[(Scheme, &format!("(require bank) ({name} struct:account 1 2)"))]);
         assert!(matches!(scheme, Err(Error::Expand(e)) if e.kind == ragwort_scheme::ExpandErrorKind::Unbound), "{name}: {scheme:?}");
     }
@@ -249,25 +242,18 @@ fn structs_are_used_across_modules() {
         ("make-struct", "(%intrinsic make-struct struct:account 1 -1)"),
         ("struct-ref", "(%intrinsic struct-ref (%app account 1 1) struct:account 0)"),
         ("struct-set!", "(%intrinsic struct-set! (%app account 1 1) struct:account 1 -1)"),
-        ("struct-field-guard", "(%intrinsic struct-field-guard struct:account 1)"),
-        ("struct-set-field-guard!", "(%intrinsic struct-set-field-guard! struct:account 1 account?)"),
-        ("make-struct-guard-error", "(%intrinsic make-struct-guard-error struct:account 1 0)"),
+        ("struct-field", "(%intrinsic struct-field (%app account 1 1) 0)"),
         ("make-struct", "(%apply-intrinsic make-struct struct:account '(1 -1))"),
     ];
     for (name, body) in direct {
         let native = module_in(&mut arena, "direct", &[(Native, &format!("(%require bank) {body}"))]);
         assert!(matches!(native, Err(Error::Lower(e)) if e.kind == ragwort_native::LowerErrorKind::UnknownIntrinsic), "{name}: {native:?}");
     }
-    let trusted = "(%require bank) (%define a (%intrinsic make-struct struct:account 1 -1)) (%intrinsic struct-set! a struct:account 1 -2) (%intrinsic struct-ref a struct:account 1)";
+    let trusted = "(%require bank) (%define a (%intrinsic make-struct struct:account 1 -1)) (%intrinsic struct-set! a struct:account 1 -2) (%intrinsic struct-field a 1)";
     assert_eq!(module_from(&mut arena, "trusted", &[], true, &[(Native, trusted)]), Ok(Ok("-2".into())));
     // The procedures that look at a struct as a whole are any code's.
     let whole = "(%require bank) (%define a (%app account 1 5)) (%intrinsic cons (%intrinsic struct-fields (%intrinsic struct-type a)) (%intrinsic struct->list a))";
     assert_eq!(module_in(&mut arena, "whole", &[(Native, whole)]), Ok(Ok("((id balance) 1 5)".into())));
-    // A constructor or mutator that calls a guard is inlined too: the one call is the guard's.
-    let ops = closure_ops(&mut arena, "guarded-maker", "(require bank) (define (f n) (account 1 n))");
-    assert!(ops.contains("StructFieldGuard") && ops.contains("MakeStruct") && calls(&ops) == 1, "{ops}");
-    let ops = closure_ops(&mut arena, "guarded-setter", "(require bank) (define (f a n) (set-account-balance! a n))");
-    assert!(ops.contains("StructFieldGuard") && ops.contains("StructSet") && calls(&ops) == 1, "{ops}");
     // No language assigns what a struct form defines.
     let native = module_in(&mut arena, "main", &[(Scheme, "(struct point (x))"), (Native, "(%set! point-x 1)")]);
     assert!(matches!(native, Err(Error::Lower(e)) if e.kind == ragwort_native::LowerErrorKind::Immutable), "{native:?}");

@@ -1,8 +1,9 @@
 //! `L2`, after `letrec` fixing, as a table of nodes like [`L3`](super::l3)'s, without joins: what
 //! cp0 optimizes and assignment conversion lowers.
 
-use ragwort_types::gc::Value;
-use ragwort_vm::Purity;
+use ragwort_types::gc::{Gc, Mutation, Value};
+use ragwort_vm::objects::{StructType, StructTypeFields};
+use ragwort_vm::{Intrinsic, Purity};
 
 use crate::{Prim, SlotOp, Var};
 
@@ -78,8 +79,19 @@ impl<'id, 'gc> L2<'id, 'gc> {
         self[self[fun].params].iter().copied().chain(self[fun].rest)
     }
 
+    /// The struct type `id` makes an instance of and the call's arguments, the type first, if
+    /// `id` is `(make-struct 'type v ...)` with a constant type and a value for each of its
+    /// fields: a call that can't fault.
+    pub(crate) fn made_struct(&self, mc: &Mutation<'gc>, id: Id<'id>) -> Option<(Gc<'gc, StructType>, Span<'id, Id<'id>>)> {
+        let Node::Intrinsic(Prim::Intrinsic(Intrinsic::MakeStruct), args) = self[id] else { return None };
+        let (&kind, values) = self[args].split_first()?;
+        let Node::Quote(kind) = self[kind] else { return None };
+        let kind = kind.downcast::<StructType>(mc)?;
+        (kind.fields(mc) as usize == values.len()).then_some((kind, args))
+    }
+
     /// Whether evaluating `id` cannot fault or cause side effects.
-    pub(crate) fn is_pure(&self, id: Id<'id>) -> bool {
+    pub(crate) fn is_pure(&self, mc: &Mutation<'gc>, id: Id<'id>) -> bool {
         let mut todo = vec![id];
         while let Some(id) = todo.pop() {
             let args = match self[id] {
@@ -99,6 +111,7 @@ impl<'id, 'gc> L2<'id, 'gc> {
                 Node::Intrinsic(Prim::Intrinsic(i), args) if i.is_discardable() => args,
                 Node::Intrinsic(Prim::Read(r), args) if r.is_discardable() => args,
                 Node::Intrinsic(Prim::Host(h), args) if h.purity == Purity::Discardable => args,
+                Node::Intrinsic(_, args) if self.made_struct(mc, id).is_some() => args,
                 Node::Set(..) | Node::App(..) | Node::Intrinsic(..) | Node::ApplyIntrinsic(..) => return false,
             };
             todo.extend(&self[args]);
