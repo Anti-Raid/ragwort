@@ -576,6 +576,21 @@ fn structs_are_of_their_types_and_equal_by_their_fields_or_themselves() {
         assert_eq!(run(mc, Intrinsic::StructSet, &[s, session, fix(1), fix(9)]), Ok(Value::VOID));
         assert_eq!(run(mc, Intrinsic::StructRef, &[s, session, fix(1)]), Ok(fix(9)));
 
+        // An instance has the type it was made as, and its fields' values as a list.
+        assert_eq!(run(mc, Intrinsic::StructType, &[q]), Ok(point4));
+        assert_eq!(run(mc, Intrinsic::StructType, &[p]), Ok(point));
+        assert_eq!(run(mc, Intrinsic::StructType, &[point]), Err(Fault::WrongType));
+        assert_eq!(run(mc, Intrinsic::StructType, &[fix(1)]), Err(Fault::WrongType));
+        let listed = run(mc, Intrinsic::StructToList, &[q]).unwrap();
+        assert_eq!(run(mc, Intrinsic::Equal, &[listed, pairs.list(&[fix(1), fix(2), fix(30), fix(4)]).unwrap()]), Ok(Value::TRUE));
+        assert_eq!(run(mc, Intrinsic::StructToList, &[point]), Err(Fault::WrongType));
+        for internal in [Intrinsic::MakeStructType, Intrinsic::MakeStruct, Intrinsic::StructRef, Intrinsic::StructSet, Intrinsic::StructFieldGuard, Intrinsic::SetStructFieldGuard, Intrinsic::MakeStructGuardError] {
+            assert!(internal.is_internal(), "{internal:?}");
+        }
+        for public in [Intrinsic::IsStruct, Intrinsic::IsStructType, Intrinsic::IsStructDerivedFrom, Intrinsic::StructFields, Intrinsic::IsStructFieldMutable, Intrinsic::StructType, Intrinsic::StructToList, Intrinsic::Car] {
+            assert!(!public.is_internal(), "{public:?}");
+        }
+
         // A sealed type is no supertype, and flags that aren't a form's to give aren't taken.
         let last = run(mc, Intrinsic::MakeStructType, &[symbol("last"), point, names(&["z"]), flags(1, false), sealed]).unwrap();
         assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol("more"), last, names(&[]), flags(0, false), plain]), Err(Fault::WrongType));
@@ -590,9 +605,6 @@ fn structs_are_of_their_types_and_equal_by_their_fields_or_themselves() {
         let (unguarded, guarded) = (fix(1), fix(3));
         let checked = run(mc, Intrinsic::MakeStructType, &[symbol("checked"), Value::FALSE, names(&["a", "b"]), pairs.list(&[unguarded, guarded]).unwrap(), plain]).unwrap();
         let deeper = run(mc, Intrinsic::MakeStructType, &[symbol("deeper"), checked, names(&["c"]), pairs.list(&[unguarded]).unwrap(), plain]).unwrap();
-        for (kind, is) in [(checked, true), (deeper, true), (point, false)] {
-            assert_eq!(run(mc, Intrinsic::IsStructGuarded, &[kind]), Ok(if is { Value::TRUE } else { Value::FALSE }));
-        }
         assert_eq!(run(mc, Intrinsic::StructFieldGuard, &[checked, fix(0)]), Ok(Value::FALSE));
         assert_eq!(run(mc, Intrinsic::StructFieldGuard, &[checked, fix(1)]), Err(Fault::Unbound), "not installed yet");
         assert_eq!(run(mc, Intrinsic::StructFieldGuard, &[checked, fix(2)]), Err(Fault::OutOfRange));

@@ -48,25 +48,31 @@
 //!
 //! # Procedures that work on any struct
 //!
+//! These look at a struct as a whole and never change one:
+//!
 //! - `(struct? v)`: whether `v` is an instance of any struct type.
 //! - `(struct-type? v)`: whether `v` is a struct type, such as `struct:point`.
 //! - `(struct-derived-from? v type)`: whether `v` is an instance of `type` or of a subtype.
-//! - `(make-struct type v ...)`: a new instance of `type`. It calls the fields' guards.
+//! - `(struct-type s)`: the type `s` was made as.
 //! - `(struct-fields type)`: the list of `type`'s field names, the supertype's first.
-//! - `(struct-ref s type k)`: field `k` of `s`, which must be an instance of `type`.
-//! - `(struct-set! s type k v)`: sets field `k` of `s`, after calling the field's guard. Setting
-//!   a field that isn't mutable raises an `immutable` error.
-//! - `(struct-field-mutable? type k)`: whether field `k` is mutable.
-//! - `(struct-guarded? type)`: whether any field of `type` has a guard.
-//! - `(struct-field-guard type k)`: the guard of field `k`, or `#f` if it has none.
-//! - `(struct-set-field-guard! type k guard)`: installs the guard of field `k`. It only works
-//!   for a field that `type` itself declares with `#:guard` and whose guard is not installed
-//!   yet. A `struct` form does this itself when it runs, so it is rarely called directly.
-//! - `(make-struct-guard-error type k v)`: the error object a guard's rejection of `v` for field
-//!   `k` raises.
+//! - `(struct->list s)`: a new list of the values of the fields of `s`, in the order
+//!   `(struct-fields (struct-type s))` names them.
+//! - `(struct-field-mutable? type k)`: whether the field at position `k` of
+//!   `(struct-fields type)` is mutable.
 //!
-//! A field index `k` is the position of the field's name in `(struct-fields type)`. An index has
-//! no other meaning, so code should look a field up by name there, not assume its position.
+//! Together they describe any struct without knowing its type:
+//!
+//! ```text
+//! (define (struct->alist s)
+//!   (map cons (struct-fields (struct-type s)) (struct->list s)))
+//!
+//! (struct->alist (point 1 2))   ; ((x . 1) (y . 2))
+//! ```
+//!
+//! Nothing else makes a struct, reads one field or sets one: only the constructor, accessors
+//! and mutators the form defines do. So a guard is always called, and code that needs to build
+//! or update structs of a type it is handed takes the constructor or a mutator as an argument,
+//! as in `(apply point fields)`.
 //!
 //! # How it is built
 //!
@@ -370,12 +376,12 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     }
 
     /// `(struct-copy name e [field value] ...)`: `(let ((t e)) (let ((v value)) ... (name field
-    /// ...)))`, a call of the struct's constructor, each field its `v` or `(struct-ref t type
-    /// k)`, which checks that `t` is of the type.
+    /// ...)))`, a call of the struct's constructor, each field its `v` or a read of that field
+    /// of `t`, which checks that `t` is of the type.
     pub(crate) fn struct_copy(&mut self, stx: Stx, name: Stx, e: Stx, updates: &[Stx]) -> Result<Stx, ExpandError> {
         let bad = ExpandErrorKind::BadSyntax;
         let Some(info) = self.struct_info(name)? else { return Err(self.error(bad, name)) };
-        let (is, get) = ("struct-derived-from?", "struct-ref");
+        let (is, get) = ("struct-derived-from?", self.internal("struct-ref", stx)?);
         let kind = self.struct_type(&info, stx)?;
         let source = self.introduce("t", stx)?;
         let mut given: Vec<Option<Stx>> = vec![None; info.fields.len()];
@@ -399,7 +405,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 Some(temp) => temp,
                 None => {
                     let k = self.value(Value::fixnum(k as i64).ok_or_else(|| self.error(OutOfMemory, stx))?, stx)?;
-                    self.build(stx, get, &[&[source, kind, k]])?
+                    self.list(&[get, source, kind, k], stx)?
                 }
             });
         }
@@ -407,7 +413,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         // Nothing has read a field of the source, to find it's not of the type.
         if all_given {
             let zero = self.value(Value::fixnum(0).expect("zero is a fixnum"), stx)?;
-            let (test, not_one) = (self.build(stx, is, &[&[source, kind]])?, self.build(stx, get, &[&[source, kind, zero]])?);
+            let (test, not_one) = (self.build(stx, is, &[&[source, kind]])?, self.list(&[get, source, kind, zero], stx)?);
             body = self.build(stx, "if", &[&[test, body, not_one]])?;
         }
         for (temp, value) in binds.into_iter().rev() {

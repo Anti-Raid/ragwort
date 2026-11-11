@@ -672,7 +672,8 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
                     Part::Field(of, i) => {
                         let kind = self.m.structs[of].kind;
                         let k = self.ex.value(fixnum(self, i)?, at)?;
-                        self.ex.build(at, "struct-ref", &[&[x.stx, kind, k]])?
+                        let get = self.ex.internal("struct-ref", at)?;
+                        self.ex.list(&[get, x.stx, kind, k], at)?
                     }
                 };
                 Next::then(rest, move |s: &mut Self, rest| Ok(Next::Done(s.ex.with_temp(at, temp.stx, value, rest)?)))

@@ -228,6 +228,12 @@ fn structs() {
     assert_eq!(fault(&format!("{point} (%app point 1)")), Fault::Arity);
     assert_eq!(fault(&format!("{point} (%app point-x 5)")), Fault::WrongType);
     assert_eq!(fault(&format!("{point} (%struct session (token)) (%app session-token (%app point 1 2))")), Fault::WrongType);
+    // A struct is looked at as a whole by any code, and what the form is built from is the
+    // form's alone.
+    let whole = format!("{point} (%define p (%app point 1 2)) {}", list(&["(%intrinsic struct-fields (%intrinsic struct-type p))", "(%intrinsic struct->list p)"]));
+    assert_eq!(eval(&whole), "((x y) (1 2))");
+    assert_eq!(error(&format!("{point} (%intrinsic struct-ref (%app point 1 2) struct:point 0)")), (LowerErrorKind::UnknownIntrinsic, "struct-ref"));
+    assert_eq!(error(&format!("{point} (%apply-intrinsic make-struct struct:point '(1 2))")), (LowerErrorKind::UnknownIntrinsic, "make-struct"));
     // Code before the form calls what it defines once the form has run, and not before.
     assert_eq!(eval(&format!("(%define sum (%lambda (p) (%intrinsic + (%app point-x p) (%app point-y p)))) {point} (%app sum (%app point 3 4))")), "7");
     assert_eq!(fault(&format!("(%define make (%lambda () (%app point 1 2))) (%define early (%app make)) {point}")), Fault::Unbound);

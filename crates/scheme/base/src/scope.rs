@@ -12,6 +12,9 @@ pub(crate) type Scope = u32;
 pub(crate) const TOP: Scope = 0;
 /// The scope of what the built-in macros introduce, which nothing read can refer to.
 pub(crate) const BASE: Scope = 1;
+/// The scope of the forms only the expander writes. No syntax a program is given has it, so no
+/// program can name one of them.
+pub(crate) const INTERNAL: Scope = 2;
 
 /// A set of scopes, sorted.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -172,7 +175,7 @@ pub(crate) struct Scopes<'gc> {
 
 impl<'gc> Scopes<'gc> {
     pub(crate) fn new(mc: &Mutation<'gc>) -> Self {
-        Self { charge: mc.charge(), sets: Interned::new(), ops: Interned::new(), applied: Map::default(), composed: Map::default(), next: BASE + 1, scratch_set: Vec::new(), scratch_ops: Vec::new() }
+        Self { charge: mc.charge(), sets: Interned::new(), ops: Interned::new(), applied: Map::default(), composed: Map::default(), next: INTERNAL + 1, scratch_set: Vec::new(), scratch_ops: Vec::new() }
     }
 
     pub(crate) fn charge(&mut self, bytes: usize) -> Result<(), OutOfMemory> {

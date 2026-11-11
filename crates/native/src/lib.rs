@@ -22,6 +22,11 @@
 //! [`HostDef`]s the code was loaded with, which only native ragwort can: other code calls the
 //! native procedures that wrap them, which pass on what they need, such as a mark.
 //!
+//! An `%intrinsic` can't name an [internal intrinsic](ragwort_vm::Intrinsic::is_internal):
+//! `(%intrinsic struct-ref s type 0)` is an error, as a struct's fields are read with the
+//! accessors `%struct` defines. Only a [`Lowerer`] made for code the embedder wrote itself
+//! takes them.
+//!
 //! Code is loaded as a module, whose files' top-level forms are one body. A `%define`, which
 //! only goes at the top level, defines one of its variables, which code anywhere in the module
 //! can refer to, as it can to what a `%require` imports, and a `%provide` exports some. A require
@@ -95,7 +100,7 @@ pub fn load<'gc>(
 ) -> Result<Loaded<'gc>, Error> {
     let name = symbols.intern_str(&Strings::new(mc), name).map_err(LowerError::from)?;
     let mut builder = ModuleBuilder::new(name.value(mc), hosts);
-    let mut lowerer = Lowerer::new(mc, symbols, hosts).map_err(LowerError::from)?;
+    let mut lowerer = Lowerer::new(mc, symbols, hosts, false).map_err(LowerError::from)?;
     let mut forms = Vec::new();
     for session in files {
         for node in Reader::new(mc, symbols, session)? {

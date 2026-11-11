@@ -17,16 +17,24 @@
 //!
 //! A type records the names of its fields, its supertype's first, and [`FieldFlags`] for each.
 //!
-//! - A field's index is the position of its name in that list. An index has no other meaning,
-//!   which leaves the compiler free to drop a field that no code reads.
+//! - A field's index is the position of its name in that list. Only the code a `struct` form
+//!   compiles to uses indexes.
 //! - Setting a field that is not mutable faults with [`Fault::Immutable`], whatever code asks.
 //! - A guarded field has a guard: a procedure of one argument that must return true for every
-//!   value the field is given. The VM stores guards but cannot call them, so the code that makes
-//!   an instance or sets a field calls the guard first: the procedures a `struct` form defines
-//!   do, and so do the prelude's `make-struct` and `struct-set!`.
+//!   value the field is given. The VM stores guards but cannot call them, so the constructor
+//!   and the mutators a `struct` form defines call the guard first.
 //!
-//! Reading or writing a field needs the instance's type. No operation returns the type of a
-//! value.
+//! # What code can do with a struct
+//!
+//! Only the procedures a `struct` form defines make an instance, read one field or set one.
+//! The intrinsics they are built from are [internal](crate::Intrinsic::is_internal), so a
+//! guard cannot be skipped.
+//!
+//! Any code can look at a struct as a whole, without changing it:
+//!
+//! - `struct-type` gives the type of an instance.
+//! - `struct-fields` gives the names of a type's fields.
+//! - `struct->list` gives the values of an instance's fields, in the same order.
 //!
 //! # Sealed types
 //!
@@ -51,8 +59,6 @@ bitflags::bitflags! {
         const IDENTITY = 1;
         /// The type cannot be a supertype.
         const SEALED = 1 << 1;
-        /// Some field of the type, its own or inherited, is guarded. The VM sets this.
-        const GUARDED = 1 << 2;
     }
 
     /// What a `struct` form declares of a field.
@@ -63,11 +69,6 @@ bitflags::bitflags! {
         /// The field has a guard.
         const GUARDED = 1 << 1;
     }
-}
-
-impl TypeFlags {
-    /// The flags a form can declare.
-    pub const DECLARED: Self = Self::IDENTITY.union(Self::SEALED);
 }
 
 /// The flags of `kind`.
@@ -128,22 +129,18 @@ pub fn make_type<'gc>(
     flags: Value<'gc>,
 ) -> Result<Gc<'gc, StructType>, Fault> {
     Symbol::of(name).ok_or(Fault::WrongType)?;
-    let declared = flags.as_fixnum().and_then(|bits| u32::try_from(bits).ok()).and_then(TypeFlags::from_bits);
-    let mut flags = declared.filter(|&flags| TypeFlags::DECLARED.contains(flags)).ok_or(Fault::WrongType)?;
+    let mut flags = flags.as_fixnum().and_then(|bits| u32::try_from(bits).ok()).and_then(TypeFlags::from_bits).ok_or(Fault::WrongType)?;
     let parent = if parent == Value::FALSE { None } else { Some(type_of(mc, parent)?) };
     let above = parent.map_or(TypeFlags::empty(), |parent| type_flags(mc, parent));
     if above.contains(TypeFlags::SEALED) {
         return Err(Fault::WrongType);
     }
-    flags |= above & (TypeFlags::IDENTITY | TypeFlags::GUARDED);
+    flags |= above & TypeFlags::IDENTITY;
     let (names, field_flags, count) = fields_of(mc, parent, fields, field_flags)?;
     let inherited = parent.map_or(0, |parent| parent.fields(mc) as usize);
     // The type has a place for the guard of each guarded field it declares itself.
     let guarded = (inherited..count as usize).any(|k| flags_at(mc, field_flags, k).contains(FieldFlags::GUARDED));
     let guards = if guarded { Vectors::new(mc).make(count as usize, Value::FALSE)?.value(mc) } else { Value::FALSE };
-    if guarded {
-        flags |= TypeFlags::GUARDED;
-    }
     let made = |supertypes: usize, last: Value<'gc>| StructType::new(mc, name, names, field_flags, guards, count, flags.bits(), supertypes, last);
     let Some(parent) = parent else { return Ok(made(0, Value::VOID)?) };
     let above = parent.items(mc);

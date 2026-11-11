@@ -10,16 +10,16 @@ use ragwort_compiler::keyword::CallShape;
 use ragwort_compiler::module::{self, Filter, Import, Imports, ModuleBuilder, ModuleError, RequireSpec, Resolver, SpecError, Uninitialized};
 use ragwort_compiler::steps::{self, Step};
 use ragwort_compiler::structs::{self, Declared};
-use ragwort_compiler::{Core, Lambda, Place, Var};
+use ragwort_compiler::{Core, Lambda, Place, Prim, Var};
 use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Value};
 use ragwort_types::string::{Strings, chars};
 use ragwort_types::symbol::{Symbol, Symbols};
 use ragwort_types::syntax::{Abbreviation, Syntax, SyntaxContext, SyntaxMeta, SyntaxScope, SyntaxSpan};
-use ragwort_vm::{HostDef, Machine};
+use ragwort_vm::{HostDef, Intrinsic, Machine};
 use ragwort_vm::objects::Module;
 
 use crate::formals::{CoreAt, KeywordDef};
-use crate::scope::{BASE, Map, Op, Scope, Set, TOP};
+use crate::scope::{BASE, INTERNAL, Map, Op, Scope, Set, TOP};
 use crate::structs::{Info, Local, LocalItem};
 use crate::tree::{Stx, Tree, View};
 use crate::{ExpandError, ExpandErrorKind};
@@ -51,6 +51,9 @@ pub(crate) enum Form {
     /// `quasisyntax` and its unquotes.
     Unsupported,
     Struct,
+    /// `(struct-ref s type k)`: field `k` of `s`, an instance of `type`. Only the expander
+    /// writes it, for `match` and `struct-copy`: see [`Expander::internal`].
+    StructRef,
 }
 
 /// The macros built in, written in Rust.
@@ -255,6 +258,7 @@ pub struct Expander<'a, 'gc> {
     bound_in: Map<u64, Vec<Scope>>,
     top: Set,
     base: Set,
+    internal: Set,
     vars: u32,
     lambdas: u32,
     /// The transformers of the load's macros.
@@ -303,6 +307,8 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let mut tree = Tree::new(mc, abbreviations);
         let top = tree.scopes.set(vec![TOP])?;
         let base = tree.scopes.set(vec![BASE])?;
+        let internal = tree.scopes.set(vec![BASE, INTERNAL])?;
+        let struct_ref = key(intern("struct-ref")?, mc);
         let exports = Imports::all(mc, prelude).unwrap_or_default().0;
         let base_cells = exports.into_iter().map(|(name, import)| Ok((key(intern(&name)?, mc), import))).collect::<Result<_, ragwort_types::Error>>()?;
         Ok(Self {
@@ -319,10 +325,11 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             keyword_defs: Map::default(),
             struct_infos: Map::default(),
             struct_locals: Map::default(),
-            bindings: Map::default(),
-            bound_in: Map::default(),
+            bindings: [((INTERNAL, struct_ref), vec![(internal, Binding::Keyword(Keyword::Form(Form::StructRef)))])].into_iter().collect(),
+            bound_in: [(struct_ref, vec![INTERNAL])].into_iter().collect(),
             top,
             base,
+            internal,
             vars: 0,
             lambdas: 0,
             macros: Vec::new(),
@@ -853,6 +860,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             (Form::Syntax, &[template]) => Ok(Step::Done(self.syntax(template)?)),
             (Form::QuoteSyntax, &[datum]) => Ok(Step::Done(Core::Quote(self.wrap(datum)?))),
             (Form::Unsupported, _) => Err(self.error(ExpandErrorKind::Unsupported, stx)),
+            (Form::StructRef, &[s, kind, k]) => Self::exprs(vec![s, kind, k], |_, parts| Ok(Step::Done(Core::Intrinsic(Prim::Intrinsic(Intrinsic::StructRef), parts)))),
             _ => bad(self),
         }
     }
@@ -1097,5 +1105,13 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let symbol = self.symbol(name)?;
         let span = self.tree.span(at);
         Ok(self.tree.id(symbol, self.base, span)?)
+    }
+
+    /// An identifier for the form named `name` that only the expander writes, at `at`. A
+    /// program can't write one: `struct-ref` in a program is an unbound variable.
+    pub(crate) fn internal(&mut self, name: &str, at: Stx) -> Result<Stx, ExpandError> {
+        let symbol = self.symbol(name)?;
+        let span = self.tree.span(at);
+        Ok(self.tree.id(symbol, self.internal, span)?)
     }
 }

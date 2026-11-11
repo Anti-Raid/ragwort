@@ -42,7 +42,7 @@ pub enum LowerErrorKind {
     NotDefined,
     /// A reference to an export of a module that hasn't defined it yet.
     Uninitialized,
-    /// An `%intrinsic` of a name that isn't one.
+    /// An `%intrinsic` of a name that isn't one the code can name.
     UnknownIntrinsic,
     /// A `%call-host` of a name that isn't one of the host functions the code was given.
     UnknownHost,
@@ -174,20 +174,39 @@ enum CoreAt<'gc> {
 }
 
 impl<'a, 'gc> Lowerer<'a, 'gc> {
-    /// A lowerer of code that calls the host functions `hosts`.
-    pub fn new(mc: &'a Mutation<'gc>, symbols: Symbols<'gc>, hosts: &'static [HostDef]) -> Result<Self, Error> {
+    /// A lowerer of code that calls the host functions `hosts`. The code's `%intrinsic`s name
+    /// [internal intrinsics](Intrinsic::is_internal) only if `internals`.
+    pub fn new(mc: &'a Mutation<'gc>, symbols: Symbols<'gc>, hosts: &'static [HostDef], internals: bool) -> Result<Self, Error> {
         let strings = Strings::new(mc);
-        let word = |name: &str| symbols.intern_str(&strings, name).map(|s| s.value(mc).to_bits());
-        let forms = FORMS.iter().map(|&(name, form)| Ok((word(name)?, form))).collect::<Result<_, Error>>()?;
-        let intrinsics = Intrinsic::ALL.iter().map(|&i| (i.name(), Prim::Intrinsic(i)));
-        let reads = Read::ALL.iter().map(|&r| (r.name(), Prim::Read(r)));
-        let requests = Request::ALL.iter().map(|&r| (r.name(), Prim::Request(r)));
-        let prims = intrinsics.chain(reads).chain(requests).map(|(name, prim)| Ok((word(name)?, prim))).collect::<Result<_, Error>>()?;
-        let hosts = hosts.iter().map(|def| Ok((word(def.name)?, def))).collect::<Result<_, Error>>()?;
+        let symbol = |name: &str| symbols.intern_str(&strings, name).map(|s| s.value(mc));
+        let mut forms = HashMap::new();
+        for (name, form) in FORMS {
+            forms.insert(symbol(name)?.to_bits(), form);
+        }
+        let mut prims = HashMap::new();
+        for &i in Intrinsic::ALL {
+            if internals || !i.is_internal() {
+                prims.insert(symbol(i.name())?.to_bits(), Prim::Intrinsic(i));
+            }
+        }
+        for &r in Read::ALL {
+            prims.insert(symbol(r.name())?.to_bits(), Prim::Read(r));
+        }
+        for &r in Request::ALL {
+            prims.insert(symbol(r.name())?.to_bits(), Prim::Request(r));
+        }
+        let mut named_hosts = HashMap::new();
+        for def in hosts {
+            named_hosts.insert(symbol(def.name)?.to_bits(), def);
+        }
+        let mut abbreviations = Vec::with_capacity(Abbreviation::ALL.len());
+        for a in Abbreviation::ALL {
+            abbreviations.push(symbol(a.name())?);
+        }
         Ok(Self {
             mc,
             pairs: Pairs::new(mc),
-            strings: Strings::new(mc),
+            strings,
             symbols,
             provides: Vec::new(),
             structs: HashMap::new(),
@@ -195,8 +214,8 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             defining: None,
             forms,
             prims,
-            hosts,
-            abbreviations: Abbreviation::ALL.iter().map(|a| Ok(symbols.intern_str(&strings, a.name())?.value(mc))).collect::<Result<_, ragwort_types::Error>>()?,
+            hosts: named_hosts,
+            abbreviations,
             scope: HashMap::new(),
             vars: 0,
             lambdas: 0,

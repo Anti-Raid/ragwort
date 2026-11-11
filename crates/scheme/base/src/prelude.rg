@@ -400,41 +400,10 @@
 (%define string-find (%lambda (s part . start) (%apply-intrinsic string-find s part start)))
 (%define string-find-last (%lambda (s part . end) (%apply-intrinsic string-find-last s part end)))
 
-; Structs by their types, which `match` and `struct-copy` are made of. A field's index is where
-; its name is in what `struct-fields` lists.
-; A struct of a type with guards: each guarded field's guard has to accept its value.
-(%define make-guarded-struct
-  (%lambda (type fields)
-    (%let ((made (%apply-intrinsic make-struct type fields)))
-      (%letrec ((check (%lambda (values k)
-                         (%if (%intrinsic null? values)
-                              made
-                              (%let ((guard (%intrinsic struct-field-guard type k)) (value (%intrinsic car values)))
-                                (%if guard
-                                     (%if (%app guard value) #f (%intrinsic raise (%intrinsic make-struct-guard-error type k value)))
-                                     #f)
-                                (%app check (%intrinsic cdr values) (%intrinsic + k 1)))))))
-        (%app check fields 0)))))
-; Calls of this with a type that has no guards make the struct themselves.
-(%define make-struct
-  (%lambda (type . fields)
-    (%if (%intrinsic struct-guarded? type) (%app make-guarded-struct type fields) (%apply-intrinsic make-struct type fields))))
-(%define struct-derived-from? (%lambda (v type) (%intrinsic struct-derived-from? v type)))
-(%define struct-ref (%lambda (s type k) (%intrinsic struct-ref s type k)))
-(%define struct-fields (%lambda (type) (%intrinsic struct-fields type)))
-; Sets a guarded field, if its guard accepts the value.
-(%define set-guarded-struct-field!
-  (%lambda (s type k v)
-    (%if (%app (%intrinsic struct-field-guard type k) v) #f (%intrinsic raise (%intrinsic make-struct-guard-error type k v)))
-    (%intrinsic struct-set! s type k v)))
-; Calls of this for a field with no guard set the field themselves.
-(%define struct-set!
-  (%lambda (s type k v)
-    (%if (%intrinsic struct-field-guarded? type k) (%app set-guarded-struct-field! s type k v) (%intrinsic struct-set! s type k v))))
-(%define struct-field-mutable? (%lambda (type k) (%intrinsic struct-field-mutable? type k)))
 (%define struct? (%lambda (v) (%intrinsic struct? v)))
 (%define struct-type? (%lambda (v) (%intrinsic struct-type? v)))
-(%define struct-guarded? (%lambda (type) (%intrinsic struct-guarded? type)))
-(%define struct-field-guard (%lambda (type k) (%intrinsic struct-field-guard type k)))
-(%define struct-set-field-guard! (%lambda (type k guard) (%intrinsic struct-set-field-guard! type k guard)))
-(%define make-struct-guard-error (%lambda (type k v) (%intrinsic make-struct-guard-error type k v)))
+(%define struct-derived-from? (%lambda (v type) (%intrinsic struct-derived-from? v type)))
+(%define struct-type (%lambda (s) (%intrinsic struct-type s)))
+(%define struct->list (%lambda (s) (%intrinsic struct->list s)))
+(%define struct-fields (%lambda (type) (%intrinsic struct-fields type)))
+(%define struct-field-mutable? (%lambda (type k) (%intrinsic struct-field-mutable? type k)))

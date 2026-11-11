@@ -834,21 +834,15 @@ fn struct_fields_are_guarded() {
     let account = "(struct account (id [balance #:mutable #:guard (lambda (v) (and (number? v) (>= v 0)))] [owner #:guard string?]))";
     let caught = |body: &str| eval(&format!("{account} (guard (e (#t (list (error-object-kind e) (error-object-message e) (error-object-irritants e)))) {body})"));
     assert_eq!(eval(&format!("{account} (define a (account 1 10 \"al\")) (set-account-balance! a 25) (list a (account-balance a))")), "(#(struct:account 1 25 \"al\") 25)");
-    // The constructor, the setter, and making and setting by the type all call the guard.
+    // The constructor, the setter and a copy all call the guard.
     assert_eq!(caught("(account 1 -5 \"al\")"), r#"(error "struct account: the guard of field balance rejected" (-5))"#);
     assert_eq!(caught("(account 1 5 'al)"), r#"(error "struct account: the guard of field owner rejected" (al))"#);
     assert_eq!(caught("(set-account-balance! (account 1 5 \"al\") 'lots)"), r#"(error "struct account: the guard of field balance rejected" (lots))"#);
-    assert_eq!(caught("(make-struct struct:account 1 -1 \"al\")"), r#"(error "struct account: the guard of field balance rejected" (-1))"#);
-    assert_eq!(caught("(struct-set! (account 1 5 \"al\") struct:account 1 -1)"), r#"(error "struct account: the guard of field balance rejected" (-1))"#);
     assert_eq!(caught("(struct-copy account (account 1 5 \"al\") [balance -2])"), r#"(error "struct account: the guard of field balance rejected" (-2))"#);
     assert_eq!(caught("(apply account '(1 -5 \"al\"))"), r#"(error "struct account: the guard of field balance rejected" (-5))"#);
-    let fine = format!("{account} (define a (make-struct struct:account 1 2 \"al\")) (struct-set! a struct:account 1 30)
+    let fine = format!("{account} (define a (account 1 2 \"al\")) (set-account-balance! a 30)
                         (list a (struct-copy account a [owner \"bo\"]) (map account-id (list a)))");
     assert_eq!(eval(&fine), r#"(#(struct:account 1 30 "al") #(struct:account 1 30 "bo") (1))"#);
-    // Making and setting by the type still fail as they do without guards.
-    assert_eq!(eval_in(&mut arena(), &format!("{account} (make-struct struct:account 1 2)")), Ok(Err(Fault::Arity)));
-    assert_eq!(eval_in(&mut arena(), &format!("{account} (struct-set! (account 1 2 \"al\") struct:account 2 \"bo\")")), Ok(Err(Fault::Immutable)));
-    assert_eq!(eval_in(&mut arena(), &format!("{account} (struct-set! (account 1 2 \"al\") struct:account 3 0)")), Ok(Err(Fault::OutOfRange)));
     // A subtype's constructor calls the guards of the fields it inherits, and its own.
     let savings = format!("{account} (struct savings account ([rate #:guard real?]))");
     assert_eq!(eval(&format!("{savings} (savings 1 10 \"al\" 0.5)")), r#"#(struct:savings 1 10 "al" 0.5)"#);
@@ -856,7 +850,6 @@ fn struct_fields_are_guarded() {
     assert_eq!(caught_sub("(savings 1 -10 \"al\" 0.5)"), r#""struct savings: the guard of field balance rejected""#);
     assert_eq!(caught_sub("(savings 1 10 \"al\" 'high)"), r#""struct savings: the guard of field rate rejected""#);
     assert_eq!(caught_sub("(set-account-balance! (savings 1 10 \"al\" 0.5) -1)"), r#""struct account: the guard of field balance rejected""#);
-    assert_eq!(caught_sub("(make-struct struct:savings 1 10 \"al\" 'high)"), r#""struct savings: the guard of field rate rejected""#);
     // The guard is evaluated once, when the form runs, and called with each value in order.
     let order = "(define log '()) (define (note x) (set! log (cons x log)) #t)
                  (struct pair2 ([a #:guard (begin (note 'made-a) note)] [b #:guard (begin (note 'made-b) note)]))
@@ -869,21 +862,19 @@ fn struct_fields_are_guarded() {
     assert_eq!(eval(local), "(#t #f)");
     let cell = "(define (f) (struct cell ([v #:mutable #:guard number?])) (define c (cell 1)) (set-cell-v! c 2) (guard (e (#t (list c 'rejected))) (set-cell-v! c 'x))) (f)";
     assert_eq!(eval(cell), "(#(struct:cell 2) rejected)");
-    // The guards can be asked of the type.
-    let asked = format!("{account} (struct plain (x))
-        (list (struct-guarded? struct:account) (struct-guarded? struct:plain) (struct-field-guard struct:account 0) (eq? (struct-field-guard struct:account 2) string?)
-              ((struct-field-guard struct:account 1) 5) ((struct-field-guard struct:account 1) -5)
-              (let ((e (make-struct-guard-error struct:account 2 'x))) (list (error-object? e) (error-object-message e) (error-object-irritants e))))");
-    assert_eq!(eval(&asked), r#"(#t #f #f #t #t #f (#t "struct account: the guard of field owner rejected" (x)))"#);
-    // A guard is installed once, by its form, and only for a field declared with one.
-    for (again, fault) in [
-        ("(struct-set-field-guard! struct:account 1 number?)", Fault::Immutable),
-        ("(struct-set-field-guard! struct:account 0 number?)", Fault::WrongType),
-        ("(struct-set-field-guard! struct:account 3 number?)", Fault::OutOfRange),
-        ("(struct-field-guard struct:account 3)", Fault::OutOfRange),
-        ("(struct-guarded? 5)", Fault::WrongType),
-    ] {
-        assert_eq!(eval_in(&mut arena(), &format!("{account} {again}")), Ok(Err(fault)), "{again}");
+    // A macro can't name the read `match` and `struct-copy` are made of, even with the scopes
+    // of syntax a built-in macro introduced, which do reach the prelude's `car`.
+    let borrowed = |name: &str, args: &str| {
+        format!("{account} (define a (account 1 2 \"al\"))
+                 (define-syntax borrow (lambda (stx) (syntax-case stx () [(_ t) (with-syntax ([f (datum->syntax #'t '{name})]) #'(f {args}))])))
+                 (cond [1 => borrow])")
+    };
+    assert_eq!(eval(&borrowed("car", "'(1 2)")), "1");
+    assert_eq!(error(&borrowed("struct-ref", "a struct:account 0")).0, ExpandErrorKind::Unbound);
+    // Only the form's own procedures reach a guard, so nothing makes a struct or sets a field
+    // without one being called.
+    for name in ["make-struct-type", "make-struct", "struct-ref", "struct-set!", "struct-guarded?", "struct-field-guard", "struct-set-field-guard!", "make-struct-guard-error"] {
+        assert_eq!(error(&format!("{account} ({name} struct:account 1 2 3)")), (ExpandErrorKind::Unbound, name), "{name}");
     }
     // A guard that isn't a procedure is an error when the form runs.
     assert_eq!(eval_in(&mut arena(), "(struct bad ([x #:guard 5]))"), Ok(Err(Fault::WrongType)));
@@ -964,53 +955,46 @@ fn structs_are_matched_and_copied() {
 }
 
 #[test]
-fn structs_by_their_types() {
+fn structs_as_wholes() {
     let shapes = "(struct point (x y)) (struct point3 point (z)) (struct session (token user) #:identity-eq?)";
     let fields = format!("{shapes} (list (struct-fields struct:point) (struct-fields struct:point3) (struct-fields struct:session))");
     assert_eq!(eval(&fields), "((x y) (x y z) (token user))");
-    let used = format!("{shapes} (define q (point3 1 2 3)) (define s (session 'tok 'al))
-        (list (make-struct struct:point 1 2) (struct-derived-from? q struct:point) (struct-derived-from? (point 1 2) struct:point3) (struct-ref q struct:point 1) (struct-ref q struct:point3 2)
-              (make-struct struct:session 1 2) (struct-derived-from? s struct:session) (struct-derived-from? q struct:session) (struct-ref s struct:session 1))");
-    assert_eq!(eval(&used), "(#(struct:point 1 2) #t #f 2 3 #(struct:session 1 2) #t #f al)");
+    let derived = format!("{shapes} (define q (point3 1 2 3)) (define s (session 'tok 'al))
+        (list (struct-derived-from? q struct:point) (struct-derived-from? (point 1 2) struct:point3) (struct-derived-from? s struct:session) (struct-derived-from? q struct:session))");
+    assert_eq!(eval(&derived), "(#t #f #t #f)");
     let any = format!("{shapes} (list (struct? (point 1 2)) (struct? (point3 1 2 3)) (struct? (session 1 2)) (struct? struct:point) (struct? 5) (struct? (vector 1)) (struct? point)
                                   (map struct? (list (point 1 2) 'a)))");
     assert_eq!(eval(&any), "(#t #t #t #f #f #f #f (#t #f))");
     let types = format!("{shapes} (list (struct-type? struct:point) (struct-type? struct:point3) (struct-type? (point 1 2)) (struct-type? point) (struct-type? 'point)
                                     (let () (struct cell (v)) (struct-type? struct:cell)))");
     assert_eq!(eval(&types), "(#t #t #f #f #f #t)");
-    // A mutable field is set by its type too, and no other is.
+    // An instance gives the type it was made as, and its fields' values in the order the type
+    // names them.
+    let whole = format!("{shapes} (define q (point3 1 2 3))
+        (list (eq? (struct-type q) struct:point3) (eq? (struct-type q) struct:point) (struct-type (point 1 2)) (struct->list q) (struct->list (session 'tok 'al))
+              (struct-fields (struct-type q)) (let () (struct unit ()) (struct->list (unit))) (map struct->list (list (point 1 2))))");
+    assert_eq!(eval(&whole), "(#t #f #<struct-type:point> (1 2 3) (tok al) (x y z) () ((1 2)))");
+    // The list is a new one each time, of the fields as they are then.
     let cells = "(struct cell (label [value #:mutable])) (struct cell3 cell (extra) #:mutable)";
-    let set = format!("{cells} (define c (cell3 'a 1 2)) (struct-set! c struct:cell 1 10) (struct-set! c struct:cell3 2 20) (list c (cell-value c))");
-    assert_eq!(eval(&set), "(#(struct:cell3 a 10 20) 10)");
-    for fixed in ["(struct-set! (cell 'a 1) struct:cell 0 'b)", "(struct-set! (cell3 'a 1 2) struct:cell3 0 'b)", "(struct-set! (point 1 2) struct:point 1 20)"] {
-        assert_eq!(eval_in(&mut arena(), &format!("{shapes} {cells} {fixed}")), Ok(Err(Fault::Immutable)), "{fixed}");
-    }
+    let listed = format!("{cells} (define c (cell 'a 1)) (define before (struct->list c)) (set-cell-value! c 2) (list before (struct->list c) (eq? (struct->list c) (struct->list c)))");
+    assert_eq!(eval(&listed), "((a 1) (a 2) #f)");
     let mutable = format!("{cells} (list (struct-field-mutable? struct:cell 0) (struct-field-mutable? struct:cell 1) (struct-field-mutable? struct:cell3 0)
                                       (struct-field-mutable? struct:cell3 1) (struct-field-mutable? struct:cell3 2))");
     assert_eq!(eval(&mutable), "(#f #t #f #t #t)");
-    let kind = format!("{shapes} (guard (e (#t (error-object-kind e))) (struct-set! (point 1 2) struct:point 0 9))");
-    assert_eq!(eval(&kind), "immutable");
-    // A field is found by its name's place among the type's.
+    // Code that knows nothing of a struct's type writes it out by its fields' names.
     let by_name = format!("{shapes}
-        (define (field s type name)
-          (let loop ((names (struct-fields type)) (k 0))
-            (if (eq? (car names) name) (struct-ref s type k) (loop (cdr names) (+ k 1)))))
-        (define (alist s type) (let loop ((names (struct-fields type)) (k 0)) (if (null? names) '() (cons (cons (car names) (struct-ref s type k)) (loop (cdr names) (+ k 1))))))
-        (list (field (point3 1 2 3) struct:point3 'z) (alist (point 7 8) struct:point))");
-    assert_eq!(eval(&by_name), "(3 ((x . 7) (y . 8)))");
-    assert_eq!(eval("(define (f) (struct cell (a b)) (list (struct-fields struct:cell) (struct-ref (cell 1 2) struct:cell 1))) (f)"), "((a b) 2)");
+        (define (struct->alist s) (map cons (struct-fields (struct-type s)) (struct->list s)))
+        (list (struct->alist (point3 1 2 3)) (struct->alist (session 'tok 'al)))");
+    assert_eq!(eval(&by_name), "(((x . 1) (y . 2) (z . 3)) ((token . tok) (user . al)))");
+    assert_eq!(eval("(define (f) (struct cell (a b)) (list (struct-fields struct:cell) (struct->list (cell 1 2)) (eq? (struct-type (cell 1 2)) struct:cell))) (f)"), "((a b) (1 2) #t)");
     for (wrong, fault) in [
         ("(struct-fields 5)", Fault::WrongType),
-        ("(struct-ref (point 1 2) struct:point 2)", Fault::OutOfRange),
-        ("(struct-set! (point 1 2) struct:point 2 0)", Fault::OutOfRange),
-        ("(struct-set! (point 1 2) struct:point3 0 0)", Fault::WrongType),
-        ("(struct-set! (point 1 2) struct:point 0 0)", Fault::Immutable),
         ("(struct-field-mutable? struct:point 2)", Fault::OutOfRange),
         ("(struct-field-mutable? (point 1 2) 0)", Fault::WrongType),
-        ("(struct-ref (point 1 2) struct:point3 0)", Fault::WrongType),
-        ("(struct-ref (point 1 2) struct:session 0)", Fault::WrongType),
-        ("(make-struct struct:point 1)", Fault::Arity),
-        ("(make-struct 5 1 2)", Fault::WrongType),
+        ("(struct-type 5)", Fault::WrongType),
+        ("(struct-type struct:point)", Fault::WrongType),
+        ("(struct->list 5)", Fault::WrongType),
+        ("(struct->list struct:point)", Fault::WrongType),
         ("(struct-derived-from? 1 2)", Fault::WrongType),
     ] {
         assert_eq!(eval_in(&mut arena(), &format!("{shapes} {wrong}")), Ok(Err(fault)), "{wrong}");

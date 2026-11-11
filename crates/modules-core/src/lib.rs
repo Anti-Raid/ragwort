@@ -90,14 +90,23 @@ pub struct File<'s> {
     pub session: &'s SyntaxSession,
 }
 
-/// A module to build: its name, the host functions its native files call, its files, in order,
-/// and the modules it requires implicitly, after the prelude. What each of those exports shadows
-/// what those before it do, and what the module defines or requires shadows them all.
+/// A module to build.
+///
+/// - `name`: the module's name.
+/// - `hosts`: the host functions its native files call.
+/// - `files`: its files, in order.
+/// - `implicit`: the modules it requires implicitly, after the prelude. What each of them
+///   exports shadows what those before it do, and what the module defines or requires shadows
+///   them all.
+/// - `internals`: whether its native files can name
+///   [internal intrinsics](ragwort_vm::Intrinsic::is_internal) in an `%intrinsic`. Leave it
+///   `false` unless the embedder wrote the module itself: see [`Lowerer::new`].
 pub struct Source<'a, 'gc> {
     pub name: &'a str,
     pub hosts: &'static [HostDef],
     pub files: &'a [File<'a>],
     pub implicit: &'a [Gc<'gc, Module>],
+    pub internals: bool,
 }
 
 /// A top-level form of a module, from a file in either language.
@@ -132,7 +141,7 @@ pub fn load<'gc>(
                 Language::Native => {
                     let lowerer = match &mut lowerer {
                         Some(lowerer) => lowerer,
-                        None => lowerer.insert(Lowerer::new(mc, symbols, source.hosts).map_err(LowerError::from)?),
+                        None => lowerer.insert(Lowerer::new(mc, symbols, source.hosts, source.internals).map_err(LowerError::from)?),
                     };
                     lowerer.declare(expander.builder(), node, first, resolver)?;
                     forms.push(Form::Native(node));
