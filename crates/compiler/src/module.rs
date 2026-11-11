@@ -17,6 +17,7 @@ use ragwort_vm::objects::{Module, ModuleFields};
 use ragwort_vm::{HostDef, Intrinsic};
 
 use crate::keyword::CallShape;
+use crate::structs::Call;
 use crate::{CompileError, Core, Lambda, Place, Prim, Var, compile};
 
 /// How many forms an inlined export's body can have.
@@ -51,6 +52,23 @@ pub struct Export {
     /// For a keyword procedure, the variable of its core, which a call with keywords that the
     /// front end matches can call itself.
     pub core: Option<Box<Export>>,
+    /// For the constructor a struct form names as its type, the type.
+    pub structure: Option<Box<StructDef>>,
+}
+
+/// A field of a struct type, as code that uses the type knows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Field {
+    pub name: Box<str>,
+    pub mutable: bool,
+}
+
+/// A struct type, as code that uses its name knows it: the variable of its module that holds
+/// the type, and its fields, its supertype's first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StructDef {
+    pub kind: u32,
+    pub fields: Box<[Field]>,
 }
 
 /// The interface of `module`, once it's built.
@@ -109,9 +127,7 @@ impl<'gc> Import<'gc> {
             let read = vec![Core::Quote(Value::object(mc, self.module)), Core::Quote(k)];
             return Ok(Core::Intrinsic(Prim::Intrinsic(Intrinsic::ModuleRef), read));
         }
-        let items = self.module.items(mc);
-        let value = (slot as usize).lt(&items.len()).then(|| items.get(slot as usize)).filter(|&v| v != Value::UNDEFINED);
-        value.map(Core::Quote).ok_or(Uninitialized)
+        self.variable(mc, slot).map(Core::Quote).ok_or(Uninitialized)
     }
 
     /// For a keyword procedure, its core, as [`Export::core`] is.
@@ -119,10 +135,26 @@ impl<'gc> Import<'gc> {
         Some(Self { module: self.module, export: self.export.core.as_deref()? })
     }
 
+    /// For the constructor a struct form names as its type, the type as its module exports it,
+    /// and the type itself.
+    pub fn struct_def(self, mc: &Mutation<'gc>) -> Option<(&'gc StructDef, Value<'gc>)> {
+        let def = self.export.structure.as_deref()?;
+        Some((def, self.variable(mc, def.kind)?))
+    }
+
+    /// The value of its module's variable `slot`, once it's defined.
+    fn variable(self, mc: &Mutation<'gc>, slot: u32) -> Option<Value<'gc>> {
+        let items = self.module.items(mc);
+        (slot as usize).lt(&items.len()).then(|| items.get(slot as usize)).filter(|&v| v != Value::UNDEFINED)
+    }
+
     /// A call of it on `args`, inlined if it can be, with new locals from `fresh`.
     pub fn call(self, mc: &Mutation<'gc>, args: Vec<Core<'gc>>, fresh: &mut dyn FnMut() -> Var) -> Result<Core<'gc>, Uninitialized> {
+        let quoted = |slot: u32| self.variable(mc, slot).map(Core::Quote);
         match &self.export.inline {
-            Some(inline) if inline.inlines(args.len()) => Ok(inline.call(args, fresh)),
+            Some(inline) if inline.inlines(args.len()) && inline.slots().all(|slot| quoted(slot).is_some()) => {
+                Ok(inline.call(args, fresh, &|slot| quoted(slot).expect("its variables are defined")))
+            }
             _ => Ok(Core::App(Box::new(self.reference(mc)?), args)),
         }
     }
@@ -233,7 +265,8 @@ impl<L: Copy> RequireSpec<L> {
 
 /// What a module export's call inlines to: the body of a lambda of no variables but its
 /// parameters, whose constants are immediates and whose calls are of intrinsics, reads and
-/// requests, which mean the same in any module.
+/// requests, which mean the same in any module. A struct procedure's also has the struct type,
+/// as the variable of its module that holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Inline {
     params: u32,
@@ -256,6 +289,8 @@ enum Template {
     /// A `let` of the locals from the first, to the values, around the body.
     Let(u32, Vec<Template>, Box<Template>),
     Immediate(Immediate),
+    /// The value of a variable of the module the template is from, which is never assigned.
+    Slot(u32),
     If(Box<[Template; 3]>),
     Prim(Prim, Vec<Template>),
     Apply(Prim, Vec<Template>),
@@ -284,21 +319,52 @@ impl Arg<'_> {
     }
 }
 
+/// An argument of the one call a struct procedure makes: one of its parameters, the value of a
+/// variable of its module, which holds its type, or a field's index.
+#[derive(Clone, Copy, Debug)]
+pub enum Operand {
+    Param(u32),
+    Slot(u32),
+    Index(u32),
+}
+
 impl Inline {
     /// What `lambda`'s calls inline to, if it can be inlined.
     pub fn of(lambda: &Lambda<'_>) -> Option<Self> {
         let params: Vec<Var> = lambda.params.iter().copied().chain(lambda.rest).collect();
         let (mut size, mut locals) = (0, Vec::new());
         let body = Template::of(&lambda.body, &params, &mut locals, &mut size)?;
+        let (params, locals) = (u32::try_from(lambda.params.len()).ok()?, u32::try_from(locals.len()).ok()?);
+        Some(Self::new(params, lambda.optional, lambda.rest.is_some(), locals, body))
+    }
+
+    /// What the calls of a procedure of `params` parameters that just calls `intrinsic` on
+    /// `operands` inline to, as a struct's procedures do.
+    pub fn of_call(intrinsic: Intrinsic, params: u32, operands: &[Operand]) -> Self {
+        let operand = |operand: &Operand| match *operand {
+            Operand::Param(i) => Template::Param(i),
+            Operand::Slot(slot) => Template::Slot(slot),
+            Operand::Index(k) => Template::Immediate(Value::fixnum(i64::from(k)).and_then(Value::immediate).expect("an index is a fixnum")),
+        };
+        Self::new(params, 0, false, 0, Template::Prim(Prim::Intrinsic(intrinsic), operands.iter().map(operand).collect()))
+    }
+
+    fn new(params: u32, optional: u32, rest: bool, locals: u32, body: Template) -> Self {
         let mut events = Vec::new();
         body.events(&mut events);
         let uses: Vec<u32> = events.iter().filter_map(|e| if let Event::Param(i) = *e { Some(i) } else { None }).collect();
         let last_use = events.iter().rposition(|e| matches!(e, Event::Param(_)));
         let first_other = events.iter().position(|e| *e == Event::Other);
-        let in_order = uses.iter().copied().eq(0..params.len() as u32);
+        let in_order = uses.iter().copied().eq(0..params + u32::from(rest));
         let linear = in_order && last_use.zip(first_other).is_none_or(|(used, other)| used < other);
-        let (params, locals) = (u32::try_from(lambda.params.len()).ok()?, u32::try_from(locals.len()).ok()?);
-        Some(Self { params, optional: lambda.optional, rest: lambda.rest.is_some(), locals, body, linear })
+        Self { params, optional, rest, locals, body, linear }
+    }
+
+    /// The variables of its module that it reads.
+    pub fn slots(&self) -> impl Iterator<Item = u32> {
+        let mut slots = Vec::new();
+        self.body.slots(&mut slots);
+        slots.into_iter()
     }
 
     pub fn takes(&self, n: usize) -> bool {
@@ -307,14 +373,15 @@ impl Inline {
 
     /// Whether a call of `n` arguments is inlined: if it takes them, and any rest list it makes
     /// nests no deeper than [`MAX_REST`].
-    fn inlines(&self, n: usize) -> bool {
+    pub fn inlines(&self, n: usize) -> bool {
         let rest = n.saturating_sub(self.params as usize);
         self.takes(n) && (!self.rest || rest <= MAX_REST || !self.body.uses_list(self.params, rest))
     }
 
     /// The body, with its parameters standing for `args`, which it takes, and the rest in a
-    /// list. An `apply` of the rest list calls its primitive on them, if it takes that many.
-    fn call<'gc>(&self, mut args: Vec<Core<'gc>>, fresh: &mut dyn FnMut() -> Var) -> Core<'gc> {
+    /// list, new locals from `fresh`, and what `slot` gives for each variable of its module it
+    /// reads. An `apply` of the rest list calls its primitive on them, if it takes that many.
+    pub fn call<'gc>(&self, mut args: Vec<Core<'gc>>, fresh: &mut dyn FnMut() -> Var, slot: &dyn Fn(u32) -> Core<'gc>) -> Core<'gc> {
         if args.len() < self.params as usize {
             args.resize(self.params as usize, Core::Quote(Value::UNSUPPLIED));
         }
@@ -337,7 +404,7 @@ impl Inline {
         let body = if self.rest {
             let mut rest = rest;
             let uses_list = self.body.uses_list(self.params, rest.len());
-            let mut cx = Instance { params: args, rest: Some(&mut rest), list: None, locals: &locals };
+            let mut cx = Instance { params: args, rest: Some(&mut rest), list: None, locals: &locals, slot };
             if uses_list {
                 // The rest's list, made once, of the rest, each bound once.
                 let items: Vec<Core<'gc>> = cx.rest.as_deref_mut().into_iter().flatten().map(|a| a.take()).collect();
@@ -352,7 +419,7 @@ impl Inline {
             }
             self.body.core(&mut cx, self.params)
         } else {
-            self.body.core(&mut Instance { params: args, rest: None, list: None, locals: &locals }, self.params)
+            self.body.core(&mut Instance { params: args, rest: None, list: None, locals: &locals, slot }, self.params)
         };
         // The list is of the rest's locals, so it's bound inside them.
         let body = match inner {
@@ -369,6 +436,7 @@ struct Instance<'r, 'gc> {
     rest: Option<&'r mut Vec<Arg<'gc>>>,
     list: Option<Arg<'gc>>,
     locals: &'r [Var],
+    slot: &'r dyn Fn(u32) -> Core<'gc>,
 }
 
 impl<'gc> Arg<'gc> {
@@ -431,7 +499,7 @@ impl Template {
     fn events(&self, out: &mut Vec<Event>) {
         match self {
             Self::Param(i) => out.push(Event::Param(*i)),
-            Self::Immediate(_) | Self::Local(_) => {}
+            Self::Immediate(_) | Self::Local(_) | Self::Slot(_) => {}
             Self::Let(_, values, body) => {
                 for value in values {
                     value.events(out);
@@ -455,12 +523,23 @@ impl Template {
         }
     }
 
+    /// The variables of its module that it reads, onto `out`.
+    fn slots(&self, out: &mut Vec<u32>) {
+        match self {
+            Self::Slot(slot) => out.push(*slot),
+            Self::Param(_) | Self::Immediate(_) | Self::Local(_) => {}
+            Self::Let(_, values, body) => values.iter().chain([&**body]).for_each(|p| p.slots(out)),
+            Self::If(parts) => parts.iter().for_each(|p| p.slots(out)),
+            Self::Prim(_, args) | Self::Apply(_, args) => args.iter().for_each(|a| a.slots(out)),
+        }
+    }
+
     /// Whether a call with `count` arguments past the parameters uses the rest parameter,
     /// `rest`, as a list, rather than as arguments an `apply` spreads.
     fn uses_list(&self, rest: u32, count: usize) -> bool {
         match self {
             Self::Param(i) => *i == rest,
-            Self::Immediate(_) | Self::Local(_) => false,
+            Self::Immediate(_) | Self::Local(_) | Self::Slot(_) => false,
             Self::Let(_, values, body) => values.iter().chain([&**body]).any(|p| p.uses_list(rest, count)),
             Self::If(parts) => parts.iter().any(|p| p.uses_list(rest, count)),
             Self::Prim(_, args) => args.iter().any(|a| a.uses_list(rest, count)),
@@ -479,6 +558,7 @@ impl Template {
             Self::Param(i) if *i == rest && cx.rest.is_some() => cx.list.as_mut().expect("the rest's list is made when it's used").take(),
             Self::Param(i) => cx.params[*i as usize].take(),
             Self::Immediate(v) => Core::Quote(v.value()),
+            Self::Slot(slot) => (cx.slot)(*slot),
             Self::Local(k) => Core::Ref(Place::Local(cx.locals[*k as usize])),
             Self::Let(first, values, body) => {
                 let binds = values.iter().zip(*first..).map(|(value, k)| (cx.locals[k as usize], value.core(cx, rest))).collect();
@@ -517,7 +597,7 @@ pub enum ModuleError {
     /// A provide of a name the module doesn't define.
     NotDefined,
     /// An assignment of a keyword procedure the module defines, whose calls the front ends
-    /// that see its definition make of its core.
+    /// that see its definition make of its core, or of a variable a struct form defines.
     Immutable,
     OutOfMemory,
 }
@@ -554,6 +634,12 @@ pub struct ModuleBuilder<'gc> {
     inlines: HashMap<u32, Inline>,
     /// The cores of the keyword procedures it defines, and their shapes, by their variables.
     cores: HashMap<u32, (u32, CallShape<'gc>)>,
+    /// The struct types it defines, by the variables that hold them, each with the variables its
+    /// form defines, and by the constructors named as they are, what they are.
+    kinds: HashMap<u32, (Value<'gc>, Vec<u32>)>,
+    structs: HashMap<u32, StructDef>,
+    /// What a call of each procedure a struct form defines does, and its type.
+    procedures: HashMap<u32, (Inline, Value<'gc>)>,
     module: Option<Gc<'gc, Module>>,
 }
 
@@ -571,6 +657,9 @@ impl<'gc> ModuleBuilder<'gc> {
             assigned: HashSet::default(),
             inlines: HashMap::default(),
             cores: HashMap::default(),
+            kinds: HashMap::default(),
+            structs: HashMap::default(),
+            procedures: HashMap::default(),
             module: None,
         }
     }
@@ -641,10 +730,27 @@ impl<'gc> ModuleBuilder<'gc> {
     /// Exports the variable `name`, a symbol, as `external`.
     pub fn provide(&mut self, external: &str, name: Value<'gc>) -> Result<(), ModuleError> {
         let Some(&Binding::Slot(slot)) = self.bindings.get(&name.to_bits()) else { return Err(ModuleError::NotDefined) };
+        self.provide_slot(external, slot)
+    }
+
+    fn provide_slot(&mut self, external: &str, slot: u32) -> Result<(), ModuleError> {
         if self.exports.iter().any(|(n, _)| **n == *external) {
             return Err(ModuleError::Duplicate);
         }
         self.exports.push((external.into(), slot));
+        Ok(())
+    }
+
+    /// Exports each variable the form of the struct type that variable `constructor` is named
+    /// for defines, by its name.
+    pub fn provide_struct(&mut self, mc: &Mutation<'gc>, constructor: u32) -> Result<(), ModuleError> {
+        let members = self.structs.get(&constructor).and_then(|def| self.kinds.get(&def.kind)).ok_or(ModuleError::NotDefined)?.1.clone();
+        let strings = Strings::new(mc);
+        for slot in members {
+            let symbol = Symbol::of(self.names[slot as usize]).expect("variables are named by symbols");
+            let external: String = chars(&strings, symbol.name(mc)).collect();
+            self.provide_slot(&external, slot)?;
+        }
         Ok(())
     }
 
@@ -707,10 +813,39 @@ impl<'gc> ModuleBuilder<'gc> {
         self.cores.get(&slot).map(|(core, shape)| (*core, shape))
     }
 
+    /// Notes that variable `def.kind` holds the struct type `kind`, which `def` describes, that
+    /// variable `constructor`, named as the type is, constructs it, and that `members` are the
+    /// variables its form defines.
+    pub fn define_struct(&mut self, constructor: u32, def: StructDef, kind: Value<'gc>, members: Vec<u32>) {
+        self.kinds.insert(def.kind, (kind, members));
+        self.structs.insert(constructor, def);
+    }
+
+    /// Notes that variable `slot` is a procedure of the struct type `kind` whose calls do what
+    /// `inline` does, so the code of any language can do that itself.
+    pub fn struct_procedure(&mut self, slot: u32, inline: Inline, kind: Value<'gc>) {
+        self.procedures.insert(slot, (inline, kind));
+    }
+
+    /// The struct type variable `slot` is the constructor named for, and the type itself.
+    pub fn struct_def(&self, slot: u32) -> Option<(&StructDef, Value<'gc>)> {
+        let def = self.structs.get(&slot)?;
+        Some((def, self.kinds.get(&def.kind)?.0))
+    }
+
+    /// A call of variable `slot` in top-level form `form`, if it's a procedure of a struct type:
+    /// one that does what the procedure does, after reading the variable if the form that
+    /// defines it may not have run yet.
+    pub fn struct_call(&self, slot: u32, form: u32) -> Option<Call<'gc>> {
+        let (inline, kind) = self.procedures.get(&slot)?;
+        let defined = self.defined_by.get(slot as usize).is_some_and(|&by| by < form);
+        Some(Call::new(inline.clone(), Core::Quote(*kind), (!defined).then_some(Place::Slot { slot, checked: true })))
+    }
+
     /// Notes that code assigns variable `slot`, so it isn't immutable, unless it's a keyword
-    /// procedure, which can't be assigned.
+    /// procedure or one a struct form defines, which can't be assigned.
     pub fn assign(&mut self, slot: u32) -> Result<(), ModuleError> {
-        if self.cores.contains_key(&slot) {
+        if self.cores.contains_key(&slot) || self.procedures.contains_key(&slot) || self.kinds.contains_key(&slot) {
             return Err(ModuleError::Immutable);
         }
         self.assigned.insert(slot);
@@ -739,8 +874,8 @@ impl<'gc> ModuleBuilder<'gc> {
         };
         let export = |slot: u32| {
             let mutable = self.assigned.contains(&slot);
-            let inline = if mutable { None } else { self.inlines.get(&slot).cloned() };
-            Export { slot, mutable, inline, core: None }
+            let inline = if mutable { None } else { self.procedures.get(&slot).map(|(inline, _)| inline).or(self.inlines.get(&slot)).cloned() };
+            Export { slot, mutable, inline, core: None, structure: self.structs.get(&slot).cloned().map(Box::new) }
         };
         let exports = self.exports.iter().map(|&(ref name, slot)| {
             let mut out = export(slot);

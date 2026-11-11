@@ -1,12 +1,17 @@
 //! Characters kept outside the heap, by the program that runs it. A host keeps an external
 //! string's owner alive while the string is reachable, and the library reads its characters
 //! like any flat string's.
+//!
+//! A string never changes, so its owner promises that the characters don't: there are always as
+//! many, with the same values. The library relies on that and can't check it: it keeps what it
+//! has read of a string, such as its length and its hash.
 
 use crate::{MAX_LEN, StrError, Units, Width};
 
-/// Characters owned outside the heap.
+/// Characters owned outside the heap, which never change.
 pub trait External: 'static {
-    /// The same characters on every call, at their narrowest width.
+    /// The same characters on every call, as many and with the same values, at their narrowest
+    /// width.
     fn units(&self) -> Units<'_>;
 }
 

@@ -78,7 +78,8 @@ impl<'a, 'gc> Strings<'a, 'gc> {
         self.mc
     }
 
-    /// A string of characters kept outside the arena, such as an [`ExternalText`].
+    /// A string of characters kept outside the arena, such as an [`ExternalText`], which must
+    /// never change, in number or in value, as no string's do.
     pub fn external(&self, chars: impl External) -> Result<Str<'gc>, Error> {
         let units = chars.units();
         check_external(units)?;

@@ -209,6 +209,53 @@ fn modules_require_what_others_provide() {
 }
 
 #[test]
+fn structs() {
+    let list = |items: &[&str]| items.iter().rfold(String::from("'()"), |rest, item| format!("(%intrinsic cons {item} {rest})"));
+    let point = "(%struct point (x (y #:mutable)))";
+    let made = format!("{point} (%define p (%app point 1 2)) (%app set-point-y! p 5) {}", list(&[
+        "(%app point? p)", "(%app point? 5)", "(%app point-x p)", "(%app point-y p)", "p", "struct:point", "(%intrinsic equal? p (%app point 1 5))",
+        "(%let ((get point-x)) (%app get p))",
+    ]));
+    assert_eq!(eval(&made), "(#t #f 1 5 #(struct:point 1 5) #<struct-type:point> #t 1)");
+    let sub = format!("{point} (%struct point3 point (z) #:mutable #:transparent) (%define q (%app point3 1 2 3)) (%app set-point3-z! q 30) {}", list(&[
+        "q", "(%app point-x q)", "(%app point3-z q)", "(%app point? q)", "(%app point3? (%app point 1 2))",
+    ]));
+    assert_eq!(eval(&sub), "(#(struct:point3 1 2 30) 1 30 #t #f)");
+    let identity = format!("(%struct session (token) #:identity-eq? #:extra-constructor-name make-session) (%define s (%app make-session 7)) {}", list(&[
+        "s", "(%app session? s)", "(%app session-token s)", "(%intrinsic equal? s (%app session 7))", "(%intrinsic equal? s s)",
+    ]));
+    assert_eq!(eval(&identity), "(#(struct:session 7) #t 7 #f #t)");
+    assert_eq!(fault(&format!("{point} (%app point 1)")), Fault::Arity);
+    assert_eq!(fault(&format!("{point} (%app point-x 5)")), Fault::WrongType);
+    assert_eq!(fault(&format!("{point} (%struct session (token)) (%app session-token (%app point 1 2))")), Fault::WrongType);
+    // Code before the form calls what it defines once the form has run, and not before.
+    assert_eq!(eval(&format!("(%define sum (%lambda (p) (%intrinsic + (%app point-x p) (%app point-y p)))) {point} (%app sum (%app point 3 4))")), "7");
+    assert_eq!(fault(&format!("(%define make (%lambda () (%app point 1 2))) (%define early (%app make)) {point}")), Fault::Unbound);
+    for (bad, at) in [
+        ("(%struct point)", "(%struct point)"),
+        ("(%struct point (x 1))", "1"),
+        ("(%struct point ((x #:auto)))", "(x #:auto)"),
+        ("(%struct point (x) #:prefab)", "#:prefab"),
+        ("(%struct point (x) #:constructor-name)", "#:constructor-name"),
+        ("(%struct point nope (x))", "nope"),
+        ("(%define f 1) (%struct point f (x))", "f"),
+        ("(%struct point (x) #:identity-eq? 1)", "1"),
+    ] {
+        assert_eq!(error(bad), (LowerErrorKind::BadShape, at), "{bad}");
+    }
+    assert_eq!(error("(%struct point (x x))"), (LowerErrorKind::Duplicate, "x"));
+    assert_eq!(error("(%struct point (x)) (%define point? 1)").0, LowerErrorKind::Duplicate);
+    assert_eq!(error("(%struct point (x)) (%set! point-x 1)"), (LowerErrorKind::Immutable, "point-x"));
+    assert_eq!(error("(%if 1 (%struct point (x)) 2)"), (LowerErrorKind::Definition, "(%struct point (x))"));
+
+    let mut arena = arena();
+    module_in(&mut arena, "shapes", "(%provide (struct-out point) origin) (%struct point (x y)) (%define origin (%app point 0 0))").unwrap().unwrap();
+    let user = "(%require shapes) (%struct point3 point (z)) (%intrinsic cons (%app point-y (%app point3 1 2 3)) (%app point? origin))";
+    assert_eq!(module_in(&mut arena, "user", user), Ok(Ok("(2 . #t)".into())));
+    assert_eq!(error("(%provide (struct-out f)) (%define f 1)").0, LowerErrorKind::NotDefined);
+}
+
+#[test]
 fn optional_and_keyword_parameters() {
     let optional = "(%define f (%lambda (a [b 2] [c (%intrinsic + a b)]) (%intrinsic cons a (%intrinsic cons b c))))
                     (%intrinsic cons (%app f 1) (%intrinsic cons (%app f 1 5) (%app f 1 5 0)))";

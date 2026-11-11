@@ -108,6 +108,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 None => self.quoted(template, stx),
             },
             (Macro::Match, &[e, ref clauses @ ..]) => self.match_form(stx, e, clauses),
+            (Macro::StructCopy, &[name, e, ref updates @ ..]) => self.struct_copy(stx, name, e, updates),
             (Macro::NamedLet, &[name, binds, ref body @ ..]) => {
                 let (vars, inits) = self.bindings_of(binds)?;
                 let formals = self.list(&vars, stx)?;

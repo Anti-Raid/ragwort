@@ -9,7 +9,7 @@ use ragwort_types::string::{self, Strings};
 use ragwort_types::vector::{AnyVector, Vectors};
 
 use crate::Fault;
-use crate::objects::{self, BoxFields};
+use crate::objects::{self, BoxFields, StructFields, StructTypeFields};
 
 /// How many values `equal?` compares for each unit of fuel it spends.
 pub(crate) const PER_FUEL: u64 = 1024;
@@ -41,8 +41,8 @@ pub(crate) fn eqv<'gc>(mc: &Mutation<'gc>, a: Value<'gc>, b: Value<'gc>) -> bool
 }
 
 /// `equal?`: [`eqv?`](eqv), or strings of the same characters, or bytevectors of the same
-/// bytes, or pairs, vectors or boxes whose contents are `equal?`. A vector's mutability doesn't
-/// matter, as in Racket. Also returns how many values it compared, a string or bytevector
+/// bytes, or pairs, vectors or boxes whose contents are `equal?`, or structs of one type whose
+/// fields are, unless it's an identity type. A vector's mutability doesn't matter, as in Racket. Also returns how many values it compared, a string or bytevector
 /// counting as one plus one per eight characters or bytes, or faults with [`Fault::OutOfFuel`]
 /// once that's past `most`.
 pub(crate) fn equal<'gc>(mc: &Mutation<'gc>, a: Value<'gc>, b: Value<'gc>, most: u64) -> Result<(bool, u64), Fault> {
@@ -58,6 +58,13 @@ pub(crate) fn equal<'gc>(mc: &Mutation<'gc>, a: Value<'gc>, b: Value<'gc>, most:
                     todo.push(Work::Items(x, y, i + 1))?;
                 }
                 (x.get(mc, i).ok_or(Fault::Malformed)?, y.get(mc, i).ok_or(Fault::Malformed)?)
+            }
+            Some(Work::Fields(x, y, i)) => {
+                let (xs, ys) = (x.items(mc), y.items(mc));
+                if i + 1 < xs.len() {
+                    todo.push(Work::Fields(x, y, i + 1))?;
+                }
+                (xs.get(i), ys.get(i))
             }
         };
         compared += 1;
@@ -99,6 +106,7 @@ pub(crate) fn equal<'gc>(mc: &Mutation<'gc>, a: Value<'gc>, b: Value<'gc>, most:
         let same_shape = match (x, y) {
             (Compound::Vector(x), Compound::Vector(y)) => x.len(mc) == y.len(mc),
             (Compound::Pair(_), Compound::Pair(_)) | (Compound::Box(_), Compound::Box(_)) => true,
+            (Compound::Struct(x), Compound::Struct(y)) => x.kind(mc) == y.kind(mc),
             _ => false,
         };
         if !same_shape {
@@ -114,15 +122,18 @@ pub(crate) fn equal<'gc>(mc: &Mutation<'gc>, a: Value<'gc>, b: Value<'gc>, most:
             }
             (Compound::Vector(x), Compound::Vector(y)) if !x.is_empty(mc) => todo.push(Work::Items(x, y, 0))?,
             (Compound::Box(x), Compound::Box(y)) => next = Some((x.value(mc), y.value(mc))),
+            (Compound::Struct(x), Compound::Struct(y)) if !x.items(mc).is_empty() => todo.push(Work::Fields(x, y, 0))?,
             _ => {}
         }
     }
 }
 
-/// What's still to compare: two values, or the items of two vectors from an index on.
+/// What's still to compare: two values, or the items of two vectors, or the fields of two
+/// structs of one type, from an index on.
 enum Work<'gc> {
     Values(Value<'gc>, Value<'gc>),
     Items(AnyVector<'gc>, AnyVector<'gc>, usize),
+    Fields(Gc<'gc, objects::Struct>, Gc<'gc, objects::Struct>, usize),
 }
 
 /// A value `equal?` compares by its contents.
@@ -131,6 +142,7 @@ enum Compound<'gc> {
     Pair(Pair<'gc>),
     Vector(AnyVector<'gc>),
     Box(Gc<'gc, objects::Box>),
+    Struct(Gc<'gc, objects::Struct>),
 }
 
 impl<'gc> Compound<'gc> {
@@ -140,6 +152,10 @@ impl<'gc> Compound<'gc> {
         }
         if let Some(vector) = vectors.vector(v) {
             return Some(Compound::Vector(vector));
+        }
+        // A struct of an identity type is `equal?` only to itself.
+        if let Some(made) = v.downcast::<objects::Struct>(mc) {
+            return made.kind(mc).is_some_and(|kind| !kind.identity(mc)).then_some(Compound::Struct(made));
         }
         v.downcast::<objects::Box>(mc).map(Compound::Box)
     }

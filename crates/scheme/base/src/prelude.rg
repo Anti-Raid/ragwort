@@ -399,3 +399,11 @@
 (%define string-replace (%lambda (s from to #:all? [all? #t]) (%intrinsic string-replace s from to all?)))
 (%define string-find (%lambda (s part . start) (%apply-intrinsic string-find s part start)))
 (%define string-find-last (%lambda (s part . end) (%apply-intrinsic string-find-last s part end)))
+
+; Structs by their types, which `match` and `struct-copy` are made of. A field's index is where
+; its name is in what `struct-fields` lists.
+(%define make-struct (%lambda (type . fields) (%apply-intrinsic make-struct type fields)))
+(%define struct? (%lambda (v type) (%intrinsic struct? v type)))
+(%define struct-ref (%lambda (s type k) (%intrinsic struct-ref s type k)))
+(%define struct-fields (%lambda (type) (%intrinsic struct-fields type)))
+(%define struct-set! (%lambda (s type k v) (%intrinsic struct-set! s type k v)))

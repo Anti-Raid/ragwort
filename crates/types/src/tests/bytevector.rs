@@ -114,6 +114,9 @@ fn external_bytevectors_keep_their_owner_while_reachable() {
     assert!(dropped.get(), "the owner went with its bytevector");
 }
 
+impl ExternalBuffer for Watched {}
+impl ExternalBufferMut for Watched {}
+
 impl AsMut<[u8]> for Watched {
     fn as_mut(&mut self) -> &mut [u8] {
         &mut self.0

@@ -4,6 +4,7 @@ use ragwort_types::pair::Pairs;
 use ragwort_types::symbol::Symbols;
 use ragwort_types::syntax::{SyntaxMeta, SyntaxSpan};
 use ragwort_types::vector::Vectors;
+use ragwort_vm::Intrinsic;
 
 use super::*;
 
@@ -84,6 +85,31 @@ fn lists_vectors_and_bytevectors_nest() {
         let list = pairs.list(&[number(mc, "1"), dotted, vector, bytes, empty, Value::NIL, Value::TRUE, Value::FALSE, Value::VOID]).unwrap();
         assert_eq!(write(mc, list), r#"(1 (2 . 3) #(4 "x") #u8(1 255) #() () #t #f #<void>)"#);
         assert_eq!(display(mc, list), "(1 (2 . 3) #(4 x) #u8(1 255) #() () #t #f #<void>)");
+    });
+}
+
+fn run<'gc>(mc: &Mutation<'gc>, op: Intrinsic, args: &[Value<'gc>]) -> Value<'gc> {
+    op.run(mc, args, &mut ragwort_vm::Fuel { run: u64::MAX, rest: 0 }).unwrap()
+}
+
+#[test]
+fn structs_are_written_with_their_fields() {
+    with(|mc| {
+        let pairs = Pairs::new(mc);
+        let fields = pairs.list(&[symbol(mc, "x"), symbol(mc, "y")]).unwrap();
+        let point = run(mc, Intrinsic::MakeStructType, &[symbol(mc, "point"), Value::FALSE, fields, Value::FALSE]);
+        let unit = run(mc, Intrinsic::MakeStructType, &[symbol(mc, "unit"), Value::FALSE, Value::NIL, Value::FALSE]);
+        let p = run(mc, Intrinsic::MakeStruct, &[point, number(mc, "1"), text(mc, "two")]);
+        let nested = run(mc, Intrinsic::MakeStruct, &[point, p, run(mc, Intrinsic::MakeStruct, &[unit])]);
+        assert_eq!(write(mc, nested), r#"#(struct:point #(struct:point 1 "two") #(struct:unit))"#);
+        assert_eq!(display(mc, p), "#(struct:point 1 two)");
+        // One that holds itself is labelled, as a vector is.
+        run(mc, Intrinsic::StructSet, &[p, point, number(mc, "1"), p]);
+        assert_eq!(write(mc, p), "#0=#(struct:point 1 #0#)");
+        // One of an identity type is written no differently.
+        let session = run(mc, Intrinsic::MakeStructType, &[symbol(mc, "session"), Value::FALSE, fields, Value::TRUE]);
+        let s = run(mc, Intrinsic::MakeStruct, &[session, text(mc, "tok"), number(mc, "7")]);
+        assert_eq!(write(mc, pairs.list(&[s, point, session]).unwrap()), r#"(#(struct:session "tok" 7) #<struct-type:point> #<struct-type:session>)"#);
     });
 }
 

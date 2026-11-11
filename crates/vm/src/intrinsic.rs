@@ -17,8 +17,8 @@ use ragwort_types::syntax::Syntax;
 use ragwort_types::vector::{AnyVector, Vectors};
 
 use crate::op::Fuel;
-use crate::{Fault, coroutine, equal, prompts, syntax};
-use crate::objects::{self, BoxFields, Condition, ConditionFields, KeywordProcedureFields, ModuleFields, MultiValue, MultiValueFields, Tag, TaskFields};
+use crate::{Fault, coroutine, equal, prompts, structs, syntax};
+use crate::objects::{self, BoxFields, Condition, ConditionFields, KeywordProcedureFields, ModuleFields, MultiValue, MultiValueFields, StructFields, StructTypeFields, Tag, TaskFields};
 
 named! {
     #[repr(u16)]
@@ -377,6 +377,24 @@ named! {
         /// `(%keyword-procedure plain core keywords required)`: a keyword procedure, as a `lambda`
         /// with keyword parameters makes. See [`crate::keyword`].
         MakeKeywordProcedure = "%keyword-procedure",
+        /// `(make-struct-type name parent fields identity?)`: a new struct type named by the
+        /// symbol `name`, whose structs have the fields the list `fields` names after those of
+        /// `parent`'s, its supertype, or `#f`, and are `equal?` only to themselves if `identity?`
+        /// isn't `#f` or the supertype's are. See [`crate::structs`].
+        MakeStructType = "make-struct-type",
+        /// `(make-struct type v ...)`: a struct of the type, with the values as its fields, which
+        /// must be as many as it has.
+        MakeStruct = "make-struct",
+        /// `(struct? v type)`: whether `v` is a struct of the type or of a subtype of it.
+        IsStruct = "struct?",
+        /// `(struct-ref s type k)`: field `k` of `s`, a struct of the type, as `struct-fields`
+        /// numbers its fields.
+        StructRef = "struct-ref",
+        /// `(struct-set! s type k v)`: sets field `k` of `s`, a struct of the type, to `v`.
+        StructSet = "struct-set!",
+        /// `(struct-fields type)`: a list of the names of the fields a struct of the type has, in
+        /// order, its supertype's first.
+        StructFields = "struct-fields",
         /// `(procedure-keywords f)`: the keywords `f` requires and those it takes, as two sorted
         /// lists, both empty for a procedure without keyword parameters.
         ProcedureKeywords = "procedure-keywords",
@@ -559,7 +577,11 @@ impl Intrinsic {
             Intrinsic::StringEq | Intrinsic::StringLt | Intrinsic::StringGt | Intrinsic::StringLe | Intrinsic::StringGe => None,
             Intrinsic::StringRef => Some(2),
             Intrinsic::StringJoin => None,
-            Intrinsic::MakeKeywordProcedure => Some(4),
+            Intrinsic::MakeKeywordProcedure | Intrinsic::MakeStructType | Intrinsic::StructSet => Some(4),
+            Intrinsic::StructRef => Some(3),
+            Intrinsic::IsStruct => Some(2),
+            Intrinsic::MakeStruct => None,
+            Intrinsic::StructFields => Some(1),
             Intrinsic::ProcedureKeywords => Some(1),
             Intrinsic::IsChar | Intrinsic::CharToInteger | Intrinsic::IntegerToChar => Some(1),
             Intrinsic::CharEq | Intrinsic::CharLt | Intrinsic::CharGt | Intrinsic::CharLe | Intrinsic::CharGe => None,
@@ -885,6 +907,9 @@ impl Intrinsic {
                 | ErrorObjectMessage
                 | ErrorObjectIrritants
                 | ErrorObjectKind
+                | MakeStructType
+                | MakeStruct
+                | StructFields
         )
     }
 
@@ -932,6 +957,46 @@ impl Intrinsic {
             Cdddar => (true, Some(Cdddr)),
             Cddddr => (false, Some(Cdddr)),
             _ => return None,
+        })
+    }
+
+    /// Runs one of the struct procedures, on the `args` values `arg` reads.
+    #[inline(never)]
+    fn structs<'gc>(self, mc: &Mutation<'gc>, arg: impl Fn(usize) -> Value<'gc>, args: usize, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
+        let boolean = |b: bool| if b { Value::TRUE } else { Value::FALSE };
+        Ok(match self {
+            Intrinsic::MakeStructType => made(mc, fuel, Value::object(mc, structs::make_type(mc, arg(0), arg(1), arg(2), arg(3))?)),
+            Intrinsic::MakeStruct if args == 0 => return Err(Fault::Arity),
+            Intrinsic::MakeStruct => {
+                let kind = structs::type_of(mc, arg(0))?;
+                made(mc, fuel, Value::object(mc, structs::make(mc, kind, (1..args).map(&arg))?))
+            }
+            Intrinsic::StructFields => {
+                let names = AnyVector::of(structs::type_of(mc, arg(0))?.names(mc)).ok_or(Fault::Malformed)?;
+                fuel.spend(names.len(mc) as u64 / equal::PER_FUEL)?;
+                let mut listed = ScratchVec::new(mc);
+                for i in 0..names.len(mc) {
+                    listed.push(names.get(mc, i).ok_or(Fault::Malformed)?)?;
+                }
+                made(mc, fuel, Pairs::new(mc).list(&listed)?)
+            }
+            Intrinsic::IsStruct => boolean(structs::of(mc, arg(0), structs::type_of(mc, arg(1))?).is_some()),
+            Intrinsic::StructRef | Intrinsic::StructSet => {
+                let kind = structs::type_of(mc, arg(1))?;
+                let fields = structs::of(mc, arg(0), kind).ok_or(Fault::WrongType)?.items(mc);
+                // A struct of the type has at least the type's fields.
+                let k = index(arg(2))?;
+                if k >= kind.fields(mc) as usize {
+                    return Err(Fault::OutOfRange);
+                }
+                if self == Intrinsic::StructRef {
+                    fields.get(k)
+                } else {
+                    fields.set(mc, k, arg(3));
+                    Value::VOID
+                }
+            }
+            _ => unreachable!("{self:?} isn't a struct procedure"),
         })
     }
 
@@ -1455,6 +1520,7 @@ impl Intrinsic {
             | Intrinsic::ImagPart
             | Intrinsic::Magnitude
             | Intrinsic::Angle => self.numeric(mc, arg, args, fuel)?,
+            Intrinsic::MakeStructType | Intrinsic::MakeStruct | Intrinsic::IsStruct | Intrinsic::StructRef | Intrinsic::StructSet | Intrinsic::StructFields => self.structs(mc, arg, args, fuel)?,
             Intrinsic::IsCharAlphabetic
             | Intrinsic::IsCharNumeric
             | Intrinsic::IsCharWhitespace

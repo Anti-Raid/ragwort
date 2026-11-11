@@ -146,6 +146,64 @@ fn keyword_procedures_are_called_across_languages() {
 }
 
 #[test]
+fn structs_are_used_across_modules() {
+    let mut arena = arena();
+    let shapes = "(provide (struct-out point) (struct-out session) origin)
+                  (struct point (x [y #:mutable]))
+                  (struct session (token) #:identity-eq?)
+                  (define origin (point 0 0))";
+    module_in(&mut arena, "shapes", &[(Scheme, shapes)]).unwrap().unwrap();
+    let user = "(require shapes)
+                (struct point3 point (z))
+                (define p (point3 1 2 3))
+                (set-point-y! p 20)
+                (define (first-of p) (point-x p))
+                (list p (first-of p) (point-y p) (point? origin) (point3? origin) (equal? origin (point 0 0)) (session-token (session 7)) (equal? (session 1) (session 1))
+                      struct:point (map point-x (list origin)))";
+    let expected = "(#(struct:point3 1 20 3) 1 20 #t #f #t 7 #f #<struct-type:point> (0))";
+    assert_eq!(module_in(&mut arena, "user", &[(Scheme, user)]), Ok(Ok(expected.into())));
+    // A struct's name stands for its type whatever it's required as, and with everything else.
+    let renamed = "(require (prefix-in s: shapes)) (struct p3 s:point (z)) (list (s:point-x (p3 1 2 3)) (s:point? (s:point 1 2)) (s:point? (p3 1 2 3)))";
+    assert_eq!(module_in(&mut arena, "renamed", &[(Scheme, renamed)]), Ok(Ok("(1 #t #t)".into())));
+    module_in(&mut arena, "all", &[(Scheme, "(provide (all-defined-out)) (struct pair2 (a b))")]).unwrap().unwrap();
+    let all = "(require all) (struct triple pair2 (c)) (list (pair2-b (triple 1 2 3)) (pair2? (pair2 1 2)))";
+    assert_eq!(module_in(&mut arena, "uses-all", &[(Scheme, all)]), Ok(Ok("(2 #t)".into())));
+    // What's exported is what the form defines, and no more.
+    let hidden = module_in(&mut arena, "hidden", &[(Scheme, "(require shapes) set-point-x!")]);
+    assert!(matches!(hidden, Err(Error::Expand(e)) if e.kind == ragwort_scheme::ExpandErrorKind::Unbound), "{hidden:?}");
+    let not_one = module_in(&mut arena, "not-one", &[(Scheme, "(provide (struct-out f)) (define (f) 1)")]);
+    assert!(matches!(not_one, Err(Error::Expand(e)) if e.kind == ragwort_scheme::ExpandErrorKind::NotDefined), "{not_one:?}");
+    // A call of another module's accessor reads the field itself, the type a constant.
+    let ops = arena.mutate(|mc| {
+        let (symbols, prelude) = (Symbols::of(mc.root(0)).unwrap(), mc.root(1).downcast::<Module>(mc).unwrap());
+        let session = SyntaxSession::new(mc, "(require shapes) (define (first-of p) (point-x p))").unwrap();
+        let files = [File { language: Scheme, session: &session }];
+        let loaded = load(mc, symbols, prelude, &Source { name: "reader", hosts: &[], files: &files, implicit: &[] }, &mut Registry).unwrap();
+        for thunk in loaded.thunks {
+            run(mc, thunk).unwrap();
+        }
+        let items = ragwort_vm::objects::ModuleFields::items(loaded.module, mc);
+        let closures = (0..items.len()).filter_map(|i| items.get(i).downcast::<ragwort_vm::objects::Closure>(mc));
+        let code = closures.map(|f| ragwort_vm::objects::ClosureFields::code(f, mc).unwrap());
+        code.map(|code| format!("{:?}", ragwort_vm::objects::BytecodeFields::ops(code, mc).unwrap())).collect::<Vec<_>>().join("\n")
+    });
+    assert!(ops.contains("StructRef") && !ops.split(|c: char| !c.is_alphanumeric()).any(|word| word == "Call" || word == "TailCall"), "{ops}");
+    // Either language defines structs the other uses, in one module or across them.
+    module_in(&mut arena, "native-shapes", &[(Native, "(%provide (struct-out pair2)) (%struct pair2 (a (b #:mutable)))")]).unwrap().unwrap();
+    let scheme = "(require native-shapes) (struct triple pair2 (c)) (define t (triple 1 2 3)) (set-pair2-b! t 20)
+                  (list (match t [(triple a b c) (list a b c)]) (struct-copy pair2 t [a 10]) (match (pair2 5 6) [(pair2 a _) a]))";
+    assert_eq!(module_in(&mut arena, "scheme-user", &[(Scheme, scheme)]), Ok(Ok("((1 20 3) #(struct:pair2 10 20) 5)".into())));
+    let mixed = [(Native, "(%struct cell (v))"), (Scheme, "(struct labelled cell (name)) (define (unwrap c) (match c [(cell v) v])) (unwrap (labelled 4 'four))")];
+    assert_eq!(module_in(&mut arena, "mixed", &mixed), Ok(Ok("4".into())));
+    let native_user = "(%require shapes) (%struct tagged point (tag)) (%app point-y (%app tagged 1 2 'tag))";
+    assert_eq!(module_in(&mut arena, "native-user", &[(Native, native_user)]), Ok(Ok("2".into())));
+    // No language assigns what a struct form defines.
+    let native = module_in(&mut arena, "main", &[(Scheme, "(struct point (x))"), (Native, "(%set! point-x 1)")]);
+    assert!(matches!(native, Err(Error::Lower(e)) if e.kind == ragwort_native::LowerErrorKind::Immutable), "{native:?}");
+    assert_eq!(module_in(&mut arena, "main", &[(Scheme, "(struct point (x))"), (Native, "(%app point-x (%app point 4))")]), Ok(Ok("4".into())));
+}
+
+#[test]
 fn no_language_assigns_a_keyword_procedure() {
     // Scheme calls of it go to its core, so assigning it would leave them calling the old one.
     let mut arena = arena();

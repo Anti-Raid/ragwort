@@ -6,6 +6,11 @@
 //! `quasiquote`, `guard`, `syntax-rules` and `with-syntax` are macros written in Rust, which
 //! expand hygienically by sets of scopes, as the code's own do.
 //!
+//! `struct` defines a type of struct and its procedures, as Racket's `struct` does: see
+//! [`structs`]. A struct is written with its fields, and is `equal?` to another of its type with
+//! `equal?` fields, or only to itself if its type is declared `#:identity-eq?`. A type can have
+//! subtypes. `match` takes structs apart and `struct-copy` copies them.
+//!
 //! The code defines macros with `define-syntax`, `let-syntax` and `letrec-syntax`, as R6RS has
 //! them: a transformer is a procedure of the syntax of a use, which `syntax-case` takes apart
 //! and `syntax` makes, and the expander runs it in a machine as it goes; `quote-syntax` is the
@@ -32,6 +37,7 @@ mod expand;
 mod formals;
 mod matching;
 mod scope;
+mod structs;
 mod transformer;
 mod tree;
 
@@ -199,10 +205,12 @@ pub fn load<'gc>(
 ) -> Result<Loaded<'gc>, Error> {
     let mut expander = Expander::new(mc, symbols, prelude, name, &[], implicit)?;
     let mut tops = Vec::new();
+    let mut declared = Vec::new();
     for session in files {
         for node in Reader::new(mc, symbols, session)? {
             let first = u32::try_from(tops.len()).map_err(|_| OutOfMemory)?;
-            expander.declare(node?, first, &mut tops, resolver)?;
+            expander.declare(node?, first, &mut declared, resolver)?;
+            tops.append(&mut declared);
         }
     }
     expander.provide()?;

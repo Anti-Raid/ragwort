@@ -12,6 +12,7 @@ pub mod objects;
 mod op;
 mod prompts;
 mod read;
+pub mod structs;
 mod request;
 mod run;
 mod segments;

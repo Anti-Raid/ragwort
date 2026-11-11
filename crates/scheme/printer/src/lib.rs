@@ -30,6 +30,7 @@ use ragwort_types::syntax::{Abbreviation, Syntax, SyntaxKind};
 use ragwort_types::vector::{AnyVector, Vector};
 use ragwort_vm::Fault;
 use ragwort_vm::objects::{Closure, Condition, ConditionFields, Continuation, ExternalRef, KeywordProcedure, MultiValue, MultiValueFields, Tag, Task};
+use ragwort_vm::objects::{Struct, StructFields, StructType, StructTypeFields};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -124,7 +125,12 @@ enum Label {
 
 /// Whether `v` holds other values the printer writes.
 fn is_container<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> bool {
-    Pair::of(v).is_some() || AnyVector::of(v).is_some() || Syntax::of(v).is_some() || v.downcast::<MultiValue>(mc).is_some() || v.downcast::<Condition>(mc).is_some()
+    Pair::of(v).is_some()
+        || AnyVector::of(v).is_some()
+        || Syntax::of(v).is_some()
+        || v.downcast::<MultiValue>(mc).is_some()
+        || v.downcast::<Condition>(mc).is_some()
+        || v.downcast::<Struct>(mc).is_some()
 }
 
 /// The `i`th value `v` holds that's written, if it has one.
@@ -142,6 +148,10 @@ fn child<'gc>(mc: &Mutation<'gc>, v: Value<'gc>, i: usize) -> Option<Value<'gc>>
         let items = many.items(mc);
         return (i < items.len()).then(|| items.get(i));
     }
+    if let Some(made) = v.downcast::<Struct>(mc) {
+        let fields = made.items(mc);
+        return (i < fields.len()).then(|| fields.get(i));
+    }
     let condition = v.downcast::<Condition>(mc)?;
     if condition.fault(mc) != Some(&Fault::Error) {
         return None;
@@ -153,7 +163,7 @@ fn child<'gc>(mc: &Mutation<'gc>, v: Value<'gc>, i: usize) -> Option<Value<'gc>>
 /// as long, but for syntax, which is written as its datum, so the walk stops past `limit`.
 fn cycles<'gc>(mc: &Mutation<'gc>, root: Value<'gc>, limit: usize) -> Result<Map<Label>, PrintError> {
     let (mut on_path, mut labels) = (Map::default(), Map::default());
-    let mutable = |v: Value<'gc>| Vector::of(v).is_some();
+    let mutable = |v: Value<'gc>| Vector::of(v).is_some() || v.downcast::<Struct>(mc).is_some();
     if mutable(root) {
         on_path.insert(root.to_bits(), ());
     }
@@ -301,10 +311,28 @@ impl<'gc> Printer<'_, 'gc> {
             work.extend([Work::Text(">"), Work::Items(v, 0)]);
         } else if let Some(condition) = v.downcast::<Condition>(mc) {
             self.condition(condition, work)?;
+        } else if let Some(made) = v.downcast::<Struct>(mc) {
+            self.out.push_str("#(struct:");
+            self.type_name(made.kind(mc).map(|kind| kind.name(mc)));
+            if !made.items(mc).is_empty() {
+                self.out.push(' ');
+            }
+            work.extend([Work::Text(")"), Work::Items(v, 0)]);
+        } else if let Some(kind) = v.downcast::<StructType>(mc) {
+            self.out.push_str("#<struct-type:");
+            self.type_name(Some(kind.name(mc)));
+            self.out.push('>');
         } else {
             self.atom(v)?;
         }
         Ok(())
+    }
+
+    /// The name of a struct type, as it is.
+    fn type_name(&mut self, name: Option<Value<'gc>>) {
+        if let Some(name) = name.and_then(Symbol::of) {
+            let _ = write!(self.out, "{}", string::display(&self.strings, name.name(self.mc)));
+        }
     }
 
     fn syntax(&mut self, syntax: Syntax<'gc>, work: &mut Vec<Work<'gc>>) {

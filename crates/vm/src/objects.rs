@@ -133,6 +133,14 @@ objects! {
     /// What a `lambda` with keyword parameters makes: see [`crate::keyword`]. `keywords` are
     /// the ones it takes and `required` the ones it needs, as sorted lists.
     pub struct KeywordProcedure { plain: Value, core: Value, keywords: Value, required: Value }
+    /// A struct type, as `struct` makes one: see [`crate::structs`]. `name` is a symbol, `names`
+    /// an immutable vector of its fields' names, its supertype's first, `fields` how many there
+    /// are, and its items are its supertypes, the outermost first. If it's an `identity` one,
+    /// its structs are `equal?` only to themselves.
+    pub struct StructType { name: Value, names: Value, fields: u32, identity: bool } items Value
+    /// A struct: the type it was made as, and its fields. It's written with them, and `equal?`
+    /// to another of its type with `equal?` fields, unless its type is an identity one.
+    pub struct Struct { kind: Member<StructType> } items Value
     /// What a frame's code keeps past its registers, which `NewSpill` makes and `LoadSpill` and
     /// `StoreSpill` read and write. Each slot holds one value for one stretch of the code.
     pub struct Spill {} items Value

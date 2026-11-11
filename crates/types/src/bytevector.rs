@@ -2,9 +2,16 @@
 //! written to; an immutable one, such as a literal, can only be read. An external one's bytes
 //! the program running the arena made and gave it, a buffer of them if it's one that's
 //! written to. [`AnyBytevector`] reads any of them.
+//!
+//! External bytes are an [`ExternalBuffer`], for a bytevector that's only read, or an
+//! [`ExternalBufferMut`], for one that's written to. A type that's one promises what the arena
+//! relies on and can't check: that the bytes' number never changes, and for an
+//! [`ExternalBuffer`], that their values don't either.
 
 use std::borrow::Cow;
 use std::cell::{RefCell, RefMut};
+use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::gc::{Gc, Mutation, OutOfMemory, Slots, Value, slot};
 use crate::objects::{self, BytevectorFields, Data, ExternBytevectorFields, ExternMutBytevectorFields, ImmutableBytevectorFields};
@@ -98,6 +105,37 @@ impl<'gc> Bytevector<'gc> {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ImmutableBytevector<'gc>(Gc<'gc, objects::ImmutableBytevector>);
+
+/// Bytes kept outside the arena, for a bytevector that's only read: what gives them, the same
+/// ones each time.
+///
+/// A type that's one promises that the bytes never change while it lives, in number or in value,
+/// as a literal's don't: code that has read them may keep what it read. So one that shares them,
+/// as an `Arc<[u8]>` does, is one whose other holders can't write to them, and bytes something
+/// else can change, such as a file mapped into memory, aren't one. Breaking the promise makes
+/// the bytevector read wrongly; it reads no more bytes than there were when it was made.
+pub trait ExternalBuffer: AsRef<[u8]> + 'static {}
+
+/// A buffer kept outside the arena, for a bytevector that's written to: what gives its bytes,
+/// the same ones each time.
+///
+/// A type that's one promises that the number of bytes never changes while it lives, as a
+/// bytevector's length doesn't, and that nothing else writes them: the arena owns the buffer.
+pub trait ExternalBufferMut: AsMut<[u8]> + 'static {}
+
+impl ExternalBuffer for Vec<u8> {}
+impl ExternalBuffer for Box<[u8]> {}
+impl ExternalBuffer for Rc<[u8]> {}
+impl ExternalBuffer for Arc<[u8]> {}
+impl ExternalBuffer for &'static [u8] {}
+impl<const N: usize> ExternalBuffer for [u8; N] {}
+impl ExternalBuffer for String {}
+impl ExternalBuffer for &'static str {}
+impl ExternalBuffer for Cow<'static, [u8]> {}
+
+impl ExternalBufferMut for Vec<u8> {}
+impl ExternalBufferMut for Box<[u8]> {}
+impl<const N: usize> ExternalBufferMut for [u8; N] {}
 
 /// Fewer external bytes are copied: keeping them outside costs more than they do.
 const COPY_EXTERNAL: usize = 64;
@@ -299,22 +337,22 @@ impl<'a, 'gc> Bytevectors<'a, 'gc> {
 
     /// A bytevector of bytes kept outside the arena, such as a `Vec<u8>` or an `Arc<[u8]>`, which
     /// can't be written to. The arena is charged for them until nothing reaches it.
-    pub fn external(&self, bytes: impl AsRef<[u8]> + 'static) -> Result<AnyBytevector<'gc>, OutOfMemory> {
+    pub fn external(&self, bytes: impl ExternalBuffer) -> Result<AnyBytevector<'gc>, OutOfMemory> {
         let len = bytes.as_ref().len();
         if len < COPY_EXTERNAL {
             return self.immutable_from_slice(bytes.as_ref());
         }
-        let owner: Box<dyn AsRef<[u8]>> = Box::new(bytes);
+        let owner: Box<dyn ExternalBuffer> = Box::new(bytes);
         let v = objects::ExternBytevector::new(self.mc, len as u64, self.mc.frozen_owning(owner, len)?)?;
         Ok(AnyBytevector::External(ExternalBytevector(v)))
     }
 
-    /// A bytevector of a buffer kept outside the arena, such as a `Vec<u8>` or a `BytesMut`, which
-    /// can be written to, however short it is, and is as long as the buffer is now. The buffer is
-    /// the arena's from here on, which is charged for its bytes until nothing reaches it.
-    pub fn external_mutable(&self, mut buffer: impl AsMut<[u8]> + 'static) -> Result<Bytevector<'gc>, OutOfMemory> {
+    /// A bytevector of a buffer kept outside the arena, such as a `Vec<u8>`, which can be written
+    /// to, however short it is, and is as long as the buffer is now. The buffer is the arena's
+    /// from here on, which is charged for its bytes until nothing reaches it.
+    pub fn external_mutable(&self, mut buffer: impl ExternalBufferMut) -> Result<Bytevector<'gc>, OutOfMemory> {
         let len = buffer.as_mut().len();
-        let buffer: RefCell<Box<dyn AsMut<[u8]>>> = RefCell::new(Box::new(buffer));
+        let buffer: RefCell<Box<dyn ExternalBufferMut>> = RefCell::new(Box::new(buffer));
         let v = objects::ExternMutBytevector::new(self.mc, len as u64, self.mc.frozen_owning(buffer, len)?)?;
         Ok(Bytevector(Kept::Outside(v)))
     }

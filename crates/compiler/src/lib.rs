@@ -38,6 +38,7 @@ mod letrec;
 mod lower;
 pub mod module;
 pub mod steps;
+pub mod structs;
 
 #[cfg(test)]
 #[path = "tests/compile.rs"]

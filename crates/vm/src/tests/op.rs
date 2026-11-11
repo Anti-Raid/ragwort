@@ -485,6 +485,81 @@ fn shifts_and_bit_fields_are_charged_for_what_their_counts_make() {
     });
 }
 
+fn run<'gc>(mc: &Mutation<'gc>, op: Intrinsic, args: &[Value<'gc>]) -> Result<Value<'gc>, Fault> {
+    op.run(mc, args, &mut Fuel { run: u64::MAX, rest: 0 })
+}
+
+/// A struct is of its type and its type's supertypes, and `equal?` to one of its type with
+/// `equal?` fields, unless its type is an identity one, whose structs are `equal?` only to
+/// themselves.
+#[test]
+fn structs_are_of_their_types_and_equal_by_their_fields_or_themselves() {
+    let mut arena = Arena::new(1 << 20, 0);
+    arena.mutate(|mc| {
+        let (symbols, strings, pairs) = (ragwort_types::symbol::Symbols::of_arena(mc).unwrap(), Strings::new(mc), Pairs::new(mc));
+        let symbol = |name: &str| symbols.intern_str(&strings, name).unwrap().value(mc);
+        let names = |names: &[&str]| pairs.list(&names.iter().map(|n| symbol(n)).collect::<Vec<_>>()).unwrap();
+        let point = run(mc, Intrinsic::MakeStructType, &[symbol("point"), Value::FALSE, names(&["x", "y"]), Value::FALSE]).unwrap();
+        let point3 = run(mc, Intrinsic::MakeStructType, &[symbol("point3"), point, names(&["z"]), Value::FALSE]).unwrap();
+        let point4 = run(mc, Intrinsic::MakeStructType, &[symbol("point4"), point3, names(&["w"]), Value::FALSE]).unwrap();
+        let other = run(mc, Intrinsic::MakeStructType, &[symbol("point"), Value::FALSE, names(&["x", "y"]), Value::FALSE]).unwrap();
+        let p = run(mc, Intrinsic::MakeStruct, &[point, fix(1), fix(2)]).unwrap();
+        let q = run(mc, Intrinsic::MakeStruct, &[point4, fix(1), fix(2), fix(3), fix(4)]).unwrap();
+        // Each is of its type and those above it, and of no other.
+        for (v, kind, is) in [(p, point, true), (p, point3, false), (p, other, false), (q, point, true), (q, point3, true), (q, point4, true), (q, other, false), (fix(1), point, false)] {
+            assert_eq!(run(mc, Intrinsic::IsStruct, &[v, kind]), Ok(if is { Value::TRUE } else { Value::FALSE }));
+        }
+        assert_eq!(run(mc, Intrinsic::StructRef, &[q, point, fix(1)]), Ok(fix(2)));
+        assert_eq!(run(mc, Intrinsic::StructRef, &[q, point4, fix(3)]), Ok(fix(4)));
+        assert_eq!(run(mc, Intrinsic::StructRef, &[q, point, fix(2)]), Err(Fault::OutOfRange), "a field of a subtype");
+        assert_eq!(run(mc, Intrinsic::StructRef, &[p, point3, fix(0)]), Err(Fault::WrongType));
+        assert_eq!(run(mc, Intrinsic::StructRef, &[p, other, fix(0)]), Err(Fault::WrongType));
+        assert_eq!(run(mc, Intrinsic::StructRef, &[p, p, fix(0)]), Err(Fault::WrongType));
+        assert_eq!(run(mc, Intrinsic::StructSet, &[q, point3, fix(2), fix(30)]), Ok(Value::VOID));
+        assert_eq!(run(mc, Intrinsic::StructRef, &[q, point4, fix(2)]), Ok(fix(30)));
+        assert_eq!(run(mc, Intrinsic::MakeStruct, &[point, fix(1)]), Err(Fault::Arity));
+        assert_eq!(run(mc, Intrinsic::MakeStruct, &[point3, fix(1), fix(2), fix(3), fix(4)]), Err(Fault::Arity));
+        assert_eq!(run(mc, Intrinsic::MakeStruct, &[fix(1), fix(1)]), Err(Fault::WrongType));
+        assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol("bad"), fix(1), Value::NIL, Value::FALSE]), Err(Fault::WrongType));
+        assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol("bad"), Value::FALSE, pairs.list(&[fix(1)]).unwrap(), Value::FALSE]), Err(Fault::WrongType));
+        let same = run(mc, Intrinsic::MakeStruct, &[point, fix(1), pairs.list(&[fix(2)]).unwrap()]).unwrap();
+        let alike = run(mc, Intrinsic::MakeStruct, &[point, fix(1), pairs.list(&[fix(2)]).unwrap()]).unwrap();
+        let elsewhere = run(mc, Intrinsic::MakeStruct, &[other, fix(1), pairs.list(&[fix(2)]).unwrap()]).unwrap();
+        let up = run(mc, Intrinsic::MakeStruct, &[point3, fix(1), pairs.list(&[fix(2)]).unwrap(), fix(3)]).unwrap();
+        assert_eq!(run(mc, Intrinsic::Equal, &[same, alike]), Ok(Value::TRUE));
+        assert_eq!(run(mc, Intrinsic::Eqv, &[same, alike]), Ok(Value::FALSE));
+        assert_eq!(run(mc, Intrinsic::Equal, &[same, p]), Ok(Value::FALSE));
+        assert_eq!(run(mc, Intrinsic::Equal, &[same, elsewhere]), Ok(Value::FALSE), "another type of the same name");
+        assert_eq!(run(mc, Intrinsic::Equal, &[same, up]), Ok(Value::FALSE), "a subtype");
+        // A struct that holds itself is compared without end otherwise.
+        let (a, b) = (run(mc, Intrinsic::MakeStruct, &[point, fix(1), fix(2)]).unwrap(), run(mc, Intrinsic::MakeStruct, &[point, fix(1), fix(2)]).unwrap());
+        run(mc, Intrinsic::StructSet, &[a, point, fix(1), a]).unwrap();
+        run(mc, Intrinsic::StructSet, &[b, point, fix(1), b]).unwrap();
+        assert_eq!(run(mc, Intrinsic::Equal, &[a, b]), Ok(Value::TRUE));
+
+        let listed = run(mc, Intrinsic::StructFields, &[point4]).unwrap();
+        assert_eq!(run(mc, Intrinsic::Equal, &[listed, names(&["x", "y", "z", "w"])]), Ok(Value::TRUE));
+        assert_eq!(run(mc, Intrinsic::StructFields, &[p]), Err(Fault::WrongType));
+
+        // An identity type's structs, and its subtypes', are `equal?` only to themselves.
+        let session = run(mc, Intrinsic::MakeStructType, &[symbol("session"), Value::FALSE, names(&["token", "user"]), Value::TRUE]).unwrap();
+        let admin = run(mc, Intrinsic::MakeStructType, &[symbol("admin"), session, names(&[]), Value::FALSE]).unwrap();
+        let (s, t) = (run(mc, Intrinsic::MakeStruct, &[session, fix(1), fix(2)]).unwrap(), run(mc, Intrinsic::MakeStruct, &[session, fix(1), fix(2)]).unwrap());
+        let (a, b) = (run(mc, Intrinsic::MakeStruct, &[admin, fix(1), fix(2)]).unwrap(), run(mc, Intrinsic::MakeStruct, &[admin, fix(1), fix(2)]).unwrap());
+        assert_eq!(run(mc, Intrinsic::IsStruct, &[s, session]), Ok(Value::TRUE));
+        assert_eq!(run(mc, Intrinsic::IsStruct, &[a, session]), Ok(Value::TRUE));
+        assert_eq!(run(mc, Intrinsic::IsStruct, &[p, session]), Ok(Value::FALSE));
+        assert_eq!(run(mc, Intrinsic::Equal, &[s, t]), Ok(Value::FALSE));
+        assert_eq!(run(mc, Intrinsic::Equal, &[s, s]), Ok(Value::TRUE));
+        assert_eq!(run(mc, Intrinsic::Equal, &[a, b]), Ok(Value::FALSE), "a subtype of an identity type");
+        assert_eq!(run(mc, Intrinsic::Equal, &[pairs.list(&[s]).unwrap(), pairs.list(&[s]).unwrap()]), Ok(Value::TRUE));
+        assert_eq!(run(mc, Intrinsic::Equal, &[pairs.list(&[s]).unwrap(), pairs.list(&[t]).unwrap()]), Ok(Value::FALSE));
+        assert_eq!(run(mc, Intrinsic::StructRef, &[s, session, fix(1)]), Ok(fix(2)));
+        assert_eq!(run(mc, Intrinsic::StructSet, &[s, session, fix(1), fix(9)]), Ok(Value::VOID));
+        assert_eq!(run(mc, Intrinsic::StructRef, &[s, session, fix(1)]), Ok(fix(9)));
+    });
+}
+
 /// A bytevector whose bytes the host owns reads like any other, and is written to if the
 /// host gave a buffer.
 #[test]

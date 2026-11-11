@@ -3,8 +3,9 @@
 use std::collections::{HashMap, HashSet};
 
 use ragwort_compiler::keyword::{self, CallShape, Fresh};
-use ragwort_compiler::module::{Binding, Filter, Import, ModuleBuilder, ModuleError, RequireSpec, Resolver, SpecError, Uninitialized};
+use ragwort_compiler::module::{Binding, Field, Filter, Import, ModuleBuilder, ModuleError, RequireSpec, Resolver, SpecError, Uninitialized};
 use ragwort_compiler::steps::{self, Step};
+use ragwort_compiler::structs::{self, Declared, Member};
 use ragwort_compiler::{Core, Lambda, Place, Prim, Var};
 use ragwort_types::Error;
 use ragwort_types::gc::{Mutation, OutOfMemory, Value};
@@ -13,7 +14,7 @@ use ragwort_types::string::{Strings, chars};
 use ragwort_types::symbol::{Keyword, Symbol, Symbols};
 use ragwort_types::vector::Vectors;
 use ragwort_types::syntax::{Abbreviation, Syntax, SyntaxKind};
-use ragwort_vm::{HostDef, Intrinsic, Read, Request};
+use ragwort_vm::{Fault, HostDef, Intrinsic, Read, Request};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LowerErrorKind {
@@ -30,7 +31,7 @@ pub enum LowerErrorKind {
     Conflict,
     /// A `%set!` of an import.
     Immutable,
-    /// A `%define`, `%require` or `%provide` that isn't at the top level.
+    /// A `%define`, `%struct`, `%require` or `%provide` that isn't at the top level.
     Definition,
     /// A module the resolver doesn't have, or one it gave that no [`ModuleBuilder`] built.
     Resolve,
@@ -87,6 +88,7 @@ enum Form {
     Letrec,
     Set,
     Define,
+    Struct,
     Require,
     Provide,
     Lambda,
@@ -96,7 +98,8 @@ enum Form {
     CallHost,
 }
 
-const FORMS: [(&str, Form); 14] = [
+const FORMS: [(&str, Form); 15] = [
+    ("%struct", Form::Struct),
     ("%quote", Form::Quote),
     ("%if", Form::If),
     ("%let", Form::Let),
@@ -123,6 +126,8 @@ pub struct Lowerer<'a, 'gc> {
     symbols: Symbols<'gc>,
     /// The `%provide`s, which name what the module defines anywhere.
     provides: Vec<Syntax<'gc>>,
+    /// The struct forms declared, by which top-level form each is, till they're lowered.
+    structs: HashMap<u32, Declared>,
     /// The top-level form being lowered, and the variable whose lambda it's in, if it's one.
     top: u32,
     defining: Option<u32>,
@@ -183,6 +188,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             strings: Strings::new(mc),
             symbols,
             provides: Vec::new(),
+            structs: HashMap::new(),
             top: 0,
             defining: None,
             forms,
@@ -198,10 +204,14 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
     /// Declares what top-level form `top`, `node`, defines, requires from `resolver` or provides.
     pub fn declare(&mut self, builder: &mut ModuleBuilder<'gc>, node: Syntax<'gc>, top: u32, resolver: &mut dyn Resolver<'gc>) -> Result<(), LowerError> {
         let items = match self.head(node) {
-            Some(Form::Define | Form::Require | Form::Provide) => self.list(node)?,
+            Some(Form::Define | Form::Struct | Form::Require | Form::Provide) => self.list(node)?,
             _ => return Ok(()),
         };
         match (self.head(node), &items[1..]) {
+            (Some(Form::Struct), parts) => {
+                let declared = self.declare_struct(builder, node, parts, top)?;
+                self.structs.insert(top, declared);
+            }
             (Some(Form::Define), &[name, value]) => {
                 self.name(name)?;
                 let slot = builder.define(name.datum(self.mc), top).map_err(|e| self.module_error(e, name))?;
@@ -242,6 +252,11 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         self.top = top;
         match self.head(node) {
             Some(Form::Require | Form::Provide) => Ok(None),
+            Some(Form::Struct) => {
+                let declared = self.structs.remove(&top).expect("a declared struct");
+                let (_, kind) = builder.struct_def(declared.constructor()).expect("a declared struct");
+                Ok(Some(declared.define(kind, self)))
+            }
             Some(Form::Define) => {
                 let items = self.list(node)?;
                 let &[_, name, value] = items.as_slice() else { return Err(self.error(LowerErrorKind::BadShape, node)) };
@@ -258,6 +273,98 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             }
             _ => self.expr(builder, node).map(Some),
         }
+    }
+
+    /// Declares what a `%struct` form defines: `node`, whose parts after its head are `parts`,
+    /// the module's top-level form `top`. It's written
+    /// as Scheme's `struct` is, and defines what that does, as [`structs`] says: `(%struct name
+    /// (field ...) option ...)`, with a supertype's name before the fields for a subtype of it.
+    fn declare_struct(&mut self, builder: &mut ModuleBuilder<'gc>, node: Syntax<'gc>, parts: &[Syntax<'gc>], top: u32) -> Result<Declared, LowerError> {
+        let bad = LowerErrorKind::BadShape;
+        let is_name = |node: &Syntax<'gc>| node.kind(self.mc) == Some(SyntaxKind::Identifier);
+        let option = |node: Syntax<'gc>| self.keyword(node).map(|k| chars(&self.strings, k.symbol(self.mc).name(self.mc)).collect::<String>());
+        let mut rest = parts.iter().copied();
+        let Some(name) = rest.next().filter(is_name) else { return Err(self.error(bad, node)) };
+        let Some(mut next) = rest.next() else { return Err(self.error(bad, node)) };
+        let mut parent = None;
+        if is_name(&next) {
+            parent = Some(next);
+            next = rest.next().ok_or_else(|| self.error(bad, node))?;
+        }
+        let mut own = Vec::new();
+        for spec in self.list(next)? {
+            if is_name(&spec) {
+                own.push((spec, false));
+                continue;
+            }
+            match *self.list(spec)?.as_slice() {
+                [id] if is_name(&id) => own.push((id, false)),
+                [id, mutable] if is_name(&id) && option(mutable).as_deref() == Some("mutable") => own.push((id, true)),
+                _ => return Err(self.error(bad, spec)),
+            }
+        }
+        self.distinct(&own.iter().map(|&(id, _)| id).collect::<Vec<_>>())?;
+        let (mut constructors, mut identity) = (Vec::new(), false);
+        while let Some(at) = rest.next() {
+            match option(at).as_deref() {
+                Some("mutable") => own.iter_mut().for_each(|(_, mutable)| *mutable = true),
+                Some("identity-eq?") => identity = true,
+                Some("transparent") => {}
+                Some("constructor-name" | "extra-constructor-name") => {
+                    let Some(id) = rest.next().filter(is_name) else { return Err(self.error(bad, at)) };
+                    constructors.push(id);
+                }
+                _ => return Err(self.error(bad, at)),
+            }
+        }
+        // The supertype is a struct type the module defines or requires, by its constructor.
+        let (above, mut fields) = match parent {
+            None => (Value::FALSE, Vec::new()),
+            Some(id) => {
+                let def = match builder.binding(id.datum(self.mc)) {
+                    Some(Binding::Slot(slot)) => builder.struct_def(slot).map(|(def, kind)| (def.clone(), kind)),
+                    Some(Binding::Import(import)) => import.struct_def(self.mc).map(|(def, kind)| (def.clone(), kind)),
+                    None => None,
+                };
+                match def {
+                    Some((def, kind)) => (kind, def.fields.into_vec()),
+                    None => return Err(self.error(bad, id)),
+                }
+            }
+        };
+        let inherited = fields.len();
+        for &(id, mutable) in &own {
+            fields.push(Field { name: self.identifier(id)?.into(), mutable });
+        }
+        let named = structs::members(&self.identifier(name)?, &fields[inherited..], inherited).ok_or_else(|| self.error(OutOfMemory, node))?;
+        let names: Vec<Value<'gc>> = own.iter().map(|&(id, _)| id.datum(self.mc)).collect();
+        let names = self.pairs.list(&names).map_err(|e| self.error(e, node))?;
+        let kind = structs::make_type(self.mc, name.datum(self.mc), above, names, identity).map_err(|fault| match fault {
+            Fault::OutOfMemory => self.error(OutOfMemory, node),
+            _ => self.error(bad, node),
+        })?;
+        let mut members = Vec::with_capacity(named.len() + constructors.len());
+        for (text, member) in named {
+            let symbol = self.symbols.intern_str(&self.strings, &text).map_err(|e| self.error(e, node))?;
+            members.push((builder.define(symbol.value(self.mc), top).map_err(|e| self.module_error(e, name))?, member));
+            // The constructors of other names go after the one named for the type.
+            if member == Member::Make {
+                for &id in &constructors {
+                    members.push((builder.define(id.datum(self.mc), top).map_err(|e| self.module_error(e, id))?, Member::Make));
+                }
+            }
+        }
+        Declared::new(builder, kind, fields, members).ok_or_else(|| self.error(OutOfMemory, node))
+    }
+
+    /// A call of the procedure of a struct type that `f` names, if it names one of the module's
+    /// that takes `n` arguments: one that does what the procedure does.
+    fn struct_call(&self, builder: &ModuleBuilder<'gc>, f: Syntax<'gc>, n: usize) -> Option<structs::Call<'gc>> {
+        if f.kind(self.mc) != Some(SyntaxKind::Identifier) {
+            return None;
+        }
+        let Ok(Err(Binding::Slot(slot))) = self.resolve(builder, f) else { return None };
+        builder.struct_call(slot, self.top).filter(|call| call.takes(n))
     }
 
     /// Sets the keyword procedure `procedure`, which `value` makes, and its core, `core`.
@@ -417,6 +524,11 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         let word = if head.kind(self.mc) == Some(SyntaxKind::Identifier) { self.text(head) } else { None };
         match (word.as_deref(), args) {
             (Some("all-defined-out"), []) => builder.provide_all(self.mc).map_err(|e| self.module_error(e, spec)),
+            (Some("struct-out"), &[name]) => {
+                self.name(name)?;
+                let Some(Binding::Slot(constructor)) = builder.binding(name.datum(self.mc)) else { return Err(self.error(LowerErrorKind::NotDefined, name)) };
+                builder.provide_struct(self.mc, constructor).map_err(|e| self.module_error(e, name))
+            }
             (Some("rename-out"), renames) => {
                 for &rename in renames {
                     let (_, external) = self.pair_of_names(rename)?;
@@ -716,18 +828,19 @@ impl<'s, 'a, 'gc> Lowering<'s, 'a, 'gc> {
                 let place = l.assigned(self.builder, name)?;
                 Ok(Step::then(value, move |_, value| Ok(Step::Done(Core::Set(place, Box::new(value))))))
             }
-            (Form::Define | Form::Require | Form::Provide, _) => Err(l.error(LowerErrorKind::Definition, node)),
+            (Form::Define | Form::Struct | Form::Require | Form::Provide, _) => Err(l.error(LowerErrorKind::Definition, node)),
             (Form::Lambda, &[formals, ref body @ ..]) => self.lambda(node, formals, body.to_vec(), false),
             (Form::App, &[f, ref args @ ..]) if args.iter().any(|&a| l.keyword(a).is_some()) || l.keyword_def(self.builder, f).is_some() => {
                 self.keyword_call(node, f, args.to_vec())
             }
-            (Form::App, &[f, ref args @ ..]) => match l.import(self.builder, f) {
-                Some(import) => steps::all(args.to_vec(), move |s: &mut Self, args| {
+            (Form::App, &[f, ref args @ ..]) => match (l.struct_call(self.builder, f, args.len()), l.import(self.builder, f)) {
+                (Some(call), _) => steps::all(args.to_vec(), move |s: &mut Self, args| Ok(Step::Done(call.core(args, &mut || s.l.fresh())))),
+                (None, Some(import)) => steps::all(args.to_vec(), move |s: &mut Self, args| {
                     let mc = s.l.mc;
                     let call = import.call(mc, args, &mut || s.l.fresh());
                     call.map(Step::Done).map_err(|Uninitialized| s.l.error(LowerErrorKind::Uninitialized, f))
                 }),
-                None => {
+                (None, None) => {
                     let args = args.to_vec();
                     Ok(Step::then(f, move |_: &mut Self, f| steps::all(args, move |_, args| Ok(Step::Done(Core::App(Box::new(f), args))))))
                 }

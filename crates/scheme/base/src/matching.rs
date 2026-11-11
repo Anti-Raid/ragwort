@@ -13,6 +13,8 @@
 //!   with a tail matching `rest`. A list's last pattern can be followed by `...`, which matches
 //!   the rest of the list, each element matching it, and binds each of its variables to a list.
 //! - `(vector p ...)` a vector of as many elements.
+//! - `(name p ...)`, `name` a struct's, a struct of its type, or of a subtype of it, each field
+//!   matching its `p`: all its fields, its supertype's first.
 //! - `(? pred p ...)` what `pred` is true of and each `p` matches; `(and p ...)` what each `p`
 //!   matches; `(or p ...)` what any does, each binding the same variables; `(not p ...)` what
 //!   none does, binding nothing.
@@ -35,6 +37,7 @@ use ragwort_types::symbol::Symbol;
 
 use crate::expand::{Aux, Expander};
 use crate::scope::Set;
+use crate::structs::Kind;
 use crate::tree::{Stx, View};
 use crate::{ExpandError, ExpandErrorKind};
 
@@ -53,14 +56,23 @@ enum Shape {
     List,
     Vector,
     Length(usize),
+    /// A struct of the type that's this one of the matcher's.
+    Struct(usize),
 }
 
-/// A part of a pair or vector.
+/// A part of a pair or vector, or a field of a struct of one of the matcher's types.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Part {
     Car,
     Cdr,
     Item(usize),
+    Field(usize, usize),
+}
+
+/// A struct type patterns name: an expression for it, and what tells it from the others.
+struct Named<'gc> {
+    kind: Stx,
+    key: Result<Value<'gc>, ragwort_compiler::Var>,
 }
 
 /// What matching a pattern does, in order.
@@ -115,6 +127,7 @@ struct Matcher<'gc> {
     temps: u32,
     parts: HashMap<(u32, Part), Temp>,
     seen: Vec<Seen<'gc>>,
+    structs: Vec<Named<'gc>>,
 }
 
 /// A pattern variable: its identifier, name and scopes, and what it's bound to.
@@ -210,7 +223,7 @@ impl<'gc> Expander<'_, 'gc> {
     /// `(let ((x e)) (let ((none (lambda () (error ...)))) clauses))`, the clauses as
     /// [`Matching::tries`] makes them.
     pub(crate) fn match_form(&mut self, stx: Stx, e: Stx, clauses: &[Stx]) -> Result<Stx, ExpandError> {
-        let m = Matcher { at: stx, temps: 0, parts: HashMap::new(), seen: Vec::new() };
+        let m = Matcher { at: stx, temps: 0, parts: HashMap::new(), seen: Vec::new(), structs: Vec::new() };
         Matching { ex: self, m, out: Vec::new() }.form(stx, e, clauses)
     }
 }
@@ -456,7 +469,26 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
             }
             ("==", &[v]) => Step::Test(self.ex.build(p, "equal?", &[&[v, x.stx]])?),
             ("==", &[v, same]) => Step::Test(self.ex.list(&[same, v, x.stx], p)?),
-            _ => return bad(self, p),
+            _ => match self.ex.struct_info(items[0])? {
+                Some(info) if info.fields.len() == args.len() => {
+                    let key = match info.kind {
+                        Kind::Constant(kind) => Ok(kind),
+                        Kind::Local(var) => Err(var),
+                    };
+                    let known = self.m.structs.iter().position(|named| named.key == key);
+                    let of = match known {
+                        Some(of) => of,
+                        None => {
+                            let kind = self.ex.struct_type(&info, p)?;
+                            self.m.structs.push(Named { kind, key });
+                            self.m.structs.len() - 1
+                        }
+                    };
+                    self.push(Step::Is(Shape::Struct(of), x));
+                    return self.field_pattern(x, of, args.to_vec(), 0);
+                }
+                _ => return bad(self, p),
+            },
         };
         self.push(step);
         Ok(Next::Done(()))
@@ -466,6 +498,17 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
     fn each_pattern(&mut self, x: Temp, pats: Vec<Stx>, i: usize) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
         let Some(&pat) = pats.get(i) else { return Ok(Next::Done(())) };
         Ok(Next::then((x, pat), move |s: &mut Self, ()| s.each_pattern(x, pats, i + 1)))
+    }
+
+    /// Matches the fields from `i` on of `x`, a struct of the matcher's type `of`, against `pats`.
+    fn field_pattern(&mut self, x: Temp, of: usize, pats: Vec<Stx>, i: usize) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
+        let Some(&pat) = pats.get(i) else { return Ok(Next::Done(())) };
+        if self.ex.is_aux(pat, Aux::Ellipsis)? {
+            return Err(self.ex.error(ExpandErrorKind::Unsupported, pat));
+        }
+        let field = self.part(x, Part::Field(of, i))?;
+        self.push(Step::Get(field, Part::Field(of, i), x));
+        Ok(Next::then((field, pat), move |s: &mut Self, ()| s.field_pattern(x, of, pats, i + 1)))
     }
 
     /// Matches the items of the vector `x` from `i` on against `pats`.
@@ -611,6 +654,10 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
                         let len = self.ex.build(at, "vector-length", &[&[x.stx]])?;
                         self.ex.build(at, "eqv?", &[&[len, n]])?
                     }
+                    Shape::Struct(of) => {
+                        let kind = self.m.structs[of].kind;
+                        self.ex.build(at, "struct?", &[&[x.stx, kind]])?
+                    }
                 };
                 Next::then(rest, move |s: &mut Self, rest| Ok(Next::Done(s.ex.build(at, "if", &[&[test, rest, fail]])?)))
             }
@@ -621,6 +668,11 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
                     Part::Item(i) => {
                         let k = self.ex.value(fixnum(self, i)?, at)?;
                         self.ex.build(at, "vector-ref", &[&[x.stx, k]])?
+                    }
+                    Part::Field(of, i) => {
+                        let kind = self.m.structs[of].kind;
+                        let k = self.ex.value(fixnum(self, i)?, at)?;
+                        self.ex.build(at, "struct-ref", &[&[x.stx, kind, k]])?
                     }
                 };
                 Next::then(rest, move |s: &mut Self, rest| Ok(Next::Done(s.ex.with_temp(at, temp.stx, value, rest)?)))

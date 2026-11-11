@@ -757,6 +757,170 @@ fn numbers_past_arithmetic() {
 }
 
 #[test]
+fn structs() {
+    let point = "(struct point (x y))";
+    let made = format!("{point} (define p (point 1 2)) (list (point? p) (point? 5) (point-x p) (point-y p) p struct:point)");
+    assert_eq!(eval(&made), "(#t #f 1 2 #(struct:point 1 2) #<struct-type:point>)");
+    assert_eq!(eval(&format!("{point} (list (equal? (point 1 '(2)) (point 1 '(2))) (eq? (point 1 2) (point 1 2)) (equal? (point 1 2) (point 1 3)))")), "(#t #f #f)");
+    // The procedures are values too, and a call that doesn't fit one goes to it.
+    assert_eq!(eval(&format!("{point} (list (map point-x (list (point 1 2) (point 3 4))) (apply point '(5 6)) (procedure? point?))")), "((1 3) #(struct:point 5 6) #t)");
+    assert_eq!(eval_in(&mut arena(), &format!("{point} (point 1)")), Ok(Err(Fault::Arity)));
+    assert_eq!(eval_in(&mut arena(), &format!("{point} (point-x 1 2)")), Ok(Err(Fault::Arity)));
+    assert_eq!(eval_in(&mut arena(), &format!("{point} (point-x 5)")), Ok(Err(Fault::WrongType)));
+    assert_eq!(eval_in(&mut arena(), &format!("{point} (point-x (vector 1 2))")), Ok(Err(Fault::WrongType)));
+    // Code before the form calls what it defines once the form has run, and not before, as it
+    // can't refer to it before.
+    assert_eq!(eval(&format!("(define (norm p) (+ (point-x p) (point-y p))) {point} (norm (point 3 4))")), "7");
+    for early in ["(point 1 2)", "(point-x 5)", "(point? 5)", "point", "struct:point"] {
+        assert_eq!(eval_in(&mut arena(), &format!("(define (f) {early}) (define early (f)) {point}")), Ok(Err(Fault::Unbound)), "{early}");
+    }
+    assert_eq!(eval_in(&mut arena(), &format!("(point 1 2) {point}")), Ok(Err(Fault::Unbound)));
+    assert_eq!(eval_in(&mut arena(), "(define (f) (set-cell-v! 1 2)) (define early (f)) (struct cell ([v #:mutable]))"), Ok(Err(Fault::Unbound)));
+    assert_eq!(eval("(struct unit ()) (list (unit) (unit? (unit)) (equal? (unit) (unit)))"), "(#(struct:unit) #t #t)");
+
+    let mutable = "(struct counter (n) #:mutable) (define c (counter 0)) (set-counter-n! c 5) (list (counter-n c) c)";
+    assert_eq!(eval(mutable), "(5 #(struct:counter 5))");
+    let one = "(struct account (id [balance #:mutable]) #:transparent) (define a (account 1 10)) (set-account-balance! a 20) (account-balance a)";
+    assert_eq!(eval(one), "20");
+    assert_eq!(error("(struct account (id [balance #:mutable])) (set-account-id! 1 2)"), (ExpandErrorKind::Unbound, "set-account-id!"));
+    let named = "(struct pt (x) #:constructor-name make-pt #:extra-constructor-name new-pt) (list (pt-x (make-pt 1)) (new-pt 2) (pt 3))";
+    assert_eq!(eval(named), "(1 #(struct:pt 2) #(struct:pt 3))");
+
+    let sub = format!("{point} (struct point3 point (z)) (struct point4 point3 ([w #:mutable])) (define q (point4 1 2 3 4)) (set-point4-w! q 40)
+                       (list q (point-x q) (point3-z q) (point4-w q) (point? q) (point3? q) (point4? (point3 1 2 3)) (point3? (point 1 2)) (equal? (point3 1 2 3) (point3 1 2 3)))");
+    assert_eq!(eval(&sub), "(#(struct:point4 1 2 3 40) 1 3 40 #t #t #f #f #t)");
+    assert_eq!(eval_in(&mut arena(), &format!("{point} (struct point3 point (z)) (point3-z (point 1 2))")), Ok(Err(Fault::WrongType)));
+
+    for (bad, at) in [
+        ("(struct point)", "(struct point)"),
+        ("(struct (point) (x))", "(struct (point) (x))"),
+        ("(struct point (x 1))", "1"),
+        ("(struct point ([x #:auto]))", "[x #:auto]"),
+        ("(struct point (x) #:prefab)", "#:prefab"),
+        ("(struct point (x) #:constructor-name)", "#:constructor-name"),
+        ("(struct point nope (x))", "nope"),
+        ("(define car2 car) (struct point car2 (x))", "car2"),
+        ("(struct point (x) #:identity-eq? #t)", "#t"),
+    ] {
+        assert_eq!(error(bad), (ExpandErrorKind::BadSyntax, at), "{bad}");
+    }
+    assert_eq!(error("(struct point (x x))"), (ExpandErrorKind::Duplicate, "x"));
+    assert_eq!(error("(struct point (x)) (define point? 1)").0, ExpandErrorKind::Duplicate);
+    assert_eq!(error("(struct point (x)) (set! point-x car)"), (ExpandErrorKind::Immutable, "point-x"));
+    assert_eq!(error("(struct point (x)) (set! struct:point 1)"), (ExpandErrorKind::Immutable, "struct:point"));
+    assert_eq!(error("(if 1 (struct point (x)) 2)"), (ExpandErrorKind::Definition, "(struct point (x))"));
+}
+
+#[test]
+fn structs_equal_only_to_themselves() {
+    let session = "(struct session (token [uses #:mutable]) #:identity-eq?)";
+    let made = format!("{session} (define s (session \"tok\" 0)) (set-session-uses! s 3)
+                        (list s (session? s) (session-token s) (session-uses s) (equal? s s) (equal? s (session \"tok\" 3)) (eqv? s s)
+                              (equal? (list s) (list s)) (equal? (list s) (list (session \"tok\" 3))))");
+    assert_eq!(eval(&made), r#"(#(struct:session "tok" 3) #t "tok" 3 #t #f #t #t #f)"#);
+    // A subtype of such a type is one too, and one of another type can be declared one.
+    let sub = format!("{session} (struct admin session (level)) (struct point (x)) (struct pinned point (y) #:identity-eq?)
+                       (list (equal? (admin 1 2 3) (admin 1 2 3)) (equal? (point 1) (point 1)) (equal? (pinned 1 2) (pinned 1 2))
+                             (let ((p (pinned 1 2))) (equal? p p)) (member (point 1) (list (point 2) (point 1))) (member (session 1 2) (list (session 1 2))))");
+    assert_eq!(eval(&sub), "(#f #t #f #t (#(struct:point 1)) #f)");
+    assert_eq!(eval("(define (f) (struct cell (v) #:identity-eq?) (define c (cell 7)) (list c (cell-v c) (equal? c (cell 7)) (equal? c c))) (f)"), "(#(struct:cell 7) 7 #f #t)");
+    // It's matched and copied as any other is.
+    assert_eq!(eval(&format!("{session} (match (session 1 2) [(session t u) (list t u)])")), "(1 2)");
+    assert_eq!(eval(&format!("{session} (define s (session 1 2)) (list (struct-copy session s [uses 9]) (equal? s (struct-copy session s)))")), "(#(struct:session 1 9) #f)");
+}
+
+#[test]
+fn structs_in_bodies() {
+    // Each time the body runs makes a new type.
+    let made = "(define (make) (struct cell (v)) (cons (cell 1) cell?))
+                (let ((a (make)) (b (make))) (list (car a) ((cdr a) (car a)) ((cdr b) (car a)) (equal? (car a) (car b))))";
+    assert_eq!(eval(made), "(#(struct:cell 1) #t #f #f)");
+    let local = "(let () (struct p (x [y #:mutable])) (define q (p 1 2)) (set-p-y! q 5) (list (p? q) (p-x q) (p-y q) (map p-x (list q)) (equal? q (p 1 5))))";
+    assert_eq!(eval(local), "(#t 1 5 (1) #t)");
+    let sub = "(struct point (x y))
+               (define (f) (struct point3 point (z)) (struct point4 point3 (w)) (define q (point4 1 2 3 4)) (list q (point-y q) (point3-z q) (point4-w q) (point? q) (point3? (point 1 2))))
+               (f)";
+    assert_eq!(eval(sub), "(#(struct:point4 1 2 3 4) 2 3 4 #t #f)");
+    assert_eq!(error("(define (f) (struct p (x)) (set! p-x car) 1)"), (ExpandErrorKind::Immutable, "p-x"));
+    assert_eq!(error("(define (f) (struct p (x)) (define p? 1) 1)").0, ExpandErrorKind::Duplicate);
+    assert_eq!(error("(define (f) (struct p (x))) (f)").0, ExpandErrorKind::NoExpression);
+}
+
+#[test]
+fn structs_are_matched_and_copied() {
+    let shapes = "(struct point (x y)) (struct point3 point (z)) (struct circle (center r)) (struct secret (v) #:identity-eq?)";
+    let area = format!("{shapes}
+        (define (describe v)
+          (match v
+            [(point3 x y z) (list 'point3 x y z)]
+            [(point 0 0) 'origin]
+            [(point x y) (list 'point x y)]
+            [(circle (point x _) r) (list 'circle x r)]
+            [(secret v) (list 'secret v)]
+            [_ 'other]))
+        (map describe (list (point 0 0) (point 1 2) (point3 1 2 3) (circle (point 5 6) 7) (secret 8) (circle 1 2) 9))");
+    assert_eq!(eval(&area), "(origin (point 1 2) (point3 1 2 3) (circle 5 7) (secret 8) other other)");
+    // A subtype's struct matches its supertype's pattern, by the supertype's fields.
+    assert_eq!(eval(&format!("{shapes} (match (point3 1 2 3) [(point x y) (list x y)])")), "(1 2)");
+    assert_eq!(eval("(define (f v) (struct cell (a)) (match (cell v) [(cell (list x y)) (+ x y)] [(cell x) x])) (list (f '(1 2)) (f 5))"), "(3 5)");
+    assert_eq!(error(&format!("{shapes} (match 1 [(point x) x])")), (ExpandErrorKind::BadSyntax, "(point x)"));
+    assert_eq!(error("(match 1 [(nope x) x])"), (ExpandErrorKind::BadSyntax, "(nope x)"));
+
+    let copied = format!("{shapes} (define p (point3 1 2 3))
+        (list (struct-copy point3 p [z 30]) (struct-copy point3 p [x 10] [z 30] [y 20]) (struct-copy point p [y 5]) (struct-copy point3 p) p
+              (secret-v (struct-copy secret (secret 1) [v 2])))");
+    assert_eq!(eval(&copied), "(#(struct:point3 1 2 30) #(struct:point3 10 20 30) #(struct:point 1 5) #(struct:point3 1 2 3) #(struct:point3 1 2 3) 2)");
+    assert_eq!(eval("(define (f) (struct cell (a b)) (struct-copy cell (cell 1 2) [b 3])) (f)"), "#(struct:cell 1 3)");
+    // The values are made in the order they're written, after the struct.
+    let order = "(struct p (a b)) (define log '()) (define (note x) (set! log (cons x log)) x)
+                 (struct-copy p (note (p 1 2)) [b (note 'b)] [a (note 'a)]) (reverse log)";
+    assert_eq!(eval(order), "(#(struct:p 1 2) b a)");
+    for wrong in ["(struct-copy point (point3 1 2 3) [x 1] [y 2])", "(struct-copy point3 (point 1 2) [z 1])", "(struct-copy point 5 [x 1] [y 2])", "(struct-copy point 5)"] {
+        let expected = if wrong.contains("(point3 1 2 3)") { Ok(Ok("#(struct:point 1 2)".to_string())) } else { Ok(Err(Fault::WrongType)) };
+        assert_eq!(eval_in(&mut arena(), &format!("{shapes} {wrong}")), expected, "{wrong}");
+    }
+    assert_eq!(error(&format!("{shapes} (struct-copy point (point 1 2) [z 1])")), (ExpandErrorKind::BadSyntax, "z"));
+    assert_eq!(error(&format!("{shapes} (struct-copy point (point 1 2) [x 1] [x 2])")).0, ExpandErrorKind::Duplicate);
+    assert_eq!(error(&format!("{shapes} (struct-copy car (point 1 2))")), (ExpandErrorKind::BadSyntax, "car"));
+}
+
+#[test]
+fn structs_by_their_types() {
+    let shapes = "(struct point (x y)) (struct point3 point (z)) (struct session (token user) #:identity-eq?)";
+    let fields = format!("{shapes} (list (struct-fields struct:point) (struct-fields struct:point3) (struct-fields struct:session))");
+    assert_eq!(eval(&fields), "((x y) (x y z) (token user))");
+    let used = format!("{shapes} (define q (point3 1 2 3)) (define s (session 'tok 'al))
+        (list (make-struct struct:point 1 2) (struct? q struct:point) (struct? (point 1 2) struct:point3) (struct-ref q struct:point 1) (struct-ref q struct:point3 2)
+              (make-struct struct:session 1 2) (struct? s struct:session) (struct? q struct:session) (struct-ref s struct:session 1))");
+    assert_eq!(eval(&used), "(#(struct:point 1 2) #t #f 2 3 #(struct:session 1 2) #t #f al)");
+    // A field is set by its type too, whether or not its form made it mutable.
+    let set = format!("{shapes} (define p (point 1 2)) (define q (point3 1 2 3)) (struct-set! p struct:point 1 20) (struct-set! q struct:point 0 10) (struct-set! q struct:point3 2 30) (list p q)");
+    assert_eq!(eval(&set), "(#(struct:point 1 20) #(struct:point3 10 2 30))");
+    // A field is found by its name's place among the type's.
+    let by_name = format!("{shapes}
+        (define (field s type name)
+          (let loop ((names (struct-fields type)) (k 0))
+            (if (eq? (car names) name) (struct-ref s type k) (loop (cdr names) (+ k 1)))))
+        (define (alist s type) (let loop ((names (struct-fields type)) (k 0)) (if (null? names) '() (cons (cons (car names) (struct-ref s type k)) (loop (cdr names) (+ k 1))))))
+        (list (field (point3 1 2 3) struct:point3 'z) (alist (point 7 8) struct:point))");
+    assert_eq!(eval(&by_name), "(3 ((x . 7) (y . 8)))");
+    assert_eq!(eval("(define (f) (struct cell (a b)) (list (struct-fields struct:cell) (struct-ref (cell 1 2) struct:cell 1))) (f)"), "((a b) 2)");
+    for (wrong, fault) in [
+        ("(struct-fields 5)", Fault::WrongType),
+        ("(struct-ref (point 1 2) struct:point 2)", Fault::OutOfRange),
+        ("(struct-set! (point 1 2) struct:point 2 0)", Fault::OutOfRange),
+        ("(struct-set! (point 1 2) struct:point3 0 0)", Fault::WrongType),
+        ("(struct-ref (point 1 2) struct:point3 0)", Fault::WrongType),
+        ("(struct-ref (point 1 2) struct:session 0)", Fault::WrongType),
+        ("(make-struct struct:point 1)", Fault::Arity),
+        ("(make-struct 5 1 2)", Fault::WrongType),
+        ("(struct? 1 2)", Fault::WrongType),
+    ] {
+        assert_eq!(eval_in(&mut arena(), &format!("{shapes} {wrong}")), Ok(Err(fault)), "{wrong}");
+    }
+}
+
+#[test]
 fn characters() {
     let kinds = "(list (char-alphabetic? #\\a) (char-alphabetic? #\\λ) (char-alphabetic? #\\1) (char-numeric? #\\7) (char-numeric? #\\٣)
                        (char-numeric? #\\a) (char-numeric? #\\½) (char-whitespace? #\\space) (char-whitespace? #\\x3000) (char-whitespace? #\\a)
