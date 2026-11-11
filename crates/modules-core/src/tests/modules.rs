@@ -119,6 +119,33 @@ fn a_modules_files_are_one_body_across_languages() {
 }
 
 #[test]
+fn keyword_procedures_are_called_across_languages() {
+    let mut arena = arena();
+    let native = "(%provide greet) (%define greet (%lambda (name #:greeting [greeting \"hi\"]) (%intrinsic string-append greeting \" \" name)))";
+    module_in(&mut arena, "lib", &[(Native, native)]).unwrap().unwrap();
+    let user = module_in(&mut arena, "user", &[(Scheme, "(require lib) (list (greet \"al\") (greet \"al\" #:greeting \"yo\"))")]);
+    assert_eq!(user, Ok(Ok("(\"hi al\" \"yo al\")".into())));
+    // In one module, each language calls the cores of the keyword procedures the other defines.
+    let scheme = "(define (f #:k [k 1]) k) (define (use) (g #:j 3))";
+    let native = "(%define g (%lambda (#:j j) (%app f #:k j))) (%app use)";
+    assert_eq!(module_in(&mut arena, "main", &[(Scheme, scheme), (Native, native)]), Ok(Ok("3".into())));
+    let ops = arena.mutate(|mc| {
+        let (symbols, prelude) = (Symbols::of(mc.root(0)).unwrap(), mc.root(1).downcast::<Module>(mc).unwrap());
+        let sessions = [SyntaxSession::new(mc, scheme).unwrap(), SyntaxSession::new(mc, native).unwrap()];
+        let files = [File { language: Scheme, session: &sessions[0] }, File { language: Native, session: &sessions[1] }];
+        let loaded = load(mc, symbols, prelude, &Source { name: "main", hosts: &[], files: &files, implicit: &[] }, &mut Registry).unwrap();
+        for thunk in loaded.thunks {
+            run(mc, thunk).unwrap();
+        }
+        let items = ragwort_vm::objects::ModuleFields::items(loaded.module, mc);
+        let closures = (0..items.len()).filter_map(|i| items.get(i).downcast::<ragwort_vm::objects::Closure>(mc));
+        let code = closures.map(|f| ragwort_vm::objects::ClosureFields::code(f, mc).unwrap());
+        code.map(|code| format!("{:?}", ragwort_vm::objects::BytecodeFields::ops(code, mc).unwrap())).collect::<Vec<_>>().join("\n")
+    });
+    assert!(ops.contains("Call") && !ops.contains("KeywordApply"), "{ops}");
+}
+
+#[test]
 fn no_language_assigns_a_keyword_procedure() {
     // Scheme calls of it go to its core, so assigning it would leave them calling the old one.
     let mut arena = arena();

@@ -2,14 +2,15 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ragwort_compiler::module::{Binding, Filter, ModuleBuilder, ModuleError, RequireSpec, Resolver, SpecError, Uninitialized};
+use ragwort_compiler::keyword::{self, CallShape, Fresh};
+use ragwort_compiler::module::{Binding, Filter, Import, ModuleBuilder, ModuleError, RequireSpec, Resolver, SpecError, Uninitialized};
 use ragwort_compiler::steps::{self, Step};
 use ragwort_compiler::{Core, Lambda, Place, Prim, Var};
 use ragwort_types::Error;
 use ragwort_types::gc::{Mutation, OutOfMemory, Value};
 use ragwort_types::pair::{Pair, Pairs};
 use ragwort_types::string::{Strings, chars};
-use ragwort_types::symbol::{Symbol, Symbols};
+use ragwort_types::symbol::{Keyword, Symbol, Symbols};
 use ragwort_types::vector::Vectors;
 use ragwort_types::syntax::{Abbreviation, Syntax, SyntaxKind};
 use ragwort_vm::{HostDef, Intrinsic, Read, Request};
@@ -139,6 +140,32 @@ pub struct Lowerer<'a, 'gc> {
     lambdas: u32,
 }
 
+/// A `%lambda`'s formals: each parameter, its name and its default, if it has one, as they're
+/// written, and the rest parameter.
+struct Formals<'gc> {
+    params: Vec<keyword::Param<'gc>>,
+    names: Vec<Syntax<'gc>>,
+    defaults: Vec<Option<Syntax<'gc>>>,
+    rest: Option<Syntax<'gc>>,
+}
+
+impl Formals<'_> {
+    fn is_plain(&self) -> bool {
+        self.params.iter().all(|p| p.keyword.is_none() && !p.optional)
+    }
+
+    fn has_keywords(&self) -> bool {
+        self.params.iter().any(|p| p.keyword.is_some())
+    }
+}
+
+/// Where the core of a keyword procedure a call knows of is.
+#[derive(Clone, Copy)]
+enum CoreAt<'gc> {
+    Slot(u32),
+    Import(Import<'gc>),
+}
+
 impl<'a, 'gc> Lowerer<'a, 'gc> {
     /// A lowerer of code that calls the host functions `hosts`.
     pub fn new(mc: &'a Mutation<'gc>, symbols: Symbols<'gc>, hosts: &'static [HostDef]) -> Result<Self, Error> {
@@ -175,9 +202,14 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             _ => return Ok(()),
         };
         match (self.head(node), &items[1..]) {
-            (Some(Form::Define), &[name, _]) => {
+            (Some(Form::Define), &[name, value]) => {
                 self.name(name)?;
-                builder.define(name.datum(self.mc), top).map_err(|e| self.module_error(e, name))?;
+                let slot = builder.define(name.datum(self.mc), top).map_err(|e| self.module_error(e, name))?;
+                if let Some(formals) = self.keyword_formals(value)? {
+                    let shape = CallShape::of(self.mc, &formals.params, formals.rest.is_some());
+                    let core = builder.define_private(name.datum(self.mc), top).map_err(|e| self.module_error(e, name))?;
+                    builder.keyword_core(slot, core, shape);
+                }
             }
             (Some(Form::Require), specs) => {
                 for &spec in specs {
@@ -214,6 +246,9 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
                 let items = self.list(node)?;
                 let &[_, name, value] = items.as_slice() else { return Err(self.error(LowerErrorKind::BadShape, node)) };
                 let Some(Binding::Slot(slot)) = builder.binding(name.datum(self.mc)) else { unreachable!("declared") };
+                if let Some((core, shape)) = builder.keyword_def(slot).map(|(core, shape)| (core, shape.clone())) {
+                    return self.keyword_definition(builder, slot, core, &shape, value).map(Some);
+                }
                 self.defining = (self.head(value) == Some(Form::Lambda)).then_some(slot);
                 let value = self.expr(builder, value);
                 self.defining = None;
@@ -223,6 +258,112 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             }
             _ => self.expr(builder, node).map(Some),
         }
+    }
+
+    /// Sets the keyword procedure `procedure`, which `value` makes, and its core, `core`.
+    fn keyword_definition(&mut self, builder: &mut ModuleBuilder<'gc>, procedure: u32, core: u32, shape: &CallShape<'gc>, value: Syntax<'gc>) -> Result<Core<'gc>, LowerError> {
+        self.defining = Some(core);
+        let mut root = true;
+        let lambda = steps::run(&mut Lowering { l: self, builder }, value, |s, node| {
+            if !std::mem::take(&mut root) {
+                return s.expr(node);
+            }
+            let items = s.l.list(node)?;
+            s.lambda(node, items[1], items[2..].to_vec(), true)
+        });
+        self.defining = None;
+        let lambda = lambda?;
+        builder.defined(core, &lambda);
+        let place = builder.place(core, self.top, None);
+        let value = keyword::procedure(self.mc, shape, Core::Ref(place), self).map_err(|e| self.error(e, value))?;
+        let core = Core::Set(Place::Slot { slot: core, checked: false }, Box::new(lambda));
+        let procedure = Core::Set(Place::Slot { slot: procedure, checked: false }, Box::new(value));
+        Ok(Core::Let(vec![(self.fresh(), core)], Box::new(procedure)))
+    }
+
+    /// The formals of `value`, if it's a `%lambda` with keyword parameters.
+    fn keyword_formals(&self, value: Syntax<'gc>) -> Result<Option<Formals<'gc>>, LowerError> {
+        if self.head(value) != Some(Form::Lambda) {
+            return Ok(None);
+        }
+        let items = self.list(value)?;
+        let Some(&formals) = items.get(1) else { return Ok(None) };
+        let formals = self.formals(formals)?;
+        Ok(formals.has_keywords().then_some(formals))
+    }
+
+    /// The parameters `formals` has: names, `[name default]`s and keywords before either, and a
+    /// rest parameter, as Racket's `lambda` takes them.
+    fn formals(&self, formals: Syntax<'gc>) -> Result<Formals<'gc>, LowerError> {
+        let mut f = Formals { params: Vec::new(), names: Vec::new(), defaults: Vec::new(), rest: None };
+        let items = match formals.kind(self.mc) {
+            Some(SyntaxKind::Identifier) => {
+                f.rest = Some(formals);
+                return Ok(f);
+            }
+            Some(SyntaxKind::List) => {
+                let mut elements = self.pairs.elements(formals.datum(self.mc));
+                let items = elements.by_ref().map(|v| self.syntax(v, formals)).collect::<Result<Vec<_>, _>>()?;
+                let rest = elements.rest();
+                f.rest = if rest == Value::NIL { None } else { Some(self.name(self.syntax(rest, formals)?)?) };
+                items
+            }
+            _ => return Err(self.error(LowerErrorKind::BadShape, formals)),
+        };
+        let mut items = items.into_iter();
+        while let Some(item) = items.next() {
+            let keyword = self.keyword(item);
+            let at = match keyword {
+                Some(_) => items.next().ok_or_else(|| self.error(LowerErrorKind::BadShape, item))?,
+                None => item,
+            };
+            let (name, default) = match at.kind(self.mc) {
+                Some(SyntaxKind::Identifier) => (at, None),
+                Some(SyntaxKind::List) => match self.list(at)?.as_slice() {
+                    &[name, default] => (self.name(name)?, Some(default)),
+                    _ => return Err(self.error(LowerErrorKind::BadShape, at)),
+                },
+                _ => return Err(self.error(LowerErrorKind::BadShape, at)),
+            };
+            if keyword.is_some() && f.params.iter().any(|p| p.keyword == keyword) {
+                return Err(self.error(LowerErrorKind::Duplicate, item));
+            }
+            // As in Racket, a required positional parameter can't follow an optional one.
+            if keyword.is_none() && default.is_none() && f.params.iter().any(|p| p.keyword.is_none() && p.optional) {
+                return Err(self.error(LowerErrorKind::BadShape, at));
+            }
+            f.params.push(keyword::Param { keyword, optional: default.is_some() });
+            f.names.push(name);
+            f.defaults.push(default);
+        }
+        Ok(f)
+    }
+
+    /// The keyword `node` is, if it's one.
+    fn keyword(&self, node: Syntax<'gc>) -> Option<Keyword<'gc>> {
+        if node.kind(self.mc) != Some(SyntaxKind::Literal) {
+            return None;
+        }
+        Keyword::of(node.datum(self.mc))
+    }
+
+    /// The core of the keyword procedure `f` names, and its shape, if it's one whose core is known:
+    /// one the module defines, or imports from a module that exports its core.
+    fn keyword_def(&self, builder: &ModuleBuilder<'gc>, f: Syntax<'gc>) -> Option<(CoreAt<'gc>, CallShape<'gc>)> {
+        if f.kind(self.mc) != Some(SyntaxKind::Identifier) {
+            return None;
+        }
+        match self.resolve(builder, f) {
+            Ok(Err(Binding::Slot(slot))) => builder.keyword_def(slot).map(|(core, shape)| (CoreAt::Slot(core), shape.clone())),
+            Ok(Err(Binding::Import(import))) => CallShape::of_import(self.mc, import).map(|(core, shape)| (CoreAt::Import(core), shape)),
+            _ => None,
+        }
+    }
+
+    fn lambda_id(&mut self) -> u32 {
+        let id = self.lambdas;
+        self.lambdas = self.lambdas.checked_add(1).expect("fewer than 2^32 lambdas");
+        id
     }
 
     /// The form `node` is, if it's a list that starts with one's name.
@@ -509,8 +650,32 @@ struct Lowering<'s, 'a, 'gc> {
     builder: &'s mut ModuleBuilder<'gc>,
 }
 
+impl Fresh for Lowerer<'_, '_> {
+    fn var(&mut self) -> Var {
+        self.fresh()
+    }
+
+    fn lambda(&mut self) -> u32 {
+        self.lambda_id()
+    }
+}
+
 /// What lowering an expression does next. Each call lowers an expression.
 type Lo<'s, 'a, 'gc> = Step<'s, Lowering<'s, 'a, 'gc>, Syntax<'gc>, Core<'gc>, LowerError>;
+
+/// A `%lambda` with optional or keyword parameters being lowered: a variable for each parameter,
+/// as its formals have them, the order it takes them in, and the defaults so far, each binding
+/// the parameter it's for, `next` the parameter after them. If it's `core_only`, it makes just the
+/// core of a keyword procedure.
+struct Optional<'gc> {
+    node: Syntax<'gc>,
+    formals: Formals<'gc>,
+    body: Vec<Syntax<'gc>>,
+    raws: Vec<Var>,
+    inits: Vec<(Var, Core<'gc>)>,
+    next: usize,
+    core_only: bool,
+}
 
 /// A `%let*` being lowered: the bindings left, and the names bound so far, each with its `%let`.
 struct Sequential<'gc> {
@@ -552,7 +717,10 @@ impl<'s, 'a, 'gc> Lowering<'s, 'a, 'gc> {
                 Ok(Step::then(value, move |_, value| Ok(Step::Done(Core::Set(place, Box::new(value))))))
             }
             (Form::Define | Form::Require | Form::Provide, _) => Err(l.error(LowerErrorKind::Definition, node)),
-            (Form::Lambda, &[formals, ref body @ ..]) => self.lambda(node, formals, body.to_vec()),
+            (Form::Lambda, &[formals, ref body @ ..]) => self.lambda(node, formals, body.to_vec(), false),
+            (Form::App, &[f, ref args @ ..]) if args.iter().any(|&a| l.keyword(a).is_some()) || l.keyword_def(self.builder, f).is_some() => {
+                self.keyword_call(node, f, args.to_vec())
+            }
             (Form::App, &[f, ref args @ ..]) => match l.import(self.builder, f) {
                 Some(import) => steps::all(args.to_vec(), move |s: &mut Self, args| {
                     let mc = s.l.mc;
@@ -627,32 +795,128 @@ impl<'s, 'a, 'gc> Lowering<'s, 'a, 'gc> {
         }))
     }
 
-    fn lambda(&mut self, node: Syntax<'gc>, formals: Syntax<'gc>, body: Vec<Syntax<'gc>>) -> Result<Lo<'s, 'a, 'gc>, LowerError> {
+    /// A `%lambda`, or if `core_only`, the core of the keyword procedure it makes.
+    fn lambda(&mut self, node: Syntax<'gc>, formals: Syntax<'gc>, body: Vec<Syntax<'gc>>, core_only: bool) -> Result<Lo<'s, 'a, 'gc>, LowerError> {
         let l = &mut *self.l;
         if body.is_empty() {
             return Err(l.error(LowerErrorKind::BadShape, node));
         }
-        let (mut names, rest) = match formals.kind(l.mc) {
-            Some(SyntaxKind::Identifier) => (Vec::new(), Some(formals)),
-            Some(SyntaxKind::List) => {
-                let mut elements = l.pairs.elements(formals.datum(l.mc));
-                let names = elements.by_ref().map(|v| l.syntax(v, formals).and_then(|n| l.name(n))).collect::<Result<Vec<_>, _>>()?;
-                let rest = elements.rest();
-                let rest = if rest == Value::NIL { None } else { Some(l.name(l.syntax(rest, formals)?)?) };
-                (names, rest)
-            }
-            _ => return Err(l.error(LowerErrorKind::BadShape, formals)),
-        };
-        let params = names.len();
-        names.extend(rest);
+        let formals = l.formals(formals)?;
+        let mut names = formals.names.clone();
+        names.extend(formals.rest);
         l.distinct(&names)?;
+        if !formals.is_plain() {
+            let raws = formals.names.iter().map(|_| l.fresh()).collect();
+            return self.defaults(Optional { node, formals, body, raws, inits: Vec::new(), next: 0, core_only });
+        }
+        let params = formals.names.len();
         let mut vars = l.bind(&names);
         self.body(body, move |s, body| {
             s.l.unbind(&names);
             let rest = (vars.len() > params).then(|| vars.pop()).flatten();
-            let id = s.l.lambdas;
-            s.l.lambdas = s.l.lambdas.checked_add(1).expect("fewer than 2^32 lambdas");
+            let id = s.l.lambda_id();
             Ok(Step::Done(Core::Lambda(Lambda { id, params: vars, optional: 0, rest, body: Box::new(body) })))
+        })
+    }
+
+    /// Binds the rest of an optional lambda's parameters, each with a default after what that
+    /// lowers to, which sees the parameters before it, then lowers its body.
+    fn defaults(&mut self, mut f: Optional<'gc>) -> Result<Lo<'s, 'a, 'gc>, LowerError> {
+        while let Some(&name) = f.formals.names.get(f.next) {
+            let (raw, default) = (f.raws[f.next], f.formals.defaults[f.next]);
+            f.next += 1;
+            let Some(default) = default else {
+                self.l.scope.entry(name.datum(self.l.mc).to_bits()).or_default().push(raw);
+                continue;
+            };
+            return Ok(Step::then(default, move |s: &mut Self, default| {
+                let var = s.l.bind(&[name])[0];
+                f.inits.push(keyword::defaulted(var, raw, default));
+                s.defaults(f)
+            }));
+        }
+        let rest = f.formals.rest.map(|name| self.l.bind(&[name])[0]);
+        let Optional { node, formals, body, raws, inits, core_only, .. } = f;
+        self.body(body, move |s, mut body| {
+            s.l.unbind(&formals.names);
+            s.l.unbind(&formals.rest.into_iter().collect::<Vec<_>>());
+            for bind in inits.into_iter().rev() {
+                body = Core::Let(vec![bind], Box::new(body));
+            }
+            let mc = s.l.mc;
+            let params = keyword::order(mc, &formals.params).into_iter().map(|i| raws[i]).collect();
+            let shape = CallShape::of(mc, &formals.params, rest.is_some());
+            let optional = u32::try_from(shape.optional).expect("fewer than 2^32 parameters");
+            let lambda = Lambda { id: s.l.lambda_id(), optional, params, rest, body: Box::new(body) };
+            if core_only || !formals.has_keywords() {
+                return Ok(Step::Done(Core::Lambda(lambda)));
+            }
+            let core = s.l.fresh();
+            let procedure = keyword::procedure(mc, &shape, Core::Ref(Place::Local(core)), &mut *s.l).map_err(|e| s.l.error(e, node))?;
+            Ok(Step::Done(Core::Let(vec![(core, Core::Lambda(lambda))], Box::new(procedure))))
+        })
+    }
+
+    /// An `%app` of `f` with keyword arguments in `args`, or of a keyword procedure whose core
+    /// is known: a direct call of the core, if it takes the call, or else a `keyword-apply`. The
+    /// arguments are each bound to a local, in the order they're written, the procedure's first
+    /// if it isn't called directly.
+    fn keyword_call(&mut self, node: Syntax<'gc>, f: Syntax<'gc>, args: Vec<Syntax<'gc>>) -> Result<Lo<'s, 'a, 'gc>, LowerError> {
+        let l = &mut *self.l;
+        let (mut kinds, mut nodes) = (Vec::new(), Vec::new());
+        let mut items = args.into_iter();
+        while let Some(arg) = items.next() {
+            let Some(k) = l.keyword(arg) else {
+                kinds.push(None);
+                nodes.push(arg);
+                continue;
+            };
+            let value = items.next().ok_or_else(|| l.error(LowerErrorKind::BadShape, arg))?;
+            if kinds.contains(&Some(k)) {
+                return Err(l.error(LowerErrorKind::Duplicate, arg));
+            }
+            kinds.push(Some(k));
+            nodes.push(value);
+        }
+        let mut given: Vec<Keyword<'gc>> = kinds.iter().flatten().copied().collect();
+        keyword::sort(l.mc, &mut given);
+        let positional = kinds.iter().filter(|k| k.is_none()).count();
+        let direct = l.keyword_def(self.builder, f).filter(|(_, shape)| shape.matches(&given, positional));
+        let calls = direct.is_none().then_some(f).into_iter().chain(nodes).collect();
+        steps::all(calls, move |s: &mut Self, cores| {
+            let mut cores = cores.into_iter();
+            let mut binds = Vec::new();
+            let mut local = |s: &mut Self, core| {
+                let var = s.l.fresh();
+                binds.push((var, core));
+                Core::Ref(Place::Local(var))
+            };
+            let procedure = if direct.is_none() { Some(local(s, cores.next().expect("the procedure"))) } else { None };
+            let (mut keyword_values, mut positional) = (Vec::new(), Vec::new());
+            for (kind, core) in kinds.into_iter().zip(cores) {
+                let value = local(s, core);
+                match kind {
+                    Some(k) => keyword_values.push((k, value)),
+                    None => positional.push(value),
+                }
+            }
+            let value_of = |k: Keyword<'gc>| keyword_values.iter().find(|&&(other, _)| other == k).map(|(_, v)| v.clone());
+            let call = match (direct, procedure) {
+                (Some((CoreAt::Slot(core), shape)), _) => {
+                    let place = s.builder.place(core, s.l.top, s.l.defining);
+                    Core::App(Box::new(Core::Ref(place)), shape.core_args(value_of, positional))
+                }
+                (Some((CoreAt::Import(core), shape)), _) => {
+                    let (mc, args) = (s.l.mc, shape.core_args(value_of, positional));
+                    core.call(mc, args, &mut || s.l.fresh()).map_err(|Uninitialized| s.l.error(LowerErrorKind::Uninitialized, f))?
+                }
+                (None, Some(procedure)) => {
+                    let given = given.iter().map(|&k| (k, value_of(k).expect("a keyword given"))).collect();
+                    keyword::apply(s.l.mc, procedure, given, positional).map_err(|e| s.l.error(e, node))?
+                }
+                (None, None) => unreachable!("an indirect call has its procedure"),
+            };
+            Ok(Step::Done(if binds.is_empty() { call } else { Core::Let(binds, Box::new(call)) }))
         })
     }
 

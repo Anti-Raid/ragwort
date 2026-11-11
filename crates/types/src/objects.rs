@@ -1,6 +1,8 @@
 //! The objects behind the views the other modules give out. They're private to the crate, so
 //! only those views change them: pairs and literal vectors stay as they were made.
 
+use std::cell::RefCell;
+
 use crate::gc::table::TableHead;
 
 crate::gc::objects! {
@@ -20,6 +22,10 @@ crate::gc::objects! {
     /// `bytes` bytes, eight to a word, the first lowest.
     pub(crate) struct Bytevector { bytes: u64 } items u64
     pub(crate) struct ImmutableBytevector { bytes: u64 } items u64
+    /// A bytevector whose `bytes` bytes live outside the arena, dropped once nothing reaches it.
+    pub(crate) struct ExternBytevector { bytes: u64, owner: Frozen<Box<dyn AsRef<[u8]>>> }
+    /// One that can be written to, in the buffer it was made of.
+    pub(crate) struct ExternMutBytevector { bytes: u64, buffer: Frozen<RefCell<Box<dyn AsMut<[u8]>>>> }
     /// Source bytes, in no particular encoding.
     pub(crate) struct SyntaxText { bytes: Frozen<Box<[u8]>> }
     /// A source's name, its text while a session keeps it, its length, and the byte offset of

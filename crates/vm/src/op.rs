@@ -245,8 +245,8 @@ pub enum Fault {
 }
 
 impl Fault {
-    /// What [`Fault::kind`] numbers, as the prelude's `error-object-kind` names them.
-    pub const KINDS: [&str; 19] = [
+    /// The names of the kinds [`Fault::kind`] numbers, as `error-object-kind` gives them.
+    pub const KINDS: [&str; 20] = [
         "malformed",
         "out-of-memory",
         "wrong-type",
@@ -266,6 +266,7 @@ impl Fault {
         "too-long",
         "syntax",
         "keyword",
+        "not-utf8",
     ];
 
     /// Which of [`Fault::KINDS`] it is.
@@ -290,6 +291,7 @@ impl Fault {
             Fault::Str(StrError::TooLong) => 16,
             Fault::Syntax => 17,
             Fault::Keyword => 18,
+            Fault::Str(StrError::NotUtf8) => 19,
         }
     }
 

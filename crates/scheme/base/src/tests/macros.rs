@@ -188,7 +188,10 @@ fn macro_mistakes_point_at_themselves() {
     // A macro that expands to itself stops when what it makes fills the arena, at the top level
     // and in an expression.
     assert_eq!(error("(define-syntax loop (syntax-rules () ((_) (loop)))) (loop)"), (OutOfMemory.into(), "(loop)"));
-    assert_eq!(error("(define-syntax loop (syntax-rules () ((_) (+ 1 (loop))))) (loop)"), (OutOfMemory.into(), "(+ 1 (loop))"));
+    // Which of its expansions fills it depends on how much room there was.
+    let (kind, at) = error("(define-syntax loop (syntax-rules () ((_) (+ 1 (loop))))) (loop)");
+    assert_eq!(kind, OutOfMemory.into());
+    assert!(["(loop)", "(+ 1 (loop))"].contains(&at), "{at}");
     // One that runs forever runs out of fuel.
     assert_eq!(error("(define-syntax spin (lambda (s) (let f () (f)))) (spin)"), (Transformer, "(spin)"));
 }

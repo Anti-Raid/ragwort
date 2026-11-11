@@ -6,6 +6,7 @@ pub mod bigint;
 mod cfloat;
 pub mod complex;
 pub mod int;
+pub mod literal;
 pub mod rational;
 pub mod real;
 

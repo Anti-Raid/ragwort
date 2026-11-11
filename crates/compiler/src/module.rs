@@ -16,6 +16,7 @@ use ragwort_types::symbol::{Symbol, Symbols};
 use ragwort_vm::objects::{Module, ModuleFields};
 use ragwort_vm::{HostDef, Intrinsic};
 
+use crate::keyword::CallShape;
 use crate::{CompileError, Core, Lambda, Place, Prim, Var, compile};
 
 /// How many forms an inlined export's body can have.
@@ -551,8 +552,8 @@ pub struct ModuleBuilder<'gc> {
     exports: Vec<(Box<str>, u32)>,
     assigned: HashSet<u32>,
     inlines: HashMap<u32, Inline>,
-    /// The cores of the keyword procedures it defines, by their variables.
-    cores: HashMap<u32, u32>,
+    /// The cores of the keyword procedures it defines, and their shapes, by their variables.
+    cores: HashMap<u32, (u32, CallShape<'gc>)>,
     module: Option<Gc<'gc, Module>>,
 }
 
@@ -695,9 +696,15 @@ impl<'gc> ModuleBuilder<'gc> {
         Place::Slot { slot, checked: !defined }
     }
 
-    /// Notes that variable `procedure` is a keyword procedure whose core is variable `core`.
-    pub fn keyword_core(&mut self, procedure: u32, core: u32) {
-        self.cores.insert(procedure, core);
+    /// Notes that variable `procedure` is a keyword procedure of shape `shape` whose core is
+    /// variable `core`, so the code of any language can call the core.
+    pub fn keyword_core(&mut self, procedure: u32, core: u32, shape: CallShape<'gc>) {
+        self.cores.insert(procedure, (core, shape));
+    }
+
+    /// The core of the keyword procedure variable `slot` is, and its shape, if it's one.
+    pub fn keyword_def(&self, slot: u32) -> Option<(u32, &CallShape<'gc>)> {
+        self.cores.get(&slot).map(|(core, shape)| (*core, shape))
     }
 
     /// Notes that code assigns variable `slot`, so it isn't immutable, unless it's a keyword
@@ -738,7 +745,7 @@ impl<'gc> ModuleBuilder<'gc> {
         let exports = self.exports.iter().map(|&(ref name, slot)| {
             let mut out = export(slot);
             if !out.mutable {
-                out.core = self.cores.get(&slot).map(|&core| Box::new(export(core)));
+                out.core = self.cores.get(&slot).map(|&(core, _)| Box::new(export(core)));
             }
             (name.clone(), out)
         });

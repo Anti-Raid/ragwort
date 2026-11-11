@@ -6,7 +6,7 @@
 //!
 //! What the tokens make, and whether brackets match, is for what reads them.
 
-pub mod number;
+pub use ragwort_num::literal as number;
 
 #[cfg(test)]
 #[path = "tests/lexer.rs"]

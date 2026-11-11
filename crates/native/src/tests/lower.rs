@@ -209,6 +209,66 @@ fn modules_require_what_others_provide() {
 }
 
 #[test]
+fn optional_and_keyword_parameters() {
+    let optional = "(%define f (%lambda (a [b 2] [c (%intrinsic + a b)]) (%intrinsic cons a (%intrinsic cons b c))))
+                    (%intrinsic cons (%app f 1) (%intrinsic cons (%app f 1 5) (%app f 1 5 0)))";
+    assert_eq!(eval(optional), "((1 2 . 3) (1 5 . 6) 1 5 . 0)");
+    let greet = "(%define greet (%lambda (name #:greeting [greeting \"hi\"]) (%intrinsic string-append greeting \" \" name)))";
+    assert_eq!(eval(&format!("{greet} (%app greet \"bob\")")), "\"hi bob\"");
+    assert_eq!(eval(&format!("{greet} (%app greet \"bob\" #:greeting \"yo\")")), "\"yo bob\"");
+    assert_eq!(eval(&format!("{greet} (%app greet #:greeting \"yo\" \"al\")")), "\"yo al\"");
+    // Through a local, a call goes by `keyword-apply`.
+    assert_eq!(eval(&format!("{greet} (%let ((g greet)) (%app g \"x\" #:greeting \"hey\"))")), "\"hey x\"");
+    assert_eq!(eval("(%app (%lambda (#:q [q 7]) q) #:q 8)"), "8");
+    assert_eq!(eval("(%app (%lambda (#:q [q 7]) q))"), "7");
+    let rest = "(%define r (%lambda (#:a [a 1] . more) (%intrinsic cons a more)))";
+    assert_eq!(eval(&format!("{rest} (%intrinsic cons (%app r 1 2) (%app r #:a 9 1))")), "((1 1 2) 9 1)");
+    // A default sees the parameters before it, keyword ones too.
+    assert_eq!(eval("(%define d (%lambda (#:x [x 1] #:y [y (%intrinsic + x 1)]) (%intrinsic cons x y))) (%app d #:x 5)"), "(5 . 6)");
+    let need = "(%define need (%lambda (x #:k k) (%intrinsic cons x k)))";
+    assert_eq!(eval(&format!("{need} (%app need 1 #:k 2)")), "(1 . 2)");
+    assert_eq!(fault(&format!("{need} (%app need 1)")), Fault::Keyword);
+    assert_eq!(fault(&format!("{greet} (%app greet \"x\" #:nope 1)")), Fault::Keyword);
+    assert_eq!(fault(&format!("{greet} (%let ((g greet)) (%app g \"x\" #:nope 1))")), Fault::Keyword);
+}
+
+#[test]
+fn bad_formals_and_keyword_calls() {
+    assert_eq!(error("(%lambda (#:k) 1)"), (BadShape, "#:k"));
+    assert_eq!(error("(%lambda ([a 1] b) 1)"), (BadShape, "b"));
+    assert_eq!(error("(%lambda ([a] b) 1)"), (BadShape, "[a]"));
+    assert_eq!(error("(%lambda (#:k a #:k b) 1)"), (Duplicate, "#:k"));
+    assert_eq!(error("(%lambda (a #:k a) 1)"), (Duplicate, "a"));
+    assert_eq!(error("(%define f (%lambda (#:k [k 1]) k)) (%app f #:k)"), (BadShape, "#:k"));
+    assert_eq!(error("(%define f (%lambda (#:k [k 1]) k)) (%app f #:k 1 #:k 2)"), (Duplicate, "#:k"));
+    assert_eq!(error("(%define f (%lambda (#:k [k 1]) k)) (%set! f 1)"), (Immutable, "f"));
+}
+
+#[test]
+fn keyword_procedures_of_other_modules_are_called_directly() {
+    let mut arena = arena();
+    let lib = "(%provide (all-defined-out))
+               (%define greet (%lambda (name #:greeting [greeting \"hi\"]) (%intrinsic string-append greeting \" \" name)))";
+    module_in(&mut arena, "lib", lib).unwrap().unwrap();
+    let main = "(%require lib) (%define f (%lambda (n) (%app greet n #:greeting \"yo\")))";
+    let ops = arena.mutate(|mc| {
+        let symbols = Symbols::of(mc.root(0)).unwrap();
+        let session = SyntaxSession::new(mc, main).unwrap();
+        let loaded = load(mc, symbols, "main", &HOSTS, &[&session], &mut Registry).unwrap();
+        for &thunk in &loaded.thunks {
+            run(mc, thunk).unwrap();
+        }
+        let f = ragwort_vm::objects::ModuleFields::items(loaded.module, mc).get(0);
+        let f = f.downcast::<ragwort_vm::objects::Closure>(mc).unwrap();
+        let ops = ragwort_vm::objects::ClosureFields::code(f, mc).unwrap();
+        ragwort_vm::objects::BytecodeFields::ops(ops, mc).unwrap().to_vec()
+    });
+    assert!(!format!("{ops:?}").contains("KeywordApply"), "{ops:?}");
+    assert_eq!(eval_in(&mut arena, &format!("{main} (%app f \"al\")")).unwrap().unwrap(), "\"yo al\"");
+    assert_eq!(eval_in(&mut arena, "(%require lib) (%app greet \"al\")").unwrap().unwrap(), "\"hi al\"");
+}
+
+#[test]
 fn calls_of_imported_wrappers_inline() {
     let mut arena = arena();
     let lib = "(%provide (all-defined-out))

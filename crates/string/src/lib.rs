@@ -5,6 +5,7 @@
 //! flat string's characters can also live outside the heap, as an [`External`].
 
 mod case;
+mod digit;
 mod external;
 mod hash;
 mod intern;
@@ -24,7 +25,8 @@ mod tests;
 use std::cmp::Ordering;
 use std::fmt;
 
-pub use case::{compare_ci, downcase, foldcase, upcase};
+pub use case::{compare_ci, downcase, downcase_char, foldcase, foldcase_char, upcase, upcase_char};
+pub use digit::digit_value;
 pub use external::{External, ExternalText, check_external};
 pub use hash::{hash, hash_str};
 pub use intern::{Table, intern, intern_str};
@@ -43,6 +45,8 @@ pub enum StrError {
     TooLong,
     /// External characters stored wider than they need.
     NotNarrowest,
+    /// Bytes that aren't UTF-8, read as text.
+    NotUtf8,
 }
 
 /// What a rope node knows of its characters, which its host stores with it.

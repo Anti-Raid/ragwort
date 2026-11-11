@@ -8,9 +8,10 @@ use ragwort_types::Error;
 use ragwort_types::bytevector::{AnyBytevector, Bytevectors};
 use ragwort_types::gc::{Frame, Mutation, ScratchVec, Value};
 use ragwort_types::named;
-use ragwort_types::num::{ComplexHost, ComplexView, Integer, Number, Nums, RationalHost, RationalView, RealHost, RealView, complex, int, real};
+use ragwort_types::num::rational::Round;
+use ragwort_types::num::{ComplexHost, ComplexView, Integer, Number, NumError, Nums, RationalHost, RationalView, RealHost, RealView, complex, int, literal, real};
 use ragwort_types::pair::{Pair, Pairs};
-use ragwort_types::string::{self, Strings};
+use ragwort_types::string::{self, Str, StrError, Strings};
 use ragwort_types::symbol::{Keyword, Symbol, Symbols};
 use ragwort_types::syntax::Syntax;
 use ragwort_types::vector::{AnyVector, Vectors};
@@ -54,6 +55,8 @@ named! {
         Remainder = "remainder",
         /// `(modulo n m)`: `n` mod `m`, with `m`'s sign.
         Modulo = "modulo",
+        /// `(floor-quotient n m)`: `n / m` rounded down, of integers, exact or not.
+        FloorQuotient = "floor-quotient",
         /// `(bitwise-and n ...)`: of exact integers, in two's complement; `-1` of none.
         BitwiseAnd = "bitwise-and",
         /// `(bitwise-ior n ...)`; `0` of none.
@@ -75,6 +78,97 @@ named! {
         /// `(bit-field-replace dest source start end)`: `dest` with bits `start` to `end`
         /// replaced by the low bits of `source`.
         BitFieldReplace = "bit-field-replace",
+        /// `number?`, which is `complex?` too.
+        IsNumber = "number?",
+        /// `real?`: whether `x` is a number with no imaginary part.
+        IsReal = "real?",
+        /// `rational?`: whether `x` is an exact rational or a finite flonum.
+        IsRational = "rational?",
+        /// `integer?`: whether `x` is an exact integer or a flonum with no fraction.
+        IsInteger = "integer?",
+        /// `exact-integer?`
+        IsExactInteger = "exact-integer?",
+        /// `(exact? z)`
+        IsExact = "exact?",
+        /// `(inexact? z)`
+        IsInexact = "inexact?",
+        /// `(nan? z)`: whether a part of `z` is NaN.
+        IsNan = "nan?",
+        /// `(infinite? z)`: whether a part of `z` is infinite.
+        IsInfinite = "infinite?",
+        /// `(finite? z)`: whether each part of `z` is neither infinite nor NaN.
+        IsFinite = "finite?",
+        /// `(zero? z)`, whichever zero it is.
+        IsZero = "zero?",
+        /// `(positive? x)`: NaN isn't.
+        IsPositive = "positive?",
+        /// `(negative? x)`: nor is -0.0.
+        IsNegative = "negative?",
+        /// `(odd? n)`, of an integer, exact or not.
+        IsOdd = "odd?",
+        /// `(even? n)`
+        IsEven = "even?",
+        /// `(max x1 x2 ...)`: inexact if any of them is.
+        Max = "max",
+        /// `(min x1 x2 ...)`
+        Min = "min",
+        /// `(abs x)`
+        Abs = "abs",
+        /// `(gcd n ...)`: never negative; `0` of none. Inexact if any of the integers is.
+        Gcd = "gcd",
+        /// `(lcm n ...)`: never negative; `1` of none.
+        Lcm = "lcm",
+        /// `(numerator x)`, in lowest terms, as exact as `x`.
+        Numerator = "numerator",
+        /// `(denominator x)`: positive.
+        Denominator = "denominator",
+        /// `(floor x)`: flonums stay flonums.
+        Floor = "floor",
+        /// `(ceiling x)`
+        Ceiling = "ceiling",
+        /// `(truncate x)`: toward zero.
+        Truncate = "truncate",
+        /// `(round x)`: to the nearest integer, ties to even.
+        Round = "round",
+        /// `(integer-sqrt n)`: `⌊√n⌋` of an exact integer that isn't negative.
+        IntegerSqrt = "integer-sqrt",
+        /// `(exact z)`: infinities and NaN have no exact value.
+        Exact = "exact",
+        /// `(inexact z)`
+        Inexact = "inexact",
+        /// `(string->number s [radix])`: the number `s` writes, as the reader reads it in radix 2,
+        /// 8, 10 or 16 unless a prefix says otherwise, or `#f`.
+        StringToNumber = "string->number",
+        /// `(exp z)`: exact 1 for exact 0.
+        Exp = "exp",
+        /// `(log z [base])`: the natural log, or the log to `base`.
+        Log = "log",
+        /// `(sin z)`
+        Sin = "sin",
+        /// `(cos z)`
+        Cos = "cos",
+        /// `(tan z)`
+        Tan = "tan",
+        /// `(asin z)`
+        Asin = "asin",
+        /// `(acos z)`
+        Acos = "acos",
+        /// `(atan z)` or `(atan y x)`, the angle of the point `(x, y)`.
+        Atan = "atan",
+        /// `(sqrt z)`: the principal root, exact when `z` is exact and its root is too.
+        Sqrt = "sqrt",
+        /// `(make-rectangular x y)`: `x + yi`.
+        MakeRectangular = "make-rectangular",
+        /// `(make-polar m a)`: magnitude `m` at angle `a`.
+        MakePolar = "make-polar",
+        /// `(real-part z)`
+        RealPart = "real-part",
+        /// `(imag-part z)`: exact 0 of a real.
+        ImagPart = "imag-part",
+        /// `(magnitude z)`
+        Magnitude = "magnitude",
+        /// `(angle z)`
+        Angle = "angle",
         /// (cons a d)
         Cons = "cons",
         /// (car lst)
@@ -193,6 +287,82 @@ named! {
         /// `(integer->char n)`: the character whose code point is `n`, which is a Unicode scalar
         /// value: up to `#x10FFFF`, and not a surrogate.
         IntegerToChar = "integer->char",
+        /// `(char-alphabetic? c)`: whether `c` is Unicode `Alphabetic`.
+        IsCharAlphabetic = "char-alphabetic?",
+        /// `(char-numeric? c)`: whether `c` is a decimal digit, of any script.
+        IsCharNumeric = "char-numeric?",
+        /// `(char-whitespace? c)`: whether `c` is Unicode `White_Space`.
+        IsCharWhitespace = "char-whitespace?",
+        /// `(char-upper-case? c)`: whether `c` is Unicode `Uppercase`.
+        IsCharUpperCase = "char-upper-case?",
+        /// `(char-lower-case? c)`: whether `c` is Unicode `Lowercase`.
+        IsCharLowerCase = "char-lower-case?",
+        /// `(digit-value c)`: the value of `c` if it's a decimal digit, of any script, or `#f`.
+        DigitValue = "digit-value",
+        /// `(char-upcase c)`: `c` in upper case, if that's one character, or else `c`.
+        CharUpcase = "char-upcase",
+        /// `(char-downcase c)`
+        CharDowncase = "char-downcase",
+        /// `(char-foldcase c)`: `c` folded as `string-foldcase` folds it, if that's one character.
+        CharFoldcase = "char-foldcase",
+        /// `(char-ci=? c1 c2 ...)`: `char=?` of the characters folded.
+        CharCiEq = "char-ci=?",
+        /// `(char-ci<? c1 c2 ...)`
+        CharCiLt = "char-ci<?",
+        /// `(char-ci>? c1 c2 ...)`
+        CharCiGt = "char-ci>?",
+        /// `(char-ci<=? c1 c2 ...)`
+        CharCiLe = "char-ci<=?",
+        /// `(char-ci>=? c1 c2 ...)`
+        CharCiGe = "char-ci>=?",
+        /// `(make-string k [c])`: `k` of `c`, or of spaces.
+        MakeString = "make-string",
+        /// `(list->string chars)`
+        ListToString = "list->string",
+        /// `(string-upcase s)`: by the full mappings, so a character may become several.
+        StringUpcase = "string-upcase",
+        /// `(string-downcase s)`
+        StringDowncase = "string-downcase",
+        /// `(string-foldcase s)`: Unicode's full case folding, so strings that differ only in case
+        /// fold alike.
+        StringFoldcase = "string-foldcase",
+        /// `(string-ci=? s1 s2 ...)`: `string=?` of the strings folded.
+        StringCiEq = "string-ci=?",
+        /// `(string-ci<? s1 s2 ...)`
+        StringCiLt = "string-ci<?",
+        /// `(string-ci>? s1 s2 ...)`
+        StringCiGt = "string-ci>?",
+        /// `(string-ci<=? s1 s2 ...)`
+        StringCiLe = "string-ci<=?",
+        /// `(string-ci>=? s1 s2 ...)`
+        StringCiGe = "string-ci>=?",
+        /// `(string->vector s [start [end]])`: a new vector of the characters.
+        StringToVector = "string->vector",
+        /// `(vector->string v [start [end]])`: the characters of `v`, or of that range.
+        VectorToString = "vector->string",
+        /// `(string->utf8 s [start [end]])`: a new bytevector of the characters' UTF-8.
+        StringToUtf8 = "string->utf8",
+        /// `(utf8->string bv [start [end]])`: the text the bytes are, which must be UTF-8.
+        Utf8ToString = "utf8->string",
+        /// `(string-prefix? s prefix)`: whether `s` starts with `prefix`.
+        IsStringPrefix = "string-prefix?",
+        /// `(string-suffix? s suffix)`
+        IsStringSuffix = "string-suffix?",
+        /// `(string-contains? s part)`: whether `part` is anywhere in `s`.
+        IsStringContains = "string-contains?",
+        /// `(string-find s part [start])`: where `part` first is in `s` at or after `start`, or `#f`.
+        StringFind = "string-find",
+        /// `(string-find-last s part [end])`: where `part` last is in `s`, all of it before `end`,
+        /// or `#f`.
+        StringFindLast = "string-find-last",
+        /// `(string-split s sep trim? repeat?)`: the pieces of `s` between `sep`s, or between runs
+        /// of whitespace if `sep` is `#f`, as Racket's `string-split` makes them.
+        StringSplit = "string-split",
+        /// `(string-trim s sep left? right? repeat?)`: `s` without `sep`, or whitespace if it's
+        /// `#f`, at the ends it says, as Racket's `string-trim` takes it off.
+        StringTrim = "string-trim",
+        /// `(string-replace s from to all?)`: `s` with `to` for each `from` in it, or the first.
+        StringReplace = "string-replace",
         /// `(char=? c1 c2 ...)`: whether the characters are the same. Each argument is checked,
         /// whatever the answer.
         CharEq = "char=?",
@@ -297,7 +467,7 @@ named! {
         ErrorObjectMessage = "error-object-message",
         /// `(error-object-irritants c)`.
         ErrorObjectIrritants = "error-object-irritants",
-        /// `(error-object-kind c)`: which of [`Fault::KINDS`] the condition is, as a fixnum.
+        /// `(error-object-kind c)`: which of [`Fault::KINDS`] the condition is, as a symbol.
         ErrorObjectKind = "error-object-kind",
         /// `syntax?`.
         IsSyntax = "syntax?",
@@ -369,7 +539,16 @@ impl Intrinsic {
             Intrinsic::IsValues | Intrinsic::ValuesLength | Intrinsic::Not | Intrinsic::IsBoolean | Intrinsic::IsKeyword => Some(1),
             Intrinsic::KeywordToString | Intrinsic::StringToKeyword | Intrinsic::IsSymbol => Some(1),
             Intrinsic::SymbolToString | Intrinsic::StringToSymbol => Some(1),
-            Intrinsic::Expt | Intrinsic::Quotient | Intrinsic::Remainder | Intrinsic::Modulo => Some(2),
+            Intrinsic::Expt | Intrinsic::Quotient | Intrinsic::Remainder | Intrinsic::Modulo | Intrinsic::FloorQuotient => Some(2),
+            Intrinsic::IsNumber | Intrinsic::IsReal | Intrinsic::IsRational | Intrinsic::IsInteger | Intrinsic::IsExactInteger => Some(1),
+            Intrinsic::IsExact | Intrinsic::IsInexact | Intrinsic::IsNan | Intrinsic::IsInfinite | Intrinsic::IsFinite => Some(1),
+            Intrinsic::IsZero | Intrinsic::IsPositive | Intrinsic::IsNegative | Intrinsic::IsOdd | Intrinsic::IsEven => Some(1),
+            Intrinsic::Abs | Intrinsic::Numerator | Intrinsic::Denominator | Intrinsic::IntegerSqrt | Intrinsic::Exact | Intrinsic::Inexact => Some(1),
+            Intrinsic::Floor | Intrinsic::Ceiling | Intrinsic::Truncate | Intrinsic::Round => Some(1),
+            Intrinsic::Exp | Intrinsic::Sin | Intrinsic::Cos | Intrinsic::Tan | Intrinsic::Asin | Intrinsic::Acos | Intrinsic::Sqrt => Some(1),
+            Intrinsic::RealPart | Intrinsic::ImagPart | Intrinsic::Magnitude | Intrinsic::Angle => Some(1),
+            Intrinsic::MakeRectangular | Intrinsic::MakePolar => Some(2),
+            Intrinsic::Max | Intrinsic::Min | Intrinsic::Gcd | Intrinsic::Lcm | Intrinsic::StringToNumber | Intrinsic::Log | Intrinsic::Atan => None,
             Intrinsic::BitwiseAnd | Intrinsic::BitwiseIor | Intrinsic::BitwiseXor => None,
             Intrinsic::BitwiseNot | Intrinsic::IntegerLength | Intrinsic::BitCount => Some(1),
             Intrinsic::ArithmeticShift | Intrinsic::IsBitSet => Some(2),
@@ -384,6 +563,16 @@ impl Intrinsic {
             Intrinsic::ProcedureKeywords => Some(1),
             Intrinsic::IsChar | Intrinsic::CharToInteger | Intrinsic::IntegerToChar => Some(1),
             Intrinsic::CharEq | Intrinsic::CharLt | Intrinsic::CharGt | Intrinsic::CharLe | Intrinsic::CharGe => None,
+            Intrinsic::IsCharAlphabetic | Intrinsic::IsCharNumeric | Intrinsic::IsCharWhitespace | Intrinsic::IsCharUpperCase | Intrinsic::IsCharLowerCase => Some(1),
+            Intrinsic::DigitValue | Intrinsic::CharUpcase | Intrinsic::CharDowncase | Intrinsic::CharFoldcase => Some(1),
+            Intrinsic::CharCiEq | Intrinsic::CharCiLt | Intrinsic::CharCiGt | Intrinsic::CharCiLe | Intrinsic::CharCiGe => None,
+            Intrinsic::ListToString | Intrinsic::StringUpcase | Intrinsic::StringDowncase | Intrinsic::StringFoldcase => Some(1),
+            Intrinsic::StringCiEq | Intrinsic::StringCiLt | Intrinsic::StringCiGt | Intrinsic::StringCiLe | Intrinsic::StringCiGe => None,
+            Intrinsic::MakeString | Intrinsic::StringToVector | Intrinsic::VectorToString | Intrinsic::StringToUtf8 | Intrinsic::Utf8ToString => None,
+            Intrinsic::IsStringPrefix | Intrinsic::IsStringSuffix | Intrinsic::IsStringContains => Some(2),
+            Intrinsic::StringFind | Intrinsic::StringFindLast => None,
+            Intrinsic::StringSplit | Intrinsic::StringReplace => Some(4),
+            Intrinsic::StringTrim => Some(5),
             Intrinsic::IsSyntax | Intrinsic::IsIdentifier | Intrinsic::SyntaxE | Intrinsic::SyntaxToDatum => Some(1),
             Intrinsic::DatumToSyntax | Intrinsic::BoundIdentifierEq | Intrinsic::FreeIdentifierEq | Intrinsic::GenerateTemporaries | Intrinsic::SyntaxMatch => Some(2),
             Intrinsic::Caar | Intrinsic::Cadr | Intrinsic::Cdar | Intrinsic::Cddr | Intrinsic::Caaar | Intrinsic::Caadr | Intrinsic::Cadar | Intrinsic::Caddr | Intrinsic::Cdaar | Intrinsic::Cdadr | Intrinsic::Cddar | Intrinsic::Cdddr | Intrinsic::Caaaar | Intrinsic::Caaadr | Intrinsic::Caadar | Intrinsic::Caaddr | Intrinsic::Cadaar | Intrinsic::Cadadr | Intrinsic::Caddar | Intrinsic::Cadddr | Intrinsic::Cdaaar | Intrinsic::Cdaadr | Intrinsic::Cdadar | Intrinsic::Cdaddr | Intrinsic::Cddaar | Intrinsic::Cddadr | Intrinsic::Cdddar | Intrinsic::Cddddr => Some(1),
@@ -423,6 +612,7 @@ impl Intrinsic {
                 | IsBitSet
                 | BitField
                 | BitFieldReplace
+                | IsNumber | IsReal | IsRational | IsInteger | IsExactInteger | IsExact | IsInexact | IsNan | IsInfinite | IsFinite | IsZero | IsPositive | IsNegative | IsOdd | IsEven | Max | Min | Abs | Gcd | Lcm | Numerator | Denominator | Floor | Ceiling | Truncate | Round | FloorQuotient | IntegerSqrt | Exact | Inexact | StringToNumber | Exp | Log | Sin | Cos | Tan | Asin | Acos | Atan | Sqrt | MakeRectangular | MakePolar | RealPart | ImagPart | Magnitude | Angle
                 | StringLength
                 | StringRef
                 | StringEq
@@ -432,6 +622,30 @@ impl Intrinsic {
                 | StringGe
                 | CharToInteger
                 | IntegerToChar
+                | IsCharAlphabetic
+                | IsCharNumeric
+                | IsCharWhitespace
+                | IsCharUpperCase
+                | IsCharLowerCase
+                | DigitValue
+                | CharUpcase
+                | CharDowncase
+                | CharFoldcase
+                | CharCiEq
+                | CharCiLt
+                | CharCiGt
+                | CharCiLe
+                | CharCiGe
+                | StringCiEq
+                | StringCiLt
+                | StringCiGt
+                | StringCiLe
+                | StringCiGe
+                | IsStringPrefix
+                | IsStringSuffix
+                | IsStringContains
+                | StringFind
+                | StringFindLast
                 | CharEq
                 | CharLt
                 | CharGt
@@ -517,6 +731,11 @@ impl Intrinsic {
             self,
             Cons | MakeBox
                 | MakeWinder
+                | IsNumber
+                | IsReal
+                | IsRational
+                | IsInteger
+                | IsExactInteger
                 | Eq
                 | Eqv
                 | IsNull
@@ -560,6 +779,7 @@ impl Intrinsic {
             self,
             IsNull
                 | IsPair
+                | IsNumber
                 | IsBoolean
                 | IsKeyword
                 | IsSymbol
@@ -613,6 +833,7 @@ impl Intrinsic {
                 | BitCount
                 | BitField
                 | BitFieldReplace
+                | Max | Min | Abs | Gcd | Lcm | Numerator | Denominator | Floor | Ceiling | Truncate | Round | FloorQuotient | IntegerSqrt | Exact | Inexact | Exp | Log | Sin | Cos | Tan | Asin | Acos | Atan | Sqrt | MakeRectangular | MakePolar | RealPart | ImagPart | Magnitude | Angle
                 | StringLength
                 | StringAppend
                 | Substring
@@ -620,6 +841,21 @@ impl Intrinsic {
                 | StringToList
                 | NumberToString
                 | StringJoin
+                | CharUpcase
+                | CharDowncase
+                | CharFoldcase
+                | MakeString
+                | ListToString
+                | StringUpcase
+                | StringDowncase
+                | StringFoldcase
+                | StringToVector
+                | VectorToString
+                | StringToUtf8
+                | Utf8ToString
+                | StringSplit
+                | StringTrim
+                | StringReplace
                 | CharToInteger
                 | IntegerToChar
                 | Cons
@@ -697,6 +933,300 @@ impl Intrinsic {
             Cddddr => (false, Some(Cdddr)),
             _ => return None,
         })
+    }
+
+    /// Runs one of the character and string procedures past the basic ones, on the `args`
+    /// values `arg` reads.
+    #[inline(never)]
+    fn text<'gc>(self, mc: &Mutation<'gc>, arg: impl Fn(usize) -> Value<'gc>, args: usize, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
+        let boolean = |b: bool| if b { Value::TRUE } else { Value::FALSE };
+        let strings = Strings::new(mc);
+        let string_of = |v: Value<'gc>| strings.string(v).ok_or(Fault::WrongType);
+        let char_of = |v: Value<'gc>| v.as_char().ok_or(Fault::WrongType);
+        // How much work a pass over `s` is.
+        let spend = |fuel: &mut Fuel, s| fuel.spend(string::len(&strings, s) as u64 / equal::PER_FUEL);
+        let made_of = match self {
+            Intrinsic::IsCharAlphabetic => return Ok(boolean(char_of(arg(0))?.is_alphabetic())),
+            Intrinsic::IsCharNumeric => return Ok(boolean(string::digit_value(char_of(arg(0))?).is_some())),
+            Intrinsic::IsCharWhitespace => return Ok(boolean(char_of(arg(0))?.is_whitespace())),
+            Intrinsic::IsCharUpperCase => return Ok(boolean(char_of(arg(0))?.is_uppercase())),
+            Intrinsic::IsCharLowerCase => return Ok(boolean(char_of(arg(0))?.is_lowercase())),
+            Intrinsic::DigitValue => return Ok(string::digit_value(char_of(arg(0))?).map_or(Value::FALSE, |d| fixnum(i64::from(d)))),
+            Intrinsic::CharUpcase => return Ok(Value::char(string::upcase_char(char_of(arg(0))?))),
+            Intrinsic::CharDowncase => return Ok(Value::char(string::downcase_char(char_of(arg(0))?))),
+            Intrinsic::CharFoldcase => return Ok(Value::char(string::foldcase_char(char_of(arg(0))?))),
+            Intrinsic::CharCiEq | Intrinsic::CharCiLt | Intrinsic::CharCiGt | Intrinsic::CharCiLe | Intrinsic::CharCiGe if args == 0 => return Err(Fault::Arity),
+            Intrinsic::CharCiEq | Intrinsic::CharCiLt | Intrinsic::CharCiGt | Intrinsic::CharCiLe | Intrinsic::CharCiGe => {
+                return Ok(boolean(compare_chars(self, (0..args).map(&arg))?));
+            }
+            Intrinsic::StringCiEq | Intrinsic::StringCiLt | Intrinsic::StringCiGt | Intrinsic::StringCiLe | Intrinsic::StringCiGe if args == 0 => {
+                return Err(Fault::Arity);
+            }
+            Intrinsic::StringCiEq | Intrinsic::StringCiLt | Intrinsic::StringCiGt | Intrinsic::StringCiLe | Intrinsic::StringCiGe => {
+                return Ok(boolean(compare_strings(mc, self, (0..args).map(&arg), fuel)?));
+            }
+            Intrinsic::MakeString if !(1..=2).contains(&args) => return Err(Fault::Arity),
+            Intrinsic::MakeString => {
+                let n = index(arg(0))?;
+                let c = if args == 2 { char_of(arg(1))? } else { ' ' };
+                fuel.spend(n as u64 / equal::PER_FUEL)?;
+                string::repeat(&strings, c, n)?.value()
+            }
+            Intrinsic::ListToString => {
+                let pairs = Pairs::new(mc);
+                let n = pairs.list_len(arg(0)).ok_or(Fault::WrongType)?;
+                fuel.spend(n / equal::PER_FUEL)?;
+                let mut chars = ScratchVec::new(mc);
+                for x in pairs.elements(arg(0)) {
+                    chars.push(char_of(x)?)?;
+                }
+                string::from_chars(&strings, chars.iter().copied())?.value()
+            }
+            Intrinsic::StringUpcase | Intrinsic::StringDowncase | Intrinsic::StringFoldcase => {
+                let s = string_of(arg(0))?;
+                spend(fuel, s)?;
+                let mapped = match self {
+                    Intrinsic::StringUpcase => string::upcase(&strings, s)?,
+                    Intrinsic::StringDowncase => string::downcase(&strings, s)?,
+                    _ => string::foldcase(&strings, s)?,
+                };
+                mapped.value()
+            }
+            Intrinsic::StringToVector | Intrinsic::VectorToString | Intrinsic::StringToUtf8 | Intrinsic::Utf8ToString if !(1..=3).contains(&args) => {
+                return Err(Fault::Arity);
+            }
+            Intrinsic::StringToVector | Intrinsic::StringToUtf8 => {
+                let s = string_of(arg(0))?;
+                let (start, end) = range(string::len(&strings, s), &arg, args)?;
+                let part = string::substring(&strings, s, start, end)?;
+                spend(fuel, part)?;
+                if self == Intrinsic::StringToVector {
+                    let vector = Vectors::new(mc).make(end - start, Value::VOID)?;
+                    let items = vector.items(mc);
+                    string::chars(&strings, part).enumerate().for_each(|(i, c)| items.set(mc, i, Value::char(c)));
+                    vector.value(mc)
+                } else {
+                    let mut bytes = ScratchVec::new(mc);
+                    let mut buffer = [0; 4];
+                    for c in string::chars(&strings, part) {
+                        for &b in c.encode_utf8(&mut buffer).as_bytes() {
+                            bytes.push(b)?;
+                        }
+                    }
+                    Bytevectors::new(mc).from_slice(&bytes)?.value(mc)
+                }
+            }
+            Intrinsic::VectorToString => {
+                let vector = AnyVector::of(arg(0)).ok_or(Fault::WrongType)?;
+                let (start, end) = range(vector.len(mc), &arg, args)?;
+                fuel.spend((end - start) as u64 / equal::PER_FUEL)?;
+                let mut chars = ScratchVec::new(mc);
+                for i in start..end {
+                    chars.push(char_of(vector.get(mc, i).ok_or(Fault::OutOfRange)?)?)?;
+                }
+                string::from_chars(&strings, chars.iter().copied())?.value()
+            }
+            Intrinsic::Utf8ToString => {
+                let bytes = AnyBytevector::of(arg(0)).ok_or(Fault::WrongType)?;
+                let (start, end) = range(bytes.len(mc), &arg, args)?;
+                fuel.spend((end - start) as u64 / equal::PER_FUEL)?;
+                let part = bytes.bytes(mc, start, end);
+                let text = std::str::from_utf8(&part).map_err(|_| Fault::Str(StrError::NotUtf8))?;
+                string::from_str(&strings, text)?.value()
+            }
+            Intrinsic::IsStringPrefix | Intrinsic::IsStringSuffix | Intrinsic::IsStringContains => {
+                let (s, part) = (string_of(arg(0))?, string_of(arg(1))?);
+                spend(fuel, s)?;
+                return Ok(boolean(match self {
+                    Intrinsic::IsStringPrefix => string::starts_with(&strings, s, part)?,
+                    Intrinsic::IsStringSuffix => string::ends_with(&strings, s, part)?,
+                    _ => string::find(&strings, s, part, 0)?.is_some(),
+                }));
+            }
+            Intrinsic::StringFind | Intrinsic::StringFindLast if !(2..=3).contains(&args) => return Err(Fault::Arity),
+            Intrinsic::StringFind | Intrinsic::StringFindLast => {
+                let (s, part) = (string_of(arg(0))?, string_of(arg(1))?);
+                spend(fuel, s)?;
+                let found = if self == Intrinsic::StringFind {
+                    string::find(&strings, s, part, if args == 3 { index(arg(2))? } else { 0 })?
+                } else {
+                    string::rfind(&strings, s, part, if args == 3 { index(arg(2))? } else { string::len(&strings, s) })?
+                };
+                return Ok(found.map_or(Value::FALSE, |i| fixnum(i as i64)));
+            }
+            Intrinsic::StringSplit => {
+                let s = string_of(arg(0))?;
+                let sep = if arg(1) == Value::FALSE { None } else { Some(string_of(arg(1))?) };
+                spend(fuel, s)?;
+                string_split(mc, s, sep, arg(2) != Value::FALSE, arg(3) != Value::FALSE)?
+            }
+            Intrinsic::StringTrim => {
+                let s = string_of(arg(0))?;
+                let sep = if arg(1) == Value::FALSE { None } else { Some(string_of(arg(1))?) };
+                spend(fuel, s)?;
+                let (left, right, repeat) = (arg(2) != Value::FALSE, arg(3) != Value::FALSE, arg(4) != Value::FALSE);
+                trimmed(&strings, s, sep, left, right, repeat)?.value()
+            }
+            Intrinsic::StringReplace => {
+                let (s, from, to) = (string_of(arg(0))?, string_of(arg(1))?, string_of(arg(2))?);
+                spend(fuel, s)?;
+                string_replace(mc, s, from, to, arg(3) != Value::FALSE)?
+            }
+            _ => unreachable!("{self:?} isn't a text procedure"),
+        };
+        Ok(made(mc, fuel, made_of))
+    }
+
+    /// Runs one of the numeric procedures past arithmetic, on the `args` values `arg` reads.
+    #[inline(never)]
+    fn numeric<'gc>(self, mc: &Mutation<'gc>, arg: impl Fn(usize) -> Value<'gc>, args: usize, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
+        let h = Nums::new(mc);
+        let boolean = |b: bool| if b { Value::TRUE } else { Value::FALSE };
+        let number = |v: Value<'gc>| h.number(v).ok_or(Fault::WrongType);
+        let real = |v: Value<'gc>| h.real(v).ok_or(Fault::WrongType);
+        let made_of = match self {
+            Intrinsic::IsNumber => return Ok(boolean(h.number(arg(0)).is_some())),
+            Intrinsic::IsReal => return Ok(boolean(h.real(arg(0)).is_some())),
+            Intrinsic::IsRational => {
+                let finite = |x| !matches!(h.real_view(x), RealView::Flonum(f) if !f.is_finite());
+                return Ok(boolean(h.real(arg(0)).is_some_and(finite)));
+            }
+            Intrinsic::IsInteger => return Ok(boolean(h.real(arg(0)).is_some_and(|x| real::is_integer(&h, x)))),
+            Intrinsic::IsExactInteger => return Ok(boolean(h.integer(arg(0)).is_some())),
+            Intrinsic::IsExact | Intrinsic::IsInexact => return Ok(boolean(complex::is_exact(&h, number(arg(0))?) == (self == Intrinsic::IsExact))),
+            Intrinsic::IsNan | Intrinsic::IsInfinite | Intrinsic::IsFinite => {
+                let parts = match h.complex_view(number(arg(0))?) {
+                    ComplexView::Real(x) => [x, x],
+                    ComplexView::Complex { re, im } => [re, im],
+                };
+                let floats = parts.map(|x| match h.real_view(x) {
+                    RealView::Flonum(f) => f,
+                    RealView::Exact(_) => 0.0,
+                });
+                return Ok(boolean(match self {
+                    Intrinsic::IsNan => floats.iter().any(|f| f.is_nan()),
+                    Intrinsic::IsInfinite => floats.iter().any(|f| f.is_infinite()),
+                    _ => floats.iter().all(|f| f.is_finite()),
+                }));
+            }
+            Intrinsic::IsZero => {
+                return Ok(boolean(match h.complex_view(number(arg(0))?) {
+                    ComplexView::Real(x) => real::sign(&h, x) == Some(Ordering::Equal),
+                    ComplexView::Complex { .. } => false,
+                }));
+            }
+            Intrinsic::IsPositive | Intrinsic::IsNegative => {
+                let want = if self == Intrinsic::IsPositive { Ordering::Greater } else { Ordering::Less };
+                return Ok(boolean(real::sign(&h, real(arg(0))?) == Some(want)));
+            }
+            Intrinsic::IsOdd | Intrinsic::IsEven => {
+                let even = match arg(0).as_fixnum() {
+                    Some(n) => n % 2 == 0,
+                    None => int::is_even(&h, integral(mc, &h, arg(0))?.0),
+                };
+                return Ok(boolean(even == (self == Intrinsic::IsEven)));
+            }
+            Intrinsic::Max | Intrinsic::Min if args == 0 => return Err(Fault::Arity),
+            Intrinsic::Max | Intrinsic::Min => {
+                let max = self == Intrinsic::Max;
+                let mut acc = real(arg(0))?;
+                for i in 1..args {
+                    let x = real(arg(i))?;
+                    acc = match (acc.value().as_fixnum(), x.value().as_fixnum()) {
+                        (Some(a), Some(b)) => if (b > a) == max { x } else { acc },
+                        _ if max => real::max(&h, acc, x)?,
+                        _ => real::min(&h, acc, x)?,
+                    };
+                }
+                h.of_real(acc)
+            }
+            // Fixnums are narrower than an i64, so `abs` can't overflow, though it can leave them.
+            Intrinsic::Abs => match arg(0).as_fixnum().and_then(|n| Value::fixnum(n.abs())) {
+                Some(n) => return Ok(n),
+                None => h.of_real(real::abs(&h, real(arg(0))?)?),
+            },
+            Intrinsic::Gcd | Intrinsic::Lcm => {
+                let gcd = self == Intrinsic::Gcd;
+                let (mut acc, mut exact) = (int::from_i64(&h, if gcd { 0 } else { 1 })?, true);
+                for i in 0..args {
+                    let (n, is_exact) = integral(mc, &h, arg(i))?;
+                    exact &= is_exact;
+                    let words = int::integer_length(&h, acc).max(int::integer_length(&h, n)) / 64;
+                    fuel.spend(words.saturating_mul(words) / equal::PER_FUEL)?;
+                    acc = if gcd { int::gcd(&h, acc, n)? } else { int::lcm(&h, acc, n)? };
+                }
+                let acc = h.of_rational(h.of_int(acc));
+                h.of_real(if exact { acc } else { real::inexact(&h, acc)? })
+            }
+            Intrinsic::Numerator => h.of_real(real::numerator(&h, real(arg(0))?)?),
+            Intrinsic::Denominator => h.of_real(real::denominator(&h, real(arg(0))?)?),
+            Intrinsic::Floor | Intrinsic::Ceiling | Intrinsic::Truncate | Intrinsic::Round => {
+                if arg(0).is_fixnum() {
+                    return Ok(arg(0));
+                }
+                let x = real(arg(0))?;
+                charge_squared(&h, fuel, h.of_real(x))?;
+                let mode = match self {
+                    Intrinsic::Floor => Round::Floor,
+                    Intrinsic::Ceiling => Round::Ceiling,
+                    Intrinsic::Truncate => Round::Truncate,
+                    _ => Round::Nearest,
+                };
+                h.of_real(real::round(&h, x, mode)?)
+            }
+            Intrinsic::IntegerSqrt => {
+                let n = h.integer(arg(0)).ok_or(Fault::WrongType)?;
+                if int::sign(&h, n) == Ordering::Less {
+                    return Err(Fault::OutOfRange);
+                }
+                charge_squared(&h, fuel, number(arg(0))?)?;
+                h.of_real(h.of_rational(h.of_int(int::isqrt(&h, n)?)))
+            }
+            Intrinsic::Exact => complex::exact(&h, number(arg(0))?)?,
+            Intrinsic::Inexact => complex::inexact(&h, number(arg(0))?)?,
+            Intrinsic::StringToNumber if !(1..=2).contains(&args) => return Err(Fault::Arity),
+            Intrinsic::StringToNumber => {
+                let strings = Strings::new(mc);
+                let s = strings.string(arg(0)).ok_or(Fault::WrongType)?;
+                let radix = if args == 2 { arg(1).as_fixnum().ok_or(Fault::WrongType)? } else { 10 };
+                let radix = [2, 8, 10, 16].into_iter().find(|&r| r == radix).ok_or(Fault::OutOfRange)? as u32;
+                // Reading a bignum takes about its digits squared, each at most four bits.
+                let len = string::len(&strings, s);
+                let words = (len as u64).saturating_mul(4) / 64;
+                fuel.spend(words.saturating_mul(words) / equal::PER_FUEL)?;
+                mc.ensure(len.saturating_mul(4))?;
+                let text: String = string::chars(&strings, s).collect();
+                match literal::parse_in(&h, &text, radix)? {
+                    Some(z) => z,
+                    None => return Ok(Value::FALSE),
+                }
+            }
+            Intrinsic::Exp => complex::exp(&h, number(arg(0))?)?,
+            Intrinsic::Log if !(1..=2).contains(&args) => return Err(Fault::Arity),
+            Intrinsic::Log if args == 2 => complex::log_base(&h, number(arg(0))?, number(arg(1))?)?,
+            Intrinsic::Log => complex::log(&h, number(arg(0))?)?,
+            Intrinsic::Sin => complex::sin(&h, number(arg(0))?)?,
+            Intrinsic::Cos => complex::cos(&h, number(arg(0))?)?,
+            Intrinsic::Tan => complex::tan(&h, number(arg(0))?)?,
+            Intrinsic::Asin => complex::asin(&h, number(arg(0))?)?,
+            Intrinsic::Acos => complex::acos(&h, number(arg(0))?)?,
+            Intrinsic::Atan if !(1..=2).contains(&args) => return Err(Fault::Arity),
+            Intrinsic::Atan if args == 2 => h.of_real(complex::atan2(&h, real(arg(0))?, real(arg(1))?)?),
+            Intrinsic::Atan => complex::atan(&h, number(arg(0))?)?,
+            Intrinsic::Sqrt => {
+                let z = number(arg(0))?;
+                charge_squared(&h, fuel, z)?;
+                complex::sqrt(&h, z)?
+            }
+            Intrinsic::MakeRectangular => complex::rectangular(&h, real(arg(0))?, real(arg(1))?)?,
+            Intrinsic::MakePolar => complex::polar(&h, real(arg(0))?, real(arg(1))?)?,
+            Intrinsic::RealPart => h.of_real(complex::real_part(&h, number(arg(0))?)),
+            Intrinsic::ImagPart => h.of_real(complex::imag_part(&h, number(arg(0))?)?),
+            Intrinsic::Magnitude => h.of_real(complex::magnitude(&h, number(arg(0))?)?),
+            Intrinsic::Angle => h.of_real(complex::angle(&h, number(arg(0))?)?),
+            _ => unreachable!("{self:?} isn't numeric"),
+        };
+        Ok(made(mc, fuel, made_of.value()))
     }
 
     /// Runs it on `args`, as the VM does on registers, but without a frame: for a compiler folding
@@ -879,7 +1409,88 @@ impl Intrinsic {
                 let text = complex::to_string(&h, z, radix)?;
                 made(mc, fuel, string::from_str(&Strings::new(mc), &text)?.value())
             }
-            Intrinsic::Quotient | Intrinsic::Remainder | Intrinsic::Modulo => divide(mc, fuel, self, arg(0), arg(1))?,
+            Intrinsic::Quotient | Intrinsic::Remainder | Intrinsic::Modulo | Intrinsic::FloorQuotient => divide(mc, fuel, self, arg(0), arg(1))?,
+            Intrinsic::IsNumber
+            | Intrinsic::IsReal
+            | Intrinsic::IsRational
+            | Intrinsic::IsInteger
+            | Intrinsic::IsExactInteger
+            | Intrinsic::IsExact
+            | Intrinsic::IsInexact
+            | Intrinsic::IsNan
+            | Intrinsic::IsInfinite
+            | Intrinsic::IsFinite
+            | Intrinsic::IsZero
+            | Intrinsic::IsPositive
+            | Intrinsic::IsNegative
+            | Intrinsic::IsOdd
+            | Intrinsic::IsEven
+            | Intrinsic::Max
+            | Intrinsic::Min
+            | Intrinsic::Abs
+            | Intrinsic::Gcd
+            | Intrinsic::Lcm
+            | Intrinsic::Numerator
+            | Intrinsic::Denominator
+            | Intrinsic::Floor
+            | Intrinsic::Ceiling
+            | Intrinsic::Truncate
+            | Intrinsic::Round
+            | Intrinsic::IntegerSqrt
+            | Intrinsic::Exact
+            | Intrinsic::Inexact
+            | Intrinsic::StringToNumber
+            | Intrinsic::Exp
+            | Intrinsic::Log
+            | Intrinsic::Sin
+            | Intrinsic::Cos
+            | Intrinsic::Tan
+            | Intrinsic::Asin
+            | Intrinsic::Acos
+            | Intrinsic::Atan
+            | Intrinsic::Sqrt
+            | Intrinsic::MakeRectangular
+            | Intrinsic::MakePolar
+            | Intrinsic::RealPart
+            | Intrinsic::ImagPart
+            | Intrinsic::Magnitude
+            | Intrinsic::Angle => self.numeric(mc, arg, args, fuel)?,
+            Intrinsic::IsCharAlphabetic
+            | Intrinsic::IsCharNumeric
+            | Intrinsic::IsCharWhitespace
+            | Intrinsic::IsCharUpperCase
+            | Intrinsic::IsCharLowerCase
+            | Intrinsic::DigitValue
+            | Intrinsic::CharUpcase
+            | Intrinsic::CharDowncase
+            | Intrinsic::CharFoldcase
+            | Intrinsic::CharCiEq
+            | Intrinsic::CharCiLt
+            | Intrinsic::CharCiGt
+            | Intrinsic::CharCiLe
+            | Intrinsic::CharCiGe
+            | Intrinsic::MakeString
+            | Intrinsic::ListToString
+            | Intrinsic::StringUpcase
+            | Intrinsic::StringDowncase
+            | Intrinsic::StringFoldcase
+            | Intrinsic::StringCiEq
+            | Intrinsic::StringCiLt
+            | Intrinsic::StringCiGt
+            | Intrinsic::StringCiLe
+            | Intrinsic::StringCiGe
+            | Intrinsic::StringToVector
+            | Intrinsic::VectorToString
+            | Intrinsic::StringToUtf8
+            | Intrinsic::Utf8ToString
+            | Intrinsic::IsStringPrefix
+            | Intrinsic::IsStringSuffix
+            | Intrinsic::IsStringContains
+            | Intrinsic::StringFind
+            | Intrinsic::StringFindLast
+            | Intrinsic::StringSplit
+            | Intrinsic::StringTrim
+            | Intrinsic::StringReplace => self.text(mc, arg, args, fuel)?,
             Intrinsic::BitwiseAnd => bitwise(mc, fuel, -1, (0..args).map(&arg), |a, b| a & b, |h, a, b| int::bitwise_and(h, a, b))?,
             Intrinsic::BitwiseIor => bitwise(mc, fuel, 0, (0..args).map(&arg), |a, b| a | b, |h, a, b| int::bitwise_or(h, a, b))?,
             Intrinsic::BitwiseXor => bitwise(mc, fuel, 0, (0..args).map(&arg), |a, b| a ^ b, |h, a, b| int::bitwise_xor(h, a, b))?,
@@ -1174,7 +1785,8 @@ impl Intrinsic {
             Intrinsic::ErrorObjectIrritants => arg(0).downcast::<Condition>(mc).ok_or(Fault::WrongType)?.irritants(mc),
             Intrinsic::ErrorObjectKind => {
                 let c = arg(0).downcast::<Condition>(mc).ok_or(Fault::WrongType)?;
-                Value::fixnum(c.fault(mc).ok_or(Fault::Malformed)?.kind() as i64).expect("kinds are fixnums")
+                let name = Fault::KINDS[c.fault(mc).ok_or(Fault::Malformed)?.kind()];
+                made(mc, fuel, Symbols::of_arena(mc)?.intern_str(&Strings::new(mc), name)?.value(mc))
             }
         })
     }
@@ -1284,7 +1896,8 @@ fn int_kind(v: Value<'_>) -> Result<(usize, bool), Fault> {
     Ok((size, kind < 0))
 }
 
-/// `quotient`, `remainder` or `modulo` of `n` and `m`, in place if they're fixnums.
+/// `quotient`, `remainder`, `modulo` or `floor-quotient` of `n` and `m`, in place if they're
+/// fixnums.
 fn divide<'gc>(mc: &Mutation<'gc>, fuel: &mut Fuel, op: Intrinsic, n: Value<'gc>, m: Value<'gc>) -> Result<Value<'gc>, Fault> {
     if let (Some(a), Some(b)) = (n.as_fixnum(), m.as_fixnum())
         && b != 0
@@ -1293,6 +1906,10 @@ fn divide<'gc>(mc: &Mutation<'gc>, fuel: &mut Fuel, op: Intrinsic, n: Value<'gc>
         let fast = match op {
             Intrinsic::Quotient => a / b,
             Intrinsic::Remainder => a % b,
+            Intrinsic::FloorQuotient => {
+                let q = a / b;
+                if a % b != 0 && (a < 0) != (b < 0) { q - 1 } else { q }
+            }
             _ => {
                 let r = a % b;
                 if r != 0 && (r < 0) != (b < 0) { r + b } else { r }
@@ -1307,6 +1924,7 @@ fn divide<'gc>(mc: &Mutation<'gc>, fuel: &mut Fuel, op: Intrinsic, n: Value<'gc>
     let generic = match op {
         Intrinsic::Quotient => real::quotient(&h, x, y),
         Intrinsic::Remainder => real::remainder(&h, x, y),
+        Intrinsic::FloorQuotient => real::floor_quotient(&h, x, y),
         _ => real::modulo(&h, x, y),
     };
     Ok(made(mc, fuel, generic?.value()))
@@ -1356,23 +1974,167 @@ fn exact_bits<'gc>(h: &Nums<'_, 'gc>, z: Number<'gc>) -> u64 {
     }
 }
 
+/// Spends what work about the square of the size of `z`'s exact parts takes, as dividing them
+/// does.
+fn charge_squared<'gc>(h: &Nums<'_, 'gc>, fuel: &mut Fuel, z: Number<'gc>) -> Result<(), Fault> {
+    let words = exact_bits(h, z) / 64;
+    fuel.spend(words.saturating_mul(words) / equal::PER_FUEL)
+}
+
+/// `v` as an exact integer, and whether it was one rather than a flonum with no fraction.
+fn integral<'gc>(mc: &Mutation<'gc>, h: &Nums<'_, 'gc>, v: Value<'gc>) -> Result<(Integer<'gc>, bool), Fault> {
+    if let Some(n) = h.integer(v) {
+        return Ok((n, true));
+    }
+    match v.as_flonum(mc) {
+        Some(f) if f.is_finite() && f.fract() == 0.0 => Ok((int::from_integral_f64(h, f)?, false)),
+        _ if h.number(v).is_some() => Err(Fault::Num(NumError::NotInteger)),
+        _ => Err(Fault::WrongType),
+    }
+}
+
 /// Whether each of `xs` is as `op` says of the next, all of them characters.
 fn compare_chars<'gc>(op: Intrinsic, xs: impl Iterator<Item = Value<'gc>>) -> Result<bool, Fault> {
     let (mut before, mut so_far) = (None, true);
     for x in xs {
         let x = x.as_char().ok_or(Fault::WrongType)?;
+        let x = if matches!(op, Intrinsic::CharCiEq | Intrinsic::CharCiLt | Intrinsic::CharCiGt | Intrinsic::CharCiLe | Intrinsic::CharCiGe) {
+            string::foldcase_char(x)
+        } else {
+            x
+        };
         if let Some(b) = before {
             so_far &= match op {
-                Intrinsic::CharEq => b == x,
-                Intrinsic::CharLt => b < x,
-                Intrinsic::CharGt => b > x,
-                Intrinsic::CharLe => b <= x,
+                Intrinsic::CharEq | Intrinsic::CharCiEq => b == x,
+                Intrinsic::CharLt | Intrinsic::CharCiLt => b < x,
+                Intrinsic::CharGt | Intrinsic::CharCiGt => b > x,
+                Intrinsic::CharLe | Intrinsic::CharCiLe => b <= x,
                 _ => b >= x,
             };
         }
         before = Some(x);
     }
     Ok(so_far)
+}
+
+/// The range from the optional start and end arguments `arg(1)` and `arg(2)` of something
+/// `len` long, all of it if they're left out.
+fn range<'gc>(len: usize, arg: &impl Fn(usize) -> Value<'gc>, args: usize) -> Result<(usize, usize), Fault> {
+    let start = if args > 1 { index(arg(1))? } else { 0 };
+    let end = if args > 2 { index(arg(2))? } else { len };
+    if start > end || end > len {
+        return Err(Fault::OutOfRange);
+    }
+    Ok((start, end))
+}
+
+/// `s` without `sep`, or whitespace if it's `None`, at the start if `left` and the end if `right`:
+/// one `sep` at each, or as many as there are if `repeat`, and every run of whitespace.
+fn trimmed<'gc>(strings: &Strings<'_, 'gc>, s: Str<'gc>, sep: Option<Str<'gc>>, left: bool, right: bool, repeat: bool) -> Result<Str<'gc>, Fault> {
+    let Some(sep) = sep else {
+        return Ok(match (left, right) {
+            (true, true) => string::trim(strings, s)?,
+            (true, false) => string::trim_start(strings, s)?,
+            (false, true) => string::trim_end(strings, s)?,
+            (false, false) => s,
+        });
+    };
+    let (n, m) = (string::len(strings, s), string::len(strings, sep));
+    if m == 0 {
+        return Ok(s);
+    }
+    let at = |i: usize| -> Result<bool, Fault> { Ok(string::equal(strings, string::substring(strings, s, i, i + m)?, sep)?) };
+    let (mut start, mut end) = (0, n);
+    while left && start + m <= end && at(start)? {
+        start += m;
+        if !repeat {
+            break;
+        }
+    }
+    while right && end >= start + m && at(end - m)? {
+        end -= m;
+        if !repeat {
+            break;
+        }
+    }
+    Ok(if (start, end) == (0, n) { s } else { string::substring(strings, s, start, end)? })
+}
+
+/// Racket's `(string-split s sep #:trim? trim #:repeat? repeat)`, `sep` `None` for runs of
+/// whitespace.
+fn string_split<'gc>(mc: &Mutation<'gc>, s: Str<'gc>, sep: Option<Str<'gc>>, trim: bool, repeat: bool) -> Result<Value<'gc>, Fault> {
+    let strings = Strings::new(mc);
+    let mut pieces = ScratchVec::new(mc);
+    match sep {
+        None if trim => {
+            for piece in string::split_whitespace(&strings, s) {
+                pieces.push(piece?.value())?;
+            }
+        }
+        // A run of whitespace at either end leaves an empty piece past it.
+        None => {
+            let (mut start, mut space) = (0, false);
+            for (i, c) in string::chars(&strings, s).enumerate() {
+                if c.is_whitespace() && !space {
+                    pieces.push(string::substring(&strings, s, start, i)?.value())?;
+                } else if !c.is_whitespace() && space {
+                    start = i;
+                }
+                space = c.is_whitespace();
+            }
+            let n = string::len(&strings, s);
+            pieces.push(string::substring(&strings, s, if space { n } else { start }, n)?.value())?;
+        }
+        Some(sep) => {
+            let s = if trim { trimmed(&strings, s, Some(sep), true, true, repeat)? } else { s };
+            if trim && string::len(&strings, s) == 0 {
+                return Ok(Value::NIL);
+            }
+            let all = string::split(&strings, s, sep).collect::<Result<Vec<_>, _>>()?;
+            let last = all.len().saturating_sub(1);
+            // Repeated separators are one, so they leave no empty pieces between them.
+            for (i, piece) in all.into_iter().enumerate() {
+                if !repeat || i == 0 || i == last || string::len(&strings, piece) > 0 {
+                    pieces.push(piece.value())?;
+                }
+            }
+        }
+    }
+    Ok(Pairs::new(mc).list(&pieces)?)
+}
+
+/// `s` with `to` in place of each `from`, or the first if not `all`. An empty `from` is before
+/// each character and after the last.
+fn string_replace<'gc>(mc: &Mutation<'gc>, s: Str<'gc>, from: Str<'gc>, to: Str<'gc>, all: bool) -> Result<Value<'gc>, Fault> {
+    let strings = Strings::new(mc);
+    let (n, m) = (string::len(&strings, s), string::len(&strings, from));
+    let mut parts = ScratchVec::new(mc);
+    if m == 0 {
+        parts.push(to)?;
+        if !all {
+            parts.push(s)?;
+        } else {
+            for i in 0..n {
+                parts.push(string::substring(&strings, s, i, i + 1)?)?;
+                parts.push(to)?;
+            }
+        }
+    } else {
+        let mut at = 0;
+        while let Some(i) = string::find(&strings, s, from, at)? {
+            parts.push(string::substring(&strings, s, at, i)?)?;
+            parts.push(to)?;
+            at = i + m;
+            if !all {
+                break;
+            }
+        }
+        if parts.is_empty() {
+            return Ok(s.value());
+        }
+        parts.push(string::substring(&strings, s, at, n)?)?;
+    }
+    Ok(string::concat_all(&strings, &parts)?.value())
 }
 
 /// `(string-join strs [sep])`: the strings of proper list `strs` with `sep`, or a space, between.
@@ -1420,6 +2182,11 @@ fn compare_strings<'gc>(mc: &Mutation<'gc>, op: Intrinsic, xs: impl Iterator<Ite
             fuel.spend(string::len(&strings, b).min(string::len(&strings, x)) as u64 / equal::PER_FUEL)?;
             so_far = match op {
                 Intrinsic::StringEq => string::equal(&strings, b, x)?,
+                Intrinsic::StringCiEq => string::compare_ci(&strings, b, x)?.is_eq(),
+                Intrinsic::StringCiLt => string::compare_ci(&strings, b, x)?.is_lt(),
+                Intrinsic::StringCiGt => string::compare_ci(&strings, b, x)?.is_gt(),
+                Intrinsic::StringCiLe => string::compare_ci(&strings, b, x)?.is_le(),
+                Intrinsic::StringCiGe => string::compare_ci(&strings, b, x)?.is_ge(),
                 Intrinsic::StringLt => string::compare(&strings, b, x)?.is_lt(),
                 Intrinsic::StringGt => string::compare(&strings, b, x)?.is_gt(),
                 Intrinsic::StringLe => string::compare(&strings, b, x)?.is_le(),

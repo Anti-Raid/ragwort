@@ -32,6 +32,7 @@ mod cp0;
 mod emit;
 mod hash;
 pub mod ir;
+pub mod keyword;
 mod l5;
 mod letrec;
 mod lower;

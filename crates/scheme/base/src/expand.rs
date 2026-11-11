@@ -6,6 +6,7 @@
 
 
 
+use ragwort_compiler::keyword::CallShape;
 use ragwort_compiler::module::{self, Filter, Import, Imports, ModuleBuilder, ModuleError, RequireSpec, Resolver, SpecError, Uninitialized};
 use ragwort_compiler::steps::{self, Step};
 use ragwort_compiler::{Core, Lambda, Place, Var};
@@ -16,7 +17,7 @@ use ragwort_types::syntax::{Abbreviation, Syntax, SyntaxContext, SyntaxMeta, Syn
 use ragwort_vm::{HostDef, Machine};
 use ragwort_vm::objects::Module;
 
-use crate::formals::{CallShape, CoreAt, Def, KeywordDef};
+use crate::formals::{CoreAt, KeywordDef};
 use crate::scope::{BASE, Map, Op, Scope, Set, TOP};
 use crate::tree::{Stx, Tree, View};
 use crate::{ExpandError, ExpandErrorKind};
@@ -229,8 +230,9 @@ pub struct Expander<'a, 'gc> {
     /// The top-level form being expanded, and the variable whose lambda it's in, if it's one.
     pub(crate) form: u32,
     pub(crate) defining: Option<u32>,
-    /// The keyword procedures definitions in this load made, which calls go to the cores of.
-    keyword_defs: Map<Def, KeywordDef<'gc>>,
+    /// The keyword procedures definitions in bodies made, by their variables, which calls go to
+    /// the cores of. The module's own are its builder's, whichever language defined them.
+    keyword_defs: Map<Var, KeywordDef<'gc>>,
     /// The bindings made in this load, with the scopes each was made in, by the newest of those
     /// scopes and the name's word. An identifier's bindings are under its own scopes.
     bindings: Map<(Scope, u64), Vec<(Set, Binding<'gc>)>>,
@@ -353,8 +355,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                         Some(shape) => {
                             let name = self.tree.symbol(id).expect("definitions bind identifiers").value(self.mc);
                             let core = self.builder.define_private(name, index).map_err(|e| self.module_error(e, id))?;
-                            self.builder.keyword_core(slot, core);
-                            self.keyword_defs.insert(Def::Slot(slot), KeywordDef { core: CoreAt::Slot(core), shape });
+                            self.builder.keyword_core(slot, core, shape);
                             out.push(Top(TopForm::DefineKeyword { procedure: slot, core, lambda: value }));
                         }
                         None => out.push(Top(TopForm::Define(slot, value))),
@@ -769,8 +770,10 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                         });
                     }
                 }
-                Binding::Local(var) => def = self.keyword_defs.get(&Def::Local(var)).cloned(),
-                Binding::Slot(slot) => def = self.keyword_defs.get(&Def::Slot(slot)).cloned(),
+                Binding::Local(var) => def = self.keyword_defs.get(&var).cloned(),
+                Binding::Slot(slot) => {
+                    def = self.builder.keyword_def(slot).map(|(core, shape)| KeywordDef { core: CoreAt::Slot(core), shape: shape.clone() });
+                }
                 _ => {}
             }
         }
@@ -830,7 +833,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let place = match self.resolve(id)? {
             // Calls of a keyword procedure a definition made go to its core, as if it can't change:
             // the module builder rules out assigning a module variable that is one.
-            Binding::Local(var) if self.keyword_defs.contains_key(&Def::Local(var)) => return Err(self.error(ExpandErrorKind::Immutable, id)),
+            Binding::Local(var) if self.keyword_defs.contains_key(&var) => return Err(self.error(ExpandErrorKind::Immutable, id)),
             Binding::Local(var) => Place::Local(var),
             Binding::Slot(slot) => {
                 self.builder.assign(slot).map_err(|e| self.module_error(e, id))?;
@@ -947,7 +950,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                     match self.keyword_lambda(value)? {
                         Some(shape) => {
                             let (procedure, core) = (self.local(id)?, self.fresh());
-                            self.keyword_defs.insert(Def::Local(procedure), KeywordDef { core: CoreAt::Local(core), shape });
+                            self.keyword_defs.insert(procedure, KeywordDef { core: CoreAt::Local(core), shape });
                             s.items.push(Item::Keyword(procedure, core, value));
                         }
                         None => s.items.push(Item::Define(self.local(id)?, value)),

@@ -256,6 +256,11 @@ pub fn modulo<H: RealHost>(h: &H, x: H::Real, y: H::Real) -> Res<H> {
     integer_op(h, x, y, int::modulo, |_, y| y.is_sign_negative())
 }
 
+/// `floor-quotient`, rounding down. A zero quotient is negative when the signs differ.
+pub fn floor_quotient<H: RealHost>(h: &H, x: H::Real, y: H::Real) -> Res<H> {
+    integer_op(h, x, y, int::floor_quotient, |x, y| x.is_sign_negative() != y.is_sign_negative())
+}
+
 /// An integer division of integers, exact or not. Inexact operands are worked out exactly
 /// and the answer rounded once, with `negative_zero` saying the sign of a zero answer.
 fn integer_op<H: RealHost>(

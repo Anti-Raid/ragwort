@@ -4,27 +4,32 @@
 
 use std::cmp::Ordering;
 
-use ragwort_num::{ComplexHost, complex, int, rational, real};
+use crate::{ComplexHost, complex, int, rational, real};
 
 /// The most a decimal's exponent can scale it by when it's read exact.
 const MAX_EXACT_SCALE: u64 = 100_000;
 
 /// The number `token` writes, made by the host `nums`, or `None` if it doesn't write one.
 pub fn parse<H: ComplexHost>(nums: &H, token: &str) -> Result<Option<H::Number>, H::Error> {
-    let (mut radix, mut exact, mut rest) = (None, None, token);
+    parse_in(nums, token, 10)
+}
+
+/// The number `token` writes in `radix` unless a prefix says otherwise, as [`parse`] reads it.
+pub fn parse_in<H: ComplexHost>(nums: &H, token: &str, radix: u32) -> Result<Option<H::Number>, H::Error> {
+    let (mut prefixed, mut exact, mut rest) = (None, None, token);
     while let [b'#', prefix, ..] = rest.as_bytes() {
         match prefix.to_ascii_lowercase() {
-            b'x' if radix.is_none() => radix = Some(16),
-            b'b' if radix.is_none() => radix = Some(2),
-            b'o' if radix.is_none() => radix = Some(8),
-            b'd' if radix.is_none() => radix = Some(10),
+            b'x' if prefixed.is_none() => prefixed = Some(16),
+            b'b' if prefixed.is_none() => prefixed = Some(2),
+            b'o' if prefixed.is_none() => prefixed = Some(8),
+            b'd' if prefixed.is_none() => prefixed = Some(10),
             b'e' if exact.is_none() => exact = Some(true),
             b'i' if exact.is_none() => exact = Some(false),
             _ => return Ok(None),
         }
         rest = &rest[2..];
     }
-    let Some(z) = complex_number(nums, rest, radix.unwrap_or(10), exact)? else { return Ok(None) };
+    let Some(z) = complex_number(nums, rest, prefixed.unwrap_or(radix), exact)? else { return Ok(None) };
     let z = match exact {
         Some(true) => complex::exact(nums, z)?,
         Some(false) => complex::inexact(nums, z)?,

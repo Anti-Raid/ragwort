@@ -699,6 +699,116 @@ fn arithmetic() {
 }
 
 #[test]
+fn number_predicates() {
+    let kinds = "(list (number? 1) (number? 1.5) (number? 1+2i) (number? 'a) (complex? 1/2) (real? 1+2i) (real? 1.5) (rational? 1/2) (rational? 1.5)
+                       (rational? +inf.0) (rational? +nan.0) (integer? 2) (integer? 2.0) (integer? 2.5) (integer? 1/2) (integer? \"2\")
+                       (exact-integer? 2) (exact-integer? 2.0))";
+    assert_eq!(eval(kinds), "(#t #t #t #f #t #f #t #t #t #f #f #t #t #f #f #f #t #f)");
+    let exactness = "(list (exact? 1/2) (exact? 0.5) (inexact? 0.5) (inexact? 1.0+2.0i) (nan? +nan.0) (nan? 1) (nan? +nan.0+1i)
+                           (infinite? -inf.0) (infinite? +nan.0) (finite? 1.5) (finite? +inf.0) (finite? 1/3) (finite? 1+inf.0i))";
+    assert_eq!(eval(exactness), "(#t #f #t #t #t #f #t #t #f #t #f #t #f)");
+    let signs = "(list (zero? 0) (zero? 0.0) (zero? -0.0) (zero? 1/2) (zero? +i) (positive? 1/2) (positive? -0.0) (negative? -0.0)
+                       (negative? -1.5) (positive? +nan.0) (odd? 3) (odd? -3) (even? 0) (even? 4.0) (odd? (expt 2 100)) (even? (+ 1 (expt 2 100))))";
+    assert_eq!(eval(signs), "(#t #t #t #f #f #t #f #f #t #f #t #t #t #t #f #f)");
+    let not_integer = Ok(Err(Fault::Num(ragwort_types::num::NumError::NotInteger)));
+    assert_eq!(eval_in(&mut arena(), "(odd? 1.5)"), not_integer);
+    assert_eq!(eval_in(&mut arena(), "(even? 1/2)"), not_integer);
+    for wrong in ["(odd? 'x)", "(zero? 'a)", "(positive? +i)", "(exact? \"1\")", "(nan? '())"] {
+        assert_eq!(eval_in(&mut arena(), wrong), Ok(Err(Fault::WrongType)), "{wrong}");
+    }
+}
+
+#[test]
+fn numbers_past_arithmetic() {
+    let extremes = "(list (max 1 3 2) (min 1 3 2) (max 1 2.0) (min 1 2.0) (max -1/2 -1/3) (abs -5) (abs -5/2) (abs -2.5)
+                          (abs -4611686018427387904))";
+    assert_eq!(eval(extremes), "(3 1 2.0 1.0 -1/3 5 5/2 2.5 4611686018427387904)");
+    let divisors = "(list (gcd) (gcd 12 18) (gcd -12 18) (gcd 0 5) (lcm) (lcm 4 6) (lcm -4 6) (lcm 0 5) (gcd 12.0 18) (lcm (expt 2 70) 3))";
+    assert_eq!(eval(divisors), "(0 6 6 5 1 12 12 0 6.0 3541774862152233910272)");
+    assert_eq!(eval("(list (numerator 6/4) (denominator 6/4) (denominator 5) (numerator 0.5) (denominator 0.5))"), "(3 2 1 1.0 2.0)");
+    let rounding = "(list (floor 2.5) (ceiling 2.5) (truncate -2.5) (round 2.5) (round 3.5) (round -2.5) (floor -7/2) (ceiling -7/2)
+                          (round 7/2) (round 5/2) (floor 3))";
+    assert_eq!(eval(rounding), "(2.0 3.0 -2.0 2.0 4.0 -2.0 -4 -3 4 2 3)");
+    let division = "(list (call-with-values (lambda () (floor/ -7 2)) list) (call-with-values (lambda () (truncate/ -7 2)) list)
+                          (floor-quotient 7 -2) (floor-remainder 7 -2) (truncate-quotient 7 -2) (truncate-remainder 7 -2)
+                          (floor-quotient -7.0 2) (floor-quotient (expt 2 70) -3))";
+    assert_eq!(eval(division), "((-4 1) (-3 -1) -4 -1 -3 1 -4.0 -393530540239137101142)");
+    let roots = "(list (call-with-values (lambda () (exact-integer-sqrt 17)) list) (integer-sqrt (expt 10 40)) (square 5) (square 1/2)
+                       (sqrt 16) (sqrt 2.25) (sqrt -4) (sqrt 1/4) (sqrt (expt 3 100)))";
+    assert_eq!(eval(roots), "((4 1) 100000000000000000000 25 1/4 4 1.5 +2i 1/2 717897987691852588770249)");
+    assert_eq!(eval("(list (exact 2.5) (exact 2.0) (inexact 1/4) (exact->inexact 1/3) (inexact->exact 0.5))"), "(5/2 2 0.25 0.3333333333333333 1/2)");
+    let parsed = "(list (string->number \"42\") (string->number \"-1/2\") (string->number \"1e3\") (string->number \"#xff\") (string->number \"ff\" 16)
+                        (string->number \"101\" 2) (string->number \"1+2i\") (string->number \"abc\") (string->number \"\") (string->number \"1/0\")
+                        (string->number \"#e1.5\") (string->number \"12345678901234567890\") (string->number \"#d10\" 16))";
+    assert_eq!(eval(parsed), "(42 -1/2 1000.0 255 255 5 1+2i #f #f #f 3/2 12345678901234567890 10)");
+    let complex = "(list (make-rectangular 1 2) (make-rectangular 1.5 0) (real-part 1+2i) (imag-part 1+2i) (imag-part 5) (magnitude -3+4i)
+                         (magnitude -5) (angle -1) (angle 1))";
+    assert_eq!(eval(complex), "(1+2i 1.5 1 2 0 5 5 3.141592653589793 0)");
+    let transcendental = "(list (exp 0) (log 1) (sin 0.0) (cos 0.0) (atan 1 1) (atan 0 1) (exp 1) (log 100 10))";
+    assert_eq!(eval(transcendental), "(1 0 0.0 1.0 0.7853981633974483 0 2.718281828459045 2.0)");
+    assert_eq!(eval_in(&mut arena(), "(max)"), Ok(Err(Fault::Arity)));
+    assert_eq!(eval_in(&mut arena(), "(log 1 2 3)"), Ok(Err(Fault::Arity)));
+    assert_eq!(eval_in(&mut arena(), "(integer-sqrt -1)"), Ok(Err(Fault::OutOfRange)));
+    assert_eq!(eval_in(&mut arena(), "(string->number \"1\" 3)"), Ok(Err(Fault::OutOfRange)));
+    assert_eq!(eval_in(&mut arena(), "(floor-quotient 1 0)"), Ok(Err(Fault::Num(ragwort_types::num::NumError::DivideByZero))));
+    for wrong in ["(max 1 'a)", "(abs +i)", "(gcd 1 'a)", "(floor \"1\")", "(string->number 'a)", "(make-rectangular 1 +i)", "(integer-sqrt 4.0)"] {
+        assert_eq!(eval_in(&mut arena(), wrong), Ok(Err(Fault::WrongType)), "{wrong}");
+    }
+}
+
+#[test]
+fn characters() {
+    let kinds = "(list (char-alphabetic? #\\a) (char-alphabetic? #\\λ) (char-alphabetic? #\\1) (char-numeric? #\\7) (char-numeric? #\\٣)
+                       (char-numeric? #\\a) (char-numeric? #\\½) (char-whitespace? #\\space) (char-whitespace? #\\x3000) (char-whitespace? #\\a)
+                       (char-upper-case? #\\A) (char-upper-case? #\\a) (char-lower-case? #\\ß) (char-lower-case? #\\1))";
+    assert_eq!(eval(kinds), "(#t #t #f #t #t #f #f #t #t #f #t #f #t #f)");
+    assert_eq!(eval("(list (digit-value #\\7) (digit-value #\\٣) (digit-value #\\x1E5F9) (digit-value #\\a) (digit-value #\\½))"), "(7 3 8 #f #f)");
+    // A character whose case maps to several stays itself.
+    let cases = "(string (char-upcase #\\a) (char-upcase #\\ß) (char-downcase #\\Σ) (char-foldcase #\\Σ) (char-foldcase #\\ı) (char-upcase #\\1))";
+    assert_eq!(eval(cases), "\"Aßσσı1\"");
+    assert_eq!(eval("(list (char-ci=? #\\a #\\A #\\a) (char-ci<? #\\a #\\B #\\c) (char-ci=? #\\a #\\b) (char-ci>=? #\\Z #\\a))"), "(#t #t #f #t)");
+    assert_eq!(eval_in(&mut arena(), "(char-upcase \"a\")"), Ok(Err(Fault::WrongType)));
+}
+
+#[test]
+fn strings_past_the_basics() {
+    let made = "(list (make-string 3 #\\x) (make-string 2) (string #\\a #\\b) (list->string '(#\\h #\\i)) (string) (string-upcase \"straße\")
+                      (string-downcase \"ÀB\") (string-foldcase \"Straße\"))";
+    assert_eq!(eval(made), r#"("xxx" "  " "ab" "hi" "" "STRASSE" "àb" "strasse")"#);
+    assert_eq!(eval("(list (string-ci=? \"Straße\" \"STRASSE\") (string-ci<? \"apple\" \"Banana\") (string-ci=? \"a\" \"b\"))"), "(#t #t #f)");
+    let vectors = "(list (string->vector \"abc\") (string->vector \"abcd\" 1 3) (vector->string #(#\\a #\\b #\\c)) (vector->string #(#\\a #\\b #\\c) 1))";
+    assert_eq!(eval(vectors), r#"(#(#\a #\b #\c) #(#\b #\c) "abc" "bc")"#);
+    let utf8 = "(list (string->utf8 \"aé\") (utf8->string #u8(104 105)) (utf8->string (string->utf8 \"λx\")) (string->utf8 \"abc\" 1))";
+    assert_eq!(eval(utf8), r#"(#u8(97 195 169) "hi" "λx" #u8(98 99))"#);
+    let mapped = "(list (string-map char-upcase \"abc\") (string-map (lambda (a b) (if (char<? a b) a b)) \"adc\" \"bbbb\")
+                        (let ((n 0)) (string-for-each (lambda (c) (set! n (+ n 1))) \"hello\") n))";
+    assert_eq!(eval(mapped), r#"("ABC" "abb" 5)"#);
+    let found = "(list (string-prefix? \"hello\" \"he\") (string-prefix? \"he\" \"hello\") (string-suffix? \"hello\" \"lo\") (string-contains? \"hello\" \"ell\")
+                       (string-contains? \"hello\" \"\") (string-contains? \"hello\" \"z\"))";
+    assert_eq!(eval(found), "(#t #f #t #t #t #f)");
+    let places = "(list (string-find \"hello\" \"l\") (string-find \"hello\" \"l\" 3) (string-find \"hello\" \"l\" 4) (string-find \"hello\" \"\")
+                        (string-find-last \"hello\" \"l\") (string-find-last \"hello\" \"l\" 3) (string-find-last \"hello\" \"z\") (string-find \"λxλ\" \"λ\" 1))";
+    assert_eq!(eval(places), "(2 3 #f 0 3 2 #f 2)");
+    assert_eq!(eval_in(&mut arena(), "(string-find \"abc\" \"a\" 9)"), Ok(Err(Fault::Str(ragwort_types::string::StrError::OutOfRange))));
+    let split = "(list (string-split \"  a b  c \") (string-split \"\") (string-split \"a,b,,c\" \",\") (string-split \",a,\" \",\")
+                       (string-split \"a,,b\" \",\" #:repeat? #t) (string-split \" a b \" #:trim? #f) (string-split \",a,\" \",\" #:trim? #f) (string-split \"a\" \",\"))";
+    assert_eq!(eval(split), r#"(("a" "b" "c") () ("a" "b" "" "c") ("a") ("a" "b") ("" "a" "b" "") ("" "a" "") ("a"))"#);
+    let trimmed = "(list (string-trim \"  hi  \") (string-trim \"  hi  \" #:left? #f) (string-trim \"  hi  \" #:right? #f) (string-trim \"--hi--\" \"-\")
+                         (string-trim \"--hi--\" \"-\" #:repeat? #t) (string-trim \"aaa\" \"a\" #:repeat? #t))";
+    assert_eq!(eval(trimmed), r#"("hi" "  hi" "hi  " "-hi-" "hi" "")"#);
+    let replaced = "(list (string-replace \"a-b-c\" \"-\" \"+\") (string-replace \"a-b-c\" \"-\" \"+\" #:all? #f) (string-replace \"abc\" \"\" \"-\")
+                          (string-replace \"abc\" \"x\" \"y\") (string-replace \"aaa\" \"aa\" \"b\"))";
+    assert_eq!(eval(replaced), r#"("a+b+c" "a+b-c" "-a-b-c-" "abc" "ba")"#);
+    assert_eq!(eval_in(&mut arena(), "(string->vector \"abc\" 2 1)"), Ok(Err(Fault::OutOfRange)));
+    assert_eq!(eval_in(&mut arena(), "(make-string -1)"), Ok(Err(Fault::OutOfRange)));
+    assert_eq!(eval_in(&mut arena(), "(utf8->string #u8(104 255))"), Ok(Err(Fault::Str(ragwort_types::string::StrError::NotUtf8))));
+    assert_eq!(eval_in(&mut arena(), "(string-trim \"a\" #:bogus 1)"), Ok(Err(Fault::Keyword)));
+    for wrong in ["(list->string '(1))", "(string-split \"a\" 'x)", "(string-upcase 1)", "(vector->string #(1))", "(string-prefix? \"a\" 1)"] {
+        assert_eq!(eval_in(&mut arena(), wrong), Ok(Err(Fault::WrongType)), "{wrong}");
+    }
+}
+
+#[test]
 fn mutable_bytevectors() {
     let fill = "(let ((b (make-bytevector 10 7)))
                   (bytevector-u8-set! b 9 200)
@@ -1351,10 +1461,7 @@ fn vm_faults_and_errors_are_error_objects() {
     assert_eq!(caught("((lambda (x) x))"), r#"(arity "arity" ())"#);
     assert_eq!(eval("(list (error-object? 1) (guard (e (#t (error-object? e))) (car '())))"), "(#f #t)");
     assert_eq!(eval_in(&mut arena(), "(error \"no one\")"), Ok(Err(Fault::Error)));
-    // The prelude names the kinds in the VM's order.
-    let names = PRELUDE.split("#(malformed").nth(1).and_then(|rest| rest.split(')').next()).unwrap();
-    let names: Vec<&str> = std::iter::once("malformed").chain(names.split_whitespace()).collect();
-    assert_eq!(names, Fault::KINDS);
+    assert_eq!(caught("(utf8->string #u8(255))"), r#"(not-utf8 "not utf8" ())"#);
 }
 
 #[test]

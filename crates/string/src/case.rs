@@ -29,6 +29,27 @@ pub fn foldcase<H: Host>(h: &H, s: H::Str) -> Res<H> {
     map_case(h, s, Case::Fold)
 }
 
+/// `c` in upper case, if that's one character, or else `c`, as R7RS's `char-upcase` maps it.
+pub fn upcase_char(c: char) -> char {
+    single(Case::Upper.map(c), c)
+}
+
+pub fn downcase_char(c: char) -> char {
+    single(Case::Lower.map(c), c)
+}
+
+/// `c` folded, as [`foldcase`] folds it, if that's one character, or else `c`.
+pub fn foldcase_char(c: char) -> char {
+    single(Case::Fold.map(c), c)
+}
+
+fn single(mut mapped: Mapped, c: char) -> char {
+    match (mapped.next(), mapped.next()) {
+        (Some(one), None) => one,
+        _ => c,
+    }
+}
+
 /// Orders `a` and `b` as their folds would be.
 pub fn compare_ci<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<Ordering, H::Error> {
     if a == b {

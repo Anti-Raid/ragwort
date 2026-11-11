@@ -485,6 +485,35 @@ fn shifts_and_bit_fields_are_charged_for_what_their_counts_make() {
     });
 }
 
+/// A bytevector whose bytes the host owns reads like any other, and is written to if the
+/// host gave a buffer.
+#[test]
+fn external_bytevectors_read_and_write_like_others() {
+    let mut arena = Arena::new(1 << 20, 0);
+    arena.mutate(|mc| {
+        let mut fuel = Fuel { run: u64::MAX, rest: 0 };
+        let h = ragwort_types::bytevector::Bytevectors::new(mc);
+        let text = "a message body from outside the arena, long enough to stay there: λ ".repeat(3);
+        let external = h.external(text.clone().into_bytes()).unwrap();
+        assert!(external.is_external());
+        let (external, copy) = (external.value(mc), h.from_slice(text.as_bytes()).unwrap().value(mc));
+        assert_eq!(Intrinsic::IsBytevector.run(mc, &[external], &mut fuel), Ok(Value::TRUE));
+        assert_eq!(Intrinsic::Equal.run(mc, &[external, copy], &mut fuel), Ok(Value::TRUE));
+        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[external, fix(2), Value::FALSE, fix(1)], &mut fuel), Ok(fix(109)));
+        assert_eq!(Intrinsic::BytevectorSet.run(mc, &[external, fix(0), fix(1), Value::FALSE, fix(1)], &mut fuel), Err(Fault::Immutable));
+        let strings = Strings::new(mc);
+        let all = Intrinsic::Utf8ToString.run(mc, &[external], &mut fuel).unwrap();
+        assert_eq!(string::display(&strings, strings.string(all).unwrap()).to_string(), text);
+        let part = Intrinsic::Utf8ToString.run(mc, &[external, fix(2), fix(9)], &mut fuel).unwrap();
+        assert_eq!(string::display(&strings, strings.string(part).unwrap()).to_string(), "message");
+        let shared = h.external_mutable(b"hello".to_vec()).unwrap().value(mc);
+        assert_eq!(Intrinsic::BytevectorSet.run(mc, &[shared, fix(0), fix(106), Value::FALSE, fix(1)], &mut fuel), Ok(Value::VOID));
+        assert_eq!(Intrinsic::BytevectorSet.run(mc, &[shared, fix(5), fix(1), Value::FALSE, fix(1)], &mut fuel), Err(Fault::OutOfRange));
+        let jello = Intrinsic::Utf8ToString.run(mc, &[shared], &mut fuel).unwrap();
+        assert_eq!(string::display(&strings, strings.string(jello).unwrap()).to_string(), "jello");
+    });
+}
+
 #[test]
 fn booleans_void_and_bytevectors() {
     let mut arena = Arena::new(1 << 20, 0);
