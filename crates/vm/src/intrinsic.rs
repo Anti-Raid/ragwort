@@ -17,6 +17,7 @@ use ragwort_types::syntax::Syntax;
 use ragwort_types::vector::{AnyVector, Vectors};
 
 use crate::op::Fuel;
+use crate::structs::{FieldFlags, TypeFlags};
 use crate::{Fault, coroutine, equal, prompts, structs, syntax};
 use crate::objects::{self, BoxFields, Condition, ConditionFields, KeywordProcedureFields, ModuleFields, MultiValue, MultiValueFields, StructFields, StructTypeFields, Tag, TaskFields};
 
@@ -377,31 +378,43 @@ named! {
         /// `(%keyword-procedure plain core keywords required)`: a keyword procedure, as a `lambda`
         /// with keyword parameters makes. See [`crate::keyword`].
         MakeKeywordProcedure = "%keyword-procedure",
-        /// `(make-struct-type name parent fields mutable identity?)`: a new struct type named by
-        /// the symbol `name`, whose structs have the fields the list `fields` names after those of
-        /// `parent`'s, its supertype, or `#f`. Each can be set if what's at its place in the list
-        /// `mutable` isn't `#f`. They're `equal?` only to themselves if `identity?` isn't `#f` or
-        /// the supertype's are. See [`crate::structs`].
+        /// `(make-struct-type name parent fields field-flags flags)`: a new struct type. See
+        /// [`crate::structs::make_type`] for the arguments.
         MakeStructType = "make-struct-type",
-        /// `(make-struct type v ...)`: a struct of the type, with the values as its fields, which
-        /// must be as many as it has.
+        /// `(make-struct type v ...)`: a new instance of the type. There must be one value for
+        /// each of the type's fields.
         MakeStruct = "make-struct",
-        /// `(struct? v)`: whether `v` is a struct, of any type.
+        /// `(struct? v)`: whether `v` is an instance of any struct type.
         IsStruct = "struct?",
-        /// `(struct-derived-from? v type)`: whether `v` is a struct of the type or of a subtype
-        /// of it.
+        /// `(struct-type? v)`: whether `v` is a struct type, as `struct:name` is.
+        IsStructType = "struct-type?",
+        /// `(struct-derived-from? v type)`: whether `v` is an instance of the type or of a
+        /// subtype of it.
         IsStructDerivedFrom = "struct-derived-from?",
-        /// `(struct-ref s type k)`: field `k` of `s`, a struct of the type, as `struct-fields`
-        /// numbers its fields.
+        /// `(struct-ref s type k)`: field `k` of `s`, which must be an instance of the type. `k`
+        /// is the position of the field's name in `(struct-fields type)`.
         StructRef = "struct-ref",
-        /// `(struct-set! s type k v)`: sets field `k` of `s`, a struct of the type, to `v`, if the
-        /// type says it can be set.
+        /// `(struct-set! s type k v)`: sets field `k` of `s`, which must be an instance of the
+        /// type, to `v`. It faults with `immutable` if the field is not mutable.
         StructSet = "struct-set!",
-        /// `(struct-fields type)`: a list of the names of the fields a struct of the type has, in
-        /// order, its supertype's first.
+        /// `(struct-fields type)`: the list of the type's field names, its supertype's first.
         StructFields = "struct-fields",
-        /// `(struct-field-mutable? type k)`: whether field `k` of a struct of the type can be set.
+        /// `(struct-field-mutable? type k)`: whether field `k` of the type is mutable.
         IsStructFieldMutable = "struct-field-mutable?",
+        /// `(struct-guarded? type)`: whether any field of the type is guarded.
+        IsStructGuarded = "struct-guarded?",
+        /// `(struct-field-guarded? type k)`: whether field `k` of the type is guarded. Unlike
+        /// `struct-field-guard`, its answer is fixed when the type is made.
+        IsStructFieldGuarded = "struct-field-guarded?",
+        /// `(struct-field-guard type k)`: the guard of field `k` of the type, or `#f` if the
+        /// field has none.
+        StructFieldGuard = "struct-field-guard",
+        /// `(struct-set-field-guard! type k guard)`: installs the procedure `guard` as the guard
+        /// of field `k`, a guarded field the type declares. A `struct` form does this once.
+        SetStructFieldGuard = "struct-set-field-guard!",
+        /// `(make-struct-guard-error type k v)`: the error object to raise when the guard of
+        /// field `k` of the type rejects `v`.
+        MakeStructGuardError = "make-struct-guard-error",
         /// `(procedure-keywords f)`: the keywords `f` requires and those it takes, as two sorted
         /// lists, both empty for a procedure without keyword parameters.
         ProcedureKeywords = "procedure-keywords",
@@ -586,9 +599,9 @@ impl Intrinsic {
             Intrinsic::StringJoin => None,
             Intrinsic::MakeKeywordProcedure | Intrinsic::StructSet => Some(4),
             Intrinsic::MakeStructType => Some(5),
-            Intrinsic::StructRef => Some(3),
-            Intrinsic::IsStructDerivedFrom | Intrinsic::IsStructFieldMutable => Some(2),
-            Intrinsic::IsStruct => Some(1),
+            Intrinsic::StructRef | Intrinsic::SetStructFieldGuard | Intrinsic::MakeStructGuardError => Some(3),
+            Intrinsic::IsStructDerivedFrom | Intrinsic::IsStructFieldMutable | Intrinsic::IsStructFieldGuarded | Intrinsic::StructFieldGuard => Some(2),
+            Intrinsic::IsStruct | Intrinsic::IsStructType | Intrinsic::IsStructGuarded => Some(1),
             Intrinsic::MakeStruct => None,
             Intrinsic::StructFields => Some(1),
             Intrinsic::ProcedureKeywords => Some(1),
@@ -678,8 +691,11 @@ impl Intrinsic {
                 | StringFind
                 | StringFindLast
                 | IsStruct
+                | IsStructType
                 | IsStructDerivedFrom
                 | IsStructFieldMutable
+                | IsStructGuarded
+                | IsStructFieldGuarded
                 | CharEq
                 | CharLt
                 | CharGt
@@ -794,6 +810,7 @@ impl Intrinsic {
                 | IsCoroutine
                 | IsErrorObject
                 | IsStruct
+                | IsStructType
                 | IsSyntax
                 | IsIdentifier
         )
@@ -804,7 +821,7 @@ impl Intrinsic {
     /// as `car` of a non-pair does, only changes which of them faults first.
     pub const fn is_reorderable(self) -> bool {
         use Intrinsic::*;
-        self.is_discardable() || matches!(self, Add | Sub | Mul | Car | Cdr | Caar | Cadr | Cdar | Cddr | Unbox | IsStructDerivedFrom | IsStructFieldMutable)
+        self.is_discardable() || matches!(self, Add | Sub | Mul | Car | Cdr | Caar | Cadr | Cdar | Cddr | Unbox | IsStructDerivedFrom | IsStructFieldMutable | IsStructGuarded | IsStructFieldGuarded)
     }
 
     /// Whether `self` is a type predicate: one of one argument, any value, that says what kind
@@ -838,6 +855,7 @@ impl Intrinsic {
                 | IsCoroutine
                 | IsErrorObject
                 | IsStruct
+                | IsStructType
         )
     }
 
@@ -940,6 +958,7 @@ impl Intrinsic {
                 | MakeStructType
                 | MakeStruct
                 | StructFields
+                | MakeStructGuardError
         )
     }
 
@@ -1011,15 +1030,27 @@ impl Intrinsic {
                 made(mc, fuel, Pairs::new(mc).list(&listed)?)
             }
             Intrinsic::IsStruct => boolean(arg(0).downcast::<objects::Struct>(mc).is_some()),
+            Intrinsic::IsStructType => boolean(arg(0).downcast::<objects::StructType>(mc).is_some()),
             Intrinsic::IsStructDerivedFrom => boolean(structs::of(mc, arg(0), structs::type_of(mc, arg(1))?).is_some()),
-            Intrinsic::IsStructFieldMutable => {
+            Intrinsic::IsStructFieldMutable | Intrinsic::IsStructFieldGuarded => {
                 let kind = structs::type_of(mc, arg(0))?;
                 let k = index(arg(1))?;
                 if k >= kind.fields(mc) as usize {
                     return Err(Fault::OutOfRange);
                 }
-                boolean(structs::is_mutable(mc, kind, k))
+                let asked = if self == Intrinsic::IsStructFieldMutable { FieldFlags::MUTABLE } else { FieldFlags::GUARDED };
+                boolean(structs::field_flags(mc, kind, k).contains(asked))
             }
+            Intrinsic::IsStructGuarded => boolean(structs::type_flags(mc, structs::type_of(mc, arg(0))?).contains(TypeFlags::GUARDED)),
+            Intrinsic::StructFieldGuard => structs::guard(mc, structs::type_of(mc, arg(0))?, index(arg(1))?)?,
+            Intrinsic::SetStructFieldGuard => {
+                if !is_procedure(mc, arg(2)) {
+                    return Err(Fault::WrongType);
+                }
+                structs::set_guard(mc, structs::type_of(mc, arg(0))?, index(arg(1))?, arg(2))?;
+                Value::VOID
+            }
+            Intrinsic::MakeStructGuardError => made(mc, fuel, structs::guard_error(mc, structs::type_of(mc, arg(0))?, index(arg(1))?, arg(2))?),
             Intrinsic::StructRef | Intrinsic::StructSet => {
                 let kind = structs::type_of(mc, arg(1))?;
                 let fields = structs::of(mc, arg(0), kind).ok_or(Fault::WrongType)?.items(mc);
@@ -1561,7 +1592,20 @@ impl Intrinsic {
             | Intrinsic::ImagPart
             | Intrinsic::Magnitude
             | Intrinsic::Angle => self.numeric(mc, arg, args, fuel)?,
-            Intrinsic::MakeStructType | Intrinsic::MakeStruct | Intrinsic::IsStruct | Intrinsic::IsStructDerivedFrom | Intrinsic::StructRef | Intrinsic::StructSet | Intrinsic::StructFields | Intrinsic::IsStructFieldMutable => {
+            Intrinsic::MakeStructType
+            | Intrinsic::MakeStruct
+            | Intrinsic::IsStruct
+            | Intrinsic::IsStructType
+            | Intrinsic::IsStructDerivedFrom
+            | Intrinsic::StructRef
+            | Intrinsic::StructSet
+            | Intrinsic::StructFields
+            | Intrinsic::IsStructFieldMutable
+            | Intrinsic::IsStructGuarded
+            | Intrinsic::IsStructFieldGuarded
+            | Intrinsic::StructFieldGuard
+            | Intrinsic::SetStructFieldGuard
+            | Intrinsic::MakeStructGuardError => {
                 self.structs(mc, arg, args, fuel)?
             }
             Intrinsic::IsCharAlphabetic

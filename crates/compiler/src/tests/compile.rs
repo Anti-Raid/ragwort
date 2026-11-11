@@ -1318,13 +1318,23 @@ fn modules_export_what_code_that_requires_them_needs() {
             ("car-cons", lambda(&[], Some(0), prim(Car, vec![spread(Cons)])), false),
             ("counter", q(0), true),
             ("five", q(5), false),
-            // Not closed: it refers to a variable of its module's.
+            // It refers to a variable of its module's that nothing assigns, which is its value.
             ("first", lambda(&[0], None, add(var(0), slot(4))), false),
+            // And this to one the module assigns, which it has to read where it's called.
+            ("counted", lambda(&[0], None, add(var(0), slot(3))), false),
+            // A call of a procedure it's given, or of one in such a variable.
+            ("applied", lambda(&[0, 1], None, Core::App(Box::new(var(0)), vec![var(1), slot(4)])), false),
         ]);
         let interface = ragwort_compiler_interface(mc, lib);
         assert!(interface.get("sum").unwrap().inline.is_some());
         assert!(interface.get("counter").unwrap().mutable && interface.get("counter").unwrap().inline.is_none());
-        assert!(interface.get("first").unwrap().inline.is_none() && interface.get("nothing").is_none());
+        assert!(interface.get("first").unwrap().inline.is_some() && interface.get("applied").unwrap().inline.is_some());
+        assert!(interface.get("counted").unwrap().inline.is_none() && interface.get("nothing").is_none());
+        // The inlined call of a procedure value calls it, with the variable's value.
+        let sum = imported(mc, lib, "sum").reference(mc).unwrap();
+        let applied = imported(mc, lib, "applied").call(mc, vec![sum, q(2)], &mut fresher()).unwrap();
+        assert!(matches!(&applied, Core::App(..)), "{applied:?}");
+        assert_eq!(run_to_end(mc, compile(mc, None, &applied).unwrap()), Ok(fix(7)));
         // An inlined call does what the call would.
         let mut fresh = fresher();
         for (name, want) in [("sum", fix(7)), ("sum-not", Value::FALSE), ("car-cons", fix(3)), ("first", fix(8))] {
@@ -1522,6 +1532,8 @@ fn reads_of_constant_vectors_fold() {
             (IsSyntax, IsNumber),
             (Intrinsic::IsStruct, IsPair),
             (IsVector, Intrinsic::IsStruct),
+            (Intrinsic::IsStructType, Intrinsic::IsStruct),
+            (Intrinsic::IsStruct, Intrinsic::IsStructType),
         ] {
             assert_eq!(asked_in(mc, when(is(known), is(asked), q(0)), asked), 0, "{asked:?} under {known:?}");
         }

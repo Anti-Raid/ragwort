@@ -9,7 +9,8 @@ use ragwort_types::string::{self, Strings};
 use ragwort_types::vector::{AnyVector, Vectors};
 
 use crate::Fault;
-use crate::objects::{self, BoxFields, StructFields, StructTypeFields};
+use crate::objects::{self, BoxFields, StructFields};
+use crate::structs::{self, TypeFlags};
 
 /// How many values `equal?` compares for each unit of fuel it spends.
 pub(crate) const PER_FUEL: u64 = 1024;
@@ -155,7 +156,7 @@ impl<'gc> Compound<'gc> {
         }
         // A struct of an identity type is `equal?` only to itself.
         if let Some(made) = v.downcast::<objects::Struct>(mc) {
-            return made.kind(mc).is_some_and(|kind| !kind.identity(mc)).then_some(Compound::Struct(made));
+            return made.kind(mc).is_some_and(|kind| !structs::type_flags(mc, kind).contains(TypeFlags::IDENTITY)).then_some(Compound::Struct(made));
         }
         v.downcast::<objects::Box>(mc).map(Compound::Box)
     }

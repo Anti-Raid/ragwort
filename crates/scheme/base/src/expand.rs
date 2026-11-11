@@ -20,7 +20,7 @@ use ragwort_vm::objects::Module;
 
 use crate::formals::{CoreAt, KeywordDef};
 use crate::scope::{BASE, Map, Op, Scope, Set, TOP};
-use crate::structs::{Info, Local};
+use crate::structs::{Info, Local, LocalItem};
 use crate::tree::{Stx, Tree, View};
 use crate::{ExpandError, ExpandErrorKind};
 
@@ -217,7 +217,8 @@ enum TopForm {
     Define(u32, Stx),
     /// A definition of a keyword procedure: its variable's slot, its core's, and its `lambda`.
     DefineKeyword { procedure: u32, core: u32, lambda: Stx },
-    Struct(Declared),
+    /// A struct form, and its guard expressions, each with its field's index.
+    Struct(Declared, Vec<(u32, Stx)>),
     Expr(Stx),
 }
 
@@ -393,7 +394,8 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 Head::Begin(forms) => queue.extend(forms.into_iter().rev()),
                 Head::Struct(form) => {
                     let index = u32::try_from(out.len()).ok().and_then(|n| first.checked_add(n)).ok_or_else(|| self.error(OutOfMemory, form))?;
-                    out.push(Top(TopForm::Struct(self.declare_struct(form, index)?)));
+                    let (declared, guards) = self.declare_struct(form, index)?;
+                    out.push(Top(TopForm::Struct(declared, guards)));
                 }
                 Head::Expr(e) => out.push(Top(TopForm::Expr(e))),
             }
@@ -538,7 +540,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 self.defining = None;
                 made
             }
-            TopForm::Struct(declared) => Ok(self.lower_struct(declared)),
+            TopForm::Struct(declared, guards) => self.lower_struct(declared, guards),
             TopForm::Expr(e) => self.expand_now(e),
         }
     }
@@ -797,7 +799,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 }
                 Binding::Local(var) => {
                     def = self.keyword_defs.get(&var).cloned();
-                    if let Some(Local::Procedure(inline, kind)) = self.struct_locals.get(&var) {
+                    if let Some(Local::Procedure(Some(inline), kind)) = self.struct_locals.get(&var) {
                         of_struct = Some(structs::Call::new(inline.clone(), Core::Ref(Place::Local(*kind)), None));
                     }
                 }
@@ -858,7 +860,10 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     fn reference(&mut self, id: Stx) -> Result<Ex<'a, 'gc>, ExpandError> {
         let place = match self.resolve(id)? {
             Binding::Local(var) => Place::Local(var),
-            Binding::Slot(slot) => self.builder.place(slot, self.form, self.defining),
+            Binding::Slot(slot) => match self.builder.constant(slot, self.form) {
+                Some(value) => return Ok(Step::Done(Core::Quote(value))),
+                None => self.builder.place(slot, self.form, self.defining),
+            },
             Binding::Import(import) => return import.reference(self.mc).map(Step::Done).map_err(|Uninitialized| self.error(ExpandErrorKind::Unbound, id)),
             Binding::Free => return Err(self.error(ExpandErrorKind::Unbound, id)),
             Binding::Macro(m) => return Ok(Step::Tail(Call::Expr(self.expand_macro(m, id)?))),
@@ -1007,10 +1012,16 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 Head::Require(form) | Head::Provide(form) => return Err(self.error(ExpandErrorKind::Definition, form)),
                 Head::Begin(forms) => s.queue.extend(forms.into_iter().rev()),
                 Head::Struct(form) => {
-                    for (id, var, value) in self.local_struct(form)? {
-                        s.defined.push(id);
-                        s.names.push(id);
-                        s.items.push(Item::Made(var, value));
+                    for item in self.local_struct(form)? {
+                        match item {
+                            LocalItem::Defined(id, var, value) => {
+                                s.defined.push(id);
+                                s.names.push(id);
+                                s.items.push(Item::Made(var, value));
+                            }
+                            LocalItem::Evaluated(var, expr) => s.items.push(Item::Define(var, expr)),
+                            LocalItem::Run(code) => s.items.push(Item::Made(self.fresh(), code)),
+                        }
                     }
                 }
                 Head::Expr(e) => s.items.push(Item::Expr(e)),

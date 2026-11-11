@@ -6,10 +6,12 @@
 //! `quasiquote`, `guard`, `syntax-rules` and `with-syntax` are macros written in Rust, which
 //! expand hygienically by sets of scopes, as the code's own do.
 //!
-//! `struct` defines a type of struct and its procedures, as Racket's `struct` does: see
-//! [`structs`]. A struct is written with its fields, and is `equal?` to another of its type with
-//! `equal?` fields, or only to itself if its type is declared `#:identity-eq?`. A type can have
-//! subtypes. `match` takes structs apart and `struct-copy` copies them.
+//! `struct` defines a struct type, as Racket's `struct` does: `(struct point (x y))` defines the
+//! constructor `point`, the predicate `point?` and the accessors `point-x` and `point-y`. A
+//! struct is printed with its fields. Two instances of one type are `equal?` when their fields
+//! are, unless the type is declared `#:identity-eq?`. A struct type can have subtypes, `match`
+//! takes a struct apart, and `struct-copy` copies one with some fields changed. The `structs`
+//! module's documentation describes the form in full.
 //!
 //! The code defines macros with `define-syntax`, `let-syntax` and `letrec-syntax`, as R6RS has
 //! them: a transformer is a procedure of the syntax of a use, which `syntax-case` takes apart

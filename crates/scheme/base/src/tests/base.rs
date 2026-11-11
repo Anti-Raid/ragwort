@@ -830,6 +830,85 @@ fn structs_equal_only_to_themselves() {
 }
 
 #[test]
+fn struct_fields_are_guarded() {
+    let account = "(struct account (id [balance #:mutable #:guard (lambda (v) (and (number? v) (>= v 0)))] [owner #:guard string?]))";
+    let caught = |body: &str| eval(&format!("{account} (guard (e (#t (list (error-object-kind e) (error-object-message e) (error-object-irritants e)))) {body})"));
+    assert_eq!(eval(&format!("{account} (define a (account 1 10 \"al\")) (set-account-balance! a 25) (list a (account-balance a))")), "(#(struct:account 1 25 \"al\") 25)");
+    // The constructor, the setter, and making and setting by the type all call the guard.
+    assert_eq!(caught("(account 1 -5 \"al\")"), r#"(error "struct account: the guard of field balance rejected" (-5))"#);
+    assert_eq!(caught("(account 1 5 'al)"), r#"(error "struct account: the guard of field owner rejected" (al))"#);
+    assert_eq!(caught("(set-account-balance! (account 1 5 \"al\") 'lots)"), r#"(error "struct account: the guard of field balance rejected" (lots))"#);
+    assert_eq!(caught("(make-struct struct:account 1 -1 \"al\")"), r#"(error "struct account: the guard of field balance rejected" (-1))"#);
+    assert_eq!(caught("(struct-set! (account 1 5 \"al\") struct:account 1 -1)"), r#"(error "struct account: the guard of field balance rejected" (-1))"#);
+    assert_eq!(caught("(struct-copy account (account 1 5 \"al\") [balance -2])"), r#"(error "struct account: the guard of field balance rejected" (-2))"#);
+    assert_eq!(caught("(apply account '(1 -5 \"al\"))"), r#"(error "struct account: the guard of field balance rejected" (-5))"#);
+    let fine = format!("{account} (define a (make-struct struct:account 1 2 \"al\")) (struct-set! a struct:account 1 30)
+                        (list a (struct-copy account a [owner \"bo\"]) (map account-id (list a)))");
+    assert_eq!(eval(&fine), r#"(#(struct:account 1 30 "al") #(struct:account 1 30 "bo") (1))"#);
+    // Making and setting by the type still fail as they do without guards.
+    assert_eq!(eval_in(&mut arena(), &format!("{account} (make-struct struct:account 1 2)")), Ok(Err(Fault::Arity)));
+    assert_eq!(eval_in(&mut arena(), &format!("{account} (struct-set! (account 1 2 \"al\") struct:account 2 \"bo\")")), Ok(Err(Fault::Immutable)));
+    assert_eq!(eval_in(&mut arena(), &format!("{account} (struct-set! (account 1 2 \"al\") struct:account 3 0)")), Ok(Err(Fault::OutOfRange)));
+    // A subtype's constructor calls the guards of the fields it inherits, and its own.
+    let savings = format!("{account} (struct savings account ([rate #:guard real?]))");
+    assert_eq!(eval(&format!("{savings} (savings 1 10 \"al\" 0.5)")), r#"#(struct:savings 1 10 "al" 0.5)"#);
+    let caught_sub = |body: &str| eval(&format!("{savings} (guard (e (#t (error-object-message e))) {body})"));
+    assert_eq!(caught_sub("(savings 1 -10 \"al\" 0.5)"), r#""struct savings: the guard of field balance rejected""#);
+    assert_eq!(caught_sub("(savings 1 10 \"al\" 'high)"), r#""struct savings: the guard of field rate rejected""#);
+    assert_eq!(caught_sub("(set-account-balance! (savings 1 10 \"al\" 0.5) -1)"), r#""struct account: the guard of field balance rejected""#);
+    assert_eq!(caught_sub("(make-struct struct:savings 1 10 \"al\" 'high)"), r#""struct savings: the guard of field rate rejected""#);
+    // The guard is evaluated once, when the form runs, and called with each value in order.
+    let order = "(define log '()) (define (note x) (set! log (cons x log)) #t)
+                 (struct pair2 ([a #:guard (begin (note 'made-a) note)] [b #:guard (begin (note 'made-b) note)]))
+                 (pair2 1 2) (pair2 3 4) (reverse log)";
+    assert_eq!(eval(order), "(made-a made-b 1 2 3 4)");
+    // In a body, each run of the body makes the type and its guards again.
+    let local = "(define (accepts? make v) (guard (e (#t #f)) (make v) #t))
+                 (define (make limit) (struct capped ([n #:guard (lambda (v) (< v limit))])) capped)
+                 (list (accepts? (make 10) 5) (accepts? (make 3) 5))";
+    assert_eq!(eval(local), "(#t #f)");
+    let cell = "(define (f) (struct cell ([v #:mutable #:guard number?])) (define c (cell 1)) (set-cell-v! c 2) (guard (e (#t (list c 'rejected))) (set-cell-v! c 'x))) (f)";
+    assert_eq!(eval(cell), "(#(struct:cell 2) rejected)");
+    // The guards can be asked of the type.
+    let asked = format!("{account} (struct plain (x))
+        (list (struct-guarded? struct:account) (struct-guarded? struct:plain) (struct-field-guard struct:account 0) (eq? (struct-field-guard struct:account 2) string?)
+              ((struct-field-guard struct:account 1) 5) ((struct-field-guard struct:account 1) -5)
+              (let ((e (make-struct-guard-error struct:account 2 'x))) (list (error-object? e) (error-object-message e) (error-object-irritants e))))");
+    assert_eq!(eval(&asked), r#"(#t #f #f #t #t #f (#t "struct account: the guard of field owner rejected" (x)))"#);
+    // A guard is installed once, by its form, and only for a field declared with one.
+    for (again, fault) in [
+        ("(struct-set-field-guard! struct:account 1 number?)", Fault::Immutable),
+        ("(struct-set-field-guard! struct:account 0 number?)", Fault::WrongType),
+        ("(struct-set-field-guard! struct:account 3 number?)", Fault::OutOfRange),
+        ("(struct-field-guard struct:account 3)", Fault::OutOfRange),
+        ("(struct-guarded? 5)", Fault::WrongType),
+    ] {
+        assert_eq!(eval_in(&mut arena(), &format!("{account} {again}")), Ok(Err(fault)), "{again}");
+    }
+    // A guard that isn't a procedure is an error when the form runs.
+    assert_eq!(eval_in(&mut arena(), "(struct bad ([x #:guard 5]))"), Ok(Err(Fault::WrongType)));
+    for (bad, at) in [
+        ("(struct p ([x #:guard]))", "[x #:guard]"),
+        ("(struct p ([x #:guard a #:guard b]))", "[x #:guard a #:guard b]"),
+        ("(struct p ([x #:nope]))", "[x #:nope]"),
+    ] {
+        assert_eq!(error(bad), (ExpandErrorKind::BadSyntax, at), "{bad}");
+    }
+    // A guarded procedure is still one of the form's, which can't be assigned.
+    assert_eq!(error("(struct p ([x #:guard number?])) (set! p car)"), (ExpandErrorKind::Immutable, "p"));
+    assert_eq!(error("(define (f) (struct p ([x #:guard number?])) (set! p car) 1)"), (ExpandErrorKind::Immutable, "p"));
+}
+
+#[test]
+fn sealed_structs_have_no_subtypes() {
+    let sealed = "(struct leaf (v) #:sealed) (struct node (l r)) (struct last node (x) #:sealed) (list (leaf 1) (last 1 2 3) (node? (last 1 2 3)))";
+    assert_eq!(eval(sealed), "(#(struct:leaf 1) #(struct:last 1 2 3) #t)");
+    assert_eq!(error("(struct leaf (v) #:sealed) (struct more leaf (w))"), (ExpandErrorKind::BadSyntax, "leaf"));
+    assert_eq!(error("(define (f) (struct leaf (v) #:sealed) (struct more leaf (w)) 1)"), (ExpandErrorKind::BadSyntax, "leaf"));
+    assert_eq!(error("(struct leaf (v) #:sealed #:what)"), (ExpandErrorKind::BadSyntax, "#:what"));
+}
+
+#[test]
 fn structs_in_bodies() {
     // Each time the body runs makes a new type.
     let made = "(define (make) (struct cell (v)) (cons (cell 1) cell?))
@@ -896,6 +975,9 @@ fn structs_by_their_types() {
     let any = format!("{shapes} (list (struct? (point 1 2)) (struct? (point3 1 2 3)) (struct? (session 1 2)) (struct? struct:point) (struct? 5) (struct? (vector 1)) (struct? point)
                                   (map struct? (list (point 1 2) 'a)))");
     assert_eq!(eval(&any), "(#t #t #t #f #f #f #f (#t #f))");
+    let types = format!("{shapes} (list (struct-type? struct:point) (struct-type? struct:point3) (struct-type? (point 1 2)) (struct-type? point) (struct-type? 'point)
+                                    (let () (struct cell (v)) (struct-type? struct:cell)))");
+    assert_eq!(eval(&types), "(#t #t #f #f #f #t)");
     // A mutable field is set by its type too, and no other is.
     let cells = "(struct cell (label [value #:mutable])) (struct cell3 cell (extra) #:mutable)";
     let set = format!("{cells} (define c (cell3 'a 1 2)) (struct-set! c struct:cell 1 10) (struct-set! c struct:cell3 2 20) (list c (cell-value c))");

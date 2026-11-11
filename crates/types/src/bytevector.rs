@@ -1,12 +1,18 @@
-//! Bytevectors, of fixed length, their bytes packed eight to a word. A [`Bytevector`] can be
-//! written to; an immutable one, such as a literal, can only be read. An external one's bytes
-//! the program running the arena made and gave it, a buffer of them if it's one that's
-//! written to. [`AnyBytevector`] reads any of them.
+//! Bytevectors. A bytevector's length is fixed when it is made. [`AnyBytevector`] reads any of
+//! the three kinds:
 //!
-//! External bytes are an [`ExternalBuffer`], for a bytevector that's only read, or an
-//! [`ExternalBufferMut`], for one that's written to. A type that's one promises what the arena
-//! relies on and can't check: that the bytes' number never changes, and for an
-//! [`ExternalBuffer`], that their values don't either.
+//! - [`Bytevector`]: writable. Its bytes are in the arena, packed eight to a word, or in a
+//!   buffer the host handed over.
+//! - [`ImmutableBytevector`]: read-only and in the arena, such as a literal.
+//! - [`ExternalBytevector`]: read-only, with bytes the host owns.
+//!
+//! # External bytes
+//!
+//! The host passes external bytes as an [`ExternalBuffer`], for a read-only bytevector, or an
+//! [`ExternalBufferMut`], for a writable one. The arena relies on two promises it cannot check:
+//!
+//! - The number of bytes never changes.
+//! - For an [`ExternalBuffer`], the values of the bytes never change either.
 
 use std::borrow::Cow;
 use std::cell::{RefCell, RefMut};
@@ -106,21 +112,35 @@ impl<'gc> Bytevector<'gc> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ImmutableBytevector<'gc>(Gc<'gc, objects::ImmutableBytevector>);
 
-/// Bytes kept outside the arena, for a bytevector that's only read: what gives them, the same
-/// ones each time.
+/// Bytes the host owns, for a read-only bytevector.
 ///
-/// A type that's one promises that the bytes never change while it lives, in number or in value,
-/// as a literal's don't: code that has read them may keep what it read. So one that shares them,
-/// as an `Arc<[u8]>` does, is one whose other holders can't write to them, and bytes something
-/// else can change, such as a file mapped into memory, aren't one. Breaking the promise makes
-/// the bytevector read wrongly; it reads no more bytes than there were when it was made.
+/// Implementing this trait is a promise that, for as long as the value lives:
+///
+/// - `as_ref` returns the same bytes on every call;
+/// - the number of bytes never changes;
+/// - the value of each byte never changes.
+///
+/// Code that has read the bytes may keep what it read, as it would for a literal. So the trait
+/// is not for bytes that something else can change, such as a file mapped into memory, or for a
+/// shared owner whose other holders can write to them.
+///
+/// Breaking the promise makes the bytevector return wrong data. It cannot cause memory
+/// unsafety: the bytevector never reads past the length it had when it was made.
+///
+/// The trait is implemented here for the standard owners. A host wraps any other type, such as
+/// `bytes::Bytes`, in a type of its own and implements the trait for that.
 pub trait ExternalBuffer: AsRef<[u8]> + 'static {}
 
-/// A buffer kept outside the arena, for a bytevector that's written to: what gives its bytes,
-/// the same ones each time.
+/// A buffer the host hands over, for a writable bytevector. The arena owns it from then on.
 ///
-/// A type that's one promises that the number of bytes never changes while it lives, as a
-/// bytevector's length doesn't, and that nothing else writes them: the arena owns the buffer.
+/// Implementing this trait is a promise that, for as long as the value lives:
+///
+/// - `as_mut` returns the same bytes on every call;
+/// - the number of bytes never changes;
+/// - nothing but the bytevector writes to them.
+///
+/// The trait is implemented here for the standard buffers. A host wraps any other type, such
+/// as `bytes::BytesMut`, in a type of its own and implements the trait for that.
 pub trait ExternalBufferMut: AsMut<[u8]> + 'static {}
 
 impl ExternalBuffer for Vec<u8> {}
@@ -335,8 +355,12 @@ impl<'a, 'gc> Bytevectors<'a, 'gc> {
         Ok(AnyBytevector::Immutable(ImmutableBytevector(v)))
     }
 
-    /// A bytevector of bytes kept outside the arena, such as a `Vec<u8>` or an `Arc<[u8]>`, which
-    /// can't be written to. The arena is charged for them until nothing reaches it.
+    /// Makes a read-only bytevector whose bytes stay in `bytes`, outside the arena.
+    ///
+    /// - Fewer than 64 bytes are copied into the arena instead, as an ordinary immutable
+    ///   bytevector.
+    /// - The arena's budget is charged for the bytes until the bytevector is collected, which
+    ///   drops `bytes`.
     pub fn external(&self, bytes: impl ExternalBuffer) -> Result<AnyBytevector<'gc>, OutOfMemory> {
         let len = bytes.as_ref().len();
         if len < COPY_EXTERNAL {
@@ -347,9 +371,12 @@ impl<'a, 'gc> Bytevectors<'a, 'gc> {
         Ok(AnyBytevector::External(ExternalBytevector(v)))
     }
 
-    /// A bytevector of a buffer kept outside the arena, such as a `Vec<u8>`, which can be written
-    /// to, however short it is, and is as long as the buffer is now. The buffer is the arena's
-    /// from here on, which is charged for its bytes until nothing reaches it.
+    /// Makes a writable bytevector over `buffer`, which the arena takes ownership of.
+    ///
+    /// - The bytevector's length is the buffer's length now, and never changes.
+    /// - The buffer is never copied, however short it is.
+    /// - The arena's budget is charged for the bytes until the bytevector is collected, which
+    ///   drops the buffer.
     pub fn external_mutable(&self, mut buffer: impl ExternalBufferMut) -> Result<Bytevector<'gc>, OutOfMemory> {
         let len = buffer.as_mut().len();
         let buffer: RefCell<Box<dyn ExternalBufferMut>> = RefCell::new(Box::new(buffer));

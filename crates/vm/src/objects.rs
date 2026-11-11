@@ -133,14 +133,21 @@ objects! {
     /// What a `lambda` with keyword parameters makes: see [`crate::keyword`]. `keywords` are
     /// the ones it takes and `required` the ones it needs, as sorted lists.
     pub struct KeywordProcedure { plain: Value, core: Value, keywords: Value, required: Value }
-    /// A struct type, as `struct` makes one: see [`crate::structs`]. `name` is a symbol, `names`
-    /// an immutable vector of its fields' names, its supertype's first, `fields` how many there
-    /// are, `mutable` an immutable bytevector with a byte for each, 1 if it can be set, and its
-    /// items are its supertypes, the outermost first. If it's an `identity` one, its structs
-    /// are `equal?` only to themselves.
-    pub struct StructType { name: Value, names: Value, mutable: Value, fields: u32, identity: bool } items Value
-    /// A struct: the type it was made as, and its fields. It's written with them, and `equal?`
-    /// to another of its type with `equal?` fields, unless its type is an identity one.
+    /// A struct type: see [`crate::structs`].
+    ///
+    /// - `name`: the type's name, a symbol.
+    /// - `names`: an immutable vector of the field names, the supertype's first.
+    /// - `field_flags`: an immutable bytevector with one byte per field, the bits of its
+    ///   [`FieldFlags`](crate::structs::FieldFlags).
+    /// - `guards`: `#f` if the type declares no guarded field. Otherwise a vector with one
+    ///   entry per field, holding the guard of each guarded field the type itself declares once
+    ///   its form has installed it, and `#f` everywhere else.
+    /// - `fields`: how many fields there are.
+    /// - `flags`: the bits of its [`TypeFlags`](crate::structs::TypeFlags).
+    /// - The items are the supertypes, outermost first.
+    pub struct StructType { name: Value, names: Value, field_flags: Value, guards: Value, fields: u32, flags: u32 } items Value
+    /// An instance of a struct type. `kind` is the type it was created with, and the items are
+    /// its fields.
     pub struct Struct { kind: Member<StructType> } items Value
     /// What a frame's code keeps past its registers, which `NewSpill` makes and `LoadSpill` and
     /// `StoreSpill` read and write. Each slot holds one value for one stretch of the code.

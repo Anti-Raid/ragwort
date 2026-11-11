@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use ragwort_compiler::keyword::{self, CallShape, Fresh};
 use ragwort_compiler::module::{Binding, Field, Filter, Import, ModuleBuilder, ModuleError, RequireSpec, Resolver, SpecError, Uninitialized};
 use ragwort_compiler::steps::{self, Step};
-use ragwort_compiler::structs::{self, Declared, Member};
+use ragwort_compiler::structs::{self, Declaration, Declared, Member};
 use ragwort_compiler::{Core, Lambda, Place, Prim, Var};
 use ragwort_types::Error;
 use ragwort_types::gc::{Mutation, OutOfMemory, Value};
@@ -14,6 +14,7 @@ use ragwort_types::string::{Strings, chars};
 use ragwort_types::symbol::{Keyword, Symbol, Symbols};
 use ragwort_types::vector::Vectors;
 use ragwort_types::syntax::{Abbreviation, Syntax, SyntaxKind};
+use ragwort_vm::structs::TypeFlags;
 use ragwort_vm::{Fault, HostDef, Intrinsic, Read, Request};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,8 +127,9 @@ pub struct Lowerer<'a, 'gc> {
     symbols: Symbols<'gc>,
     /// The `%provide`s, which name what the module defines anywhere.
     provides: Vec<Syntax<'gc>>,
-    /// The struct forms declared, by which top-level form each is, till they're lowered.
-    structs: HashMap<u32, Declared>,
+    /// The struct forms declared, by which top-level form each is, till they're lowered, each
+    /// with its guard expressions and their fields' indexes.
+    structs: HashMap<u32, (Declared, Vec<(u32, Syntax<'gc>)>)>,
     /// The top-level form being lowered, and the variable whose lambda it's in, if it's one.
     top: u32,
     defining: Option<u32>,
@@ -253,9 +255,11 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         match self.head(node) {
             Some(Form::Require | Form::Provide) => Ok(None),
             Some(Form::Struct) => {
-                let declared = self.structs.remove(&top).expect("a declared struct");
-                let (_, kind) = builder.struct_def(declared.constructor()).expect("a declared struct");
-                Ok(Some(declared.define(kind, self)))
+                let (declared, guards) = self.structs.remove(&top).expect("a declared struct");
+                let guards = guards.into_iter().map(|(k, guard)| Ok((k, self.expr(builder, guard)?))).collect::<Result<Vec<_>, LowerError>>()?;
+                let (def, kind) = builder.struct_def(declared.constructor()).expect("a declared struct");
+                let fields = def.fields.to_vec();
+                Ok(Some(declared.define(kind, &fields, guards, self)))
             }
             Some(Form::Define) => {
                 let items = self.list(node)?;
@@ -276,10 +280,11 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
     }
 
     /// Declares what a `%struct` form defines: `node`, whose parts after its head are `parts`,
-    /// the module's top-level form `top`. It's written
-    /// as Scheme's `struct` is, and defines what that does, as [`structs`] says: `(%struct name
-    /// (field ...) option ...)`, with a supertype's name before the fields for a subtype of it.
-    fn declare_struct(&mut self, builder: &mut ModuleBuilder<'gc>, node: Syntax<'gc>, parts: &[Syntax<'gc>], top: u32) -> Result<Declared, LowerError> {
+    /// the module's top-level form `top`. It's written as Scheme's `struct` is, and defines what
+    /// that does, as [`structs`] says: `(%struct name (field ...) option ...)`, with a
+    /// supertype's name before the fields for a subtype of it. It gives the form's guard
+    /// expressions too, each with its field's index.
+    fn declare_struct(&mut self, builder: &mut ModuleBuilder<'gc>, node: Syntax<'gc>, parts: &[Syntax<'gc>], top: u32) -> Result<(Declared, Vec<(u32, Syntax<'gc>)>), LowerError> {
         let bad = LowerErrorKind::BadShape;
         let is_name = |node: &Syntax<'gc>| node.kind(self.mc) == Some(SyntaxKind::Identifier);
         let option = |node: Syntax<'gc>| self.keyword(node).map(|k| chars(&self.strings, k.symbol(self.mc).name(self.mc)).collect::<String>());
@@ -291,24 +296,33 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             parent = Some(next);
             next = rest.next().ok_or_else(|| self.error(bad, node))?;
         }
-        let mut own = Vec::new();
+        // Each field the form declares: its name, whether it's mutable, and its guard.
+        let mut own: Vec<(Syntax<'gc>, bool, Option<Syntax<'gc>>)> = Vec::new();
         for spec in self.list(next)? {
             if is_name(&spec) {
-                own.push((spec, false));
+                own.push((spec, false, None));
                 continue;
             }
-            match *self.list(spec)?.as_slice() {
-                [id] if is_name(&id) => own.push((id, false)),
-                [id, mutable] if is_name(&id) && option(mutable).as_deref() == Some("mutable") => own.push((id, true)),
-                _ => return Err(self.error(bad, spec)),
+            let written = self.list(spec)?;
+            let mut options = written.iter().copied();
+            let Some(id) = options.next().filter(is_name) else { return Err(self.error(bad, spec)) };
+            let (mut mutable, mut guard) = (false, None);
+            while let Some(at) = options.next() {
+                match option(at).as_deref() {
+                    Some("mutable") => mutable = true,
+                    Some("guard") if guard.is_none() => guard = Some(options.next().ok_or_else(|| self.error(bad, spec))?),
+                    _ => return Err(self.error(bad, spec)),
+                }
             }
+            own.push((id, mutable, guard));
         }
-        self.distinct(&own.iter().map(|&(id, _)| id).collect::<Vec<_>>())?;
-        let (mut constructors, mut identity) = (Vec::new(), false);
+        self.distinct(&own.iter().map(|&(id, ..)| id).collect::<Vec<_>>())?;
+        let (mut constructors, mut flags) = (Vec::new(), TypeFlags::empty());
         while let Some(at) = rest.next() {
             match option(at).as_deref() {
-                Some("mutable") => own.iter_mut().for_each(|(_, mutable)| *mutable = true),
-                Some("identity-eq?") => identity = true,
+                Some("mutable") => own.iter_mut().for_each(|(_, mutable, _)| *mutable = true),
+                Some("identity-eq?") => flags |= TypeFlags::IDENTITY,
+                Some("sealed") => flags |= TypeFlags::SEALED,
                 Some("transparent") => {}
                 Some("constructor-name" | "extra-constructor-name") => {
                     let Some(id) = rest.next().filter(is_name) else { return Err(self.error(bad, at)) };
@@ -317,7 +331,8 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
                 _ => return Err(self.error(bad, at)),
             }
         }
-        // The supertype is a struct type the module defines or requires, by its constructor.
+        // The supertype is a struct type the module defines or requires, by its constructor,
+        // that isn't sealed.
         let (above, mut fields) = match parent {
             None => (Value::FALSE, Vec::new()),
             Some(id) => {
@@ -327,18 +342,22 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
                     None => None,
                 };
                 match def {
-                    Some((def, kind)) => (kind, def.fields.into_vec()),
-                    None => return Err(self.error(bad, id)),
+                    Some((def, kind)) if !def.sealed => (kind, def.fields.into_vec()),
+                    _ => return Err(self.error(bad, id)),
                 }
             }
         };
         let inherited = fields.len();
-        for &(id, mutable) in &own {
-            fields.push(Field { name: self.identifier(id)?.into(), mutable });
+        let mut guards = Vec::new();
+        for &(id, mutable, guard) in &own {
+            if let Some(guard) = guard {
+                guards.push((u32::try_from(fields.len()).map_err(|_| self.error(OutOfMemory, id))?, guard));
+            }
+            fields.push(Field { name: self.identifier(id)?.into(), mutable, guarded: guard.is_some() });
         }
         let named = structs::members(&self.identifier(name)?, &fields[inherited..], inherited).ok_or_else(|| self.error(OutOfMemory, node))?;
-        let names: Vec<(Value<'gc>, bool)> = own.iter().map(|&(id, mutable)| (id.datum(self.mc), mutable)).collect();
-        let kind = structs::make_type(self.mc, name.datum(self.mc), above, &names, identity).map_err(|fault| match fault {
+        let declared: Vec<Declaration<'gc>> = own.iter().map(|&(id, mutable, guard)| Declaration { name: id.datum(self.mc), mutable, guarded: guard.is_some() }).collect();
+        let kind = structs::make_type(self.mc, name.datum(self.mc), above, &declared, flags).map_err(|fault| match fault {
             Fault::OutOfMemory => self.error(OutOfMemory, node),
             _ => self.error(bad, node),
         })?;
@@ -346,14 +365,14 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         for (text, member) in named {
             let symbol = self.symbols.intern_str(&self.strings, &text).map_err(|e| self.error(e, node))?;
             members.push((builder.define(symbol.value(self.mc), top).map_err(|e| self.module_error(e, name))?, member));
-            // The constructors of other names go after the one named for the type.
+            // The constructors of other names go after the one that has the struct's name.
             if member == Member::Make {
                 for &id in &constructors {
                     members.push((builder.define(id.datum(self.mc), top).map_err(|e| self.module_error(e, id))?, Member::Make));
                 }
             }
         }
-        Declared::new(builder, kind, fields, members).ok_or_else(|| self.error(OutOfMemory, node))
+        Ok((Declared::new(builder, kind, fields, flags.contains(TypeFlags::SEALED), members), guards))
     }
 
     /// A call of the procedure of a struct type that `f` names, if it names one of the module's
@@ -657,7 +676,10 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
     fn reference(&mut self, builder: &mut ModuleBuilder<'gc>, name: Syntax<'gc>) -> Result<Core<'gc>, LowerError> {
         Ok(match self.resolve(builder, name)? {
             Ok(var) => Core::Ref(Place::Local(var)),
-            Err(Binding::Slot(slot)) => Core::Ref(builder.place(slot, self.top, self.defining)),
+            Err(Binding::Slot(slot)) => match builder.constant(slot, self.top) {
+                Some(value) => Core::Quote(value),
+                None => Core::Ref(builder.place(slot, self.top, self.defining)),
+            },
             Err(Binding::Import(import)) => import.reference(self.mc).map_err(|Uninitialized| self.error(LowerErrorKind::Uninitialized, name))?,
         })
     }

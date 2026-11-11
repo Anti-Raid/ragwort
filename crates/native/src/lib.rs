@@ -24,14 +24,16 @@
 //!
 //! Code is loaded as a module, whose files' top-level forms are one body. A `%define`, which
 //! only goes at the top level, defines one of its variables, which code anywhere in the module
-//! can refer to, as it can to what a `%require` imports, and a `%provide` exports some. A
-//! `%struct`, which goes there too, defines what Scheme's `struct` does, written the same way: a
-//! type, its constructor, its predicate, and its fields' accessors and mutators, which either
-//! language's code calls. A require
+//! can refer to, as it can to what a `%require` imports, and a `%provide` exports some. A require
 //! spec is a module's name, an identifier or a string, or `(only-in spec name ...)`,
 //! `(except-in spec name ...)`, `(prefix-in prefix spec)` or `(rename-in spec (old new) ...)`. A
 //! provide spec is a name, `(rename-out (name external) ...)`, `(all-defined-out)`, or
-//! `(struct-out name)` for all that a struct form defines.
+//! `(struct-out name)`, which exports everything the struct form for `name` defines.
+//!
+//! `%struct` defines a struct type the way Scheme's `struct` does, with the same syntax for
+//! fields and options. It only goes at the top level. `(%struct point (x y))` defines
+//! `struct:point`, `point`, `point?`, `point-x` and `point-y`, which code in any of the module's
+//! languages can use.
 //!
 //! A name is the innermost local of that name in scope, or else the module's variable of that
 //! name, or else its import of it. A body's expressions run in order, and the last one's value is

@@ -1,16 +1,38 @@
-//! What a struct form defines, as core forms, for any front end: see [`ragwort_vm::structs`] for
-//! the types. A form defines its type, a constructor named as the type is, a predicate, an
-//! accessor for each of its own fields, and a mutator for each of those that's mutable.
+//! The code a `struct` form defines, shared by every front end. The struct types themselves are
+//! in [`ragwort_vm::structs`].
 //!
-//! At a module's top level the type is made when the form is declared, so the module's code has
-//! it as a constant, and a call of one of the procedures, in whichever of the module's languages
-//! or in a module that requires it, does what the procedure does itself. Where the form may not
-//! have run yet, the call reads the procedure's variable first, and so fails as a call of the
-//! procedure would.
+//! A form defines, in this order:
+//!
+//! - the struct type;
+//! - a constructor with the struct's name;
+//! - a predicate;
+//! - an accessor for each field the form declares;
+//! - a mutator for each of those fields that is mutable.
+//!
+//! # Top-level forms
+//!
+//! A top-level form's type is created when the form is declared, before any of the module's code
+//! is compiled, so the code holds the type as a constant. A call to one of the form's procedures
+//! is compiled to the operation itself, with no procedure call. That holds in every language of
+//! the module and in the modules that require it.
+//!
+//! A call can be in code that runs before the form has. Such a call first reads the procedure's
+//! variable, with the usual check that it is defined, so it fails the way a call to an undefined
+//! procedure does.
+//!
+//! # Guards
+//!
+//! A guarded field has a guard: a procedure that must return true for every value the field is
+//! given. The form's code evaluates the guard expressions and installs the guards in the type
+//! before it defines anything. A constructor calls the guard of each guarded field, inherited
+//! ones included, and a mutator calls its field's guard. A call to such a procedure is compiled
+//! to the guard calls and the operation, unless it has too many guards, in which case it is an
+//! ordinary procedure call.
 
 use ragwort_types::gc::{Mutation, OutOfMemory, Value};
 use ragwort_types::pair::Pairs;
-use ragwort_vm::{Fault, Intrinsic, structs};
+use ragwort_vm::structs::{self, FieldFlags, TypeFlags};
+use ragwort_vm::{Fault, Intrinsic, Request};
 
 use crate::keyword::Fresh;
 use crate::module::{Field, Inline, ModuleBuilder, Operand, StructDef};
@@ -45,38 +67,104 @@ pub fn members(name: &str, fields: &[Field], inherited: usize) -> Option<Vec<(St
     Some(members)
 }
 
-/// The lists a type is made of: the names of `fields`, its own, each a symbol, and whether each
-/// is mutable.
-fn listed<'gc>(mc: &Mutation<'gc>, fields: &[(Value<'gc>, bool)]) -> Result<(Value<'gc>, Value<'gc>), OutOfMemory> {
-    let pairs = Pairs::new(mc);
-    let names: Vec<Value<'gc>> = fields.iter().map(|&(name, _)| name).collect();
-    let mutable: Vec<Value<'gc>> = fields.iter().map(|&(_, mutable)| if mutable { Value::TRUE } else { Value::FALSE }).collect();
-    Ok((pairs.list(&names)?, pairs.list(&mutable)?))
+/// A field a struct form declares: its name, a symbol, and what the form says of it.
+#[derive(Clone, Copy)]
+pub struct Declaration<'gc> {
+    pub name: Value<'gc>,
+    pub mutable: bool,
+    pub guarded: bool,
 }
 
-/// A new type named by the symbol `name`, with `fields`, each its name and whether it's mutable,
-/// after those of its supertype `parent`, or `#f`. Its structs are `equal?` only to themselves
-/// if `identity`, or if the supertype's are.
-pub fn make_type<'gc>(mc: &Mutation<'gc>, name: Value<'gc>, parent: Value<'gc>, fields: &[(Value<'gc>, bool)], identity: bool) -> Result<Value<'gc>, Fault> {
-    let (names, mutable) = listed(mc, fields)?;
-    let identity = if identity { Value::TRUE } else { Value::FALSE };
-    structs::make_type(mc, name, parent, names, mutable, identity).map(|kind| Value::object(mc, kind))
+/// The lists a type is made of: the names of `fields`, the ones its form declares, and the bits
+/// of each one's flags.
+fn listed<'gc>(mc: &Mutation<'gc>, fields: &[Declaration<'gc>]) -> Result<(Value<'gc>, Value<'gc>), OutOfMemory> {
+    let pairs = Pairs::new(mc);
+    let names: Vec<Value<'gc>> = fields.iter().map(|field| field.name).collect();
+    let flags = fields.iter().map(|field| {
+        let mut flags = FieldFlags::empty();
+        flags.set(FieldFlags::MUTABLE, field.mutable);
+        flags.set(FieldFlags::GUARDED, field.guarded);
+        Value::fixnum(i64::from(flags.bits())).expect("flags are a fixnum")
+    });
+    Ok((pairs.list(&names)?, pairs.list(&flags.collect::<Vec<_>>())?))
+}
+
+fn bits<'gc>(flags: TypeFlags) -> Value<'gc> {
+    Value::fixnum(i64::from(flags.bits())).expect("flags are a fixnum")
+}
+
+/// A new type named by the symbol `name`, with the fields `fields` after those of its supertype
+/// `parent`, or `#f`, and the flags its form declares.
+pub fn make_type<'gc>(mc: &Mutation<'gc>, name: Value<'gc>, parent: Value<'gc>, fields: &[Declaration<'gc>], flags: TypeFlags) -> Result<Value<'gc>, Fault> {
+    let (names, field_flags) = listed(mc, fields)?;
+    structs::make_type(mc, name, parent, names, field_flags, bits(flags)).map(|kind| Value::object(mc, kind))
 }
 
 /// Code that makes such a type each time it runs, as a form in a body does.
-pub fn type_maker<'gc>(mc: &Mutation<'gc>, name: Value<'gc>, parent: Core<'gc>, fields: &[(Value<'gc>, bool)], identity: bool) -> Result<Core<'gc>, OutOfMemory> {
-    let (names, mutable) = listed(mc, fields)?;
-    let identity = Core::Quote(if identity { Value::TRUE } else { Value::FALSE });
-    Ok(Core::Intrinsic(Prim::Intrinsic(Intrinsic::MakeStructType), vec![Core::Quote(name), parent, Core::Quote(names), Core::Quote(mutable), identity]))
+pub fn type_maker<'gc>(mc: &Mutation<'gc>, name: Value<'gc>, parent: Core<'gc>, fields: &[Declaration<'gc>], flags: TypeFlags) -> Result<Core<'gc>, OutOfMemory> {
+    let (names, field_flags) = listed(mc, fields)?;
+    let args = vec![Core::Quote(name), parent, Core::Quote(names), Core::Quote(field_flags), Core::Quote(bits(flags))];
+    Ok(Core::Intrinsic(Prim::Intrinsic(Intrinsic::MakeStructType), args))
 }
 
-/// What a call of the procedure `member` of a struct type of `fields` fields does, the type
-/// being in variable `kind` of its module. The type itself isn't called.
-pub fn inline(member: Member, kind: u32, fields: u32) -> Option<Inline> {
+fn index<'gc>(k: u32) -> Core<'gc> {
+    Core::Quote(Value::fixnum(i64::from(k)).expect("an index is a fixnum"))
+}
+
+/// Code that installs the procedure `guard` evaluates to as the guard of field `k` of the type
+/// `kind` evaluates to.
+pub fn guard_installer<'gc>(kind: Core<'gc>, k: u32, guard: Core<'gc>) -> Core<'gc> {
+    Core::Intrinsic(Prim::Intrinsic(Intrinsic::SetStructFieldGuard), vec![kind, index(k), guard])
+}
+
+/// Code that calls the guard of field `k` of the type `kind` evaluates to on the value of `v`,
+/// and raises the guard's error if it returns false.
+fn guarded<'gc>(kind: &Core<'gc>, k: u32, v: Var) -> Core<'gc> {
+    let value = || Core::Ref(Place::Local(v));
+    let guard = Core::Intrinsic(Prim::Intrinsic(Intrinsic::StructFieldGuard), vec![kind.clone(), index(k)]);
+    let error = Core::Intrinsic(Prim::Intrinsic(Intrinsic::MakeStructGuardError), vec![kind.clone(), index(k), value()]);
+    let raise = Core::Intrinsic(Prim::Request(Request::Raise), vec![error]);
+    Core::If(Box::new(Core::App(Box::new(guard), vec![value()])), Box::new(Core::Quote(Value::VOID)), Box::new(raise))
+}
+
+/// How many forms the inlined body of a procedure that calls guards can have. Each guard is
+/// about a dozen, so a constructor with a few guards is inlined, and one with many is called.
+const MAX_GUARDED: usize = 64;
+
+/// Numbers the variables and the lambda of one procedure, for its template.
+struct Numbering(u32);
+
+impl Fresh for Numbering {
+    fn var(&mut self) -> Var {
+        self.0 += 1;
+        Var(self.0)
+    }
+
+    fn lambda(&mut self) -> u32 {
+        0
+    }
+}
+
+/// What a call of the procedure `member` of a struct type with the fields `fields` does, the
+/// type being in variable `kind` of its module. `None` for the type itself, which isn't called,
+/// and for a procedure that calls too many guards to inline, which is called as it is.
+pub fn inline(member: Member, kind: u32, fields: &[Field]) -> Option<Inline> {
+    let calls_guard = match member {
+        Member::Make => fields.iter().any(|field| field.guarded),
+        Member::Set(k) => fields.get(k as usize).is_some_and(|field| field.guarded),
+        Member::Type | Member::Is | Member::Ref(_) => false,
+    };
+    if calls_guard {
+        let holder = Core::Ref(Place::Slot { slot: kind, checked: false });
+        let made = value(member, holder, fields, &mut Numbering(0));
+        let Core::Lambda(lambda) = &made else { return None };
+        return Inline::of_at_most(lambda, MAX_GUARDED);
+    }
     let kind = Operand::Slot(kind);
+    let count = u32::try_from(fields.len()).ok()?;
     Some(match member {
         Member::Type => return None,
-        Member::Make => Inline::of_call(Intrinsic::MakeStruct, fields, &std::iter::once(kind).chain((0..fields).map(Operand::Param)).collect::<Vec<_>>()),
+        Member::Make => Inline::of_call(Intrinsic::MakeStruct, count, &std::iter::once(kind).chain((0..count).map(Operand::Param)).collect::<Vec<_>>()),
         Member::Is => Inline::of_call(Intrinsic::IsStructDerivedFrom, 1, &[Operand::Param(0), kind]),
         Member::Ref(k) => Inline::of_call(Intrinsic::StructRef, 1, &[Operand::Param(0), kind, Operand::Index(k)]),
         Member::Set(k) => Inline::of_call(Intrinsic::StructSet, 2, &[Operand::Param(0), kind, Operand::Index(k), Operand::Param(1)]),
@@ -84,14 +172,17 @@ pub fn inline(member: Member, kind: u32, fields: u32) -> Option<Inline> {
 }
 
 /// The value of the variable a struct form defines as `member` of the type `kind` evaluates to,
-/// which has `fields` fields: the type, or a procedure of it.
-pub fn value<'gc>(member: Member, kind: Core<'gc>, fields: u32, fresh: &mut impl Fresh) -> Core<'gc> {
+/// which has the fields `fields`: the type, or a procedure of it. A constructor calls the guard
+/// of each guarded field first, in order, and a mutator its field's.
+pub fn value<'gc>(member: Member, kind: Core<'gc>, fields: &[Field], fresh: &mut impl Fresh) -> Core<'gc> {
     let local = |var: &Var| Core::Ref(Place::Local(*var));
-    let index = |k: u32| Core::Quote(Value::fixnum(i64::from(k)).expect("an index is a fixnum"));
+    let is_guarded = |k: usize| fields.get(k).is_some_and(|field| field.guarded);
+    let mut checks = Vec::new();
     let (params, prim, args) = match member {
         Member::Type => return kind,
         Member::Make => {
-            let params: Vec<Var> = (0..fields).map(|_| fresh.var()).collect();
+            let params: Vec<Var> = fields.iter().map(|_| fresh.var()).collect();
+            checks.extend(params.iter().enumerate().filter(|&(k, _)| is_guarded(k)).map(|(k, &v)| guarded(&kind, k as u32, v)));
             let args = std::iter::once(kind).chain(params.iter().map(local)).collect();
             (params, Intrinsic::MakeStruct, args)
         }
@@ -105,11 +196,17 @@ pub fn value<'gc>(member: Member, kind: Core<'gc>, fields: u32, fresh: &mut impl
         }
         Member::Set(k) => {
             let (s, v) = (fresh.var(), fresh.var());
+            if is_guarded(k as usize) {
+                checks.push(guarded(&kind, k, v));
+            }
             (vec![s, v], Intrinsic::StructSet, vec![local(&s), kind, index(k), local(&v)])
         }
     };
-    let body = Box::new(Core::Intrinsic(Prim::Intrinsic(prim), args));
-    Core::Lambda(Lambda { id: fresh.lambda(), optional: 0, params, rest: None, body })
+    let mut body = Core::Intrinsic(Prim::Intrinsic(prim), args);
+    if !checks.is_empty() {
+        body = Core::Let(checks.into_iter().map(|check| (fresh.var(), check)).collect(), Box::new(body));
+    }
+    Core::Lambda(Lambda { id: fresh.lambda(), optional: 0, params, rest: None, body: Box::new(body) })
 }
 
 /// A call of a procedure of a struct type, which does what the procedure does itself.
@@ -148,36 +245,49 @@ impl<'gc> Call<'gc> {
 pub struct Declared {
     constructor: u32,
     members: Vec<(u32, Member)>,
-    fields: u32,
 }
 
 impl Declared {
-    /// Notes in `builder` what a struct form of the module's defines: `kind` is its type,
-    /// `fields` all the type's fields, its supertype's first, and
-    /// `members` the variables the form defines: the type's, then the constructor's that's named
-    /// as the type is, then the rest. `None` if those are more fields than a type has.
-    pub fn new<'gc>(builder: &mut ModuleBuilder<'gc>, kind: Value<'gc>, fields: Vec<Field>, members: Vec<(u32, Member)>) -> Option<Self> {
-        let count = u32::try_from(fields.len()).ok()?;
+    /// Notes in `builder` what a struct form of the module's defines.
+    ///
+    /// - `kind`: the form's type.
+    /// - `fields`: all the type's fields, its supertype's first.
+    /// - `sealed`: whether the form says the type is sealed.
+    /// - `members`: the variables the form defines: the type's, then the constructor's that has
+    ///   the struct's name, then the rest.
+    pub fn new<'gc>(builder: &mut ModuleBuilder<'gc>, kind: Value<'gc>, fields: Vec<Field>, sealed: bool, members: Vec<(u32, Member)>) -> Self {
         let (holder, constructor) = (members[0].0, members[1].0);
-        builder.define_struct(constructor, StructDef { kind: holder, fields: fields.into() }, kind, members.iter().map(|&(slot, _)| slot).collect());
         for &(slot, member) in &members {
-            if let Some(inline) = inline(member, holder, count) {
+            if let Some(inline) = inline(member, holder, &fields) {
                 builder.struct_procedure(slot, inline, kind);
+            } else if member != Member::Type {
+                builder.struct_variable(slot);
             }
         }
-        Some(Self { constructor, members, fields: count })
+        builder.define_struct(constructor, StructDef { kind: holder, fields: fields.into(), sealed }, kind, members.iter().map(|&(slot, _)| slot).collect());
+        Self { constructor, members }
     }
 
-    /// The constructor named as the type is, which the module's builder has the type by.
+    /// The constructor that has the struct's name, which the module's builder has the type by.
     pub fn constructor(&self) -> u32 {
         self.constructor
     }
 
-    /// The code of the form, which defines each of its variables, `kind` being its type.
-    pub fn define<'gc>(self, kind: Value<'gc>, fresh: &mut impl Fresh) -> Core<'gc> {
-        let mut binds = Vec::with_capacity(self.members.len());
+    /// The code of the form.
+    ///
+    /// - `kind`: the form's type.
+    /// - `fields`: all the type's fields, its supertype's first.
+    /// - `guards`: the guard expression of each guarded field the form declares, with the
+    ///   field's index, in the order the form has them.
+    ///
+    /// It evaluates the guards and installs them, then defines each of the form's variables.
+    pub fn define<'gc>(self, kind: Value<'gc>, fields: &[Field], guards: Vec<(u32, Core<'gc>)>, fresh: &mut impl Fresh) -> Core<'gc> {
+        let mut binds = Vec::with_capacity(guards.len() + self.members.len());
+        for (k, guard) in guards {
+            binds.push((fresh.var(), guard_installer(Core::Quote(kind), k, guard)));
+        }
         for (slot, member) in self.members {
-            let value = value(member, Core::Quote(kind), self.fields, fresh);
+            let value = value(member, Core::Quote(kind), fields, fresh);
             binds.push((fresh.var(), Core::Set(Place::Slot { slot, checked: false }, Box::new(value))));
         }
         Core::Let(binds, Box::new(Core::Quote(Value::VOID)))

@@ -5,8 +5,9 @@
 //! A module's variables are its slots. A reference to one the front end knows is defined where
 //! it runs is unchecked: one defined by an earlier top-level form, or the variable itself inside
 //! the lambda that's directly its definition. An export no code of its module assigns is
-//! immutable, so a module requiring it quotes its value, and if its definition is a closed lambda,
-//! inlines its calls. Code reads an export its module assigns with `module-ref`.
+//! immutable, so a module requiring it quotes its value, and if its definition is a small lambda
+//! of no variables but its parameters and other immutable variables of its module, inlines its
+//! calls. Code reads an export its module assigns with `module-ref`.
 
 use crate::hash::{HashMap, HashSet};
 
@@ -61,14 +62,19 @@ pub struct Export {
 pub struct Field {
     pub name: Box<str>,
     pub mutable: bool,
+    /// Whether the field has a guard, which code that makes an instance or sets the field calls.
+    pub guarded: bool,
 }
 
-/// A struct type, as code that uses its name knows it: the variable of its module that holds
-/// the type, and its fields, its supertype's first.
+/// A struct type, as code that uses its name knows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StructDef {
+    /// The variable of its module that holds the type.
     pub kind: u32,
+    /// Its fields, its supertype's first.
     pub fields: Box<[Field]>,
+    /// Whether it's sealed, so it can't be a supertype.
+    pub sealed: bool,
 }
 
 /// The interface of `module`, once it's built.
@@ -263,10 +269,10 @@ impl<L: Copy> RequireSpec<L> {
     }
 }
 
-/// What a module export's call inlines to: the body of a lambda of no variables but its
-/// parameters, whose constants are immediates and whose calls are of intrinsics, reads and
-/// requests, which mean the same in any module. A struct procedure's also has the struct type,
-/// as the variable of its module that holds it.
+/// What a module export's call inlines to: the body of a lambda whose constants are immediates
+/// and whose only variables are its parameters, the locals it binds, and variables of its own
+/// module that are never assigned, which a module that inlines it has by their values. It calls
+/// intrinsics, reads and requests, which mean the same in any module, and procedure values.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Inline {
     params: u32,
@@ -294,6 +300,8 @@ enum Template {
     If(Box<[Template; 3]>),
     Prim(Prim, Vec<Template>),
     Apply(Prim, Vec<Template>),
+    /// A call of the procedure the first makes, on the rest.
+    Call(Vec<Template>),
 }
 
 /// What a template does as it's evaluated: uses a parameter, or anything else that isn't just a
@@ -331,9 +339,15 @@ pub enum Operand {
 impl Inline {
     /// What `lambda`'s calls inline to, if it can be inlined.
     pub fn of(lambda: &Lambda<'_>) -> Option<Self> {
+        Self::of_at_most(lambda, MAX_INLINE)
+    }
+
+    /// What `lambda`'s calls inline to, if it can be inlined and its body has at most `most`
+    /// forms.
+    pub fn of_at_most(lambda: &Lambda<'_>, most: usize) -> Option<Self> {
         let params: Vec<Var> = lambda.params.iter().copied().chain(lambda.rest).collect();
-        let (mut size, mut locals) = (0, Vec::new());
-        let body = Template::of(&lambda.body, &params, &mut locals, &mut size)?;
+        let (mut left, mut locals) = (most, Vec::new());
+        let body = Template::of(&lambda.body, &params, &mut locals, &mut left)?;
         let (params, locals) = (u32::try_from(lambda.params.len()).ok()?, u32::try_from(locals.len()).ok()?);
         Some(Self::new(params, lambda.optional, lambda.rest.is_some(), locals, body))
     }
@@ -372,7 +386,7 @@ impl Inline {
     }
 
     /// Whether a call of `n` arguments is inlined: if it takes them, and any rest list it makes
-    /// nests no deeper than [`MAX_REST`].
+    /// nests no deeper than `MAX_REST`.
     pub fn inlines(&self, n: usize) -> bool {
         let rest = n.saturating_sub(self.params as usize);
         self.takes(n) && (!self.rest || rest <= MAX_REST || !self.body.uses_list(self.params, rest))
@@ -403,13 +417,15 @@ impl Inline {
         let mut inner = None;
         let body = if self.rest {
             let mut rest = rest;
-            let uses_list = self.body.uses_list(self.params, rest.len());
+            let list_uses = self.body.list_uses(self.params, rest.len());
             let mut cx = Instance { params: args, rest: Some(&mut rest), list: None, locals: &locals, slot };
-            if uses_list {
-                // The rest's list, made once, of the rest, each bound once.
+            if list_uses > 0 {
+                // The rest's list, made once, of the rest, each bound once. Where the body uses
+                // it in one place, it's made there, so a path that doesn't use it doesn't make
+                // it: unless the template is linear, its parts are locals and constants.
                 let items: Vec<Core<'gc>> = cx.rest.as_deref_mut().into_iter().flatten().map(|a| a.take()).collect();
                 let list = items.into_iter().rfold(Core::Quote(Value::NIL), |tail, item| Core::Intrinsic(Prim::Intrinsic(Intrinsic::Cons), vec![item, tail]));
-                if self.linear {
+                if self.linear || list_uses == 1 {
                     cx.list = Some(Arg::Core(Some(list)));
                 } else {
                     let var = fresh();
@@ -464,32 +480,36 @@ fn takes(prim: Prim, n: usize) -> bool {
 }
 
 impl Template {
-    /// The template of `core`, a body of `params`, in which `locals` are the locals bound so far.
-    fn of(core: &Core<'_>, params: &[Var], locals: &mut Vec<Var>, size: &mut usize) -> Option<Self> {
-        *size += 1;
-        if *size > MAX_INLINE {
-            return None;
-        }
+    /// The template of `core`, a body of `params`, in which `locals` are the locals bound so far,
+    /// if it's one of at most `left` forms, which it's taken from.
+    fn of(core: &Core<'_>, params: &[Var], locals: &mut Vec<Var>, left: &mut usize) -> Option<Self> {
+        *left = left.checked_sub(1)?;
         // A host function is in the table of any module that requires this one.
         let closed = |prim: &Prim| !matches!(prim, Prim::Slot(..));
-        let mut all = |args: &[Core<'_>], locals: &mut Vec<Var>| args.iter().map(|a| Self::of(a, params, locals, size)).collect::<Option<Vec<_>>>();
+        let mut all = |args: &[Core<'_>], locals: &mut Vec<Var>| args.iter().map(|a| Self::of(a, params, locals, left)).collect::<Option<Vec<_>>>();
         Some(match core {
             Core::Ref(Place::Local(v)) => match params.iter().position(|p| p == v) {
                 Some(i) => Self::Param(i as u32),
                 None => Self::Local(locals.iter().position(|l| l == v)? as u32),
             },
+            // A variable of the module's: kept only if nothing assigns it, once that's known.
+            Core::Ref(Place::Slot { slot, .. }) => Self::Slot(*slot),
+            Core::App(f, args) => {
+                let f = Self::of(f, params, locals, left)?;
+                Self::Call(std::iter::once(Some(f)).chain(args.iter().map(|a| Self::of(a, params, locals, left))).collect::<Option<Vec<_>>>()?)
+            }
             Core::Quote(v) => Self::Immediate(v.immediate()?),
             Core::If(a, b, c) => {
-                let (a, b) = (Self::of(a, params, locals, size)?, Self::of(b, params, locals, size)?);
-                Self::If(Box::new([a, b, Self::of(c, params, locals, size)?]))
+                let (a, b) = (Self::of(a, params, locals, left)?, Self::of(b, params, locals, left)?);
+                Self::If(Box::new([a, b, Self::of(c, params, locals, left)?]))
             }
             Core::Intrinsic(prim, args) if closed(prim) => Self::Prim(*prim, all(args, locals)?),
             Core::ApplyIntrinsic(prim, args) if closed(prim) => Self::Apply(*prim, all(args, locals)?),
             Core::Let(binds, body) => {
-                let values = binds.iter().map(|(_, value)| Self::of(value, params, locals, size)).collect::<Option<Vec<_>>>()?;
+                let values = binds.iter().map(|(_, value)| Self::of(value, params, locals, left)).collect::<Option<Vec<_>>>()?;
                 let first = u32::try_from(locals.len()).ok()?;
                 locals.extend(binds.iter().map(|&(var, _)| var));
-                Self::Let(first, values, Box::new(Self::of(body, params, locals, size)?))
+                Self::Let(first, values, Box::new(Self::of(body, params, locals, left)?))
             }
             _ => return None,
         })
@@ -514,7 +534,7 @@ impl Template {
                     branch.events(out);
                 }
             }
-            Self::Prim(_, args) | Self::Apply(_, args) => {
+            Self::Prim(_, args) | Self::Apply(_, args) | Self::Call(args) => {
                 for arg in args {
                     arg.events(out);
                 }
@@ -530,24 +550,29 @@ impl Template {
             Self::Param(_) | Self::Immediate(_) | Self::Local(_) => {}
             Self::Let(_, values, body) => values.iter().chain([&**body]).for_each(|p| p.slots(out)),
             Self::If(parts) => parts.iter().for_each(|p| p.slots(out)),
-            Self::Prim(_, args) | Self::Apply(_, args) => args.iter().for_each(|a| a.slots(out)),
+            Self::Prim(_, args) | Self::Apply(_, args) | Self::Call(args) => args.iter().for_each(|a| a.slots(out)),
         }
     }
 
     /// Whether a call with `count` arguments past the parameters uses the rest parameter,
     /// `rest`, as a list, rather than as arguments an `apply` spreads.
     fn uses_list(&self, rest: u32, count: usize) -> bool {
+        self.list_uses(rest, count) > 0
+    }
+
+    /// In how many places a call with `count` arguments past the parameters uses the rest
+    /// parameter, `rest`, as a list.
+    fn list_uses(&self, rest: u32, count: usize) -> usize {
+        let of = |parts: &[Template]| parts.iter().map(|p| p.list_uses(rest, count)).sum::<usize>();
         match self {
-            Self::Param(i) => *i == rest,
-            Self::Immediate(_) | Self::Local(_) | Self::Slot(_) => false,
-            Self::Let(_, values, body) => values.iter().chain([&**body]).any(|p| p.uses_list(rest, count)),
-            Self::If(parts) => parts.iter().any(|p| p.uses_list(rest, count)),
-            Self::Prim(_, args) => args.iter().any(|a| a.uses_list(rest, count)),
+            Self::Param(i) => usize::from(*i == rest),
+            Self::Immediate(_) | Self::Local(_) | Self::Slot(_) => 0,
+            Self::Let(_, values, body) => of(values) + body.list_uses(rest, count),
+            Self::If(parts) => of(&parts[..]),
+            Self::Prim(_, args) | Self::Call(args) => of(args),
             Self::Apply(prim, args) => match args.split_last() {
-                Some((Self::Param(i), fixed)) if *i == rest => {
-                    !takes(*prim, fixed.len() + count) || fixed.iter().any(|a| a.uses_list(rest, count))
-                }
-                _ => args.iter().any(|a| a.uses_list(rest, count)),
+                Some((Self::Param(i), fixed)) if *i == rest => usize::from(!takes(*prim, fixed.len() + count)) + of(fixed),
+                _ => of(args),
             },
         }
     }
@@ -569,6 +594,11 @@ impl Template {
                 Core::If(Box::new(a.core(cx, rest)), Box::new(b.core(cx, rest)), Box::new(c.core(cx, rest)))
             }
             Self::Prim(prim, args) => Core::Intrinsic(*prim, args.iter().map(|a| a.core(cx, rest)).collect()),
+            Self::Call(parts) => {
+                let mut parts = parts.iter().map(|part| part.core(cx, rest));
+                let f = parts.next().expect("a call has a procedure");
+                Core::App(Box::new(f), parts.collect())
+            }
             Self::Apply(prim, args) => match args.split_last() {
                 Some((Self::Param(i), fixed)) if *i == rest && cx.rest.is_some() => {
                     let count = cx.rest.as_ref().map_or(0, |r| r.len());
@@ -638,8 +668,10 @@ pub struct ModuleBuilder<'gc> {
     /// form defines, and by the constructors named as they are, what they are.
     kinds: HashMap<u32, (Value<'gc>, Vec<u32>)>,
     structs: HashMap<u32, StructDef>,
-    /// What a call of each procedure a struct form defines does, and its type.
+    /// What a call of each procedure a struct form defines does, and its type, and the
+    /// procedures such forms define that are called as they are.
     procedures: HashMap<u32, (Inline, Value<'gc>)>,
+    guarded: HashSet<u32>,
     module: Option<Gc<'gc, Module>>,
 }
 
@@ -660,6 +692,7 @@ impl<'gc> ModuleBuilder<'gc> {
             kinds: HashMap::default(),
             structs: HashMap::default(),
             procedures: HashMap::default(),
+            guarded: HashSet::default(),
             module: None,
         }
     }
@@ -827,6 +860,12 @@ impl<'gc> ModuleBuilder<'gc> {
         self.procedures.insert(slot, (inline, kind));
     }
 
+    /// Notes that variable `slot` is a procedure a struct form defines whose calls are ordinary
+    /// calls, as it calls a guard. Like the form's other variables, it can't be assigned.
+    pub fn struct_variable(&mut self, slot: u32) {
+        self.guarded.insert(slot);
+    }
+
     /// The struct type variable `slot` is the constructor named for, and the type itself.
     pub fn struct_def(&self, slot: u32) -> Option<(&StructDef, Value<'gc>)> {
         let def = self.structs.get(&slot)?;
@@ -842,10 +881,17 @@ impl<'gc> ModuleBuilder<'gc> {
         Some(Call::new(inline.clone(), Core::Quote(*kind), (!defined).then_some(Place::Slot { slot, checked: true })))
     }
 
+    /// The value of variable `slot` in top-level form `form`, if it's known now: a struct type
+    /// whose form has run by then.
+    pub fn constant(&self, slot: u32, form: u32) -> Option<Value<'gc>> {
+        let (kind, _) = self.kinds.get(&slot)?;
+        self.defined_by.get(slot as usize).is_some_and(|&by| by < form).then_some(*kind)
+    }
+
     /// Notes that code assigns variable `slot`, so it isn't immutable, unless it's a keyword
     /// procedure or one a struct form defines, which can't be assigned.
     pub fn assign(&mut self, slot: u32) -> Result<(), ModuleError> {
-        if self.cores.contains_key(&slot) || self.procedures.contains_key(&slot) || self.kinds.contains_key(&slot) {
+        if self.cores.contains_key(&slot) || self.procedures.contains_key(&slot) || self.guarded.contains(&slot) || self.kinds.contains_key(&slot) {
             return Err(ModuleError::Immutable);
         }
         self.assigned.insert(slot);
@@ -874,7 +920,10 @@ impl<'gc> ModuleBuilder<'gc> {
         };
         let export = |slot: u32| {
             let mutable = self.assigned.contains(&slot);
-            let inline = if mutable { None } else { self.procedures.get(&slot).map(|(inline, _)| inline).or(self.inlines.get(&slot)).cloned() };
+            // What reads a variable the module assigns isn't inlined: it would have the value the
+            // variable had when it was required.
+            let fixed = |inline: &&Inline| inline.slots().all(|read| !self.assigned.contains(&read));
+            let inline = if mutable { None } else { self.procedures.get(&slot).map(|(inline, _)| inline).or(self.inlines.get(&slot)).filter(fixed).cloned() };
             Export { slot, mutable, inline, core: None, structure: self.structs.get(&slot).cloned().map(Box::new) }
         };
         let exports = self.exports.iter().map(|&(ref name, slot)| {

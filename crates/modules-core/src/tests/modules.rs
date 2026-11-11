@@ -145,6 +145,34 @@ fn keyword_procedures_are_called_across_languages() {
     assert!(ops.contains("Call") && !ops.contains("KeywordApply"), "{ops}");
 }
 
+/// The instructions of the procedures the Scheme module `text`, named `name`, defines, once it has
+/// run.
+fn closure_ops(arena: &mut Arena, name: &str, text: &str) -> String {
+    arena.mutate(|mc| {
+        let (symbols, prelude) = (Symbols::of(mc.root(0)).unwrap(), mc.root(1).downcast::<Module>(mc).unwrap());
+        let session = SyntaxSession::new(mc, text).unwrap();
+        let files = [File { language: Scheme, session: &session }];
+        let loaded = load(mc, symbols, prelude, &Source { name, hosts: &[], files: &files, implicit: &[] }, &mut Registry).unwrap();
+        for thunk in loaded.thunks {
+            run(mc, thunk).unwrap();
+        }
+        let items = ragwort_vm::objects::ModuleFields::items(loaded.module, mc);
+        let closures = (0..items.len()).filter_map(|i| items.get(i).downcast::<ragwort_vm::objects::Closure>(mc));
+        let code = closures.map(|f| ragwort_vm::objects::ClosureFields::code(f, mc).unwrap());
+        code.map(|code| format!("{:?}", ragwort_vm::objects::BytecodeFields::ops(code, mc).unwrap())).collect::<Vec<_>>().join("\n")
+    })
+}
+
+/// Whether `ops` has `name` as a whole word, such as an intrinsic's name.
+fn names(ops: &str, name: &str) -> bool {
+    ops.split(|c: char| !c.is_alphanumeric()).any(|word| word == name)
+}
+
+/// How many procedure calls `ops` has, not counting calls of intrinsics.
+fn calls(ops: &str) -> usize {
+    ops.split(|c: char| !c.is_alphanumeric()).filter(|&word| word == "Call" || word == "TailCall").count()
+}
+
 #[test]
 fn structs_are_used_across_modules() {
     let mut arena = arena();
@@ -174,20 +202,8 @@ fn structs_are_used_across_modules() {
     let not_one = module_in(&mut arena, "not-one", &[(Scheme, "(provide (struct-out f)) (define (f) 1)")]);
     assert!(matches!(not_one, Err(Error::Expand(e)) if e.kind == ragwort_scheme::ExpandErrorKind::NotDefined), "{not_one:?}");
     // A call of another module's accessor reads the field itself, the type a constant.
-    let ops = arena.mutate(|mc| {
-        let (symbols, prelude) = (Symbols::of(mc.root(0)).unwrap(), mc.root(1).downcast::<Module>(mc).unwrap());
-        let session = SyntaxSession::new(mc, "(require shapes) (define (first-of p) (point-x p))").unwrap();
-        let files = [File { language: Scheme, session: &session }];
-        let loaded = load(mc, symbols, prelude, &Source { name: "reader", hosts: &[], files: &files, implicit: &[] }, &mut Registry).unwrap();
-        for thunk in loaded.thunks {
-            run(mc, thunk).unwrap();
-        }
-        let items = ragwort_vm::objects::ModuleFields::items(loaded.module, mc);
-        let closures = (0..items.len()).filter_map(|i| items.get(i).downcast::<ragwort_vm::objects::Closure>(mc));
-        let code = closures.map(|f| ragwort_vm::objects::ClosureFields::code(f, mc).unwrap());
-        code.map(|code| format!("{:?}", ragwort_vm::objects::BytecodeFields::ops(code, mc).unwrap())).collect::<Vec<_>>().join("\n")
-    });
-    assert!(ops.contains("StructRef") && !ops.split(|c: char| !c.is_alphanumeric()).any(|word| word == "Call" || word == "TailCall"), "{ops}");
+    let ops = closure_ops(&mut arena, "reader", "(require shapes) (define (first-of p) (point-x p))");
+    assert!(ops.contains("StructRef") && calls(&ops) == 0, "{ops}");
     // Either language defines structs the other uses, in one module or across them.
     module_in(&mut arena, "native-shapes", &[(Native, "(%provide (struct-out pair2)) (%struct pair2 (a (b #:mutable)))")]).unwrap().unwrap();
     let scheme = "(require native-shapes) (struct triple pair2 (c)) (define t (triple 1 2 3)) (set-pair2-b! t 20)
@@ -197,6 +213,41 @@ fn structs_are_used_across_modules() {
     assert_eq!(module_in(&mut arena, "mixed", &mixed), Ok(Ok("4".into())));
     let native_user = "(%require shapes) (%struct tagged point (tag)) (%app point-y (%app tagged 1 2 'tag))";
     assert_eq!(module_in(&mut arena, "native-user", &[(Native, native_user)]), Ok(Ok("2".into())));
+    // Guards and sealing go with a struct to the modules that require it.
+    let bank = "(provide (struct-out account) (struct-out receipt))
+                (struct account (id [balance #:mutable #:guard (lambda (v) (>= v 0))]))
+                (struct receipt (amount) #:sealed)";
+    module_in(&mut arena, "bank", &[(Scheme, bank)]).unwrap().unwrap();
+    let rejected = |body: &str| format!("(require bank) (struct savings account (rate)) (guard (e (#t (error-object-message e))) {body})");
+    for body in ["(account 1 -1)", "(savings 1 -1 2)", "(set-account-balance! (savings 1 1 2) -5)", "(make-struct struct:account 1 -1)", "(struct-copy account (account 1 1) [balance -1])"] {
+        let message = "\"struct account: the guard of field balance rejected\"";
+        let message = if body.starts_with("(savings") { message.replace("struct account", "struct savings") } else { message.to_string() };
+        assert_eq!(module_in(&mut arena, "customer", &[(Scheme, &rejected(body))]), Ok(Ok(message)), "{body}");
+    }
+    let accepted = "(require bank) (struct savings account (rate)) (define s (savings 1 5 2)) (set-account-balance! s 9) (list s (receipt-amount (receipt 3)))";
+    assert_eq!(module_in(&mut arena, "customer", &[(Scheme, accepted)]), Ok(Ok("(#(struct:savings 1 9 2) 3)".into())));
+    let native_rejected = module_in(&mut arena, "native-customer", &[(Native, "(%require bank) (%app account 1 -1)")]);
+    assert_eq!(native_rejected, Ok(Err(Fault::Error)));
+    let sealed = module_in(&mut arena, "sealed", &[(Scheme, "(require bank) (struct more receipt (x))")]);
+    assert!(matches!(sealed, Err(Error::Expand(e)) if e.kind == ragwort_scheme::ExpandErrorKind::BadSyntax), "{sealed:?}");
+    let sealed = module_in(&mut arena, "sealed", &[(Native, "(%require bank) (%struct more receipt (x))")]);
+    assert!(matches!(sealed, Err(Error::Lower(e)) if e.kind == ragwort_native::LowerErrorKind::BadShape), "{sealed:?}");
+    // Making and setting by a type that's known where it's done, with no guard to call, are
+    // the operations themselves, whether the type is the module's own or another's.
+    for text in ["(require shapes) (define (f n) (make-struct struct:point n 2))", "(struct pt (x y)) (define (f n) (make-struct struct:pt n 2))"] {
+        let ops = closure_ops(&mut arena, "maker", text);
+        assert!(ops.contains("MakeStruct") && calls(&ops) == 0 && !names(&ops, "Cons") && !ops.contains("IsStructGuarded"), "{text}: {ops}");
+    }
+    let ops = closure_ops(&mut arena, "setter", "(require shapes) (define (f p n) (struct-set! p struct:point 1 n))");
+    assert!(ops.contains("StructSet") && calls(&ops) == 0 && !ops.contains("IsStructFieldGuarded"), "{ops}");
+    // A type that's only known when the code runs is asked whether it has guards.
+    let ops = closure_ops(&mut arena, "dynamic", "(define (f type n) (make-struct type n 2))");
+    assert!(ops.contains("IsStructGuarded") && ops.contains("MakeStruct"), "{ops}");
+    // A constructor or mutator that calls a guard is inlined too: the one call is the guard's.
+    let ops = closure_ops(&mut arena, "guarded-maker", "(require bank) (define (f n) (account 1 n))");
+    assert!(ops.contains("StructFieldGuard") && ops.contains("MakeStruct") && calls(&ops) == 1, "{ops}");
+    let ops = closure_ops(&mut arena, "guarded-setter", "(require bank) (define (f a n) (set-account-balance! a n))");
+    assert!(ops.contains("StructFieldGuard") && ops.contains("StructSet") && calls(&ops) == 1, "{ops}");
     // No language assigns what a struct form defines.
     let native = module_in(&mut arena, "main", &[(Scheme, "(struct point (x))"), (Native, "(%set! point-x 1)")]);
     assert!(matches!(native, Err(Error::Lower(e)) if e.kind == ragwort_native::LowerErrorKind::Immutable), "{native:?}");

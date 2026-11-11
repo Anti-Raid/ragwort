@@ -499,12 +499,13 @@ fn structs_are_of_their_types_and_equal_by_their_fields_or_themselves() {
         let (symbols, strings, pairs) = (ragwort_types::symbol::Symbols::of_arena(mc).unwrap(), Strings::new(mc), Pairs::new(mc));
         let symbol = |name: &str| symbols.intern_str(&strings, name).unwrap().value(mc);
         let names = |names: &[&str]| pairs.list(&names.iter().map(|n| symbol(n)).collect::<Vec<_>>()).unwrap();
-        // A type whose fields can all be set, or can't.
-        let flags = |n: usize, mutable: bool| pairs.list(&vec![if mutable { Value::TRUE } else { Value::FALSE }; n]).unwrap();
-        let point = run(mc, Intrinsic::MakeStructType, &[symbol("point"), Value::FALSE, names(&["x", "y"]), flags(2, true), Value::FALSE]).unwrap();
-        let point3 = run(mc, Intrinsic::MakeStructType, &[symbol("point3"), point, names(&["z"]), flags(1, true), Value::FALSE]).unwrap();
-        let point4 = run(mc, Intrinsic::MakeStructType, &[symbol("point4"), point3, names(&["w"]), flags(1, false), Value::FALSE]).unwrap();
-        let other = run(mc, Intrinsic::MakeStructType, &[symbol("point"), Value::FALSE, names(&["x", "y"]), flags(2, false), Value::FALSE]).unwrap();
+        // The flags of a type's fields, which can all be set, or can't.
+        let flags = |n: usize, mutable: bool| pairs.list(&vec![fix(i64::from(mutable)); n]).unwrap();
+        let (plain, identity, sealed) = (fix(0), fix(1), fix(2));
+        let point = run(mc, Intrinsic::MakeStructType, &[symbol("point"), Value::FALSE, names(&["x", "y"]), flags(2, true), plain]).unwrap();
+        let point3 = run(mc, Intrinsic::MakeStructType, &[symbol("point3"), point, names(&["z"]), flags(1, true), plain]).unwrap();
+        let point4 = run(mc, Intrinsic::MakeStructType, &[symbol("point4"), point3, names(&["w"]), flags(1, false), plain]).unwrap();
+        let other = run(mc, Intrinsic::MakeStructType, &[symbol("point"), Value::FALSE, names(&["x", "y"]), flags(2, false), plain]).unwrap();
         let p = run(mc, Intrinsic::MakeStruct, &[point, fix(1), fix(2)]).unwrap();
         let q = run(mc, Intrinsic::MakeStruct, &[point4, fix(1), fix(2), fix(3), fix(4)]).unwrap();
         // Each is of its type and those above it, and of no other.
@@ -513,6 +514,9 @@ fn structs_are_of_their_types_and_equal_by_their_fields_or_themselves() {
         }
         for (v, is) in [(p, true), (q, true), (point, false), (fix(1), false), (pairs.list(&[p]).unwrap(), false)] {
             assert_eq!(run(mc, Intrinsic::IsStruct, &[v]), Ok(if is { Value::TRUE } else { Value::FALSE }));
+        }
+        for (v, is) in [(point, true), (point4, true), (p, false), (fix(1), false)] {
+            assert_eq!(run(mc, Intrinsic::IsStructType, &[v]), Ok(if is { Value::TRUE } else { Value::FALSE }));
         }
         assert_eq!(run(mc, Intrinsic::StructRef, &[q, point, fix(1)]), Ok(fix(2)));
         assert_eq!(run(mc, Intrinsic::StructRef, &[q, point4, fix(3)]), Ok(fix(4)));
@@ -533,9 +537,9 @@ fn structs_are_of_their_types_and_equal_by_their_fields_or_themselves() {
         assert_eq!(run(mc, Intrinsic::MakeStruct, &[point, fix(1)]), Err(Fault::Arity));
         assert_eq!(run(mc, Intrinsic::MakeStruct, &[point3, fix(1), fix(2), fix(3), fix(4)]), Err(Fault::Arity));
         assert_eq!(run(mc, Intrinsic::MakeStruct, &[fix(1), fix(1)]), Err(Fault::WrongType));
-        assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol("bad"), fix(1), Value::NIL, Value::NIL, Value::FALSE]), Err(Fault::WrongType));
-        assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol("bad"), Value::FALSE, pairs.list(&[fix(1)]).unwrap(), flags(1, false), Value::FALSE]), Err(Fault::WrongType));
-        assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol("bad"), Value::FALSE, names(&["x", "y"]), flags(1, false), Value::FALSE]), Err(Fault::WrongType), "a flag for each field");
+        assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol("bad"), fix(1), Value::NIL, Value::NIL, plain]), Err(Fault::WrongType));
+        assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol("bad"), Value::FALSE, pairs.list(&[fix(1)]).unwrap(), flags(1, false), plain]), Err(Fault::WrongType));
+        assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol("bad"), Value::FALSE, names(&["x", "y"]), flags(1, false), plain]), Err(Fault::WrongType), "a flag for each field");
         let same = run(mc, Intrinsic::MakeStruct, &[point, fix(1), pairs.list(&[fix(2)]).unwrap()]).unwrap();
         let alike = run(mc, Intrinsic::MakeStruct, &[point, fix(1), pairs.list(&[fix(2)]).unwrap()]).unwrap();
         let elsewhere = run(mc, Intrinsic::MakeStruct, &[other, fix(1), pairs.list(&[fix(2)]).unwrap()]).unwrap();
@@ -556,8 +560,8 @@ fn structs_are_of_their_types_and_equal_by_their_fields_or_themselves() {
         assert_eq!(run(mc, Intrinsic::StructFields, &[p]), Err(Fault::WrongType));
 
         // An identity type's structs, and its subtypes', are `equal?` only to themselves.
-        let session = run(mc, Intrinsic::MakeStructType, &[symbol("session"), Value::FALSE, names(&["token", "user"]), flags(2, true), Value::TRUE]).unwrap();
-        let admin = run(mc, Intrinsic::MakeStructType, &[symbol("admin"), session, names(&[]), flags(0, false), Value::FALSE]).unwrap();
+        let session = run(mc, Intrinsic::MakeStructType, &[symbol("session"), Value::FALSE, names(&["token", "user"]), flags(2, true), identity]).unwrap();
+        let admin = run(mc, Intrinsic::MakeStructType, &[symbol("admin"), session, names(&[]), flags(0, false), plain]).unwrap();
         let (s, t) = (run(mc, Intrinsic::MakeStruct, &[session, fix(1), fix(2)]).unwrap(), run(mc, Intrinsic::MakeStruct, &[session, fix(1), fix(2)]).unwrap());
         let (a, b) = (run(mc, Intrinsic::MakeStruct, &[admin, fix(1), fix(2)]).unwrap(), run(mc, Intrinsic::MakeStruct, &[admin, fix(1), fix(2)]).unwrap());
         assert_eq!(run(mc, Intrinsic::IsStructDerivedFrom, &[s, session]), Ok(Value::TRUE));
@@ -571,6 +575,39 @@ fn structs_are_of_their_types_and_equal_by_their_fields_or_themselves() {
         assert_eq!(run(mc, Intrinsic::StructRef, &[s, session, fix(1)]), Ok(fix(2)));
         assert_eq!(run(mc, Intrinsic::StructSet, &[s, session, fix(1), fix(9)]), Ok(Value::VOID));
         assert_eq!(run(mc, Intrinsic::StructRef, &[s, session, fix(1)]), Ok(fix(9)));
+
+        // A sealed type is no supertype, and flags that aren't a form's to give aren't taken.
+        let last = run(mc, Intrinsic::MakeStructType, &[symbol("last"), point, names(&["z"]), flags(1, false), sealed]).unwrap();
+        assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol("more"), last, names(&[]), flags(0, false), plain]), Err(Fault::WrongType));
+        assert_eq!(run(mc, Intrinsic::IsStructDerivedFrom, &[run(mc, Intrinsic::MakeStruct, &[last, fix(1), fix(2), fix(3)]).unwrap(), point]), Ok(Value::TRUE));
+        for bad in [fix(4), fix(8), fix(-1), Value::FALSE] {
+            assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol("bad"), Value::FALSE, names(&[]), flags(0, false), bad]), Err(Fault::WrongType));
+        }
+        assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol("bad"), Value::FALSE, names(&["x"]), pairs.list(&[fix(4)]).unwrap(), plain]), Err(Fault::WrongType));
+
+        // A guarded field's guard is its type's, installed once, and its subtypes' too.
+        let guard = Value::object(mc, objects::Closure::new(mc, code(mc, &[]).downcast::<objects::Bytecode>(mc), 0, Value::VOID).unwrap());
+        let (unguarded, guarded) = (fix(1), fix(3));
+        let checked = run(mc, Intrinsic::MakeStructType, &[symbol("checked"), Value::FALSE, names(&["a", "b"]), pairs.list(&[unguarded, guarded]).unwrap(), plain]).unwrap();
+        let deeper = run(mc, Intrinsic::MakeStructType, &[symbol("deeper"), checked, names(&["c"]), pairs.list(&[unguarded]).unwrap(), plain]).unwrap();
+        for (kind, is) in [(checked, true), (deeper, true), (point, false)] {
+            assert_eq!(run(mc, Intrinsic::IsStructGuarded, &[kind]), Ok(if is { Value::TRUE } else { Value::FALSE }));
+        }
+        assert_eq!(run(mc, Intrinsic::StructFieldGuard, &[checked, fix(0)]), Ok(Value::FALSE));
+        assert_eq!(run(mc, Intrinsic::StructFieldGuard, &[checked, fix(1)]), Err(Fault::Unbound), "not installed yet");
+        assert_eq!(run(mc, Intrinsic::StructFieldGuard, &[checked, fix(2)]), Err(Fault::OutOfRange));
+        assert_eq!(run(mc, Intrinsic::SetStructFieldGuard, &[checked, fix(0), guard]), Err(Fault::WrongType), "a field that isn't guarded");
+        assert_eq!(run(mc, Intrinsic::SetStructFieldGuard, &[deeper, fix(1), guard]), Err(Fault::WrongType), "a supertype's field");
+        assert_eq!(run(mc, Intrinsic::SetStructFieldGuard, &[checked, fix(1), fix(5)]), Err(Fault::WrongType), "no procedure");
+        assert_eq!(run(mc, Intrinsic::SetStructFieldGuard, &[checked, fix(1), guard]), Ok(Value::VOID));
+        assert_eq!(run(mc, Intrinsic::SetStructFieldGuard, &[checked, fix(1), guard]), Err(Fault::Immutable), "installed already");
+        assert_eq!(run(mc, Intrinsic::StructFieldGuard, &[checked, fix(1)]), Ok(guard));
+        assert_eq!(run(mc, Intrinsic::StructFieldGuard, &[deeper, fix(1)]), Ok(guard));
+        assert_eq!(run(mc, Intrinsic::StructFieldGuard, &[deeper, fix(2)]), Ok(Value::FALSE));
+        let error = run(mc, Intrinsic::MakeStructGuardError, &[deeper, fix(1), fix(7)]).unwrap();
+        let message = run(mc, Intrinsic::ErrorObjectMessage, &[error]).unwrap();
+        assert_eq!(string::display(&strings, strings.string(message).unwrap()).to_string(), "struct deeper: the guard of field b rejected");
+        assert_eq!(run(mc, Intrinsic::Equal, &[run(mc, Intrinsic::ErrorObjectIrritants, &[error]).unwrap(), pairs.list(&[fix(7)]).unwrap()]), Ok(Value::TRUE));
     });
 }
 
