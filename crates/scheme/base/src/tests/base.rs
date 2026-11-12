@@ -744,8 +744,9 @@ fn numbers_past_arithmetic() {
     let complex = "(list (make-rectangular 1 2) (make-rectangular 1.5 0) (real-part 1+2i) (imag-part 1+2i) (imag-part 5) (magnitude -3+4i)
                          (magnitude -5) (angle -1) (angle 1))";
     assert_eq!(eval(complex), "(1+2i 1.5 1 2 0 5 5 3.141592653589793 0)");
-    let transcendental = "(list (exp 0) (log 1) (sin 0.0) (cos 0.0) (atan 1 1) (atan 0 1) (exp 1) (log 100 10))";
-    assert_eq!(eval(transcendental), "(1 0 0.0 1.0 0.7853981633974483 0 2.718281828459045 2.0)");
+    // The last digit of `(exp 1)` is the platform's: FreeBSD's is one off the nearest.
+    let transcendental = "(list (exp 0) (log 1) (sin 0.0) (cos 0.0) (atan 1 1) (atan 0 1) (< (abs (- (exp 1) 2.718281828459045)) 1e-15) (log 100 10))";
+    assert_eq!(eval(transcendental), "(1 0 0.0 1.0 0.7853981633974483 0 #t 2.0)");
     assert_eq!(eval_in(&mut arena(), "(max)"), Ok(Err(Fault::Arity)));
     assert_eq!(eval_in(&mut arena(), "(log 1 2 3)"), Ok(Err(Fault::Arity)));
     assert_eq!(eval_in(&mut arena(), "(integer-sqrt -1)"), Ok(Err(Fault::OutOfRange)));
