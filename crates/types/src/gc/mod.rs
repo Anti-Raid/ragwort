@@ -220,7 +220,37 @@ mod root_tests;
 #[path = "tests/fuzz.rs"]
 mod fuzz_tests;
 
-pub const REGION: usize = 64 << 20;
+/// The capacity of an arena's object region, in bytes. The default is 64 MiB.
+///
+/// The capacity is a compile-time constant, so an object access masks its index with a constant and needs no bounds check. To build with another capacity, set the `RAGWORT_REGION_MB` environment variable to a power of two from 16 to 8192, in mebibytes:
+///
+/// ```text
+/// RAGWORT_REGION_MB=128 cargo build --release
+/// ```
+///
+/// - Every arena reserves `2 * REGION` bytes of address space. The system commits memory only for the pages an arena uses.
+/// - An arena's own limit, given to [`Arena::new`], still bounds how much of the region it uses.
+pub const REGION: usize = region();
+
+const REGION_SETTING: &str = "RAGWORT_REGION_MB must be a power of two from 16 to 8192";
+
+const fn region() -> usize {
+    let digits = match option_env!("RAGWORT_REGION_MB") {
+        Some(setting) => setting.as_bytes(),
+        None => return 64 << 20,
+    };
+    assert!(!digits.is_empty() && digits.len() <= 4, "{}", REGION_SETTING);
+    let mut mebibytes = 0;
+    let mut at = 0;
+    while at < digits.len() {
+        assert!(digits[at].is_ascii_digit(), "{}", REGION_SETTING);
+        mebibytes = mebibytes * 10 + (digits[at] - b'0') as usize;
+        at += 1;
+    }
+    assert!(mebibytes.is_power_of_two() && mebibytes >= 16 && mebibytes <= 8192, "{}", REGION_SETTING);
+    mebibytes << 20
+}
+
 /// The region in words: twice `REGION`, so evacuation has fresh pages to copy into.
 const WORDS: usize = 2 * REGION / 8;
 /// The words of the region, as everything that reads them sees it.

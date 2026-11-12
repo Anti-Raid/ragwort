@@ -2,6 +2,10 @@
 //!
 //! When a runtime operation yields to the dispatch loop, argument registers remain in the stack slots above the stack base (or, for tail requests, in the deallocated frame). When initiating the callee, arguments are transferred into the new frame. Because the stack clears abandoned slots when migrating between stack segments, arguments must be [detached](Args::detach) into safe inline or heap representations before segment switching.
 
+#[cfg(test)]
+#[path = "tests/args.rs"]
+mod tests;
+
 use ragwort_types::gc::{Frame, Mutation, Slots, Stack, Value};
 use ragwort_types::pair::{Pair, Pairs};
 
@@ -18,33 +22,45 @@ pub(crate) struct Args<'gc> {
     pub(crate) rest: Value<'gc>,
 }
 
+/// The maximum number of arguments stored inline. Four values fit in the space `Held::Slots` already occupies, so they add nothing to the size of [`Args`].
+const INLINE: usize = 4;
+
 #[derive(Clone, Copy)]
 enum Held<'gc> {
     Slots(Slots<'gc>),
-    Inline([Value<'gc>; 2], u8),
+    Inline([Value<'gc>; INLINE], u8),
+}
+
+const _: () = assert!(size_of::<Held<'static>>() <= size_of::<Slots<'static>>() + size_of::<u64>());
+
+/// Stores `from`, which holds at most [`INLINE`] values, inline.
+fn inline<'gc>(from: &[Value<'gc>]) -> Held<'gc> {
+    let mut values = [Value::VOID; INLINE];
+    values[..from.len()].copy_from_slice(from);
+    Held::Inline(values, from.len() as u8)
 }
 
 impl<'gc> Args<'gc> {
     pub(crate) fn none() -> Self {
-        Args { held: Held::Inline([Value::VOID; 2], 0), rest: Value::NIL }
+        Args { held: inline(&[]), rest: Value::NIL }
     }
 
     pub(crate) fn one(a: Value<'gc>) -> Self {
-        Args { held: Held::Inline([a, Value::VOID], 1), rest: Value::NIL }
+        Args { held: inline(&[a]), rest: Value::NIL }
     }
 
     pub(crate) fn two(a: Value<'gc>, b: Value<'gc>) -> Self {
-        Args { held: Held::Inline([a, b], 2), rest: Value::NIL }
+        Args { held: inline(&[a, b]), rest: Value::NIL }
     }
 
     /// Constructs an `Args` sequence starting with `first`, followed by the elements in `rest` (a list or [`MultiValue`]).
     pub(crate) fn before(first: Value<'gc>, rest: Value<'gc>) -> Self {
-        Args { held: Held::Inline([first, Value::VOID], 1), rest }
+        Args { held: inline(&[first]), rest }
     }
 
     /// Constructs an `Args` sequence containing the elements of `rest` (a list or [`MultiValue`]).
     pub(crate) fn list(rest: Value<'gc>) -> Self {
-        Args { held: Held::Inline([Value::VOID; 2], 0), rest }
+        Args { held: inline(&[]), rest }
     }
 
     /// Constructs an `Args` sequence backed by stack `slots`, followed by trailing elements in `rest`.
@@ -104,11 +120,7 @@ impl<'gc> Args<'gc> {
         if k <= held {
             let held = match self.held {
                 Held::Slots(slots) => Held::Slots(slots.slice(k..held).ok_or(Fault::Malformed)?),
-                Held::Inline(values, n) => match k {
-                    0 => Held::Inline(values, n),
-                    1 => Held::Inline([values[1], Value::VOID], n - 1),
-                    _ => Held::Inline([Value::VOID; 2], 0),
-                },
+                Held::Inline(values, n) => inline(&values[k..usize::from(n)]),
             };
             return Ok(Args { held, rest: self.rest });
         }
@@ -128,7 +140,7 @@ impl<'gc> Args<'gc> {
             let n = self.held().checked_sub(1).ok_or(Fault::Arity)?;
             let held = match self.held {
                 Held::Slots(slots) => Held::Slots(slots.slice(0..n).ok_or(Fault::Malformed)?),
-                Held::Inline(values, _) => Held::Inline([values[0], Value::VOID], n as u8),
+                Held::Inline(values, _) => inline(&values[..n]),
             };
             return Ok(Args { held, rest: self.held_get(n) });
         }
@@ -173,12 +185,14 @@ impl<'gc> Args<'gc> {
     /// Detaches arguments from stack slot references by copying them into inline arrays or heap lists, ensuring they survive stack segment relocation.
     pub(crate) fn detach(self, mc: &Mutation<'gc>) -> Result<Self, Fault> {
         let Held::Slots(slots) = self.held else { return Ok(self) };
-        Ok(match slots.len() {
-            0 => Args::list(self.rest),
-            1 => Args { held: Held::Inline([slots.get(0), Value::VOID], 1), rest: self.rest },
-            2 => Args { held: Held::Inline([slots.get(0), slots.get(1)], 2), rest: self.rest },
-            _ => Args::list(self.to_list(mc)?),
-        })
+        if slots.len() > INLINE {
+            return Ok(Args::list(self.to_list(mc)?));
+        }
+        let mut values = [Value::VOID; INLINE];
+        for (i, value) in values.iter_mut().enumerate().take(slots.len()) {
+            *value = slots.get(i);
+        }
+        Ok(Args { held: Held::Inline(values, slots.len() as u8), rest: self.rest })
     }
 
     /// Converts all arguments into a standard Scheme proper list.

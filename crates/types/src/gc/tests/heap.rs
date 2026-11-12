@@ -375,11 +375,11 @@ fn allocation_during_lazy_sweeping_is_kept() {
 /// backing that can't give memory back keeps counting them.
 #[test]
 fn free_pages_are_given_back() {
-    let mut arena = Arena::new(64 << 20, 2);
+    let mut arena = Arena::new(REGION, 2);
     build(&mut arena, 10_000);
     arena.mutate(|mc| {
-        // 32 MiB of vectors, dropped right after.
-        for _ in 0..32 {
+        // Fills half the region with 1 MiB vectors, each dropped as soon as the next one replaces it.
+        for _ in 0..REGION >> 21 {
             let v = Vector::new(mc, 128 << 10, Value::NIL).unwrap();
             mc.set_root(1, Value::object(mc, v));
         }
@@ -388,7 +388,7 @@ fn free_pages_are_given_back() {
     arena.collect();
     let committed = arena.committed_bytes();
     if ragwort_gc_region::Region::releases() {
-        assert!(committed < 12 << 20, "{committed} bytes still committed");
+        assert!(committed < REGION / 16 * 3, "{committed} bytes still committed");
     } else {
         assert_eq!(committed, arena.pages_bytes());
     }

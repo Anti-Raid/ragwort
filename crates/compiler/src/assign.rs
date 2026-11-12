@@ -119,6 +119,8 @@ pub(crate) fn convert<'id, 'gc>(tree: &mut l3::L3<'id, 'gc>, root: Id<'id>, assi
     if assigned.is_empty() {
         return;
     }
+    let mut boxed = HashSet::default();
+    order_hazards(tree, root, assigned, &mut boxed);
     let mut survey = Survey {
         tree,
         assigned,
@@ -128,7 +130,7 @@ pub(crate) fn convert<'id, 'gc>(tree: &mut l3::L3<'id, 'gc>, root: Id<'id>, assi
         captures: 0,
         outer: std::vec::Vec::new(),
         saved: std::vec::Vec::new(),
-        boxed: HashSet::default(),
+        boxed,
     };
     let mut todo = vec![Step::Expr(root, true)];
     while let Some(step) = todo.pop() {
@@ -285,21 +287,18 @@ impl<'id> Survey<'_, '_, 'id, '_> {
             Node::Lambda(fun) => todo.extend([Step::Enter(fun), Step::Expr(tree[fun].body, true), Step::Leave]),
             Node::App(f, args) => {
                 let all: std::vec::Vec<Id<'id>> = std::iter::once(f).chain(tree[args].iter().copied()).collect();
-                self.arguments(&all);
                 exprs(&all, todo);
                 if !tail {
                     todo.push(Step::Capture);
                 }
             }
             Node::Intrinsic(prim, args) | Node::ApplyIntrinsic(prim, args) => {
-                self.arguments(&tree[args]);
                 exprs(&tree[args], todo);
                 if !tail && !matches!(prim, Prim::Intrinsic(_) | Prim::Slot(..)) {
                     todo.push(Step::Capture);
                 }
             }
             Node::Jump(_, args) => {
-                self.arguments(&tree[args]);
                 exprs(&tree[args], todo);
             }
             Node::Join(scope, codes) => {
@@ -312,17 +311,175 @@ impl<'id> Survey<'_, '_, 'id, '_> {
         }
         todo[at..].reverse();
     }
+}
 
-    /// Marks for boxing any variable that is assigned by one argument while being read by an earlier argument within the same call.
-    fn arguments(&mut self, args: &[Id<'id>]) {
-        let tree = self.tree;
-        for (j, &arg) in args.iter().enumerate() {
-            for id in tree.deep(arg) {
-                if let Node::Set(v, _) = tree[id]
-                    && args[..j].iter().any(|&before| tree.deep(before).any(|r| matches!(tree[r], Node::Ref(w) if w == v)))
-                {
-                    self.boxed.insert(v);
+/// Trait for bitsets tracking reads and writes of assigned variables during argument order analysis.
+trait VarSet: Clone + Default {
+    fn new(words: usize) -> Self;
+    fn insert(&mut self, idx: usize);
+    fn union_with(&mut self, other: &Self);
+    fn for_each_intersection(&self, other: &Self, f: impl FnMut(usize));
+}
+
+impl VarSet for u64 {
+    fn new(_words: usize) -> Self {
+        0
+    }
+
+    fn insert(&mut self, idx: usize) {
+        *self |= 1u64 << idx;
+    }
+
+    fn union_with(&mut self, other: &Self) {
+        *self |= *other;
+    }
+
+    fn for_each_intersection(&self, other: &Self, mut f: impl FnMut(usize)) {
+        let mut both = *self & *other;
+        while both != 0 {
+            let tz = both.trailing_zeros() as usize;
+            f(tz);
+            both &= both - 1;
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct LargeSet(Vec<u64>);
+
+impl VarSet for LargeSet {
+    fn new(words: usize) -> Self {
+        LargeSet(vec![0; words])
+    }
+
+    fn insert(&mut self, idx: usize) {
+        self.0[idx / 64] |= 1u64 << (idx % 64);
+    }
+
+    fn union_with(&mut self, other: &Self) {
+        for (a, &b) in self.0.iter_mut().zip(&other.0) {
+            *a |= b;
+        }
+    }
+
+    fn for_each_intersection(&self, other: &Self, mut f: impl FnMut(usize)) {
+        for (i, (&a, &b)) in self.0.iter().zip(&other.0).enumerate() {
+            let mut both = a & b;
+            while both != 0 {
+                let tz = both.trailing_zeros() as usize;
+                f(i * 64 + tz);
+                both &= both - 1;
+            }
+        }
+    }
+}
+
+struct Effect<S> {
+    reads: S,
+    writes: S,
+}
+
+enum OrderTask<'id> {
+    Enter(Id<'id>),
+    Leave(Id<'id>, usize),
+}
+
+/// Identifies variables in `assigned` that must be boxed because an earlier argument in a call
+/// reads the variable while a later argument in the same call assigns to it.
+fn order_hazards<'id, 'gc>(
+    tree: &l3::L3<'id, 'gc>,
+    root: Id<'id>,
+    assigned: &HashSet<Var>,
+    boxed: &mut HashSet<Var>,
+) {
+    let var_list: Vec<Var> = assigned.iter().copied().collect();
+    let var_map: HashMap<Var, usize> = var_list.iter().copied().enumerate().map(|(i, v)| (v, i)).collect();
+    if assigned.len() <= 64 {
+        survey_order::<u64>(tree, root, 1, &var_map, &var_list, boxed);
+    } else {
+        let words = assigned.len().div_ceil(64);
+        survey_order::<LargeSet>(tree, root, words, &var_map, &var_list, boxed);
+    }
+}
+
+fn survey_order<'id, 'gc, S: VarSet>(
+    tree: &l3::L3<'id, 'gc>,
+    root: Id<'id>,
+    words: usize,
+    var_map: &HashMap<Var, usize>,
+    var_list: &[Var],
+    boxed: &mut HashSet<Var>,
+) {
+    let mut results: Vec<Effect<S>> = Vec::new();
+    let mut todo = vec![OrderTask::Enter(root)];
+    let mut children_buf: Vec<Id<'id>> = Vec::new();
+
+    while let Some(task) = todo.pop() {
+        match task {
+            OrderTask::Enter(id) => {
+                let start = results.len();
+                children_buf.clear();
+                tree.children(id, |child| children_buf.push(child));
+                tree.bodies(id, |body| children_buf.push(body));
+
+                if children_buf.is_empty() {
+                    let mut reads = S::new(words);
+                    let mut writes = S::new(words);
+                    match tree[id] {
+                        Node::Ref(v) => {
+                            if let Some(&idx) = var_map.get(&v) {
+                                reads.insert(idx);
+                            }
+                        }
+                        Node::Set(v, _) => {
+                            if let Some(&idx) = var_map.get(&v) {
+                                writes.insert(idx);
+                            }
+                        }
+                        _ => {}
+                    }
+                    results.push(Effect { reads, writes });
+                } else {
+                    todo.push(OrderTask::Leave(id, start));
+                    for &child in children_buf.iter().rev() {
+                        todo.push(OrderTask::Enter(child));
+                    }
                 }
+            }
+            OrderTask::Leave(id, start) => {
+                let is_call = matches!(
+                    tree[id],
+                    Node::App(..) | Node::Intrinsic(..) | Node::ApplyIntrinsic(..) | Node::Jump(..)
+                );
+                if is_call {
+                    let mut seen_reads = S::new(words);
+                    for child in &results[start..] {
+                        child.writes.for_each_intersection(&seen_reads, |idx| {
+                            boxed.insert(var_list[idx]);
+                        });
+                        seen_reads.union_with(&child.reads);
+                    }
+                }
+                let mut node_reads = S::new(words);
+                let mut node_writes = S::new(words);
+                for child in results.drain(start..) {
+                    node_reads.union_with(&child.reads);
+                    node_writes.union_with(&child.writes);
+                }
+                match tree[id] {
+                    Node::Ref(v) => {
+                        if let Some(&idx) = var_map.get(&v) {
+                            node_reads.insert(idx);
+                        }
+                    }
+                    Node::Set(v, _) => {
+                        if let Some(&idx) = var_map.get(&v) {
+                            node_writes.insert(idx);
+                        }
+                    }
+                    _ => {}
+                }
+                results.push(Effect { reads: node_reads, writes: node_writes });
             }
         }
     }

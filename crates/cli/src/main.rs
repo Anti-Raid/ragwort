@@ -30,9 +30,10 @@ fn finish(result: Result<(), Vec<String>>) -> ExitCode {
 
 /// The program `from` describes: one that starts from its image, if it has one.
 fn program(from: Source) -> Result<Program, Vec<String>> {
-    let Some(image) = from.image else { return Program::new(from.modules) };
+    let heap = from.heap.unwrap_or(program::HEAP);
+    let Some(image) = from.image else { return Program::new(heap, from.modules) };
     let bytes = std::fs::read(&image).map_err(|e| vec![format!("{}: {e}", image.display())])?;
-    Program::from_image(from.modules, &bytes).map_err(|errors| errors.iter().map(|error| format!("{}: {error}", image.display())).collect())
+    Program::from_image(heap, from.modules, &bytes).map_err(|errors| errors.iter().map(|error| format!("{}: {error}", image.display())).collect())
 }
 
 /// Compiles the modules of `program` and `entry`, and writes their bytecode.

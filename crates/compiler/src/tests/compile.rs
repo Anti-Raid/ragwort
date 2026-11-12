@@ -1703,3 +1703,131 @@ fn host_functions_are_called_in_the_loop() {
         assert!(!unused(ADD_DISCARDABLE).iter().any(|op| matches!(op, Op::CallHost { .. })));
     });
 }
+
+#[test]
+fn argument_order_hazard_boxing_and_deep_calls() {
+    fn ops_of(build: impl for<'gc> FnOnce(&Mutation<'gc>) -> Core<'gc>) -> Vec<Op> {
+        let mut arena = Arena::new(1 << 24, 0);
+        arena.mutate(|mc| all_ops(mc, compile(mc, Some(hosting(mc)), &build(mc)).expect("compiled")))
+    }
+
+    // 1. Correctness of boxing:
+    // A) Primitive / intrinsic call: earlier argument reads x, later argument assigns x -> boxed.
+    fn earlier_read_later_set<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
+        let_(vec![(0, q(1))], prim(Cons, vec![var(0), seq(1, set(0, q(2)), q(3))]))
+    }
+    eval(earlier_read_later_set, |mc, result| {
+        let pair = Pair::of(result.expect("success")).expect("pair");
+        assert_eq!((pair.head(mc), pair.tail(mc)), (fix(1), fix(3)));
+    });
+    assert!(has_box_op(&ops_of(earlier_read_later_set)));
+
+    // Vice versa: earlier argument assigns x, later argument reads x -> NOT boxed.
+    fn earlier_set_later_read<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
+        let_(vec![(0, q(1))], prim(Cons, vec![seq(1, set(0, q(2)), q(3)), var(0)]))
+    }
+    eval(earlier_set_later_read, |mc, result| {
+        let pair = Pair::of(result.expect("success")).expect("pair");
+        assert_eq!((pair.head(mc), pair.tail(mc)), (fix(3), fix(2)));
+    });
+    assert!(!has_box_op(&ops_of(earlier_set_later_read)));
+
+    // B) Function application (Node::App): earlier argument reads x, later argument assigns x -> boxed.
+    fn app_earlier_read_later_set<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
+        lambda(&[1], None, let_(vec![(0, q(10))], app(var(1), vec![var(0), seq(4, set(0, q(20)), q(30))])))
+    }
+    assert_eq!(number(|mc| app(app_earlier_read_later_set(mc), vec![lambda(&[2, 3], None, add(var(2), var(3)))])), Ok(40));
+    assert!(has_box_op(&ops_of(app_earlier_read_later_set)));
+
+    // Vice versa: earlier argument assigns x, later argument reads x -> NOT boxed.
+    fn app_earlier_set_later_read<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
+        lambda(&[1], None, let_(vec![(0, q(10))], app(var(1), vec![seq(4, set(0, q(20)), q(30)), var(0)])))
+    }
+    assert_eq!(number(|mc| app(app_earlier_set_later_read(mc), vec![lambda(&[2, 3], None, add(var(2), var(3)))])), Ok(50));
+    assert!(!has_box_op(&ops_of(app_earlier_set_later_read)));
+
+    // 2. Wide and deeply nested calls completing rapidly:
+    // Depth 250 nested calls with 4 arguments at each level and set! at the base.
+    fn deep_nested<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
+        let mut inner = seq(1001, set(0, add(var(0), q(1))), var(0));
+        for _ in 0..250 {
+            inner = app(var(1), vec![q(1), q(2), q(3), inner]);
+        }
+        let f = lambda(&[2, 3, 4, 5], None, add(var(2), var(5)));
+        let_(vec![(0, q(0)), (1, f)], inner)
+    }
+    let start = std::time::Instant::now();
+    assert_eq!(number(deep_nested), Ok(251));
+    assert!(start.elapsed() < std::time::Duration::from_secs(2), "deeply nested calls should complete rapidly");
+
+    // Wide call with 100 arguments where argument 0 reads x and argument 99 assigns x -> boxed.
+    fn wide_call<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
+        let mut args = Vec::with_capacity(100);
+        args.push(var(0));
+        for _ in 1..99 {
+            args.push(q(0));
+        }
+        args.push(seq(1002, set(0, q(42)), q(0)));
+        lambda(&[2], None, let_(vec![(0, q(1))], app(var(2), args)))
+    }
+    let start = std::time::Instant::now();
+    let ops = ops_of(wide_call);
+    assert!(has_box_op(&ops));
+    assert!(start.elapsed() < std::time::Duration::from_secs(2), "wide call should complete rapidly");
+
+    // Wide call vice versa: argument 0 assigns x and argument 99 reads x -> NOT boxed.
+    fn wide_vice_versa<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
+        let mut args = Vec::with_capacity(100);
+        args.push(seq(1002, set(0, q(42)), q(0)));
+        for _ in 1..99 {
+            args.push(q(0));
+        }
+        args.push(var(0));
+        lambda(&[2], None, let_(vec![(0, q(1))], app(var(2), args)))
+    }
+    let start = std::time::Instant::now();
+    let ops = ops_of(wide_vice_versa);
+    assert!(!has_box_op(&ops));
+    assert!(start.elapsed() < std::time::Duration::from_secs(2), "wide call vice versa should complete rapidly");
+}
+
+#[test]
+fn argument_hazards_are_found_among_many_assigned_variables() {
+    const VARS: u32 = 70;
+    const LAST: u32 = VARS - 1;
+    // Assigns every variable, then builds `(cons hazard sum)`, where `sum` reads them all.
+    fn program<'gc>(hazard: Core<'gc>) -> Core<'gc> {
+        let mut sum = var(0);
+        for v in 1..VARS {
+            sum = add(sum, var(v));
+        }
+        let mut body = prim(Cons, vec![hazard, sum]);
+        for v in 0..LAST {
+            body = seq(1000 + v, set(v, q(5)), body);
+        }
+        let_((0..VARS).map(|v| (v, q(1))).collect(), body)
+    }
+    fn read_then_set<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
+        program(prim(Cons, vec![var(LAST), seq(2000, set(LAST, q(2)), q(3))]))
+    }
+    fn set_then_read<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
+        program(prim(Cons, vec![seq(2000, set(LAST, q(2)), q(3)), var(LAST)]))
+    }
+    fn boxes(build: impl for<'gc> FnOnce(&Mutation<'gc>) -> Core<'gc>) -> bool {
+        let mut arena = Arena::new(1 << 24, 0);
+        arena.mutate(|mc| has_box_op(&all_ops(mc, compile(mc, Some(hosting(mc)), &build(mc)).expect("compiled"))))
+    }
+    let total = i64::from(LAST) * 5 + 2;
+    eval(read_then_set, |mc, result| {
+        let outer = Pair::of(result.expect("success")).expect("pair");
+        let inner = Pair::of(outer.head(mc)).expect("pair");
+        assert_eq!((inner.head(mc), inner.tail(mc), outer.tail(mc)), (fix(1), fix(3), fix(total)));
+    });
+    eval(set_then_read, |mc, result| {
+        let outer = Pair::of(result.expect("success")).expect("pair");
+        let inner = Pair::of(outer.head(mc)).expect("pair");
+        assert_eq!((inner.head(mc), inner.tail(mc), outer.tail(mc)), (fix(3), fix(2), fix(total)));
+    });
+    assert!(boxes(read_then_set));
+    assert!(!boxes(set_then_read));
+}

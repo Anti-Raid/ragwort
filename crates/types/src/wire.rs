@@ -21,9 +21,12 @@
 //!
 //! Nothing says what type the bytes are of. What's read must be what was written, by the same
 //! build: [`Wire::SHAPE`] changes when a type's fields do, and an image is stamped with the
-//! shapes of what it holds. A derived shape is made of the names and types of the fields as
-//! they're written, not of the shapes of those types, so a stamp is made of the shape of each
-//! type that's saved.
+//! shapes of what it holds. A derived shape mixes the shapes of its field types transitively
+//! (breaking const cycles on recursive data structures).
+
+#[cfg(test)]
+#[path = "tests/wire.rs"]
+mod tests;
 
 use std::any::Any;
 use std::ops::Range;

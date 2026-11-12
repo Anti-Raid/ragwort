@@ -472,9 +472,9 @@ fn counts(shape: Shape) -> Result<(u8, u8), Fault> {
     Ok((shape.required as u8, fixed))
 }
 
-/// Binds arguments for procedures with more parameters than `MAX_PARAMS`: places the first `MAX_PARAMS
-/// - 1` arguments into registers and collects remaining arguments into a rest list in the final
-/// register.
+/// Binds arguments for procedures with more parameters than `MAX_PARAMS`: places the first
+/// `MAX_PARAMS - 1` arguments into registers and collects remaining arguments into a rest list in
+/// the final register.
 #[inline(never)]
 fn bind_spread<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, shape: Shape, mut argc: u8, mut rest: Value<'gc>) -> Result<(), Fault> {
     // Procedures with optional parameters are constrained by the compiler to fit within `MAX_PARAMS`, so

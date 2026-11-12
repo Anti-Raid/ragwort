@@ -18,6 +18,13 @@
 //! - `compile --image core.img -o more.img extra=lib/extra` makes an image of both.
 //! - An image is for the build of `ragwort` that made it.
 //!
+//! # Memory
+//!
+//! `--heap size` sets the program's memory limit, which defaults to the capacity of the object region (64 MiB unless `ragwort` was built with another). The size is a whole number of bytes with an optional binary unit suffix: `--heap 16m` allows 16 MiB, and `k` and `g` select KiB and GiB.
+//!
+//! - The limit covers every object and every value the program holds outside the object region, such as source text and compiled code.
+//! - A program that exceeds the limit stops with an out-of-memory error.
+//!
 //! # Modules
 //!
 //! `name=folder` makes the files in `folder` the module `name`, which code requires by that
@@ -44,6 +51,7 @@ usage:
 
   name=folder   the files in folder are the module `name`; `=folder` names it as the folder
   --image file  start from the modules an image holds
+  --heap size   limit the program's memory, such as `--heap 16m` (k, m and g are binary units)
   .rg files are Scheme, .rgn files are native ragwort
 ";
 
@@ -69,6 +77,8 @@ pub enum Command {
 /// Where a command's modules are from: an image, if it starts from one, and folders.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Source {
+    /// The memory limit given by `--heap`, in bytes.
+    pub heap: Option<usize>,
     pub image: Option<PathBuf>,
     pub modules: Vec<ModuleDir>,
 }
@@ -82,12 +92,27 @@ pub fn language(path: &Path) -> Option<Language> {
     }
 }
 
+/// Parses a memory size such as `16m`: a whole number of bytes with an optional binary unit suffix `k`, `m` or `g`. Returns `None` for zero, for a malformed size, and for a size that overflows `usize`.
+fn size(text: &str) -> Option<usize> {
+    let (digits, shift) = match text.char_indices().last()? {
+        (at, 'k' | 'K') => (&text[..at], 10),
+        (at, 'm' | 'M') => (&text[..at], 20),
+        (at, 'g' | 'G') => (&text[..at], 30),
+        _ => (text, 0),
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let count: usize = digits.parse().ok()?;
+    count.checked_mul(1 << shift).filter(|&bytes| bytes > 0)
+}
+
 /// What `args`, the arguments after the program's name, ask for, or what's wrong with them.
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
     let mut args = args.into_iter().peekable();
     let compile = args.next_if(|arg| arg == "compile").is_some();
     let mut modules: Vec<ModuleDir> = Vec::new();
-    let (mut entry, mut image, mut output) = (None, None, None);
+    let (mut entry, mut image, mut output, mut heap) = (None, None, None, None);
     while let Some(arg) = args.next() {
         if arg == "-h" || arg == "--help" {
             return Ok(Command::Help);
@@ -98,6 +123,14 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
                 return Err(format!("`{arg}` is given twice"));
             }
             *file = Some(PathBuf::from(args.next().ok_or_else(|| format!("`{arg}` needs a file"))?));
+            continue;
+        }
+        if arg == "--heap" {
+            if heap.is_some() {
+                return Err("`--heap` is given twice".to_string());
+            }
+            let text = args.next().ok_or("`--heap` needs a size")?;
+            heap = Some(size(&text).ok_or_else(|| format!("`{text}` is not a size such as `16m`"))?);
             continue;
         }
         if arg.starts_with('-') {
@@ -122,7 +155,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
         }
         modules.push(ModuleDir { name: name.to_string(), folder: PathBuf::from(folder) });
     }
-    let from = Source { image, modules };
+    let from = Source { heap, image, modules };
     match (compile, output) {
         (false, Some(_)) => Err("`-o` goes with `compile`".to_string()),
         (false, None) => Ok(Command::Run { from, entry }),

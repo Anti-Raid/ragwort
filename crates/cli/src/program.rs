@@ -45,7 +45,7 @@ use ragwort_modules_core::{Error, File, Language, Located, Source, load_located,
 use ragwort_printer_scheme::{Mode, to_string};
 use ragwort_reader_scheme::{ErrorKind, Reader};
 use ragwort_types::gc::image::{LoadError, SaveError};
-use ragwort_types::gc::{Arena, Gc, Mutation, Root, Value, ValueRoot};
+use ragwort_types::gc::{Arena, Gc, Mutation, REGION, Root, Value, ValueRoot};
 use ragwort_types::pair::Pairs;
 use ragwort_types::string::{Strings, chars, from_str};
 use ragwort_types::symbol::{Symbol, Symbols};
@@ -56,8 +56,8 @@ use ragwort_vm::{Fault, HostDef, MIN_SEGMENT, Machine, Outcome};
 use crate::args::{ModuleDir, language};
 use crate::{hosts, listing};
 
-/// The most bytes the arena takes.
-const HEAP: usize = 1 << 28;
+/// The default memory limit of a program, in bytes: the capacity of the object region.
+pub const HEAP: usize = REGION;
 /// The most characters a result or a raised value is shown in.
 const SHOWN: usize = 1 << 16;
 const OUT_OF_MEMORY: &str = "out of memory";
@@ -366,8 +366,8 @@ fn run(arena: &mut Arena, thunk: &ValueRoot, mut out: Option<&mut dyn FnMut(&str
 
 impl Program {
     /// A program whose code can require the modules of `dirs`, none of them loaded yet.
-    pub fn new(dirs: Vec<ModuleDir>) -> Result<Self, Vec<String>> {
-        let mut arena = Arena::new(HEAP, 0);
+    pub fn new(heap: usize, dirs: Vec<ModuleDir>) -> Result<Self, Vec<String>> {
+        let mut arena = Arena::new(heap, 0);
         let modules = Modules { dirs, loaded: Vec::new(), wanted: None, errors: Vec::new(), listing: None };
         let (symbols, built) = arena.mutate(start).map_err(|message| vec![message])?;
         for thunk in &built.thunks {
@@ -475,8 +475,8 @@ impl Program {
 
     /// A program that starts from what the image `bytes` holds, and can require the modules of
     /// `dirs` besides.
-    pub fn from_image(dirs: Vec<ModuleDir>, bytes: &[u8]) -> Result<Self, Vec<String>> {
-        let mut arena = Arena::new(HEAP, 0);
+    pub fn from_image(heap: usize, dirs: Vec<ModuleDir>, bytes: &[u8]) -> Result<Self, Vec<String>> {
+        let mut arena = Arena::new(heap, 0);
         let mut modules = Modules { dirs, loaded: Vec::new(), wanted: None, errors: Vec::new(), listing: None };
         let (symbols, prelude) = arena.mutate(|mc| restore(mc, bytes, &mut modules)).map_err(|message| vec![message])?;
         let repl = modules.loaded.iter().find(|(name, _)| name == hosts::NAME).map(|(_, module)| module.clone());

@@ -1,6 +1,20 @@
-use proc_macro2::TokenStream;
-use quote::{format_ident, quote};
+use proc_macro2::{TokenStream, TokenTree};
+use quote::{format_ident, quote, ToTokens};
 use syn::{Data, DeriveInput, Error, Fields, Index};
+
+/// Checks if a type expression contains a given identifier, used to break const evaluation
+/// cycles on recursive data structures.
+fn contains_ident(ty: &syn::Type, ident: &syn::Ident) -> bool {
+    contains_ident_stream(ty.to_token_stream(), ident)
+}
+
+fn contains_ident_stream(stream: TokenStream, ident: &syn::Ident) -> bool {
+    stream.into_iter().any(|tree| match tree {
+        TokenTree::Ident(i) => i == *ident,
+        TokenTree::Group(g) => contains_ident_stream(g.stream(), ident),
+        _ => false,
+    })
+}
 
 /// The code that writes `fields`, bound as `names`, and the code that reads them into what
 /// `make` makes of them.
@@ -44,9 +58,15 @@ pub(crate) fn expand(input: TokenStream) -> Result<TokenStream, Error> {
     let w = quote!(::ragwort_types::wire);
     let name = &item.ident;
     let mut shape = name.to_string();
+    let mut field_tys = Vec::new();
     let (write, read) = match &item.data {
         Data::Struct(data) => {
             shape.push_str(&text(&data.fields));
+            for field in &data.fields {
+                if !contains_ident(&field.ty, name) {
+                    field_tys.push(&field.ty);
+                }
+            }
             let (pattern, write, read) = parts(&data.fields, quote!(Self));
             (quote!(let Self #pattern = self; #write), quote!(Ok(#read)))
         }
@@ -57,6 +77,11 @@ pub(crate) fn expand(input: TokenStream) -> Result<TokenStream, Error> {
             let (mut writes, mut reads) = (Vec::new(), Vec::new());
             for (place, variant) in data.variants.iter().enumerate() {
                 shape.push_str(&format!("|{}{}", variant.ident, text(&variant.fields)));
+                for field in &variant.fields {
+                    if !contains_ident(&field.ty, name) {
+                        field_tys.push(&field.ty);
+                    }
+                }
                 let ident = &variant.ident;
                 let place = Index::from(place);
                 let (pattern, write, read) = parts(&variant.fields, quote!(Self::#ident));
@@ -67,9 +92,13 @@ pub(crate) fn expand(input: TokenStream) -> Result<TokenStream, Error> {
         }
         Data::Union(data) => return Err(Error::new_spanned(data.union_token, "a union has no binary form")),
     };
+    let mut shape_expr = quote!(#w::shape_of(#shape));
+    for ty in field_tys {
+        shape_expr = quote!(#w::mix(#shape_expr, <#ty as #w::Wire>::SHAPE));
+    }
     Ok(quote! {
         impl #w::Wire for #name {
-            const SHAPE: u64 = #w::shape_of(#shape);
+            const SHAPE: u64 = #shape_expr;
 
             fn write(&self, out: &mut #w::Writer) {
                 #write
