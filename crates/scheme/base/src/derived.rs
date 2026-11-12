@@ -218,12 +218,15 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     /// `(%guard (lambda () body ...) (lambda (var) (cond clause ... (else (raise-continuable
     /// var)))))`, the `else` only if the clauses have none: the prelude's `%guard` calls the
     /// handler once it has left the body, so the clauses run in the guard's context.
+    ///
+    /// `(guard (var #:no-traceback clause ...) body ...)` expands to `%guard/no-traceback` instead, so a condition this guard catches records no call trace when it is raised.
     fn guard(&mut self, stx: Stx, spec: Stx, body: &[Stx]) -> Result<Stx, ExpandError> {
         let parts = self.proper(spec)?;
         let Some((&var, clauses)) = parts.split_first().filter(|(var, _)| self.is_id(**var)) else {
             return Err(self.error(ExpandErrorKind::BadSyntax, spec));
         };
-        let mut clauses = clauses.to_vec();
+        let quiet = clauses.first().is_some_and(|&option| self.keyword_name(option).as_deref() == Some("no-traceback"));
+        let mut clauses = if quiet { clauses[1..].to_vec() } else { clauses.to_vec() };
         let has_else = match clauses.last() {
             Some(&last) => match self.proper(last)?.first() {
                 Some(&head) => self.is_aux(head, Aux::Else)?,
@@ -241,7 +244,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let cond = self.build(stx, "cond", &[&clauses])?;
         let formals = self.list(&[var], stx)?;
         let handler = self.build(stx, "lambda", &[&[formals, cond]])?;
-        self.build(stx, "%guard", &[&[thunk, handler]])
+        self.build(stx, if quiet { "%guard/no-traceback" } else { "%guard" }, &[&[thunk, handler]])
     }
 
     /// `(let ((t key)) (cond ((memv t '(datum ...)) body ...) ...))`, with `=> f` as `(f t)`.

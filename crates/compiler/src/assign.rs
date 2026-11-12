@@ -43,6 +43,7 @@ pub(crate) fn lower<'s, 'id, 'gc>(tree: &mut l3::L3<'id, 'gc>, from: &L2<'s, 'gc
         let id = match task {
             Task::Expr(id) => id,
             Task::Make(id) => {
+                tree.at(from.site(id));
                 let mut pop = || vals.pop().expect("a lowered child");
                 let node = match from[id] {
                     l2::Node::If(..) => {

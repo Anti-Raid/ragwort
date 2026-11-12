@@ -8,7 +8,7 @@
 use ragwort_compiler::keyword::{self, CallShape, Fresh};
 use ragwort_compiler::module::Import;
 use ragwort_compiler::steps::Step;
-use ragwort_compiler::{Core, Lambda, Place, Var};
+use ragwort_compiler::{Core, Lambda, Place, Position, Var};
 use ragwort_types::symbol::Keyword;
 
 use crate::expand::{Binding, Ex, Expander};
@@ -169,7 +169,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             }
             let params = f.order.into_iter().map(|i| f.raws[i]).collect();
             let optional = u32::try_from(f.shape.optional).map_err(|_| this.error(ExpandErrorKind::BadSyntax, f.stx))?;
-            let lambda = Lambda { id: this.lambda_id(), optional, params, rest, body: Box::new(body) };
+            let lambda = Lambda { id: this.lambda_id(), optional, params, rest, body: Box::new(body), name: None, at: Position::of(this.mc, this.tree.span(f.stx)) };
             then(this, lambda, f.shape)
         })
     }

@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 use ragwort_compiler::module::{Loaded, Resolver};
 use ragwort_modules_core::image::{self, ImageError};
 use ragwort_modules_core::{Error, File, Language, Located, Source, load_located, prelude};
-use ragwort_printer_scheme::{Mode, to_string};
+use ragwort_printer_scheme::{Mode, render, to_string};
 use ragwort_reader_scheme::{ErrorKind, Reader};
 use ragwort_types::gc::image::{LoadError, SaveError};
 use ragwort_types::gc::{Arena, Gc, Mutation, REGION, Root, Value, ValueRoot};
@@ -51,6 +51,7 @@ use ragwort_types::string::{Strings, chars, from_str};
 use ragwort_types::symbol::{Symbol, Symbols};
 use ragwort_types::syntax::{Syntax, SyntaxKind, SyntaxSession};
 use ragwort_vm::objects::Module;
+use ragwort_vm::report::Report;
 use ragwort_vm::{Fault, HostDef, MIN_SEGMENT, Machine, Outcome};
 
 use crate::args::{ModuleDir, language};
@@ -199,7 +200,7 @@ fn ran<'gc>(mc: &Mutation<'gc>, outcome: Result<Outcome<'gc>, Fault>) -> Ran<'gc
     match outcome {
         Ok(Outcome::Paused) => Ran::More,
         Ok(Outcome::Done(value)) => Ran::Done(value),
-        Ok(Outcome::Raised(raised)) => Ran::Failed(format!("uncaught: {}", shown(mc, raised))),
+        Ok(Outcome::Raised(raised)) => Ran::Failed(render(mc, &Report::of(mc, raised), SHOWN)),
         Ok(Outcome::Yielded(_)) => Ran::Failed("error: a yield with nothing to resume it".to_string()),
         Ok(Outcome::Deferred(_)) => Ran::Failed("error: a host call that's never answered".to_string()),
         Err(e) => Ran::Failed(fault(e)),

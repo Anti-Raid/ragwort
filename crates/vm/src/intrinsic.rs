@@ -21,6 +21,7 @@ use ragwort_types::syntax::Syntax;
 use ragwort_types::vector::{AnyVector, Vectors};
 
 use crate::op::{Context, Fuel};
+use crate::report::Failure;
 use crate::{Fault, coroutine, equal, prompts, structs, syntax};
 use crate::objects::{self, BoxFields, Condition, ConditionFields, KeywordProcedureFields, ModuleFields, MultiValue, MultiValueFields, StructFields, StructTypeFields, Tag, Task, TaskFields};
 
@@ -641,6 +642,10 @@ named! {
         /// `(error-object-kind c)`: returns the fault kind symbol corresponding to condition `c` from
         /// [`Fault::KINDS`].
         ErrorObjectKind = ("error-object-kind", takes(1, TRUTHY)),
+        /// `(error-object-traceback c)`: returns the calls in progress when condition `c` was first raised, innermost first, as a list of `(name file line)` entries. `name` is the procedure's symbol or `#f`; `file` and `line` say where the procedure is defined, and are `#f` when that is unknown.
+        ErrorObjectTraceback = ("error-object-traceback", takes(1, 0)),
+        /// `(error-object-who c)`: returns the name of the built-in operation or host function that raised condition `c` as a symbol, or `#f` if `c` was not raised by one.
+        ErrorObjectWho = ("error-object-who", takes(1, 0)),
         /// `(syntax? x)`: returns `#t` if `x` is a syntax object, and `#f` otherwise.
         IsSyntax = ("syntax?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `(identifier? x)`: returns `#t` if syntax object `x` wraps a symbol, and `#f` otherwise.
@@ -1811,7 +1816,7 @@ impl Intrinsic {
                     irritants = pairs.cons(arg(i), irritants)?.value(mc);
                 }
                 let fault = if self == Intrinsic::MakeError { Fault::Error } else { Fault::Syntax };
-                made(mc, fuel, Value::object(mc, Condition::new(mc, mc.frozen(fault)?, arg(0), irritants)?))
+                made(mc, fuel, Value::object(mc, Condition::new(mc, mc.frozen(Failure { fault, operation: None })?, arg(0), irritants, Value::FALSE)?))
             }
             Intrinsic::IsProcedure => boolean(is_procedure(mc, arg(0))),
             Intrinsic::MakeKeywordProcedure => {
@@ -1874,17 +1879,24 @@ impl Intrinsic {
                 let c = arg(0).downcast::<Condition>(mc).ok_or(Fault::WrongType)?;
                 match c.message(mc) {
                     Value::VOID => {
-                        let kind = c.fault(mc).ok_or(Fault::Malformed)?.kind();
-                        let words = Fault::KINDS[kind].replace('-', " ");
-                        made(mc, fuel, string::from_str(&Strings::new(mc), &words)?.value())
+                        let words = c.failure(mc).ok_or(Fault::Malformed)?.fault.message();
+                        made(mc, fuel, string::from_str(&Strings::new(mc), words)?.value())
                     }
                     message => message,
                 }
             }
             Intrinsic::ErrorObjectIrritants => arg(0).downcast::<Condition>(mc).ok_or(Fault::WrongType)?.irritants(mc),
+            Intrinsic::ErrorObjectWho => {
+                let c = arg(0).downcast::<Condition>(mc).ok_or(Fault::WrongType)?;
+                made(mc, fuel, crate::report::who(mc, c)?)
+            }
+            Intrinsic::ErrorObjectTraceback => {
+                let c = arg(0).downcast::<Condition>(mc).ok_or(Fault::WrongType)?;
+                made(mc, fuel, crate::report::traceback(mc, c)?)
+            }
             Intrinsic::ErrorObjectKind => {
                 let c = arg(0).downcast::<Condition>(mc).ok_or(Fault::WrongType)?;
-                let name = Fault::KINDS[c.fault(mc).ok_or(Fault::Malformed)?.kind()];
+                let name = Fault::KINDS[c.failure(mc).ok_or(Fault::Malformed)?.fault.kind()];
                 made(mc, fuel, Symbols::of_arena(mc)?.intern_str(&Strings::new(mc), name)?.value(mc))
             }
         })

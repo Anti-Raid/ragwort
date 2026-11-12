@@ -49,7 +49,7 @@ fn seq<'gc>(v: u32, a: Core<'gc>, b: Core<'gc>) -> Core<'gc> {
 }
 
 fn lambda<'gc>(id: u32, params: &[u32], body: Core<'gc>) -> Core<'gc> {
-    Core::Lambda(Lambda { id, params: params.iter().map(|&v| Var(v)).collect(), optional: 0, rest: None, body: Box::new(body) })
+    Core::Lambda(Lambda { id, params: params.iter().map(|&v| Var(v)).collect(), optional: 0, rest: None, body: Box::new(body), name: None, at: None })
 }
 
 fn app<'gc>(f: Core<'gc>, args: Vec<Core<'gc>>) -> Core<'gc> {
@@ -65,7 +65,7 @@ fn l5_of(build: impl for<'gc> FnOnce(&Mutation<'gc>) -> Core<'gc>) -> String {
     let mut arena = Arena::new(1 << 24, 0);
     arena.mutate(|mc| {
         let trees = ragwort_alloc::Arena::new();
-        let f = to_l5(mc, &trees, &build(mc)).unwrap();
+        let f = to_l5(mc, &trees, &build(mc), &mut crate::ir::Origins::default(), &|_| None).unwrap();
         verify(&f).unwrap_or_else(|e| panic!("{e}\n{f}"));
         f.to_string()
     })
@@ -251,7 +251,8 @@ fn function<'a, 'gc>(arena: &'a Trees, values: u32, blocks: Vec<BlockData<'a, 'g
 }
 
 fn block<'a, 'gc>(arena: &'a Trees, params: &[u32], insts: Vec<Inst<'a, 'gc>>, end: End<'a>) -> BlockData<'a, 'gc> {
-    BlockData { params: params.iter().map(|&v| Val(v)).collect_in(arena), insts: insts.into_iter().collect_in(arena), end }
+    let sites = vec![0; insts.len()];
+    BlockData { params: params.iter().map(|&v| Val(v)).collect_in(arena), insts: insts.into_iter().collect_in(arena), sites, end, end_site: 0 }
 }
 
 #[test]
@@ -340,7 +341,7 @@ fn deep_code_needs_no_stack() {
                 let program = lower(&trees, &t, root).unwrap();
                 verify(&program).unwrap();
                 assert_eq!(program.functions.len(), LAMBDAS as usize + 1);
-                let thunk = crate::emit::emit(mc, None, &program).unwrap();
+                let thunk = crate::emit::emit(mc, None, &program, &crate::ir::Origins::default()).unwrap();
                 if !run {
                     return;
                 }

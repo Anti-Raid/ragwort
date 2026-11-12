@@ -109,7 +109,7 @@ pub fn procedure<'gc>(mc: &Mutation<'gc>, shape: &CallShape<'gc>, core: Core<'gc
             }
         };
         let optional = u32::try_from(shape.optional).map_err(|_| OutOfMemory)?;
-        Core::Lambda(Lambda { id: fresh.lambda(), optional, params, rest, body: Box::new(body) })
+        Core::Lambda(Lambda { id: fresh.lambda(), optional, params, rest, body: Box::new(body), name: None, at: None })
     };
     let pairs = Pairs::new(mc);
     let all: Vec<Value<'gc>> = shape.keywords.iter().map(|&(k, _)| k.value(mc)).collect();

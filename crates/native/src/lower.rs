@@ -7,7 +7,7 @@ use ragwort_compiler::keyword::{self, CallShape, Fresh};
 use ragwort_compiler::module::{Binding, Field, Filter, Import, ModuleBuilder, ModuleError, RequireSpec, Resolver, SpecError, Unusable};
 use ragwort_compiler::steps::{self, Step};
 use ragwort_compiler::structs::{self, Declaration, Declared, Member};
-use ragwort_compiler::{Core, Lambda, Place, Prim, Var};
+use ragwort_compiler::{Core, Lambda, Place, Position, Prim, Var};
 use ragwort_types::Error;
 use ragwort_types::gc::{Mutation, OutOfMemory, Value};
 use ragwort_types::pair::{Pair, Pairs};
@@ -941,10 +941,13 @@ impl<'s, 'a, 'gc> Lowering<'s, 'a, 'gc> {
         l.distinct(&names)?;
         // A `%letrec`'s names are in scope in its inits, a `%let`'s only in its body.
         let vars = if recursive { l.bind(&names) } else { Vec::new() };
-        steps::all(inits, move |s: &mut Self, inits| {
+        steps::all(inits, move |s: &mut Self, mut inits: Vec<Core<'gc>>| {
             let vars = if recursive { vars } else { s.l.bind(&names) };
             s.body(body, move |s, body| {
                 s.l.unbind(&names);
+                for (init, name) in inits.iter_mut().zip(&names) {
+                    init.name(name.datum(s.l.mc));
+                }
                 let binds = vars.into_iter().zip(inits).collect();
                 Ok(Step::Done(if recursive { Core::Letrec(binds, Box::new(body)) } else { Core::Let(binds, Box::new(body)) }))
             })
@@ -1001,7 +1004,7 @@ impl<'s, 'a, 'gc> Lowering<'s, 'a, 'gc> {
             s.l.unbind(&names);
             let rest = (vars.len() > params).then(|| vars.pop()).flatten();
             let id = s.l.lambda_id();
-            Ok(Step::Done(Core::Lambda(Lambda { id, params: vars, optional: 0, rest, body: Box::new(body) })))
+            Ok(Step::Done(Core::Lambda(Lambda { id, params: vars, optional: 0, rest, body: Box::new(body), name: None, at: Position::of(s.l.mc, node.span(s.l.mc)) })))
         })
     }
 
@@ -1033,7 +1036,7 @@ impl<'s, 'a, 'gc> Lowering<'s, 'a, 'gc> {
             let params = keyword::order(mc, &formals.params).into_iter().map(|i| raws[i]).collect();
             let shape = CallShape::of(mc, &formals.params, rest.is_some());
             let optional = u32::try_from(shape.optional).expect("fewer than 2^32 parameters");
-            let lambda = Lambda { id: s.l.lambda_id(), optional, params, rest, body: Box::new(body) };
+            let lambda = Lambda { id: s.l.lambda_id(), optional, params, rest, body: Box::new(body), name: None, at: Position::of(mc, node.span(mc)) };
             if core_only || !formals.has_keywords() {
                 return Ok(Step::Done(Core::Lambda(lambda)));
             }

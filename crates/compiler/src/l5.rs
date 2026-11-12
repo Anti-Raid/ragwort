@@ -76,7 +76,11 @@ pub(crate) struct Function<'a, 'gc> {
 pub(crate) struct BlockData<'a, 'gc> {
     pub(crate) params: Vec<'a, Val>,
     pub(crate) insts: Vec<'a, Inst<'a, 'gc>>,
+    /// The source site of each instruction, parallel to `insts`: a site number of the compilation's `Sites`, or 0.
+    pub(crate) sites: std::vec::Vec<u32>,
     pub(crate) end: End<'a>,
+    /// The source site of `end`.
+    pub(crate) end_site: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -247,7 +251,9 @@ fn sets_in<'id>(tree: &L4<'id, '_>, root: Id<'id>, sets: &mut HashSet<Var>) {
 struct Building<'a, 'gc> {
     params: Vec<'a, Val>,
     insts: Vec<'a, Inst<'a, 'gc>>,
+    sites: std::vec::Vec<u32>,
     end: Option<End<'a>>,
+    end_site: u32,
 }
 
 /// The continuation context for an expression's result: either continuing sequentially within the
@@ -293,6 +299,8 @@ struct Builder<'a, 't, 'id, 'gc> {
     this: Val,
     /// The stack of remaining lowering tasks to execute, processed in LIFO order (next task at the top).
     todo: std::vec::Vec<Task<'a, 'id>>,
+    /// The source site of the expression being lowered, which the instructions built for it receive.
+    site: u32,
     /// The SSA value produced by the most recently lowered expression, or `None` if control diverged
     /// (e.g. jumped or returned). This value is consumed by the subsequent task on the work stack.
     ret: Option<Val>,
@@ -326,10 +334,11 @@ enum Task<'a, 'id> {
     /// mutated variables across the join boundary.
     Join { codes: Span<'id, JoinCode<'id>>, carried: std::vec::Vec<Var>, rest: Option<Block>, lowered: std::vec::Vec<bool>, ctx: Ctx, code: Option<(usize, usize)> },
     /// Evaluates function call arguments after the callee expression has been evaluated.
-    Callee { args: Span<'id, Id<'id>>, tail: bool },
+    Callee { args: Span<'id, Id<'id>>, tail: bool, site: u32 },
     /// Evaluates argument index `at` from `args` (following evaluation sequence `order`, if specified),
     /// accumulating results into `vals`.
-    Args { args: Span<'id, Id<'id>>, order: Option<Vec<'a, usize>>, at: usize, vals: Vec<'a, Val>, then: Use },
+    /// Evaluates the arguments of the operation `then`, which reports the source site `site`.
+    Args { args: Span<'id, Id<'id>>, order: Option<Vec<'a, usize>>, at: usize, vals: Vec<'a, Val>, then: Use, site: u32 },
     /// Manages mutually recursive closures for `funs` bound to `dsts`, tracking compiled function
     /// codes and environment captures as each closure is lowered.
     Closures { funs: std::vec::Vec<Fun<'id>>, dsts: Vec<'a, Val>, codes: Vec<'a, Code<'a>>, captures: Option<Vec<'a, Captured>> },
@@ -363,7 +372,7 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
 
     fn block(&mut self, params: Vec<'a, Val>) -> Block {
         let b = Block(u32::try_from(self.blocks.len()).expect("fewer than 2^32 blocks"));
-        self.blocks.push(Building { params, insts: self.arena.vec(), end: None });
+        self.blocks.push(Building { params, insts: self.arena.vec(), sites: std::vec::Vec::new(), end: None, end_site: 0 });
         b
     }
 
@@ -372,7 +381,10 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
     }
 
     fn push(&mut self, inst: Inst<'a, 'gc>) {
-        self.building().insts.push(inst);
+        let site = self.site;
+        let block = self.building();
+        block.insts.push(inst);
+        block.sites.push(site);
     }
 
     fn def(&mut self, inst: impl FnOnce(Val) -> Inst<'a, 'gc>) -> Val {
@@ -382,9 +394,11 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
     }
 
     fn end(&mut self, end: End<'a>) {
+        let site = self.site;
         let block = self.building();
         debug_assert!(block.end.is_none(), "a block ends once");
         block.end = Some(end);
+        block.end_site = site;
     }
 
     fn bind(&mut self, v: Var) -> Val {
@@ -429,7 +443,8 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
             optional: formals.optional,
             rest: None,
             upvalues,
-            blocks: vec![Building { params: arena.vec(), insts: arena.vec(), end: None }],
+            blocks: vec![Building { params: arena.vec(), insts: arena.vec(), sites: std::vec::Vec::new(), end: None, end_site: 0 }],
+            site: 0,
             cur: Block(0),
             next: 0,
             env: HashMap::default(),
@@ -452,7 +467,9 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
         let blocks = self.blocks.into_iter().map(|block| BlockData {
             params: block.params,
             insts: block.insts,
+            sites: block.sites,
             end: block.end.expect("every block made ends"),
+            end_site: block.end_site,
         });
         let (id, this, params, optional, rest, upvalues) = (self.id, self.this, self.params, self.optional, self.rest, self.upvalues);
         Function { id, this, params, optional, rest, upvalues, blocks: blocks.collect_in(self.arena), values: self.next }
@@ -464,7 +481,10 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
         let (arena, tree) = (self.arena, self.tree);
         while let Some(task) = self.todo.pop() {
             match task {
-                Task::Expr(expr, ctx) => self.start(expr, ctx)?,
+                Task::Expr(expr, ctx) => {
+                    self.site = tree.site(expr);
+                    self.start(expr, ctx)?
+                }
                 Task::Test { then, other, ctx } => {
                     let Some(test) = self.ret else { continue };
                     let (a, b) = (self.block(arena.vec()), self.block(arena.vec()));
@@ -515,11 +535,12 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
                     }
                 }
                 Task::Join { codes, carried, rest, lowered, ctx, code } => self.join_next(codes, carried, rest, lowered, ctx, code),
-                Task::Callee { args, tail } => {
+                Task::Callee { args, tail, site } => {
                     let Some(f) = self.ret else { continue };
+                    self.site = site;
                     self.args(args, None, if tail { Use::TailCall(f) } else { Use::Call(f) });
                 }
-                Task::Args { args, order, at, mut vals, then } => {
+                Task::Args { args, order, at, mut vals, then, site } => {
                     if at > 0 {
                         let Some(val) = self.ret else { continue };
                         match &order {
@@ -529,11 +550,12 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
                     }
                     let list = &tree[args];
                     if at == list.len() {
+                        self.site = site;
                         self.finish_args(then, vals)?;
                         continue;
                     }
                     let next = order.as_ref().map_or(at, |order| order[at]);
-                    self.todo.push(Task::Args { args, order, at: at + 1, vals, then });
+                    self.todo.push(Task::Args { args, order, at: at + 1, vals, then, site });
                     self.todo.push(Task::Expr(list[next], Ctx::Value));
                 }
                 Task::Closures { funs, dsts, codes, captures } => {
@@ -589,7 +611,7 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
             (Node::Join(scope, codes), _) => self.join(codes, scope, ctx),
             (Node::Jump(id, args), _) => self.jump(id, args)?,
             (Node::App(f, args), _) => {
-                self.todo.push(Task::Callee { args, tail: ctx == Ctx::Tail });
+                self.todo.push(Task::Callee { args, tail: ctx == Ctx::Tail, site: self.site });
                 self.todo.push(Task::Expr(f, Ctx::Value));
             }
             (Node::Intrinsic(prim @ (Prim::Request(_) | Prim::Host(_)), args), Ctx::Tail) => self.args(args, None, Use::TailPrim(prim, false)),
@@ -667,7 +689,7 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
     fn args(&mut self, args: Span<'id, Id<'id>>, order: Option<Vec<'a, usize>>, then: Use) {
         let n = self.tree[args].len();
         let vals = if order.is_some() { self.arena.vec_of(self.this, n) } else { Vec::with_capacity_in(n, self.arena) };
-        self.todo.push(Task::Args { args, order, at: 0, vals, then });
+        self.todo.push(Task::Args { args, order, at: 0, vals, then, site: self.site });
     }
 
     fn finish_args(&mut self, then: Use, args: Vec<'a, Val>) -> Result<(), CompileError> {

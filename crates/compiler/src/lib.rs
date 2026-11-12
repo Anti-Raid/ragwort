@@ -50,7 +50,9 @@ use ragwort_alloc::Arena;
 
 use ragwort_types::Wire;
 use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Value};
-use ragwort_vm::objects::Module;
+use ragwort_types::syntax::SyntaxSpan;
+use ragwort_types::vector::AnyVector;
+use ragwort_vm::objects::{Module, ModuleFields};
 use ragwort_vm::{HostDef, Intrinsic, Request};
 
 /// A local variable identifier, numbered uniquely by the expander so no two bindings share the same ID.
@@ -97,6 +99,31 @@ impl SlotOp {
 }
 
 /// A lambda expression in the [`Core`] AST.
+/// A position in source text: the source it belongs to, as the value of a [`SyntaxSource`](ragwort_types::syntax::SyntaxSource), and a byte offset into that source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Position<'gc> {
+    pub source: Value<'gc>,
+    pub offset: u32,
+}
+
+impl<'gc> Position<'gc> {
+    /// Returns the position where `span` starts, or `None` for a span that belongs to no source.
+    pub fn of(mc: &Mutation<'gc>, span: SyntaxSpan<'gc>) -> Option<Self> {
+        Some(Self { source: span.source()?.value(mc), offset: span.start() })
+    }
+}
+
+impl<'gc> Core<'gc> {
+    /// Names this expression `name`, a symbol, if it is a lambda that has no name yet. A front end calls this on the value of a binding form, so that the procedure is reported under the name it is bound to.
+    pub fn name(&mut self, name: Value<'gc>) {
+        if let Core::Lambda(lambda) = self
+            && lambda.name.is_none()
+        {
+            lambda.name = Some(name);
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Lambda<'gc> {
     /// A unique identifier distinguishing this lambda from all others within the compilation unit.
@@ -108,6 +135,10 @@ pub struct Lambda<'gc> {
     /// An optional rest parameter that receives any excess arguments as a list.
     pub rest: Option<Var>,
     pub body: Box<Core<'gc>>,
+    /// The symbol the lambda is bound to by the definition or binding form that created it, if any. Error reports show it as the procedure's name.
+    pub name: Option<Value<'gc>>,
+    /// Where the lambda's source form starts, if a front end read it from source. Error reports show it as the procedure's location.
+    pub at: Option<Position<'gc>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -127,6 +158,8 @@ pub enum Core<'gc> {
     Intrinsic(Prim, Vec<Core<'gc>>),
     /// Invokes an intrinsic whose final argument is a list that is spread into remaining arguments, analogous to `apply`.
     ApplyIntrinsic(Prim, Vec<Core<'gc>>),
+    /// The expression, marked as coming from the given source position. A front end wraps a call in this so that an error the call raises reports where the call was written.
+    At(Position<'gc>, Box<Core<'gc>>),
 }
 
 impl Core<'_> {
@@ -155,6 +188,7 @@ impl Core<'_> {
             }
             Core::Lambda(f) => take(&mut f.body),
             Core::Intrinsic(_, args) | Core::ApplyIntrinsic(_, args) => args.iter_mut().for_each(take),
+            Core::At(_, inner) => take(inner),
         }
     }
 }
@@ -235,25 +269,27 @@ impl std::error::Error for CompileError {}
 /// zero-argument [`Closure`](ragwort_vm::objects::Closure) ready for execution by [`ragwort_vm::Machine::new`].
 pub fn compile<'gc>(mc: &Mutation<'gc>, module: Option<Gc<'gc, Module>>, core: &Core<'gc>) -> Result<Value<'gc>, CompileError> {
     let arena = Arena::new();
-    let mut l5 = to_l5(mc, &arena, core)?;
+    let mut names = ir::Origins::default();
+    let slots = module.and_then(|module| AnyVector::of(module.names(mc)));
+    let mut l5 = to_l5(mc, &arena, core, &mut names, &|slot| slots?.get(mc, slot as usize))?;
     merge::merge(mc, &mut l5);
     #[cfg(debug_assertions)]
     l5::check(&l5);
-    emit::emit(mc, module, &l5)
+    emit::emit(mc, module, &l5, &names)
 }
 
 /// Transforms `core` through the lowering, fixing, optimization, assignment conversion, and closure conversion passes to produce an L5 SSA program.
-fn to_l5<'a, 'gc>(mc: &Mutation<'gc>, arena: &'a Arena, core: &Core<'gc>) -> Result<l5::Program<'a, 'gc>, CompileError> {
+fn to_l5<'a, 'gc>(mc: &Mutation<'gc>, arena: &'a Arena, core: &Core<'gc>, names: &mut ir::Origins<'gc>, slot_name: &dyn Fn(u32) -> Option<Value<'gc>>) -> Result<l5::Program<'a, 'gc>, CompileError> {
     // Each intermediate IR table is deallocated as soon as the subsequent pass completes.
     ir::l1::scope(|mut l1| {
-        let (root, supply) = lower::lower(&mut l1, core)?;
+        let (root, supply) = lower::lower(&mut l1, core, names, slot_name)?;
         ir::l2::scope(move |mut src| {
             let (root, supply) = letrec::fix_letrec(mc, &l1, root, &mut src, supply);
             drop(l1);
             #[cfg(debug_assertions)]
             src.check(root);
             ir::l2::scope(move |mut l2| {
-                let (root, mut supply) = cp0::optimize(mc, &mut src, root, &mut l2, supply);
+                let (root, mut supply) = cp0::optimize(mc, &mut src, root, &mut l2, supply, names);
                 drop(src);
                 locals::replace(mc, &mut l2, root, &mut supply);
                 letrec::prune(mc, &mut l2, root);

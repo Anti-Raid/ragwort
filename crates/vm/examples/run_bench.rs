@@ -158,7 +158,7 @@ fn time(name: &str, ops: &'static [Op], callee: Callee, n: i64, runs: usize) {
             let owner = module::new(mc, Value::FALSE, &[fix(0)], hosts).expect("alloc");
             let closure = |ops: &'static [Op], constants| {
                 let captures = mc.frozen(Box::from([])).expect("alloc");
-                let code = Bytecode::new(mc, mc.frozen(Box::from(ops)).expect("alloc"), constants, captures, 1, Some(owner)).expect("alloc");
+                let code = Bytecode::new(mc, mc.frozen(Box::from(ops)).expect("alloc"), constants, captures, 1, Some(owner), Value::FALSE, Value::FALSE, 0, Value::FALSE, 0, 0).expect("alloc");
                 Value::object(mc, Closure::new(mc, Some(code), 0, Value::VOID).expect("alloc"))
             };
             let f = match callee {

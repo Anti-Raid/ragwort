@@ -46,7 +46,9 @@ pub(crate) fn fix_letrec<'s, 'id, 'gc>(mc: &Mutation<'gc>, from: &L1<'s, 'gc>, r
                 let u = usages.pop().expect("opened");
                 inits.push((vals.pop().expect("a fixed init"), u));
             }
-            Task::Expr(id) => match from[id] {
+            Task::Expr(id) => {
+                cx.tree.at(from.site(id));
+                match from[id] {
                 l1::Node::Quote(v) => vals.push(cx.tree.add(Node::Quote(v))),
                 l1::Node::Ref(v) => {
                     usage.used.insert(v);
@@ -67,8 +69,10 @@ pub(crate) fn fix_letrec<'s, 'id, 'gc>(mc: &Mutation<'gc>, from: &L1<'s, 'gc>, r
                     from.children(id, |child| then.push(Task::Expr(child)));
                     then.push(Task::Make(id));
                 }
-            },
+                }
+            }
             Task::Make(id) => {
+                cx.tree.at(from.site(id));
                 let mut last = |n: usize| vals.split_off(vals.len() - n);
                 let node = match from[id] {
                     l1::Node::If(..) => {

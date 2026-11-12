@@ -10,10 +10,12 @@ use ragwort_alloc::{Arena, CollectIn, Vec as AVec};
 use ragwort_types::gc::{Gc, Mutation, Value, WINDOW};
 use ragwort_types::vector::Vectors;
 use ragwort_vm::frame::{self, ARGS, CLOSURE, MAX_PARAMS, Shape};
-use ragwort_vm::objects::{self, Bytecode, BytecodeFields, Closure, ModuleFields};
+use ragwort_vm::objects::{self, Bytecode, BytecodeFields, Closure, ModuleFields, Sites, SitesFields};
+use ragwort_vm::report::{Line, Scope, Table};
 use ragwort_vm::{Capture, HostDef, Intrinsic, Op, Request};
 
 use crate::hash::HashMap;
+use crate::ir::{Inlined, Origins, Site};
 use crate::l5::{self, Block, Captured, Code, End, Function, Inst, Program, Val};
 use crate::{CompileError, Prim, SlotOp};
 
@@ -24,8 +26,8 @@ const STAGE: usize = WINDOW / 4;
 const LIMIT: u8 = (WINDOW - STAGE) as u8;
 const SCRATCH: u8 = LIMIT;
 
-pub(crate) fn emit<'gc>(mc: &Mutation<'gc>, owner: Option<Gc<'gc, objects::Module>>, program: &Program<'_, 'gc>) -> Result<Value<'gc>, CompileError> {
-    let mut module = Module { mc, owner, constants: Vec::new(), index: HashMap::default(), codes: Vec::new(), pending: Vec::new() };
+pub(crate) fn emit<'gc>(mc: &Mutation<'gc>, owner: Option<Gc<'gc, objects::Module>>, program: &Program<'_, 'gc>, names: &Origins<'gc>) -> Result<Value<'gc>, CompileError> {
+    let mut module = Module { mc, owner, names, lines: Vec::new(), items: Vec::new(), item_index: HashMap::default(), constants: Vec::new(), index: HashMap::default(), codes: Vec::new(), pending: Vec::new() };
     let code = module.function(program.root(), &[])?;
     while let Some(Pending { slot, function, captures, closure }) = module.pending.pop() {
         let bytecode = module.function(&program.functions[function as usize], &captures)?;
@@ -36,6 +38,12 @@ pub(crate) fn emit<'gc>(mc: &Mutation<'gc>, owner: Option<Gc<'gc, objects::Modul
     let table = Vectors::new(mc).immutable_from_slice(&module.constants)?.value(mc);
     for &c in &module.codes {
         c.set_constants(mc, table);
+    }
+    if !module.lines.is_empty() {
+        let sites = module.sites()?;
+        for &c in &module.codes {
+            c.set_sites(mc, sites);
+        }
     }
     Ok(Value::object(mc, Closure::new(mc, Some(code), 0, Value::VOID)?))
 }
@@ -360,6 +368,11 @@ struct Module<'a, 'gc> {
     mc: &'a Mutation<'gc>,
     /// The owning runtime module whose imported variables and host function tables are accessed.
     owner: Option<Gc<'gc, objects::Module>>,
+    names: &'a Origins<'gc>,
+    /// The position table rows of every function emitted so far, and the sources and names they refer to by index.
+    lines: Vec<Line>,
+    items: Vec<Value<'gc>>,
+    item_index: HashMap<u64, u32>,
     constants: Vec<Value<'gc>>,
     index: HashMap<u64, u32>,
     codes: Vec<Gc<'gc, Bytecode>>,
@@ -396,6 +409,42 @@ impl<'a, 'gc> Module<'a, 'gc> {
 
     /// Emits bytecode for function `f`, fusing 1- and 2-argument intrinsic tests into conditional branches
     /// unless jump targets exceed the 16-bit signed branch offset limit.
+    /// Returns the index of `value` among the items of the position table, adding it if it is new.
+    fn item(&mut self, value: Value<'gc>) -> u32 {
+        let next = self.items.len() as u32;
+        let index = *self.item_index.entry(value.to_bits()).or_insert(next);
+        if index == next {
+            self.items.push(value);
+        }
+        index
+    }
+
+    /// Returns the source index, byte offset and inlined-call number of `site`, or `None` for a site without a position.
+    fn located(&mut self, site: u32) -> Option<(u32, u32, u32)> {
+        let Site { at, inlined } = self.names.sites.get(site)?;
+        Some((self.item(at.source), at.offset, inlined))
+    }
+
+    /// Builds the object that holds the position table of the functions emitted.
+    fn sites(&mut self) -> Result<Value<'gc>, CompileError> {
+        let mc = self.mc;
+        // Inlined calls keep their numbers: the compilation numbers an inlined call after the call that encloses it, and rows refer to those numbers.
+        let mut scopes = Vec::with_capacity(self.names.sites.inlined.len());
+        for i in 0..self.names.sites.inlined.len() {
+            let Inlined { lambda, call } = self.names.sites.inlined[i];
+            let name = self.item(self.names.get(lambda).name.unwrap_or(Value::FALSE));
+            let (source, offset, inlined) = self.located(call).unwrap_or((u32::MAX, 0, 0));
+            scopes.push(Scope { name, source, offset, inlined });
+        }
+        let table = Table { lines: std::mem::take(&mut self.lines).into(), scopes: scopes.into() };
+        let sites = Sites::new(mc, mc.frozen(table)?, self.items.len(), Value::FALSE)?;
+        let items = sites.items(mc);
+        for (i, &item) in self.items.iter().enumerate() {
+            items.set(mc, i, item);
+        }
+        Ok(Value::object(mc, sites))
+    }
+
     fn function(&mut self, f: &Function<'_, 'gc>, captures: &[Capture]) -> Result<Gc<'gc, Bytecode>, CompileError> {
         let (constants, codes, pending) = (self.constants.len(), self.codes.len(), self.pending.len());
         if let Some(code) = self.attempt(f, captures, true)? {
@@ -486,6 +535,7 @@ impl<'a, 'gc> Module<'a, 'gc> {
             first,
             starts: arena.vec_of(0, f.blocks.len()),
             jumps: arena.vec(),
+            sited: Vec::new(),
         };
         if let Some(dst) = spill {
             e.ops.push(Op::NewSpill { dst, count: colours.count - own });
@@ -499,7 +549,7 @@ impl<'a, 'gc> Module<'a, 'gc> {
         for (i, &b) in order.iter().enumerate() {
             e.block(f, b, &live, order.get(i + 1).copied())?;
         }
-        let Emitter { mut ops, mut starts, mut jumps, .. } = e;
+        let Emitter { mut ops, mut starts, mut jumps, mut sited, .. } = e;
         // Eliminates redundant jumps to the immediately following instruction (e.g. blocks where parallel moves collapsed to no-ops).
         loop {
             let gone: AVec<'_, usize> = jumps
@@ -520,6 +570,7 @@ impl<'a, 'gc> Module<'a, 'gc> {
             }
             ops = ops.into_iter().enumerate().filter(|(i, _)| !gone.contains(i)).map(|(_, op)| op).collect();
             starts.iter_mut().for_each(|s| *s = moved[*s]);
+            sited.iter_mut().for_each(|(pc, _)| *pc = moved[*pc]);
             jumps = jumps.into_iter().filter(|(at, _)| !gone.contains(at)).map(|(at, to)| (moved[at], to)).collect_in(arena);
         }
         for (at, to) in jumps {
@@ -534,7 +585,21 @@ impl<'a, 'gc> Module<'a, 'gc> {
             }
         }
         let mc = self.mc;
-        let code = Bytecode::new(mc, mc.frozen(Box::from(ops))?, Value::VOID, mc.frozen(Box::from(captures))?, arity, self.owner)?;
+        // A function without a lambda ID is the code of a top-level form, which the trace of an error tells apart from a procedure.
+        let described = f.id.map(|id| self.names.get(id)).unwrap_or_default();
+        let name = match f.id {
+            Some(_) => described.name.unwrap_or(Value::FALSE),
+            None => Value::VOID,
+        };
+        let (source, start) = described.at.map_or((Value::FALSE, 0), |at| (at.source, at.offset));
+        let lines_start = self.lines.len();
+        for (pc, site) in sited {
+            // A row without a position ends the range of the row before it.
+            let (source, offset, inlined) = self.located(site).unwrap_or((u32::MAX, 0, 0));
+            self.lines.push(Line { pc: pc as u32, source, offset, inlined });
+        }
+        let (lines_start, lines_len) = (lines_start as u32, (self.lines.len() - lines_start) as u32);
+        let code = Bytecode::new(mc, mc.frozen(Box::from(ops))?, Value::VOID, mc.frozen(Box::from(captures))?, arity, self.owner, name, source, start, Value::FALSE, lines_start, lines_len)?;
         self.codes.push(code);
         Ok(Some(code))
     }
@@ -631,6 +696,8 @@ struct Emitter<'m, 'a, 't, 'gc> {
     module: &'m mut Module<'a, 'gc>,
     arena: &'t Arena,
     ops: Vec<Op>,
+    /// The instruction index where each run of instructions from one source site starts, with that site. Site 0 marks instructions with no known position.
+    sited: Vec<(usize, u32)>,
     locs: AVec<'t, Option<Loc>>,
     uses: AVec<'t, u32>,
     imms: Imms<'t, 'gc>,
@@ -660,6 +727,13 @@ struct Emitter<'m, 'a, 't, 'gc> {
 }
 
 impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
+    /// Records that the instructions emitted from here on come from `site`.
+    fn site(&mut self, site: u32) {
+        if self.sited.last().map_or(0, |&(_, last)| last) != site {
+            self.sited.push((self.ops.len(), site));
+        }
+    }
+
     fn block(&mut self, f: &Function<'_, 'gc>, b: usize, live: &Live<'_>, next: Option<usize>) -> Result<(), CompileError> {
         self.starts[b] = self.ops.len();
         self.fence = self.ops.len();
@@ -718,9 +792,13 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
                 self.aim(b, j, d, &mut highs, &mut after);
             }
             let base = highs[j].map_or(self.first, |h| self.first.max(h + 1));
+            self.site(block.sites[j]);
             self.inst(inst, base)?;
         }
         (self.at, self.seen, self.highs, self.after) = (at, seen, highs, after);
+        // An instruction fused into the end of the block is emitted there, and keeps its own site.
+        let fused = tail.is_some() || test.is_some();
+        self.site(if fused { block.sites[n - 1] } else { block.end_site });
         match (tail, test, &block.end) {
             (Some((prim, args)), _, _) => self.tail_prim(prim, args),
             (None, Some((intrinsic, args)), End::Branch { then, other, .. }) => {
@@ -1052,7 +1130,7 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
                 match (self.stage(self.first, None, args, false), spread) {
                     // A guard continuation retains its caller frame; invoking it from that frame allows the VM
                     // to reuse the existing handler in place without creating a new prompt.
-                    (Some(base), false) if request == Request::Guard => self.ops.extend([
+                    (Some(base), false) if matches!(request, Request::Guard | Request::GuardQuiet) => self.ops.extend([
                         Op::CallRequest { base, args: n, request },
                         Op::LoadAcc { dst: SCRATCH },
                         Op::Return { src: SCRATCH },

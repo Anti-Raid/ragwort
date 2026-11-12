@@ -18,7 +18,7 @@ use crate::Fault;
 use crate::intrinsic::values;
 use crate::args::Args;
 use crate::machine::{Outer, Then, condition};
-use crate::objects::{Continuation, ContinuationFields, Guard, GuardFields, MultiValue, Native, NativeFields, Prompt, PromptFields, TaskFields, WinderFields};
+use crate::objects::{Bytecode, Continuation, ContinuationFields, Guard, GuardFields, MultiValue, Native, NativeFields, Prompt, PromptFields, TaskFields, WinderFields};
 use crate::prompts::{self, Wind, default_tag, handler_key};
 use crate::segments::{Cut, cut_at};
 
@@ -143,9 +143,15 @@ impl<'gc> Outer<'_, 'gc> {
     /// Dispatches exception `obj`: invokes the innermost handler procedure (with active handlers updated
     /// to enclosing ones), unwinds to the innermost guard, or returns [`Then::Uncaught`] if no handler or
     /// guard exists.
-    pub(crate) fn raising(&mut self, obj: Value<'gc>, continuable: bool) -> Result<Then<'gc>, Fault> {
+    pub(crate) fn raising(&mut self, obj: Value<'gc>, continuable: bool, first: Option<(Gc<'gc, Bytecode>, usize)>) -> Result<Then<'gc>, Fault> {
         let (mc, task) = (self.mc(), self.task());
         let handlers = prompts::mark(mc, task, handler_key(), Value::NIL)?;
+        let handler = Pair::of(handlers).map(|cell| cell.head(mc));
+        // The call trace is recorded before any unwinding, unless the guard that catches the condition opted out of it.
+        let quiet = handler.and_then(|handler| handler.downcast::<Guard>(mc)).is_some_and(|guard| !guard.traced(mc));
+        if !quiet {
+            self.record(obj, first)?;
+        }
         let Some(cell) = Pair::of(handlers) else { return Ok(Then::Uncaught(obj, false)) };
         let handler = cell.head(mc);
         if let Some(guard) = handler.downcast::<Guard>(mc) {
@@ -178,9 +184,9 @@ impl<'gc> Outer<'_, 'gc> {
 
     /// Pushes a new [`Guard`] record wrapping `handler` onto the chain (flagged as `co/try-resume` if
     /// `tried` is true) and installs it as the innermost handler mark for the subsequent call.
-    pub(crate) fn guard(&mut self, handler: Value<'gc>, tried: bool) -> Result<(), Fault> {
+    pub(crate) fn guard(&mut self, handler: Value<'gc>, tried: bool, traced: bool) -> Result<(), Fault> {
         let (mc, task) = (self.mc(), self.task());
-        let guard = Value::object(mc, Guard::new(mc, handler, task.winders(mc))?);
+        let guard = Value::object(mc, Guard::new(mc, handler, task.winders(mc), traced)?);
         self.push(Kind::Guarded, guard, if tried { Value::TRUE } else { Value::FALSE })?;
         let (pairs, handlers) = (Pairs::new(mc), prompts::mark(mc, task, handler_key(), Value::NIL)?);
         let mark = pairs.cons(handler_key(), pairs.cons(guard, handlers)?.value(mc))?.value(mc);

@@ -25,6 +25,8 @@ pub(crate) struct Regs<'gc> {
     pub(crate) fp: usize,
     pub(crate) pc: usize,
     pub(crate) acc: Value<'gc>,
+    /// The bytecode the inner loop was executing when it last exited, used to find the instruction that raised a fault.
+    pub(crate) code: Option<Gc<'gc, Bytecode>>,
 }
 
 /// The reason the inner execution loop suspended or exited.
@@ -73,6 +75,7 @@ pub(crate) fn exec<'s, 'gc>(mc: &'s Mutation<'gc>, stack: &'s Stack, task: Gc<'g
     };
     let Err(exit) = run.go();
     (regs.fp, regs.pc, regs.acc, *fuel) = (run.fp, run.pc, run.cx.acc, run.cx.fuel);
+    regs.code = Some(run.code);
     exit
 }
 
@@ -337,7 +340,7 @@ impl<'s, 'gc> Run<'s, 'gc> {
                 }
             }
             Request::WithMark if !spread && !tail && args >= 3 => return self.marked_call(base, args, request),
-            Request::WithHandler | Request::Guard if !spread && !tail && args == 2 => return self.marked_call(base, args, request),
+            Request::WithHandler | Request::Guard | Request::GuardQuiet if !spread && !tail && args == 2 => return self.marked_call(base, args, request),
             _ => return Err(Exit::Request { base, args, request, spread, tail }),
         };
         if tail { self.tail_call(call) } else { self.call(call, false) }
@@ -351,7 +354,7 @@ impl<'s, 'gc> Run<'s, 'gc> {
         let (mc, frame, task) = (self.cx.mc, self.cx.frame, self.cx.task);
         let (procedure, argc) = match request {
             Request::WithMark => (frame.get(base + 2), args - 3),
-            Request::Guard => (frame.get(base), 0),
+            Request::Guard | Request::GuardQuiet => (frame.get(base), 0),
             _ => (frame.get(base + 1), 0),
         };
         let call = Call { base: base + SAVED_MARKS, argc, rest: Value::NIL };
@@ -364,13 +367,14 @@ impl<'s, 'gc> Run<'s, 'gc> {
         let (key, value, guard) = match request {
             Request::WithMark => (frame.get(base), frame.get(base + 1), None),
             _ => {
-                let handler = if request == Request::Guard {
-                    Value::object(mc, Guard::new(mc, frame.get(base + 1), task.winders(mc)).map_err(Fault::from)?)
+                let guarding = matches!(request, Request::Guard | Request::GuardQuiet);
+                let handler = if guarding {
+                    Value::object(mc, Guard::new(mc, frame.get(base + 1), task.winders(mc), request == Request::Guard).map_err(Fault::from)?)
                 } else {
                     frame.get(base)
                 };
                 let handlers = prompts::mark(mc, task, handler_key(), Value::NIL)?;
-                let guard = (request == Request::Guard).then_some(handler);
+                let guard = guarding.then_some(handler);
                 (handler_key(), pairs.cons(handler, handlers).map_err(Fault::from)?.value(mc), guard)
             }
         };

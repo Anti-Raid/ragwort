@@ -12,6 +12,7 @@ pub mod module;
 pub mod objects;
 mod op;
 mod prompts;
+pub mod report;
 pub mod structs;
 mod request;
 mod run;

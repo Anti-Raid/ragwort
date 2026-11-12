@@ -139,7 +139,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     /// innermost form is, and anything else is the transformer's failure.
     fn raised(&self, raised: Value<'gc>, at: Stx) -> ExpandError {
         let mc = self.mc;
-        let Some(condition) = raised.downcast::<Condition>(mc).filter(|c| c.fault(mc) == Some(&Fault::Syntax)) else {
+        let Some(condition) = raised.downcast::<Condition>(mc).filter(|c| c.failure(mc).is_some_and(|failure| failure.fault == Fault::Syntax)) else {
             return self.error(ExpandErrorKind::Transformer, at);
         };
         let (mut form, mut rest) = (Value::VOID, condition.irritants(mc));

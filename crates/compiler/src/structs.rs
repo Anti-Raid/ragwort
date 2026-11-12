@@ -121,7 +121,7 @@ pub fn value<'gc>(member: Member, kind: Core<'gc>, fields: u32, fresh: &mut impl
         }
     };
     let body = Box::new(Core::Intrinsic(Prim::Intrinsic(prim), args));
-    Core::Lambda(Lambda { id: fresh.lambda(), optional: 0, params, rest: None, body })
+    Core::Lambda(Lambda { id: fresh.lambda(), optional: 0, params, rest: None, body, name: None, at: None })
 }
 
 /// A direct expansion of a generated struct procedure call.

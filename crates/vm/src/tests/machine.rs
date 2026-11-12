@@ -31,7 +31,7 @@ fn module_in<'gc>(mc: &Mutation<'gc>, owner: Option<Gc<'gc, Module>>, constants:
         .iter()
         .map(|&(arity, captures, ops)| {
             let (ops, captures) = (mc.frozen(Box::from(ops)).unwrap(), mc.frozen(Box::from(captures)).unwrap());
-            Bytecode::new(mc, ops, Value::VOID, captures, arity, owner).unwrap()
+            Bytecode::new(mc, ops, Value::VOID, captures, arity, owner, Value::FALSE, Value::FALSE, 0, Value::FALSE, 0, 0).unwrap()
         })
         .collect();
     let mut table = constants.to_vec();
@@ -81,7 +81,7 @@ fn spread<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Vec<Value<'gc>> {
 
 /// Retrieves the underlying [`Fault`] code from an active or raised [`Condition`] object.
 fn fault<'gc>(mc: &Mutation<'gc>, raised: Value<'gc>) -> Fault {
-    *raised.downcast::<Condition>(mc).unwrap().fault(mc).unwrap()
+    raised.downcast::<Condition>(mc).unwrap().failure(mc).unwrap().fault
 }
 
 /// Runs `machine` to completion within a single GC step, automatically resuming execution through any intermediate [`Outcome::Paused`] states.

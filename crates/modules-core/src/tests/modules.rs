@@ -30,7 +30,7 @@ fn run<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Result<Value<'gc>, Fault> 
         match machine.run(mc).unwrap() {
             Outcome::Paused => {}
             Outcome::Done(value) => return Ok(value),
-            Outcome::Raised(raised) => return Err(*raised.downcast::<Condition>(mc).expect("a condition").fault(mc).unwrap()),
+            Outcome::Raised(raised) => return Err(raised.downcast::<Condition>(mc).expect("a condition").failure(mc).unwrap().fault),
             _ => panic!("yielded"),
         }
     }

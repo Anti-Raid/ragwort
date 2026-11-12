@@ -2,7 +2,7 @@
 
 use ragwort_types::gc::{Segment, objects};
 
-use crate::{Capture, Fault, Op};
+use crate::{Capture, Op};
 
 #[cfg(test)]
 #[path = "tests/objects.rs"]
@@ -18,7 +18,20 @@ objects! {
         captures: Frozen<std::boxed::Box<[Capture]>>,
         arity: i64,
         module: Member<Module>,
+        /// The procedure's name as a symbol, `#f` for an anonymous procedure, or void for the code of a top-level form.
+        name: Value,
+        /// The source that defines the procedure, as the value of a `SyntaxSource`, or `#f` when the source is unknown.
+        source: Value,
+        /// The byte offset in `source` where the procedure's definition starts.
+        start: u32,
+        /// The [`Sites`] object holding the position table of the code this function was compiled with, or `#f` if no positions were recorded.
+        sites: Value,
+        /// The first row of this function in that table, and the number of rows it owns.
+        lines_start: u32,
+        lines_len: u32,
     }
+    /// The source positions of code compiled together (see [`crate::report::Table`]). The items are the sources and procedure names that the table's rows refer to by index.
+    pub struct Sites { table: Frozen<crate::report::Table> } items Value
     /// A compiled `syntax-case` pattern descriptor along with the literal identifiers and pattern data it references (see [`crate::syntax_case`]).
     pub struct SyntaxPattern { shape: Frozen<std::boxed::Box<crate::syntax_case::PatternShape>> } items Value
     /// A compiled `syntax` template descriptor and its constituent syntax objects used for macro output expansion.
@@ -46,12 +59,12 @@ objects! {
     pub struct Tag { name: Value }
     /// A first-class, callable continuation object: encapsulates the continuation record chain (`chain`) and delimited prompts (`prompts`) delimited by an enclosing prompt. `attachments` preserves continuation marks present at capture time (including any tail-position marks from the capturing frame), and `winders` records the dynamic-wind stack. A composable continuation splices on top of the calling continuation; an `escape` continuation (created by `call/cc`) aborts and replaces the current continuation up to the nearest default prompt.
     pub struct Continuation { chain: Value, attachments: Value, winders: Value, prompts: Value, escape: bool }
-    /// An exception condition object: `fault` classifies the error type, while `message` and `irritants` hold the error message and detail values passed to `error`.
-    pub struct Condition { fault: Frozen<Fault>, message: Value, irritants: Value }
+    /// An exception condition object: `failure` classifies the error type and names the operation that raised it, while `message` and `irritants` hold the error message and detail values passed to `error`. For a fault raised by the VM, `message` is void and `irritants` holds the values the failed operation was given. `trace` is `#f` until the condition is first raised, and then holds the call trace recorded by [`crate::report`].
+    pub struct Condition { failure: Frozen<crate::report::Failure>, message: Value, irritants: Value, trace: Value }
     /// Represents a `dynamic-wind` guard holding `before` and `after` thunks executed when entering or exiting a dynamic extent. Maintained innermost-first in task and prompt winders lists.
     pub struct Winder { before: Value, after: Value }
     /// An exception handler record installed by `guard` or `co/try-resume` in continuation marks. When an unhandled exception reaches this guard, execution unwinds to its installation site and invokes `handler` with the raised value (or, if `handler` is `#f`, returns `#f` and the value), restoring the dynamic `winders` in place when the guard was established. Stored in a register beneath the protected thunk's frame or within an outer [`Native`] continuation record.
-    pub struct Guard { handler: Value, winders: Value }
+    pub struct Guard { handler: Value, winders: Value, traced: bool }
     /// A continuation boundary record representing an internal VM control point on the stack chain. When overlying frames return, `kind` specifies the next VM action using operands `a` and `b`. `attachments` and `next` function like those in [`Frames`]. Immutable once constructed, allowing a continuation to resume from it repeatedly.
     pub struct Native { kind: u32, a: Value, b: Value, attachments: Value, next: Value }
     /// A coroutine task representing an arena-allocated execution state managed by a [`crate::Machine`]: preserves the result accumulator (`acc`) between run steps, the continuation record chain (`chain`), continuation marks (`attachments` as an association list of `(key . value)` pairs), active dynamic [`Winder`]s, and enclosing delimited prompts (`prompts`). `spare` and `spare_base` retain a cached stack segment reused during stack overflows.

@@ -27,7 +27,7 @@ use ragwort_types::gc::{Gc, Mutation, Value};
 use ragwort_vm::objects::{StructType, StructTypeFields};
 use ragwort_vm::{Fuel, Intrinsic, Purity, structs};
 
-use crate::ir::Supply;
+use crate::ir::{Origins, Supply};
 use crate::ir::l2::{Bind, Fun, Function, Id, L2, Node, Span};
 use crate::{Prim, SlotOp, Var};
 
@@ -42,7 +42,7 @@ const MAX_INLINE_DEPTH: usize = 4;
 
 /// Optimizes the L2 expression rooted at `root` in `src`, writing the optimized AST into `out`
 /// and returning the new root expression ID. Cloned functions during inlining are temporarily added to `src`.
-pub(crate) fn optimize<'s, 'd, 'gc>(mc: &Mutation<'gc>, src: &mut L2<'s, 'gc>, root: Id<'s>, out: &mut L2<'d, 'gc>, supply: Supply) -> (Id<'d>, Supply) {
+pub(crate) fn optimize<'s, 'd, 'gc>(mc: &Mutation<'gc>, src: &mut L2<'s, 'gc>, root: Id<'s>, out: &mut L2<'d, 'gc>, supply: Supply, names: &mut Origins<'gc>) -> (Id<'d>, Supply) {
     let (mut uses, mut used, mut assigned) = (HashMap::<Var, UseStats>::default(), HashSet::default(), HashSet::default());
     for id in src.deep(root) {
         match src[id] {
@@ -69,6 +69,7 @@ pub(crate) fn optimize<'s, 'd, 'gc>(mc: &Mutation<'gc>, src: &mut L2<'s, 'gc>, r
         src,
         out,
         supply,
+        names,
         uses,
         used,
         assigned,
@@ -151,6 +152,8 @@ struct LetFrame<'s, 'd> {
 /// A worklist task: either a source expression to optimize, or an action to assemble previously optimized expressions into a target node.
 enum Task<'s, 'd, 'gc> {
     Expr(Id<'s>),
+    /// Sets the source site that the nodes built by the following task receive.
+    At(u32),
     Arm(usize),
     /// Evaluates the branches of an `if` once its test expression has been constructed.
     Test(usize, usize),
@@ -192,7 +195,7 @@ enum Task<'s, 'd, 'gc> {
     /// Finalizes a function definition once its body expression has been constructed.
     Function(Fun<'s>),
     /// Dispatches a call expression once its operator has been constructed, with arguments still in source form.
-    Callee(Span<'s, Id<'s>>),
+    Callee(Span<'s, Id<'s>>, u32),
     /// Optimizes and folds a call expression once its operator and `n` arguments have all been constructed.
     Call(usize),
     /// Emits a direct application node `App(f, args)` without further simplification once operator and arguments are constructed.
@@ -208,6 +211,7 @@ struct Cp0<'m, 't, 's, 'd, 'gc> {
     src: &'t mut L2<'s, 'gc>,
     out: &'t mut L2<'d, 'gc>,
     supply: Supply,
+    names: &'t mut Origins<'gc>,
     /// Usage statistics for each variable across the input AST. Because variable IDs are globally unique, this also reflects occurrences in its binding scope.
     uses: HashMap<Var, UseStats>,
     used: HashSet<Var>,
@@ -274,6 +278,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
     fn run(&mut self, task: Task<'s, 'd, 'gc>, then: &mut Vec<Task<'s, 'd, 'gc>>) {
         let made = match task {
             Task::Expr(id) => return self.expr(id, then),
+            Task::At(site) => return self.at(site),
             Task::Arm(arm) => {
                 let mark = self.learned.len();
                 self.arm(arm, then);
@@ -409,7 +414,10 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                 let fun = self.function(fun, body);
                 self.out.add(Node::Lambda(fun))
             }
-            Task::Callee(args) => return self.callee(args, then),
+            Task::Callee(args, site) => {
+                self.at(site);
+                return self.callee(args, site, then);
+            }
             Task::Call(n) => {
                 let args = self.last(n);
                 let f = self.pop();
@@ -436,8 +444,42 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         self.vals.push(made);
     }
 
+    /// Records that the body of the lambda `lambda`, rooted at `body` in the source table, takes the place of the call at `site`. Errors raised in the body then report the lambda as an inlined call. A lambda without a name is not recorded.
+    fn inlined_src(&mut self, lambda: u32, body: Id<'s>, site: u32) {
+        if self.names.get(lambda).name.is_none() {
+            return;
+        }
+        let inlined = self.names.sites.inline(lambda, site);
+        let ids: Vec<Id<'s>> = self.src.frame(body).collect();
+        for id in ids {
+            let moved = self.names.sites.within(self.src.site(id), inlined);
+            self.src.set_site(id, moved);
+        }
+    }
+
+    /// As [`Cp0::inlined_src`], for a body that is already in the output table.
+    fn inlined_out(&mut self, lambda: u32, body: Id<'d>, site: u32) {
+        if self.names.get(lambda).name.is_none() {
+            return;
+        }
+        let inlined = self.names.sites.inline(lambda, site);
+        let ids: Vec<Id<'d>> = self.out.frame(body).collect();
+        for id in ids {
+            let moved = self.names.sites.within(self.out.site(id), inlined);
+            self.out.set_site(id, moved);
+        }
+    }
+
+    /// Sets the source site that nodes added to either table receive.
+    fn at(&mut self, site: u32) {
+        self.src.at(site);
+        self.out.at(site);
+    }
+
     fn expr(&mut self, id: Id<'s>, then: &mut Vec<Task<'s, 'd, 'gc>>) {
         let node = self.src[id];
+        let site = self.src.site(id);
+        self.at(site);
         let made = match node {
             Node::Quote(v) => Node::Quote(v),
             Node::Ref(v) => match self.subst.get(&v).copied() {
@@ -461,18 +503,18 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                 return self.open_let(binds, body, then);
             }
             Node::Set(v, value) => return then.extend([Task::Expr(value), Task::Set(v)]),
-            Node::App(f, args) => return self.app(f, args, then),
+            Node::App(f, args) => return self.app(f, args, site, then),
             Node::Lambda(fun) => {
                 let small = std::mem::take(&mut self.next_small);
                 return then.extend(self.body_tasks(fun, small).into_iter().chain([Task::Function(fun)]));
             }
             Node::Intrinsic(prim, args) => {
                 then.extend(self.src[args].iter().map(|&a| Task::Expr(a)));
-                return then.push(Task::Intrinsic(prim, self.src[args].len()));
+                return then.extend([Task::At(site), Task::Intrinsic(prim, self.src[args].len())]);
             }
             Node::ApplyIntrinsic(prim, args) => {
                 then.extend(self.src[args].iter().map(|&a| Task::Expr(a)));
-                return then.push(Task::ApplyIntrinsic(prim, self.src[args].len()));
+                return then.extend([Task::At(site), Task::ApplyIntrinsic(prim, self.src[args].len())]);
             }
         };
         let made = self.out.add(made);
@@ -713,7 +755,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
     }
 
     /// Optimizes a source application `(f args...)`. Enclosing `Let` bindings and effect sequences (`Seq`) around the callee are floated outwards (e.g. `((let (...) f) x) -> (let (...) (f x))`). Directly applied lambdas and single-use procedures are inlined while body and arguments are still in source form, ensuring they are optimized only once in context.
-    fn app(&mut self, f: Id<'s>, args: Span<'s, Id<'s>>, then: &mut Vec<Task<'s, 'd, 'gc>>) {
+    fn app(&mut self, f: Id<'s>, args: Span<'s, Id<'s>>, site: u32, then: &mut Vec<Task<'s, 'd, 'gc>>) {
         match self.src[f] {
             Node::Seq(a, b) => {
                 let call = self.src.add(Node::App(b, args));
@@ -725,15 +767,16 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             }
             Node::Lambda(fun) if takes(self.src, fun, self.src[args].len()) => {
                 let binds = self.bind_src(fun, args);
+                self.inlined_src(self.src[fun].id, self.src[fun].body, site);
                 return self.open_let(binds, self.src[fun].body, then);
             }
             _ => {}
         }
-        then.extend([Task::Expr(f), Task::Callee(args)]);
+        then.extend([Task::Expr(f), Task::Callee(args, site)]);
     }
 
     /// Continues optimizing a call where the operator has already been lowered; handles inlining of single-use lambdas.
-    fn callee(&mut self, args: Span<'s, Id<'s>>, then: &mut Vec<Task<'s, 'd, 'gc>>) {
+    fn callee(&mut self, args: Span<'s, Id<'s>>, site: u32, then: &mut Vec<Task<'s, 'd, 'gc>>) {
         let f = self.pop();
         let n = self.src[args].len();
         if let Node::Ref(v) = self.out[f]
@@ -745,19 +788,20 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                 let small = self.small_as_written(fun);
                 then.extend(self.body_tasks(fun, small).into_iter().chain([Task::Function(fun), Task::LateBind(frame, v)]));
                 then.extend(self.src[args].iter().map(|&a| Task::Expr(a)));
-                return then.push(Task::Call(n));
+                return then.extend([Task::At(site), Task::Call(n)]);
             }
             if takes(self.src, fun, n) {
                 let binds = self.bind_src(fun, args);
+                self.inlined_src(self.src[fun].id, self.src[fun].body, site);
                 return self.open_let(binds, self.src[fun].body, then);
             }
             then.extend(self.body_tasks(fun, false).into_iter().chain([Task::Function(fun)]));
             then.extend(self.src[args].iter().map(|&a| Task::Expr(a)));
-            return then.push(Task::App(n));
+            return then.extend([Task::At(site), Task::App(n)]);
         }
         self.vals.push(f);
         then.extend(self.src[args].iter().map(|&a| Task::Expr(a)));
-        then.push(Task::Call(n));
+        then.extend([Task::At(site), Task::Call(n)]);
     }
 
     /// Schedules worklist tasks to optimize the body of `fun`: stashes module-slot facts before entry, evaluates the body, and rolls back local facts learned within it upon exit.
@@ -830,6 +874,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             Node::Lambda(fun) if takes(self.out, fun, args.len()) => {
                 let func = self.out[fun];
                 let params = self.out[func.params].to_vec();
+                self.inlined_out(func.id, func.body, self.out.current());
                 let binds = self.bind_done(params, func.rest, args).into_iter().map(|(v, e)| Bind::Val(v, e)).collect();
                 // The pre-optimized lambda body may contain arbitrary calls with side effects; clear module-slot facts.
                 self.slot_derived.clear();
@@ -845,6 +890,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                 let renamed = self.alpha_rename(fun);
                 self.inline_depth += 1;
                 let func = self.src[renamed];
+                self.inlined_src(func.id, func.body, self.out.current());
                 let params = self.src[func.params].to_vec();
                 let binds = self.bind_done(params, func.rest, args).into_iter().map(|(v, e)| BindIn::Val(v, Init::Done(e))).collect();
                 self.open_let(binds, func.body, then);
@@ -1319,6 +1365,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         let body = self.rename(f.body, &mut map);
         let params = self.src.list(params);
         let id = self.supply.fresh_lambda();
+        self.names.copy(f.id, id);
         self.src.function(Function { id, params, optional: f.optional, rest, body })
     }
 
@@ -1355,6 +1402,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             Node::ApplyIntrinsic(prim, args) => Node::ApplyIntrinsic(prim, self.rename_all(args, map)),
             Node::Set(..) | Node::Lambda(_) => unreachable!("small inlinable functions have no Set/Lambda"),
         };
+        self.src.at(self.out.site(e));
         self.src.add(node)
     }
 

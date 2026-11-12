@@ -25,7 +25,109 @@ pub(crate) mod l2;
 pub(crate) mod l3;
 pub(crate) mod l4;
 
-use crate::Var;
+use ragwort_types::gc::Value;
+
+use crate::hash::HashMap;
+use crate::{Position, Var};
+
+/// What an error report shows for a lambda: the name it is bound to and where its source form starts.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Described<'gc> {
+    pub(crate) name: Option<Value<'gc>>,
+    pub(crate) at: Option<Position<'gc>>,
+}
+
+/// What error reports need to know about the code being compiled: the description of each lambda, keyed by lambda ID, and the source sites that IR nodes refer to. Passes identify a function by its lambda ID and a position by its site number, so this information travels beside the IR tables instead of inside every record.
+#[derive(Default)]
+pub(crate) struct Origins<'gc> {
+    lambdas: HashMap<u32, Described<'gc>>,
+    pub(crate) sites: Sites<'gc>,
+}
+
+impl<'gc> Origins<'gc> {
+    /// Records the name and position of `lambda`, where it has them.
+    pub(crate) fn describe(&mut self, lambda: u32, name: Option<Value<'gc>>, at: Option<Position<'gc>>) {
+        if name.is_some() || at.is_some() {
+            self.lambdas.insert(lambda, Described { name, at });
+        }
+    }
+
+    pub(crate) fn name(&mut self, lambda: u32, name: Value<'gc>) {
+        self.lambdas.entry(lambda).or_default().name = Some(name);
+    }
+
+    pub(crate) fn get(&self, lambda: u32) -> Described<'gc> {
+        self.lambdas.get(&lambda).copied().unwrap_or_default()
+    }
+
+    /// Gives the lambda `to`, a copy of the lambda `from`, the same description.
+    pub(crate) fn copy(&mut self, from: u32, to: u32) {
+        if let Some(&described) = self.lambdas.get(&from) {
+            self.lambdas.insert(to, described);
+        }
+    }
+}
+
+/// An inlined call: the lambda whose body was copied into its caller, and the site of the call it replaced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Inlined {
+    pub(crate) lambda: u32,
+    pub(crate) call: u32,
+}
+
+/// A source site: a position, and the inlined call it is part of. `inlined` is an index into [`Sites::inlined`] plus one, or 0 for code that was written in the function it belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Site<'gc> {
+    pub(crate) at: Position<'gc>,
+    pub(crate) inlined: u32,
+}
+
+/// The source sites of the code being compiled. IR nodes refer to a site by its index plus one, so that 0 can stand for "no known position".
+#[derive(Default)]
+pub(crate) struct Sites<'gc> {
+    pub(crate) sites: Vec<Site<'gc>>,
+    pub(crate) inlined: Vec<Inlined>,
+    /// The site already made for a site moved into an inlined call, keyed by the original site and the inlined call.
+    moved: HashMap<(u32, u32), u32>,
+}
+
+impl<'gc> Sites<'gc> {
+    /// Adds a site for code at `at` that is not part of an inlined call.
+    pub(crate) fn add(&mut self, at: Position<'gc>) -> u32 {
+        self.sites.push(Site { at, inlined: 0 });
+        self.sites.len() as u32
+    }
+
+    pub(crate) fn get(&self, site: u32) -> Option<Site<'gc>> {
+        self.sites.get((site as usize).checked_sub(1)?).copied()
+    }
+
+    /// Records that the body of `lambda` was inlined in place of the call at `call`, and returns the inlined call's number.
+    pub(crate) fn inline(&mut self, lambda: u32, call: u32) -> u32 {
+        self.inlined.push(Inlined { lambda, call });
+        self.inlined.len() as u32
+    }
+
+    /// Returns the site for code at `site` once it is part of the inlined call `within`. Code that was already part of an inlined call keeps that call, which itself becomes part of `within`.
+    pub(crate) fn within(&mut self, site: u32, within: u32) -> u32 {
+        let Some(original) = self.get(site) else { return 0 };
+        if let Some(&moved) = self.moved.get(&(site, within)) {
+            return moved;
+        }
+        let inlined = match self.inlined.get((original.inlined as usize).wrapping_sub(1)).copied() {
+            Some(inner) => {
+                let call = self.within(inner.call, within);
+                self.inline(inner.lambda, call)
+            }
+            None => within,
+        };
+        self.sites.push(Site { at: original.at, inlined });
+        let moved = self.sites.len() as u32;
+        self.moved.insert((site, within), moved);
+        moved
+    }
+}
+
 /// Generates fresh variable and lambda identifiers, threaded across compiler passes.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Supply {

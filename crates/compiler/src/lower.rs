@@ -1,8 +1,10 @@
 //! Pass 1 (`Core -> L1`): Validates the input AST structure and lowers module-level variable references
 //! (`Place::Slot`) into explicit slot access primitives.
 
+use ragwort_types::gc::Value;
+
 use crate::hash::HashSet;
-use crate::ir::Supply;
+use crate::ir::{Origins, Supply};
 use crate::ir::l1::{Function, Id, L1, Node};
 use crate::{CompileError, Core, Place, Prim, SlotOp, Var};
 
@@ -11,18 +13,25 @@ use crate::{CompileError, Core, Place, Prim, SlotOp, Var};
 ///
 /// Implemented iteratively using explicit work and value stacks, preventing machine stack
 /// overflow regardless of expression nesting depth.
-pub(crate) fn lower<'id, 'gc>(tree: &mut L1<'id, 'gc>, core: &Core<'gc>) -> Result<(Id<'id>, Supply), CompileError> {
-    let mut pass = Lower { tree, bound: HashSet::default(), scope: HashSet::default(), lambdas: HashSet::default(), max_var: 0, max_lambda: 0 };
+pub(crate) fn lower<'id, 'gc>(tree: &mut L1<'id, 'gc>, core: &Core<'gc>, names: &mut Origins<'gc>, slot_name: &dyn Fn(u32) -> Option<Value<'gc>>) -> Result<(Id<'id>, Supply), CompileError> {
+    let mut pass = Lower { tree, names, slot_name, bound: HashSet::default(), scope: HashSet::default(), lambdas: HashSet::default(), max_var: 0, max_lambda: 0 };
     let mut vals = Vec::new();
-    let mut todo = vec![Task::Expr(core)];
+    // Each task carries the source site of the expression it belongs to, which the nodes it adds receive.
+    let mut todo = vec![(Task::Expr(core), 0)];
     let mut then = Vec::new();
-    while let Some(task) = todo.pop() {
+    while let Some((task, mut site)) = todo.pop() {
+        pass.tree.at(site);
         match task {
-            Task::Expr(core) => {
+            Task::Expr(mut core) => {
+                while let Core::At(at, inner) = core {
+                    site = pass.names.sites.add(*at);
+                    core = inner;
+                }
+                pass.tree.at(site);
                 if let Some(leaf) = pass.enter(core, &mut then)? {
                     vals.push(pass.tree.add(leaf));
                 }
-                todo.extend(then.drain(..).rev());
+                todo.extend(then.drain(..).rev().map(|task| (task, site)));
             }
             Task::Scope(binds) => pass.scope.extend(binds.iter().map(|&(v, _)| v)),
             Task::Make(core) => {
@@ -46,6 +55,9 @@ enum Task<'c, 'gc> {
 
 struct Lower<'t, 'id, 'gc> {
     tree: &'t mut L1<'id, 'gc>,
+    names: &'t mut Origins<'gc>,
+    /// Returns the name of a module variable slot, which names a lambda that the slot is defined as.
+    slot_name: &'t dyn Fn(u32) -> Option<Value<'gc>>,
     bound: HashSet<Var>,
     scope: HashSet<Var>,
     lambdas: HashSet<u32>,
@@ -127,6 +139,7 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
                 }
                 all(args, then);
             }
+            Core::At(..) => unreachable!("the driver unwraps positions before entering an expression"),
         }
         then.push(Task::Make(core));
         Ok(None)
@@ -151,7 +164,13 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
                 if matches!(core, Core::Let(..)) { Node::Let(binds, body) } else { Node::Letrec(binds, body) }
             }
             Core::Set(Place::Local(v), _) => Node::Set(*v, last(1)[0]),
-            Core::Set(Place::Slot { slot, checked }, _) => {
+            Core::Set(Place::Slot { slot, checked }, value) => {
+                if let Core::Lambda(f) = &**value
+                    && f.name.is_none()
+                    && let Some(name) = (self.slot_name)(*slot)
+                {
+                    self.names.name(f.id, name);
+                }
                 let op = if *checked { SlotOp::StoreChecked } else { SlotOp::Store };
                 let value = last(1);
                 Node::Intrinsic(Prim::Slot(op, *slot), self.tree.list(value))
@@ -167,11 +186,13 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
                     self.scope.remove(&v);
                 }
                 let params = self.tree.list(f.params.iter().copied());
+                self.names.describe(f.id, f.name, f.at);
                 Node::Lambda(self.tree.function(Function { id: f.id, params, optional: f.optional, rest: f.rest, body }))
             }
             Core::Intrinsic(prim, args) => Node::Intrinsic(*prim, self.tree.list(last(args.len()))),
             Core::ApplyIntrinsic(prim, args) => Node::ApplyIntrinsic(*prim, self.tree.list(last(args.len()))),
             Core::Quote(_) | Core::Ref(_) => unreachable!("leaves are lowered as they're reached"),
+            Core::At(..) => unreachable!("the driver unwraps positions before entering an expression"),
         }
     }
 

@@ -70,6 +70,8 @@ named! {
         /// point (running intervening `after` winders) and calls `handler` with the raised condition in place
         /// of `thunk`.
         Guard = "guard",
+        /// `(guard/no-traceback thunk handler)`: behaves as `guard`, but a condition that this guard catches does not record a call trace when it is raised. Intended for guards that use errors as control flow.
+        GuardQuiet = "guard/no-traceback",
         /// `(co/resume co arg ...)`: resumes pending coroutine `co` until it yields, finishes, or raises an
         /// unhandled exception. Passes `arg ...` to initialize the coroutine procedure or as the return values
         /// of its suspended `co/yield`. Returns the yielded or returned values; if the coroutine fails,
@@ -98,7 +100,7 @@ impl Request {
         let (least, most) = match self {
             Request::Apply => (2, None),
             Request::WithMark | Request::CallWithPrompt => (3, None),
-            Request::ApplyValues | Request::Capture | Request::WithHandler | Request::Guard => (2, Some(2)),
+            Request::ApplyValues | Request::Capture | Request::WithHandler | Request::Guard | Request::GuardQuiet => (2, Some(2)),
             Request::CallCc | Request::Raise | Request::RaiseContinuable => (1, Some(1)),
             Request::Abort | Request::Resume | Request::TryResume | Request::Compose => (1, None),
             Request::Yield => (0, None),
@@ -141,13 +143,13 @@ impl Request {
             Request::WithHandler => outer.with_handler(arg(0)?, arg(1)?)?,
             Request::Raise => Then::Raise(arg(0)?, false),
             Request::RaiseContinuable => Then::Raise(arg(0)?, true),
-            Request::Guard => {
-                outer.guard(arg(1)?, false)?;
+            Request::Guard | Request::GuardQuiet => {
+                outer.guard(arg(1)?, false, self == Request::Guard)?;
                 Then::Call(arg(0)?, Args::none())
             }
             Request::Resume => Then::Resume(arg(0)?, args.tail(mc, 1)?),
             Request::TryResume => {
-                outer.guard(Value::FALSE, true)?;
+                outer.guard(Value::FALSE, true, true)?;
                 Then::Resume(arg(0)?, args.tail(mc, 1)?)
             }
             Request::Yield => Then::Yield(outer.values(args)?),

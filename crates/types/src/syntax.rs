@@ -35,6 +35,18 @@ impl<'gc> SyntaxText<'gc> {
 pub struct SyntaxSource<'gc>(Gc<'gc, objects::SyntaxSource>);
 
 impl<'gc> SyntaxSource<'gc> {
+    /// Returns the source that `value` holds, if it holds one.
+    pub fn of(value: Value<'gc>) -> Option<Self> {
+        match Data::of(value) {
+            Some(Data::SyntaxSource(source)) => Some(Self(source)),
+            _ => None,
+        }
+    }
+
+    pub fn value(self, mc: &Mutation<'gc>) -> Value<'gc> {
+        Value::object(mc, self.0)
+    }
+
     pub fn name(self, mc: &Mutation<'gc>) -> Option<SyntaxText<'gc>> {
         self.0.name(mc).map(SyntaxText)
     }

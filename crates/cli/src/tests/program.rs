@@ -52,8 +52,8 @@ fn the_repl_keeps_what_each_input_defines() {
     assert_eq!(eval(&mut program, "(match (point 1 2) [(point a _ ...) a])"), values(&["1"]));
     assert_eq!(eval(&mut program, "(list display write newline)").map(|written| written.len()), Ok(1));
     // What's wrong with an input leaves the ones before it as they were.
-    assert_eq!(eval(&mut program, "(car 5)"), Err(vec!["uncaught: #<error WrongType>".to_string()]));
-    assert_eq!(eval(&mut program, "1 (car 5) 2"), Err(vec!["uncaught: #<error WrongType>".to_string()]));
+    assert_eq!(eval(&mut program, "(car 5)"), Err(vec!["error: car: wrong type of argument: 5\n  at <input>:1".to_string()]));
+    assert_eq!(eval(&mut program, "1 (car 5) 2"), Err(vec!["error: car: wrong type of argument: 5\n  at <input>:1".to_string()]));
     assert_eq!(eval(&mut program, "\n (nope)"), Err(vec!["<input>:2:3: a name nothing defines".to_string()]));
     assert_eq!(eval(&mut program, "(set! x 2)"), Err(vec!["<input>:1:7: an assignment of an import".to_string()]));
     assert_eq!(eval(&mut program, "(f x)"), values(&["14"]));
@@ -84,7 +84,7 @@ fn code_requires_the_modules_the_command_line_names() {
     let main = file(&root, "main.rg", "(require lib/foo lib/text)\n(define made (make-user \"bo\" 1))\n(greet made)\n(twice 2)");
     assert_eq!(Program::new(HEAP, library(&root)).unwrap().run_file(&main, true), Ok(()));
     let failing = file(&root, "failing.rg", "(require lib/text)\n(twice 'two)");
-    assert_eq!(Program::new(HEAP, library(&root)).unwrap().run_file(&failing, true), Err(vec!["uncaught: #<error WrongType>".to_string()]));
+    assert_eq!(Program::new(HEAP, library(&root)).unwrap().run_file(&failing, true), Err(vec![format!("error: +: wrong type of argument: two two\n  at {}:2", failing.display())]));
     assert_eq!(Program::new(HEAP, library(&root)).unwrap().run_file(&failing, false), Ok(()));
     // A module that's required runs as an entry point does: what it drops as it starts is
     // collected as it goes, however much that is.
@@ -120,7 +120,7 @@ fn what_is_wrong_says_where() {
     assert_eq!(run(vec![dir("broken", broken.parent().unwrap())], &user), [at(&second, "2:4: a name nothing defines"), at(&user, "1:10: a module that can't be found")]);
     let raising = file(&root, "raising/one.rg", "(car 1)");
     let raises = file(&root, "raises.rg", "(require raising)");
-    assert_eq!(run(vec![dir("raising", raising.parent().unwrap())], &raises), ["module raising: uncaught: #<error WrongType>".to_string(), at(&raises, "1:10: a module that can't be found")]);
+    assert_eq!(run(vec![dir("raising", raising.parent().unwrap())], &raises), [format!("module raising: error: car: wrong type of argument: 1\n  at {}:1", raising.display()), at(&raises, "1:10: a module that can't be found")]);
     let empty = scratch("wrong-empty");
     let needs = file(&root, "needs.rg", "(require empty)");
     assert_eq!(run(vec![dir("empty", &empty)], &needs), [format!("{}: no .rg or .rgn files", empty.display()), at(&needs, "1:10: a module that can't be found")]);
@@ -170,7 +170,7 @@ fn an_image_starts_a_program_from_the_modules_it_holds() {
     assert_eq!(eval(&mut loaded, "(require lib/foo lib/text) (list (greet (make-user \"ann\" 3)) (twice 21))"), values(&["(\"ann!\" 42)"]));
     assert_eq!(eval(&mut loaded, "(list display (twice 1))").map(|written| written.len()), Ok(1));
     let main = file(&root, "main.rg", "(require lib/foo lib/text)\n(greet (make-user \"bo\" 1))\n(twice 'two)");
-    assert_eq!(Program::from_image(HEAP, Vec::new(), &bytes).unwrap().run_file(&main, true), Err(vec!["uncaught: #<error WrongType>".to_string()]));
+    assert_eq!(Program::from_image(HEAP, Vec::new(), &bytes).unwrap().run_file(&main, true), Err(vec![format!("error: +: wrong type of argument: two two\n  at {}:3", main.display())]));
 
     // Modules from folders go on top, and the two make another image.
     file(&root, "extra/e.rg", "(require lib/text)\n(provide thrice)\n(define (thrice x) (+ x (twice x)))");
@@ -196,4 +196,17 @@ fn a_program_stops_at_its_memory_limit() {
     assert_eq!(eval(&mut small, "(+ 1 2)"), values(&["3"]));
     let mut roomy = Program::new(HEAP, Vec::new()).unwrap();
     assert_eq!(eval(&mut roomy, big), values(&["1000000"]));
+}
+
+#[test]
+fn an_uncaught_error_lists_the_calls_in_progress() {
+    let root = scratch("trace");
+    let main = file(&root, "main.rg", "(define (inner x) (vector-ref x 9))\n(define (middle x) (+ 1 (inner x)))\n(define (main) (+ 1 (middle (vector 1))))\n(main)");
+    let at = main.display();
+    let report = format!("error: vector-ref: value out of range: #(1) 9\n  in inner ({at}:1)\n  in middle ({at}:2)\n  in main ({at}:3)");
+    assert_eq!(Program::new(HEAP, Vec::new()).unwrap().run_file(&main, true), Err(vec![report]));
+    let anonymous = file(&root, "anonymous.rg", "(define (apply-it f) (+ 1 (f 5)))\n(apply-it (lambda (x) (+ 1 (car x))))");
+    let at = anonymous.display();
+    let report = format!("error: car: wrong type of argument: 5\n  in (anonymous) ({at}:2)\n  in apply-it ({at}:1)");
+    assert_eq!(Program::new(HEAP, Vec::new()).unwrap().run_file(&anonymous, true), Err(vec![report]));
 }

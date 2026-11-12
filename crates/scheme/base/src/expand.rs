@@ -10,7 +10,7 @@ use ragwort_compiler::keyword::CallShape;
 use ragwort_compiler::module::{self, Filter, Import, Imports, ModuleBuilder, ModuleError, RequireSpec, Resolver, SpecError, Unusable};
 use ragwort_compiler::steps::{self, Step};
 use ragwort_compiler::structs::Declared;
-use ragwort_compiler::{Core, Lambda, Place, Prim, Var};
+use ragwort_compiler::{Core, Lambda, Place, Position, Prim, Var};
 use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Value};
 use ragwort_types::string::{Strings, chars};
 use ragwort_types::symbol::{Symbol, Symbols};
@@ -171,8 +171,10 @@ pub(crate) struct Ambiguous;
 /// What a body has, in order: a definition of a variable, or of a keyword procedure, the core's
 /// variable too, or an expression.
 enum Item {
-    Define(Var, Stx),
-    Keyword(Var, Var, Stx),
+    /// A definition: its variable, the identifier it defines, and its value.
+    Define(Var, Stx, Stx),
+    /// A keyword procedure's definition: its variable, the variable of its core, the identifier it defines, and its lambda.
+    Keyword(Var, Var, Stx, Stx),
     Expr(Stx),
 }
 
@@ -805,7 +807,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                         return Self::exprs(items[1..].to_vec(), move |this, args| {
                             let mc = this.mc;
                             let call = import.call(mc, args, &mut || this.fresh());
-                            call.map(Step::Done).map_err(|e| this.import_error(e, head))
+                            call.map(|call| Step::Done(this.at(stx, call))).map_err(|e| this.import_error(e, head))
                         });
                     }
                 }
@@ -825,12 +827,23 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             && call.takes(items.len() - 1)
             && !self.has_keyword_args(&items[1..])
         {
-            return Self::exprs(items[1..].to_vec(), move |this, args| Ok(Step::Done(call.core(args, &mut || this.fresh()))));
+            return Self::exprs(items[1..].to_vec(), move |this, args| {
+                let call = call.core(args, &mut || this.fresh());
+                Ok(Step::Done(this.at(stx, call)))
+            });
         }
         if def.is_some() || self.has_keyword_args(&items[1..]) {
             return self.keyword_call(head, items[1..].to_vec(), def);
         }
-        Self::expr(head, move |_, f| Self::exprs(items[1..].to_vec(), move |_, args| Ok(Step::Done(Core::App(Box::new(f), args)))))
+        Self::expr(head, move |_, f| Self::exprs(items[1..].to_vec(), move |this, args| Ok(Step::Done(this.at(stx, Core::App(Box::new(f), args))))))
+    }
+
+    /// Marks `call`, the expansion of the call form `stx`, with the position of that form, so that an error the call raises reports where it was written.
+    fn at(&self, stx: Stx, call: Core<'gc>) -> Core<'gc> {
+        match Position::of(self.mc, self.tree.span(stx)) {
+            Some(position) => Core::At(position, Box::new(call)),
+            None => call,
+        }
     }
 
     fn form(&mut self, form: Form, stx: Stx, items: Vec<Stx>, tail: Option<Stx>) -> Result<Ex<'a, 'gc>, ExpandError> {
@@ -944,7 +957,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let params = ids.iter().map(|&id| self.local(id)).collect::<Result<_, _>>()?;
         let rest = rest.map(|id| self.local(id)).transpose()?;
         let body = self.scoped(&body, scope)?;
-        Self::body_then(stx, body, move |this, body| Ok(Step::Done(Core::Lambda(Lambda { id: this.lambda_id(), params, optional: 0, rest, body: Box::new(body) }))))
+        Self::body_then(stx, body, move |this, body| Ok(Step::Done(Core::Lambda(Lambda { id: this.lambda_id(), params, optional: 0, rest, body: Box::new(body), name: None, at: Position::of(this.mc, this.tree.span(stx)) }))))
     }
 
     /// A `let`, or if `recursive`, a `letrec`.
@@ -962,7 +975,13 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             }
         }
         self.distinct(&ids)?;
-        let finish = move |this: &mut Self, vars: Vec<Var>, inits: Vec<Core<'gc>>| {
+        let names: Vec<Option<Symbol<'gc>>> = ids.iter().map(|&id| self.tree.symbol(id)).collect();
+        let finish = move |this: &mut Self, vars: Vec<Var>, mut inits: Vec<Core<'gc>>| {
+            for (init, name) in inits.iter_mut().zip(&names) {
+                if let Some(name) = name {
+                    init.name(name.value(this.mc));
+                }
+            }
             let body = this.scoped(&body, scope)?;
             Self::body_then(stx, body, move |_, body| {
                 let binds = vars.into_iter().zip(inits).collect();
@@ -1004,9 +1023,9 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                         Some(shape) => {
                             let (procedure, core) = (self.local(id)?, self.fresh());
                             self.keyword_defs.insert(procedure, KeywordDef { core: CoreAt::Local(core), shape });
-                            s.items.push(Item::Keyword(procedure, core, value));
+                            s.items.push(Item::Keyword(procedure, core, id, value));
                         }
-                        None => s.items.push(Item::Define(self.local(id)?, value)),
+                        None => s.items.push(Item::Define(self.local(id)?, id, value)),
                     }
                 }
                 Head::DefineSyntax(form) => {
@@ -1036,19 +1055,24 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     /// The rest of a body's definitions and expressions, `items`, bound after `binds`, then its
     /// `last` expression.
     fn defines(&mut self, mut items: std::vec::IntoIter<Item>, mut binds: Vec<(Var, Core<'gc>)>, last: Stx) -> Result<Ex<'a, 'gc>, ExpandError> {
-        let (var, value) = match items.next() {
+        let (var, name, value) = match items.next() {
             None => return Self::expr(last, move |_, last| Ok(Step::Done(Core::Letrec(binds, Box::new(last))))),
-            Some(Item::Define(var, value)) => (var, value),
-            Some(Item::Expr(e)) => (self.fresh(), e),
-            Some(Item::Keyword(procedure, core, lambda)) => {
-                return self.keyword_definition(lambda, move |this, lambda, shape| {
+            Some(Item::Define(var, id, value)) => (var, self.tree.symbol(id), value),
+            Some(Item::Expr(e)) => (self.fresh(), None, e),
+            Some(Item::Keyword(procedure, core, id, lambda)) => {
+                let name = self.tree.symbol(id);
+                return self.keyword_definition(lambda, move |this, mut lambda, shape| {
+                    lambda.name = name.map(|name| name.value(this.mc));
                     binds.push((core, Core::Lambda(lambda)));
                     binds.push((procedure, this.keyword_procedure(&shape, Core::Ref(Place::Local(core)))?));
                     this.defines(items, binds, last)
                 });
             }
         };
-        Self::expr(value, move |this, value| {
+        Self::expr(value, move |this, mut value| {
+            if let Some(name) = name {
+                value.name(name.value(this.mc));
+            }
             binds.push((var, value));
             this.defines(items, binds, last)
         })

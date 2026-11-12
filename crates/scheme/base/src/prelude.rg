@@ -215,8 +215,11 @@
 (%define error-object-message (%lambda (c) (%intrinsic error-object-message c)))
 (%define error-object-irritants (%lambda (c) (%intrinsic error-object-irritants c)))
 (%define error-object-kind (%lambda (c) (%intrinsic error-object-kind c)))
+(%define error-object-traceback (%lambda (c) (%intrinsic error-object-traceback c)))
+(%define error-object-who (%lambda (c) (%intrinsic error-object-who c)))
 ; What `guard` expands to: `thunk`, and if it raises, `handler` in its place, with what it raised.
 (%define %guard (%lambda (thunk handler) (%intrinsic guard thunk handler)))
+(%define %guard/no-traceback (%lambda (thunk handler) (%intrinsic guard/no-traceback thunk handler)))
 
 (%define make-coroutine (%lambda (f) (%intrinsic make-coroutine f)))
 (%define coroutine? (%lambda (x) (%intrinsic coroutine? x)))

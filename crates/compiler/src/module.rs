@@ -530,7 +530,11 @@ fn takes(prim: Prim, n: usize) -> bool {
 
 impl Template {
     /// Converts `core` into a `Template` given formal parameters `params` and visible `locals`, returning `None` if AST complexity exceeds the remaining quota in `left`.
-    fn of(core: &Core<'_>, params: &[Var], locals: &mut Vec<Var>, left: &mut usize) -> Option<Self> {
+    fn of(mut core: &Core<'_>, params: &[Var], locals: &mut Vec<Var>, left: &mut usize) -> Option<Self> {
+        // A template keeps no positions: code inlined from it reports the position of the call it replaces.
+        while let Core::At(_, inner) = core {
+            core = inner;
+        }
         *left = left.checked_sub(1)?;
         // Host functions are transitively propagated into the host table of any requiring module, so they may be safely inlined.
         let closed = |prim: &Prim| !matches!(prim, Prim::Slot(..));

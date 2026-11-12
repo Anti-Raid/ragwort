@@ -64,7 +64,7 @@ fn lambda<'gc>(params: &[u32], rest: Option<u32>, body: Core<'gc>) -> Core<'gc> 
 fn optional_lambda<'gc>(params: &[u32], optional: u32, rest: Option<u32>, body: Core<'gc>) -> Core<'gc> {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    Core::Lambda(Lambda { id, params: params.iter().map(|&v| Var(v)).collect(), optional, rest: rest.map(Var), body: Box::new(body) })
+    Core::Lambda(Lambda { id, params: params.iter().map(|&v| Var(v)).collect(), optional, rest: rest.map(Var), body: Box::new(body), name: None, at: None })
 }
 
 fn app<'gc>(f: Core<'gc>, args: Vec<Core<'gc>>) -> Core<'gc> {
@@ -86,7 +86,7 @@ fn eval(build: impl for<'gc> FnOnce(&Mutation<'gc>) -> Core<'gc>, check: impl fo
                 Outcome::Paused => {}
                 Outcome::Yielded(_) | Outcome::Deferred(_) => panic!("yielded"),
                 Outcome::Done(value) => break Ok(value),
-                Outcome::Raised(raised) => break Err(*raised.downcast::<Condition>(mc).unwrap().fault(mc).unwrap()),
+                Outcome::Raised(raised) => break Err(raised.downcast::<Condition>(mc).unwrap().failure(mc).unwrap().fault),
             }
         };
         check(mc, result);
@@ -418,11 +418,11 @@ fn bad_forms_dont_compile() {
     assert_eq!(error(|_| prim(Car, vec![])), CompileError::Arity(Prim::Intrinsic(Car)));
     // ((lambda () 1) (lambda () 2)), both numbered 7.
     fn numbered<'gc>(body: Core<'gc>) -> Core<'gc> {
-        Core::Lambda(Lambda { id: 7, params: Vec::new(), optional: 0, rest: None, body: Box::new(body) })
+        Core::Lambda(Lambda { id: 7, params: Vec::new(), optional: 0, rest: None, body: Box::new(body), name: None, at: None })
     }
     assert_eq!(error(|_| app(numbered(q(1)), vec![numbered(q(2))])), CompileError::SameLambda(7));
     // Reject a lambda with one parameter but an optional-parameter count of two.
-    assert_eq!(error(|_| Core::Lambda(Lambda { id: 7, params: vec![Var(0)], optional: 2, rest: None, body: Box::new(q(1)) })), CompileError::TooManyOptional(7));
+    assert_eq!(error(|_| Core::Lambda(Lambda { id: 7, params: vec![Var(0)], optional: 2, rest: None, body: Box::new(q(1)), name: None, at: None })), CompileError::TooManyOptional(7));
     assert_eq!(error(|_| Core::Intrinsic(Prim::Request(Request::Capture), vec![q(1)])), CompileError::Arity(Prim::Request(Request::Capture)));
 }
 
@@ -1303,7 +1303,7 @@ fn run_to_end<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Result<Value<'gc>, 
         match machine.run(mc).unwrap() {
             Outcome::Paused => {}
             Outcome::Done(value) => return Ok(value),
-            Outcome::Raised(raised) => return Err(*raised.downcast::<Condition>(mc).unwrap().fault(mc).unwrap()),
+            Outcome::Raised(raised) => return Err(raised.downcast::<Condition>(mc).unwrap().failure(mc).unwrap().fault),
             _ => panic!("yielded"),
         }
     }

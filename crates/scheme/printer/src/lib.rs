@@ -28,7 +28,7 @@ use ragwort_types::string::{self, Strings};
 use ragwort_types::symbol::{Keyword, Symbol};
 use ragwort_types::syntax::{Abbreviation, Syntax, SyntaxKind};
 use ragwort_types::vector::{AnyVector, Vector};
-use ragwort_vm::Fault;
+use ragwort_vm::report::{Failure, Raised, Report};
 use ragwort_vm::objects::{Closure, Condition, ConditionFields, Continuation, ExternalRef, KeywordProcedure, MultiValue, MultiValueFields, Tag, Task};
 use ragwort_vm::objects::{Struct, StructFields, StructType, StructTypeFields};
 
@@ -72,6 +72,44 @@ impl fmt::Display for PrintError {
 }
 
 impl std::error::Error for PrintError {}
+
+/// Formats `report` as the text shown for an uncaught raised value. The value itself is limited to `limit` bytes.
+///
+/// The first line is `error:` and the message of an error object, or `uncaught:` and the written form of any other value. Each call of the trace follows on a line of its own, innermost first, as `  in name (file:line)`, where the line is that of the call or operation in progress. A procedure the compiler inlined is marked `[inlined]`, and top-level code is shown as `  at file:line`.
+///
+/// ```text
+/// error: car: wrong type of argument: 5
+///   in first [inlined] (bot.rg:2)
+///   in inner (bot.rg:5)
+///   in main (bot.rg:9)
+///   at bot.rg:12
+/// ```
+pub fn render<'gc>(mc: &Mutation<'gc>, report: &Report<'gc>, limit: usize) -> String {
+    let (label, mode) = if matches!(report.error, Raised::Value(_)) { ("uncaught", Mode::Write) } else { ("error", Mode::Display) };
+    let mut text = format!("{label}: {}", to_string(mc, report.value, mode, limit).unwrap_or_else(|_| "...".to_string()));
+    for context in &report.trace.contexts {
+        let place = context.file.as_ref().map(|file| format!("{file}:{}", context.line));
+        if context.top_level {
+            // Top-level code has no name to show, so it is listed only when its position is known.
+            if let Some(place) = place {
+                text.push_str(&format!("\n  at {place}"));
+            }
+            continue;
+        }
+        text.push_str("\n  in ");
+        text.push_str(context.procedure.as_deref().unwrap_or("(anonymous)"));
+        if context.inlined {
+            text.push_str(" [inlined]");
+        }
+        if let Some(place) = place {
+            text.push_str(&format!(" ({place})"));
+        }
+    }
+    if report.trace.truncated {
+        text.push_str("\n  ...");
+    }
+    text
+}
 
 /// `value` as text, in `mode`, of at most `limit` bytes.
 pub fn to_string<'gc>(mc: &Mutation<'gc>, value: Value<'gc>, mode: Mode, limit: usize) -> Result<String, PrintError> {
@@ -153,9 +191,6 @@ fn child<'gc>(mc: &Mutation<'gc>, v: Value<'gc>, i: usize) -> Option<Value<'gc>>
         return (i < fields.len()).then(|| fields.get(i));
     }
     let condition = v.downcast::<Condition>(mc)?;
-    if condition.fault(mc) != Some(&Fault::Error) {
-        return None;
-    }
     [condition.message(mc), condition.irritants(mc)].get(i).copied()
 }
 
@@ -230,6 +265,8 @@ enum Work<'gc> {
     Items(Value<'gc>, usize),
     /// The end of a syntax object's datum.
     LeaveSyntax,
+    /// Switches the printer to the given mode for the work that follows.
+    Mode(Mode),
 }
 
 struct Printer<'a, 'gc> {
@@ -273,6 +310,7 @@ impl<'gc> Printer<'_, 'gc> {
                     }
                 }
                 Work::LeaveSyntax => self.in_syntax -= 1,
+                Work::Mode(mode) => self.mode = mode,
             }
             if self.out.len() > self.limit {
                 return Err(PrintError::TooLong);
@@ -350,13 +388,29 @@ impl<'gc> Printer<'_, 'gc> {
 
     fn condition(&mut self, condition: Gc<'gc, Condition>, work: &mut Vec<Work<'gc>>) -> Result<(), PrintError> {
         let mc = self.mc;
-        match condition.fault(mc) {
-            Some(Fault::Error) => {
-                self.out.push_str("#<error ");
-                work.extend([Work::Text(">"), Work::Tail(condition.irritants(mc)), Work::Value(condition.message(mc))]);
+        let Some(&Failure { fault, operation }) = condition.failure(mc) else {
+            self.out.push_str("#<error>");
+            return Ok(());
+        };
+        let (message, irritants) = (condition.message(mc), condition.irritants(mc));
+        if self.mode == Mode::Display {
+            // The irritants are written even when the condition is displayed, so that a string irritant keeps its quotes.
+            work.extend([Work::Mode(Mode::Display), Work::Tail(irritants), Work::Mode(Mode::Write)]);
+            if irritants != Value::NIL {
+                work.push(Work::Text(":"));
             }
-            Some(fault) => write!(self.out, "#<error {fault:?}>")?,
-            None => self.out.push_str("#<error>"),
+        } else {
+            self.out.push_str("#<error ");
+            work.extend([Work::Text(">"), Work::Tail(irritants)]);
+        }
+        // A fault raised by the VM has no message of its own and is described by its kind.
+        if message == Value::VOID {
+            work.push(Work::Text(fault.message()));
+        } else {
+            work.push(Work::Value(message));
+        }
+        if let Some(operation) = operation {
+            work.extend([Work::Text(": "), Work::Text(operation.name())]);
         }
         Ok(())
     }
@@ -396,6 +450,10 @@ impl<'gc> Printer<'_, 'gc> {
                 write!(self.out, "{b}")?;
             }
             self.out.push(')');
+        } else if let Some(name) = ragwort_vm::report::procedure_name(mc, v) {
+            self.out.push_str("#<procedure ");
+            self.symbol(name, false)?;
+            self.out.push('>');
         } else {
             self.out.push_str(match v {
                 Value::NIL => "()",

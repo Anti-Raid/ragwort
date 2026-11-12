@@ -187,6 +187,7 @@ fn merge_in<'gc>(mc: &Mutation<'gc>, f: &mut Function<'_, 'gc>) {
     merged.sort_unstable();
     for &(b, i) in merged.iter().rev() {
         f.blocks[b].insts.remove(i);
+        f.blocks[b].sites.remove(i);
     }
     for block in &mut f.blocks {
         block.insts.iter_mut().for_each(|inst| inst.each_use_mut(|v| *v = of(&same, *v)));

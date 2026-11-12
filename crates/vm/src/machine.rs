@@ -6,10 +6,11 @@ use ragwort_types::pair::Pairs;
 use crate::args::Args;
 use crate::frame::{self, CLOSURE, Link};
 use crate::intrinsic::values;
-use crate::objects::{BytecodeFields, Closure, ClosureFields, Condition, Continuation, KeywordProcedure, Native, NativeFields, Task, TaskFields};
+use crate::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Condition, ConditionFields, Continuation, KeywordProcedure, Native, NativeFields, Task, TaskFields};
 use crate::run::{self, Exit, HostThen, Regs, bind};
 use crate::segments::{CHUNK, Resume, Segments};
 use crate::module::Deferred;
+use crate::report::{self, Failure, Origin};
 use crate::{Fault, Fuel, Request, coroutine, keyword, prompts};
 
 #[cfg(test)]
@@ -76,7 +77,7 @@ impl Machine {
         let segment = segment.max(MIN_SEGMENT);
         let mut stack = mc.stack(Segment::new(mc, segment)?)?;
         let task = coroutine::root(mc)?;
-        let mut regs = Regs { fp: 0, pc: 0, acc: Value::VOID };
+        let mut regs = Regs { fp: 0, pc: 0, acc: Value::VOID, code: None };
         Outer::new(mc, &mut stack, task, task, &mut regs, segment).start(procedure, args_of(mc, args)?)?;
         let mut machine = Machine { stack, task: Root::new(mc, task)?, fp: 0, pc: 0, segment, fuel: u64::MAX, finished: false, waiting: Waiting::No };
         machine.save(mc, task, &regs);
@@ -95,7 +96,7 @@ impl Machine {
         let last = self.task.get(mc).expect("a machine runs in its own arena");
         task.set_idle(mc, last.idle(mc));
         task.set_none(mc, last.none(mc));
-        let mut regs = Regs { fp: 0, pc: 0, acc: Value::VOID };
+        let mut regs = Regs { fp: 0, pc: 0, acc: Value::VOID, code: None };
         Outer::new(mc, &mut self.stack, task, task, &mut regs, self.segment).start(procedure, args_of(mc, args)?)?;
         (self.task, self.finished, self.waiting) = (Root::new(mc, task)?, false, Waiting::No);
         self.save(mc, task, &regs);
@@ -121,7 +122,7 @@ impl Machine {
             return Err(Fault::Finished);
         }
         let mut task = coroutine::current(mc, self.task.get(mc).expect("a machine runs in its own arena"));
-        let mut regs = Regs { fp: self.fp, pc: self.pc, acc: task.acc(mc) };
+        let mut regs = Regs { fp: self.fp, pc: self.pc, acc: task.acc(mc), code: None };
         let mut fuel = Fuel { run: self.fuel, rest: 0 };
         let outcome = match self.drive(mc, &mut task, &mut regs, &mut fuel) {
             Ok(Outcome::Paused) if fuel.left() == 0 => Err(Fault::OutOfFuel),
@@ -223,6 +224,16 @@ fn args_of<'gc>(mc: &Mutation<'gc>, args: &[Value<'gc>]) -> Result<Args<'gc>, Fa
     })
 }
 
+/// What the outer loop holds responsible for a fault, which determines what the raised condition reports.
+enum Blame<'gc> {
+    /// The fault did not come from an identifiable operation.
+    Nothing,
+    /// The instruction the inner loop was executing when it exited: the one before the saved program counter.
+    Instruction,
+    /// The value that a call instruction tried to call.
+    Callee(Value<'gc>),
+}
+
 /// The result of an outer loop step: returns `Ok(Some(outcome))` when execution finishes or pauses,
 /// `Ok(None)` to continue running, or `Err(fault)` on error.
 pub(crate) type Step<'gc> = Result<Option<Outcome<'gc>>, Fault>;
@@ -271,12 +282,21 @@ impl<'a, 'gc> Outer<'a, 'gc> {
     /// Processes the exit condition that paused the inner loop. Non-fatal faults are raised as
     /// `Condition` objects, including faults that occur while invoking exception handlers.
     fn exit(&mut self, exit: Exit<'gc>, deferred: &mut Option<Deferred>) -> Step<'gc> {
+        let mut blame = Blame::Nothing;
         let mut step = match exit {
             Exit::Paused => return Ok(Some(Outcome::Paused)),
-            Exit::Fault(fault) => Err(fault),
+            Exit::Fault(fault) => {
+                blame = Blame::Instruction;
+                Err(fault)
+            }
             Exit::Overflow { callee, argc, rest } => self.overflow(callee, argc, rest).map(|()| None),
             Exit::Underflow => self.resume(),
-            Exit::Call { base, argc, rest, tail } => self.call(base, argc, rest, tail),
+            Exit::Call { base, argc, rest, tail } => {
+                if let Ok(callee) = self.registers(base, 1) {
+                    blame = Blame::Callee(callee.get(0));
+                }
+                self.call(base, argc, rest, tail)
+            }
             Exit::Request { base, args, request, spread, tail } => self.request(base, args, request, spread, tail),
             Exit::Host { base, tail, then } => {
                 // Take the deferred value beforehand so it is properly dropped if `keep` fails.
@@ -287,29 +307,54 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         while let Err(fault) = step
             && !fault.is_fatal()
         {
-            step = self.fault(fault);
+            step = self.fault(fault, std::mem::replace(&mut blame, Blame::Nothing));
         }
         step
     }
 
-    /// Creates and raises a `Condition` object for `fault`, replacing the frame where the fault
-    /// occurred.
-    fn fault(&mut self, fault: Fault) -> Step<'gc> {
+    /// Identifies the operation that raised `fault` and the values it was given, according to `blame`.
+    fn origin(&self, fault: Fault, blame: Blame<'gc>) -> Result<Origin<'gc>, Fault> {
         let mc = self.mc();
-        let raised = condition(mc, fault, Value::VOID, Value::NIL)?;
+        match blame {
+            Blame::Instruction => {
+                let (Some(code), Ok(frame)) = (self.regs.code, self.segments.frame(self.regs.fp)) else { return Ok(Origin { operation: None, irritants: Value::NIL }) };
+                report::origin(mc, frame, code, self.regs.pc, fault)
+            }
+            Blame::Callee(callee) => Ok(Origin { operation: None, irritants: Pairs::new(mc).cons(callee, Value::NIL)?.value(mc) }),
+            Blame::Nothing => Ok(Origin { operation: None, irritants: Value::NIL }),
+        }
+    }
+
+    /// Creates and raises a `Condition` object for `fault`, replacing the frame where the fault
+    /// occurred. `blame` selects what the condition reports as the failed operation.
+    fn fault(&mut self, fault: Fault, blame: Blame<'gc>) -> Step<'gc> {
+        let mc = self.mc();
+        let first = if matches!(blame, Blame::Instruction) { self.regs.code.map(|code| (code, self.regs.pc)) } else { None };
+        let origin = self.origin(fault, blame)?;
+        let failure = Failure { fault, operation: origin.operation };
+        let raised = Value::object(mc, Condition::new(mc, mc.frozen(failure)?, Value::VOID, origin.irritants, Value::FALSE)?);
         if self.regs.fp > self.segments.stack.base()
             && let Ok(frame) = self.segments.frame(self.regs.fp)
             && let Ok(link) = frame::link_of(mc, frame)
         {
             let _ = self.segments.reify(self.regs.fp, link);
         }
-        self.raise(raised, false)
+        let then = self.raising(raised, false, first)?;
+        self.then(then)
+    }
+
+    /// Records the call trace in `obj` if it is a condition that has not been raised before. `first` is the function that raised a fault, as [`report::capture`] takes it.
+    pub(crate) fn record(&mut self, obj: Value<'gc>, first: Option<(Gc<'gc, Bytecode>, usize)>) -> Result<(), Fault> {
+        let mc = self.mc();
+        let Some(condition) = obj.downcast::<Condition>(mc).filter(|condition| condition.trace(mc) == Value::FALSE) else { return Ok(()) };
+        condition.set_trace(mc, report::capture(mc, self.task(), first)?);
+        Ok(())
     }
 
     /// Raises `obj`, behaving as `raise` (non-continuable) or `raise-continuable` depending on the
     /// `continuable` flag.
     fn raise(&mut self, obj: Value<'gc>, continuable: bool) -> Step<'gc> {
-        let then = self.raising(obj, continuable)?;
+        let then = self.raising(obj, continuable, None)?;
         self.then(then)
     }
 
@@ -494,5 +539,5 @@ impl<'a, 'gc> Outer<'a, 'gc> {
 /// Constructs a Scheme `Condition` object representing `fault`, with the specified message and
 /// irritants.
 pub(crate) fn condition<'gc>(mc: &Mutation<'gc>, fault: Fault, message: Value<'gc>, irritants: Value<'gc>) -> Result<Value<'gc>, Fault> {
-    Ok(Value::object(mc, Condition::new(mc, mc.frozen(fault)?, message, irritants)?))
+    Ok(Value::object(mc, Condition::new(mc, mc.frozen(Failure { fault, operation: None })?, message, irritants, Value::FALSE)?))
 }

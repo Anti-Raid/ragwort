@@ -48,7 +48,7 @@ fn load_text<'gc>(mc: &Mutation<'gc>, text: &str) -> Result<Vec<Value<'gc>>, Err
 }
 
 fn run<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Result<Value<'gc>, Fault> {
-    run_raising(mc, thunk).map_err(|raised| *raised.downcast::<Condition>(mc).expect("a condition").fault(mc).unwrap())
+    run_raising(mc, thunk).map_err(|raised| raised.downcast::<Condition>(mc).expect("a condition").failure(mc).unwrap().fault)
 }
 
 /// The thunk's value, or what it raised that nothing caught.
@@ -66,7 +66,7 @@ fn run_raising<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Result<Value<'gc>,
 
 fn raised_text<'gc>(mc: &Mutation<'gc>, raised: Value<'gc>) -> String {
     match raised.downcast::<Condition>(mc) {
-        Some(c) => format!("{:?} {}", c.fault(mc), show(mc, c.irritants(mc))),
+        Some(c) => format!("{:?} {}", c.failure(mc).map(|failure| failure.fault), show(mc, c.irritants(mc))),
         None => show(mc, raised),
     }
 }
@@ -323,9 +323,9 @@ fn numbers_compare_by_value() {
                       (< 1267650600228229401496703205376 1267650600228229401496703205377) (> +inf.0 100000000000000000000000000000000) (< +nan.0 1) (= +nan.0 +nan.0) (>= 2 1 +nan.0))";
     assert_eq!(eval(text), "(#t #f #t #t #f #t #t #t #t #t #t #f #f #f)");
     // Every argument's checked, though the answer's known before it.
-    assert_eq!(uncaught("(< 2 1 'x)"), "#<error WrongType>");
-    assert_eq!(uncaught("(< 1+2i 2)"), "#<error WrongType>");
-    assert_eq!(uncaught("(<)"), "#<error Arity>");
+    assert_eq!(uncaught("(< 2 1 'x)"), "#<error <: wrong type of argument 2 1 x>");
+    assert_eq!(uncaught("(< 1+2i 2)"), "#<error <: wrong type of argument 1+2i 2>");
+    assert_eq!(uncaught("(<)"), "#<error wrong number of arguments #<procedure <> 0>");
 }
 
 #[test]
@@ -333,7 +333,7 @@ fn powers_stay_exact_when_they_can() {
     let text = "(list (expt 2 100) (expt 2/3 3) (expt 2 -2) (expt 1.5 2) (expt 4 1/2) (expt 0 0) (expt 0.0 0) (expt -1 (expt 10 30))
                       (expt 1 (expt 10 30)) (expt 0+1i 2) (expt -8 1/3))";
     assert_eq!(eval(text), "(1267650600228229401496703205376 8/27 1/4 2.25 2 1 1 1 1 -1 1.0+1.732050807568877i)");
-    assert_eq!(uncaught("(expt 0 -1)"), "#<error Num(DivideByZero)>");
+    assert_eq!(uncaught("(expt 0 -1)"), "#<error expt: division by zero 0 -1>");
     // A result too big for the arena is turned down before it's computed, which ends the run.
     arena().mutate(|mc| {
         let [thunk] = load_text(mc, "(expt 3 (expt 10 15))").unwrap()[..] else { panic!("one form") };
@@ -344,7 +344,7 @@ fn powers_stay_exact_when_they_can() {
         machine.set_fuel(10_000);
         assert_eq!(machine.run(mc), Err(Fault::OutOfFuel));
     });
-    assert_eq!(uncaught("(expt 'x 2)"), "#<error WrongType>");
+    assert_eq!(uncaught("(expt 'x 2)"), "#<error expt: wrong type of argument x 2>");
 }
 
 #[test]
@@ -353,10 +353,10 @@ fn integer_division_keeps_the_sign_it_should() {
                       (quotient 17.0 5) (modulo -17 5.0) (remainder -0.0 3) (modulo 100000000000000000000 7) (quotient -100000000000000000000 3)
                       (remainder 4611686018427387903 -1) (quotient -4611686018427387904 -1))";
     assert_eq!(eval(text), "(3 -3 2 -2 3 -3 0 3.0 3.0 -0.0 2 -33333333333333333333 0 4611686018427387904)");
-    assert_eq!(uncaught("(modulo 1 0)"), "#<error Num(DivideByZero)>");
-    assert_eq!(uncaught("(remainder 1/2 3)"), "#<error Num(NotInteger)>");
-    assert_eq!(uncaught("(quotient 1.5 1)"), "#<error Num(NotInteger)>");
-    assert_eq!(uncaught("(modulo \"1\" 2)"), "#<error WrongType>");
+    assert_eq!(uncaught("(modulo 1 0)"), "#<error modulo: division by zero 1 0>");
+    assert_eq!(uncaught("(remainder 1/2 3)"), "#<error remainder: not an integer 1/2 3>");
+    assert_eq!(uncaught("(quotient 1.5 1)"), "#<error quotient: not an integer 1.5 1>");
+    assert_eq!(uncaught("(modulo \"1\" 2)"), "#<error modulo: wrong type of argument \"1\" 2>");
 }
 
 #[test]
@@ -399,9 +399,9 @@ fn bitwise_operations_work_on_any_exact_integer() {
     let want = "(-1 0 0 8 14 7 4 1180591620717411303424 -3 8 3 #t #f #t 2 1180591620717411303423 12 \
                 1267650600228229401496703205376 0 -1 1208925819614629174706183)";
     assert_eq!(eval(text), want.split_whitespace().collect::<Vec<_>>().join(" "));
-    assert_eq!(uncaught("(bitwise-and 1.0 2)"), "#<error WrongType>");
-    assert_eq!(uncaught("(bit-field 5 3 1)"), "#<error OutOfRange>");
-    assert_eq!(uncaught("(bit-set? -1 5)"), "#<error OutOfRange>");
+    assert_eq!(uncaught("(bitwise-and 1.0 2)"), "#<error bitwise-and: wrong type of argument 1.0 2>");
+    assert_eq!(uncaught("(bit-field 5 3 1)"), "#<error bit-field: value out of range 5 3 1>");
+    assert_eq!(uncaught("(bit-set? -1 5)"), "#<error bit-set?: value out of range -1 5>");
 }
 
 #[test]
@@ -421,10 +421,10 @@ fn logical_shifts_treat_a_number_as_so_many_bits() {
     let text = "(list (logical-shift-right -1 28 32) (logical-shift-right -16 2 8) (logical-shift-right -1 40 32) (logical-shift-right 5 0 64)
                       (logical-shift-left -1 28 32) (logical-shift-left 255 4 8) (logical-shift-left 1 70 64) (logical-shift-left 3 63 64))";
     assert_eq!(eval(text), "(15 60 0 5 4026531840 240 0 9223372036854775808)");
-    assert_eq!(uncaught("(logical-shift-right 1 -1 32)"), "#<error OutOfRange>");
-    assert_eq!(uncaught("(logical-shift-left 1 -1 32)"), "#<error OutOfRange>");
+    assert_eq!(uncaught("(logical-shift-right 1 -1 32)"), "#<error bit-field: value out of range 1 -1 32>");
+    assert_eq!(uncaught("(logical-shift-left 1 -1 32)"), "#<error bit-field: value out of range 1 -1 32>");
     for text in ["(logical-shift-right 5 40.0 32)", "(logical-shift-left 5 81/2 32)", "(logical-shift-right 5 40 2.5)", "(logical-shift-left 'x 40 32)"] {
-        assert_eq!(uncaught(text), "#<error WrongType>", "{text}");
+        assert!(uncaught(text).contains(": wrong type of argument "), "{text}");
     }
 }
 
@@ -477,8 +477,8 @@ fn strings_append_and_count_characters() {
                 (define s (grow \"ab\" 12))
                 (list (string-length s) (equal? (string-append s \"z\") (string-append s \"z\")) (string-length (string-append s s)))";
     assert_eq!(eval(long), "(12287 #t 24574)");
-    assert_eq!(uncaught("(string-append \"a\" 'b)"), "#<error WrongType>");
-    assert_eq!(uncaught("(string-length 'a)"), "#<error WrongType>");
+    assert_eq!(uncaught("(string-append \"a\" 'b)"), "#<error string-append: wrong type of argument \"a\" b>");
+    assert_eq!(uncaught("(string-length 'a)"), "#<error string-length: wrong type of argument a>");
 }
 
 #[test]
@@ -490,13 +490,13 @@ fn strings_slice_index_and_compare() {
     let compared = "(list (string=? \"a\" \"a\" \"a\") (string=? \"a\" \"b\") (string<? \"a\" \"b\" \"c\") (string<? \"ab\" \"abc\") (string<? \"b\" \"a\")
                           (string>? \"c\" \"b\" \"a\") (string<=? \"a\" \"a\" \"b\") (string>=? \"b\" \"c\") (string<? \"Z\" \"a\" \"é\" \"🦀\") (string=? \"x\"))";
     assert_eq!(eval(compared), "(#t #f #t #t #f #t #t #f #t #t)");
-    assert_eq!(uncaught("(substring \"abc\" 2 1)"), "#<error Str(OutOfRange)>");
-    assert_eq!(uncaught("(substring \"abc\" 0 4)"), "#<error Str(OutOfRange)>");
-    assert_eq!(uncaught("(string-ref \"abc\" 3)"), "#<error Str(OutOfRange)>");
-    assert_eq!(uncaught("(string-ref \"abc\" -1)"), "#<error OutOfRange>");
-    assert_eq!(uncaught("(string->list \"abc\" 2 1)"), "#<error Str(OutOfRange)>");
+    assert_eq!(uncaught("(substring \"abc\" 2 1)"), "#<error substring: value out of range \"abc\" 2 1>");
+    assert_eq!(uncaught("(substring \"abc\" 0 4)"), "#<error substring: value out of range \"abc\" 0 4>");
+    assert_eq!(uncaught("(string-ref \"abc\" 3)"), "#<error string-ref: value out of range \"abc\" 3>");
+    assert_eq!(uncaught("(string-ref \"abc\" -1)"), "#<error string-ref: value out of range \"abc\" -1>");
+    assert_eq!(uncaught("(string->list \"abc\" 2 1)"), "#<error string->list: value out of range \"abc\" 2 1>");
     // Every argument's checked, though the answer's known before it.
-    assert_eq!(uncaught("(string<? \"b\" \"a\" 'c)"), "#<error WrongType>");
+    assert_eq!(uncaught("(string<? \"b\" \"a\" 'c)"), "#<error string<?: wrong type of argument \"b\" \"a\" c>");
 }
 
 #[test]
@@ -507,11 +507,11 @@ fn characters_are_code_points() {
     assert_eq!(eval(text), "(#t #f 97 129408 #\\λ #\\x10ffff #t #f #t #f #t #t #f #t #t)");
     // What the printer writes for unseen characters reads back.
     assert_eq!(eval("(list (char->integer #\\x10ffff) (char->integer #\\x200b) (string->list \"a\\x200b;\\xfeff;\"))"), "(1114111 8203 (#\\a #\\x200b #\\xfeff))");
-    assert_eq!(uncaught("(integer->char 55296)"), "#<error OutOfRange>");
-    assert_eq!(uncaught("(integer->char 1114112)"), "#<error OutOfRange>");
-    assert_eq!(uncaught("(integer->char -1)"), "#<error OutOfRange>");
-    assert_eq!(uncaught("(char->integer \"a\")"), "#<error WrongType>");
-    assert_eq!(uncaught("(char<? #\\b #\\a 'c)"), "#<error WrongType>");
+    assert_eq!(uncaught("(integer->char 55296)"), "#<error integer->char: value out of range 55296>");
+    assert_eq!(uncaught("(integer->char 1114112)"), "#<error integer->char: value out of range 1114112>");
+    assert_eq!(uncaught("(integer->char -1)"), "#<error integer->char: value out of range -1>");
+    assert_eq!(uncaught("(char->integer \"a\")"), "#<error char->integer: wrong type of argument \"a\">");
+    assert_eq!(uncaught("(char<? #\\b #\\a 'c)"), "#<error char<?: wrong type of argument #\\b #\\a c>");
 }
 
 #[test]
@@ -522,9 +522,9 @@ fn strings_join_with_a_separator() {
     let long = "(define (words n acc) (if (eqv? n 0) acc (words (- n 1) (cons (number->string n) acc))))
                 (string-length (string-join (words 1000 '()) \", \"))";
     assert_eq!(eval(long), "4891");
-    assert_eq!(uncaught("(string-join '(\"a\" b))"), "#<error WrongType>");
-    assert_eq!(uncaught("(string-join '(\"a\" . \"b\"))"), "#<error WrongType>");
-    assert_eq!(uncaught("(string-join '(\"a\") 'x)"), "#<error WrongType>");
+    assert_eq!(uncaught("(string-join '(\"a\" b))"), "#<error string-join: wrong type of argument (\"a\" b)>");
+    assert_eq!(uncaught("(string-join '(\"a\" . \"b\"))"), "#<error string-join: wrong type of argument (\"a\" . \"b\")>");
+    assert_eq!(uncaught("(string-join '(\"a\") 'x)"), "#<error string-join: wrong type of argument (\"a\") x>");
 }
 
 #[test]
@@ -544,8 +544,8 @@ fn numbers_write_as_they_read() {
         eval(ends),
         "(\"0\" \"0\" \"-1\" \"1234567\" \"12345678\" \"4611686018427387903\" \"-4000000000000000\" \"-100000000000000000000000000000000000000000000000000000000000000\" \"4611686018427387904\")"
     );
-    assert_eq!(uncaught("(number->string 10 3)"), "#<error OutOfRange>");
-    assert_eq!(uncaught("(number->string 'x)"), "#<error WrongType>");
+    assert_eq!(uncaught("(number->string 10 3)"), "#<error number->string: value out of range 10 3>");
+    assert_eq!(uncaught("(number->string 'x)"), "#<error number->string: wrong type of argument x>");
 }
 
 #[test]
@@ -553,7 +553,7 @@ fn symbols_and_strings_name_each_other() {
     let text = "(list (symbol? 'a) (symbol? \"a\") (symbol? '#:a) (string? \"a\") (string? 'a) (symbol->string 'abc) (eq? 'abc (string->symbol \"abc\"))
                       (string->symbol \"two words\") (eq? (string->symbol (symbol->string 'x)) 'x))";
     assert_eq!(eval(text), "(#t #f #f #t #f \"abc\" #t |two words| #t)");
-    assert_eq!(uncaught("(symbol->string \"a\")"), "#<error WrongType>");
+    assert_eq!(uncaught("(symbol->string \"a\")"), "#<error symbol->string: wrong type of argument \"a\">");
 }
 
 #[test]
@@ -1688,14 +1688,14 @@ fn vm_faults_and_errors_are_error_objects() {
             "(guard (e ((error-object? e) (list (error-object-kind e) (error-object-message e) (error-object-irritants e)))) {body})"
         ))
     };
-    assert_eq!(caught("(car 1)"), r#"(wrong-type "wrong type" ())"#);
-    assert_eq!(caught("(vector-ref (vector 1) 5)"), r#"(out-of-range "out of range" ())"#);
-    assert_eq!(caught("(/ 1 0)"), r#"(divide-by-zero "divide by zero" ())"#);
+    assert_eq!(caught("(car 1)"), r#"(wrong-type "wrong type of argument" (1))"#);
+    assert_eq!(caught("(vector-ref (vector 1) 5)"), r#"(out-of-range "value out of range" (#(1) 5))"#);
+    assert_eq!(caught("(/ 1 0)"), r#"(divide-by-zero "division by zero" (1 0))"#);
     assert_eq!(caught("(error \"bad thing\" 1 'two)"), r#"(error "bad thing" (1 two))"#);
-    assert_eq!(caught("((lambda (x) x))"), r#"(arity "arity" ())"#);
+    assert_eq!(caught("((lambda (x) x))"), r#"(arity "wrong number of arguments" (#<procedure> 0))"#);
     assert_eq!(eval("(list (error-object? 1) (guard (e (#t (error-object? e))) (car '())))"), "(#f #t)");
     assert_eq!(eval_in(&mut arena(), "(error \"no one\")"), Ok(Err(Fault::Error)));
-    assert_eq!(caught("(utf8->string #u8(255))"), r#"(not-utf8 "not utf8" ())"#);
+    assert_eq!(caught("(utf8->string #u8(255))"), r#"(not-utf8 "invalid UTF-8" (#u8(255)))"#);
 }
 
 #[test]
@@ -1897,3 +1897,195 @@ mod macros;
 
 #[path = "modules.rs"]
 mod modules;
+
+#[test]
+fn faults_name_the_operation_and_what_it_was_given() {
+    let displayed = |text: &str| {
+        arena().mutate(|mc| {
+            let [thunk] = load_text(mc, text).unwrap()[..] else { panic!("one form") };
+            let raised = run_raising(mc, thunk).expect_err("raised");
+            ragwort_printer_scheme::to_string(mc, raised, ragwort_printer_scheme::Mode::Display, usize::MAX).unwrap()
+        })
+    };
+    assert_eq!(displayed("(car 5)"), "car: wrong type of argument: 5");
+    assert_eq!(displayed("(string-length \"abc\" 1)"), "wrong number of arguments: #<procedure string-length> 2");
+    assert_eq!(displayed("(vector-ref (vector 1 2) 9)"), "vector-ref: value out of range: #(1 2) 9");
+    assert_eq!(displayed("(+ \"two\" 1)"), "+: wrong type of argument: \"two\" 1");
+    assert_eq!(displayed("(if (< 1 'x) 1 2)"), "<: wrong type of argument: 1 x");
+    assert_eq!(displayed("(5 1 2)"), "not a procedure: 5");
+    assert_eq!(displayed("((lambda (x) x) 1 2)"), "wrong number of arguments: #<procedure> 2");
+    assert_eq!(displayed("(error \"bad thing\" \"a\" 'b)"), "bad thing: \"a\" b");
+    assert_eq!(displayed("(error \"alone\")"), "alone");
+    assert_eq!(uncaught("(error \"bad thing\" \"a\" 'b)"), "#<error \"bad thing\" \"a\" b>");
+    // An operation in tail position, and one whose result a loop branches on, report the same way.
+    assert_eq!(displayed("((lambda (x) (cdr x)) 7)"), "cdr: wrong type of argument: 7");
+    assert_eq!(displayed("(let loop ([i 0]) (if (< i 'end) (loop (+ i 1)) i))"), "<: wrong type of argument: 0 end");
+}
+
+#[test]
+fn procedures_are_named_for_what_they_are_bound_to() {
+    assert_eq!(eval("(let () (define (greet x) x) greet)"), "#<procedure greet>");
+    assert_eq!(eval("(let ([f (lambda (x) x)]) f)"), "#<procedure f>");
+    assert_eq!(eval("(letrec ([even? (lambda (n) (if (= n 0) #t (odd? (- n 1))))] [odd? (lambda (n) (if (= n 0) #f (even? (- n 1))))]) even?)"), "#<procedure even?>");
+    assert_eq!(eval("(let loop ([i 0]) (if (< i 1) loop 0))"), "#<procedure loop>");
+    assert_eq!(eval("(let () (define (opt a #:key [k 1]) a) opt)"), "#<procedure opt>");
+    assert_eq!(eval("(lambda (x) x)"), "#<procedure>");
+    assert_eq!(eval("(list car string-length)"), "(#<procedure car> #<procedure string-length>)");
+    let top = "(define (greet a) a) (define (opt a #:key [k 1]) a) (struct point (x y)) (list greet opt point-x point (greet 1))";
+    assert_eq!(eval_in(&mut arena(), top), Ok(Ok("(#<procedure greet> #<procedure opt> #<procedure point-x> #<procedure point> 1)".into())));
+    // An arity error names the procedure that was called.
+    assert_eq!(uncaught("(let () (define (greet a) a) (greet 1 2))"), "#<error wrong number of arguments #<procedure greet> 2>");
+    assert_eq!(uncaught("((lambda (x) x))"), "#<error wrong number of arguments #<procedure> 0>");
+}
+
+#[test]
+fn errors_record_the_calls_in_progress() {
+    let names = "(guard (e (#t (map car (error-object-traceback e))))";
+    let traced = |text: String| eval_in(&mut arena(), &text);
+    let fault = "(define (inner x) (vector-ref x 9)) (define (middle x) (+ 1 (inner x))) (define (outer x) (+ 1 (middle x)))";
+    assert_eq!(traced(format!("{fault} {names} (outer (vector 1)))")), Ok(Ok("(inner middle outer #f)".into())));
+    let raised = "(define (inner x) (+ 1 (error \"bad\" x))) (define (outer x) (+ 1 (inner x)))";
+    assert_eq!(traced(format!("{raised} {names} (outer 5))")), Ok(Ok("(inner outer #f)".into())));
+    // Each entry is `(name file line)`: the line is that of the call or operation in progress in the procedure, and the file is `#f` for source without a name. A call in tail position leaves no entry.
+    assert_eq!(traced("(error-object-traceback (guard (e (#t e)) (car 1)))".into()), Ok(Ok("((#f #f 1) (#f #f 1))".into())));
+    let lines = "(define (inner x)\n  (car x))\n\n(define (outer x)\n  (+ 1 (inner x)))\n(guard (e (#t (error-object-traceback e)))\n  (outer 5))";
+    assert_eq!(traced(lines.into()), Ok(Ok("((inner #f 2) (outer #f 5) (#f #f 6))".into())));
+    assert_eq!(traced(format!("(define (inner x) (car x)) (define (outer x) (inner x)) {names} (outer 5))")), Ok(Ok("(inner #f)".into())));
+    // A guard that matches no clause raises the condition again, which keeps the trace of where it was first raised.
+    let again = "(define (inner x) (car x)) (define (outer x) (+ 1 (inner x)))";
+    assert_eq!(traced(format!("{again} {names} (guard (e2 ((string? e2) 'no)) (outer 5)))")), Ok(Ok("(inner outer #f #f)".into())));
+    // The trace continues through `dynamic-wind` and into the procedure that resumed a coroutine.
+    let wound = "(define (work x) (+ 1 (car x))) (define (via) (+ 1 (dynamic-wind (lambda () 1) (lambda () (+ 1 (work 5))) (lambda () 2))))";
+    assert_eq!(traced(format!("{wound} {names} (via))")), Ok(Ok("(work #f dynamic-wind via #f)".into())));
+    let resumed = "(define (work x) (+ 1 (car x))) (define (step) (+ 1 (work 5))) (define (drive co) (+ 1 (co/resume co)))";
+    assert_eq!(traced(format!("{resumed} {names} (drive (make-coroutine step)))")), Ok(Ok("(work step drive #f)".into())));
+    assert_eq!(uncaught("(error-object-traceback 5)"), "#<error error-object-traceback: wrong type of argument 5>");
+}
+
+#[test]
+fn a_host_reads_the_trace_of_a_raised_condition() {
+    let trace_of = |text: &str| {
+        arena().mutate(|mc| {
+            let mut raised = None;
+            for &thunk in &load_text(mc, text).unwrap() {
+                raised = run_raising(mc, thunk).err();
+            }
+            ragwort_vm::report::trace(mc, raised.expect("raised"))
+        })
+    };
+    let trace = trace_of("(define (f x) (+ 1 (car x))) (+ 1 (f 1))");
+    let seen: Vec<(Option<&str>, bool)> = trace.contexts.iter().map(|context| (context.procedure.as_deref(), context.top_level)).collect();
+    assert_eq!(seen, [(Some("f"), false), (None, true)]);
+    assert!(!trace.truncated);
+    // A call stack deeper than the trace records keeps its innermost calls.
+    let deep = trace_of("(define (deep n) (if (= n 0) (car n) (+ 1 (deep (- n 1))))) (deep 200)");
+    assert!(deep.truncated);
+    assert_eq!(deep.contexts.len(), 64);
+    assert!(deep.contexts.iter().all(|context| context.procedure.as_deref() == Some("deep")));
+    // A value that is not a condition has no trace.
+    assert_eq!(trace_of("(raise 'plain)"), ragwort_vm::report::Trace::default());
+}
+
+#[test]
+fn a_guard_can_opt_out_of_call_traces() {
+    let inner = "(define (inner x) (+ 1 (car x)))";
+    let quiet = format!("{inner} (guard (e #:no-traceback (#t (list (error-object-message e) (error-object-traceback e)))) (+ 1 (inner 5)))");
+    assert_eq!(eval_in(&mut arena(), &quiet), Ok(Ok("(\"wrong type of argument\" ())".into())));
+    let traced = format!("{inner} (guard (e (#t (map car (error-object-traceback e)))) (+ 1 (inner 5)))");
+    assert_eq!(eval_in(&mut arena(), &traced), Ok(Ok("(inner #f #f)".into())));
+    // A quiet guard that matches no clause raises the condition again from its own context, so the trace an outer guard sees starts there.
+    let mid = "(define (mid) (+ 1 (guard (e2 #:no-traceback ((string? e2) 'no)) (+ 1 (inner 5)))))";
+    let outer = format!("{inner} {mid} (guard (e (#t (map car (error-object-traceback e)))) (+ 1 (mid)))");
+    assert_eq!(eval_in(&mut arena(), &outer), Ok(Ok("(mid #f #f)".into())));
+    assert_eq!(eval_in(&mut arena(), "(guard (e #:no-traceback) (car 1))"), Ok(Err(Fault::WrongType)));
+    assert_eq!(eval("(guard (e #:no-traceback ((symbol? e) (list 'caught e))) (raise 'boom))"), "(caught boom)");
+    assert_eq!(eval("(let loop ([i 0] [acc 0]) (if (< i 1000) (loop (+ i 1) (+ acc (guard (e #:no-traceback (#t 1)) (car i)))) acc))"), "1000");
+}
+
+/// Runs the forms of `text` until one raises, and passes the report of what it raised to `check`.
+fn reported(text: &str, check: impl for<'gc> FnOnce(&Mutation<'gc>, ragwort_vm::report::Report<'gc>)) {
+    arena().mutate(|mc| {
+        let mut raised = None;
+        for &thunk in &load_text(mc, text).unwrap() {
+            if let Err(value) = run_raising(mc, thunk) {
+                raised = Some(value);
+                break;
+            }
+        }
+        check(mc, ragwort_vm::report::Report::of(mc, raised.expect("raised")));
+    });
+}
+
+#[test]
+fn a_host_matches_on_what_was_raised() {
+    use ragwort_types::num::NumError;
+    use ragwort_vm::report::{Raised, procedure_name};
+
+    reported("(car 5)", |mc, report| {
+        let Raised::WrongType { operation: Some(operation), operands } = report.error else { panic!("{:?}", report.error) };
+        assert_eq!((operation.name(), show(mc, operands)), ("car", "(5)".to_string()));
+    });
+    reported("(vector-ref (vector 1) 9)", |mc, report| {
+        let Raised::OutOfRange { operation: Some(operation), operands } = report.error else { panic!("{:?}", report.error) };
+        assert_eq!((operation.name(), show(mc, operands)), ("vector-ref", "(#(1) 9)".to_string()));
+    });
+    reported("(/ 1 0)", |_, report| assert!(matches!(report.error, Raised::Number { error: NumError::DivideByZero, operation: Some(_), .. })));
+    reported("(define (f a) a) (+ 1 (f 1 2))", |mc, report| {
+        let Raised::Arity { operation: None, procedure: Some(procedure), given: 2 } = report.error else { panic!("{:?}", report.error) };
+        assert_eq!(procedure_name(mc, procedure).map(|name| show(mc, name.value(mc))), Some("f".to_string()));
+    });
+    reported("(car)", |_, report| assert!(matches!(report.error, Raised::Arity { procedure: Some(_), given: 0, .. })));
+    reported("(5 1)", |mc, report| {
+        let Raised::NotProcedure { value: Some(value) } = report.error else { panic!("{:?}", report.error) };
+        assert_eq!(show(mc, value), "5");
+    });
+    reported("(define (g) later) (g) (define later 1)", |mc, report| {
+        let Raised::Unbound { name: Some(name) } = report.error else { panic!("{:?}", report.error) };
+        assert_eq!(show(mc, name.value(mc)), "later");
+    });
+    reported("(error \"bad\" 1 2)", |mc, report| {
+        let Raised::Error { message, irritants } = report.error else { panic!("{:?}", report.error) };
+        assert_eq!((show(mc, message), show(mc, irritants)), ("\"bad\"".to_string(), "(1 2)".to_string()));
+    });
+    reported("(raise 'plain)", |mc, report| {
+        let Raised::Value(value) = report.error else { panic!("{:?}", report.error) };
+        assert_eq!(show(mc, value), "plain");
+        assert!(report.trace.contexts.is_empty());
+        assert_eq!(ragwort_printer_scheme::render(mc, &report, usize::MAX), "uncaught: plain");
+    });
+    reported("(define (f x) (+ 1 (car x))) (define (g x) (+ 1 (f x))) (+ 1 (g 5))", |mc, report| {
+        assert_eq!(ragwort_printer_scheme::render(mc, &report, usize::MAX), "error: car: wrong type of argument: 5\n  in f\n  in g");
+    });
+}
+
+#[test]
+fn scripts_read_which_operation_failed() {
+    assert_eq!(eval("(guard (e (#t (error-object-who e))) (car 5))"), "car");
+    assert_eq!(eval("(guard (e (#t (error-object-who e))) (vector-ref (vector) 1))"), "vector-ref");
+    assert_eq!(eval("(guard (e (#t (error-object-who e))) (error \"mine\"))"), "#f");
+    assert_eq!(eval("(guard (e (#t (error-object-who e))) ((lambda (x) x)))"), "#f");
+    assert_eq!(uncaught("(error-object-who 'x)"), "#<error error-object-who: wrong type of argument x>");
+}
+
+#[test]
+fn inlined_procedures_keep_their_place_in_a_trace() {
+    let names = "(guard (e (#t (error-object-traceback e)))";
+    let traced = |text: String| eval_in(&mut arena(), &text);
+    // A local procedure called once is inlined into its caller, and still gets an entry with the line of the failed operation.
+    let once = "(define (outer x)\n  (define (helper y)\n    (car y))\n  (+ 1 (helper x)))";
+    assert_eq!(traced(format!("{once}\n{names}\n  (+ 1 (outer 5)))")), Ok(Ok("((helper #f 3) (outer #f 4) (#f #f 6) (#f #f 5))".into())));
+    // So does a small procedure copied into each of its calls, and a procedure inlined inside another inlined one.
+    let small = "(define (outer x)\n  (define (first y) (car y))\n  (+ (first x)\n     (first x)))";
+    assert_eq!(traced(format!("{small}\n{names}\n  (+ 1 (outer 5)))")), Ok(Ok("((first #f 2) (outer #f 3) (#f #f 6) (#f #f 5))".into())));
+    let nested = "(define (outer x)\n  (define (a y)\n    (define (b z)\n      (car z))\n    (+ 1 (b y)))\n  (+ 1 (a x)))";
+    assert_eq!(traced(format!("{nested}\n{names}\n  (+ 1 (outer 5)))")), Ok(Ok("((b #f 4) (a #f 5) (outer #f 6) (#f #f 8) (#f #f 7))".into())));
+    // A loop runs in its procedure's frame and reports that procedure, at the line that failed.
+    let looped = "(define (outer x)\n  (let loop ([i 0])\n    (if (< i 2)\n        (loop (+ i 1))\n        (car x))))";
+    assert_eq!(traced(format!("{looped}\n{names}\n  (+ 1 (outer 5)))")), Ok(Ok("((outer #f 5) (#f #f 7) (#f #f 6))".into())));
+    // A host sees which entries were inlined, and the rendered report marks them.
+    reported(&format!("{once}\n(+ 1 (outer 5))"), |mc, report| {
+        let seen: Vec<_> = report.trace.contexts.iter().map(|context| (context.procedure.as_deref(), context.inlined, context.top_level, context.line)).collect();
+        assert_eq!(seen, [(Some("helper"), true, false, 3), (Some("outer"), false, false, 4), (None, false, true, 5)]);
+        assert_eq!(ragwort_printer_scheme::render(mc, &report, usize::MAX), "error: car: wrong type of argument: 5\n  in helper [inlined]\n  in outer");
+    });
+}

@@ -226,6 +226,35 @@ impl Fault {
         "not-utf8",
     ];
 
+    /// A short description of each fault kind, indexed as [`Fault::KINDS`] is. An error report shows it after the name of the failed operation, as in `car: wrong type of argument: 5`.
+    pub const MESSAGES: [&str; 20] = [
+        "malformed bytecode",
+        "out of memory",
+        "wrong type of argument",
+        "value out of range",
+        "immutable object",
+        "wrong number of arguments",
+        "not a procedure",
+        "no matching prompt",
+        "undefined variable",
+        "the program has finished",
+        "out of fuel",
+        "error",
+        "coroutine is not suspended",
+        "division by zero",
+        "no exact value",
+        "not an integer",
+        "string too long",
+        "bad syntax",
+        "bad keyword argument",
+        "invalid UTF-8",
+    ];
+
+    /// Returns the short description of this fault from [`Fault::MESSAGES`].
+    pub fn message(self) -> &'static str {
+        Self::MESSAGES[self.kind()]
+    }
+
     /// Returns the integer index corresponding to this fault in [`Fault::KINDS`].
     pub fn kind(self) -> usize {
         match self {

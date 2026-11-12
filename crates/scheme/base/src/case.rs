@@ -77,7 +77,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 };
                 // The rest are tried if the fender fails or the pattern doesn't match.
                 let k = this.fresh();
-                let thunk = Core::Lambda(Lambda { id: this.lambda_id(), params: Vec::new(), optional: 0, rest: None, body: Box::new(next) });
+                let thunk = Core::Lambda(Lambda { id: this.lambda_id(), params: Vec::new(), optional: 0, rest: None, body: Box::new(next), name: None, at: None });
                 Self::expr(fender, move |_, fender| {
                     let again = || Core::App(Box::new(local(k)), Vec::new());
                     let body = Core::If(Box::new(fender), Box::new(output), Box::new(again()));

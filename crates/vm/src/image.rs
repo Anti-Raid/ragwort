@@ -12,7 +12,8 @@ use ragwort_types::wire::{Malformed, Reader, Wire, Writer, mix, shape_of};
 
 use crate::objects::Vm;
 use crate::syntax_case::{Item, Pattern, PatternShape, Repeat, Template, TemplateShape};
-use crate::{Capture, Fault, HostDef, Intrinsic, Op, Request};
+use crate::report::{Failure, Table};
+use crate::{Capture, HostDef, Intrinsic, Op, Request};
 
 /// A combined hash of the serialized layout (wire shape) of all VM structures, used as a schema stamp to validate image compatibility upon loading.
 pub const SHAPE: u64 = {
@@ -21,7 +22,8 @@ pub const SHAPE: u64 = {
         Intrinsic::SHAPE,
         Request::SHAPE,
         Capture::SHAPE,
-        Fault::SHAPE,
+        Failure::SHAPE,
+        Table::SHAPE,
         <&'static HostDef>::SHAPE,
         PatternShape::SHAPE,
         Pattern::SHAPE,
@@ -98,7 +100,8 @@ pub fn kinds() -> Vec<Kind> {
         Kind::of::<Box<[Op]>>(),
         Kind::of::<Box<[Capture]>>(),
         Kind::of::<Box<[&'static HostDef]>>(),
-        Kind::of::<Fault>(),
+        Kind::of::<Failure>(),
+        Kind::of::<Table>(),
         Kind::of::<Box<PatternShape>>(),
         Kind::of::<Box<TemplateShape>>(),
     ]

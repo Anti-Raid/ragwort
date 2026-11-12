@@ -65,7 +65,7 @@ fn run<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Result<Value<'gc>, Fault> 
             Outcome::Paused => {}
             Outcome::Yielded(_) | Outcome::Deferred(_) => panic!("yielded"),
             Outcome::Done(value) => return Ok(value),
-            Outcome::Raised(raised) => return Err(*raised.downcast::<Condition>(mc).unwrap().fault(mc).unwrap()),
+            Outcome::Raised(raised) => return Err(raised.downcast::<Condition>(mc).unwrap().failure(mc).unwrap().fault),
         }
     }
 }

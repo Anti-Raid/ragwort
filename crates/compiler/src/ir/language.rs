@@ -80,6 +80,10 @@ macro_rules! language {
         $(#[$table_meta])*
         pub(crate) struct $table<'id, 'gc> {
             nodes: Vec<$node<'id, 'gc>>,
+            /// The source site of each node, parallel to `nodes`: an index into the compilation's [`Sites`](crate::ir::Sites), or 0 for a node with no known position.
+            sites: Vec<u32>,
+            /// The site given to each node as it is added.
+            current: u32,
             $functions: Vec<$function>,
             $($list: Vec<$item>,)*
         }
@@ -161,7 +165,7 @@ macro_rules! language {
 
         /// Calls `f` with a new empty table and a fresh lifetime brand.
         pub(crate) fn scope<'gc, R>(f: impl for<'id> FnOnce($table<'id, 'gc>) -> R) -> R {
-            f($table { nodes: Vec::new(), $functions: Vec::new(), $($list: Vec::new(),)* })
+            f($table { nodes: Vec::new(), sites: Vec::new(), current: 0, $functions: Vec::new(), $($list: Vec::new(),)* })
         }
 
         fn count(n: usize) -> u32 {
@@ -172,7 +176,32 @@ macro_rules! language {
             pub(crate) fn add(&mut self, node: $node<'id, 'gc>) -> Id<'id> {
                 let id = Id(count(self.nodes.len()), std::marker::PhantomData);
                 self.nodes.push(node);
+                self.sites.push(self.current);
                 id
+            }
+
+            /// Sets the source site that nodes added from now on receive. A pass calls this with the site of the node it is translating, so that the nodes it builds for that node report the same source position.
+            #[allow(dead_code)]
+            pub(crate) fn at(&mut self, site: u32) {
+                self.current = site;
+            }
+
+            /// Returns the source site that nodes added now receive.
+            #[allow(dead_code)]
+            pub(crate) fn current(&self) -> u32 {
+                self.current
+            }
+
+            /// Returns the source site of the node `id`, or 0 if it has none.
+            #[allow(dead_code)]
+            pub(crate) fn site(&self, id: Id<'id>) -> u32 {
+                self.sites[id.0 as usize]
+            }
+
+            /// Replaces the source site of the node `id`.
+            #[allow(dead_code)]
+            pub(crate) fn set_site(&mut self, id: Id<'id>, site: u32) {
+                self.sites[id.0 as usize] = site;
             }
 
             /// Replaces the node at `id` during an in-place rewrite.
