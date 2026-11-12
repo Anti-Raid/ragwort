@@ -9,9 +9,9 @@
 //! - an accessor for each field the form declares;
 //! - a mutator for each of those fields that is mutable.
 //!
-//! # Top-level forms
+//! # When the type is made
 //!
-//! A top-level form's type is created when the form is declared, before any of the module's code
+//! A form only goes at a module's top level. Its type is created when the form is declared, before any of the module's code
 //! is compiled, so the code holds the type as a constant. A call to one of the form's procedures
 //! is compiled to the operation itself, with no procedure call. That holds in every language of
 //! the module and in the modules that require it.
@@ -87,13 +87,6 @@ fn bits<'gc>(flags: TypeFlags) -> Value<'gc> {
 pub fn make_type<'gc>(mc: &Mutation<'gc>, name: Value<'gc>, parent: Value<'gc>, fields: &[Declaration<'gc>], flags: TypeFlags) -> Result<Value<'gc>, Fault> {
     let (names, field_flags) = listed(mc, fields)?;
     structs::make_type(mc, name, parent, names, field_flags, bits(flags)).map(|kind| Value::object(mc, kind))
-}
-
-/// Code that makes such a type each time it runs, as a form in a body does.
-pub fn type_maker<'gc>(mc: &Mutation<'gc>, name: Value<'gc>, parent: Core<'gc>, fields: &[Declaration<'gc>], flags: TypeFlags) -> Result<Core<'gc>, OutOfMemory> {
-    let (names, field_flags) = listed(mc, fields)?;
-    let args = vec![Core::Quote(name), parent, Core::Quote(names), Core::Quote(field_flags), Core::Quote(bits(flags))];
-    Ok(Core::Intrinsic(Prim::Intrinsic(Intrinsic::MakeStructType), args))
 }
 
 fn index<'gc>(k: u32) -> Core<'gc> {
@@ -196,7 +189,7 @@ impl Declared {
                 builder.struct_procedure(slot, inline, kind);
             }
         }
-        builder.define_struct(constructor, StructDef { kind: holder, fields: fields.into(), sealed }, kind, members.iter().map(|&(slot, _)| slot).collect());
+        builder.define_struct(constructor, StructDef { kind: holder, fields: fields.into(), sealed, match_only: false }, kind, members.clone());
         Self { constructor, members, fields: count }
     }
 

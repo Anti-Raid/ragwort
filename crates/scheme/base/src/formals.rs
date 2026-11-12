@@ -6,7 +6,7 @@
 //! made, here or in a module this one requires, itself, as Racket does.
 
 use ragwort_compiler::keyword::{self, CallShape, Fresh};
-use ragwort_compiler::module::{Import, Uninitialized};
+use ragwort_compiler::module::Import;
 use ragwort_compiler::steps::Step;
 use ragwort_compiler::{Core, Lambda, Place, Var};
 use ragwort_types::symbol::Keyword;
@@ -267,7 +267,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                     CoreAt::Slot(slot) => self.builder.place(slot, self.form, self.defining),
                     CoreAt::Import(import) => {
                         let mc = self.mc;
-                        let call = import.call(mc, args, &mut || self.fresh()).map_err(|Uninitialized| self.error(ExpandErrorKind::Unbound, head))?;
+                        let call = import.call(mc, args, &mut || self.fresh()).map_err(|e| self.import_error(e, head))?;
                         return Ok(if binds.is_empty() { call } else { Core::Let(binds, Box::new(call)) });
                     }
                 };

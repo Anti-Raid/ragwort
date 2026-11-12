@@ -18,7 +18,7 @@ use ragwort_vm::objects::{Module, ModuleFields};
 use ragwort_vm::{HostDef, Intrinsic};
 
 use crate::keyword::CallShape;
-use crate::structs::Call;
+use crate::structs::{Call, Member};
 use crate::{CompileError, Core, Lambda, Place, Prim, Var, compile};
 
 /// How many forms an inlined export's body can have.
@@ -73,6 +73,9 @@ pub struct StructDef {
     pub fields: Box<[Field]>,
     /// Whether it's sealed, so it can't be a supertype.
     pub sealed: bool,
+    /// Whether its name is only for `match` here, as it is where a module requires a struct
+    /// that's provided without its constructor: the name isn't a value, and the type is sealed.
+    pub match_only: bool,
 }
 
 /// The interface of `module`, once it's built.
@@ -113,25 +116,33 @@ pub struct Import<'gc> {
     pub export: &'gc Export,
 }
 
-/// A reference to an immutable export of a module that hasn't defined it, which the module's
-/// resolver shouldn't have given.
+/// Why an import has no value for code to use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Uninitialized;
+pub enum Unusable {
+    /// It's an immutable export of a module that hasn't defined it, which the module's resolver
+    /// shouldn't have given.
+    Uninitialized,
+    /// It's the name of a struct provided without its constructor, which is only for `match`.
+    MatchOnly,
+}
 
 impl<'gc> Import<'gc> {
     fn same(self, other: Self) -> bool {
-        self.module == other.module && self.export.slot == other.export.slot
+        self.module == other.module && self.export.slot == other.export.slot && self.export.structure == other.export.structure
     }
 
     /// A reference to it: its value, or for a mutable export, a read of it.
-    pub fn reference(self, mc: &Mutation<'gc>) -> Result<Core<'gc>, Uninitialized> {
+    pub fn reference(self, mc: &Mutation<'gc>) -> Result<Core<'gc>, Unusable> {
+        if self.export.structure.as_deref().is_some_and(|def| def.match_only) {
+            return Err(Unusable::MatchOnly);
+        }
         let slot = self.export.slot;
         if self.export.mutable {
             let k = Value::fixnum(i64::from(slot)).expect("slots are fixnums");
             let read = vec![Core::Quote(Value::object(mc, self.module)), Core::Quote(k)];
             return Ok(Core::Intrinsic(Prim::Intrinsic(Intrinsic::ModuleRef), read));
         }
-        self.variable(mc, slot).map(Core::Quote).ok_or(Uninitialized)
+        self.variable(mc, slot).map(Core::Quote).ok_or(Unusable::Uninitialized)
     }
 
     /// For a keyword procedure, its core, as [`Export::core`] is.
@@ -153,7 +164,7 @@ impl<'gc> Import<'gc> {
     }
 
     /// A call of it on `args`, inlined if it can be, with new locals from `fresh`.
-    pub fn call(self, mc: &Mutation<'gc>, args: Vec<Core<'gc>>, fresh: &mut dyn FnMut() -> Var) -> Result<Core<'gc>, Uninitialized> {
+    pub fn call(self, mc: &Mutation<'gc>, args: Vec<Core<'gc>>, fresh: &mut dyn FnMut() -> Var) -> Result<Core<'gc>, Unusable> {
         let quoted = |slot: u32| self.variable(mc, slot).map(Core::Quote);
         match &self.export.inline {
             Some(inline) if inline.inlines(args.len()) && inline.slots().all(|slot| quoted(slot).is_some()) => {
@@ -637,6 +648,15 @@ pub enum Binding<'gc> {
     Import(Import<'gc>),
 }
 
+/// What a module provides by a name.
+#[derive(Clone, Copy)]
+enum Provided {
+    /// One of its variables.
+    Variable(u32),
+    /// The struct type that the variable is the constructor named for, for `match` only.
+    Matching(u32),
+}
+
 /// A module as its front ends build it. First they declare its definitions, requires and
 /// provides, then [`ModuleBuilder::start`] makes it, and they lower and [`ModuleBuilder::compile`]
 /// each of its forms, in order, and [`ModuleBuilder::finish`] gives it its [`Interface`].
@@ -650,14 +670,14 @@ pub struct ModuleBuilder<'gc> {
     /// implicitly, which they shadow.
     bindings: HashMap<u64, Binding<'gc>>,
     implicit: HashMap<u64, Import<'gc>>,
-    exports: Vec<(Box<str>, u32)>,
+    exports: Vec<(Box<str>, Provided)>,
     assigned: HashSet<u32>,
     inlines: HashMap<u32, Inline>,
     /// The cores of the keyword procedures it defines, and their shapes, by their variables.
     cores: HashMap<u32, (u32, CallShape<'gc>)>,
     /// The struct types it defines, by the variables that hold them, each with the variables its
     /// form defines, and by the constructors named as they are, what they are.
-    kinds: HashMap<u32, (Value<'gc>, Vec<u32>)>,
+    kinds: HashMap<u32, (Value<'gc>, Vec<(u32, Member)>)>,
     structs: HashMap<u32, StructDef>,
     /// What a call of each procedure a struct form defines does, and its type.
     procedures: HashMap<u32, (Inline, Value<'gc>)>,
@@ -751,26 +771,35 @@ impl<'gc> ModuleBuilder<'gc> {
     /// Exports the variable `name`, a symbol, as `external`.
     pub fn provide(&mut self, external: &str, name: Value<'gc>) -> Result<(), ModuleError> {
         let Some(&Binding::Slot(slot)) = self.bindings.get(&name.to_bits()) else { return Err(ModuleError::NotDefined) };
-        self.provide_slot(external, slot)
+        self.provide_as(external, Provided::Variable(slot))
     }
 
-    fn provide_slot(&mut self, external: &str, slot: u32) -> Result<(), ModuleError> {
+    fn provide_as(&mut self, external: &str, provided: Provided) -> Result<(), ModuleError> {
         if self.exports.iter().any(|(n, _)| **n == *external) {
             return Err(ModuleError::Duplicate);
         }
-        self.exports.push((external.into(), slot));
+        self.exports.push((external.into(), provided));
         Ok(())
     }
 
     /// Exports each variable the form of the struct type that variable `constructor` is named
     /// for defines, by its name.
-    pub fn provide_struct(&mut self, mc: &Mutation<'gc>, constructor: u32) -> Result<(), ModuleError> {
+    ///
+    /// Without `constructors`, none of the form's constructors is exported, and the struct's
+    /// name is exported for `match` only: see [`StructDef::match_only`]. So a module that
+    /// requires it can take such structs apart, and only what else the module provides makes
+    /// them.
+    pub fn provide_struct(&mut self, mc: &Mutation<'gc>, constructor: u32, constructors: bool) -> Result<(), ModuleError> {
         let members = self.structs.get(&constructor).and_then(|def| self.kinds.get(&def.kind)).ok_or(ModuleError::NotDefined)?.1.clone();
         let strings = Strings::new(mc);
-        for slot in members {
+        for (slot, member) in members {
             let symbol = Symbol::of(self.names[slot as usize]).expect("variables are named by symbols");
             let external: String = chars(&strings, symbol.name(mc)).collect();
-            self.provide_slot(&external, slot)?;
+            if constructors || member != Member::Make {
+                self.provide_as(&external, Provided::Variable(slot))?;
+            } else if slot == constructor {
+                self.provide_as(&external, Provided::Matching(slot))?;
+            }
         }
         Ok(())
     }
@@ -837,7 +866,7 @@ impl<'gc> ModuleBuilder<'gc> {
     /// Notes that variable `def.kind` holds the struct type `kind`, which `def` describes, that
     /// variable `constructor`, named as the type is, constructs it, and that `members` are the
     /// variables its form defines.
-    pub fn define_struct(&mut self, constructor: u32, def: StructDef, kind: Value<'gc>, members: Vec<u32>) {
+    pub fn define_struct(&mut self, constructor: u32, def: StructDef, kind: Value<'gc>, members: Vec<(u32, Member)>) {
         self.kinds.insert(def.kind, (kind, members));
         self.structs.insert(constructor, def);
     }
@@ -908,14 +937,27 @@ impl<'gc> ModuleBuilder<'gc> {
             let inline = if mutable { None } else { self.procedures.get(&slot).map(|(inline, _)| inline).or(self.inlines.get(&slot)).filter(fixed).cloned() };
             Export { slot, mutable, inline, core: None, structure: self.structs.get(&slot).cloned().map(Box::new) }
         };
-        let exports = self.exports.iter().map(|&(ref name, slot)| {
-            let mut out = export(slot);
-            if !out.mutable {
-                out.core = self.cores.get(&slot).map(|&(core, _)| Box::new(export(core)));
-            }
-            (name.clone(), out)
-        });
-        ragwort_vm::module::set_interface(mc, module, Interface { exports: exports.collect() })?;
+        let mut exports = HashMap::default();
+        for &(ref name, provided) in &self.exports {
+            let out = match provided {
+                Provided::Variable(slot) => {
+                    let mut out = export(slot);
+                    if !out.mutable {
+                        out.core = self.cores.get(&slot).map(|&(core, _)| Box::new(export(core)));
+                    }
+                    out
+                }
+                // The name stands for the type's variable, so nothing gets the constructor by it.
+                Provided::Matching(constructor) => {
+                    let def = self.structs.get(&constructor).expect("a struct's constructor").clone();
+                    let mut out = export(def.kind);
+                    out.structure = Some(Box::new(StructDef { sealed: true, match_only: true, ..def }));
+                    out
+                }
+            };
+            exports.insert(name.clone(), out);
+        }
+        ragwort_vm::module::set_interface(mc, module, Interface { exports })?;
         Ok(module)
     }
 }

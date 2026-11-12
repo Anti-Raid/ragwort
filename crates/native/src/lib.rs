@@ -34,6 +34,8 @@
 //! `(except-in spec name ...)`, `(prefix-in prefix spec)` or `(rename-in spec (old new) ...)`. A
 //! provide spec is a name, `(rename-out (name external) ...)`, `(all-defined-out)`, or
 //! `(struct-out name)`, which exports everything the struct form for `name` defines.
+//! `(struct-out name #:omit-constructor)` leaves out the form's constructors: see Scheme's
+//! `struct` for what the name is then.
 //!
 //! `%struct` defines a struct type the way Scheme's `struct` does, with the same syntax for
 //! fields and options. It only goes at the top level. `(%struct point (x y))` defines

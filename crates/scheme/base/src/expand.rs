@@ -7,9 +7,9 @@
 
 
 use ragwort_compiler::keyword::CallShape;
-use ragwort_compiler::module::{self, Filter, Import, Imports, ModuleBuilder, ModuleError, RequireSpec, Resolver, SpecError, Uninitialized};
+use ragwort_compiler::module::{self, Filter, Import, Imports, ModuleBuilder, ModuleError, RequireSpec, Resolver, SpecError, Unusable};
 use ragwort_compiler::steps::{self, Step};
-use ragwort_compiler::structs::{self, Declared};
+use ragwort_compiler::structs::Declared;
 use ragwort_compiler::{Core, Lambda, Place, Prim, Var};
 use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Value};
 use ragwort_types::string::{Strings, chars};
@@ -20,7 +20,6 @@ use ragwort_vm::objects::Module;
 
 use crate::formals::{CoreAt, KeywordDef};
 use crate::scope::{BASE, INTERNAL, Map, Op, Scope, Set, TOP};
-use crate::structs::{Info, Local};
 use crate::tree::{Stx, Tree, View};
 use crate::{ExpandError, ExpandErrorKind};
 
@@ -170,19 +169,18 @@ pub(crate) enum Binding<'gc> {
 pub(crate) struct Ambiguous;
 
 /// What a body has, in order: a definition of a variable, or of a keyword procedure, the core's
-/// variable too, or a variable a struct form defines, with its value, or an expression.
-enum Item<'gc> {
+/// variable too, or an expression.
+enum Item {
     Define(Var, Stx),
     Keyword(Var, Var, Stx),
-    Made(Var, Core<'gc>),
     Expr(Stx),
 }
 
 /// A body's forms still to look at, last first, and what's been found in those before them.
-struct Scan<'gc> {
+struct Scan {
     stx: Stx,
     queue: Vec<Stx>,
-    items: Vec<Item<'gc>>,
+    items: Vec<Item>,
     defined: Vec<Stx>,
     names: Vec<Stx>,
 }
@@ -245,10 +243,6 @@ pub struct Expander<'a, 'gc> {
     /// The keyword procedures definitions in bodies made, by their variables, which calls go to
     /// the cores of. The module's own are its builder's, whichever language defined them.
     keyword_defs: Map<Var, KeywordDef<'gc>>,
-    /// The struct types forms in bodies made, by the locals of the constructors named for them,
-    /// and what each local such a form defined is. The module's own are its builder's.
-    pub(crate) struct_infos: Map<Var, Info<'gc>>,
-    pub(crate) struct_locals: Map<Var, Local>,
     /// The bindings made in this load, with the scopes each was made in, by the newest of those
     /// scopes and the name's word. An identifier's bindings are under its own scopes.
     bindings: Map<(Scope, u64), Vec<(Set, Binding<'gc>)>>,
@@ -322,8 +316,6 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             form: 0,
             defining: None,
             keyword_defs: Map::default(),
-            struct_infos: Map::default(),
-            struct_locals: Map::default(),
             bindings: [((INTERNAL, struct_ref), vec![(internal, Binding::Keyword(Keyword::Form(Form::StructRef)))])].into_iter().collect(),
             bound_in: [(struct_ref, vec![INTERNAL])].into_iter().collect(),
             top,
@@ -424,9 +416,14 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 let word = if self.is_id(head) { self.text(head) } else { None };
                 match (word.as_deref(), args) {
                     (Some("all-defined-out"), []) => self.builder.provide_all(self.mc).map_err(|e| self.module_error(e, spec))?,
-                    (Some("struct-out"), &[name]) if self.is_id(name) => {
+                    (Some("struct-out"), &[name, ref options @ ..]) if self.is_id(name) => {
+                        let constructors = match options {
+                            [] => true,
+                            &[option] if self.keyword_name(option).as_deref() == Some("omit-constructor") => false,
+                            _ => return Err(self.error(ExpandErrorKind::BadSyntax, spec)),
+                        };
                         let Binding::Slot(constructor) = self.resolve(name)? else { return Err(self.error(ExpandErrorKind::NotDefined, name)) };
-                        self.builder.provide_struct(self.mc, constructor).map_err(|e| self.module_error(e, name))?;
+                        self.builder.provide_struct(self.mc, constructor, constructors).map_err(|e| self.module_error(e, name))?;
                     }
                     (Some("rename-out"), renames) => {
                         for &rename in renames {
@@ -502,6 +499,15 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             },
         };
         Some(chars(&self.strings, s).collect())
+    }
+
+    /// The error of using the import `stx` as a value, which it doesn't have.
+    pub(crate) fn import_error(&self, e: Unusable, stx: Stx) -> ExpandError {
+        let kind = match e {
+            Unusable::Uninitialized => ExpandErrorKind::Unbound,
+            Unusable::MatchOnly => ExpandErrorKind::NoConstructor,
+        };
+        self.error(kind, stx)
     }
 
     fn module_error(&self, e: ModuleError, stx: Stx) -> ExpandError {
@@ -799,16 +805,11 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                         return Self::exprs(items[1..].to_vec(), move |this, args| {
                             let mc = this.mc;
                             let call = import.call(mc, args, &mut || this.fresh());
-                            call.map(Step::Done).map_err(|Uninitialized| this.error(ExpandErrorKind::Unbound, head))
+                            call.map(Step::Done).map_err(|e| this.import_error(e, head))
                         });
                     }
                 }
-                Binding::Local(var) => {
-                    def = self.keyword_defs.get(&var).cloned();
-                    if let Some(Local::Procedure(inline, kind)) = self.struct_locals.get(&var) {
-                        of_struct = Some(structs::Call::new(inline.clone(), Core::Ref(Place::Local(*kind)), None));
-                    }
-                }
+                Binding::Local(var) => def = self.keyword_defs.get(&var).cloned(),
                 Binding::Slot(slot) => {
                     def = self.builder.keyword_def(slot).map(|(core, shape)| KeywordDef { core: CoreAt::Slot(core), shape: shape.clone() });
                     of_struct = self.builder.struct_call(slot, self.form);
@@ -871,7 +872,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 Some(value) => return Ok(Step::Done(Core::Quote(value))),
                 None => self.builder.place(slot, self.form, self.defining),
             },
-            Binding::Import(import) => return import.reference(self.mc).map(Step::Done).map_err(|Uninitialized| self.error(ExpandErrorKind::Unbound, id)),
+            Binding::Import(import) => return import.reference(self.mc).map(Step::Done).map_err(|e| self.import_error(e, id)),
             Binding::Free => return Err(self.error(ExpandErrorKind::Unbound, id)),
             Binding::Macro(m) => return Ok(Step::Tail(Call::Expr(self.expand_macro(m, id)?))),
             Binding::Keyword(_) | Binding::Pattern { .. } => return Err(self.error(ExpandErrorKind::BadSyntax, id)),
@@ -883,7 +884,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let place = match self.resolve(id)? {
             // Calls of a keyword procedure a definition made go to its core, as if it can't change:
             // the module builder rules out assigning a module variable that is one.
-            Binding::Local(var) if self.keyword_defs.contains_key(&var) || self.struct_locals.contains_key(&var) => {
+            Binding::Local(var) if self.keyword_defs.contains_key(&var) => {
                 return Err(self.error(ExpandErrorKind::Immutable, id));
             }
             Binding::Local(var) => Place::Local(var),
@@ -992,7 +993,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
 
     /// Goes on looking at a body's forms till they're all found, each macro one defines made
     /// before those after it are looked at, then expands what they define and do.
-    fn scan(&mut self, mut s: Scan<'gc>) -> Result<Ex<'a, 'gc>, ExpandError> {
+    fn scan(&mut self, mut s: Scan) -> Result<Ex<'a, 'gc>, ExpandError> {
         while let Some(form) = s.queue.pop() {
             match self.head(form)? {
                 Head::Define(form) => {
@@ -1016,15 +1017,8 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                         this.scan(s)
                     });
                 }
-                Head::Require(form) | Head::Provide(form) => return Err(self.error(ExpandErrorKind::Definition, form)),
+                Head::Require(form) | Head::Provide(form) | Head::Struct(form) => return Err(self.error(ExpandErrorKind::Definition, form)),
                 Head::Begin(forms) => s.queue.extend(forms.into_iter().rev()),
-                Head::Struct(form) => {
-                    for (id, var, value) in self.local_struct(form)? {
-                        s.defined.push(id);
-                        s.names.push(id);
-                        s.items.push(Item::Made(var, value));
-                    }
-                }
                 Head::Expr(e) => s.items.push(Item::Expr(e)),
             }
         }
@@ -1041,20 +1035,17 @@ impl<'a, 'gc> Expander<'a, 'gc> {
 
     /// The rest of a body's definitions and expressions, `items`, bound after `binds`, then its
     /// `last` expression.
-    fn defines(&mut self, mut items: std::vec::IntoIter<Item<'gc>>, mut binds: Vec<(Var, Core<'gc>)>, last: Stx) -> Result<Ex<'a, 'gc>, ExpandError> {
-        let (var, value) = loop {
-            match items.next() {
-                None => return Self::expr(last, move |_, last| Ok(Step::Done(Core::Letrec(binds, Box::new(last))))),
-                Some(Item::Define(var, value)) => break (var, value),
-                Some(Item::Expr(e)) => break (self.fresh(), e),
-                Some(Item::Made(var, value)) => binds.push((var, value)),
-                Some(Item::Keyword(procedure, core, lambda)) => {
-                    return self.keyword_definition(lambda, move |this, lambda, shape| {
-                        binds.push((core, Core::Lambda(lambda)));
-                        binds.push((procedure, this.keyword_procedure(&shape, Core::Ref(Place::Local(core)))?));
-                        this.defines(items, binds, last)
-                    });
-                }
+    fn defines(&mut self, mut items: std::vec::IntoIter<Item>, mut binds: Vec<(Var, Core<'gc>)>, last: Stx) -> Result<Ex<'a, 'gc>, ExpandError> {
+        let (var, value) = match items.next() {
+            None => return Self::expr(last, move |_, last| Ok(Step::Done(Core::Letrec(binds, Box::new(last))))),
+            Some(Item::Define(var, value)) => (var, value),
+            Some(Item::Expr(e)) => (self.fresh(), e),
+            Some(Item::Keyword(procedure, core, lambda)) => {
+                return self.keyword_definition(lambda, move |this, lambda, shape| {
+                    binds.push((core, Core::Lambda(lambda)));
+                    binds.push((procedure, this.keyword_procedure(&shape, Core::Ref(Place::Local(core)))?));
+                    this.defines(items, binds, last)
+                });
             }
         };
         Self::expr(value, move |this, value| {

@@ -12,7 +12,7 @@ use ragwort_types::string::Strings;
 use ragwort_types::symbol::Symbols;
 
 use super::*;
-use crate::module::{Import, Imports, ModuleBuilder, ModuleError, Uninitialized};
+use crate::module::{Import, Imports, ModuleBuilder, ModuleError, Unusable};
 
 fn fix<'gc>(n: i64) -> Value<'gc> {
     Value::fixnum(n).unwrap()
@@ -1386,7 +1386,7 @@ fn modules_export_what_code_that_requires_them_needs() {
         builder.define(symbol(mc, "x"), 0).unwrap();
         builder.provide_all(mc).unwrap();
         let unrun = builder.finish(mc).unwrap();
-        assert_eq!(imported(mc, unrun, "x").reference(mc), Err(Uninitialized));
+        assert_eq!(imported(mc, unrun, "x").reference(mc), Err(Unusable::Uninitialized));
     });
 }
 

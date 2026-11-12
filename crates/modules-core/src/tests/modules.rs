@@ -180,6 +180,56 @@ fn calls(ops: &str) -> usize {
 }
 
 #[test]
+fn structs_provided_without_their_constructor_are_only_matched() {
+    use ragwort_native::LowerErrorKind;
+    use ragwort_scheme::ExpandErrorKind;
+    let mut arena = arena();
+    let users = "(provide (struct-out user #:omit-constructor) make-user)
+                 (struct user (name [age #:mutable]) #:extra-constructor-name raw-user)
+                 (define (make-user name age) (if (string? name) (user name age) (raw-user \"nobody\" 0)))
+                 (struct-copy user (make-user 'x 1) [age 2])";
+    assert_eq!(module_in(&mut arena, "users", &[(Scheme, users)]), Ok(Ok("#(struct:user \"nobody\" 2)".into())));
+    // Everything but the constructors is there, and the name takes a struct apart.
+    let reader = "(require users) (define u (make-user \"ann\" 3)) (set-user-age! u 4)
+                  (list (match u [(user name age) (list name age)]) (match u [(user name _ ...) name]) (match 5 [(user _ ...) 'user] [_ 'other])
+                        (user? u) (user-name u) u struct:user)";
+    let expected = "((\"ann\" 4) \"ann\" other #t \"ann\" #(struct:user \"ann\" 4) #<struct-type:user>)";
+    assert_eq!(module_in(&mut arena, "reader", &[(Scheme, reader)]), Ok(Ok(expected.into())));
+    let renamed = "(require (prefix-in u: users)) (match (u:make-user \"bo\" 1) [(u:user name _) name])";
+    assert_eq!(module_in(&mut arena, "renamed", &[(Scheme, renamed)]), Ok(Ok("\"bo\"".into())));
+    // Nothing a module that requires it writes makes one but by what else is provided.
+    let wrong = [
+        ("(user \"ann\" 3)", ExpandErrorKind::NoConstructor),
+        ("user", ExpandErrorKind::NoConstructor),
+        ("(map user '(\"ann\") '(3))", ExpandErrorKind::NoConstructor),
+        ("(struct-copy user (make-user \"ann\" 3) [age 5])", ExpandErrorKind::NoConstructor),
+        ("(struct admin user (level))", ExpandErrorKind::BadSyntax),
+        ("(raw-user \"ann\" 3)", ExpandErrorKind::Unbound),
+        ("(set! user 1)", ExpandErrorKind::Immutable),
+    ];
+    for (text, kind) in wrong {
+        let result = module_in(&mut arena, "wrong", &[(Scheme, &format!("(require users) {text}"))]);
+        assert!(matches!(result, Err(Error::Expand(e)) if e.kind == kind), "{text}: {result:?}");
+    }
+    let native = "(%require users) (%app user-name (%app make-user \"cy\" 1))";
+    assert_eq!(module_in(&mut arena, "native-reader", &[(Native, native)]), Ok(Ok("\"cy\"".into())));
+    for (text, kind) in [("(%app user \"ann\" 3)", LowerErrorKind::NoConstructor), ("user", LowerErrorKind::NoConstructor), ("(%struct admin user (level))", LowerErrorKind::BadShape)] {
+        let result = module_in(&mut arena, "wrong", &[(Native, &format!("(%require users) {text}"))]);
+        assert!(matches!(result, Err(Error::Lower(e)) if e.kind == kind), "{text}: {result:?}");
+    }
+    // Native ragwort provides one the same way.
+    let pairs = "(%provide (struct-out pair2 #:omit-constructor) twice) (%struct pair2 (a b)) (%define twice (%lambda (a) (%app pair2 a a)))";
+    module_in(&mut arena, "pairs", &[(Native, pairs)]).unwrap().unwrap();
+    assert_eq!(module_in(&mut arena, "pair-reader", &[(Scheme, "(require pairs) (match (twice 4) [(pair2 a b) (+ a b)])")]), Ok(Ok("8".into())));
+    let made = module_in(&mut arena, "pair-maker", &[(Scheme, "(require pairs) (pair2 1 2)")]);
+    assert!(matches!(made, Err(Error::Expand(e)) if e.kind == ExpandErrorKind::NoConstructor), "{made:?}");
+    for (text, kind) in [("(provide (struct-out p #:nope))", ExpandErrorKind::BadSyntax), ("(provide (struct-out p #:omit-constructor) p)", ExpandErrorKind::Duplicate)] {
+        let result = module_in(&mut arena, "wrong", &[(Scheme, &format!("{text} (struct p (x))"))]);
+        assert!(matches!(result, Err(Error::Expand(e)) if e.kind == kind), "{text}: {result:?}");
+    }
+}
+
+#[test]
 fn structs_are_used_across_modules() {
     let mut arena = arena();
     let shapes = "(provide (struct-out point) (struct-out session) origin)

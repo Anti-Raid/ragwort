@@ -14,7 +14,10 @@
 //!   the rest of the list, each element matching it, and binds each of its variables to a list.
 //! - `(vector p ...)` a vector of as many elements.
 //! - `(name p ...)`, `name` a struct's, a struct of its type, or of a subtype of it, each field
-//!   matching its `p`: all its fields, its supertype's first.
+//!   matching its `p`: all its fields, its supertype's first. One `p` can be followed by `...`,
+//!   which matches it against each field the other patterns leave, and binds each of its
+//!   variables to a list: `(user name _ ...)` looks at the first field only, and
+//!   `(point3 x rest ...)` binds `rest` to the list of the other two.
 //! - `(? pred p ...)` what `pred` is true of and each `p` matches; `(and p ...)` what each `p`
 //!   matches; `(or p ...)` what any does, each binding the same variables; `(not p ...)` what
 //!   none does, binding nothing.
@@ -37,7 +40,6 @@ use ragwort_types::symbol::Symbol;
 
 use crate::expand::{Aux, Expander};
 use crate::scope::Set;
-use crate::structs::Kind;
 use crate::tree::{Stx, View};
 use crate::{ExpandError, ExpandErrorKind};
 
@@ -69,10 +71,20 @@ enum Part {
     Field(usize, usize),
 }
 
+/// One of a struct pattern's patterns, with the fields it's matched against, `count` of them
+/// from `first` on: one, or for a pattern that `...` follows, as many as the others leave.
+#[derive(Clone, Copy)]
+struct FieldPat {
+    pat: Stx,
+    first: usize,
+    count: usize,
+    repeats: bool,
+}
+
 /// A struct type patterns name: an expression for it, and what tells it from the others.
 struct Named<'gc> {
     kind: Stx,
-    key: Result<Value<'gc>, ragwort_compiler::Var>,
+    key: Value<'gc>,
 }
 
 /// What matching a pattern does, in order.
@@ -517,26 +529,22 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
             }
             ("==", &[v]) => Step::Test(self.ex.build(p, "equal?", &[&[v, x.stx]])?),
             ("==", &[v, same]) => Step::Test(self.ex.list(&[same, v, x.stx], p)?),
-            _ => match self.ex.struct_info(items[0])? {
-                Some(info) if info.fields.len() == args.len() => {
-                    let key = match info.kind {
-                        Kind::Constant(kind) => Ok(kind),
-                        Kind::Local(var) => Err(var),
-                    };
-                    let known = self.m.structs.iter().position(|named| named.key == key);
-                    let of = match known {
-                        Some(of) => of,
-                        None => {
-                            let kind = self.ex.struct_type(&info, p)?;
-                            self.m.structs.push(Named { kind, key });
-                            self.m.structs.len() - 1
-                        }
-                    };
-                    self.push(Step::Is(Shape::Struct(of), x));
-                    return self.field_pattern(x, of, args.to_vec(), 0);
-                }
-                _ => return bad(self, p),
-            },
+            _ => {
+                let Some(info) = self.ex.struct_info(items[0])? else { return bad(self, p) };
+                let pats = self.field_pats(p, args, info.fields.len())?;
+                let key = info.kind;
+                let known = self.m.structs.iter().position(|named| named.key == key);
+                let of = match known {
+                    Some(of) => of,
+                    None => {
+                        let kind = self.ex.struct_type(&info, p)?;
+                        self.m.structs.push(Named { kind, key });
+                        self.m.structs.len() - 1
+                    }
+                };
+                self.push(Step::Is(Shape::Struct(of), x));
+                return self.field_pattern(x, of, pats, 0);
+            }
         };
         self.push(step);
         Ok(Next::Done(()))
@@ -548,15 +556,101 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         Ok(Next::then((x, pat), move |s: &mut Self, ()| s.each_pattern(x, pats, i + 1)))
     }
 
-    /// Matches the fields from `i` on of `x`, a struct of the matcher's type `of`, against `pats`.
-    fn field_pattern(&mut self, x: Temp, of: usize, pats: Vec<Stx>, i: usize) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
-        let Some(&pat) = pats.get(i) else { return Ok(Next::Done(())) };
-        if self.ex.is_aux(pat, Aux::Ellipsis)? {
-            return Err(self.ex.error(ExpandErrorKind::Unsupported, pat));
+    /// The fields each of `pats`, the patterns of the struct pattern `p`, is matched against,
+    /// the struct having `fields` of them. Only one pattern can repeat, and there's a field
+    /// for each one that doesn't.
+    fn field_pats(&mut self, p: Stx, pats: &[Stx], fields: usize) -> Result<Vec<FieldPat>, ExpandError> {
+        let bad = ExpandErrorKind::BadSyntax;
+        let mut dots = None;
+        for (i, &pat) in pats.iter().enumerate() {
+            if self.ex.is_aux(pat, Aux::Ellipsis)? {
+                if i == 0 || dots.is_some() {
+                    return Err(self.ex.error(bad, pat));
+                }
+                dots = Some(i);
+            }
         }
-        let field = self.part(x, Part::Field(of, i))?;
-        self.push(Step::Get(field, Part::Field(of, i), x));
-        Ok(Next::then((field, pat), move |s: &mut Self, ()| s.field_pattern(x, of, pats, i + 1)))
+        let single = pats.len() - if dots.is_some() { 2 } else { 0 };
+        let spare = match fields.checked_sub(single) {
+            Some(spare) if spare == 0 || dots.is_some() => spare,
+            _ => return Err(self.ex.error(bad, p)),
+        };
+        let mut out = Vec::with_capacity(pats.len());
+        let mut first = 0;
+        for (i, &pat) in pats.iter().enumerate() {
+            if dots == Some(i) {
+                continue;
+            }
+            let repeats = dots == Some(i + 1);
+            let count = if repeats { spare } else { 1 };
+            out.push(FieldPat { pat, first, count, repeats });
+            first += count;
+        }
+        Ok(out)
+    }
+
+    /// A temporary for field `k` of `x`, a struct of the matcher's type `of`, read by then.
+    fn field(&mut self, x: Temp, of: usize, k: usize) -> Result<Temp, ExpandError> {
+        let field = self.part(x, Part::Field(of, k))?;
+        self.push(Step::Get(field, Part::Field(of, k), x));
+        Ok(field)
+    }
+
+    /// Matches the fields of `x`, a struct of the matcher's type `of`, against `pats` from `i`
+    /// on. A pattern that repeats is matched against the list of its fields, as a list's last
+    /// pattern is against the rest of the list, and `_ ...` reads none.
+    fn field_pattern(&mut self, x: Temp, of: usize, pats: Vec<FieldPat>, i: usize) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
+        let Some(&FieldPat { pat, first, count, repeats }) = pats.get(i) else { return Ok(Next::Done(())) };
+        if !repeats {
+            let field = self.field(x, of, first)?;
+            return Ok(Next::then((field, pat), move |s: &mut Self, ()| s.field_pattern(x, of, pats, i + 1)));
+        }
+        if self.ex.is_aux(pat, Aux::Underscore)? {
+            return self.field_pattern(x, of, pats, i + 1);
+        }
+        let mut values = Vec::with_capacity(count);
+        for k in first..first + count {
+            values.push(self.field(x, of, k)?.stx);
+        }
+        let all = self.temp()?;
+        let list = self.ex.build(pat, "list", &[&values])?;
+        self.push(Step::Bind(all, list));
+        if self.ex.is_id(pat) {
+            self.not_bound(pat)?;
+            self.variable(all, pat)?;
+            return self.field_pattern(x, of, pats, i + 1);
+        }
+        self.repeat_pattern(all, pat, move |s| s.field_pattern(x, of, pats, i + 1))
+    }
+
+    /// An error if the pattern so far binds the variable `id`: one that's bound to a list of
+    /// what it matched can't also be a test against what it was bound to before.
+    fn not_bound(&mut self, id: Stx) -> Result<(), ExpandError> {
+        let key = (self.ex.tree.symbol(id).expect("an identifier"), self.ex.tree.scopes_of(id)?);
+        if self.m.seen.iter().any(|seen| seen.key() == key) {
+            return Err(self.ex.error(ExpandErrorKind::Duplicate, id));
+        }
+        Ok(())
+    }
+
+    /// Matches each element of `list`, a list, against `item`, binds each of `item`'s variables
+    /// to the list of what it was bound to for each element, and goes on to `then`.
+    fn repeat_pattern(&mut self, list: Temp, item: Stx, then: impl FnOnce(&mut Self) -> Result<Pat<'e, 'a, 'gc>, ExpandError> + 'e) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
+        let element = self.temp()?;
+        let before = std::mem::take(&mut self.m.seen);
+        self.inner_pattern(element, item, move |s, steps| {
+            let inner = std::mem::replace(&mut s.m.seen, before);
+            if let Some(seen) = inner.iter().find(|seen| s.m.seen.iter().any(|other| other.key() == seen.key())) {
+                return Err(s.ex.error(ExpandErrorKind::Duplicate, seen.id));
+            }
+            let values = inner.iter().map(|v| v.value).collect();
+            let results = inner.iter().map(|_| Ok(s.temp()?.stx)).collect::<Result<Vec<_>, ExpandError>>()?;
+            let first = s.m.seen.len();
+            s.m.seen.extend(inner);
+            s.push(Step::Each { list, item: element, steps, values, results: results.clone() });
+            s.bind_results(first, &results);
+            then(s)
+        })
     }
 
     /// Matches the items of the vector `x` from `i` on against `pats`.
@@ -653,28 +747,11 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
             if self.ex.is_id(item) {
                 self.push(Step::Is(Shape::List, at));
                 if !self.ex.is_aux(item, Aux::Underscore)? {
-                    let key = (self.ex.tree.symbol(item).expect("an identifier"), self.ex.tree.scopes_of(item)?);
-                    if self.m.seen.iter().any(|seen| seen.key() == key) {
-                        return Err(self.ex.error(ExpandErrorKind::Duplicate, item));
-                    }
+                    self.not_bound(item)?;
                 }
                 return Ok(Next::Tail((at, item)));
             }
-            let element = self.temp()?;
-            let before = std::mem::take(&mut self.m.seen);
-            return self.inner_pattern(element, item, move |s, steps| {
-                let inner = std::mem::replace(&mut s.m.seen, before);
-                if let Some(seen) = inner.iter().find(|seen| s.m.seen.iter().any(|other| other.key() == seen.key())) {
-                    return Err(s.ex.error(ExpandErrorKind::Duplicate, seen.id));
-                }
-                let values = inner.iter().map(|v| v.value).collect();
-                let results = inner.iter().map(|_| Ok(s.temp()?.stx)).collect::<Result<Vec<_>, ExpandError>>()?;
-                let first = s.m.seen.len();
-                s.m.seen.extend(inner);
-                s.push(Step::Each { list: at, item: element, steps, values, results: results.clone() });
-                s.bind_results(first, &results);
-                Ok(Next::Done(()))
-            });
+            return self.repeat_pattern(at, item, |_| Ok(Next::Done(())));
         }
         self.push(Step::Is(Shape::Pair, at));
         let head = self.part(at, Part::Car)?;

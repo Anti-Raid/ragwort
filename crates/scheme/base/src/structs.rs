@@ -10,6 +10,9 @@
 //!
 //! A field is written as its name, or as `(name #:mutable)` for one that can be set.
 //!
+//! The form only goes at a module's top level, as `require` and `provide` do. So every struct
+//! type exists before any code runs, and the compiler knows each one where it's used.
+//!
 //! # What it defines
 //!
 //! For `(struct point (x (y #:mutable)))`:
@@ -37,9 +40,34 @@
 //!
 //! - As the supertype in another `struct` form.
 //! - In a `match` pattern such as `(point px py)`, with one sub-pattern per field, the
-//!   supertype's fields first. It matches an instance of the struct or of a subtype.
+//!   supertype's fields first. It matches an instance of the struct or of a subtype. One
+//!   sub-pattern can be followed by `...` to stand for the fields the others leave:
+//!   `(point px _ ...)` looks at `x` alone.
 //! - In `(struct-copy point p (y 5))`, which makes a new `point` with the fields of `p` except
 //!   the ones given.
+//!
+//! # Providing a struct
+//!
+//! `(provide (struct-out point))` exports everything the form defines.
+//!
+//! `(provide (struct-out point #:omit-constructor))` exports everything but the constructors.
+//! A module that requires it can still test, read and match a `point`, but can't make one
+//! except through what else the module provides:
+//!
+//! ```text
+//! (provide (struct-out user #:omit-constructor) make-user)
+//! (struct user (name age))
+//! (define (make-user name age)
+//!   (unless (string? name) (raise 'bad-name))
+//!   (user name age))
+//! ```
+//!
+//! In a module that requires this one:
+//!
+//! - `(match u [(user name age) ...])` works, as do `user?` and `user-name`.
+//! - `(user "ann" 3)`, `user` as a value and `(struct-copy user u ...)` are errors, since each
+//!   would make a `user` that `make-user` hasn't checked.
+//! - `user` can't be a supertype, since a subtype's constructor would do the same.
 //!
 //! # Procedures that work on any struct
 //!
@@ -69,18 +97,18 @@
 //! is handed takes the constructor or a mutator as an argument, as in `(apply point fields)`.
 //!
 //! A struct has no guard or contract of its own. To check the values a struct is made with,
-//! write a procedure that checks them and then calls the constructor, and provide that.
+//! write a procedure that checks them and then calls the constructor, and provide that with
+//! the struct's constructor left out, as above.
 //!
 //! # How it is built
 //!
 //! The struct types are in [`ragwort_vm::structs`]. The code a form defines is built by
-//! [`ragwort_compiler::structs`], which native ragwort's `%struct` uses too. A top-level form's
-//! type is created once, when its module is expanded. A form inside a body creates a new type
-//! each time the body runs.
+//! [`ragwort_compiler::structs`], which native ragwort's `%struct` uses too. The form's type is
+//! created once, when its module is expanded.
 
-use ragwort_compiler::module::{Field, Inline, StructDef};
+use ragwort_compiler::module::{Field, StructDef};
 use ragwort_compiler::structs::{self, Declaration, Declared, Member};
-use ragwort_compiler::{Core, Place, Var};
+use ragwort_compiler::Core;
 use ragwort_types::gc::{OutOfMemory, Value};
 use ragwort_types::string::chars;
 use ragwort_vm::Fault;
@@ -116,43 +144,20 @@ struct Parts<'gc> {
     members: Vec<(Stx, Member)>,
 }
 
-/// Where a struct type is, to code that uses it.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Kind<'gc> {
-    Constant(Value<'gc>),
-    Local(Var),
-}
-
-impl<'gc> Kind<'gc> {
-    pub(crate) fn core(self) -> Core<'gc> {
-        match self {
-            Kind::Constant(kind) => Core::Quote(kind),
-            Kind::Local(var) => Core::Ref(Place::Local(var)),
-        }
-    }
-}
-
 /// A struct type, as the name of its constructor stands for it: its fields are all of them, its
 /// supertype's first.
 #[derive(Clone, Debug)]
 pub(crate) struct Info<'gc> {
-    pub(crate) kind: Kind<'gc>,
-    /// The identifier of the local the type is in, if it's in one.
-    holder: Option<Stx>,
+    pub(crate) kind: Value<'gc>,
     pub(crate) fields: Vec<Field>,
     sealed: bool,
-}
-
-/// What a local that a struct form in a body defines is: the type, or a procedure of the type
-/// in the given local, with what a call of it does.
-pub(crate) enum Local {
-    Type,
-    Procedure(Inline, Var),
+    /// Whether its module provides it without its constructor, so the name is only for `match`.
+    match_only: bool,
 }
 
 impl<'a, 'gc> Expander<'a, 'gc> {
     /// The name of the keyword `stx` is, if it's one.
-    fn keyword_name(&self, stx: Stx) -> Option<String> {
+    pub(crate) fn keyword_name(&self, stx: Stx) -> Option<String> {
         let keyword = self.tree.keyword(stx)?;
         Some(chars(&self.strings, keyword.symbol(self.mc).name(self.mc)).collect())
     }
@@ -222,9 +227,8 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         if !self.is_id(id) {
             return Ok(None);
         }
-        let of = |def: &StructDef, kind: Value<'gc>| Info { kind: Kind::Constant(kind), holder: None, fields: def.fields.to_vec(), sealed: def.sealed };
+        let of = |def: &StructDef, kind: Value<'gc>| Info { kind, fields: def.fields.to_vec(), sealed: def.sealed, match_only: def.match_only };
         Ok(match self.resolve(id)? {
-            Binding::Local(var) => self.struct_infos.get(&var).cloned(),
             Binding::Slot(slot) => self.builder.struct_def(slot).map(|(def, kind)| of(def, kind)),
             Binding::Import(import) => import.struct_def(self.mc).map(|(def, kind)| of(def, kind)),
             _ => None,
@@ -271,11 +275,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     pub(crate) fn declare_struct(&mut self, form: Stx, index: u32) -> Result<Declared, ExpandError> {
         let parts = self.struct_form(form)?;
         let Parts { parent, fields, members } = self.struct_parts(&parts)?;
-        let above = match parent.map(|parent| parent.kind) {
-            None => Value::FALSE,
-            Some(Kind::Constant(kind)) => kind,
-            Some(Kind::Local(_)) => return Err(self.error(ExpandErrorKind::BadSyntax, form)),
-        };
+        let above = parent.map_or(Value::FALSE, |parent| parent.kind);
         let (name, own) = self.struct_names(&parts);
         let kind = structs::make_type(self.mc, name, above, &own, parts.flags).map_err(|fault| match fault {
             Fault::OutOfMemory => self.error(OutOfMemory, form),
@@ -295,48 +295,10 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         declared.define(kind, self)
     }
 
-    /// Binds what `form`, a struct form in a body, defines, each to a local, and gives each
-    /// with its identifier and its value, in order: the type, made when the body runs, then
-    /// its procedures.
-    pub(crate) fn local_struct(&mut self, form: Stx) -> Result<Vec<(Stx, Var, Core<'gc>)>, ExpandError> {
-        let parts = self.struct_form(form)?;
-        let Parts { parent, fields, members } = self.struct_parts(&parts)?;
-        let (name, own) = self.struct_names(&parts);
-        let above = parent.map_or(Core::Quote(Value::FALSE), |parent| parent.kind.core());
-        let count = u32::try_from(fields.len()).expect("a type's fields are counted");
-        let mut items = Vec::with_capacity(members.len());
-        let mut holder = None;
-        for (i, (id, member)) in members.into_iter().enumerate() {
-            let var = self.local(id)?;
-            let (kind, holder) = *holder.get_or_insert((var, id));
-            let value = match member {
-                Member::Type => structs::type_maker(self.mc, name, above.clone(), &own, parts.flags)?,
-                _ => structs::value(member, Core::Ref(Place::Local(kind)), count, self),
-            };
-            let local = match structs::inline(member, 0, count) {
-                Some(inline) => Local::Procedure(inline, kind),
-                None => Local::Type,
-            };
-            self.struct_locals.insert(var, local);
-            // The first constructor is the one that has the struct's name.
-            if i == 1 {
-                let sealed = parts.flags.contains(TypeFlags::SEALED);
-                self.struct_infos.insert(var, Info { kind: Kind::Local(kind), holder: Some(holder), fields: fields.clone(), sealed });
-            }
-            items.push((id, var, value));
-        }
-        Ok(items)
-    }
-
     /// An expression for the type of `info`, at `at`.
     pub(crate) fn struct_type(&mut self, info: &Info<'gc>, at: Stx) -> Result<Stx, ExpandError> {
-        match (info.kind, info.holder) {
-            (Kind::Constant(kind), _) => {
-                let kind = self.value(kind, at)?;
-                self.quoted(kind, at)
-            }
-            (Kind::Local(_), holder) => Ok(holder.expect("a type in a local has its identifier")),
-        }
+        let kind = self.value(info.kind, at)?;
+        self.quoted(kind, at)
     }
 
     /// `(struct-copy name e [field value] ...)`: `(let ((t e)) (let ((v value)) ... (name field
@@ -345,6 +307,9 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     pub(crate) fn struct_copy(&mut self, stx: Stx, name: Stx, e: Stx, updates: &[Stx]) -> Result<Stx, ExpandError> {
         let bad = ExpandErrorKind::BadSyntax;
         let Some(info) = self.struct_info(name)? else { return Err(self.error(bad, name)) };
+        if info.match_only {
+            return Err(self.error(ExpandErrorKind::NoConstructor, name));
+        }
         let (is, get) = ("struct-derived-from?", self.internal("struct-ref", stx)?);
         let kind = self.struct_type(&info, stx)?;
         let source = self.introduce("t", stx)?;

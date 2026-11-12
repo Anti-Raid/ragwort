@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use ragwort_compiler::keyword::{self, CallShape, Fresh};
-use ragwort_compiler::module::{Binding, Field, Filter, Import, ModuleBuilder, ModuleError, RequireSpec, Resolver, SpecError, Uninitialized};
+use ragwort_compiler::module::{Binding, Field, Filter, Import, ModuleBuilder, ModuleError, RequireSpec, Resolver, SpecError, Unusable};
 use ragwort_compiler::steps::{self, Step};
 use ragwort_compiler::structs::{self, Declaration, Declared, Member};
 use ragwort_compiler::{Core, Lambda, Place, Prim, Var};
@@ -42,6 +42,8 @@ pub enum LowerErrorKind {
     NotDefined,
     /// A reference to an export of a module that hasn't defined it yet.
     Uninitialized,
+    /// The name of a struct whose module provides it without its constructor, used as a value.
+    NoConstructor,
     /// An `%intrinsic` of a name that isn't one the code can name.
     UnknownIntrinsic,
     /// A `%call-host` of a name that isn't one of the host functions the code was given.
@@ -545,10 +547,15 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         let word = if head.kind(self.mc) == Some(SyntaxKind::Identifier) { self.text(head) } else { None };
         match (word.as_deref(), args) {
             (Some("all-defined-out"), []) => builder.provide_all(self.mc).map_err(|e| self.module_error(e, spec)),
-            (Some("struct-out"), &[name]) => {
+            (Some("struct-out"), &[name, ref options @ ..]) => {
                 self.name(name)?;
+                let constructors = match options {
+                    [] => true,
+                    &[option] if self.keyword(option).is_some_and(|k| chars(&self.strings, k.symbol(self.mc).name(self.mc)).eq("omit-constructor".chars())) => false,
+                    _ => return Err(self.error(LowerErrorKind::BadShape, spec)),
+                };
                 let Some(Binding::Slot(constructor)) = builder.binding(name.datum(self.mc)) else { return Err(self.error(LowerErrorKind::NotDefined, name)) };
-                builder.provide_struct(self.mc, constructor).map_err(|e| self.module_error(e, name))
+                builder.provide_struct(self.mc, constructor, constructors).map_err(|e| self.module_error(e, name))
             }
             (Some("rename-out"), renames) => {
                 for &rename in renames {
@@ -585,6 +592,15 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             _ => return None,
         };
         Some(chars(&self.strings, s).collect())
+    }
+
+    /// The error of using the import `node` as a value, which it doesn't have.
+    fn import_error(&self, e: Unusable, node: Syntax<'gc>) -> LowerError {
+        let kind = match e {
+            Unusable::Uninitialized => LowerErrorKind::Uninitialized,
+            Unusable::MatchOnly => LowerErrorKind::NoConstructor,
+        };
+        self.error(kind, node)
     }
 
     fn module_error(&self, e: ModuleError, node: Syntax<'gc>) -> LowerError {
@@ -683,7 +699,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
                 Some(value) => Core::Quote(value),
                 None => Core::Ref(builder.place(slot, self.top, self.defining)),
             },
-            Err(Binding::Import(import)) => import.reference(self.mc).map_err(|Uninitialized| self.error(LowerErrorKind::Uninitialized, name))?,
+            Err(Binding::Import(import)) => import.reference(self.mc).map_err(|e| self.import_error(e, name))?,
         })
     }
 
@@ -862,7 +878,7 @@ impl<'s, 'a, 'gc> Lowering<'s, 'a, 'gc> {
                 (None, Some(import)) => steps::all(args.to_vec(), move |s: &mut Self, args| {
                     let mc = s.l.mc;
                     let call = import.call(mc, args, &mut || s.l.fresh());
-                    call.map(Step::Done).map_err(|Uninitialized| s.l.error(LowerErrorKind::Uninitialized, f))
+                    call.map(Step::Done).map_err(|e| s.l.import_error(e, f))
                 }),
                 (None, None) => {
                     let args = args.to_vec();
@@ -1045,7 +1061,7 @@ impl<'s, 'a, 'gc> Lowering<'s, 'a, 'gc> {
                 }
                 (Some((CoreAt::Import(core), shape)), _) => {
                     let (mc, args) = (s.l.mc, shape.core_args(value_of, positional));
-                    core.call(mc, args, &mut || s.l.fresh()).map_err(|Uninitialized| s.l.error(LowerErrorKind::Uninitialized, f))?
+                    core.call(mc, args, &mut || s.l.fresh()).map_err(|e| s.l.import_error(e, f))?
                 }
                 (None, Some(procedure)) => {
                     let given = given.iter().map(|&k| (k, value_of(k).expect("a keyword given"))).collect();

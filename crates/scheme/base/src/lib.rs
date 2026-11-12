@@ -68,7 +68,8 @@ pub enum ExpandErrorKind {
     BadSyntax,
     /// Two bindings of one identifier in one binding form or body.
     Duplicate,
-    /// A definition where only expressions go.
+    /// A definition where only expressions go, or a `struct`, `require` or `provide` that isn't
+    /// at the top level.
     Definition,
     /// A body with no expression after its definitions.
     NoExpression,
@@ -86,6 +87,9 @@ pub enum ExpandErrorKind {
     NotProvided,
     /// A provide of a name the module doesn't define.
     NotDefined,
+    /// The name of a struct whose module provides it without its constructor, used as a value
+    /// or in `struct-copy`: it's only for `match`.
+    NoConstructor,
     /// An identifier that two bindings could be, neither of whose scopes include the other's.
     Ambiguous,
     /// Syntax the expander doesn't support yet: `quasisyntax` and its unquotes, a `syntax-rules`
@@ -146,6 +150,7 @@ impl fmt::Display for ExpandError {
             ExpandErrorKind::Resolve => "a module that can't be found",
             ExpandErrorKind::NotProvided => "a name the module doesn't provide",
             ExpandErrorKind::NotDefined => "a provide of a name that isn't defined",
+            ExpandErrorKind::NoConstructor => "a struct whose constructor its module doesn't provide",
             ExpandErrorKind::Ambiguous => "an identifier with more than one binding",
             ExpandErrorKind::Unsupported => "syntax that isn't supported yet",
             ExpandErrorKind::Transformer => "a macro's transformer that failed",

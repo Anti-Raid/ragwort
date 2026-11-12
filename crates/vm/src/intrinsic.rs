@@ -687,7 +687,7 @@ impl Intrinsic {
     ///
     /// The internal intrinsics are the parts a `struct` form is built from:
     ///
-    /// - `make-struct-type`, which the form makes its type with.
+    /// - `make-struct-type`, which makes a type as the form does.
     /// - `make-struct`, `struct-ref` and `struct-set!`, which the constructor, the accessors
     ///   and the mutators it defines are.
     /// - `struct-field` and `struct-fixed-field`, which a compiler reads a field with once it
