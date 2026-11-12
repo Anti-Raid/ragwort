@@ -1,5 +1,5 @@
-//! The `ragwort` command: runs a file, opens a REPL, or compiles and prints bytecode. See
-//! [`args`] for the command line.
+//! The `ragwort` command: runs a file, opens a REPL, compiles and prints bytecode, or saves
+//! compiled modules as an image. See [`args`] for the command line.
 
 mod args;
 mod hosts;
@@ -7,9 +7,10 @@ mod listing;
 mod program;
 mod repl;
 
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use crate::args::{Command, ModuleDir, USAGE};
+use crate::args::{Command, Source, USAGE};
 use crate::hosts::{flush, put};
 use crate::program::Program;
 
@@ -27,11 +28,15 @@ fn finish(result: Result<(), Vec<String>>) -> ExitCode {
     }
 }
 
-fn compile(modules: Vec<ModuleDir>, entry: Option<std::path::PathBuf>) -> ExitCode {
-    let mut program = match Program::new(modules) {
-        Ok(program) => program,
-        Err(errors) => return fail(&errors),
-    };
+/// The program `from` describes: one that starts from its image, if it has one.
+fn program(from: Source) -> Result<Program, Vec<String>> {
+    let Some(image) = from.image else { return Program::new(from.modules) };
+    let bytes = std::fs::read(&image).map_err(|e| vec![format!("{}: {e}", image.display())])?;
+    Program::from_image(from.modules, &bytes).map_err(|errors| errors.iter().map(|error| format!("{}: {error}", image.display())).collect())
+}
+
+/// Compiles the modules of `program` and `entry`, and writes their bytecode.
+fn compile(mut program: Program, entry: Option<PathBuf>) -> ExitCode {
     program.list();
     let mut result = program.load_all();
     if result.is_ok()
@@ -43,6 +48,12 @@ fn compile(modules: Vec<ModuleDir>, entry: Option<std::path::PathBuf>) -> ExitCo
     finish(result)
 }
 
+/// Compiles the modules of `program`, and saves it to the file at `to`.
+fn save(mut program: Program, to: &Path) -> ExitCode {
+    let saved = program.load_all().and_then(|()| program.save_image());
+    finish(saved.and_then(|bytes| std::fs::write(to, bytes).map_err(|e| vec![format!("{}: {e}", to.display())])))
+}
+
 fn main() -> ExitCode {
     let command = match args::parse(std::env::args().skip(1)) {
         Ok(command) => command,
@@ -51,21 +62,18 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match command {
+    let (from, then): (Source, Box<dyn FnOnce(Program) -> ExitCode>) = match command {
         Command::Help => {
             put(USAGE);
-            ExitCode::SUCCESS
+            return ExitCode::SUCCESS;
         }
-        Command::Compile { modules, entry } => compile(modules, entry),
-        Command::Run { modules, entry } => {
-            let mut program = match Program::new(modules) {
-                Ok(program) => program,
-                Err(errors) => return fail(&errors),
-            };
-            match entry {
-                Some(entry) => finish(program.run_file(&entry, true)),
-                None => repl::run(&mut program),
-            }
-        }
+        Command::Compile { from, entry } => (from, Box::new(|program| compile(program, entry))),
+        Command::Save { from, to } => (from, Box::new(move |program| save(program, &to))),
+        Command::Run { from, entry: Some(entry) } => (from, Box::new(move |mut program| finish(program.run_file(&entry, true)))),
+        Command::Run { from, entry: None } => (from, Box::new(|mut program| repl::run(&mut program))),
+    };
+    match program(from) {
+        Ok(program) => then(program),
+        Err(errors) => fail(&errors),
     }
 }

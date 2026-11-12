@@ -101,6 +101,12 @@ impl FrozenTable {
         self.slot(word)?.value.get()?.downcast_ref()
     }
 
+    /// The value a frozen field's word names, whatever its type, and what it's charged.
+    pub(crate) fn any(&self, word: u64) -> Option<(&dyn Any, usize)> {
+        let slot = self.slot(word)?;
+        Some((&**slot.value.get()?, slot.cost.get()))
+    }
+
     pub(crate) fn alloc<T: Any>(&self, budget: &Budget, marked: bool, value: T, owned: usize) -> Result<u32, OutOfMemory> {
         budget.count_allocation()?;
         let cost = (size_of::<T>() + FROZEN_COST).saturating_add(owned);

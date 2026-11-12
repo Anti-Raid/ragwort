@@ -180,6 +180,64 @@ fn calls(ops: &str) -> usize {
 }
 
 #[test]
+fn an_image_holds_modules_for_another_arena() {
+    let library = "(provide (struct-out point) (struct-out user #:omit-constructor) make-user greet next! table big area total)
+                   (struct point (x [y #:mutable]))
+                   (struct user (name age))
+                   (define (make-user name age) (user name age))
+                   (define (greet name #:greeting [greeting \"hello\"]) (string-append greeting \", \" name))
+                   (define next! (let ((n 0)) (lambda () (set! n (+ n 1)) n)))
+                   (next!)
+                   (define table (list 'apple \"a string that is too long to fit in a word\" #(1 2 3) #\\x 1.5 (point 1 2)))
+                   (define big (expt 2 100))
+                   (define (area p) (match p [(point x y) (* x y)]))";
+    let native = "(%define total (%lambda (a b) (%call-host add a b)))";
+    let user = "(require library)
+                (define p (point 3 4))
+                (set-point-y! p 5)
+                (list (area p) (match (make-user \"ann\" 3) [(user name _ ...) name]) (greet \"bo\") (greet \"cy\" #:greeting \"hi\") (next!) (next!)
+                      (eq? (car table) 'apple) table (+ big 1) (total 20 22) (struct-copy point p [x 9]) (equal? (point 1 2) (list-ref table 5))
+                      (string->symbol \"apple\") (eq? (string->symbol \"apple\") (car table)))";
+    let expected = "(15 \"ann\" \"hello, bo\" \"hi, cy\" 2 3 #t (apple \"a string that is too long to fit in a word\" #(1 2 3) #\\x 1.5 #(struct:point 1 2)) 1267650600228229401496703205377 42 #(struct:point 9 5) #t apple #t)";
+    let mut arena = arena();
+    assert_eq!(module_hosting(&mut arena, "library", &HOSTS, &[(Scheme, library), (Native, native)]).map(|ran| ran.is_ok()), Ok(true));
+    arena.collect();
+    let bytes = arena.mutate(|mc| image::save(mc, &[mc.root(0), mc.root(1), mc.root(2)])).unwrap();
+    // The arena that saved it goes on as it was.
+    assert_eq!(module_in(&mut arena, "user", &[(Scheme, user)]), Ok(Ok(expected.into())));
+
+    let restored = |bytes: &[u8]| {
+        let mut arena = Arena::new(1 << 24, 3);
+        arena.mutate(|mc| {
+            let roots = image::load(mc, bytes, HOSTS.iter()).unwrap();
+            assert_eq!(roots.len(), 3);
+            roots.iter().enumerate().for_each(|(i, &root)| mc.set_root(i, root));
+        });
+        arena
+    };
+    // Another has what the first had when it saved it, and nothing of what it did after.
+    let mut other = restored(&bytes);
+    assert_eq!(module_in(&mut other, "user", &[(Scheme, user)]), Ok(Ok(expected.into())));
+    other.collect();
+    assert_eq!(module_in(&mut other, "again", &[(Scheme, "(require library) (list (next!) (area (point 2 3)))")]), Ok(Ok("(4 6)".into())));
+    let wrong = module_in(&mut other, "wrong", &[(Scheme, "(require library) (user \"ann\" 3)")]);
+    assert!(matches!(wrong, Err(Error::Expand(e)) if e.kind == ragwort_scheme::ExpandErrorKind::NoConstructor), "{wrong:?}");
+    // What's loaded can be saved again, with what was loaded after it.
+    other.collect();
+    let more = other.mutate(|mc| image::save(mc, &[mc.root(0), mc.root(1), mc.root(2)])).unwrap();
+    let mut third = restored(&more);
+    assert_eq!(module_in(&mut third, "last", &[(Scheme, "(require library again) (next!)")]), Ok(Ok("5".into())));
+
+    // An image names the host functions its code calls, which have to be there.
+    let hostless = Arena::new(1 << 24, 3).mutate(|mc| image::load(mc, &bytes, []).map(|roots| roots.len()));
+    assert_eq!(hostless, Err(image::ImageError::Host("add".into())));
+    let mut cut = bytes.clone();
+    cut.truncate(bytes.len() / 2);
+    let cut = Arena::new(1 << 24, 3).mutate(|mc| image::load(mc, &cut, HOSTS.iter()).map(|roots| roots.len()));
+    assert_eq!(cut, Err(image::ImageError::Load(ragwort_types::gc::image::LoadError::Malformed)));
+}
+
+#[test]
 fn structs_provided_without_their_constructor_are_only_matched() {
     use ragwort_native::LowerErrorKind;
     use ragwort_scheme::ExpandErrorKind;

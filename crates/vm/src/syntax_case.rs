@@ -9,6 +9,7 @@
 
 use std::ops::Range;
 
+use ragwort_types::Wire;
 use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Value};
 use ragwort_types::pair::{Pair, Pairs};
 use ragwort_types::syntax::{Syntax, SyntaxKind};
@@ -22,7 +23,7 @@ use crate::syntax;
 
 /// A pattern, its literals and data the items of the [`SyntaxPattern`] it's in. Its parts are
 /// nodes of the [`PatternShape`] it's in, by index, and lists of them its ranges of `lists`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Wire)]
 pub enum Pattern {
     /// `_`.
     Any,
@@ -38,14 +39,14 @@ pub enum Pattern {
 }
 
 /// A pattern under an ellipsis, and the slots of its variables.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Wire)]
 pub struct Repeat {
     pub each: u32,
     pub slots: Range<u32>,
 }
 
 /// A pattern, its last node, the nodes of its parts before it, and how many variables it has.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Wire)]
 pub struct PatternShape {
     pub nodes: Vec<Pattern>,
     pub lists: Vec<u32>,
@@ -73,7 +74,7 @@ impl PatternShape {
 
 /// A template, its constants the items of the [`SyntaxTemplate`] it's in. Its parts are nodes of
 /// the [`TemplateShape`] it's in, by index, and its items a range of its `items`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Wire)]
 pub enum Template {
     /// The syntax in this item.
     Const(u32),
@@ -86,7 +87,7 @@ pub enum Template {
 
 /// An item of a list or vector template, made once for each match of the pattern variables in
 /// it under `ellipses` ellipses, which are in `slots`, a range of the shape's.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Wire)]
 pub struct Item {
     pub template: u32,
     pub ellipses: u32,
@@ -95,7 +96,7 @@ pub struct Item {
 
 /// A template, its last node, the nodes of its parts before it, and how many ellipses each
 /// pattern variable it's passed is under in its pattern.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Wire)]
 pub struct TemplateShape {
     pub nodes: Vec<Template>,
     pub items: Vec<Item>,

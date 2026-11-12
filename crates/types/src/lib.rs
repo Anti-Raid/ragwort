@@ -5,7 +5,8 @@
 extern crate self as ragwort_types;
 
 pub use gc::Error;
-pub use ragwort_derive::named;
+pub use ragwort_derive::{Wire, named};
+pub use wire::Wire;
 
 /// A name none of an enum's variants has, from the `FromStr` that [`named!`] writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,3 +22,4 @@ pub mod string;
 pub mod symbol;
 pub mod syntax;
 pub mod vector;
+pub mod wire;

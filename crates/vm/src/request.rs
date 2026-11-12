@@ -9,7 +9,7 @@
 //! coroutines. The default prompt tag's handler is the prelude's.
 
 use ragwort_types::gc::Value;
-use ragwort_types::named;
+use ragwort_types::{Wire, named};
 
 use crate::Fault;
 use crate::args::Args;
@@ -19,7 +19,7 @@ use crate::prompts::{self, tag_of};
 
 named! {
     #[repr(u16)]
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
     pub enum Request {
         /// `(apply f x ... list)`: calls `f` with the `x`s, then the elements of `list`: as many as
         /// fill `f`'s required parameters, the rest as its rest list, so a list of any length fits.

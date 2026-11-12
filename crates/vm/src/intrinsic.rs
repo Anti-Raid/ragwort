@@ -7,7 +7,7 @@
 
 use std::cmp::Ordering;
 
-use ragwort_types::Error;
+use ragwort_types::{Error, Wire};
 use ragwort_types::bytevector::{AnyBytevector, Bytevectors};
 use ragwort_types::gc::{Gc, Mutation, ScratchVec, Value};
 use ragwort_types::named;
@@ -26,7 +26,7 @@ use crate::objects::{self, BoxFields, Condition, ConditionFields, KeywordProcedu
 named! {
     #[repr(u16)]
     #[data(Traits)]
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Wire)]
     pub enum Intrinsic {
         /// `+`: fixnums are added in place, anything else by the generic add.
         Add = ("+", any(FOLD | REORDER | TRUTHY | COMMUTE)),

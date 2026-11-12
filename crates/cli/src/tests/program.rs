@@ -73,6 +73,14 @@ fn code_requires_the_modules_the_command_line_names() {
     let mut program = Program::new(library(&root)).unwrap();
     assert_eq!(eval(&mut program, "(require lib/foo lib/text) (list (greet (make-user \"ann\" 3)) (twice 21))"), values(&["(\"ann!\" 42)"]));
     assert_eq!(eval(&mut program, "(require lib/text) (user \"ann\" 3)"), Err(vec!["<input>:1:21: a struct whose constructor its module doesn't provide".to_string()]));
+    // A module an input requires by name is there for the inputs after it, till they define
+    // what it does.
+    assert_eq!(eval(&mut program, "(twice 4)"), values(&["8"]));
+    assert_eq!(eval(&mut program, "(define (twice x) 'mine) (twice 4)"), values(&["mine"]));
+    assert_eq!(eval(&mut program, "(list (twice 4) (shout \"a\"))"), values(&["(mine \"a!\")"]));
+    let mut filtered = Program::new(library(&root)).unwrap();
+    assert_eq!(eval(&mut filtered, "(require (only-in lib/text twice)) (twice 4)"), values(&["8"]));
+    assert_eq!(eval(&mut filtered, "(twice 4)"), Err(vec!["<input>:1:2: a name nothing defines".to_string()]));
     let main = file(&root, "main.rg", "(require lib/foo lib/text)\n(define made (make-user \"bo\" 1))\n(greet made)\n(twice 2)");
     assert_eq!(Program::new(library(&root)).unwrap().run_file(&main, true), Ok(()));
     let failing = file(&root, "failing.rg", "(require lib/text)\n(twice 'two)");
@@ -140,4 +148,35 @@ fn compiling_lists_the_bytecode_of_each_module() {
     program.list();
     assert_eq!(program.run_file(&wrong, false), Err(vec![format!("{}:1:14: a name nothing defines", wrong.display())]));
     assert_eq!(program.take_listing(), "");
+}
+
+#[test]
+fn an_image_starts_a_program_from_the_modules_it_holds() {
+    let root = scratch("images");
+    let mut program = Program::new(library(&root)).unwrap();
+    assert_eq!(program.load_all(), Ok(()));
+    let bytes = program.save_image().unwrap();
+    // Nothing is read from the folders again: the modules are the image's.
+    std::fs::remove_dir_all(root.join("text")).unwrap();
+    std::fs::remove_dir_all(root.join("foo")).unwrap();
+    let mut loaded = Program::from_image(Vec::new(), &bytes).unwrap();
+    assert_eq!(eval(&mut loaded, "(require lib/foo lib/text) (list (greet (make-user \"ann\" 3)) (twice 21))"), values(&["(\"ann!\" 42)"]));
+    assert_eq!(eval(&mut loaded, "(list display (twice 1))").map(|written| written.len()), Ok(1));
+    let main = file(&root, "main.rg", "(require lib/foo lib/text)\n(greet (make-user \"bo\" 1))\n(twice 'two)");
+    assert_eq!(Program::from_image(Vec::new(), &bytes).unwrap().run_file(&main, true), Err(vec!["uncaught: #<error WrongType>".to_string()]));
+
+    // Modules from folders go on top, and the two make another image.
+    file(&root, "extra/e.rg", "(require lib/text)\n(provide thrice)\n(define (thrice x) (+ x (twice x)))");
+    let mut more = Program::from_image(vec![dir("extra", &root.join("extra"))], &bytes).unwrap();
+    assert_eq!(more.load_all(), Ok(()));
+    let both = more.save_image().unwrap();
+    let mut last = Program::from_image(Vec::new(), &both).unwrap();
+    assert_eq!(eval(&mut last, "(require extra) (thrice 5)"), values(&["15"]));
+
+    let clash = Program::from_image(vec![dir("lib/text", &root)], &bytes).err();
+    assert_eq!(clash, Some(vec!["the module `lib/text` is in the image already".to_string()]));
+    assert_eq!(Program::from_image(Vec::new(), b"not an image").err(), Some(vec!["not a ragwort image, or one that's damaged".to_string()]));
+    let mut other = bytes.clone();
+    other[8] ^= 1;
+    assert_eq!(Program::from_image(Vec::new(), &other).err(), Some(vec!["the image was made by another build of ragwort".to_string()]));
 }

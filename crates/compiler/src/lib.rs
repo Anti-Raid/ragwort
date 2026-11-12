@@ -50,6 +50,7 @@ use std::fmt;
 
 use ragwort_alloc::Arena;
 
+use ragwort_types::Wire;
 use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Value};
 use ragwort_vm::objects::Module;
 use ragwort_vm::{HostDef, Intrinsic, Request};
@@ -66,7 +67,7 @@ pub enum Place {
     Slot { slot: u32, checked: bool },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
 pub enum Prim {
     Intrinsic(Intrinsic),
     Request(Request),
@@ -78,7 +79,7 @@ pub enum Prim {
 
 /// What a [`Prim::Slot`] does: a load takes no arguments and a store one, its value. A checked
 /// one faults if the variable isn't defined yet.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
 pub enum SlotOp {
     Load,
     LoadChecked,

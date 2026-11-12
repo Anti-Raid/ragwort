@@ -11,7 +11,10 @@
 
 use crate::hash::{HashMap, HashSet};
 
+use ragwort_types::Wire;
+use ragwort_types::gc::image::{Kind, LoadError, freeze};
 use ragwort_types::gc::{Gc, Immediate, Mutation, OutOfMemory, Value};
+use ragwort_types::wire::{Malformed, Reader, Writer, mix, shape_of};
 use ragwort_types::string::{Strings, chars};
 use ragwort_types::symbol::{Symbol, Symbols};
 use ragwort_vm::objects::{Module, ModuleFields};
@@ -42,8 +45,72 @@ impl Interface {
     }
 }
 
+/// A module's exports are saved in the order of their names.
+impl Wire for Interface {
+    const SHAPE: u64 = shape_of("Interface");
+
+    fn write(&self, out: &mut Writer) {
+        let mut exports: Vec<(&Box<str>, &Export)> = self.exports.iter().collect();
+        exports.sort_by_key(|&(name, _)| name);
+        out.length(exports.len());
+        for (name, export) in exports {
+            name.write(out);
+            export.write(out);
+        }
+    }
+
+    fn read(input: &mut Reader<'_>) -> Result<Self, Malformed> {
+        let mut exports = HashMap::default();
+        for _ in 0..input.length()? {
+            let name = Box::<str>::read(input)?;
+            exports.insert(name, Export::read(input)?);
+        }
+        Ok(Self { exports })
+    }
+}
+
+/// Saves what a module's compiler knows of it: its [`Interface`], or nothing, for a module
+/// that isn't finished. What something else has put there isn't saved.
+fn save_interface(value: &dyn std::any::Any, out: &mut Writer) -> bool {
+    let Some(held) = value.downcast_ref::<Box<dyn std::any::Any>>() else { return false };
+    if let Some(interface) = held.downcast_ref::<Interface>() {
+        out.u8(1);
+        interface.write(out);
+        true
+    } else if held.is::<()>() {
+        out.u8(0);
+        true
+    } else {
+        false
+    }
+}
+
+fn load_interface<'gc>(mc: &Mutation<'gc>, input: &mut Reader<'_>, cost: usize) -> Result<u64, LoadError> {
+    let held: Box<dyn std::any::Any> = match input.u8()? {
+        0 => Box::new(()),
+        1 => Box::new(Interface::read(input)?),
+        _ => return Err(LoadError::Malformed),
+    };
+    Ok(freeze(mc, held, cost)?)
+}
+
+/// The kind of frozen value a module's interface is, for an image: see
+/// [`ragwort_types::gc::image`].
+pub const INTERFACE: Kind = Kind { save: save_interface, load: load_interface, shape: SHAPE };
+
+/// A number that changes when the form of anything in an [`Interface`] does.
+const SHAPE: u64 = {
+    let shapes = [Interface::SHAPE, Export::SHAPE, StructDef::SHAPE, Field::SHAPE, Inline::SHAPE, Template::SHAPE, Prim::SHAPE, crate::SlotOp::SHAPE];
+    let (mut shape, mut i) = (0, 0);
+    while i < shapes.len() {
+        shape = mix(shape, shapes[i]);
+        i += 1;
+    }
+    shape
+};
+
 /// One of a module's variables, as it exports it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
 pub struct Export {
     pub slot: u32,
     /// Whether its module assigns it, so it's read as it is when code reads it.
@@ -58,14 +125,14 @@ pub struct Export {
 }
 
 /// A field of a struct type, as code that uses the type knows it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
 pub struct Field {
     pub name: Box<str>,
     pub mutable: bool,
 }
 
 /// A struct type, as code that uses its name knows it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
 pub struct StructDef {
     /// The variable of its module that holds the type.
     pub kind: u32,
@@ -282,7 +349,7 @@ impl<L: Copy> RequireSpec<L> {
 /// and whose only variables are its parameters, the locals it binds, and variables of its own
 /// module that are never assigned, which a module that inlines it has by their values. It calls
 /// intrinsics and requests, which mean the same in any module, and procedure values.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
 pub struct Inline {
     params: u32,
     /// How many of the last parameters a call can leave out, which it passes as unsupplied.
@@ -296,7 +363,7 @@ pub struct Inline {
     linear: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
 enum Template {
     Param(u32),
     /// A local the body binds, by the order its `let`s bind them in.

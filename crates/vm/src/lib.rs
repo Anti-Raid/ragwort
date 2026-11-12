@@ -3,6 +3,7 @@
 mod args;
 mod coroutine;
 mod equal;
+pub mod image;
 pub mod frame;
 mod intrinsic;
 pub mod keyword;

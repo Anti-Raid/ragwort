@@ -4,6 +4,12 @@
 //! from its folder the first time code requires it, and runs it then, since the code that
 //! requires it is compiled against what it defines.
 //!
+//! # Images
+//!
+//! [`Program::save_image`] saves the symbols, the prelude and every module loaded, by name,
+//! and [`Program::from_image`] starts from them: see [`ragwort_modules_core::image`]. The
+//! modules of an image have run, so they aren't loaded from their folders again.
+//!
 //! # The REPL
 //!
 //! Each input is a module of its own that provides everything it defines, and requires
@@ -11,6 +17,8 @@
 //!
 //! - A definition is there for the inputs after it, and one of the same name later takes its
 //!   place for the inputs after that.
+//! - A module an input requires by its name alone, as `(require lib/text)` does, is there for
+//!   the inputs after it too. One required through `only-in` or the like is for that input.
 //! - An input can't `set!` a variable an earlier one defined, as no module can one it requires.
 //! - A macro lasts for the input that defines it.
 
@@ -22,12 +30,16 @@ use std::hash::{BuildHasher, Hasher, RandomState};
 use std::path::{Path, PathBuf};
 
 use ragwort_compiler::module::{Loaded, Resolver};
+use ragwort_modules_core::image::{self, ImageError};
 use ragwort_modules_core::{Error, File, Language, Located, Source, load_located, prelude};
 use ragwort_printer_scheme::{Mode, to_string};
 use ragwort_reader_scheme::{ErrorKind, Reader};
+use ragwort_types::gc::image::{LoadError, SaveError};
 use ragwort_types::gc::{Arena, Gc, Mutation, Root, Value, ValueRoot};
-use ragwort_types::symbol::Symbols;
-use ragwort_types::syntax::SyntaxSession;
+use ragwort_types::pair::Pairs;
+use ragwort_types::string::{Strings, chars, from_str};
+use ragwort_types::symbol::{Symbol, Symbols};
+use ragwort_types::syntax::{Syntax, SyntaxKind, SyntaxSession};
 use ragwort_vm::objects::Module;
 use ragwort_vm::{Fault, HostDef, MIN_SEGMENT, Machine, Outcome};
 
@@ -72,8 +84,39 @@ pub struct Program {
     symbols: ValueRoot,
     prelude: Root<Module>,
     modules: Modules,
-    /// The modules a REPL input requires implicitly: `repl`, then each input before it.
+    /// The modules a REPL input requires implicitly: `repl`, then each input before it, and
+    /// each module one of them required by name, which are `required`.
     inputs: Vec<Root<Module>>,
+    required: Vec<String>,
+}
+
+/// The text of `node`, if it's an identifier or a string.
+fn name_of<'gc>(mc: &Mutation<'gc>, node: Syntax<'gc>) -> Option<String> {
+    let (strings, datum) = (Strings::new(mc), node.datum(mc));
+    let name = match node.kind(mc)? {
+        SyntaxKind::Identifier => Symbol::of(datum)?.name(mc),
+        SyntaxKind::Literal => strings.string(datum)?,
+        _ => return None,
+    };
+    Some(chars(&strings, name).collect())
+}
+
+/// The modules that `text`'s forms require by name alone, as `(require lib/text "other")`
+/// does two.
+fn required_by<'gc>(mc: &Mutation<'gc>, symbols: Symbols<'gc>, text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let Ok(session) = SyntaxSession::new(mc, text) else { return names };
+    let Ok(reader) = Reader::new(mc, symbols, &session) else { return names };
+    for node in reader.flatten() {
+        if node.kind(mc) != Some(SyntaxKind::List) {
+            continue;
+        }
+        let mut items = Pairs::new(mc).elements(node.datum(mc)).filter_map(Syntax::of);
+        if items.next().and_then(|head| name_of(mc, head)).as_deref() == Some("require") {
+            names.extend(items.filter_map(|spec| name_of(mc, spec)));
+        }
+    }
+    names
 }
 
 /// The one-based line and column of byte `offset` of `text`.
@@ -267,6 +310,32 @@ fn start<'gc>(mc: &Mutation<'gc>, modules: &mut Modules) -> Result<(ValueRoot, R
     Ok((ValueRoot::new(mc, symbols.value(mc)).map_err(oom)?, Root::new(mc, loaded.module).map_err(oom)?, Root::new(mc, repl).map_err(oom)?))
 }
 
+/// What an image holds, in a new arena's first step: the symbol table, the prelude, and each
+/// module with its name. A module the command line gives a folder too is an error.
+fn restore<'gc>(mc: &Mutation<'gc>, bytes: &[u8], modules: &mut Modules) -> Result<(ValueRoot, Root<Module>), String> {
+    let oom = |_| OUT_OF_MEMORY.to_string();
+    let roots = image::load(mc, bytes, hosts::HOSTS.iter()).map_err(|e| match e {
+        ImageError::Host(name) => format!("the image calls the host function `{name}`, which this ragwort doesn't have"),
+        ImageError::Load(LoadError::Stamp) => "the image was made by another build of ragwort".to_string(),
+        ImageError::Load(LoadError::OutOfMemory) => OUT_OF_MEMORY.to_string(),
+        ImageError::Load(_) => "not a ragwort image, or one that's damaged".to_string(),
+    })?;
+    let damaged = || "an image that holds something other than modules".to_string();
+    let [symbols, prelude, named @ ..] = roots.as_slice() else { return Err(damaged()) };
+    let prelude = prelude.downcast::<Module>(mc).ok_or_else(damaged)?;
+    let strings = Strings::new(mc);
+    for pair in named.chunks(2) {
+        let &[name, module] = pair else { return Err(damaged()) };
+        let name: String = chars(&strings, strings.string(name).ok_or_else(damaged)?).collect();
+        if modules.dirs.iter().any(|dir| dir.name == name) {
+            return Err(format!("the module `{name}` is in the image already"));
+        }
+        let module = module.downcast::<Module>(mc).ok_or_else(damaged)?;
+        modules.loaded.push((name, Root::new(mc, module).map_err(oom)?));
+    }
+    Ok((ValueRoot::new(mc, *symbols).map_err(oom)?, Root::new(mc, prelude).map_err(oom)?))
+}
+
 /// Calls `thunk` and runs it to its end, a step at a time, so the collector keeps up. Its
 /// value goes to `out`, written out, unless it's void.
 fn run(arena: &mut Arena, thunk: &ValueRoot, mut out: Option<&mut dyn FnMut(&str)>) -> Result<(), String> {
@@ -300,7 +369,40 @@ impl Program {
         let mut arena = Arena::new(HEAP, 0);
         let mut modules = Modules { dirs, loaded: Vec::new(), loading: Vec::new(), errors: Vec::new(), listing: None };
         let (symbols, prelude, repl) = arena.mutate(|mc| start(mc, &mut modules)).map_err(|message| vec![message])?;
-        Ok(Self { arena, symbols, prelude, modules, inputs: vec![repl] })
+        Ok(Self { arena, symbols, prelude, modules, inputs: vec![repl], required: Vec::new() })
+    }
+
+    /// A program that starts from what the image `bytes` holds, and can require the modules of
+    /// `dirs` besides.
+    pub fn from_image(dirs: Vec<ModuleDir>, bytes: &[u8]) -> Result<Self, Vec<String>> {
+        let mut arena = Arena::new(HEAP, 0);
+        let mut modules = Modules { dirs, loaded: Vec::new(), loading: Vec::new(), errors: Vec::new(), listing: None };
+        let (symbols, prelude) = arena.mutate(|mc| restore(mc, bytes, &mut modules)).map_err(|message| vec![message])?;
+        let repl = modules.loaded.iter().find(|(name, _)| name == hosts::NAME).map(|(_, module)| module.clone());
+        let Some(repl) = repl else { return Err(vec![format!("an image without the `{}` module", hosts::NAME)]) };
+        Ok(Self { arena, symbols, prelude, modules, inputs: vec![repl], required: Vec::new() })
+    }
+
+    /// The symbols, the prelude and every module loaded, as an image for
+    /// [`Program::from_image`].
+    pub fn save_image(&mut self) -> Result<Vec<u8>, Vec<String>> {
+        let Self { arena, symbols, prelude, modules, .. } = self;
+        arena.collect();
+        let saved = arena.mutate(|mc| {
+            let strings = Strings::new(mc);
+            let mut roots = vec![symbols.get(mc).ok()?, Value::object(mc, prelude.get(mc).ok()?)];
+            for (name, module) in &modules.loaded {
+                roots.push(from_str(&strings, name).ok()?.value());
+                roots.push(Value::object(mc, module.get(mc).ok()?));
+            }
+            Some(image::save(mc, &roots))
+        });
+        match saved {
+            None => Err(vec![OUT_OF_MEMORY.to_string()]),
+            Some(Ok(bytes)) => Ok(bytes),
+            Some(Err(SaveError::Host(_) | SaveError::Frozen(_))) => Err(vec!["a module holds a value of the host's, which an image can't hold".to_string()]),
+            Some(Err(SaveError::Unnumbered | SaveError::Busy)) => Err(vec!["a module holds a value that an image can't hold".to_string()]),
+        }
     }
 
     /// Keeps the bytecode of each module loaded from here on, for [`Program::take_listing`].
@@ -366,7 +468,7 @@ impl Program {
     /// Runs `text` as the REPL's next input, giving `out` the value of each of its forms,
     /// written out, as it's made.
     pub fn eval(&mut self, text: &str, out: &mut dyn FnMut(&str)) -> Result<(), Vec<String>> {
-        let Self { arena, symbols, prelude, modules, inputs } = self;
+        let Self { arena, symbols, prelude, modules, inputs, required } = self;
         let name = format!("input-{}", inputs.len());
         let file = |text: &str| SourceFile { path: "<input>".into(), text: text.to_string(), language: Language::Scheme };
         let files = [file(text), file("(provide (all-defined-out))")];
@@ -375,9 +477,16 @@ impl Program {
             let implicit = inputs.iter().map(|input| input.get(mc).ok()).collect::<Option<Vec<_>>>()?;
             let loaded = load_module(mc, base, modules, &name, &[], &files, &implicit)?;
             let thunks = loaded.thunks.iter().map(|&thunk| ValueRoot::new(mc, thunk).ok()).collect::<Option<Vec<_>>>()?;
-            Some((thunks, Root::new(mc, loaded.module).ok()?))
+            Some((thunks, Root::new(mc, loaded.module).ok()?, required_by(mc, base.symbols, text)))
         });
-        let Some((thunks, module)) = loaded else { return Err(std::mem::take(&mut modules.errors)) };
+        let Some((thunks, module, names)) = loaded else { return Err(std::mem::take(&mut modules.errors)) };
+        for name in names {
+            let found = modules.loaded.iter().find(|(loaded, _)| *loaded == name);
+            if let Some((_, module)) = found.filter(|_| !required.contains(&name)) {
+                inputs.push(module.clone());
+                required.push(name);
+            }
+        }
         inputs.push(module);
         for thunk in &thunks {
             run(arena, thunk, Some(&mut *out)).map_err(|message| vec![message])?;

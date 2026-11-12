@@ -1,7 +1,7 @@
 //! The instruction set. Registers are `u8`s, slots of the current frame's window; jumps are
 //! relative to the instruction after them.
 
-use ragwort_types::{Error, named};
+use ragwort_types::{Error, Wire, named};
 use ragwort_types::gc::{Frame, Gc, Mutation, OutOfMemory, Slots, Value, WINDOW};
 use ragwort_types::constant::Constants;
 use ragwort_types::num::NumError;
@@ -19,7 +19,7 @@ mod tests;
 named! {
     /// One instruction. Every variant fits in 8 bytes: an opcode, registers, and up to a 32-bit
     /// index or offset.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
     pub enum Op {
         /// Move contents of register `src` to `dst`
         Move { dst: u8, src: u8 } = "move",
@@ -125,7 +125,7 @@ named! {
 const _: () = assert!(size_of::<Op>() == 8);
 
 /// Where a new closure's upvalue comes from, in its code's capture list.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
 pub enum Capture {
     /// A register of the frame making the closure, read once all of a `NewClosure`'s closures
     /// are in theirs.
@@ -204,7 +204,7 @@ pub enum Control {
 
 /// Why an instruction couldn't run. All but the fatal ones are raised in the program, as a
 /// `Condition`, and end the run only if no handler takes them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
 pub enum Fault {
     /// The bytecode broke a rule the compiler keeps: a constant or upvalue that isn't there,
     /// registers past the frame, or an intrinsic or request passed a number of arguments it

@@ -3,6 +3,7 @@
 
 mod named;
 mod objects;
+mod wire;
 
 /// Declares a group of `ragwort_types::gc` object types, with typed fields and an enum over the
 /// group. See that crate's docs for the syntax and what's generated.
@@ -34,4 +35,12 @@ pub fn objects(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
 #[proc_macro]
 pub fn named(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     named::expand(input.into()).unwrap_or_else(syn::Error::into_compile_error).into()
+}
+
+/// Writes `ragwort_types::wire::Wire` for a struct or an enum whose fields all have it: the
+/// fields in order, after the variant's place for an enum. Its `SHAPE` is made of the names
+/// and types of its fields and variants, so it changes when they do.
+#[proc_macro_derive(Wire)]
+pub fn wire(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    wire::expand(input.into()).unwrap_or_else(syn::Error::into_compile_error).into()
 }

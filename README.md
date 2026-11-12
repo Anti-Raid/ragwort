@@ -9,6 +9,7 @@ A (fairly) simple GC'd scheme-like language for defining Discord bots etc. in An
 - ``ragwort [name=folder]... entry.rg`` runs a file. ``name=folder`` makes the files in ``folder`` the module ``name``, which code gets with ``(require name)``; ``=folder`` names the module as the folder.
 - ``ragwort [name=folder]...`` opens a REPL, which prints the value of each form.
 - ``ragwort compile [name=folder]... [entry.rg]`` compiles the modules and the entry point and prints their bytecode. The modules run, since code is compiled against what the modules it requires define; the entry point doesn't.
+- ``ragwort compile -o core.img [name=folder]...`` compiles and runs the modules and saves them as an image. Using ``--image core.img`` with any of the commands starts from the snapshotted image holds so ``ragwort --image core.img bot.rg`` runs ``bot.rg`` without compiling or rerunning the snapshotted modules again.
 
 A ``.rg`` file is Scheme and a ``.rgn`` file is native ragwort. ``(require repl)`` gives ``display``, ``write`` and ``newline``.
 

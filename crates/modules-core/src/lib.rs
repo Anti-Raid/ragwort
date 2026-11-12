@@ -5,6 +5,8 @@
 //! refers to what the others define at the top level by name, but for what a Scheme macro defines
 //! hygienically, and a module provides what any of them define.
 
+pub mod image;
+
 #[cfg(test)]
 #[path = "tests/modules.rs"]
 mod tests;

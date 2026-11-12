@@ -170,6 +170,7 @@ use ragwort_gc_region::Region;
 
 mod frozen;
 mod budget;
+pub mod image;
 #[doc(hidden)]
 pub mod raw;
 mod root;

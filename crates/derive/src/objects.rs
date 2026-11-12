@@ -224,6 +224,8 @@ pub(crate) fn expand(input: TokenStream) -> syn::Result<TokenStream> {
             pub const BASE: u16 = #base;
             /// One past the group's last type number, where a group declared `after` it starts.
             pub const END: u16 = Self::BASE + #count;
+            /// How the collector sees each of the group's types, in order.
+            pub const DESCS: &'static [&'static #w::Desc] = &[#(&<#names as #w::Object>::DESC),*];
         }
 
         #[allow(dead_code)]
