@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/alloc",
+    "crates/cli",
     "crates/compiler",
     "crates/derive",
     "crates/gc-region",

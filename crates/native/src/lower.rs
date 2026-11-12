@@ -1,6 +1,7 @@
 //! Lowering: native ragwort's syntax to core forms.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use ragwort_compiler::keyword::{self, CallShape, Fresh};
 use ragwort_compiler::module::{Binding, Field, Filter, Import, ModuleBuilder, ModuleError, RequireSpec, Resolver, SpecError, Unusable};
@@ -75,6 +76,38 @@ pub struct LowerError {
     pub start: u32,
     pub end: u32,
 }
+
+impl fmt::Display for LowerErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            LowerErrorKind::NotAForm => "a list that doesn't start with a form's name",
+            LowerErrorKind::BadShape => "a form with the wrong parts",
+            LowerErrorKind::Duplicate => "a name bound twice",
+            LowerErrorKind::Unbound => "a name nothing defines",
+            LowerErrorKind::Conflict => "a name both defined and required",
+            LowerErrorKind::Immutable => "an assignment of an import",
+            LowerErrorKind::Definition => "a definition that isn't at the top level",
+            LowerErrorKind::Resolve => "a module that can't be found",
+            LowerErrorKind::NotProvided => "a name the module doesn't provide",
+            LowerErrorKind::NotDefined => "a provide of a name that isn't defined",
+            LowerErrorKind::Uninitialized => "an export of a module that hasn't defined it yet",
+            LowerErrorKind::NoConstructor => "a struct whose constructor its module doesn't provide",
+            LowerErrorKind::UnknownIntrinsic => "an intrinsic the code can't name",
+            LowerErrorKind::UnknownHost => "a host function the module wasn't given",
+            LowerErrorKind::Arity => "an intrinsic or host call with the wrong number of arguments",
+            LowerErrorKind::Unsupported => "syntax native ragwort doesn't have",
+            LowerErrorKind::Arena(_) => "running out of memory",
+        })
+    }
+}
+
+impl fmt::Display for LowerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} at bytes {}..{}", self.kind, self.start, self.end)
+    }
+}
+
+impl std::error::Error for LowerError {}
 
 impl From<Error> for LowerError {
     fn from(e: Error) -> Self {

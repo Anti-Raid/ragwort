@@ -88,9 +88,9 @@ impl ReadError {
     }
 }
 
-impl fmt::Display for ReadError {
+impl fmt::Display for ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let what = match self.kind {
+        f.write_str(match self {
             ErrorKind::UnexpectedClose => "a closing bracket with no list open",
             ErrorKind::Mismatched { .. } => "a list closed with the wrong bracket",
             ErrorKind::Unclosed => "a list, string or comment that's never closed",
@@ -109,8 +109,13 @@ impl fmt::Display for ReadError {
             ErrorKind::ForeignSession => "a session from another arena",
             ErrorKind::Arena(Error::OutOfMemory) => "running out of memory",
             ErrorKind::Arena(_) => "a value the arena couldn't make",
-        };
-        write!(f, "{what} at bytes {}..{}", self.start, self.end)
+        })
+    }
+}
+
+impl fmt::Display for ReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} at bytes {}..{}", self.kind, self.start, self.end)
     }
 }
 

@@ -137,9 +137,9 @@ impl From<ragwort_types::Error> for ExpandError {
     }
 }
 
-impl fmt::Display for ExpandError {
+impl fmt::Display for ExpandErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let what = match self.kind {
+        f.write_str(match self {
             ExpandErrorKind::BadSyntax => "bad syntax",
             ExpandErrorKind::Duplicate => "an identifier bound twice",
             ExpandErrorKind::Definition => "a definition where an expression goes",
@@ -156,8 +156,13 @@ impl fmt::Display for ExpandError {
             ExpandErrorKind::Transformer => "a macro's transformer that failed",
             ExpandErrorKind::Phase => "a macro's transformer that refers to a variable that doesn't exist yet",
             ExpandErrorKind::Arena(_) => "running out of memory",
-        };
-        write!(f, "{what} at bytes {}..{}", self.start, self.end)
+        })
+    }
+}
+
+impl fmt::Display for ExpandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} at bytes {}..{}", self.kind, self.start, self.end)
     }
 }
 

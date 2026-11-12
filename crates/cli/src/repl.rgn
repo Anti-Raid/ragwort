@@ -1,0 +1,4 @@
+(%provide display write newline)
+(%define display (%lambda (v) (%call-host display v)))
+(%define write (%lambda (v) (%call-host write v)))
+(%define newline (%lambda () (%call-host newline)))

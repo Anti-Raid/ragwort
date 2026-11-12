@@ -1,0 +1,24 @@
+[package]
+name = "ragwort-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ragwort"
+path = "src/main.rs"
+
+[dependencies]
+ragwort-types = { path = "../types", default-features = false }
+ragwort-vm = { path = "../vm", default-features = false }
+ragwort-compiler = { path = "../compiler", default-features = false }
+ragwort-reader-scheme = { path = "../scheme/reader", default-features = false }
+ragwort-printer-scheme = { path = "../scheme/printer", default-features = false }
+ragwort-modules-core = { path = "../modules-core", default-features = false }
+
+[features]
+default = ["mmap", "arena"]
+mmap = ["ragwort-types/mmap", "ragwort-vm/mmap", "ragwort-compiler/mmap", "ragwort-reader-scheme/mmap", "ragwort-printer-scheme/mmap", "ragwort-modules-core/mmap"]
+arena = ["ragwort-compiler/arena", "ragwort-modules-core/arena"]
+
+[lints]
+workspace = true

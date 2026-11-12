@@ -115,6 +115,14 @@ enum Form<'gc> {
     Native(Syntax<'gc>),
 }
 
+/// A [`load`] that failed: what's wrong, and which of the module's files it's in, by its place in
+/// [`Source::files`]. There's no file for what's wrong with what the module provides as a whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Located {
+    pub error: Error,
+    pub file: Option<usize>,
+}
+
 /// Builds the module `source` describes, interning names in `symbols`, and compiles each of its
 /// forms. It requires the `prelude` module, which has run, implicitly, and the modules `resolver`
 /// finds as it says.
@@ -125,18 +133,43 @@ pub fn load<'gc>(
     source: &Source<'_, 'gc>,
     resolver: &mut dyn Resolver<'gc>,
 ) -> Result<Loaded<'gc>, Error> {
+    load_located(mc, symbols, prelude, source, resolver).map_err(|failed| failed.error)
+}
+
+/// As [`load`], saying which file an error is in.
+pub fn load_located<'gc>(
+    mc: &Mutation<'gc>,
+    symbols: Symbols<'gc>,
+    prelude: Gc<'gc, Module>,
+    source: &Source<'_, 'gc>,
+    resolver: &mut dyn Resolver<'gc>,
+) -> Result<Loaded<'gc>, Located> {
+    let mut file = None;
+    load_from(mc, symbols, prelude, source, resolver, &mut file).map_err(|error| Located { error, file })
+}
+
+/// [`load`], keeping in `at` the file whose code it's working on.
+fn load_from<'gc>(
+    mc: &Mutation<'gc>,
+    symbols: Symbols<'gc>,
+    prelude: Gc<'gc, Module>,
+    source: &Source<'_, 'gc>,
+    resolver: &mut dyn Resolver<'gc>,
+    at: &mut Option<usize>,
+) -> Result<Loaded<'gc>, Error> {
     let mut expander = Expander::new(mc, symbols, prelude, source.name, source.hosts, source.implicit)?;
     let mut lowerer = None;
     let mut forms = Vec::new();
     let mut tops = Vec::new();
-    for file in source.files {
+    for (k, file) in source.files.iter().enumerate() {
+        *at = Some(k);
         for node in Reader::new(mc, symbols, file.session)? {
             let node = node?;
             let first = u32::try_from(forms.len()).map_err(|_| OutOfMemory)?;
             match file.language {
                 Language::Scheme => {
                     expander.declare(node, first, &mut tops, resolver)?;
-                    forms.extend(tops.drain(..).map(Form::Scheme));
+                    forms.extend(tops.drain(..).map(|top| (k, Form::Scheme(top))));
                 }
                 Language::Native => {
                     let lowerer = match &mut lowerer {
@@ -144,18 +177,20 @@ pub fn load<'gc>(
                         None => lowerer.insert(Lowerer::new(mc, symbols, source.hosts, source.internals).map_err(LowerError::from)?),
                     };
                     lowerer.declare(expander.builder(), node, first, resolver)?;
-                    forms.push(Form::Native(node));
+                    forms.push((k, Form::Native(node)));
                 }
             }
         }
     }
+    *at = None;
     expander.provide()?;
     if let Some(lowerer) = &mut lowerer {
         lowerer.provide(expander.builder())?;
     }
     expander.builder().start(mc)?;
     let mut thunks = Vec::with_capacity(forms.len());
-    for (i, form) in forms.into_iter().enumerate() {
+    for (i, (k, form)) in forms.into_iter().enumerate() {
+        *at = Some(k);
         let i = u32::try_from(i).map_err(|_| OutOfMemory)?;
         let core = match form {
             Form::Scheme(top) => Some(expander.lower(top, i)?),
@@ -165,6 +200,7 @@ pub fn load<'gc>(
             thunks.push(expander.builder().compile(mc, &core)?);
         }
     }
+    *at = None;
     let module = expander.finish()?;
     Ok(Loaded { module, thunks })
 }
