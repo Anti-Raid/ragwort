@@ -1,20 +1,22 @@
-//! Intermediate representations for the micropass compiler pipeline.
+//! Intermediate representations (IRs) for the micropass compiler pipeline.
 //!
-//! Each pass either transforms an IR within the same grammar (`cp0: L2 -> L2`) or reduces the
-//! grammar by eliminating forms. Each is a table of nodes, which refer to their children by id,
-//! made by its module's `language!`, rather than a tree of boxes:
-//! - [`Core`](crate::Core) (`L0`): input from the expander/lowerer.
-//! - `L1`: module variables (`Place::Slot`) lowered to slot primitives; all variables are
-//!   lexical [`Var`]s.
-//! - `L2`: `Letrec` eliminated via Waddell–Sarkar–Dybvig fixing in favor of `Let`s of values
-//!   and of `Fix` groups (mutually recursive unassigned lambdas), `Seq`, and `Set`.
-//! - `L3`: assignment conversion boxes (`MakeBox`, `Unbox`, `SetBox`) the assigned variables a
-//!   closure or a re-entered continuation could see, after contification; the rest keep their
-//!   `Set`s, assigned in their frame's registers. `Join` and `Jump` come only from contification.
-//! - `L4`: closures converted; variable references are split into [`VarRef::Local`] and
-//!   [`VarRef::Upvalue`], and every closure carries its [`UpvalSource`] capture table.
-//! - `L5`: each function a graph of basic blocks in SSA form, with block parameters where paths
-//!   meet; see the `l5` module.
+//! Each pass either optimizes an IR within the same grammar (e.g. `cp0: L2 -> L2`) or lowers
+//! the language by eliminating specific syntactic forms. Each IR is represented as a flat arena
+//! table of nodes referencing children by numeric IDs (generated via the `language!` macro in each
+//! IR module) rather than as a heap-allocated tree of boxed structures:
+//! - [`Core`](crate::Core) (`L0`): Input AST produced by the expander and lowerer.
+//! - `L1`: Lowers module-level variable references (`Place::Slot`) into slot access primitives;
+//!   all variables are lexical [`Var`] identifiers.
+//! - `L2`: Eliminates `Letrec` via Waddell–Sarkar–Dybvig fixing into sequential `Let` bindings
+//!   of values, `Fix` groups (mutually recursive unassigned lambdas), sequences, and assignments.
+//! - `L3`: Performs assignment conversion, wrapping mutable variables accessed across closure or
+//!   continuation boundaries into explicit heap boxes (`MakeBox`, `Unbox`, `SetBox`) after contification.
+//!   Remaining assigned variables are mutated in place within frame registers via `Set`. Introduces
+//!   `Join` and `Jump` forms from contification.
+//! - `L4`: Performs closure conversion, partitioning variable references into [`VarRef::Local`]
+//!   and [`VarRef::Upvalue`], with every closure annotated with an [`UpvalSource`] capture table.
+//! - `L5`: Represents each function as a control flow graph of basic blocks in SSA form with block
+//!   parameters at merge points; see the `l5` module.
 
 #[macro_use]
 mod language;
@@ -24,7 +26,7 @@ pub(crate) mod l3;
 pub(crate) mod l4;
 
 use crate::Var;
-/// Fresh variable and lambda identifier generator threaded across passes.
+/// Generates fresh variable and lambda identifiers, threaded across compiler passes.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Supply {
     pub(crate) next_var: u32,
@@ -45,22 +47,22 @@ impl Supply {
     }
 }
 
-/// Where a closure's upvalue comes from in the immediately enclosing function.
+/// The origin of a closure's upvalue within its immediately enclosing function.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpvalSource {
-    /// A local variable of the enclosing function.
+    /// Sourced from a local variable in the enclosing function's frame.
     Local(Var),
-    /// Upvalue `index` of the enclosing function.
+    /// Sourced from upvalue slot `index` in the enclosing function's capture table.
     Upvalue(u32),
-    /// The enclosing function's own closure object (`frame::CLOSURE`, register 0).
+    /// Sourced from the enclosing function's own closure object (`frame::CLOSURE`, located in register 0).
     SelfClosure,
 }
 
-/// A resolved variable reference inside a closure-converted expression.
+/// A resolved variable reference within a closure-converted expression.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VarRef {
     Local(Var),
     Upvalue(u32),
-    /// The currently executing closure (`frame::CLOSURE`, register 0).
+    /// References the currently executing closure object (`frame::CLOSURE`, located in register 0).
     SelfClosure,
 }

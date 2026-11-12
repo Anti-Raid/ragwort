@@ -12,21 +12,20 @@ fn fix<'gc>(n: i64) -> Value<'gc> {
     Value::fixnum(n).unwrap()
 }
 
-/// One function of a test module: its arity, capture list and code.
+/// Definition of a single function within a test module, represented as `(arity, captures, bytecode_ops)`.
 type Func<'a> = (i64, &'a [Capture], &'a [Op]);
 
-/// Functions sharing a constant table of `constants`, then the functions themselves, so
-/// function `i` is constant `constants.len() + i`.
+/// Compiles functions that share a single constant table. The provided `constants` are placed first in the table, followed by the function closures themselves, such that function `i` is located at index `constants.len() + i`.
 fn module<'gc>(mc: &Mutation<'gc>, constants: &[Value<'gc>], funcs: &[Func<'_>]) -> Vec<Gc<'gc, Bytecode>> {
     module_in(mc, None, constants, funcs)
 }
 
-/// As [`module`], with the functions in a module of no variables calling `hosts`.
+/// Like [`module`], but sets up the functions within an owner module that has no module-level variables and exposes the specified host function definitions (`hosts`).
 fn module_calling<'gc>(mc: &Mutation<'gc>, constants: &[Value<'gc>], hosts: &'static [HostDef], funcs: &[Func<'_>]) -> Vec<Gc<'gc, Bytecode>> {
     module_in(mc, Some(crate::module::new(mc, Value::FALSE, &[], hosts).unwrap()), constants, funcs)
 }
 
-/// As [`module`], with the functions in `owner`.
+/// Like [`module`], but attaches the resulting bytecode functions to the specified owning `Module` (if provided).
 fn module_in<'gc>(mc: &Mutation<'gc>, owner: Option<Gc<'gc, Module>>, constants: &[Value<'gc>], funcs: &[Func<'_>]) -> Vec<Gc<'gc, Bytecode>> {
     let codes: Vec<_> = funcs
         .iter()
@@ -42,7 +41,7 @@ fn module_in<'gc>(mc: &Mutation<'gc>, owner: Option<Gc<'gc, Module>>, constants:
     codes
 }
 
-/// A constant that [`call`] and [`outcome`] make a prompt tag, the same one each time.
+/// Sentinel constant value (`i64::MIN`) that [`call`] and [`outcome`] map to a consistent, shared prompt tag object in the constant table.
 const TAG: i64 = i64::MIN;
 
 fn table<'gc>(mc: &Mutation<'gc>, constants: &[i64]) -> Vec<Value<'gc>> {
@@ -69,7 +68,7 @@ fn items<'gc>(mc: &Mutation<'gc>, mut v: Value<'gc>) -> Vec<i64> {
     out
 }
 
-/// What a task returned, as fixnums: each of a `MultiValue`'s, or the one value.
+/// Extracts the result of a completed task as a vector of `i64` fixnums, unpacking `MultiValue` instances or wrapping a single scalar return value.
 fn fixnums<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Vec<i64> {
     spread(mc, value).iter().map(|v| v.as_fixnum().unwrap()).collect()
 }
@@ -80,12 +79,12 @@ fn spread<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Vec<Value<'gc>> {
     (0..items.len()).map(|i| items.get(i)).collect()
 }
 
-/// The fault behind a raised condition.
+/// Retrieves the underlying [`Fault`] code from an active or raised [`Condition`] object.
 fn fault<'gc>(mc: &Mutation<'gc>, raised: Value<'gc>) -> Fault {
     *raised.downcast::<Condition>(mc).unwrap().fault(mc).unwrap()
 }
 
-/// Runs `machine` to the end within this step, going on past each pause.
+/// Runs `machine` to completion within a single GC step, automatically resuming execution through any intermediate [`Outcome::Paused`] states.
 fn to_end<'gc>(mc: &Mutation<'gc>, machine: &mut Machine) -> Result<Outcome<'gc>, Fault> {
     loop {
         match machine.run(mc)? {
@@ -95,8 +94,7 @@ fn to_end<'gc>(mc: &Mutation<'gc>, machine: &mut Machine) -> Result<Outcome<'gc>
     }
 }
 
-/// Calls `code` with `args` to the end, in one step. Lists come back as their digits, `(1 2 3)`
-/// as 123.
+/// Executes `code` with `args` to completion in a single GC step. Fixnum returns are preserved directly, while linked lists representing digit sequences (e.g. `(1 2 3)`) are flattened into integers (e.g. `123`).
 fn run<'gc>(mc: &Mutation<'gc>, code: Gc<'gc, Bytecode>, args: &[Value<'gc>]) -> Result<Vec<i64>, Fault> {
     let mut machine = Machine::new(mc, MIN_SEGMENT, closure(mc, code), args)?;
     let values = match to_end(mc, &mut machine)? {
@@ -108,8 +106,7 @@ fn run<'gc>(mc: &Mutation<'gc>, code: Gc<'gc, Bytecode>, args: &[Value<'gc>]) ->
     Ok(values.iter().map(|&v| if Pair::of(v).is_some() { digits(v) } else { v.as_fixnum().unwrap() }).collect())
 }
 
-/// Runs the machine to the end a step at a time, so the arena collects as it goes, and returns
-/// its values as fixnums, and how many runs it took.
+/// Steps the machine to completion across arena collection boundaries, allowing incremental GC between execution steps. Returns the final values as fixnums and the total number of execution steps required.
 fn finish(arena: &mut Arena, mut machine: Machine) -> Result<(Vec<i64>, usize), Fault> {
     for runs in 1.. {
         let done = arena.step(|mc| -> Result<_, Fault> {
@@ -127,7 +124,7 @@ fn finish(arena: &mut Arena, mut machine: Machine) -> Result<(Vec<i64>, usize), 
     unreachable!()
 }
 
-/// Calls function 0 of a module with `args` to the end, in one run.
+/// Initializes an arena and runs function 0 of the module with `args` to completion in a single execution step, returning the resulting values as fixnums.
 fn call(constants: &[i64], funcs: &[Func<'_>], args: &[i64]) -> Result<Vec<i64>, Fault> {
     let mut arena = Arena::new(1 << 24, 0);
     arena.mutate(|mc| {
@@ -143,7 +140,7 @@ fn call(constants: &[i64], funcs: &[Func<'_>], args: &[i64]) -> Result<Vec<i64>,
     })
 }
 
-/// Calls function 0 of a module to the end and hands its outcome to `check`.
+/// Initializes an arena, runs function 0 of the module to completion, and supplies the final [`Outcome`] to the provided `check` closure.
 fn outcome(constants: &[i64], funcs: &[Func<'_>], check: impl for<'gc> FnOnce(&Mutation<'gc>, Outcome<'gc>)) {
     let mut arena = Arena::new(1 << 24, 0);
     arena.mutate(|mc| {
@@ -154,7 +151,7 @@ fn outcome(constants: &[i64], funcs: &[Func<'_>], check: impl for<'gc> FnOnce(&M
     });
 }
 
-/// `(define (sum n) (if (eq? 0 n) 0 (+ n (sum (+ n -1)))))`, with constants `0` and `-1`.
+/// Bytecode implementation of recursive summation: `(define (sum n) (if (eq? 0 n) 0 (+ n (sum (+ n -1)))))`, referencing constant indices for `0` and `-1`.
 const SUM: &[Op] = &[
     Op::LoadConst { dst: 3, index: 0 },
     Op::Move { dst: 4, src: 1 },
@@ -182,7 +179,7 @@ fn deep_recursion_crosses_segments() {
 
 #[test]
 fn calls_start_past_the_callers_link() {
-    // A function of one argument has its link in register 2, so a call there would overwrite it.
+    // In a single-argument function, register 2 stores the caller's return continuation link; setting the call base to register 2 would clobber the link, so the VM rejects it with `Fault::Malformed`.
     let clobber = [Op::Move { dst: 2, src: 1 }, Op::Call { base: 2, args: 0 }, Op::Return { src: 1 }];
     assert_eq!(call(&[], &[(1, &[], &clobber)], &[0]), Err(Fault::Malformed));
 }
@@ -200,8 +197,8 @@ fn a_finished_machine_stays_finished() {
 
 #[test]
 fn runs_pause_so_the_arena_can_collect() {
-    // (let loop ((n 200000) (acc 0)) (if (eq? 0 n) acc (loop (+ n -1) (car (cons (+ acc 1) n))))):
-    // 200000 pairs of garbage, several times what the arena holds.
+    // Evaluates `(let loop ((n 200000) (acc 0)) (if (eq? 0 n) acc (loop (+ n -1) (car (cons (+ acc 1) n)))))`.
+    // This creates 200,000 short-lived cons pairs—exceeding arena capacity multiple times over—verifying that VM execution pauses allow garbage collection to reclaim memory.
     let main = [
         Op::NewClosure { dst: 2, count: 1, code: 5 },
         Op::LoadConst { dst: 3, index: 3 },
@@ -245,8 +242,7 @@ fn runs_pause_so_the_arena_can_collect() {
 
 #[test]
 fn rest_arguments_and_apply() {
-    // (lambda (a . rest) (cons a rest)), (lambda (a b c) (+ a b c)), then tail and non-tail
-    // (apply f x list).
+    // Tests variadic rest arguments `(lambda (a . rest) (cons a rest))` and fixed-arity calls `(lambda (a b c) (+ a b c))`, followed by both non-tail and tail invocations of `(apply f x list)`.
     let variadic: Func<'_> = (-2, &[], &[Op::TailCallIntrinsic { base: 1, args: 2, intrinsic: Cons }]);
     let exact: Func<'_> = (3, &[], &[Op::TailCallIntrinsic { base: 1, args: 3, intrinsic: Add }]);
     let tail_apply: Func<'_> = (3, &[], &[Op::TailCallRequest { base: 1, args: 3, request: Request::Apply }]);
@@ -280,7 +276,7 @@ fn rest_arguments_and_apply() {
 
 #[test]
 fn multiple_values_are_an_object() {
-    // (define (three) (values 1 2 3))
+    // Defines a procedure returning three values: `(define (three) (values 1 2 3))`.
     let three: Func<'_> = (
         0,
         &[],
@@ -294,7 +290,7 @@ fn multiple_values_are_an_object() {
     let funcs = |main: &'static [Op]| -> [Func<'static>; 2] { [(0, &[], main), three] };
     let constants = [1, 2, 3, 0];
 
-    // The task returns it; (+ 1 (three)) is a type error.
+    // Returning multiple values directly from a task succeeds and unpacks them; attempting to pass them to a single-value operation like `(+ 1 (three))` raises a type error.
     let tail = &[Op::NewClosure { dst: 3, count: 1, code: 5 }, Op::TailCall { base: 3, args: 0 }];
     assert_eq!(call(&constants, &funcs(tail), &[]), Ok(vec![1, 2, 3]));
     let add = &[
@@ -308,7 +304,7 @@ fn multiple_values_are_an_object() {
     ];
     assert_eq!(call(&constants, &funcs(add), &[]), Err(Fault::WrongType));
 
-    // (let ((v (three))) (if (values? v) (+ (values-length v) (values-ref v 0)) v))
+    // Inspects multiple values as a first-class object: `(let ((v (three))) (if (values? v) (+ (values-length v) (values-ref v 0)) v))`.
     let apart = &[
         Op::NewClosure { dst: 5, count: 1, code: 5 },
         Op::Call { base: 5, args: 0 },
@@ -329,23 +325,23 @@ fn multiple_values_are_an_object() {
     ];
     assert_eq!(call(&constants, &funcs(apart), &[]), Ok(vec![4]));
 
-    // (values) is an empty one.
+    // Calling `(values)` with zero arguments produces an empty multiple-values object.
     let none = &[Op::TailCallIntrinsic { base: 2, args: 0, intrinsic: Values }];
     assert_eq!(call(&constants, &funcs(none), &[]), Ok(vec![]));
 }
 
-/// Upvalues of a test's function 0 under the prelude: its procedures, and its prompt tag.
+/// Upvalue indices provided to function 0 when executing under the prelude, exposing core prelude procedures and the default prompt tag.
 const CALL_CC: u32 = 0;
 const WITH_HANDLER: u32 = 1;
 const RAISE_CONTINUABLE: u32 = 2;
 const RAISE: u32 = 3;
-/// What this VM leaves to native ragwort, written out in bytecode: a prompt with Racket's
-/// default handler, which calls the thunk an abort passes under the prompt again, `call/cc` in
-/// terms of it, and wrappers of the exception requests. Returns `run`, which calls a thunk under
-/// the prompt, and the upvalues of a test's function 0.
+/// Bytecode implementation of runtime prelude primitives that Ragwort delegates to native code:
+/// sets up a delimited prompt with Racket's default abort handler (which re-invokes an aborted thunk under the prompt),
+/// implements `call/cc` via delimited capture and abort, and wraps exception-handling requests.
+/// Returns `(run, upvalues)` where `run` evaluates a thunk under the prompt.
 fn prelude<'gc>(mc: &Mutation<'gc>) -> (Value<'gc>, Vec<Value<'gc>>) {
     let tag = Value::object(mc, Tag::new(mc, Value::VOID).unwrap());
-    // Constant 0 is the tag; function i is 1 + i.
+    // In the prelude constant table, index 0 is reserved for the prompt tag; functions are indexed at `1 + i`.
     let default_handler = [
         Op::LoadConst { dst: 3, index: 0 },
         Op::Move { dst: 4, src: 0 },
@@ -358,7 +354,8 @@ fn prelude<'gc>(mc: &Mutation<'gc>) -> (Value<'gc>, Vec<Value<'gc>>) {
         Op::Move { dst: 5, src: 1 },
         Op::TailCallRequest { base: 3, args: 3, request: Request::CallWithPrompt },
     ];
-    // (call/cc f): (capture tag (lambda (k) (f (lambda (v) (abort tag (lambda () (k v)))))))
+    // Delimited control encoding of `call/cc`:
+    // `(call/cc f) => (capture tag (lambda (k) (f (lambda (v) (abort tag (lambda () (k v)))))))`.
     let call_cc = [
         Op::LoadConst { dst: 3, index: 0 },
         Op::NewClosure { dst: 4, count: 1, code: 4 },
@@ -395,7 +392,7 @@ fn prelude<'gc>(mc: &Mutation<'gc>) -> (Value<'gc>, Vec<Value<'gc>>) {
     (close(1), vec![close(2), close(6), close(7), close(8), tag])
 }
 
-/// `thunk`, called with `handler` as what a raise calls.
+/// Executes `thunk` with `handler` installed as the exception handler for raises.
 fn with_raise_handler<'gc>(mc: &Mutation<'gc>, handler: Value<'gc>, thunk: Value<'gc>) -> Value<'gc> {
     let code = [
         Op::LoadConst { dst: 2, index: 0 },
@@ -405,8 +402,7 @@ fn with_raise_handler<'gc>(mc: &Mutation<'gc>, handler: Value<'gc>, thunk: Value
     closure(mc, module(mc, &[handler, thunk], &[(0, &[], &code)])[0])
 }
 
-/// Runs function 0 of a module under the prelude's prompt, with the prelude's procedures as its
-/// upvalues and its `raise` taking VM faults, and hands the outcome to `check`.
+/// Executes function 0 within the prelude's delimited prompt environment—supplying prelude procedures as upvalues and directing VM faults to `raise`—and passes the final [`Outcome`] to `check`.
 fn prelude_outcome(constants: &[i64], funcs: &[Func<'_>], check: impl for<'gc> FnOnce(&Mutation<'gc>, Outcome<'gc>)) {
     let mut arena = Arena::new(1 << 24, 0);
     arena.mutate(|mc| {
@@ -431,7 +427,8 @@ fn prelude_call(constants: &[i64], funcs: &[Func<'_>]) -> Vec<i64> {
 
 #[test]
 fn prompts_take_aborts() {
-    // (+ 1000 (call-with-prompt tag (lambda (a b) (+ a b)) (lambda () (+ 1 (abort tag 5 2)))))
+    // Tests aborting to a prompt handler with multiple arguments:
+    // `(+ 1000 (call-with-prompt tag (lambda (a b) (+ a b)) (lambda () (+ 1 (abort tag 5 2)))))` evaluates to 1007.
     let main = [
         Op::LoadConst { dst: 3, index: 0 },
         Op::NewClosure { dst: 4, count: 2, code: 6 },
@@ -458,10 +455,10 @@ fn prompts_take_aborts() {
     let with = |thunk: &[Op]| call(&constants, &[(0, &[], &main), (2, &[], &handler), (0, &[], thunk)], &[]);
     assert_eq!(with(&thunk), Ok(vec![1007]));
 
-    // A thunk that returns passes its value through the prompt.
+    // When a thunk enclosed in a prompt returns normally without aborting, its return value passes directly through the prompt.
     assert_eq!(with(&[Op::LoadConst { dst: 2, index: 4 }, Op::Return { src: 2 }]), Ok(vec![1001]));
 
-    // An abort to a tag with no prompt faults, and one to something that isn't a tag.
+    // Verifies that aborting to a tag without an active prompt or aborting to a non-tag value results in an appropriate fault.
     let fresh = [
         Op::CallIntrinsic { base: 3, args: 0, intrinsic: MakePromptTag },
         Op::LoadAcc { dst: 3 },
@@ -473,7 +470,8 @@ fn prompts_take_aborts() {
 
 #[test]
 fn composable_continuations_go_on_where_theyre_called() {
-    // (+ 1000 (call-with-prompt tag h (lambda () (+ 1 (capture tag (lambda (k) (+ (k 1) (k 2))))))))
+    // Tests invoking a captured delimited continuation `k` multiple times within the body:
+    // `(+ 1000 (call-with-prompt tag h (lambda () (+ 1 (capture tag (lambda (k) (+ (k 1) (k 2))))))))`.
     let main = [
         Op::LoadConst { dst: 3, index: 0 },
         Op::NewClosure { dst: 4, count: 2, code: 7 },
@@ -511,13 +509,12 @@ fn composable_continuations_go_on_where_theyre_called() {
     let constants = [TAG, 1000, 1, 2, 10, 0];
     let with = |f: &[Op]| call(&constants, &[(0, &[], &main), (-1, &[], &handler), (0, &[], &thunk), (1, &[], f)], &[]);
     assert_eq!(with(&twice), Ok(vec![1006]));
-    // (k 10) in tail position.
+    // Invokes captured continuation `(k 10)` in tail position.
     assert_eq!(with(&[Op::Move { dst: 3, src: 1 }, Op::LoadConst { dst: 4, index: 4 }, Op::TailCall { base: 3, args: 1 }]), Ok(vec![1012]));
 
-    // (let ((kb (box 0)))
-    //   (+ (call-with-prompt tag h (lambda () (+ 1 (capture tag (lambda (k) (set-box! kb k) 0)))))
-    //      ((unbox kb) 10)))
-    // k goes on after its prompt has returned, outside any prompt.
+    // Tests escaping and resuming a delimited continuation outside the lifetime of its original prompt:
+    // `(let ((kb (box 0))) (+ (call-with-prompt tag h (lambda () (+ 1 (capture tag (lambda (k) (set-box! kb k) 0))))) ((unbox kb) 10)))`.
+    // Verifies that `k` resumes execution correctly in the outer caller context without an enclosing prompt.
     let main = [
         Op::LoadConst { dst: 2, index: 5 },
         Op::CallIntrinsic { base: 2, args: 1, intrinsic: MakeBox },
@@ -549,7 +546,8 @@ fn composable_continuations_go_on_where_theyre_called() {
 
 #[test]
 fn marks_are_dropped_on_return_and_replaced_in_tail_position() {
-    // (values (with-mark key 1 (lambda () (mark-value key 0))) (mark-value key 0))
+    // Verifies continuation mark scoping:
+    // `(values (with-mark key 1 (lambda () (mark-value key 0))) (mark-value key 0))` yields `(1 0)`, showing that the mark is present during evaluation and cleared upon return.
     let main = [
         Op::LoadConst { dst: 3, index: 0 },
         Op::LoadConst { dst: 4, index: 1 },
@@ -566,8 +564,8 @@ fn marks_are_dropped_on_return_and_replaced_in_tail_position() {
     let constants = [TAG, 1, 0, 100_000, -1];
     assert_eq!(call(&constants, &[(0, &[], &main), (0, &[], &get)], &[]), Ok(vec![1, 0]));
 
-    // (with-mark key 1 (lambda () (call-with-prompt (make-prompt-tag) h (lambda () (mark-value key 0))))):
-    // marks are seen through prompts.
+    // Verifies that continuation marks set outside a prompt remain visible across prompt boundaries:
+    // `(with-mark key 1 (lambda () (call-with-prompt (make-prompt-tag) h (lambda () (mark-value key 0)))))` reads the outer mark value `1`.
     let main = [
         Op::LoadConst { dst: 3, index: 0 },
         Op::LoadConst { dst: 4, index: 1 },
@@ -584,8 +582,9 @@ fn marks_are_dropped_on_return_and_replaced_in_tail_position() {
     let funcs = [(0, &[][..], &main[..]), (0, &[], &inner), (-1, &[], &handler), (0, &[], &get)];
     assert_eq!(call(&constants, &funcs, &[]), Ok(vec![1]));
 
-    // (let loop ((n 100000)) (if (eq? 0 n) (mark-value key 0) (with-mark key n (lambda () (loop (+ n -1))))))
-    // Each mark replaces the last, so it runs in a small arena.
+    // Verifies tail-mark replacement behavior:
+    // `(let loop ((n 100000)) (if (eq? 0 n) (mark-value key 0) (with-mark key n (lambda () (loop (+ n -1))))))`.
+    // Each tail call replaces the current frame's continuation mark rather than allocating a new mark frame, executing in constant stack space within a small arena.
     let main = [Op::NewClosure { dst: 2, count: 1, code: 6 }, Op::LoadConst { dst: 3, index: 3 }, Op::TailCall { base: 2, args: 1 }];
     let looping = [
         Op::LoadConst { dst: 3, index: 2 },
@@ -620,8 +619,8 @@ fn marks_are_dropped_on_return_and_replaced_in_tail_position() {
 
 #[test]
 fn deep_continuations_come_back_in_chunks() {
-    // sum, but its base case is (capture tag (lambda (k) (set-box! kb k) 0)), under a prompt;
-    // main then calls k once with 1000: (let ((r (prompt (sum 3000)))) (if (first time) (k 1000) r)).
+    // Recursively evaluates `sum` down 3,000 stack frames and captures the entire multi-chunk continuation `k` at the base case.
+    // The driver routine then resumes `(k 1000)`, verifying that continuations spanning multiple stack chunks are captured and restored correctly.
     let sum = [
         Op::LoadConst { dst: 3, index: 0 },
         Op::Move { dst: 4, src: 1 },
@@ -694,7 +693,8 @@ fn deep_continuations_come_back_in_chunks() {
 
 #[test]
 fn call_cc_from_the_prelude() {
-    // (+ 1 (call/cc (lambda (k) (+ 100 (k 5)))))
+    // Standard `call/cc` test verifying that calling continuation `(k 5)` aborts the intervening computation `(+ 100 ...)`:
+    // `(+ 1 (call/cc (lambda (k) (+ 100 (k 5)))))` evaluates to 6.
     let main = [
         Op::LoadUpvalue { dst: 4, index: CALL_CC },
         Op::NewClosure { dst: 5, count: 1, code: 4 },
@@ -717,10 +717,9 @@ fn call_cc_from_the_prelude() {
     ];
     assert_eq!(prelude_call(&[1, 5, 100], &[(0, &[], &main), (1, &[], &f)]), [6]);
 
-    // (let ((n (box 0)) (kb (box 0)))
-    //   (let ((v (call/cc (lambda (c) (set-box! kb c) 0))))
-    //     (set-box! n (+ (unbox n) 1))
-    //     (if (eq? (unbox n) 3) v ((unbox kb) (+ v 10)))))
+    // Tests re-entering a `call/cc` continuation multiple times:
+    // `(let ((n (box 0)) (kb (box 0))) (let ((v (call/cc (lambda (c) (set-box! kb c) 0)))) (set-box! n (+ (unbox n) 1)) (if (eq? (unbox n) 3) v ((unbox kb) (+ v 10)))))`.
+    // Re-invokes `kb` until the mutation counter `n` reaches 3, accumulating the result.
     let reenter = [
         Op::LoadConst { dst: 2, index: 0 },
         Op::CallIntrinsic { base: 2, args: 1, intrinsic: MakeBox },
@@ -766,7 +765,8 @@ fn call_cc_from_the_prelude() {
 #[test]
 fn exceptions_from_the_prelude() {
     use Capture::Upvalue;
-    // (+ 1 (with-exception-handler (lambda (e) (+ e 10)) (lambda () (+ 100 (raise-continuable 5)))))
+    // Tests continuable exception handling:
+    // `(+ 1 (with-exception-handler (lambda (e) (+ e 10)) (lambda () (+ 100 (raise-continuable 5)))))` returns 116, resuming the thunk after the handler returns.
     let main = [
         Op::LoadUpvalue { dst: 4, index: WITH_HANDLER },
         Op::NewClosure { dst: 5, count: 2, code: 5 },
@@ -791,10 +791,9 @@ fn exceptions_from_the_prelude() {
     let funcs = [(0, &[][..], &main[..]), (1, &[], &handler), (0, &[Upvalue(RAISE_CONTINUABLE)], &thunk)];
     assert_eq!(prelude_call(&[5, 10, 100, 1], &funcs), [116]);
 
-    // (with-exception-handler (lambda (e) 1000)
-    //   (lambda () (+ 1 (with-exception-handler (lambda (e) (+ 1 (raise-continuable (+ e 1))))
-    //                     (lambda () (+ 1 (raise-continuable 5)))))))
-    // The inner handler's raise goes to the outer one.
+    // Tests cascading exception handling across nested handlers:
+    // `(with-exception-handler (lambda (e) 1000) (lambda () (+ 1 (with-exception-handler (lambda (e) (+ 1 (raise-continuable (+ e 1)))) (lambda () (+ 1 (raise-continuable 5)))))))`.
+    // Verifies that a `raise-continuable` issued within an active exception handler is intercepted by the enclosing outer handler.
     let main = [Op::LoadUpvalue { dst: 2, index: WITH_HANDLER }, Op::NewClosure { dst: 3, count: 2, code: 4 }, Op::TailCall { base: 2, args: 2 }];
     let outer = [Op::LoadConst { dst: 3, index: 0 }, Op::Return { src: 3 }];
     let outer_thunk = [
@@ -839,8 +838,9 @@ fn exceptions_from_the_prelude() {
     ];
     assert_eq!(prelude_call(&[1000, 1, 5], &funcs), [1003]);
 
-    // (call/cc (lambda (k) (with-exception-handler k (lambda () (with-exception-handler (lambda (e) 0) (lambda () (raise 5)))))))
-    // The inner handler returns from a raise, which is raised to k.
+    // Tests returning from a non-continuable exception handler:
+    // `(call/cc (lambda (k) (with-exception-handler k (lambda () (with-exception-handler (lambda (e) 0) (lambda () (raise 5)))))))`.
+    // Because returning from a non-continuable `raise` is prohibited, the VM raises a secondary error condition, which is captured by outer handler `k`.
     let main = [Op::LoadUpvalue { dst: 2, index: CALL_CC }, Op::NewClosure { dst: 3, count: 1, code: 3 }, Op::TailCall { base: 2, args: 1 }];
     let f = [
         Op::LoadUpvalue { dst: 3, index: 0 },
@@ -863,8 +863,7 @@ fn exceptions_from_the_prelude() {
         assert_eq!(fault(mc, value), Fault::Error);
     });
 
-    // (call/cc (lambda (k) (with-exception-handler k (lambda () (car 5))))): VM faults go to
-    // the prelude's raise.
+    // Verifies that internal VM faults (such as executing `(car 5)` on a non-pair) are promoted into condition objects and dispatched to the installed exception handler.
     let f = [
         Op::LoadUpvalue { dst: 3, index: 0 },
         Op::Move { dst: 4, src: 1 },
@@ -878,21 +877,21 @@ fn exceptions_from_the_prelude() {
         assert_eq!(fault(mc, value), Fault::WrongType);
     });
 
-    // (raise 5) with no handler ends the run with it.
+    // Executing `(raise 5)` with no active exception handler terminates the run and returns `Outcome::Raised(5)`.
     let main = [Op::LoadUpvalue { dst: 2, index: RAISE }, Op::LoadConst { dst: 3, index: 0 }, Op::TailCall { base: 2, args: 1 }];
     prelude_outcome(&[5], &[(0, &[], &main)], |_, outcome| assert_eq!(outcome, Outcome::Raised(fix(5))));
 }
 
 #[test]
 fn faults_go_to_the_raise_handler() {
-    // (car 5), with no handler.
+    // Triggering a fault via `(car 5)` without an installed exception handler terminates execution, yielding `Outcome::Raised` containing a `Fault::WrongType` condition.
     let main = [Op::LoadConst { dst: 2, index: 0 }, Op::TailCallIntrinsic { base: 2, args: 1, intrinsic: Car }];
     outcome(&[5], &[(0, &[], &main)], |mc, outcome| {
         let Outcome::Raised(value) = outcome else { panic!("{outcome:?}") };
         assert_eq!(fault(mc, value), Fault::WrongType);
     });
 
-    // A handler that isn't a procedure ends the run with that fault.
+    // Attempting to invoke an exception handler that is not a procedure causes the task to fault with `Fault::NotProcedure`.
     let mut arena = Arena::new(1 << 20, 0);
     arena.mutate(|mc| {
         let constants = table(mc, &[5]);
@@ -902,8 +901,8 @@ fn faults_go_to_the_raise_handler() {
         assert_eq!(fault(mc, value), Fault::NotProcedure);
     });
 
-    // A fault in a nested frame calls the handler in place of the faulting frame. Faults can't go
-    // on, so a handler that returns raises an error with the fault's condition in its place.
+    // When a fault occurs within a nested call frame, the exception handler replaces the faulting frame on the stack.
+    // Because VM faults cannot be resumed, if the handler returns normally, the VM raises a secondary error condition containing the original fault.
     let caller = [
         Op::NewClosure { dst: 3, count: 1, code: 4 },
         Op::Call { base: 3, args: 0 },
@@ -926,7 +925,8 @@ fn faults_go_to_the_raise_handler() {
 
 #[test]
 fn equal_spends_fuel_as_it_goes() {
-    // (let ((same (equal? v w))) (begin) same), with a jump after the comparison.
+    // Structural equality comparison followed by an unconditional jump instruction:
+    // `(let ((same (equal? v w))) (begin) same)`.
     let main = [
         Op::LoadConst { dst: 2, index: 0 },
         Op::LoadConst { dst: 3, index: 1 },
@@ -942,18 +942,18 @@ fn equal_spends_fuel_as_it_goes() {
         let vector = || vectors.from_slice(&items).unwrap().value(mc);
         let codes = module(mc, &[vector(), vector()], &[(0, &[], &main)]);
         let start = || Machine::new(mc, MIN_SEGMENT, closure(mc, codes[0]), &[]).unwrap();
-        // The vectors and their items are 10241 values, 10 units of fuel, and the jump one more.
+        // The compared vector structures contain 10,241 total elements, which consumes 10 fuel units (1 unit per 1,024 elements), plus 1 fuel unit for the jump instruction (11 fuel units total).
         let mut machine = start();
         assert_eq!(to_end(mc, &mut machine).unwrap(), Outcome::Done(Value::TRUE));
         assert_eq!(machine.fuel(), u64::MAX - 11);
 
-        // With less fuel than that in all, it stops partway, and the task is finished.
+        // With less than 11 fuel units allocated (e.g. 9), comparison halts mid-execution with `Fault::OutOfFuel`, transitioning the task to finished so further runs return `Fault::Finished`.
         let mut machine = start();
         machine.set_fuel(9);
         assert_eq!(to_end(mc, &mut machine), Err(Fault::OutOfFuel));
         assert_eq!(machine.run(mc), Err(Fault::Finished));
 
-        // Fuel for the comparison and the jump is enough.
+        // Providing exactly 11 fuel units supplies the exact amount required for the full comparison and the subsequent jump instruction to complete successfully.
         let mut machine = start();
         machine.set_fuel(11);
         assert_eq!(to_end(mc, &mut machine).unwrap(), Outcome::Done(Value::TRUE));
@@ -963,8 +963,9 @@ fn equal_spends_fuel_as_it_goes() {
 
 #[test]
 fn a_branch_whose_test_ends_the_step_runs_it_once() {
-    // (if (make-vector 50000 0) 50000 0): making the vector has the step end, so the run pauses at
-    // the branch, and goes on past it rather than making another.
+    // Evaluates `(if (make-vector 50000 0) 50000 0)`.
+    // Allocating the 50,000-element vector exhausts available arena memory, causing the execution step to pause at the branch instruction;
+    // resuming execution steps past the branch without re-executing the condition allocation.
     let main = [
         Op::LoadConst { dst: 2, index: 0 },
         Op::LoadConst { dst: 3, index: 1 },
@@ -1021,7 +1022,7 @@ fn module_variables_are_checked_until_defined() {
             (0, &[], &[Op::LoadSlotChecked { dst: 2, slot: 0 }, Op::Return { src: 2 }]),
         ];
         let mut codes = module_in(mc, Some(instance), &constants, &funcs);
-        // Code from no module has no variables.
+        // Bytecode executed outside any module scope contains no module-level variable definitions.
         codes[5] = module(mc, &constants, &funcs[5..])[0];
         assert_eq!(run(mc, codes[0], &[]), Err(Fault::Unbound));
         assert_eq!(run(mc, codes[1], &[]), Err(Fault::Unbound));
@@ -1035,14 +1036,14 @@ fn module_variables_are_checked_until_defined() {
 }
 
 
-/// `(add n ...)`, spending a unit of fuel for each.
+/// Host function implementing variadic addition `(add n ...)`, consuming 1 unit of execution fuel per argument.
 fn add_host<'s, 'gc>(cx: &mut HostContext<'s, 'gc>, args: HostArgs<'s, 'gc>) -> Result<Reply<'gc>, Fault> {
     cx.charge(args.len() as u64)?;
     let sum = args.iter().map(|v| v.as_fixnum().ok_or(Fault::WrongType)).sum::<Result<i64, _>>()?;
     Ok(Reply::Value(fix(sum)))
 }
 
-/// `(call-with f x)`: `(f x)`, in its place.
+/// Host function implementing `(call-with f x)`: tail-invokes procedure `f` with argument `x`.
 fn call_with<'s, 'gc>(cx: &mut HostContext<'s, 'gc>, args: HostArgs<'s, 'gc>) -> Result<Reply<'gc>, Fault> {
     Ok(Reply::Call(args.get(0).unwrap(), Pairs::new(cx.mc()).list(&[args.get(1).unwrap()])?))
 }
@@ -1051,12 +1052,12 @@ fn raise_host<'s, 'gc>(_: &mut HostContext<'s, 'gc>, args: HostArgs<'s, 'gc>) ->
     Ok(Reply::Raise(args.get(0).unwrap()))
 }
 
-/// Defers with its argument, as a fixnum.
+/// Host function that defers execution, returning its fixnum argument packaged inside [`Outcome::Deferred`].
 fn defer_host<'s, 'gc>(_: &mut HostContext<'s, 'gc>, args: HostArgs<'s, 'gc>) -> Result<Reply<'gc>, Fault> {
     Ok(Reply::Defer(Box::new(args.get(0).unwrap().as_fixnum())))
 }
 
-/// `(burn n)`: spends `n` units of fuel.
+/// Host function implementing `(burn n)`, consuming `n` units of execution fuel.
 fn burn<'s, 'gc>(cx: &mut HostContext<'s, 'gc>, args: HostArgs<'s, 'gc>) -> Result<Reply<'gc>, Fault> {
     cx.charge(args.get(0).unwrap().as_fixnum().unwrap() as u64)?;
     Ok(Reply::Value(Value::VOID))
@@ -1086,7 +1087,7 @@ fn host_functions_run_where_theyre_called() {
         let constants = [fix(10), fix(20), fix(1)];
         let inc = 3 + 7;
         let funcs: [Func<'_>; 9] = [
-            // (+ 1 (add 10 20)), (add 10), (add)
+            // Tests host addition calls with multiple, single, and zero arguments: `(+ 1 (add 10 20))`, `(add 10)`, and `(add)`.
             (
                 0,
                 &[],
@@ -1101,9 +1102,9 @@ fn host_functions_run_where_theyre_called() {
             ),
             (0, &[], &[Op::LoadConst { dst: 2, index: 0 }, Op::TailCallHost { base: 2, args: 1, host: 0 }]),
             (0, &[], &[Op::TailCallHost { base: 2, args: 0, host: 0 }]),
-            // (call-with 10): too few.
+            // Tests calling `(call-with 10)` with insufficient arguments, expecting a malformed call fault.
             (0, &[], &[Op::LoadConst { dst: 2, index: 0 }, Op::TailCallHost { base: 2, args: 1, host: 1 }]),
-            // (+ 100 (call-with inc 10)), and in tail position.
+            // Tests `(call-with inc 10)` in non-tail position (`(+ 100 ...)`) and in tail position.
             (
                 0,
                 &[],
@@ -1117,11 +1118,11 @@ fn host_functions_run_where_theyre_called() {
                 ],
             ),
             (0, &[], &[Op::NewClosure { dst: 2, count: 1, code: inc }, Op::LoadConst { dst: 3, index: 0 }, Op::TailCallHost { base: 2, args: 2, host: 1 }]),
-            // (raise 1)
+            // Invokes host function `raise_host` with argument 1: `(raise 1)`.
             (0, &[], &[Op::LoadConst { dst: 2, index: 2 }, Op::CallHost { base: 2, args: 1, host: 2 }, Op::Return { src: 2 }]),
-            // inc
+            // Bytecode closure incrementing its argument: `(lambda (x) (+ x 1))`.
             (1, &[], &[Op::AddImm { dst: 1, a: 1, imm: 1 }, Op::Return { src: 1 }]),
-            // A host function the module doesn't have.
+            // Invokes a host function index that is out of bounds for the current module, expecting a fault.
             (0, &[], &[Op::TailCallHost { base: 2, args: 0, host: 5 }]),
         ];
         let codes = module_calling(mc, &constants, &HOSTS, &funcs);
@@ -1141,7 +1142,7 @@ fn host_functions_run_where_theyre_called() {
 fn deferred_host_calls_wait_for_the_host() {
     let mut arena = Arena::new(1 << 24, 0);
     arena.mutate(|mc| {
-        // (+ 1 (defer 10))
+        // Tests calling a host function that defers execution: `(+ 1 (defer 10))`.
         let code: &[Op] = &[
             Op::LoadConst { dst: 2, index: 0 },
             Op::CallHost { base: 2, args: 1, host: DEFER },
@@ -1153,7 +1154,7 @@ fn deferred_host_calls_wait_for_the_host() {
         let mut machine = Machine::new(mc, MIN_SEGMENT, closure(mc, code), &[]).unwrap();
         let Ok(Outcome::Deferred(deferred)) = to_end(mc, &mut machine) else { panic!("not deferred") };
         assert_eq!(deferred.into_inner().downcast::<Option<i64>>().ok().map(|b| *b), Some(Some(10)));
-        // A run goes on as a reply of void, which can't be added to.
+        // Resuming execution without supplying a return value for the deferred host call defaults to replying with void, triggering a type fault upon addition.
         let Ok(Outcome::Raised(raised)) = machine.run(mc) else { panic!("not raised") };
         assert_eq!(fault(mc, raised), Fault::WrongType);
         let mut machine = Machine::new(mc, MIN_SEGMENT, closure(mc, code), &[]).unwrap();
@@ -1234,7 +1235,7 @@ fn what_the_host_raises_goes_to_the_raise_handler() {
         let (raising, deferring) = (call(2), call(DEFER));
         let handler = [Op::Return { src: 1 }];
         let codes = module_calling(mc, &[fix(1)], &HOSTS, &[(0, &[], &raising), (0, &[], &deferring), (1, &[], &handler)]);
-        // A raise can't go on, so the handler returning raises an error with what was raised.
+        // Because host raises are non-continuable, an exception handler returning normally raises a secondary error condition containing the originally raised value.
         for (code, raised) in [(codes[0], fix(1)), (codes[1], fix(7))] {
             let thunk = with_raise_handler(mc, closure(mc, codes[2]), closure(mc, code));
             let mut machine = Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap();

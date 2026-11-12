@@ -1,16 +1,17 @@
-//! Pass 6 (`L3 -> L4`): closure conversion, after [`contify`](crate::contify).
+//! Pass 6 (`L3 -> L4`): Closure conversion (runs after [`contify`](crate::contify)).
 //!
-//! - Converts contification's joins, loops among them, into `Join`s, and calls of them into
-//!   `Jump`s within the frame: no closures, no frames.
+//! - Converts contification join points (including loops among them) into `Join` nodes,
+//!   and turns calls to them into intra-frame `Jump` nodes without allocating closures or stack frames.
 //! - Resolves self-references inside single-binding recursive closures to [`VarRef::SelfClosure`]
 //!   (register `0`, `frame::CLOSURE`), avoiding self-captured upvalues.
-//! - Computes free variables bottom-up, splits variable references into [`VarRef::Local`],
+//! - Computes free variables bottom-up, classifies variable references into [`VarRef::Local`],
 //!   [`VarRef::Upvalue`], and [`VarRef::SelfClosure`], and attaches an explicit [`UpvalSource`]
-//!   capture table to every closure.
+//!   capture table to each closure.
 //!
-//! It's a loop over a stack of tasks, the converted nodes on a stack of their own, so it takes
-//! no more of the machine's stack however deep the tree. Variables are resolved in the order the
-//! tree is read in, a join's code before its scope, which numbers each closure's upvalues.
+//! The pass is implemented iteratively using an explicit task stack and a value stack for converted
+//! nodes, preventing call-stack overflow regardless of AST depth. Variable references are resolved in
+//! preorder traversal order (processing join bodies before join scopes), which consistently assigns
+//! upvalue indices for each closure.
 
 use crate::hash::HashSet;
 
@@ -19,7 +20,8 @@ use crate::ir::l4::{self, Fun, Id, JoinCode, L4, Node};
 use crate::ir::{UpvalSource, VarRef};
 use crate::{Prim, Var};
 
-/// `root` of `from` into `tree`, and its root there.
+/// Lowers the L3 expression rooted at `root` in `from` into closure-converted L4 form in `tree`,
+/// returning the new root expression ID.
 pub(crate) fn closure_convert<'s, 'id, 'gc>(tree: &mut L4<'id, 'gc>, from: &L3<'s, 'gc>, root: l3::Id<'s>) -> Id<'id> {
     let mut c = Convert { from, tree, envs: vec![Env::new(HashSet::default(), None)], vals: Vec::new(), funs: Vec::new(), binds: Vec::new(), codes: Vec::new() };
     let mut todo = vec![Task::Expr(root)];
@@ -30,7 +32,8 @@ pub(crate) fn closure_convert<'s, 'id, 'gc>(tree: &mut L4<'id, 'gc>, from: &L3<'
     c.vals.pop().expect("the root's converted")
 }
 
-/// What's left to do: an expression to convert, or what to make of those converted.
+/// A deferred task in the iterative closure-conversion worklist: either an L3 expression to visit,
+/// or an action to assemble previously converted child expressions into an L4 node.
 enum Task<'s> {
     Expr(l3::Id<'s>),
     If,
@@ -41,13 +44,14 @@ enum Task<'s> {
     Intrinsic(Prim, usize),
     ApplyIntrinsic(Prim, usize),
     Lambda,
-    /// Into a function's body, which can refer to itself as its closure if it's `self_closure`.
+    /// Enters a function body, pushing a new lexical environment for its parameters;
+    /// `self_closure` specifies the variable that refers to the closure itself for recursive calls.
     Enter(l3::Fun<'s>, Option<Var>),
     Leave(l3::Fun<'s>),
     Val(Var),
-    /// A group's functions, in scope in their code.
+    /// Brings a group of mutually recursive functions into scope before converting their bodies.
     Group(l3::Span<'s, (Var, l3::Fun<'s>)>),
-    /// A group of one, which is in scope after it.
+    /// Binds a single recursive function to `Var` and brings it into scope after converting its body.
     One(Var),
     Fix(l3::Span<'s, (Var, l3::Fun<'s>)>),
     Let(l3::Span<'s, l3::Bind<'s>>),
@@ -56,7 +60,8 @@ enum Task<'s> {
     Join(usize),
 }
 
-/// What's in scope in a function being converted.
+/// Lexical scope tracking local variables, captured upvalues, and optional self-closure references
+/// for a function during conversion.
 struct Env {
     locals: HashSet<Var>,
     upvalues: Vec<Var>,
@@ -84,7 +89,8 @@ impl Env {
     }
 }
 
-/// The table being read, the one being made, and what's been converted, innermost last.
+/// State of the closure-conversion pass, maintaining references to the input L3 AST, output L4
+/// AST, lexical environment stack, and intermediate converted sub-expressions.
 struct Convert<'r, 's, 'id, 'gc> {
     from: &'r L3<'s, 'gc>,
     tree: &'r mut L4<'id, 'gc>,
@@ -104,7 +110,7 @@ impl<'s, 'id, 'gc> Convert<'_, 's, 'id, 'gc> {
         self.vals.pop().expect("a converted node")
     }
 
-    /// The last `n` nodes converted, as a list.
+    /// Drains the last `n` converted node IDs from `self.vals` and stores them as an L4 span.
     fn last(&mut self, n: usize) -> l4::Span<'id, Id<'id>> {
         let at = self.vals.len() - n;
         self.tree.list(self.vals.drain(at..))
@@ -220,7 +226,8 @@ impl<'s, 'id, 'gc> Convert<'_, 's, 'id, 'gc> {
         }
     }
 
-    /// Converts what has no children, and pushes the tasks of what has, last first.
+    /// Directly converts leaf expressions or pushes child expression tasks onto the worklist
+    /// in reverse order to ensure left-to-right evaluation.
     fn expr(&mut self, id: l3::Id<'s>, todo: &mut Vec<Task<'s>>) {
         let from = self.from;
         let at = todo.len();

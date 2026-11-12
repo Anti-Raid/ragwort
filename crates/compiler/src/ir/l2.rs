@@ -1,5 +1,5 @@
-//! `L2`, after `letrec` fixing, as a table of nodes like [`L3`](super::l3)'s, without joins: what
-//! cp0 optimizes and assignment conversion lowers.
+//! `L2`: the node-table IR produced by `letrec` fixing and optimized by cp0. Similar to
+//! [`L3`](super::l3), but without joins; assignment lowering converts it to L3.
 
 use ragwort_types::gc::{Gc, Mutation, Value};
 use ragwort_vm::objects::{StructType, StructTypeFields};
@@ -15,7 +15,7 @@ language! {
         If(test: Id<'id>, then: Id<'id>, other: Id<'id>),
         Seq(first: Id<'id>, second: Id<'id>),
         Let(binds: Span<'id, Bind<'id>>, body: Id<'id>),
-        /// An assignment of a variable, which evaluates to void.
+        /// Assigns a variable and evaluates to void.
         Set(var: Var, value: Id<'id>),
         App(callee: Id<'id>, args: Span<'id, Id<'id>>),
         Lambda(fun: Fun<'id>),
@@ -27,11 +27,11 @@ language! {
     leaves { Value<'gc>, Var, Prim }
 }
 
-/// One of a [`Node::Let`]'s bindings, in scope for those after it and its body.
+/// A [`Node::Let`] binding, visible to subsequent bindings and the body.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Bind<'id> {
     Val(Var, Id<'id>),
-    /// Functions, in scope in each other's code too.
+    /// A mutually recursive function group, with every function visible in every body.
     Fix(Span<'id, (Var, Fun<'id>)>),
 }
 
@@ -51,12 +51,12 @@ impl<'id, 'gc> Bodies<'id, 'gc> for Bind<'id> {
     }
 }
 
-/// A lambda's function.
+/// A lambda's function record.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Function<'id> {
     /// Distinguishes this lambda from every other in the expression being compiled.
     pub(crate) id: u32,
-    /// How many of the last of `params` a call can leave out.
+    /// Number of trailing entries in `params` that a call may omit.
     pub(crate) optional: u32,
     pub(crate) params: Span<'id, Var>,
     /// Receives the arguments past `params` as a list, if any.
@@ -65,7 +65,7 @@ pub(crate) struct Function<'id> {
 }
 
 impl<'id, 'gc> L2<'id, 'gc> {
-    /// The variables `bind` binds.
+    /// Returns the variables introduced by `bind`.
     pub(crate) fn vars(&self, bind: Bind<'id>) -> impl Iterator<Item = Var> + '_ {
         let (one, group) = match bind {
             Bind::Val(v, _) => (Some(v), &[][..]),
@@ -74,14 +74,13 @@ impl<'id, 'gc> L2<'id, 'gc> {
         one.into_iter().chain(group.iter().map(|&(v, _)| v))
     }
 
-    /// The variables `fun` binds as it's called: its parameters, and its rest one.
+    /// Returns `fun`'s positional parameters and optional rest parameter.
     pub(crate) fn params(&self, fun: Fun<'id>) -> impl Iterator<Item = Var> + '_ {
         self[self[fun].params].iter().copied().chain(self[fun].rest)
     }
 
-    /// The struct type `id` makes an instance of and the call's arguments, the type first, if
-    /// `id` is `(make-struct 'type v ...)` with a constant type and a value for each of its
-    /// fields: a call that can't fault.
+    /// Recognizes `(make-struct 'type v ...)` with a constant struct type and the correct field count.
+    /// Returns the type and arguments, including the type argument, when the call cannot fault.
     pub(crate) fn made_struct(&self, mc: &Mutation<'gc>, id: Id<'id>) -> Option<(Gc<'gc, StructType>, Span<'id, Id<'id>>)> {
         let Node::Intrinsic(Prim::Intrinsic(Intrinsic::MakeStruct), args) = self[id] else { return None };
         let (&kind, values) = self[args].split_first()?;
@@ -143,7 +142,7 @@ impl<'id, 'gc> L2<'id, 'gc> {
         true
     }
 
-    /// Panics if the tree from `root` isn't well-formed, as a debug build checks.
+    /// Panics if the tree rooted at `root` is malformed. Used by debug-build checks.
     #[cfg(debug_assertions)]
     pub(crate) fn check(&self, root: Id<'id>) {
         if let Err(e) = self.verify(root) {
@@ -151,9 +150,9 @@ impl<'id, 'gc> L2<'id, 'gc> {
         }
     }
 
-    /// Whether the tree from `root`, and the code of each function in it, is well-formed: each
-    /// node and function has one parent, and each variable is bound once and used only in its
-    /// scope, which a function's body is in. Nodes nothing reaches aren't checked.
+    /// Checks the tree and function bodies reachable from `root`. Each reachable node and function must
+    /// have one parent; each variable must have one binding and be referenced only within its lexical
+    /// scope. Unreachable nodes are ignored.
     #[cfg(any(debug_assertions, test))]
     pub(crate) fn verify(&self, root: Id<'id>) -> Result<(), String> {
         use crate::hash::HashSet;

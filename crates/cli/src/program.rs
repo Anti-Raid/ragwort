@@ -4,6 +4,16 @@
 //! from its folder the first time code requires it, and runs it then, since the code that
 //! requires it is compiled against what it defines.
 //!
+//! # Loading what a module requires
+//!
+//! A module is built in one step of the arena, and what it requires has to have run by then.
+//! So building stops at a `require` of a module that isn't loaded. That module is then built
+//! and run, and the first is built again from the start, as often as it takes: once for each
+//! module it's the first to require.
+//!
+//! Every module's code, the prelude's included, runs a step at a time between builds, so the
+//! collector keeps up with what it allocates as it does for the entry point.
+//!
 //! # Images
 //!
 //! [`Program::save_image`] saves the symbols, the prelude and every module loaded, by name,
@@ -64,12 +74,33 @@ struct Modules {
     dirs: Vec<ModuleDir>,
     /// Those loaded and run, by name.
     loaded: Vec<(String, Root<Module>)>,
-    /// Those being loaded, the innermost last: one of them that's required again requires itself.
-    loading: Vec<String>,
+    /// The module the build under way asked for that isn't loaded, which it stopped at.
+    wanted: Option<String>,
     /// What went wrong, in order.
     errors: Vec<String>,
     /// The bytecode of each module loaded since [`Program::list`], if it's kept.
     listing: Option<String>,
+}
+
+/// A module that's built and hasn't run: the code of each of its forms, to run in order.
+struct Built {
+    thunks: Vec<ValueRoot>,
+    module: Root<Module>,
+}
+
+/// Why a module wasn't built.
+enum Missed {
+    /// It requires this module, which isn't loaded: the message says where.
+    Needs(String, String),
+    /// Something's wrong, which `Modules::errors` says.
+    Failed,
+}
+
+/// A module being loaded: its files, and where the module that asked for it requires it.
+struct Pending {
+    name: String,
+    files: Vec<SourceFile>,
+    asked: Option<String>,
 }
 
 /// What every module is built on.
@@ -175,18 +206,6 @@ fn ran<'gc>(mc: &Mutation<'gc>, outcome: Result<Outcome<'gc>, Fault>) -> Ran<'gc
     }
 }
 
-/// Calls `thunk` and runs it to its end, in this step.
-fn run_now<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Result<Value<'gc>, String> {
-    let mut machine = Machine::new(mc, MIN_SEGMENT, thunk, &[]).map_err(fault)?;
-    loop {
-        match ran(mc, machine.run(mc)) {
-            Ran::More => {}
-            Ran::Done(value) => return Ok(value),
-            Ran::Failed(message) => return Err(message),
-        }
-    }
-}
-
 /// The source files in `folder`, in the order of their names.
 fn read_folder(folder: &Path) -> Result<Vec<SourceFile>, String> {
     let wrong = |e: std::io::Error| format!("{}: {e}", folder.display());
@@ -210,7 +229,8 @@ fn read_file(path: &Path) -> Result<SourceFile, String> {
     Ok(SourceFile { path: path.to_path_buf(), text, language })
 }
 
-/// Builds the module `name` of `files`. What's wrong with it goes to `modules.errors`.
+/// Builds the module `name` of `files`. What's wrong with it goes to `modules.errors`, unless
+/// it's that it requires a module that isn't loaded yet.
 fn load_module<'gc>(
     mc: &Mutation<'gc>,
     base: Base<'gc>,
@@ -219,12 +239,12 @@ fn load_module<'gc>(
     hosts: &'static [HostDef],
     files: &[SourceFile],
     implicit: &[Gc<'gc, Module>],
-) -> Option<Loaded<'gc>> {
+) -> Result<Loaded<'gc>, Missed> {
     let mut sessions = Vec::with_capacity(files.len());
     for file in files {
         let Ok(session) = SyntaxSession::named(mc, &file.path.to_string_lossy(), &file.text) else {
             modules.errors.push(OUT_OF_MEMORY.to_string());
-            return None;
+            return Err(Missed::Failed);
         };
         sessions.push(session);
     }
@@ -233,81 +253,61 @@ fn load_module<'gc>(
         parts.push(File { language: file.language, session });
     }
     let source = Source { name, hosts, files: &parts, implicit, internals: false };
-    match load_located(mc, base.symbols, base.prelude, &source, &mut Finder { base, modules }) {
+    modules.wanted = None;
+    match load_located(mc, base.symbols, base.prelude, &source, &mut Finder { modules }) {
         Ok(loaded) => {
             if let Some(listing) = &mut modules.listing {
                 listing::list(mc, name, &loaded.thunks, listing);
             }
-            Some(loaded)
+            Ok(loaded)
         }
         Err(failed) => {
-            modules.errors.push(describe(name, files, &failed));
-            None
+            let message = describe(name, files, &failed);
+            match modules.wanted.take() {
+                Some(module) => Err(Missed::Needs(module, message)),
+                None => {
+                    modules.errors.push(message);
+                    Err(Missed::Failed)
+                }
+            }
         }
     }
 }
 
-/// Builds the module `name` of `files`, runs it, and keeps it for the code that requires it.
-fn install<'gc>(mc: &Mutation<'gc>, base: Base<'gc>, modules: &mut Modules, name: &str, hosts: &'static [HostDef], files: &[SourceFile]) -> Option<Gc<'gc, Module>> {
-    let loaded = load_module(mc, base, modules, name, hosts, files, &[])?;
-    for thunk in loaded.thunks {
-        if let Err(message) = run_now(mc, thunk) {
-            modules.errors.push(format!("module {name}: {message}"));
-            return None;
-        }
+/// `loaded`, kept across steps till it has run.
+fn rooted<'gc>(mc: &Mutation<'gc>, loaded: &Loaded<'gc>) -> Option<Built> {
+    let mut thunks = Vec::with_capacity(loaded.thunks.len());
+    for &thunk in &loaded.thunks {
+        thunks.push(ValueRoot::new(mc, thunk).ok()?);
     }
-    let Ok(root) = Root::new(mc, loaded.module) else {
-        modules.errors.push(OUT_OF_MEMORY.to_string());
-        return None;
-    };
-    modules.loaded.push((name.to_string(), root));
-    Some(loaded.module)
+    Some(Built { thunks, module: Root::new(mc, loaded.module).ok()? })
 }
 
-/// Finds the modules code requires: those loaded, and those the command line gives a folder.
-struct Finder<'m, 'gc> {
-    base: Base<'gc>,
+/// Finds the modules code requires among those loaded. One the command line gives a folder
+/// that isn't loaded yet is noted, for the build to be tried again once it is.
+struct Finder<'m> {
     modules: &'m mut Modules,
 }
 
-impl<'gc> Resolver<'gc> for Finder<'_, 'gc> {
+impl<'gc> Resolver<'gc> for Finder<'_> {
     fn resolve(&mut self, mc: &Mutation<'gc>, name: &str, _: Value<'gc>) -> Option<Gc<'gc, Module>> {
         if let Some((_, module)) = self.modules.loaded.iter().find(|(loaded, _)| loaded == name) {
             return module.get(mc).ok();
         }
-        if self.modules.loading.iter().any(|loading| loading == name) {
-            self.modules.errors.push(format!("module {name}: it requires itself, through {}", self.modules.loading.join(", ")));
-            return None;
+        if self.modules.dirs.iter().any(|dir| dir.name == name) {
+            self.modules.wanted = Some(name.to_string());
         }
-        let folder = self.modules.dirs.iter().find(|dir| dir.name == name)?.folder.clone();
-        let files = match read_folder(&folder) {
-            Ok(files) => files,
-            Err(message) => {
-                self.modules.errors.push(message);
-                return None;
-            }
-        };
-        self.modules.loading.push(name.to_string());
-        let module = install(mc, self.base, self.modules, name, &[], &files);
-        self.modules.loading.pop();
-        module
+        None
     }
 }
 
-/// The symbol table, the prelude and the `repl` module, in a new arena's first step.
-fn start<'gc>(mc: &Mutation<'gc>, modules: &mut Modules) -> Result<(ValueRoot, Root<Module>, Root<Module>), String> {
+/// The symbol table and the prelude, built, in a new arena's first step.
+fn start<'gc>(mc: &Mutation<'gc>) -> Result<(ValueRoot, Built), String> {
     let oom = |_| OUT_OF_MEMORY.to_string();
     let symbols = Symbols::with_seed(mc, RandomState::new().build_hasher().finish()).map_err(oom)?;
     let loaded = prelude(mc, symbols).map_err(|e| format!("the prelude: {e:?}"))?;
-    for thunk in loaded.thunks {
-        run_now(mc, thunk).map_err(|message| format!("the prelude: {message}"))?;
-    }
-    let base = Base { symbols, prelude: loaded.module };
-    let files = [SourceFile { path: "repl.rgn".into(), text: hosts::SOURCE.to_string(), language: Language::Native }];
-    let Some(repl) = install(mc, base, modules, hosts::NAME, &hosts::HOSTS, &files) else {
-        return Err(std::mem::take(&mut modules.errors).join("\n"));
-    };
-    Ok((ValueRoot::new(mc, symbols.value(mc)).map_err(oom)?, Root::new(mc, loaded.module).map_err(oom)?, Root::new(mc, repl).map_err(oom)?))
+    let built = rooted(mc, &loaded).ok_or_else(|| OUT_OF_MEMORY.to_string())?;
+    Ok((ValueRoot::new(mc, symbols.value(mc)).map_err(oom)?, built))
 }
 
 /// What an image holds, in a new arena's first step: the symbol table, the prelude, and each
@@ -316,6 +316,7 @@ fn restore<'gc>(mc: &Mutation<'gc>, bytes: &[u8], modules: &mut Modules) -> Resu
     let oom = |_| OUT_OF_MEMORY.to_string();
     let roots = image::load(mc, bytes, hosts::HOSTS.iter()).map_err(|e| match e {
         ImageError::Host(name) => format!("the image calls the host function `{name}`, which this ragwort doesn't have"),
+        ImageError::SameHost(path) => format!("two host functions are both `{path}`"),
         ImageError::Load(LoadError::Stamp) => "the image was made by another build of ragwort".to_string(),
         ImageError::Load(LoadError::OutOfMemory) => OUT_OF_MEMORY.to_string(),
         ImageError::Load(_) => "not a ragwort image, or one that's damaged".to_string(),
@@ -367,16 +368,116 @@ impl Program {
     /// A program whose code can require the modules of `dirs`, none of them loaded yet.
     pub fn new(dirs: Vec<ModuleDir>) -> Result<Self, Vec<String>> {
         let mut arena = Arena::new(HEAP, 0);
-        let mut modules = Modules { dirs, loaded: Vec::new(), loading: Vec::new(), errors: Vec::new(), listing: None };
-        let (symbols, prelude, repl) = arena.mutate(|mc| start(mc, &mut modules)).map_err(|message| vec![message])?;
-        Ok(Self { arena, symbols, prelude, modules, inputs: vec![repl], required: Vec::new() })
+        let modules = Modules { dirs, loaded: Vec::new(), wanted: None, errors: Vec::new(), listing: None };
+        let (symbols, built) = arena.mutate(start).map_err(|message| vec![message])?;
+        for thunk in &built.thunks {
+            run(&mut arena, thunk, None).map_err(|message| vec![format!("the prelude: {message}")])?;
+        }
+        let mut program = Self { arena, symbols, prelude: built.module, modules, inputs: Vec::new(), required: Vec::new() };
+        let files = [SourceFile { path: "repl.rgn".into(), text: hosts::SOURCE.to_string(), language: Language::Native }];
+        let Some(built) = program.build(hosts::NAME, &hosts::HOSTS, &files, false) else { return Err(program.take_errors()) };
+        program.inputs.push(built.module.clone());
+        program.finish(hosts::NAME, built).map_err(|message| vec![message])?;
+        Ok(program)
+    }
+
+    fn take_errors(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.modules.errors)
+    }
+
+    /// One try at building the module `name` of `files`, which stops at a module it requires
+    /// that isn't loaded. A REPL input requires what the inputs before it defined implicitly.
+    fn attempt(&mut self, name: &str, hosts: &'static [HostDef], files: &[SourceFile], input: bool) -> Result<Built, Missed> {
+        let Self { arena, symbols, prelude, modules, inputs, .. } = self;
+        let implicit: &[Root<Module>] = if input { inputs } else { &[] };
+        let built = arena.mutate(|mc| {
+            let symbols = symbols.get(mc).ok().and_then(Symbols::of);
+            let (Some(symbols), Ok(prelude)) = (symbols, prelude.get(mc)) else { return Ok(None) };
+            let mut required = Vec::with_capacity(implicit.len());
+            for module in implicit {
+                let Ok(module) = module.get(mc) else { return Ok(None) };
+                required.push(module);
+            }
+            let loaded = load_module(mc, Base { symbols, prelude }, modules, name, hosts, files, &required)?;
+            Ok(rooted(mc, &loaded))
+        })?;
+        built.ok_or_else(|| {
+            modules.errors.push(OUT_OF_MEMORY.to_string());
+            Missed::Failed
+        })
+    }
+
+    /// Builds the module `name` of `files`, after loading each module it requires that isn't
+    /// loaded yet.
+    fn build(&mut self, name: &str, hosts: &'static [HostDef], files: &[SourceFile], input: bool) -> Option<Built> {
+        loop {
+            match self.attempt(name, hosts, files, input) {
+                Ok(built) => return Some(built),
+                Err(Missed::Failed) => return None,
+                Err(Missed::Needs(module, asked)) => self.ensure(module, Some(asked))?,
+            }
+        }
+    }
+
+    /// Runs the module `name`, which is built, and keeps it for the code that requires it.
+    fn finish(&mut self, name: &str, built: Built) -> Result<(), String> {
+        for thunk in &built.thunks {
+            run(&mut self.arena, thunk, None).map_err(|message| format!("module {name}: {message}"))?;
+        }
+        self.modules.loaded.push((name.to_string(), built.module));
+        Ok(())
+    }
+
+    /// Loads the module `name` from its folder and runs it, after each module it requires
+    /// that isn't loaded yet, and each that those require. `asked` is where the code that
+    /// requires it does, which is what's wrong with that code if the module can't be loaded.
+    fn ensure(&mut self, name: String, asked: Option<String>) -> Option<()> {
+        let mut pending: Vec<Pending> = Vec::new();
+        let mut next = Some((name, asked));
+        // Where the module that can't be loaded was asked for, if it isn't one of `pending`.
+        let asked = loop {
+            if let Some((name, asked)) = next.take() {
+                if pending.iter().any(|module| module.name == name) {
+                    let through: Vec<&str> = pending.iter().map(|module| &*module.name).collect();
+                    self.modules.errors.push(format!("module {name}: it requires itself, through {}", through.join(", ")));
+                    break asked;
+                }
+                let folder = self.modules.dirs.iter().find(|dir| dir.name == name).map(|dir| dir.folder.clone());
+                match folder.as_deref().map(read_folder) {
+                    Some(Ok(files)) => pending.push(Pending { name, files, asked }),
+                    Some(Err(message)) => {
+                        self.modules.errors.push(message);
+                        break asked;
+                    }
+                    None => {
+                        self.modules.errors.push(format!("module {name}: no folder is given for it"));
+                        break asked;
+                    }
+                }
+            }
+            let Some(module) = pending.last() else { return Some(()) };
+            match self.attempt(&module.name, &[], &module.files, false) {
+                Ok(built) => {
+                    if let Err(message) = self.finish(&module.name, built) {
+                        self.modules.errors.push(message);
+                        break None;
+                    }
+                    pending.pop();
+                }
+                Err(Missed::Failed) => break None,
+                Err(Missed::Needs(module, asked)) => next = Some((module, Some(asked))),
+            }
+        };
+        self.modules.errors.extend(asked);
+        self.modules.errors.extend(pending.into_iter().rev().filter_map(|module| module.asked));
+        None
     }
 
     /// A program that starts from what the image `bytes` holds, and can require the modules of
     /// `dirs` besides.
     pub fn from_image(dirs: Vec<ModuleDir>, bytes: &[u8]) -> Result<Self, Vec<String>> {
         let mut arena = Arena::new(HEAP, 0);
-        let mut modules = Modules { dirs, loaded: Vec::new(), loading: Vec::new(), errors: Vec::new(), listing: None };
+        let mut modules = Modules { dirs, loaded: Vec::new(), wanted: None, errors: Vec::new(), listing: None };
         let (symbols, prelude) = arena.mutate(|mc| restore(mc, bytes, &mut modules)).map_err(|message| vec![message])?;
         let repl = modules.loaded.iter().find(|(name, _)| name == hosts::NAME).map(|(_, module)| module.clone());
         let Some(repl) = repl else { return Err(vec![format!("an image without the `{}` module", hosts::NAME)]) };
@@ -416,15 +517,11 @@ impl Program {
 
     /// Loads every module the command line names that isn't loaded yet.
     pub fn load_all(&mut self) -> Result<(), Vec<String>> {
-        let Self { arena, symbols, prelude, modules, .. } = self;
-        let names: Vec<String> = modules.dirs.iter().map(|dir| dir.name.clone()).collect();
+        let names: Vec<String> = self.modules.dirs.iter().map(|dir| dir.name.clone()).collect();
         for name in names {
-            let found = arena.mutate(|mc| {
-                let base = Base { symbols: Symbols::of(symbols.get(mc).ok()?)?, prelude: prelude.get(mc).ok()? };
-                Finder { base, modules }.resolve(mc, &name, Value::FALSE).map(drop)
-            });
-            if found.is_none() {
-                return Err(std::mem::take(&mut modules.errors));
+            let loaded = self.modules.loaded.iter().any(|(loaded, _)| *loaded == name);
+            if !loaded && self.ensure(name, None).is_none() {
+                return Err(self.take_errors());
             }
         }
         Ok(())
@@ -434,16 +531,10 @@ impl Program {
     pub fn run_file(&mut self, path: &Path, running: bool) -> Result<(), Vec<String>> {
         let file = read_file(path).map_err(|message| vec![message])?;
         let name = path.file_stem().map_or_else(|| "main".to_string(), |stem| stem.to_string_lossy().into_owned());
-        let Self { arena, symbols, prelude, modules, .. } = self;
-        let thunks = arena.mutate(|mc| {
-            let base = Base { symbols: Symbols::of(symbols.get(mc).ok()?)?, prelude: prelude.get(mc).ok()? };
-            let loaded = load_module(mc, base, modules, &name, &[], &[file], &[])?;
-            loaded.thunks.iter().map(|&thunk| ValueRoot::new(mc, thunk).ok()).collect::<Option<Vec<_>>>()
-        });
-        let Some(thunks) = thunks else { return Err(std::mem::take(&mut modules.errors)) };
+        let Some(built) = self.build(&name, &[], &[file], false) else { return Err(self.take_errors()) };
         if running {
-            for thunk in &thunks {
-                run(arena, thunk, None).map_err(|message| vec![message])?;
+            for thunk in &built.thunks {
+                run(&mut self.arena, thunk, None).map_err(|message| vec![message])?;
             }
         }
         Ok(())
@@ -468,18 +559,12 @@ impl Program {
     /// Runs `text` as the REPL's next input, giving `out` the value of each of its forms,
     /// written out, as it's made.
     pub fn eval(&mut self, text: &str, out: &mut dyn FnMut(&str)) -> Result<(), Vec<String>> {
-        let Self { arena, symbols, prelude, modules, inputs, required } = self;
-        let name = format!("input-{}", inputs.len());
+        let name = format!("input-{}", self.inputs.len());
         let file = |text: &str| SourceFile { path: "<input>".into(), text: text.to_string(), language: Language::Scheme };
         let files = [file(text), file("(provide (all-defined-out))")];
-        let loaded = arena.mutate(|mc| {
-            let base = Base { symbols: Symbols::of(symbols.get(mc).ok()?)?, prelude: prelude.get(mc).ok()? };
-            let implicit = inputs.iter().map(|input| input.get(mc).ok()).collect::<Option<Vec<_>>>()?;
-            let loaded = load_module(mc, base, modules, &name, &[], &files, &implicit)?;
-            let thunks = loaded.thunks.iter().map(|&thunk| ValueRoot::new(mc, thunk).ok()).collect::<Option<Vec<_>>>()?;
-            Some((thunks, Root::new(mc, loaded.module).ok()?, required_by(mc, base.symbols, text)))
-        });
-        let Some((thunks, module, names)) = loaded else { return Err(std::mem::take(&mut modules.errors)) };
+        let Some(built) = self.build(&name, &[], &files, true) else { return Err(self.take_errors()) };
+        let Self { arena, symbols, modules, inputs, required, .. } = self;
+        let names = arena.mutate(|mc| symbols.get(mc).ok().and_then(Symbols::of).map_or(Vec::new(), |symbols| required_by(mc, symbols, text)));
         for name in names {
             let found = modules.loaded.iter().find(|(loaded, _)| *loaded == name);
             if let Some((_, module)) = found.filter(|_| !required.contains(&name)) {
@@ -487,8 +572,8 @@ impl Program {
                 required.push(name);
             }
         }
-        inputs.push(module);
-        for thunk in &thunks {
+        inputs.push(built.module);
+        for thunk in &built.thunks {
             run(arena, thunk, Some(&mut *out)).map_err(|message| vec![message])?;
         }
         Ok(())

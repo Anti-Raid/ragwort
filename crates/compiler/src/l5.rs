@@ -1,14 +1,16 @@
-//! Pass 8 (`L4 -> L5`): each function as a graph of basic blocks in SSA form.
+//! Pass 8 (`L4 -> L5`): transforms each function into a control-flow graph of basic blocks in SSA form.
 //!
-//! Every [`Val`] is defined once: by the function's entry, a block's parameters or an
-//! instruction. Where paths meet, a block takes parameters, which jumps to it pass, as Cranelift
-//! takes them. An unboxed `set!` gives its variable a new value; contified joins become blocks,
-//! taking the variables assigned in their group as more parameters. Only a jump passes values: a
-//! branch goes to blocks without parameters.
+//! Every SSA value ([`Val`]) is defined exactly once: at function entry, as a basic block parameter,
+//! or as the destination of an instruction. Control-flow merges are represented using block parameters
+//! passed by jump terminators (following Cranelift-style block arguments rather than traditional φ-nodes).
+//! An unboxed `set!` assigns a fresh SSA value to its variable. Contified joins are lowered into basic
+//! blocks that accept any variables mutated within their group as additional block parameters. Only jumps
+//! can pass arguments to basic blocks; conditional branches target blocks without parameters.
 //!
-//! An end that calls something that can capture the frame's continuation or set its marks, a
-//! call, a request or a host call, stays a tail call in tail position. Intrinsics and reads don't,
-//! so in tail position they're an instruction and a [`End::Return`].
+//! A block terminator that performs an operation capable of capturing the current continuation or modifying
+//! continuation marks (such as a function call, VM request, or host call) remains a tail call when in tail
+//! position. In contrast, intrinsics and memory reads cannot capture continuations; in tail position, they
+//! are lowered into an instruction followed by an explicit [`End::Return`].
 
 use std::fmt;
 use std::iter;
@@ -26,16 +28,18 @@ use crate::{CompileError, Prim, SlotOp, Var};
 #[path = "tests/l5.rs"]
 mod tests;
 
-/// A value of a function.
+/// An SSA value identifier within a function.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Val(pub(crate) u32);
 
-/// A block of a function, an index of its [`Function::blocks`].
+/// A basic block identifier, representing an index into [`Function::blocks`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Block(pub(crate) u32);
 
-/// The code compiled, as its functions: the last the code's own, and each other one the code of
-/// closures a function after it makes, which refer to it by its index.
+/// A compiled program consisting of a sequence of lowered functions.
+///
+/// The final function in the list represents the top-level program entry point. Earlier functions
+/// define the bodies of closures created by subsequent functions, which reference them by their index.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Program<'a, 'gc> {
     pub(crate) functions: Vec<'a, Function<'a, 'gc>>,
@@ -49,20 +53,22 @@ impl<'a, 'gc> Program<'a, 'gc> {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Function<'a, 'gc> {
-    /// The lambda it's from, or `None` for the code compiled.
+    /// The source lambda ID from which this function was derived, or `None` for top-level code.
     pub(crate) id: Option<u32>,
-    /// The closure being run.
+    /// The SSA value representing the currently executing closure object (`self`).
     pub(crate) this: Val,
-    /// The last `optional` of which a call can leave out.
+    /// The formal parameter values. The caller may omit up to the last `optional` parameters.
     pub(crate) params: Vec<'a, Val>,
     pub(crate) optional: u32,
-    /// The arguments past `params`, as a list.
+    /// The rest parameter holding any surplus arguments as a Scheme list, or `None` if absent.
     pub(crate) rest: Option<Val>,
-    /// How many upvalues the function's closures have.
+    /// The number of upvalues captured by closures of this function.
     pub(crate) upvalues: u32,
-    /// The first is where it starts, which takes no parameters and nothing jumps to.
+    /// The basic blocks forming the function's control flow graph.
+    ///
+    /// The first block (`blocks[0]`) is the entry block; it takes no parameters and has no incoming predecessors.
     pub(crate) blocks: Vec<'a, BlockData<'a, 'gc>>,
-    /// How many values there are, all below this.
+    /// The total number of SSA values allocated in this function. All valid `Val` IDs are strictly less than this.
     pub(crate) values: u32,
 }
 
@@ -77,17 +83,17 @@ pub(crate) struct BlockData<'a, 'gc> {
 pub(crate) enum Inst<'a, 'gc> {
     Const(Val, Value<'gc>),
     Upvalue(Val, u32),
-    /// `prim` on `args`; if `spread`, the last is a list of the rest. A store of a module variable
-    /// is void.
+    /// Applies primitive `prim` to `args`. If `spread` is true, the final argument is a list whose
+    /// elements are unpacked. Storing into a module variable yields a void value.
     Prim { dst: Val, prim: Prim, args: Vec<'a, Val>, spread: bool },
     Call { dst: Val, f: Val, args: Vec<'a, Val> },
-    /// A closure of each of `codes`, all made before any captures anything, so they can capture
-    /// each other.
+    /// Instantiates closures for each entry in `codes` and binds them to `dsts`. All closure objects
+    /// are allocated before environment captures are resolved, enabling mutual recursion.
     Closures { dsts: Vec<'a, Val>, codes: Vec<'a, Code<'a>> },
 }
 
-/// A closure's code, the index of its function in the [`Program`], and what it captures, in the
-/// order its upvalues are.
+/// The specification for instantiating a closure: the index of its underlying [`Function`] in the
+/// [`Program`], followed by its captured values in upvalue index order.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Code<'a> {
     pub(crate) function: u32,
@@ -103,11 +109,11 @@ pub(crate) enum Captured {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum End<'a> {
     Jump(Block, Vec<'a, Val>),
-    /// To `other` if `test` is `#f`, else to `then`.
+    /// Branches conditionally: jumps to `other` if `test` evaluates to `#f`, otherwise jumps to `then`.
     Branch { test: Val, then: Block, other: Block },
     Return(Val),
     TailCall { f: Val, args: Vec<'a, Val> },
-    /// A request or host call in tail position.
+    /// A VM request or host function invocation occurring in tail position.
     TailPrim { prim: Prim, args: Vec<'a, Val>, spread: bool },
 }
 
@@ -141,7 +147,7 @@ impl Inst<'_, '_> {
         }
     }
 
-    /// Each value it uses, to change.
+    /// Invokes `f` with a mutable reference to each SSA value read (used) by this instruction.
     pub(crate) fn each_use_mut(&mut self, mut f: impl FnMut(&mut Val)) {
         match self {
             Inst::Const(..) | Inst::Upvalue(..) => {}
@@ -183,7 +189,7 @@ impl End<'_> {
         }
     }
 
-    /// Each value it uses, to change.
+    /// Invokes `f` with a mutable reference to each SSA value read (used) by this terminator.
     pub(crate) fn each_use_mut(&mut self, mut f: impl FnMut(&mut Val)) {
         match self {
             End::Jump(_, args) | End::TailPrim { args, .. } => args.iter_mut().for_each(f),
@@ -193,8 +199,10 @@ impl End<'_> {
     }
 }
 
-/// The code compiled, of no parameters, from `root` of `tree`, as [`L5`](self). Each function
-/// is lowered by a [`Builder`] of its own, those of closures being made on a stack above theirs.
+/// Lowers the L4 AST from `root` in `tree` into an [`L5`](self) SSA program.
+///
+/// Each function is lowered independently by its own [`Builder`]. Closures are lowered in a stack-oriented,
+/// bottom-up order, with nested closure functions emitted ahead of the functions enclosing them.
 pub(crate) fn lower<'a, 'id, 'gc>(arena: &'a Arena, tree: &L4<'id, 'gc>, root: Id<'id>) -> Result<Program<'a, 'gc>, CompileError> {
     let top = Formals { params: &[], optional: 0, rest: None };
     let mut stack = vec![Builder::new(arena, tree, None, top, 0, root)];
@@ -216,7 +224,7 @@ pub(crate) fn lower<'a, 'id, 'gc>(arena: &'a Arena, tree: &L4<'id, 'gc>, root: I
     }
 }
 
-/// Panics if `program` isn't well-formed, as a debug build checks.
+/// Validates that `program` is well-formed, panicking on verification failure in debug builds.
 #[cfg(debug_assertions)]
 pub(crate) fn check(program: &Program<'_, '_>) {
     if let Err(e) = verify(program) {
@@ -231,7 +239,7 @@ struct Formals<'a> {
     rest: Option<Var>,
 }
 
-/// Adds the locals the frame from `root` assigns to `sets`.
+/// Collects all local variables mutated (via `set!`) within the frame rooted at `root` into `sets`.
 fn sets_in<'id>(tree: &L4<'id, '_>, root: Id<'id>, sets: &mut HashSet<Var>) {
     sets.extend(tree.frame(root).filter_map(|id| if let Node::Set(v, _) = tree[id] { Some(v) } else { None }));
 }
@@ -242,15 +250,17 @@ struct Building<'a, 'gc> {
     end: Option<End<'a>>,
 }
 
-/// Where an expression's value goes: on in the block, or returned from the function.
+/// The continuation context for an expression's result: either continuing sequentially within the
+/// current basic block (`Ctx::Val`), or returning from the function (`Ctx::Tail`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Ctx {
     Value,
     Tail,
 }
 
-/// A join of a group being lowered: its block once something jumps to it, how many parameters
-/// its jumps pass, and its group, whose assigned variables they pass too.
+/// Represents a join point within an active contification group: its target basic block (allocated
+/// on the first incoming jump), the count of explicit jump arguments, and the group index tracking
+/// mutated in-scope variables that must be passed along as extra arguments.
 struct Join<'a> {
     block: Option<Block>,
     params: Vec<'a, Var>,
@@ -266,59 +276,66 @@ struct Builder<'a, 't, 'id, 'gc> {
     rest: Option<Val>,
     upvalues: u32,
     blocks: std::vec::Vec<Building<'a, 'gc>>,
-    /// Where code goes.
+    /// The basic block currently being constructed.
     cur: Block,
     next: u32,
     env: HashMap<Var, Val>,
-    /// Variables bound to what an assignment returns, made only where they're read.
+    /// Local variables bound to the result of an assignment statement; they evaluate to void and
+    /// are materialized as SSA values only if subsequently read.
     voids: HashSet<Var>,
-    /// The variables in `sets` in scope, innermost last.
+    /// The mutated local variables (`sets`) currently in scope, ordered from outermost to innermost.
     assigned: std::vec::Vec<Var>,
-    /// The function's locals it assigns.
+    /// The set of local variables that are mutated via `set!` anywhere within this function.
     sets: HashSet<Var>,
     joins: HashMap<Var, Join<'a>>,
-    /// For each join group, the variables in scope it assigns.
+    /// For each active join group, the list of in-scope mutated variables assigned within that group.
     groups: std::vec::Vec<std::vec::Vec<Var>>,
     this: Val,
-    /// What's left to do, the next last.
+    /// The stack of remaining lowering tasks to execute, processed in LIFO order (next task at the top).
     todo: std::vec::Vec<Task<'a, 'id>>,
-    /// The value of the expression lowered last, if control goes on past it, which the task after
-    /// it takes.
+    /// The SSA value produced by the most recently lowered expression, or `None` if control diverged
+    /// (e.g. jumped or returned). This value is consumed by the subsequent task on the work stack.
     ret: Option<Val>,
 }
 
-/// What lowering a function does next: an expression, or going on from one with its [`Builder::ret`].
+/// A step in lowering a function: either initiating lowering of an expression or continuing execution
+/// using the result left in [`Builder::ret`].
 enum Task<'a, 'id> {
     Expr(Id<'id>, Ctx),
-    /// An `if`'s arms, after its test.
+    /// Lowers the branches of an `if` expression after its condition test has been evaluated.
     Test { then: Id<'id>, other: Id<'id>, ctx: Ctx },
-    /// The other arm, from `other`, after the first, with the assigned variables' values before it.
+    /// Lowers the `else` branch (`other`) after the `then` branch has been lowered, restoring the
+    /// mutated variable bindings to their state before the conditional.
     Then { other: Id<'id>, ctx: Ctx, b: Block, vars: std::vec::Vec<Var>, before: std::vec::Vec<Val> },
-    /// Where the arms meet: the first's value, where it ended and the assigned variables there.
+    /// Merges the control flow of both arms of an `if` expression, reconciling their return values
+    /// and any updated local variable bindings.
     Else { x: Option<Val>, end_a: Block, env_a: std::vec::Vec<Val>, vars: std::vec::Vec<Var> },
-    /// A `Seq`'s second, after its first.
+    /// Lowers the trailing expression of a sequence (`Seq`) after evaluating the leading expression.
     Seq(Id<'id>, Ctx),
     Bind(Rest<'id>),
-    /// `v` bound to the value made, or as void to what an assignment made, then the next.
+    /// Binds variable `v` to the newly produced value (or marks it void if bound to an assignment),
+    /// then proceeds with lowering `next`.
     Bound { v: Var, void: bool, next: Rest<'id> },
-    /// A `Let`'s variables out of scope.
+    /// Pops a `let` expression's bindings and resets the mutated variable tracking to restore the enclosing scope.
     Unbind { binds: Span<'id, Bind<'id>>, assigned: usize },
     Assign(Var),
-    /// Void, as an assignment's value.
+    /// Produces a void value to represent the result of an assignment expression.
     Void,
     Return,
-    /// A join group's scope or one of its codes, the `code`th with `n` assigned variables, done.
+    /// Finalizes the scope or the `code`th join definition in a join group, having preserved `n`
+    /// mutated variables across the join boundary.
     Join { codes: Span<'id, JoinCode<'id>>, carried: std::vec::Vec<Var>, rest: Option<Block>, lowered: std::vec::Vec<bool>, ctx: Ctx, code: Option<(usize, usize)> },
-    /// A call's arguments, after its callee.
+    /// Evaluates function call arguments after the callee expression has been evaluated.
     Callee { args: Span<'id, Id<'id>>, tail: bool },
-    /// The `at`th of `args`, in `order` if any, after those before, whose values `vals` has.
+    /// Evaluates argument index `at` from `args` (following evaluation sequence `order`, if specified),
+    /// accumulating results into `vals`.
     Args { args: Span<'id, Id<'id>>, order: Option<Vec<'a, usize>>, at: usize, vals: Vec<'a, Val>, then: Use },
-    /// Closures of `funs`, bound to `dsts`, as many of whose codes as are lowered, and the
-    /// captures of the one being lowered.
+    /// Manages mutually recursive closures for `funs` bound to `dsts`, tracking compiled function
+    /// codes and environment captures as each closure is lowered.
     Closures { funs: std::vec::Vec<Fun<'id>>, dsts: Vec<'a, Val>, codes: Vec<'a, Code<'a>>, captures: Option<Vec<'a, Captured>> },
 }
 
-/// A `Let`'s bindings from the `i`th, then its body.
+/// Tracks the remaining bindings of a `let` expression starting at index `i`, followed by its body.
 #[derive(Clone, Copy)]
 struct Rest<'id> {
     binds: Span<'id, Bind<'id>>,
@@ -327,7 +344,7 @@ struct Rest<'id> {
     ctx: Ctx,
 }
 
-/// What arguments' values are for.
+/// Indicates the destination or calling convention for an evaluated argument list (e.g. primitive, call, or join jump).
 #[derive(Clone, Copy)]
 enum Use {
     Call(Val),
@@ -390,7 +407,7 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
         self.env.get(&v).copied().ok_or(CompileError::Unbound(v))
     }
 
-    /// The values of the first `n` of `assigned`.
+    /// Captures a snapshot of the current SSA values of the first `n` mutated local variables in `assigned`.
     fn snapshot(&self, n: usize) -> std::vec::Vec<Val> {
         self.assigned[..n].iter().map(|v| self.env[v]).collect()
     }
@@ -441,8 +458,8 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
         Function { id, this, params, optional, rest, upvalues, blocks: blocks.collect_in(self.arena), values: self.next }
     }
 
-    /// Lowers until the function is done, or until the code of one of its closures is wanted,
-    /// which [`Builder::give`] gives it.
+    /// Drives lowering until the function is complete, or until compilation pauses because the code
+    /// for a nested closure is required (subsequently supplied via [`Builder::give`]).
     fn run(&mut self) -> Result<Option<(Fun<'id>, u32)>, CompileError> {
         let (arena, tree) = (self.arena, self.tree);
         while let Some(task) = self.todo.pop() {
@@ -544,7 +561,7 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
         Ok(None)
     }
 
-    /// The code of the closure [`Builder::run`] wanted last, by its index in the program.
+    /// Supplies the lowered function index for the nested closure requested during the last invocation of [`Builder::run`].
     fn give(&mut self, function: u32) {
         let Some(Task::Closures { codes, captures, .. }) = self.todo.last_mut() else {
             unreachable!("a closure's code is lowered when its closures want it")
@@ -552,8 +569,8 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
         codes.push(Code { function, captures: captures.take().expect("captured before its code was lowered") });
     }
 
-    /// Starts lowering `expr`, whose value, if `ctx` is a value and control goes on past it, the
-    /// task after its own takes.
+    /// Initiates lowering of `expr`. If `ctx` requests a value and control flows through, the resulting
+    /// SSA value will be delivered to the subsequent task on the work stack.
     fn start(&mut self, expr: Id<'id>, ctx: Ctx) -> Result<(), CompileError> {
         self.ret = None;
         match (self.tree[expr], ctx) {
@@ -597,8 +614,7 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
         Ok(())
     }
 
-    /// Starts lowering `expr` for what it does, after which control goes on if the value the next
-    /// task takes is something.
+    /// Lowers `expr` strictly for its side effects, discarding its value before continuing with the next task.
     fn effect(&mut self, expr: Id<'id>) {
         if let Node::Set(v, value) = self.tree[expr] {
             self.todo.push(Task::Assign(v));
@@ -608,7 +624,8 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
         }
     }
 
-    /// The `rest.i`th binding, control having gone on past those before, or the body after the last.
+    /// Lowers the binding at index `rest.i`, continuing past previously lowered bindings, or transitions
+    /// to lowering the body once all bindings are processed.
     fn bind_next(&mut self, rest: Rest<'id>) {
         let tree = self.tree;
         let Some(&bind) = tree[rest.binds].get(rest.i) else {
@@ -618,8 +635,8 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
         let next = Rest { i: rest.i + 1, ..rest };
         match bind {
             Bind::Val(v, init) => match tree[init] {
-                // A body's forms before its last are bound to what they return, as often an
-                // assignment's, which is void.
+                // Non-terminal statements in a sequence evaluate for side effects. For assignments
+                // that mutate an unmonitored variable, record them as void without generating redundant bindings.
                 Node::Set(target, value) if !self.sets.contains(&v) => {
                     self.todo.push(Task::Bound { v, void: true, next });
                     self.todo.push(Task::Assign(target));
@@ -646,7 +663,7 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
         self.assigned.truncate(assigned);
     }
 
-    /// Starts lowering `args`, in `order` if any, for `then`.
+    /// Initiates lowering for arguments in `args`, following permutation `order` if provided, to feed into `then`.
     fn args(&mut self, args: Span<'id, Id<'id>>, order: Option<Vec<'a, usize>>, then: Use) {
         let n = self.tree[args].len();
         let vals = if order.is_some() { self.arena.vec_of(self.this, n) } else { Vec::with_capacity_in(n, self.arena) };
@@ -673,8 +690,8 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
         Ok(())
     }
 
-    /// Where an `if`'s arms meet, the first having ended in `end_a` with `x` and `env_a` the values
-    /// of `vars`, the second where control is.
+    /// Emits a join block where both branches of an `if` converge: `end_a` is the exit block of the `then` branch
+    /// (with result `x` and environment `env_a`), and the current block is the exit of the `else` branch.
     fn meet(&mut self, x: Option<Val>, end_a: Block, env_a: &[Val], vars: &[Var]) {
         let y = self.ret;
         let (end_b, env_b) = (self.cur, self.snapshot(vars.len()));
@@ -719,8 +736,9 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
         self.ret = Some(result);
     }
 
-    /// Starts on `scope`, then the code of each join of `codes` something jumps to. In a value's
-    /// place, they all go on to one block, taking the value and the group's assigned variables.
+    /// Lowers the enclosing `scope` followed by the bodies of all referenced join procedures in `codes`.
+    /// When evaluated in value context, all branches jump to a shared exit block passing their result
+    /// and mutated local variables.
     fn join(&mut self, codes: Span<'id, JoinCode<'id>>, scope: Id<'id>, ctx: Ctx) {
         let tree = self.tree;
         let group = &tree[codes];
@@ -743,8 +761,8 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
         self.todo.push(Task::Expr(scope, ctx));
     }
 
-    /// After a join group's scope or one of its codes: the next code something jumps to, or what
-    /// they go on to.
+    /// Continues processing a join group after compiling the scope or a join body: lowers the next
+    /// reachable join routine or transitions to the join group's exit block.
     fn join_next(&mut self, codes: Span<'id, JoinCode<'id>>, carried: std::vec::Vec<Var>, mut rest: Option<Block>, mut lowered: std::vec::Vec<bool>, ctx: Ctx, code: Option<(usize, usize)>) {
         let tree = self.tree;
         let group = &tree[codes];
@@ -779,7 +797,8 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
         });
     }
 
-    /// Jumps from where control is, with `out`, if it goes on, to `rest`, made if it isn't yet.
+    /// If the current block does not diverge, emits a jump passing `out` and `carried` variables to `rest`
+    /// (allocating `rest` if not already created).
     fn go_on(&mut self, out: Option<Val>, carried: &[Var], rest: &mut Option<Block>) {
         let Some(out) = out else { return };
         let to = match *rest {
@@ -804,7 +823,7 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
         Ok(())
     }
 
-    /// A jump to join `id` with `vals` for its parameters.
+    /// Emits a jump to the join point identified by `id`, passing `vals` as block parameters along with any carried variables.
     fn jump_with(&mut self, id: Var, mut vals: Vec<'a, Val>) -> Result<(), CompileError> {
         let join = self.joins.get(&id).ok_or(CompileError::Unbound(id))?;
         let (block, params, group) = (join.block, join.params.len(), join.group);
@@ -824,7 +843,8 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
         Ok(())
     }
 
-    /// Starts on closures of `funs`, bound to `vars` if they're a group's, before they capture them.
+    /// Lowers a set of mutually recursive closures (`funs`) bound to `vars`, initializing closure allocations
+    /// prior to capturing upvalues.
     fn closures(&mut self, funs: std::vec::Vec<Fun<'id>>, vars: &[Var]) {
         let arena = self.arena;
         let dsts: Vec<'a, Val> = funs.iter().map(|_| self.fresh()).collect_in(arena);
@@ -836,9 +856,8 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
     }
 }
 
-/// The order to evaluate a jump's `args` to `params` in, if they can go in any: each after the
-/// others that read the parameter it's for where it can be, so the value it replaces is dead by
-/// the time it's made, and can make way for it.
+/// Determines a safe evaluation ordering for arguments passed in a jump to prevent an argument expression
+/// from overwriting a parameter register while that register's previous value is still required by a subsequent argument.
 fn order<'a, 'id>(arena: &'a Arena, tree: &L4<'id, '_>, args: &[Id<'id>], params: &[Var]) -> Option<Vec<'a, usize>> {
     let n = args.len();
     if !(2..=16).contains(&n) || n != params.len() || !args.iter().all(|&arg| reorderable(tree, arg)) {
@@ -855,7 +874,8 @@ fn order<'a, 'id>(arena: &'a Arena, tree: &L4<'id, '_>, args: &[Id<'id>], params
     Some(order)
 }
 
-/// Whether `expr` can be evaluated before or after others like it, doing nothing but make a value.
+/// Determines whether `expr` is pure and side-effect free, allowing its evaluation order to be reordered
+/// relative to other pure expressions.
 pub(crate) fn reorderable<'id>(tree: &L4<'id, '_>, expr: Id<'id>) -> bool {
     tree.frame(expr).all(|id| match tree[id] {
         Node::Quote(_) | Node::Ref(_) | Node::Lambda(_) | Node::If(..) | Node::Seq(..) => true,
@@ -867,7 +887,7 @@ pub(crate) fn reorderable<'id>(tree: &L4<'id, '_>, expr: Id<'id>) -> bool {
     })
 }
 
-/// Whether `expr` reads or assigns local `target`, or captures it.
+/// Determines whether `expr` references local variable `target` via read, mutation (`set!`), or closure capture.
 pub(crate) fn reads_local<'id>(tree: &L4<'id, '_>, expr: Id<'id>, target: Var) -> bool {
     let captures = |fun: Fun<'id>| tree[tree[fun].captures].contains(&UpvalSource::Local(target));
     tree.frame(expr).any(|id| match tree[id] {
@@ -878,7 +898,8 @@ pub(crate) fn reads_local<'id>(tree: &L4<'id, '_>, expr: Id<'id>, target: Var) -
     })
 }
 
-/// Where a value is defined: its block, and 0 for the block's start or 1 past the instruction.
+/// The definition site of an SSA value: identifies its basic block, along with an offset (0 for block parameters,
+/// or `instruction_index + 1` for instructions).
 #[cfg(any(debug_assertions, test))]
 #[derive(Clone, Copy)]
 struct Def {
@@ -886,7 +907,7 @@ struct Def {
     after: usize,
 }
 
-/// Where each of a function's `values` is defined.
+/// A mapping tracking the definition site of every SSA value allocated within a function.
 #[cfg(any(debug_assertions, test))]
 struct Defs {
     values: u32,
@@ -905,8 +926,8 @@ impl Defs {
         Ok(())
     }
 
-    /// Whether `v` is defined on every way to position `at` of block `b`, with `idom` its
-    /// blocks' immediate dominators.
+    /// Verifies that value `v` dominates position `at` in block `b`, ensuring it is defined on all paths
+    /// reaching this point using the immediate dominator tree `idom`.
     fn check(&self, idom: &[usize], v: Val, b: usize, at: usize) -> Result<(), String> {
         let def = self.at.get(&v).ok_or_else(|| format!("{v}, used in b{b}, isn't defined"))?;
         let ok = if def.block == b { def.after < at } else { dominates(idom, def.block, b) };
@@ -914,12 +935,9 @@ impl Defs {
     }
 }
 
-/// Checks that `f` and the functions of its closures are well-formed: each value defined once,
-/// where it's used, and every block reached, jumped to with as many values as it takes.
 #[cfg(any(debug_assertions, test))]
-/// Whether each of `program`'s functions is well-formed, and is the code of closures of one
-/// function after it, but the last.
-#[cfg(any(debug_assertions, test))]
+/// Verifies that every function in `program` is well-formed and that each function (except the top-level entry
+/// at the end) is referenced by a closure in a subsequent function.
 pub(crate) fn verify(program: &Program<'_, '_>) -> Result<(), String> {
     let functions = &program.functions;
     if functions.is_empty() {
@@ -943,7 +961,8 @@ pub(crate) fn verify(program: &Program<'_, '_>) -> Result<(), String> {
     }
 }
 
-/// Whether `f` is well-formed, its closures' codes among `before`.
+/// Verifies that function `f` is well-formed and that any closures it instantiates reference functions
+/// located within the preceding slice `before`.
 #[cfg(any(debug_assertions, test))]
 pub(crate) fn verify_function(f: &Function<'_, '_>, before: &[Function<'_, '_>]) -> Result<(), String> {
     let n = f.blocks.len();
@@ -985,14 +1004,15 @@ pub(crate) fn verify_function(f: &Function<'_, '_>, before: &[Function<'_, '_>])
         }
     }
     let idom = dominators(&f.blocks, &preds)?;
-    // The emitter colours blocks in order, so each comes after those it's only reached through.
+    // The register allocator processes blocks in topological/dominator order; every block must appear
+    // after its immediate dominator (`idom[b] < b`).
     if let Some(b) = (1..n).find(|&b| idom[b] >= b) {
         return Err(format!("b{b} comes before b{}, which it's only reached through", idom[b]));
     }
     let check = |v: Val, b: usize, at: usize| defs.check(&idom, v, b, at);
     for (b, block) in f.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
-            // A group's closures capture each other.
+            // Closures within a mutually recursive group may capture each other's allocated instances.
             let at = if let Inst::Closures { .. } = inst { i + 2 } else { i + 1 };
             for v in inst.uses() {
                 check(v, b, at)?;
@@ -1025,8 +1045,8 @@ pub(crate) fn verify_function(f: &Function<'_, '_>, before: &[Function<'_, '_>])
     Ok(())
 }
 
-/// Each block's immediate dominator, the entry its own, by Cooper, Harvey and Kennedy's
-/// iteration, or an error if a block can't be reached.
+/// Computes the immediate dominator of each basic block using the iterative algorithm of Cooper, Harvey,
+/// and Kennedy. Returns an error if any block is unreachable from the entry block.
 pub(crate) fn dominators(blocks: &[BlockData<'_, '_>], preds: &[impl AsRef<[usize]>]) -> Result<std::vec::Vec<usize>, String> {
     let n = blocks.len();
     let mut order = std::vec::Vec::with_capacity(n);
@@ -1175,7 +1195,8 @@ fn args(args: &[Val]) -> String {
     if args.is_empty() { String::new() } else { format!(" {}", Vals(args)) }
 }
 
-/// Prints the code's function, then those of its closures, each before those of its own.
+/// Formats the program for display by printing the top-level function followed by each nested closure
+/// function in hierarchical order.
 impl fmt::Display for Program<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut todo = vec![self.root()];
@@ -1189,7 +1210,8 @@ impl fmt::Display for Program<'_, '_> {
 }
 
 impl<'a, 'gc> Function<'a, 'gc> {
-    /// Prints the function, adding those of its closures, among `functions`, to `nested`.
+    /// Formats the function as human-readable SSA text and appends references to its nested closure functions
+    /// to `nested` for subsequent printing.
     fn print<'p>(&self, f: &mut fmt::Formatter<'_>, functions: &'p [Function<'a, 'gc>], nested: &mut std::vec::Vec<&'p Function<'a, 'gc>>) -> fmt::Result {
         match self.id {
             Some(id) => write!(f, "function {id}")?,

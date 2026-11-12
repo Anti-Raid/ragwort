@@ -12,8 +12,7 @@ fn fix<'gc>(n: i64) -> Value<'gc> {
     Value::fixnum(n).unwrap()
 }
 
-/// `op.step(cx)` out of line: `step` inlines every intrinsic's body, and a debug build gives each
-/// inlined copy its own stack, so a test that steps many ops inline overflows the thread's stack.
+/// Executes `op.step(cx)` out of line (`#[inline(never)]`). In debug builds, inlining `step` causes every intrinsic implementation's stack frame to accumulate on the caller's stack, causing stack overflow in tests executing long operation sequences.
 #[inline(never)]
 fn step<'gc>(op: Op, cx: &mut Context<'_, 'gc>) -> Result<Control, Fault> {
     op.step(cx)
@@ -69,8 +68,7 @@ fn steps_run_against_the_frame() {
             Ok(Control::Next)
         );
         assert_eq!(frame.get(6), fix(28));
-        // `AddImm`: fixnums in place, past the fixnum edge by the generic add, and faulting on
-        // non-numbers.
+        // Tests `Op::AddImm`: verifies in-place fixnum addition, overflow promotion to generic addition when exceeding fixnum boundaries, and type faults when operating on non-numeric operands.
         assert_eq!(step(Op::AddImm { dst: 7, a: 4, imm: -20 }, &mut cx), Ok(Control::Next));
         assert_eq!(frame.get(7), fix(-6));
         assert_eq!(step(Op::AddImm { dst: 7, a: 7, imm: i16::MAX }, &mut cx), Ok(Control::Next));
@@ -126,7 +124,7 @@ fn malformed_bytecode_faults() {
     });
 }
 
-/// Code that does nothing, whose closures capture `captures`.
+/// Constructs a no-op bytecode object (`Op::Return { src: 0 }`) whose closure captures the specified `captures`.
 fn code<'gc>(mc: &Mutation<'gc>, captures: &[Capture]) -> Value<'gc> {
     let ops = mc.frozen(Box::from([Op::Return { src: 0 }])).unwrap();
     let empty = Vectors::new(mc).immutable_from_slice(&[]).unwrap().value(mc);
@@ -167,7 +165,7 @@ fn closures_capture_registers_upvalues_and_each_other() {
     });
 }
 
-/// Runs `f` against a fresh frame with no constants or upvalues.
+/// Initializes an arena and fresh VM execution frame with empty constant and upvalue tables, then executes `f` within that context.
 fn with_frame(f: impl for<'s, 'gc> FnOnce(&mut Context<'s, 'gc>)) {
     let mut arena = Arena::new(1 << 26, 0);
     arena.mutate(|mc| {
@@ -258,7 +256,7 @@ fn equality_goes_as_deep_as_it_should() {
             ragwort_types::num::complex::add(&h, a, b).unwrap().value()
         };
 
-        // Numbers are eqv? by exactness and value, whatever objects hold them.
+        // Under `eqv?`, numbers are equivalent if they have identical exactness and numerical value, irrespective of whether they share the same heap object identity (e.g. comparing separately allocated bignums or flonums).
         assert!(test(cx, eqv, big(1), big(1)) && big(1) != big(1));
         assert!(!test(cx, eqv, big(1), big(2)));
         assert!(test(cx, eqv, Value::flonum(mc, 1e300).unwrap(), Value::flonum(mc, 1e300).unwrap()));
@@ -266,14 +264,14 @@ fn equality_goes_as_deep_as_it_should() {
         assert!(!test(cx, equal, fix(2), Value::flonum(mc, 2.0).unwrap()));
         assert!(!test(cx, Intrinsic::Eq, big(1), big(1)));
 
-        // Strings are equal? by their characters, but only eqv? as the same object.
+        // Strings with equivalent character sequences compare `equal?`, but satisfy `eqv?` only when referencing the exact same heap allocation.
         let long = "a string too long to fit in a value";
         assert!(!test(cx, eqv, text(long), text(long)));
         assert!(test(cx, equal, text(long), text(long)));
         assert!(!test(cx, equal, text(long), text("a string too long to fit in a value!")));
         assert!(!test(cx, equal, text("1"), fix(1)));
 
-        // Pairs, vectors of either kind, and boxes, by their contents.
+        // Structural equality `equal?` compares pairs, mutable/immutable vectors, and boxes by recursively comparing their contents.
         let list = |items: &[_]| pairs.list(items).unwrap();
         let tree = |n| list(&[text(long), list(&[big(n), boxed(fix(1))]), vectors.from_slice(&[fix(n), Value::NIL]).unwrap().value(mc)]);
         assert!(!test(cx, eqv, tree(1), tree(1)));
@@ -286,14 +284,13 @@ fn equality_goes_as_deep_as_it_should() {
         assert!(!test(cx, equal, boxed(fix(1)), list(&[fix(1)])));
         assert!(!test(cx, equal, boxed(fix(1)), boxed(fix(2))));
 
-        // A long list, and one nested deep in its heads, take no Rust stack.
+        // Comparing long lists (200,000 items) and deep left-nested pair spines operates iteratively without consuming host Rust call stack frames.
         let long_list = || pairs.list(&(0..200_000).map(fix).collect::<Vec<_>>()).unwrap();
         assert!(test(cx, equal, long_list(), long_list()));
         let deep = || (0..200_000).fold(Value::NIL, |v, _| pairs.cons(v, Value::NIL).unwrap().value(mc));
         assert!(test(cx, equal, deep(), deep()));
 
-        // Cycles end: a box that holds itself, and vectors that hold each other, with a
-        // difference far enough in that comparing starts looking for cycles first.
+        // Structural equality comparison properly terminates on cyclic structures (such as self-referential boxes and mutually referential vectors) rather than looping infinitely.
         let cycle = || {
             let b = boxed(Value::VOID);
             b.downcast::<crate::objects::Box>(mc).unwrap().set_value(mc, b);
@@ -308,8 +305,7 @@ fn equality_goes_as_deep_as_it_should() {
         assert!(test(cx, equal, knot(1), knot(1)));
         assert!(!test(cx, equal, knot(1), knot(2)));
 
-        // Shared parts are compared once, not once for each way to reach them: 64 levels of
-        // `(cons x x)` and `(vector x x)` have 2^64 paths each.
+        // Structural equality memoizes visits to shared subgraphs to avoid exponential traversal: a 64-level DAG of `(cons x x)` or `(vector x x)` containing 2^64 paths completes efficiently in linear time.
         let shared = |leaf, vector: bool| {
             (0..64).fold(leaf, |x, _| {
                 if vector { vectors.immutable_from_slice(&[x, x]).unwrap().value(mc) } else { pairs.cons(x, x).unwrap().value(mc) }
@@ -332,7 +328,7 @@ fn equality_goes_as_deep_as_it_should() {
         assert!(test(cx, equal, ring(3, 0), ring(5, 0)));
         assert!(!test(cx, equal, ring(3000, 1), ring(3000, 2)));
 
-        // A unit of fuel for each 1024 values compared: a list's pairs count as well as its items.
+        // Equality comparisons consume 1 unit of fuel for every 1,024 values visited (accounting for pair container nodes as well as element values).
         let spent = |cx: &mut Context<'_, '_>, a, b| {
             cx.fuel = Fuel { run: 100, rest: 0 };
             test(cx, equal, a, b);
@@ -344,7 +340,7 @@ fn equality_goes_as_deep_as_it_should() {
         assert_eq!(spent(cx, list(&items), list(&items)), 20);
         assert_eq!(spent(cx, list(&short), list(&short)), 0);
 
-        // Past the run's fuel, it spends the rest, and past that it stops.
+        // Once the primary run fuel budget is exhausted, fuel is drawn from the reserve budget (`fuel.rest`); if both are depleted, execution stops with `Fault::OutOfFuel`.
         cx.fuel = Fuel { run: 3, rest: 20 };
         test(cx, equal, vector(&items), vector(&items));
         assert_eq!(cx.fuel, Fuel { run: 0, rest: 13 });
@@ -383,7 +379,7 @@ fn values_are_an_object() {
         frame.set(31, Value::NIL);
         assert_eq!(call(cx, 30, 2, Intrinsic::ValuesRef), Err(Fault::WrongType));
 
-        // One value is itself, and none is an empty object.
+        // Calling `values` with a single argument produces the scalar value itself, whereas zero arguments returns an empty multiple-values object.
         call(cx, 20, 1, Intrinsic::Values).unwrap();
         assert_eq!(cx.acc, fix(10));
         call(cx, 20, 1, Intrinsic::IsValues).unwrap();
@@ -433,7 +429,7 @@ fn every_cxr_follows_its_name_from_the_last_letter() {
     arena.mutate(|mc| {
         let mut fuel = Fuel { run: u64::MAX, rest: 0 };
         let pairs = Pairs::new(mc);
-        // A tree four deep, each leaf the path to it, written as `c...r` would read it.
+        // Constructs a binary pair tree of depth 4 where each leaf string encodes its traversal path in `c...r` notation (e.g. "caddar").
         fn tree<'gc>(mc: &Mutation<'gc>, path: String, depth: usize) -> Value<'gc> {
             if depth == 0 {
                 return string::from_str(&Strings::new(mc), &path).unwrap().value();
@@ -472,7 +468,7 @@ fn shifts_and_bit_fields_are_charged_for_what_their_counts_make() {
             assert!(intrinsic.run(mc, &args, &mut fuel).is_ok(), "{intrinsic:?}");
             assert_eq!(fuel.left(), 1000 - 12_800_000 / 64 / 1024, "{intrinsic:?}");
         }
-        // Wide fields of narrow numbers cost nothing past the call.
+        // Bitfield operations specifying large field widths on small fixnum values incur no additional fuel cost beyond the baseline instruction call.
         let mut fuel = Fuel { run: 100, rest: 0 };
         assert_eq!(Intrinsic::BitField.run(mc, &[fix(5), fix(0), bits], &mut fuel), Ok(fix(5)));
         assert_eq!(Intrinsic::BitFieldReplace.run(mc, &[fix(1), fix(2), fix(0), bits], &mut fuel), Ok(fix(2)));
@@ -480,7 +476,7 @@ fn shifts_and_bit_fields_are_charged_for_what_their_counts_make() {
         assert_eq!(Intrinsic::BitFieldReplace.run(mc, &[fix(1), fix(-1), bits, bits], &mut fuel), Ok(fix(1)));
         assert_eq!(Intrinsic::ArithmeticShift.run(mc, &[fix(0), bits], &mut fuel), Ok(fix(0)));
         assert_eq!(fuel.left(), 100);
-        // -1 is as long as 0, but shifts into a number as long as the count.
+        // Shifting -1 left by a large bit count allocates a bignum proportional in size to the shift amount, consuming fuel according to allocation size and triggering `Fault::OutOfFuel`.
         assert_eq!(Intrinsic::ArithmeticShift.run(mc, &[fix(-1), bits], &mut fuel), Err(Fault::OutOfFuel));
     });
 }
@@ -489,9 +485,6 @@ fn run<'gc>(mc: &Mutation<'gc>, op: Intrinsic, args: &[Value<'gc>]) -> Result<Va
     op.run(mc, args, &mut Fuel { run: u64::MAX, rest: 0 })
 }
 
-/// A struct is of its type and its type's supertypes, and `equal?` to one of its type with
-/// `equal?` fields, unless its type is an identity one, whose structs are `equal?` only to
-/// themselves.
 #[test]
 fn intrinsics_on_the_task_need_one_and_are_never_folded_or_moved() {
     let dynamic: Vec<Intrinsic> = Intrinsic::ALL.iter().copied().filter(|i| i.is_dynamic()).collect();
@@ -501,8 +494,7 @@ fn intrinsics_on_the_task_need_one_and_are_never_folded_or_moved() {
         assert!(i.arity().is_some(), "{i:?}");
     }
     assert!(!Intrinsic::SetWinders.is_discardable() && !Intrinsic::FrameMarks.is_discardable() && Intrinsic::MarkValue.is_discardable());
-    // What each intrinsic is declared as agrees with itself: a type predicate takes one
-    // argument and never faults, and what can be dropped can be moved, unless it's on the task.
+    // Asserts self-consistency of intrinsic metadata properties: type predicates are unary and discardable (pure); discardable operations are reorderable unless they depend dynamically on the task state.
     for &i in Intrinsic::ALL {
         if i.is_type_predicate() {
             assert!(i.arity() == Some(1) && i.is_discardable(), "{i:?}");
@@ -523,6 +515,7 @@ fn intrinsics_on_the_task_need_one_and_are_never_folded_or_moved() {
     });
 }
 
+/// Tests struct type inheritance and equality: a struct instance satisfies type predicates for its concrete type and all ancestor supertypes; instances of the same struct type are `equal?` if their corresponding fields are `equal?`, unless the type was declared with identity equality, in which case instances are only equal to themselves.
 #[test]
 fn structs_are_of_their_types_and_equal_by_their_fields_or_themselves() {
     let mut arena = Arena::new(1 << 20, 0);
@@ -530,7 +523,7 @@ fn structs_are_of_their_types_and_equal_by_their_fields_or_themselves() {
         let (symbols, strings, pairs) = (ragwort_types::symbol::Symbols::of_arena(mc).unwrap(), Strings::new(mc), Pairs::new(mc));
         let symbol = |name: &str| symbols.intern_str(&strings, name).unwrap().value(mc);
         let names = |names: &[&str]| pairs.list(&names.iter().map(|n| symbol(n)).collect::<Vec<_>>()).unwrap();
-        // The flags of a type's fields, which can all be set, or can't.
+        // Generates field mutability flags for struct type definition (1 for mutable/settable, 0 for immutable).
         let flags = |n: usize, mutable: bool| pairs.list(&vec![fix(i64::from(mutable)); n]).unwrap();
         let (plain, identity, sealed) = (fix(0), fix(1), fix(2));
         let point = run(mc, Intrinsic::MakeStructType, &[symbol("point"), Value::FALSE, names(&["x", "y"]), flags(2, true), plain]).unwrap();
@@ -539,7 +532,7 @@ fn structs_are_of_their_types_and_equal_by_their_fields_or_themselves() {
         let other = run(mc, Intrinsic::MakeStructType, &[symbol("point"), Value::FALSE, names(&["x", "y"]), flags(2, false), plain]).unwrap();
         let p = run(mc, Intrinsic::MakeStruct, &[point, fix(1), fix(2)]).unwrap();
         let q = run(mc, Intrinsic::MakeStruct, &[point4, fix(1), fix(2), fix(3), fix(4)]).unwrap();
-        // Each is of its type and those above it, and of no other.
+        // Validates `struct-derived-from?`: verifies that an instance matches its concrete type descriptor and all ancestor supertypes, but does not match unrelated types or non-struct values.
         for (v, kind, is) in [(p, point, true), (p, point3, false), (p, other, false), (q, point, true), (q, point3, true), (q, point4, true), (q, other, false), (fix(1), point, false)] {
             assert_eq!(run(mc, Intrinsic::IsStructDerivedFrom, &[v, kind]), Ok(if is { Value::TRUE } else { Value::FALSE }));
         }
@@ -557,7 +550,7 @@ fn structs_are_of_their_types_and_equal_by_their_fields_or_themselves() {
         assert_eq!(run(mc, Intrinsic::StructRef, &[p, p, fix(0)]), Err(Fault::WrongType));
         assert_eq!(run(mc, Intrinsic::StructSet, &[q, point3, fix(2), fix(30)]), Ok(Value::VOID));
         assert_eq!(run(mc, Intrinsic::StructRef, &[q, point4, fix(2)]), Ok(fix(30)));
-        // A field its type doesn't say can be set can't be, by any type the struct is of.
+        // Fields declared immutable cannot be modified via `struct-set!`, whether targeted through the concrete type or any of its supertypes.
         assert_eq!(run(mc, Intrinsic::StructSet, &[q, point4, fix(3), fix(40)]), Err(Fault::Immutable));
         assert_eq!(run(mc, Intrinsic::StructSet, &[q, point4, fix(0), fix(10)]), Ok(Value::VOID), "a supertype's that can be");
         assert_eq!(run(mc, Intrinsic::StructSet, &[q, point4, fix(0), fix(1)]), Ok(Value::VOID));
@@ -580,7 +573,7 @@ fn structs_are_of_their_types_and_equal_by_their_fields_or_themselves() {
         assert_eq!(run(mc, Intrinsic::Equal, &[same, p]), Ok(Value::FALSE));
         assert_eq!(run(mc, Intrinsic::Equal, &[same, elsewhere]), Ok(Value::FALSE), "another type of the same name");
         assert_eq!(run(mc, Intrinsic::Equal, &[same, up]), Ok(Value::FALSE), "a subtype");
-        // A struct that holds itself is compared without end otherwise.
+        // Verifies cycle handling in struct equality: mutually recursive and self-referential structs are compared for structural equality without infinite recursion.
         let (a, b) = (run(mc, Intrinsic::MakeStruct, &[point, fix(1), fix(2)]).unwrap(), run(mc, Intrinsic::MakeStruct, &[point, fix(1), fix(2)]).unwrap());
         run(mc, Intrinsic::StructSet, &[a, point, fix(1), a]).unwrap();
         run(mc, Intrinsic::StructSet, &[b, point, fix(1), b]).unwrap();
@@ -590,7 +583,7 @@ fn structs_are_of_their_types_and_equal_by_their_fields_or_themselves() {
         assert_eq!(run(mc, Intrinsic::Equal, &[listed, names(&["x", "y", "z", "w"])]), Ok(Value::TRUE));
         assert_eq!(run(mc, Intrinsic::StructFields, &[p]), Err(Fault::WrongType));
 
-        // An identity type's structs, and its subtypes', are `equal?` only to themselves.
+        // Struct instances of types declared with the identity flag (and any subtypes derived from them) compare `equal?` solely via object identity rather than by comparing field values.
         let session = run(mc, Intrinsic::MakeStructType, &[symbol("session"), Value::FALSE, names(&["token", "user"]), flags(2, true), identity]).unwrap();
         let admin = run(mc, Intrinsic::MakeStructType, &[symbol("admin"), session, names(&[]), flags(0, false), plain]).unwrap();
         let (s, t) = (run(mc, Intrinsic::MakeStruct, &[session, fix(1), fix(2)]).unwrap(), run(mc, Intrinsic::MakeStruct, &[session, fix(1), fix(2)]).unwrap());
@@ -607,7 +600,7 @@ fn structs_are_of_their_types_and_equal_by_their_fields_or_themselves() {
         assert_eq!(run(mc, Intrinsic::StructSet, &[s, session, fix(1), fix(9)]), Ok(Value::VOID));
         assert_eq!(run(mc, Intrinsic::StructRef, &[s, session, fix(1)]), Ok(fix(9)));
 
-        // An instance has the type it was made as, and its fields' values as a list.
+        // Tests `struct-type`: returns the exact struct type descriptor that created the instance, and asserts that non-struct inputs trigger type faults.
         assert_eq!(run(mc, Intrinsic::StructType, &[q]), Ok(point4));
         assert_eq!(run(mc, Intrinsic::StructType, &[p]), Ok(point));
         assert_eq!(run(mc, Intrinsic::StructType, &[point]), Err(Fault::WrongType));
@@ -622,7 +615,7 @@ fn structs_are_of_their_types_and_equal_by_their_fields_or_themselves() {
             assert!(!public.is_internal(), "{public:?}");
         }
 
-        // A sealed type is no supertype, and flags that aren't a form's to give aren't taken.
+        // Asserts that extending a sealed struct type or passing unrecognized property flags to `make-struct-type` fails with a type fault.
         let last = run(mc, Intrinsic::MakeStructType, &[symbol("last"), point, names(&["z"]), flags(1, false), sealed]).unwrap();
         assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol("more"), last, names(&[]), flags(0, false), plain]), Err(Fault::WrongType));
         assert_eq!(run(mc, Intrinsic::IsStructDerivedFrom, &[run(mc, Intrinsic::MakeStruct, &[last, fix(1), fix(2), fix(3)]).unwrap(), point]), Ok(Value::TRUE));
@@ -634,8 +627,7 @@ fn structs_are_of_their_types_and_equal_by_their_fields_or_themselves() {
     });
 }
 
-/// A bytevector whose bytes the host owns reads like any other, and is written to if the
-/// host gave a buffer.
+/// Verifies that an external bytevector backed by host-owned memory supports standard bytevector read operations, as well as write operations when backed by a mutable buffer.
 #[test]
 fn external_bytevectors_read_and_write_like_others() {
     let mut arena = Arena::new(1 << 20, 0);
@@ -683,7 +675,7 @@ fn booleans_void_and_bytevectors() {
         assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, Value::NIL, Value::FALSE, fix(1)], &mut fuel), Err(Fault::WrongType));
         assert_eq!(Intrinsic::BytevectorRef.run(mc, &[fix(0), fix(0), Value::FALSE, fix(1)], &mut fuel), Err(Fault::WrongType));
         assert_eq!(Intrinsic::BytevectorSet.run(mc, &[bytes, fix(0), fix(256), Value::FALSE, fix(1)], &mut fuel), Err(Fault::OutOfRange));
-        // Two bytes across a word, most significant first, and signed.
+        // Tests reading a 2-byte signed integer across word boundaries in big-endian byte order.
         assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(7), Value::TRUE, fix(2)], &mut fuel), Ok(fix(0x08ff)));
         assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(7), Value::FALSE, fix(-2)], &mut fuel), Ok(fix(-248)));
         assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(0), Value::FALSE, fix(0)], &mut fuel), Err(Fault::OutOfRange));
@@ -707,7 +699,7 @@ fn string_comparisons_spend_fuel_for_what_they_compare() {
             op.run(mc, args, &mut fuel).unwrap();
             100 - fuel.left()
         }
-        // A unit for each 1024 characters of the shorter of each pair.
+        // String comparison operations (`string=?`, `string<?`, `string>=?`) consume 1 unit of fuel per 1,024 characters compared up to the length of the shorter string.
         let (long, other) = (text(&"a".repeat(10_240)), text(&"a".repeat(10_240)));
         for op in [Intrinsic::StringEq, Intrinsic::StringLt, Intrinsic::StringGe] {
             assert_eq!(spent(mc, op, &[long, other]), 10, "{op:?}");

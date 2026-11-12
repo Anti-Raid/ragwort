@@ -1,30 +1,19 @@
-//! Pass 8b (`L5 -> L5`): a read that gives what an earlier one gave is that one's value.
+//! Read reuse (`L5 -> L5`): replaces redundant reads with earlier SSA values.
 //!
-//! Two kinds of read are merged:
+//! Immutable field reads can reuse a dominating read of the same field on the same struct. For
+//! example, `(* (point-x p) (point-x p))` needs only one field read.
 //!
-//! - A field that can't be set, of the same struct. `(* (point-x p) (point-x p))` reads the
-//!   field once.
-//! - A variable of the module, read again with nothing between the reads that could assign
-//!   it: a call, a request, a host call or a store. `(+ (point-x origin) (point-y origin))`
-//!   loads `origin` once.
+//! Module-variable loads can reuse an earlier value only when every incoming path provides that
+//! value and no intervening operation could assign the variable. Calls, requests, host calls, and
+//! stores invalidate the relevant facts. For example, the branch in `(if (point? origin) (point-x
+//! origin) 0)` can reuse the test's load of `origin`.
 //!
-//! # Which earlier read
+//! Repeated loads of a captured variable identify the same captured value, allowing field-read
+//! reuse across those loads. The upvalue loads themselves are not merged: loading costs as much as
+//! moving the reused value, and unused loads are omitted during emission.
 //!
-//! - For a field, one the code always runs before the later read, whatever is between them.
-//! - For a variable of the module, one that every way to the later read goes through, with
-//!   nothing after it that could assign the variable. In
-//!   `(if (point? origin) (point-x origin) 0)` the branch reads what the test loaded.
-//!
-//! # Captured variables
-//!
-//! A variable the closure captured is the same for as long as the function runs, so two
-//! loads of it give one struct, and a field of it read twice is read once: in
-//! `(lambda () (* (point-x p) (point-x p)))`, where each `p` is a load. The loads themselves
-//! aren't merged. A load costs what moving the value to where it's used would, and one
-//! that's left with no use isn't emitted.
-//!
-//! A value read earlier is kept in a register till its last use, so at most [`MOST`] of each
-//! kind are kept at once.
+//! Cached results remain live until their last use, so each cache is limited to [`MOST`] entries to
+//! control register pressure.
 
 use ragwort_types::gc::{Mutation, Value};
 use ragwort_vm::objects::{StructType, StructTypeFields};
@@ -34,39 +23,38 @@ use crate::hash::HashMap;
 use crate::l5::{Function, Inst, Program, Val, dominators};
 use crate::{Prim, SlotOp};
 
-/// How many earlier reads of a kind later ones are merged with at once.
+/// Maximum number of cached reads per category.
 const MOST: usize = 32;
 
-/// Merges the reads of each of `program`'s functions.
+/// Reuses eligible reads in every function of `program`.
 pub(crate) fn merge<'gc>(mc: &Mutation<'gc>, program: &mut Program<'_, 'gc>) {
     for function in &mut program.functions {
         merge_in(mc, function);
     }
 }
 
-/// A read that gives the same value however often the function makes it.
+/// Identifies a read whose result remains unchanged throughout the function.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Fixed {
-    /// A variable the closure captured.
+    /// A captured upvalue.
     Upvalue(u32),
-    /// A field that can't be set, of a struct.
+    /// An immutable struct field.
     Field(Val, usize),
 }
 
-/// The value of each of the module's variables that's been read, with nothing since that could
-/// have assigned it.
+/// Known values of module slots, valid until an operation may assign those slots.
 type Slots = HashMap<u32, Val>;
 
-/// A step of the walk down the tree of which block runs before which.
+/// A task in the dominator-tree traversal.
 enum Step {
     Into(usize),
-    /// Out of a block: the reads made in it and the blocks under it, past the first `n` noted,
-    /// aren't made on the way to what's next.
+    /// Leaves a dominator subtree, discarding cached reads added after the first `n` entries because
+    /// they do not dominate subsequent sibling subtrees.
     Out(usize),
 }
 
-/// What `inst` does to `slots`. A read of a variable that's there is the value there, which
-/// this gives after the read's own.
+/// Updates `slots` for `inst`. For a reusable load, returns the load's result and its earlier
+/// equivalent value.
 fn slot_step(slots: &mut Slots, inst: &Inst<'_, '_>) -> Option<(Val, Val)> {
     match inst {
         Inst::Call { .. } | Inst::Prim { prim: Prim::Request(_) | Prim::Host(_), .. } => slots.clear(),
@@ -84,11 +72,9 @@ fn slot_step(slots: &mut Slots, inst: &Inst<'_, '_>) -> Option<(Val, Val)> {
     None
 }
 
-/// The [`Slots`] each block starts with: what every way to it ends with. A block no code gets
-/// to has none.
-///
-/// A block's are only ever taken from, each time a way to it turns out to end with less, so
-/// this ends.
+/// Computes available module-slot values at each block's entry by intersecting predecessor facts.
+/// Unreachable blocks have no entry state. After initialization, entry states only lose facts,
+/// ensuring convergence.
 fn slots_into(f: &Function<'_, '_>) -> Vec<Option<Slots>> {
     let mut into: Vec<Option<Slots>> = vec![None; f.blocks.len()];
     into[0] = Some(Slots::default());
@@ -132,14 +118,14 @@ fn merge_in<'gc>(mc: &Mutation<'gc>, f: &mut Function<'_, 'gc>) {
         under[above].push(b);
     }
     let mut slots_into = slots_into(f);
-    // What each value merged away is the same as, and the instructions that made them.
+    // Replacement values for eliminated reads and the instructions to remove.
     let mut same: Vec<Option<Val>> = vec![None; f.values as usize];
     let mut merged = Vec::new();
     let of = |same: &[Option<Val>], v: Val| same[v.0 as usize].unwrap_or(v);
-    // The first load of the captured variable that each later load of it is a load of.
+    // Maps repeated upvalue loads to the first load of that captured variable.
     let mut loaded: Vec<Option<Val>> = vec![None; f.values as usize];
     let fixnum = |v: Val| constants[v.0 as usize].and_then(|k| k.as_fixnum()).and_then(|k| usize::try_from(k).ok());
-    // The value of each read that can't change, made in the blocks from the first to this one.
+    // Caches immutable reads encountered along the current dominator path.
     let (mut fixed, mut noted) = (HashMap::<Fixed, Val>::default(), Vec::new());
     let mut todo = vec![Step::Into(0)];
     while let Some(step) = todo.pop() {
@@ -161,8 +147,8 @@ fn merge_in<'gc>(mc: &Mutation<'gc>, f: &mut Function<'_, 'gc>) {
                     let Some(k) = fixnum(k) else { continue };
                     (*dst, Fixed::Field(of(&loaded, of(&same, s)), k), false)
                 }
-                // A read by a type that didn't fault read a field of the type: and it checks
-                // the type too, so it's still made.
+                // A successful typed read identifies the field, but the instruction must remain to perform its type
+                // check.
                 Inst::Prim { dst, prim: Prim::Intrinsic(Intrinsic::StructRef), args, spread: false } => {
                     let &[s, kind, k] = args.as_slice() else { continue };
                     let kind = constants[kind.0 as usize].and_then(|kind| kind.downcast::<StructType>(mc));

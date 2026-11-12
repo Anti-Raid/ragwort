@@ -1,12 +1,13 @@
-//! A [`Request`] calls a procedure or changes the continuation, so the outer loop carries it
-//! out. It reads its arguments out of the frame, keeps the continuation it returns to, then
-//! runs, and what it leads to is a [`Then`]. What only works on the running task's state, as
-//! `mark-value` reads a mark, is an [intrinsic](crate::Intrinsic::is_dynamic), which the inner
-//! loop runs.
+//! VM runtime requests that alter control flow, invoke procedures, or manipulate continuations,
+//! requiring execution by the outer VM loop. A request reads argument registers from the caller's
+//! frame, reifies the return continuation onto the chain, and executes, producing a [`Then`]
+//! directive. Dynamic state queries that only inspect task state without modifying continuations (such
+//! as `mark-value`) are handled directly by the inner loop as
+//! [intrinsics](crate::Intrinsic::is_dynamic).
 //!
-//! These are marks, prompts and continuations, as Racket has them, exceptions and the jumps that
-//! run `dynamic-wind`'s winders, which the VM runs between calls of Scheme code, and switching
-//! coroutines. The default prompt tag's handler is the prelude's.
+//! Requests implement delimited control operations (prompts, marks, and continuations modeled after
+//! Racket), exception handling, `dynamic-wind` unwind/rewind trampolines, and coroutine resumption and
+//! yielding. The default prompt tag handler is provided by the prelude.
 
 use ragwort_types::gc::Value;
 use ragwort_types::{Wire, named};
@@ -21,68 +22,78 @@ named! {
     #[repr(u16)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
     pub enum Request {
-        /// `(apply f x ... list)`: calls `f` with the `x`s, then the elements of `list`: as many as
-        /// fill `f`'s required parameters, the rest as its rest list, so a list of any length fits.
-        /// The inner loop makes it a call itself, as it's already laid out as one.
+        /// `(apply f x ... list)`: invokes `f` with positional arguments `x ...` followed by the unpacked
+        /// elements of `list`. Elements are bound to fixed parameters with any remaining elements collected
+        /// into a rest list. Executed directly as a call in the inner loop when arguments are already laid out
+        /// in registers.
         Apply = "apply",
-        /// `(apply-values f v)`: calls `f` with the values in `v` if it's a [`MultiValue`], or
-        /// with `v` alone.
+        /// `(apply-values f v)`: calls `f` with the multiple values contained in `v` if `v` is a
+        /// [`MultiValue`], or with `v` itself as a single argument.
         ApplyValues = "apply-values",
-        /// `(with-mark key value f arg ...)`: calls `f` with the `arg`s, with a mark of `value`
-        /// for `key` on its continuation. In tail position, it replaces the frame's mark for
-        /// `key`, if it has one, so a loop that sets a mark stays in constant space.
+        /// `(with-mark key value f arg ...)`: invokes `f` with arguments `arg ...`, attaching a continuation
+        /// mark pairing `key` with `value` to the call's continuation. In tail position, replaces any existing
+        /// mark for `key` in the current frame to preserve constant stack space.
         WithMark = "with-mark",
-        /// `(call-with-prompt tag handler f arg ...)`: calls `f` with the `arg`s under a prompt for
-        /// `tag`, which an abort to it calls `handler` in place of.
+        /// `(call-with-prompt tag handler f arg ...)`: evaluates `(f arg ...)` delimited by a continuation
+        /// prompt for `tag`. Aborting to `tag` removes the delimited continuation and invokes `handler` in its
+        /// place.
         CallWithPrompt = "call-with-prompt",
-        /// `(abort tag value ...)`: runs the `after`s of the winders up to the nearest prompt for
-        /// `tag`, then drops the continuation up to it, and the prompt, and calls its handler with
-        /// the values in their place, as `abort-current-continuation` does.
+        /// `(abort tag value ...)`: unwinds `after` winders up to the nearest prompt matching `tag`, discards
+        /// the delimited continuation and the prompt, and invokes the prompt's handler with `value ...`
+        /// (implementing `abort-current-continuation`).
         Abort = "abort",
-        /// `(capture tag f)`: calls `f` with the composable continuation up to the nearest prompt
-        /// for `tag`, a procedure that goes on with it on top of the continuation it's called in.
+        /// `(capture tag f)`: captures the delimited continuation up to the nearest prompt matching `tag` and
+        /// invokes `f` with it as a composable continuation procedure, which when called reinstates the
+        /// captured frames atop the caller's continuation.
         Capture = "capture",
-        /// `(compose k v ...)`: goes on with the continuation `k` on top of this one, returning
-        /// the `v`s to it, without the `before`s of its winders that calling it runs.
+        /// `(compose k v ...)`: composes continuation `k` directly onto the current continuation and delivers
+        /// values `v ...` to it, bypassing the `before` winders normally executed when invoking `k` as a
+        /// procedure.
         Compose = "compose",
-        /// `(call/cc f)`: calls `f` with the escape continuation up to the nearest default prompt,
-        /// which goes on in place of the continuation it's called in, up to the nearest default
-        /// prompt, once the winders it leaves and enters have run.
+        /// `(call/cc f)`: captures the escape continuation up to the nearest default prompt and calls `(f
+        /// k)`. Invoking `k` replaces the current continuation up to the default prompt after executing
+        /// intervening `after` and `before` winders.
         CallCc = "call/cc",
-        /// `(with-exception-handler handler thunk)`: calls `thunk` with `handler` innermost on
-        /// the handler stack.
+        /// `(with-exception-handler handler thunk)`: executes `thunk` with `handler` pushed as the innermost
+        /// exception handler on the continuation marks stack.
         WithHandler = "with-exception-handler",
-        /// `(raise obj)`: calls the innermost handler with `obj` and the handler stack outside
-        /// it. If it returns, an error is raised there in its place. A raise with no handler runs
-        /// the task's `after`s: then a coroutine fails, and `obj` is raised again where it was
-        /// resumed, and a machine's own task ends with [`Outcome::Raised`](crate::Outcome::Raised).
+        /// `(raise obj)`: raises a non-continuable exception, invoking the innermost handler with `obj` while
+        /// masking that handler from nested raises. If the handler returns, a non-continuable error is raised
+        /// at the return point. If unhandled, executes all dynamic-wind `after` thunks; for coroutines, fails
+        /// the coroutine and reraises in its resumer; for the root task, terminates with
+        /// [`Outcome::Raised`](crate::Outcome::Raised).
         Raise = "raise",
-        /// `(raise-continuable obj)`: as `raise`, but returns what the handler does.
+        /// `(raise-continuable obj)`: raises a continuable exception, behaving like `raise` but returning the
+        /// value produced by the handler to the raise site if the handler returns.
         RaiseContinuable = "raise-continuable",
-        /// `(guard thunk handler)`: calls `thunk`, and if it raises, goes back here, running the
-        /// `after`s on the way, and calls `handler` with what was raised in place of `thunk`.
+        /// `(guard thunk handler)`: executes `thunk`; if an exception is raised, unwinds the stack to this
+        /// point (running intervening `after` winders) and calls `handler` with the raised condition in place
+        /// of `thunk`.
         Guard = "guard",
-        /// `(co/resume co arg ...)`: runs the pending coroutine `co` until it yields, finishes or
-        /// fails. It starts by calling its procedure with the `arg`s, or goes on from its last
-        /// yield, which returns them. Returns what it yields or returns; if it fails, the same
-        /// condition is raised here.
+        /// `(co/resume co arg ...)`: resumes pending coroutine `co` until it yields, finishes, or raises an
+        /// unhandled exception. Passes `arg ...` to initialize the coroutine procedure or as the return values
+        /// of its suspended `co/yield`. Returns the yielded or returned values; if the coroutine fails,
+        /// reraises the unhandled condition at the call site.
         Resume = "co/resume",
-        /// `(co/try-resume co arg ...)`: as `co/resume`, but returns `#t` and what that does, or
-        /// `#f` and what it raises.
+        /// `(co/try-resume co arg ...)`: protected coroutine resumption, behaving like `co/resume` but
+        /// returning values `(#t . result)` on success or `(#f . condition)` if the coroutine raises an
+        /// unhandled exception.
         TryResume = "co/try-resume",
-        /// `(co/yield v ...)`: suspends the running coroutine, so the `co/resume` that ran it
-        /// returns the `v`s. In a machine's own task, it ends the run with
-        /// [`Outcome::Yielded`](crate::Outcome::Yielded). Returns the values it's resumed with.
+        /// `(co/yield v ...)`: suspends the active coroutine and returns values `v ...` from the enclosing
+        /// `co/resume`. If invoked in the root task, terminates execution with
+        /// [`Outcome::Yielded`](crate::Outcome::Yielded). When resumed, returns the arguments passed to
+        /// `co/resume`.
         Yield = "co/yield",
-        /// `(keyword-apply f kws vals arg ... list)`: calls `f` with keywords `kws`, a sorted
-        /// list, each passed its value in the list `vals`, and the `arg`s, then the elements of
-        /// `list`. See [`crate::keyword`].
+        /// `(keyword-apply f kws vals arg ... list)`: calls `f` with keyword arguments defined by sorted symbol
+        /// list `kws` and matching value list `vals`, followed by positional arguments `arg ...` and the
+        /// unpacked elements of `list`. See [`crate::keyword`].
         KeywordApply = "keyword-apply",
     }
 }
 
 impl Request {
-    /// Whether it takes `args` arguments. Bytecode that passes another number is malformed.
+    /// Returns whether the request accepts `args` arguments; bytecode supplying any other argument count
+    /// is malformed.
     pub fn takes(self, args: usize) -> bool {
         let (least, most) = match self {
             Request::Apply => (2, None),
@@ -96,7 +107,7 @@ impl Request {
         args >= least && most.is_none_or(|most| args <= most)
     }
 
-    /// Runs it on `args`, as many as it [takes](Request::takes).
+    /// Executes the request with `args`, which must satisfy [takes](Request::takes).
     pub(crate) fn run<'gc>(self, outer: &mut Outer<'_, 'gc>, args: Args<'gc>) -> Result<Then<'gc>, Fault> {
         let (mc, task) = (outer.mc(), outer.task());
         let arg = |i| args.get(mc, i);

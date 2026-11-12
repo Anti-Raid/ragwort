@@ -1,13 +1,13 @@
-//! Optional and keyword parameters, and calls with keyword arguments, as core forms, for any
-//! front end, as Racket's `lambda` takes them.
+//! Lowers optional parameters, keyword parameters, and keyword calls into core forms for use by
+//! front ends. Parameter behavior follows Racket's `lambda`.
 //!
-//! An optional positional parameter is optional to the VM too, which binds it to
-//! `#<unsupplied>` when a call leaves it out, and the code puts the default in its place. A
-//! procedure with keyword parameters is a keyword procedure (see [`ragwort_vm::keyword`]): a
-//! core, which takes each keyword's value, sorted by name, then the positional arguments, and a
-//! plain procedure for calls without keywords. A call with keywords goes through `keyword-apply`,
-//! unless what it calls is a keyword procedure whose core the caller knows, which it calls
-//! itself.
+//! The VM binds omitted optional positional arguments to `#<unsupplied>`; generated code evaluates
+//! their defaults. A keyword procedure has a core procedure that receives keyword values sorted by
+//! name, followed by positional arguments, and a plain procedure for calls without keywords. See
+//! [`ragwort_vm::keyword`].
+//!
+//! Keyword calls use `keyword-apply` unless the caller knows the keyword procedure's core and can
+//! call it directly.
 
 use ragwort_types::gc::{Mutation, OutOfMemory, Value};
 use ragwort_types::pair::Pairs;
@@ -17,22 +17,21 @@ use ragwort_vm::{Intrinsic, Request, keyword};
 use crate::module::Import;
 use crate::{Core, Lambda, Place, Prim, Var};
 
-/// Where a front end gets new locals and lambda numbers from.
+/// Supplies fresh local-variable and lambda IDs to a front end.
 pub trait Fresh {
     fn var(&mut self) -> Var;
     fn lambda(&mut self) -> u32;
 }
 
-/// A parameter, as formals have it: its keyword, if it's a keyword parameter, and whether it has
-/// a default.
+/// Parameter metadata: its keyword, if any, and whether it has a default.
 #[derive(Clone, Copy)]
 pub struct Param<'gc> {
     pub keyword: Option<Keyword<'gc>>,
     pub optional: bool,
 }
 
-/// What a call of a keyword procedure has to match: its keywords, sorted, each with whether it's
-/// required, and how many positional arguments it takes.
+/// A keyword procedure's accepted arguments: sorted keywords with required flags, plus its
+/// positional arity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallShape<'gc> {
     pub keywords: Vec<(Keyword<'gc>, bool)>,
@@ -42,7 +41,7 @@ pub struct CallShape<'gc> {
 }
 
 impl<'gc> CallShape<'gc> {
-    /// The shape of formals with `params`, and a rest parameter if `rest`.
+    /// Computes the argument shape of `params`, including a rest parameter when `rest` is true.
     pub fn of(mc: &Mutation<'gc>, params: &[Param<'gc>], rest: bool) -> Self {
         let mut keywords: Vec<_> = params.iter().filter_map(|p| Some((p.keyword?, !p.optional))).collect();
         keywords.sort_by(|a, b| keyword::order(mc, a.0, b.0));
@@ -50,8 +49,8 @@ impl<'gc> CallShape<'gc> {
         CallShape { keywords, required: positional().filter(|p| !p.optional).count(), optional: positional().filter(|p| p.optional).count(), rest }
     }
 
-    /// The shape of the keyword procedure `import` refers to, and the import of its core, if its
-    /// module exports that.
+    /// Returns the imported keyword procedure's shape and core import, if the exporting module exposes
+    /// them.
     pub fn of_import(mc: &Mutation<'gc>, import: Import<'gc>) -> Option<(Import<'gc>, Self)> {
         let core = import.keyword_core()?;
         let Ok(Core::Quote(f)) = import.reference(mc) else { return None };
@@ -60,8 +59,8 @@ impl<'gc> CallShape<'gc> {
         Some((core, CallShape { keywords, required, optional, rest: shape.rest }))
     }
 
-    /// Whether a call with the keywords `given`, sorted, and `positional` other arguments is one
-    /// the procedure takes.
+    /// Checks whether the procedure accepts sorted keywords `given` and `positional` positional
+    /// arguments.
     pub fn matches(&self, given: &[Keyword<'gc>], positional: usize) -> bool {
         let takes = positional >= self.required && (self.rest || positional <= self.required + self.optional);
         let known = given.iter().all(|k| self.keywords.iter().any(|&(other, _)| other == *k));
@@ -69,8 +68,8 @@ impl<'gc> CallShape<'gc> {
         takes && known && required
     }
 
-    /// The arguments of a direct call of the core: each keyword's value, or `#<unsupplied>` where
-    /// `value_of` has none, then the `positional` ones.
+    /// Builds arguments for a direct core call: sorted keyword values, using `#<unsupplied>` when
+    /// `value_of` returns none, followed by positional arguments.
     pub fn core_args(&self, value_of: impl Fn(Keyword<'gc>) -> Option<Core<'gc>>, positional: Vec<Core<'gc>>) -> Vec<Core<'gc>> {
         let mut args: Vec<Core<'gc>> = self.keywords.iter().map(|&(k, _)| value_of(k).unwrap_or(Core::Quote(Value::UNSUPPLIED))).collect();
         args.extend(positional);
@@ -78,8 +77,8 @@ impl<'gc> CallShape<'gc> {
     }
 }
 
-/// The order a lambda with `params` takes them in: the keyword ones, sorted, then the positional
-/// ones, as indexes into `params`.
+/// Returns indices into `params` in calling order: sorted keyword parameters followed by positional
+/// parameters.
 pub fn order<'gc>(mc: &Mutation<'gc>, params: &[Param<'gc>]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..params.len()).filter(|&i| params[i].keyword.is_some()).collect();
     order.sort_by(|&a, &b| keyword::order(mc, params[a].keyword.expect("a keyword"), params[b].keyword.expect("a keyword")));
@@ -87,14 +86,13 @@ pub fn order<'gc>(mc: &Mutation<'gc>, params: &[Param<'gc>]) -> Vec<usize> {
     order
 }
 
-/// `var` bound to the parameter `raw`, or to `default` if the call left it out.
+/// Binds `var` to `raw`, or evaluates `default` when the argument was omitted.
 pub fn defaulted<'gc>(var: Var, raw: Var, default: Core<'gc>) -> (Var, Core<'gc>) {
     let missing = Core::Intrinsic(Prim::Intrinsic(Intrinsic::Eq), vec![Core::Ref(Place::Local(raw)), Core::Quote(Value::UNSUPPLIED)]);
     (var, Core::If(Box::new(missing), Box::new(default), Box::new(Core::Ref(Place::Local(raw)))))
 }
 
-/// The keyword procedure of `core`, whose shape is `shape`, with what it needs that's new from
-/// `fresh`.
+/// Builds a keyword procedure from `core` and `shape`, using `fresh` for generated IDs.
 pub fn procedure<'gc>(mc: &Mutation<'gc>, shape: &CallShape<'gc>, core: Core<'gc>, fresh: &mut impl Fresh) -> Result<Core<'gc>, OutOfMemory> {
     let plain = if shape.keywords.iter().any(|&(_, required)| required) {
         Core::Quote(Value::FALSE)
@@ -120,8 +118,8 @@ pub fn procedure<'gc>(mc: &Mutation<'gc>, shape: &CallShape<'gc>, core: Core<'gc
     Ok(Core::Intrinsic(Prim::Intrinsic(Intrinsic::MakeKeywordProcedure), vec![plain, core, all, required]))
 }
 
-/// A call of `f` through `keyword-apply`, with the keywords `given`, sorted, each with its value,
-/// and the `positional` arguments.
+/// Builds a `keyword-apply` call to `f` with sorted keyword/value pairs `given` and the positional
+/// arguments.
 pub fn apply<'gc>(mc: &Mutation<'gc>, f: Core<'gc>, given: Vec<(Keyword<'gc>, Core<'gc>)>, positional: Vec<Core<'gc>>) -> Result<Core<'gc>, OutOfMemory> {
     let kws: Vec<Value<'gc>> = given.iter().map(|(k, _)| k.value(mc)).collect();
     let cons = |item, rest| Core::Intrinsic(Prim::Intrinsic(Intrinsic::Cons), vec![item, rest]);
@@ -132,7 +130,7 @@ pub fn apply<'gc>(mc: &Mutation<'gc>, f: Core<'gc>, given: Vec<(Keyword<'gc>, Co
     Ok(Core::Intrinsic(Prim::Request(Request::KeywordApply), args))
 }
 
-/// Sorts `keywords` as keyword procedures take them.
+/// Sorts keywords into the order required by keyword procedures.
 pub fn sort<'gc>(mc: &Mutation<'gc>, keywords: &mut [Keyword<'gc>]) {
     keywords.sort_by(|&a, &b| keyword::order(mc, a, b));
 }

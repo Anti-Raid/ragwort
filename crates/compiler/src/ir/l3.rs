@@ -1,7 +1,7 @@
-//! `L3`, between assignment conversion and closure conversion, as a table of nodes like
-//! [`L4`](super::l4)'s: variables are still lexical, and functions are records the table keeps,
-//! which a [`Node::Lambda`] or [`Bind::Fix`] refers to as another frame, and a [`JoinCode`] as
-//! code of its own frame.
+//! `L3`: the node-table IR used by assignment conversion and contification before closure
+//! conversion. References remain lexical. [`Node::Lambda`] and [`Bind::Fix`] refer to function
+//! records that execute in separate frames; [`JoinCode`] refers to code executed in the current
+//! frame.
 
 use ragwort_types::gc::Value;
 
@@ -19,12 +19,12 @@ language! {
         If(test: Id<'id>, then: Id<'id>, other: Id<'id>),
         Seq(first: Id<'id>, second: Id<'id>),
         Let(binds: Span<'id, Bind<'id>>, body: Id<'id>),
-        /// Its scope, in which [`Node::Jump`]s to one of its codes go to it, as they do in the
-        /// codes.
+        /// A scope and its join definitions. [`Node::Jump`] can target these joins from the scope or from
+        /// any join body in the group.
         Join(scope: Id<'id>, codes: Span<'id, JoinCode<'id>>),
         /// A jump to a join of an enclosing [`Node::Join`] with values for its parameters.
         Jump(join: Var, args: Span<'id, Id<'id>>),
-        /// An assignment of a variable, which evaluates to void.
+        /// Assigns a variable and evaluates to void.
         Set(var: Var, value: Id<'id>),
         App(callee: Id<'id>, args: Span<'id, Id<'id>>),
         Lambda(fun: Fun<'id>),
@@ -36,11 +36,11 @@ language! {
     leaves { Value<'gc>, Var, Prim }
 }
 
-/// One of a [`Node::Let`]'s bindings, in scope for those after it and its body.
+/// A [`Node::Let`] binding, visible to subsequent bindings and the body.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Bind<'id> {
     Val(Var, Id<'id>),
-    /// Functions, in scope in each other's code too.
+    /// A mutually recursive function group, with every function visible in every body.
     Fix(Span<'id, (Var, Fun<'id>)>),
 }
 
@@ -60,8 +60,8 @@ impl<'id, 'gc> Bodies<'id, 'gc> for Bind<'id> {
     }
 }
 
-/// A join's code: its function's body, in the frame, with its parameters bound to the values a
-/// jump to `id` has.
+/// Join code executed in the current frame. A jump to `id` supplies values for the function's
+/// parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct JoinCode<'id> {
     pub(crate) id: Var,
@@ -78,12 +78,12 @@ impl<'id, 'gc> Bodies<'id, 'gc> for JoinCode<'id> {
     fn bodies(self, _: &L3<'id, 'gc>, _: &mut impl FnMut(Id<'id>)) {}
 }
 
-/// A function: a lambda's, or a join's code.
+/// A function record used by either a lambda or a join.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Function<'id> {
     /// Distinguishes this lambda from every other in the expression being compiled.
     pub(crate) id: u32,
-    /// How many of the last of `params` a call can leave out.
+    /// Number of trailing entries in `params` that a call may omit.
     pub(crate) optional: u32,
     pub(crate) params: Span<'id, Var>,
     /// Receives the arguments past `params` as a list, if any.
@@ -92,7 +92,7 @@ pub(crate) struct Function<'id> {
 }
 
 impl<'id, 'gc> L3<'id, 'gc> {
-    /// The variables `bind` binds.
+    /// Returns the variables introduced by `bind`.
     pub(crate) fn vars(&self, bind: Bind<'id>) -> impl Iterator<Item = Var> + '_ {
         let (one, group) = match bind {
             Bind::Val(v, _) => (Some(v), &[][..]),
@@ -101,12 +101,12 @@ impl<'id, 'gc> L3<'id, 'gc> {
         one.into_iter().chain(group.iter().map(|&(v, _)| v))
     }
 
-    /// The variables `fun` binds as it's called: its parameters, and its rest one.
+    /// Returns `fun`'s positional parameters and optional rest parameter.
     pub(crate) fn params(&self, fun: Fun<'id>) -> impl Iterator<Item = Var> + '_ {
         self[self[fun].params].iter().copied().chain(self[fun].rest)
     }
 
-    /// Panics if the tree from `root` isn't well-formed, as a debug build checks.
+    /// Panics if the tree rooted at `root` is malformed. Used by debug-build checks.
     #[cfg(debug_assertions)]
     pub(crate) fn check(&self, root: Id<'id>) {
         if let Err(e) = self.verify(root) {
@@ -114,11 +114,10 @@ impl<'id, 'gc> L3<'id, 'gc> {
         }
     }
 
-    /// Whether the tree from `root`, and the code of each function in it, is well-formed: each
-    /// node and function has one parent, each variable is bound once and used only in its scope,
-    /// which a function's body is in, and each jump is to a join in scope in its frame with as
-    /// many values as the join takes, which takes no optional or rest ones. Nodes nothing reaches
-    /// aren't checked.
+    /// Checks the tree and function bodies reachable from `root`. Nodes and functions must have one
+    /// parent; variables must be uniquely bound and used within scope. Jumps must target an in-scope
+    /// join in the same frame with matching arity. Joins cannot have optional or rest parameters.
+    /// Unreachable nodes are ignored.
     #[cfg(any(debug_assertions, test))]
     pub(crate) fn verify(&self, root: Id<'id>) -> Result<(), String> {
         use crate::hash::{HashMap, HashSet};
@@ -136,7 +135,7 @@ impl<'id, 'gc> L3<'id, 'gc> {
         let mut funs = vec![false; self.functions.len()];
         let mut bound = HashSet::default();
         let mut locals = HashSet::default();
-        // The joins in scope in each frame, by how many values they take.
+        // Maps each frame's in-scope joins to their arities.
         let mut frames: Vec<HashMap<Var, usize>> = vec![HashMap::default()];
         let mut todo = vec![Task::Expr(root)];
         let mut then = Vec::new();

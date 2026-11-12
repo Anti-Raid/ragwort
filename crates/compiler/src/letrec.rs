@@ -1,13 +1,13 @@
 //! Pass 2 (`L1 -> L2`): Waddell–Sarkar–Dybvig `letrec` / `letrec*` fixing.
 //!
-//! Eliminates `L1`'s `Letrec` in favor of one [`l2::Node::Let`], in order, of:
-//! - [`Bind::Val`] for non-recursive bindings, non-self-recursive lambdas, and unreferenced
-//!   side-effecting bindings,
-//! - [`Bind::Fix`] for strongly connected components of unassigned mutually recursive lambdas,
-//! - [`Bind::Val`]s of `#<void>` and of [`l2::Node::Set`]s only for complex bindings with true
-//!   forward value dependencies.
+//! Eliminates `L1` `Letrec` forms, transforming each block into an ordered [`l2::Node::Let`] comprising:
+//! - [`Bind::Val`] for non-recursive values, non-self-recursive lambdas, and unreferenced
+//!   effectful expressions,
+//! - [`Bind::Fix`] for strongly connected components of unassigned, mutually recursive lambdas,
+//! - Initial [`Bind::Val`] bindings to `#<void>` followed by [`l2::Node::Set`] assignments only for
+//!   complex bindings exhibiting true forward value dependencies.
 //!
-//! It's a loop over a stack of tasks, what each node uses on a stack of its own.
+//! Traversal is performed iteratively via an explicit task stack, tracking free variable usages on a companion stack.
 
 use ragwort_types::gc::{Mutation, Value};
 
@@ -17,25 +17,24 @@ use crate::ir::l1::{self, L1};
 use crate::ir::l2::{self, Bind, Fun, Id, L2, Node};
 use crate::ir::Supply;
 
-/// Maximum number of closures in a single `Fix` group (must fit in `STAGE` scratch registers).
+/// Maximum number of mutually recursive closures allowed in a single `Fix` group, bounded by available `STAGE` scratch registers.
 const MAX_FIX_GROUP: usize = 30;
 
-/// `root` of `from` into `tree`, `letrec`s fixed, and its root there.
+/// Lowers `root` from `from` into `tree` with all `letrec` bindings fixed, returning the new root node ID and updated `Supply`.
 pub(crate) fn fix_letrec<'s, 'id, 'gc>(mc: &Mutation<'gc>, from: &L1<'s, 'gc>, root: l1::Id<'s>, tree: &mut L2<'id, 'gc>, mut supply: Supply) -> (Id<'id>, Supply) {
-    /// A node to fix, or what to make of what its children fixed to.
+    /// A transformation task: an unvisited node, a usage scope boundary, or a deferred node assembly operation.
     enum Task<'s> {
         Expr(l1::Id<'s>),
-        /// Into what has a usage of its own: a binding's init, a binding form's body, or a
-        /// function's.
+        /// Pushes a fresh variable usage tracking context when entering a subexpression with isolated usage (a binding initializer, let body, or lambda body).
         Open,
-        /// A binding's init fixed, which keeps its usage.
+        /// Finalizes processing of a binding initializer, recording the lowered node and its associated free variable usage.
         Keep,
         Make(l1::Id<'s>),
     }
     let mut cx = Cx { mc, tree, supply: &mut supply };
     let mut usages = vec![Usage::default()];
     let mut vals: Vec<Id<'id>> = Vec::new();
-    // The inits fixed of each binding form the walk is in, with what they use.
+    // Stack of lowered initializers and their free variable usages for active enclosing binding forms.
     let mut inits: Vec<(Id<'id>, Usage)> = Vec::new();
     let mut todo = vec![Task::Expr(root)];
     let mut then = Vec::new();
@@ -116,11 +115,11 @@ pub(crate) fn fix_letrec<'s, 'id, 'gc>(mc: &Mutation<'gc>, from: &L1<'s, 'gc>, r
 struct Cx<'t, 's, 'id, 'gc> {
     mc: &'t Mutation<'gc>,
     tree: &'t mut L2<'id, 'gc>,
-    /// For the variables the results of a fallback's assignments are bound to.
+    /// Identifier generator for variables bound to the results of assignment expressions during fallback desugaring.
     supply: &'s mut Supply,
 }
 
-/// The variables an expression refers to and assigns, outside the binding forms within it.
+/// Tracks variables referenced and mutated within an expression, excluding those bound locally within it.
 #[derive(Default)]
 pub(crate) struct Usage {
     used: HashSet<Var>,
@@ -128,8 +127,7 @@ pub(crate) struct Usage {
 }
 
 impl Usage {
-    /// Takes in `other`, the smaller poured into the larger, so merging up a whole tree costs
-    /// `n log n`.
+    /// Merges `other` into `self` using small-into-large set merging to maintain O(n log n) total complexity across AST traversal.
     fn absorb(&mut self, mut other: Self) {
         if self.used.len() < other.used.len() {
             std::mem::swap(&mut self.used, &mut other.used);
@@ -145,7 +143,7 @@ impl Usage {
         self.used.contains(&v) || self.assigned.contains(&v)
     }
 
-    /// What's left outside a form binding `vars`.
+    /// Returns the remaining free variable usage after removing the variables bound by `vars`.
     fn bind(mut self, vars: impl IntoIterator<Item = Var>) -> Self {
         for v in vars {
             self.forget(v);
@@ -158,7 +156,7 @@ impl Usage {
         self.assigned.remove(&v);
     }
 
-    /// Those of `vars` this uses, and those it assigns.
+    /// Computes the intersection of `self`'s used and assigned variables with `vars`, returning `(used_in_vars, assigned_in_vars)`.
     fn among(&self, vars: &HashSet<Var>) -> (HashSet<Var>, HashSet<Var>) {
         let among = |set: &HashSet<Var>| -> HashSet<Var> {
             if set.len() < vars.len() {
@@ -171,26 +169,25 @@ impl Usage {
     }
 }
 
-/// Drops the bindings from `root` nothing uses, as `simplify_let_with` does for one `let`, for
-/// a whole tree in one walk: inside out, so a binding only a dropped one used goes too. A `let`
-/// left with none takes its body's place.
+/// Traverses `root` bottom-up in a single pass to eliminate unused pure bindings across the entire expression tree.
+/// Bindings referenced solely by other dead bindings are transitively removed. If all bindings in a `let` are pruned,
+/// the node is replaced by its body.
 pub(crate) fn prune<'id, 'gc>(mc: &Mutation<'gc>, tree: &mut l2::L2<'id, 'gc>, root: l2::Id<'id>) {
-    /// What's left of the walk, which takes what each node uses in on the top of `usages`.
+    /// A pending traversal task in the pruning pass, tracking variable usage at the top of the `usages` stack.
     enum Task<'id> {
         Expr(l2::Id<'id>),
-        /// Into a `let`'s body, or a function's, which has a usage of its own.
+        /// Pushes a new variable usage tracking context upon entering a lambda body or `let` body.
         Open,
-        /// Out of a function's body, its parameters bound.
+        /// Finalizes traversal of a function body, removes its formal parameters from the tracked usage, and merges remaining free variables into the outer scope.
         Function(l2::Fun<'id>),
-        /// The `let`'s binding `i`, once those after it are walked: it stays if what's after it
-        /// mentions it, or it's not pure.
+        /// Evaluates `let` binding `i` after all subsequent bindings and the body have been processed: retains the binding if it is impure or referenced downstream.
         Bind(l2::Id<'id>, usize),
-        /// Its group's variables, once its functions are walked.
+        /// Removes all variables bound by a mutually recursive `Fix` group from the active usage set after analyzing its member functions.
         Forget(l2::Span<'id, (Var, l2::Fun<'id>)>),
         Let(l2::Id<'id>),
     }
     let mut usages = vec![Usage::default()];
-    // The bindings kept of each `let` the walk is in, last first.
+    // Stack of retained bindings for each active enclosing `let` expression, accumulated in reverse order.
     let mut kept: Vec<Vec<l2::Bind<'id>>> = Vec::new();
     let mut todo = vec![Task::Expr(root)];
     let mut then = Vec::new();
@@ -259,13 +256,12 @@ pub(crate) fn prune<'id, 'gc>(mc: &Mutation<'gc>, tree: &mut l2::L2<'id, 'gc>, r
     }
 }
 
-/// A binding still to be fixed, with its place among them.
+/// A letrec binding awaiting resolution, represented as `(original_index, variable, initializer_id)`.
 type Pending<'id> = (usize, Var, Id<'id>);
 
 impl<'id> Cx<'_, '_, 'id, '_> {
-    /// Drops the pure bindings of a `Let` unused in `body`, given what `body` and each init use,
-    /// and says what the result uses. The rest stay in it, in order, so a body of many forms, a
-    /// `Let` of results unused, stays as flat as it was.
+    /// Eliminates unused pure bindings from a `Let` given the usage profiles of its body and initializers, returning
+    /// the simplified expression and combined variable usage. Preserves active bindings in original order to maintain flat expression bodies.
     fn simplify_let_with(&mut self, binds: Vec<(Var, Id<'id>, Usage)>, body: Id<'id>, body_usage: Usage) -> (Id<'id>, Usage) {
         let mut usage = body_usage;
         let mut kept = Vec::with_capacity(binds.len());
@@ -280,7 +276,7 @@ impl<'id> Cx<'_, '_, 'id, '_> {
         (self.with(kept, body), usage)
     }
 
-    /// `body` in the scope of `binds`, if there are any.
+    /// Wraps `body` in a `Let` node containing `binds`, or returns `body` directly if `binds` is empty.
     fn with(&mut self, binds: Vec<Bind<'id>>, body: Id<'id>) -> Id<'id> {
         if binds.is_empty() {
             return body;
@@ -313,7 +309,7 @@ impl<'id> Cx<'_, '_, 'id, '_> {
         used.extend(body_used);
         assigned.extend(body_assigned);
 
-        // Filter out completely unused pure bindings; what's left is all the block uses.
+        // Discard completely unreferenced pure bindings; remaining bindings represent all active dependencies of the block.
         let mut usage = body_usage;
         let mut indexed: Vec<Pending<'id>> = Vec::with_capacity(binds.len());
         for (i, (v, init, u)) in binds.into_iter().enumerate() {
@@ -343,8 +339,7 @@ impl<'id> Cx<'_, '_, 'id, '_> {
                 }
                 out.push(Bind::Val(v, init));
             } else {
-                // Forward reference to an uninitialized variable: fall back to `<void>` + `Set` for
-                // the remaining bindings in their original lexical order.
+                // Detected forward reference to an uninitialized variable: desugar remaining bindings into `#<void>` initialization followed by `Set` assignments in original source order.
                 let mut rest: Vec<Pending<'id>> = std::mem::take(&mut pending_fix);
                 rest.push((idx, v, init));
                 rest.extend(iter);
@@ -366,8 +361,7 @@ impl<'id> Cx<'_, '_, 'id, '_> {
         (self.with(out, body), usage)
     }
 
-    /// Binds those of `rest` used to `#<void>`, then assigns each its init, or evaluates it if
-    /// it's unused, in order.
+    /// Desugars `rest` using the general fallback strategy: binds referenced variables to `#<void>`, then sequentially assigns each initializer or evaluates impure unused initializers for their side effects.
     fn fallback(&mut self, rest: impl IntoIterator<Item = (Var, Id<'id>)>, used: &HashSet<Var>, out: &mut Vec<Bind<'id>>) {
         let rest: Vec<(Var, Id<'id>)> = rest.into_iter().collect();
         for &(v, _) in rest.iter().filter(|(v, _)| used.contains(v)) {
@@ -383,8 +377,7 @@ impl<'id> Cx<'_, '_, 'id, '_> {
         }
     }
 
-    /// Flushes all functions in `pending_fix` whose transitive dependencies in `letrec_vars` are
-    /// satisfied by `bound` and other ready functions in `pending_fix`.
+    /// Emits all functions in `pending_fix` whose transitive dependencies within the `letrec` block have been satisfied by already-bound variables or mutually dependent functions within `pending_fix`.
     fn flush_ready_fix(&mut self, pending_fix: &mut Vec<Pending<'id>>, bound: &mut HashSet<Var>, fv: &HashMap<Var, HashSet<Var>>, out: &mut Vec<Bind<'id>>) {
         if pending_fix.is_empty() {
             return;
@@ -412,7 +405,7 @@ impl<'id> Cx<'_, '_, 'id, '_> {
         }
         *pending_fix = kept;
 
-        // Decompose `ready` into Tarjan strongly-connected components in topological order.
+        // Decompose the dependency graph of `ready` functions into strongly connected components in topological order using Tarjan's algorithm.
         for scc in tarjan_sccs(ready, fv) {
             for &(v, _) in &scc {
                 bound.insert(v);
@@ -430,7 +423,7 @@ impl<'id> Cx<'_, '_, 'id, '_> {
                 let group = self.tree.list(group);
                 out.push(Bind::Fix(group));
             } else {
-                // Very large mutually recursive SCC (> 30 functions): fall back to boxed assignment.
+                // Fall back to desugared assignment for mutually recursive SCCs exceeding MAX_FIX_GROUP (30 functions), which exceed available staging registers.
                 let members: HashSet<Var> = scc.iter().map(|&(v, _)| v).collect();
                 self.fallback(scc, &members, out);
             }
@@ -438,7 +431,7 @@ impl<'id> Cx<'_, '_, 'id, '_> {
     }
 }
 
-/// Computes strongly connected components of `nodes` in dependency order (callees before callers).
+/// Computes the strongly connected components of `nodes` in topological dependency order (callees preceding callers) via Tarjan's algorithm.
 fn tarjan_sccs<T: Copy>(nodes: Vec<(Var, T)>, fv: &HashMap<Var, HashSet<Var>>) -> Vec<Vec<(Var, T)>> {
     let n = nodes.len();
     let index_of: HashMap<Var, usize> = nodes.iter().enumerate().map(|(i, &(v, _))| (v, i)).collect();
@@ -462,8 +455,7 @@ fn tarjan_sccs<T: Copy>(nodes: Vec<(Var, T)>, fv: &HashMap<Var, HashSet<Var>>) -
     }
 
     impl Tarjan<'_> {
-        /// Visits `root` and what it reaches, with a stack of where each visit is in its edges
-        /// in place of recursion, as a long chain of definitions would go deep.
+        /// Iteratively explores `root` and reachable nodes using an explicit call stack to avoid machine stack overflow on deep dependency chains.
         fn visit(&mut self, root: usize) {
             let mut calls = vec![(root, 0)];
             self.enter(root);

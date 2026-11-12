@@ -1,14 +1,14 @@
-//! What the VM runs between calls of Scheme code: exceptions and the jumps that run winders, as
-//! Lua runs a C function's continuation. A request pushes a [`Native`] record on
-//! the chain and calls a procedure; once that returns, the record's [`Kind`] says what comes
-//! next, which may call another.
+//! Inter-instruction VM operations: exception handling and non-local jump trampolines for
+//! `dynamic-wind`. Similar to continuation handling in Lua, operations push a [`Native`] frame onto
+//! the continuation chain before calling a procedure; upon return, the record's [`Kind`] determines
+//! the subsequent action (such as executing additional thunks or completing an unwind).
 //!
-//! The handlers mark holds the handler stack, as a list, innermost first: procedures, which a
-//! raise calls with the mark set to those outside them, and [`Guard`]s, which it goes back to.
-//! `dynamic-wind`, as Chez has it, is the prelude's: it sets the task's [`Winder`](crate::objects::Winder)s around its
-//! thunk, and a prompt keeps those of the part it returns to. A jump out of their extent runs
-//! their `after`s and one into it their `before`s, each with the task's set to the winders
-//! outside it.
+//! The handler stack is maintained in a continuation mark as an association list (innermost first)
+//! containing handler procedures and [`Guard`] frames. Raising an exception invokes handlers with the
+//! mark updated to reflect outer handlers, or unwinds to an enclosing guard. `dynamic-wind`
+//! establishes [`Winder`](crate::objects::Winder) records around its thunk; non-local jumps out of its
+//! dynamic extent run its `after` thunks, and jumps into its extent run its `before` thunks, each
+//! executed with the task's active winders restricted to those enclosing the winder.
 
 use ragwort_types::gc::{Gc, Value};
 use ragwort_types::pair::{Pair, Pairs};
@@ -22,28 +22,29 @@ use crate::objects::{Continuation, ContinuationFields, Guard, GuardFields, Multi
 use crate::prompts::{self, Wind, default_tag, handler_key};
 use crate::segments::{Cut, cut_at};
 
-/// What a [`Native`] record does once what's above it returns, with its `a` and `b`.
+/// Specifies the action to execute when a [`Native`] continuation frame returns, parameterized by
+/// stored values `a` and `b`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
-    /// The handler of a `raise` of `a` returned: raise an error in its place.
+    /// The exception handler invoked for `raise(a)` returned; raises a non-continuable exception error in
+    /// its place.
     Handled,
-    /// What a [`Guard`] `a` was set for returned: return what it did, or `#t` and it if `b` says
-    /// it's a `co/try-resume`'s.
+    /// The guarded thunk for [`Guard`] `a` returned normally; returns its result, or returns `(#t .
+    /// result)` if `b` indicates it was wrapped by `co/try-resume`.
     Guarded,
-    /// Call the thunk of the first `(thunk . winders)` of the list `a`, with the task's winders
-    /// set to `winders`, then go on with the rest. Once there are none, go on as the record `b` does.
+    /// Executes the first `(thunk . winders)` pair in list `a` with active winders set to `winders`, then
+    /// processes the remaining pairs; once exhausted, completes the action specified by record `b`.
     Winds,
-    /// Abort to the nearest prompt for the tag `a`, with the values of the list `b`.
+    /// Aborts to the nearest prompt matching tag `a`, passing the values in list `b`.
     Abort,
-    /// Go on with the escape continuation `a`, in place of the current one up to the nearest
-    /// default prompt, with the values of the list `b`.
+    /// Reinstates escape continuation `a` in place of the current continuation up to the nearest default
+    /// prompt, passing values `b`.
     Escape,
-    /// Go on with the composable continuation `a` on top of the current one, with the values of
-    /// the list `b`.
+    /// Composes continuation `a` on top of the current continuation, passing values `b`.
     Compose,
-    /// `a` was raised with no handler, and the `after`s have run.
+    /// Value `a` was raised without a handler, and all intervening `after` thunks have finished running.
     Uncaught,
-    /// `b` was raised to the [`Guard`] `a`: go back to where it was set.
+    /// Value `b` was raised within [`Guard`] `a`; unwinds the stack to where the guard was established.
     Catch,
 }
 
@@ -65,7 +66,8 @@ impl Kind {
 }
 
 impl<'gc> Outer<'_, 'gc> {
-    /// Pushes a record of `kind` on the chain, for what's called next to return to.
+    /// Pushes a [`Native`] record of type `kind` onto the continuation chain as the return destination for
+    /// the subsequent call.
     pub(crate) fn push(&self, kind: Kind, a: Value<'gc>, b: Value<'gc>) -> Result<(), Fault> {
         let (mc, task) = (self.mc(), self.task());
         let record = Native::new(mc, kind as u32, a, b, task.attachments(mc), task.chain(mc))?;
@@ -73,7 +75,8 @@ impl<'gc> Outer<'_, 'gc> {
         Ok(())
     }
 
-    /// Goes on from `native`, the record on top of the chain, which it's already taken off.
+    /// Executes the action specified by [`Native`] record `native`, which has been popped from the head of
+    /// the continuation chain.
     pub(crate) fn native(&mut self, native: Gc<'gc, Native>) -> Result<Then<'gc>, Fault> {
         self.step(Kind::of(native.kind(self.mc()))?, native.a(self.mc()), native.b(self.mc()))
     }
@@ -126,7 +129,7 @@ impl<'gc> Outer<'_, 'gc> {
         })
     }
 
-    /// Runs the thunks of `todo`, a list of `(thunk . winders)`, then goes on as `kind` does with
+    /// Executes each `(thunk . winders)` entry in `todo`, then proceeds with action `kind` parameterized by
     /// `a` and `b`.
     fn unwind(&mut self, todo: Value<'gc>, kind: Kind, a: Value<'gc>, b: Value<'gc>) -> Result<Then<'gc>, Fault> {
         if todo == Value::NIL {
@@ -137,9 +140,9 @@ impl<'gc> Outer<'_, 'gc> {
         self.step(Kind::Winds, todo, Value::object(mc, then))
     }
 
-    /// What raising `obj` leads to: a call of the innermost handler, with the handlers mark set
-    /// to those outside it, which a raise that isn't `continuable` doesn't return from, or a jump
-    /// to the innermost guard, or if there's neither, [`Then::Uncaught`].
+    /// Dispatches exception `obj`: invokes the innermost handler procedure (with active handlers updated
+    /// to enclosing ones), unwinds to the innermost guard, or returns [`Then::Uncaught`] if no handler or
+    /// guard exists.
     pub(crate) fn raising(&mut self, obj: Value<'gc>, continuable: bool) -> Result<Then<'gc>, Fault> {
         let (mc, task) = (self.mc(), self.task());
         let handlers = prompts::mark(mc, task, handler_key(), Value::NIL)?;
@@ -156,15 +159,16 @@ impl<'gc> Outer<'_, 'gc> {
         Ok(Then::Call(handler, Args::one(obj)))
     }
 
-    /// Runs the task's `after`s, for `obj`, raised with no handler, then goes on as
-    /// [`Then::Uncaught`] does once they have.
+    /// Executes all remaining `after` winders for an unhandled exception `obj`, then transitions to
+    /// [`Then::Uncaught`].
     pub(crate) fn unwind_all(&mut self, obj: Value<'gc>) -> Result<Then<'gc>, Fault> {
         let mc = self.mc();
         let todo = winds_todo(mc, &prompts::winds(mc, self.task(), None)?, &[])?;
         self.unwind(todo, Kind::Uncaught, obj, Value::VOID)
     }
 
-    /// Calls `thunk` with `handler` innermost in the handlers mark.
+    /// Invokes `thunk` with `handler` installed as the innermost entry in the exception handlers
+    /// continuation mark.
     pub(crate) fn with_handler(&mut self, handler: Value<'gc>, thunk: Value<'gc>) -> Result<Then<'gc>, Fault> {
         let (mc, task) = (self.mc(), self.task());
         let handlers = prompts::mark(mc, task, handler_key(), Value::NIL)?;
@@ -172,8 +176,8 @@ impl<'gc> Outer<'_, 'gc> {
         Ok(Then::Call(thunk, Args::none()))
     }
 
-    /// Pushes a record of a new [`Guard`] of `handler` on the chain, a `co/try-resume`'s if
-    /// it's `tried`, and puts the guard innermost in the handlers mark, for what's called next.
+    /// Pushes a new [`Guard`] record wrapping `handler` onto the chain (flagged as `co/try-resume` if
+    /// `tried` is true) and installs it as the innermost handler mark for the subsequent call.
     pub(crate) fn guard(&mut self, handler: Value<'gc>, tried: bool) -> Result<(), Fault> {
         let (mc, task) = (self.mc(), self.task());
         let guard = Value::object(mc, Guard::new(mc, handler, task.winders(mc))?);
@@ -184,9 +188,8 @@ impl<'gc> Outer<'_, 'gc> {
         Ok(())
     }
 
-    /// Where a raise to the [`Guard`] `guard` goes back to: which prompt's part of the
-    /// continuation it's kept in, counting from the current one, the continuation there, and
-    /// the prompts under that part.
+    /// Locates the target return boundary for [`Guard`] `guard`: returns the prompt segment index
+    /// (counting from the active segment), the continuation cut, and the underlying prompt list.
     fn back_to(&self, guard: Value<'gc>) -> Result<(usize, Cut<'gc>, Value<'gc>), Fault> {
         let (mc, task) = (self.mc(), self.task());
         if let Some(cut) = cut_at(mc, task.chain(mc), guard)? {
@@ -203,8 +206,8 @@ impl<'gc> Outer<'_, 'gc> {
         Err(Fault::Malformed)
     }
 
-    /// Aborts to the nearest prompt for `tag` with `args`, once the `after`s of the winders up to
-    /// it have run.
+    /// Aborts to the nearest prompt matching `tag` with `args`, after unwinding all `after` winders up to
+    /// that prompt.
     pub(crate) fn abort(&mut self, tag: Value<'gc>, args: Args<'gc>) -> Result<Then<'gc>, Fault> {
         let mc = self.mc();
         let todo = winds_todo(mc, &prompts::winds(mc, self.task(), Some(tag))?, &[])?;
@@ -222,10 +225,9 @@ impl<'gc> Outer<'_, 'gc> {
         })
     }
 
-    /// Goes on with `k` with `args`, once the winders it leaves and enters have run: an escape
-    /// continuation leaves those up to the nearest default prompt that it doesn't hold, and
-    /// enters those it holds that the current continuation doesn't; a composable one enters all
-    /// of its own.
+    /// Reinstates continuation `k` with `args` after executing necessary `before` and `after` winders:
+    /// escape continuations unwind winders exited up to the common ancestor and rewind newly entered
+    /// winders, while composable continuations rewind all of their own winders.
     pub(crate) fn go_to(&mut self, k: Gc<'gc, Continuation>, args: Args<'gc>) -> Result<Then<'gc>, Fault> {
         let mc = self.mc();
         let to = prompts::winds_of(mc, k)?;
@@ -242,7 +244,8 @@ impl<'gc> Outer<'_, 'gc> {
         self.unwind(todo, kind, Value::object(mc, k), args.to_list(mc)?)
     }
 
-    /// Goes on with the continuation `k` with `args`, as an escape or composed.
+    /// Directly resumes continuation `k` with `args`, dispatching as either an escape continuation or a
+    /// composable continuation.
     fn go_now(&mut self, k: Value<'gc>, escape: bool, args: Args<'gc>) -> Result<Then<'gc>, Fault> {
         let (mc, task) = (self.mc(), self.task());
         if escape {
@@ -253,8 +256,8 @@ impl<'gc> Outer<'_, 'gc> {
     }
 }
 
-/// The `after`s of `leaving`, innermost first, then the `before`s of `entering`, outermost first,
-/// as a list of `(thunk . winders)`.
+/// Builds a list of `(thunk . winders)` pairs containing the `after` thunks of `leaving` winders
+/// (innermost first), followed by the `before` thunks of `entering` winders (outermost first).
 fn winds_todo<'gc>(mc: &ragwort_types::gc::Mutation<'gc>, leaving: &[Wind<'gc>], entering: &[Wind<'gc>]) -> Result<Value<'gc>, Fault> {
     let pairs = Pairs::new(mc);
     let mut todo = Value::NIL;

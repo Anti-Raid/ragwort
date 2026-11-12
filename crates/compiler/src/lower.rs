@@ -1,15 +1,16 @@
-//! Pass 1 (`Core -> L1`): validates the input AST and lowers module variables (`Place::Slot`)
-//! into slot primitives.
+//! Pass 1 (`Core -> L1`): Validates the input AST structure and lowers module-level variable references
+//! (`Place::Slot`) into explicit slot access primitives.
 
 use crate::hash::HashSet;
 use crate::ir::Supply;
 use crate::ir::l1::{Function, Id, L1, Node};
 use crate::{CompileError, Core, Place, Prim, SlotOp, Var};
 
-/// `core` into `tree`, its root there, and what makes variables and lambdas fresh after it.
+/// Lowers the input `core` AST into the IR `tree`, returning the lowered root node ID and a
+/// fresh `Supply` configured for subsequent variable and lambda identifier allocations.
 ///
-/// It's a loop over a stack of tasks, the lowered nodes on a stack of their own, so it takes no
-/// more of the machine's stack however deeply `core` nests.
+/// Implemented iteratively using explicit work and value stacks, preventing machine stack
+/// overflow regardless of expression nesting depth.
 pub(crate) fn lower<'id, 'gc>(tree: &mut L1<'id, 'gc>, core: &Core<'gc>) -> Result<(Id<'id>, Supply), CompileError> {
     let mut pass = Lower { tree, bound: HashSet::default(), scope: HashSet::default(), lambdas: HashSet::default(), max_var: 0, max_lambda: 0 };
     let mut vals = Vec::new();
@@ -34,10 +35,11 @@ pub(crate) fn lower<'id, 'gc>(tree: &mut L1<'id, 'gc>, core: &Core<'gc>) -> Resu
     Ok((vals.pop().expect("the root's lowered"), supply))
 }
 
-/// A form to lower, or what to make of what its parts lowered to.
+/// A deferred lowering task: an unlowered AST expression, a lexical scope boundary, or an
+/// instruction to assemble a node from lowered subexpressions.
 enum Task<'c, 'gc> {
     Expr(&'c Core<'gc>),
-    /// A `let`'s variables, in scope in its body.
+    /// Introduces the bindings of a `let` expression into the active lexical scope for its body.
     Scope(&'c [(Var, Core<'gc>)]),
     Make(&'c Core<'gc>),
 }
@@ -52,8 +54,8 @@ struct Lower<'t, 'id, 'gc> {
 }
 
 impl<'id, 'gc> Lower<'_, 'id, 'gc> {
-    /// Checks `core` as it's reached, and lowers it if it has no parts; else pushes the tasks
-    /// that lower them and then it onto `then`, in order.
+    /// Validates `core` upon initial visit. If `core` is a leaf expression, lowers it immediately;
+    /// otherwise, pushes tasks onto `then` to lower its subexpressions followed by a task to assemble the parent node.
     fn enter<'c>(&mut self, core: &'c Core<'gc>, then: &mut Vec<Task<'c, 'gc>>) -> Result<Option<Node<'id, 'gc>>, CompileError> {
         let all = |args: &'c [Core<'gc>], then: &mut Vec<Task<'c, 'gc>>| then.extend(args.iter().map(Task::Expr));
         match core {
@@ -119,7 +121,7 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
                 all(args, then);
             }
             Core::ApplyIntrinsic(prim, args) => {
-                // A host function's arguments must fit a frame.
+                // Host functions and slot primitives cannot be invoked via dynamic apply intrinsics; arguments must fit a VM call frame.
                 if args.is_empty() || matches!(prim, Prim::Host(_) | Prim::Slot(..)) {
                     return Err(CompileError::Arity(*prim));
                 }
@@ -130,7 +132,8 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
         Ok(None)
     }
 
-    /// `core`'s node, of its parts last lowered, which leave `vals`; what it bound leaves scope.
+    /// Constructs the lowered L1 node for `core` by popping its lowered child IDs from `vals`, and
+    /// removes any variables introduced by this binding form from the active lexical scope.
     fn make(&mut self, core: &Core<'gc>, vals: &mut Vec<Id<'id>>) -> Node<'id, 'gc> {
         let mut last = |n: usize| vals.split_off(vals.len() - n);
         match core {

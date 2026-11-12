@@ -1,5 +1,6 @@
-//! The inner loop: runs instructions against a frame of the stack, which it borrows, so it
-//! hands anything that changes the stack to the outer loop in `machine.rs`.
+//! The bytecode execution inner loop. Executes instructions within a borrowed stack frame,
+//! delegating any operation that modifies stack segments or continuations to the outer loop in
+//! `machine.rs`.
 
 use std::convert::Infallible;
 
@@ -14,35 +15,40 @@ use crate::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Guard, Mo
 use crate::prompts::{self, handler_key};
 use crate::{Context, Control, Fault, Op, Request};
 
-/// The most arguments a call passes: they and the link after them fill the frame.
+/// The maximum number of arguments a call can pass directly in registers; arguments and the
+/// subsequent frame link occupy the remainder of the frame window.
 pub(crate) const MAX_ARGS: usize = WINDOW - 2;
 
-/// The registers the inner loop leaves for the next stretch of it.
+/// Virtual machine registers preserved between invocations of the inner execution loop (frame
+/// pointer, program counter, and accumulator).
 pub(crate) struct Regs<'gc> {
     pub(crate) fp: usize,
     pub(crate) pc: usize,
     pub(crate) acc: Value<'gc>,
 }
 
-/// Why the inner loop stopped.
+/// The reason the inner execution loop suspended or exited.
 pub(crate) enum Exit<'gc> {
     Paused,
     Fault(Fault),
-    /// A call, of a closure, whose frame, at `callee`, doesn't fit in the segment.
+    /// A closure call whose target frame at `callee` exceeds the remaining capacity of the current stack
+    /// segment.
     Overflow { callee: usize, argc: u8, rest: Value<'gc> },
     Underflow,
-    /// A call of something other than a closure, in register `base`, with the `argc`
-    /// registers after it and the elements of `rest` as its arguments.
+    /// An invocation of a non-closure procedure located in register `base`, passing `argc` following
+    /// registers and elements of `rest` as arguments.
     Call { base: u8, argc: u8, rest: Value<'gc>, tail: bool },
-    /// A request on the `args` registers from `base`, the last a list of more if `spread`.
+    /// A runtime request operation with `args` register arguments starting at `base` (with the last
+    /// argument spread as a list if `spread` is true).
     Request { base: u8, args: u8, request: Request, spread: bool, tail: bool },
-    /// What a host function called with a call laid out at `base` asked for that the loop
-    /// can't do.
+    /// A host function call initiated at register `base` that requested an operation requiring outer
+    /// loop handling (such as raising or deferring).
     Host { base: u8, tail: bool, then: HostThen<'gc> },
 }
 
-/// What a host function's call leaves the loop for. A deferral's data goes in the slot
-/// [`exec`] fills, so an [`Exit`] has nothing to drop, and the loop drops none on every call.
+/// The deferred action or exception requested by a host function. Deferral payload data is stored in
+/// the slot provided to [`exec`], keeping [`Exit`] lightweight and avoiding drop overhead on every
+/// call.
 pub(crate) enum HostThen<'gc> {
     Raise(Value<'gc>),
     Defer,
@@ -54,10 +60,11 @@ impl From<Fault> for Exit<'_> {
     }
 }
 
-/// Runs instructions until one needs the stack changed, the run's fuel runs out, or one faults.
+/// Executes bytecode instructions until stack reconfiguration is required, fuel is exhausted, or a
+/// fault occurs.
 ///
-/// It and [`Run::go`] are inlined into the machine's loop: compiled as a function of their own,
-/// the loop's registers spilled on every instruction, and calls took twice as long.
+/// Both this function and [`Run::go`] are marked `#[inline(always)]` into the machine's loop to
+/// avoid spilling register state across instructions and doubling call dispatch overhead.
 #[inline(always)]
 pub(crate) fn exec<'s, 'gc>(mc: &'s Mutation<'gc>, stack: &'s Stack, task: Gc<'gc, Task>, regs: &mut Regs<'gc>, fuel: &mut Fuel, deferred: &'s mut Option<Deferred>) -> Exit<'gc> {
     let mut run = match Run::new(mc, stack, task, regs, *fuel, deferred) {
@@ -69,8 +76,8 @@ pub(crate) fn exec<'s, 'gc>(mc: &'s Mutation<'gc>, stack: &'s Stack, task: Gc<'g
     exit
 }
 
-/// A call of the procedure in register `base`, with the `argc` registers after it as its
-/// arguments, then the elements of the list `rest`.
+/// Represents an invocation of the procedure at register `base`, passing `argc` consecutive
+/// registers and the `rest` list as arguments.
 #[derive(Clone, Copy)]
 struct Call<'gc> {
     base: u8,
@@ -84,22 +91,23 @@ impl<'gc> Call<'gc> {
     }
 }
 
-/// The inner loop's state. Every step returns `Err` to leave the loop, so `?` does it.
+/// State of the inner execution loop. Step methods return `Err(Exit)` to break out of the instruction
+/// loop via `?`.
 struct Run<'s, 'gc> {
     cx: Context<'s, 'gc>,
     stack: &'s Stack,
-    /// The current closure's code, its instructions, its module's host functions once one has
-    /// been called, and the instruction to run next.
+    /// The active closure's bytecode object, instruction slice, lazily loaded module host functions
+    /// table, and next program counter.
     code: Gc<'gc, Bytecode>,
     ops: &'gc [Op],
     hosts: Option<&'gc [&'static HostDef]>,
-    /// Where a host function's deferral leaves its data.
+    /// Mutable reference where a deferred host function stores its suspension data.
     deferred: &'s mut Option<Deferred>,
     pc: usize,
-    /// Where the current frame starts, and where its link is in it.
+    /// The base offset of the active frame on the segment, and the slot offset of its return link.
     fp: usize,
     link: u8,
-    /// The highest `fp` a frame fits at in this segment.
+    /// The maximum frame pointer offset that can fit within the current stack segment.
     limit: usize,
 }
 
@@ -132,8 +140,8 @@ impl<'s, 'gc> Run<'s, 'gc> {
                 Control::Next => {}
                 Control::Jump(offset) => {
                     self.pc = self.pc.checked_add_signed(offset as isize).ok_or(Fault::Malformed)?;
-                    // A jump pauses past itself, so a branch's intrinsic test, which can be what
-                    // has the step end, isn't run again when the run goes on.
+                    // Advance the program counter past the jump before pausing so branch condition intrinsics (which
+                    // may trigger GC steps) are not re-evaluated upon resuming.
                     if self.cx.fuel.run == 0 {
                         self.cx.fuel.rest = self.cx.fuel.rest.saturating_sub(1);
                         return Err(Exit::Paused);
@@ -165,8 +173,8 @@ impl<'s, 'gc> Run<'s, 'gc> {
         }
     }
 
-    /// Spends a unit of fuel on the call or jump just fetched. With none left, it stops before
-    /// the instruction, which hasn't done anything yet, so the next run starts with it.
+    /// Deducts a unit of fuel for the fetched call or jump instruction. If fuel is exhausted, pauses
+    /// before executing the instruction so subsequent runs resume directly from it.
     #[inline(always)]
     fn charge(&mut self) -> Result<(), Exit<'gc>> {
         if self.cx.fuel.run == 0 {
@@ -177,9 +185,9 @@ impl<'s, 'gc> Run<'s, 'gc> {
         Ok(())
     }
 
-    /// Calls in a new frame at `call.base`, which returns here, putting back this frame's marks
-    /// if it set `marks` for it. The frame must start past this one's link, so it overwrites
-    /// nothing this frame keeps.
+    /// Allocates a new non-tail frame at `call.base` that returns to this point, restoring active
+    /// continuation marks if specified. The new frame starts past the current frame's link to prevent
+    /// overwriting preserved caller state.
     #[inline(always)]
     fn call(&mut self, call: Call<'gc>, marks: bool) -> Result<(), Exit<'gc>> {
         fits(call)?;
@@ -196,7 +204,8 @@ impl<'s, 'gc> Run<'s, 'gc> {
         self.enter(frame, callee, closure, call, link)
     }
 
-    /// Calls in place of the current frame, so the callee returns to this frame's caller.
+    /// Executes a tail call in place of the current frame, causing the callee to return directly to this
+    /// frame's caller.
     #[inline(always)]
     fn tail_call(&mut self, call: Call<'gc>) -> Result<(), Exit<'gc>> {
         fits(call)?;
@@ -207,22 +216,24 @@ impl<'s, 'gc> Run<'s, 'gc> {
         self.enter(frame, self.fp, closure, call, link)
     }
 
-    /// The closure `call` calls. Anything else is called by the outer loop.
+    /// Resolves the target closure of `call`; any non-closure target exits to the outer loop for
+    /// invocation.
     #[inline(always)]
     fn closure(&self, call: Call<'gc>, tail: bool) -> Result<Gc<'gc, Closure>, Exit<'gc>> {
         let (base, argc, rest) = (call.base, call.argc, call.rest);
         self.cx.frame.get(base).downcast::<Closure>(self.cx.mc).ok_or(Exit::Call { base, argc, rest, tail })
     }
 
-    /// Binds the arguments of `closure`, in `frame`, at `fp`, writes its `link`, and starts its
-    /// code.
+    /// Binds arguments for `closure` in `frame` at `fp`, records its return `link`, and begins executing
+    /// its bytecode.
     #[inline(always)]
     fn enter(&mut self, frame: Frame<'s, 'gc>, fp: usize, closure: Gc<'gc, Closure>, call: Call<'gc>, link: Value<'gc>) -> Result<(), Exit<'gc>> {
         let mc = self.cx.mc;
         let code = closure.code(mc).ok_or(Fault::Malformed)?;
         let arity = code.arity(mc);
         if let Err(fault) = bind(mc, frame, arity, call.argc, call.rest, &mut self.cx.fuel) {
-            // A tail call's frame is the callee's now, so a fault finds its link where it looks.
+            // Because a tail call overwrites the current frame with the callee, write the return link
+            // immediately so fault unwinding finds a valid linkage.
             frame.set(frame::link_slot(arity), link);
             return Err(fault.into());
         }
@@ -232,8 +243,8 @@ impl<'s, 'gc> Run<'s, 'gc> {
         Ok(())
     }
 
-    /// Runs `closure`, whose code is `code`, from now on. Its code is loaded only if it isn't the
-    /// code running, as it is for a loop's call of itself.
+    /// Switches execution context to `closure` with bytecode `code`. Avoids reloading bytecode metadata
+    /// when entering the same code (such as during self-recursive calls).
     #[inline(always)]
     fn switch(&mut self, closure: Gc<'gc, Closure>, code: Gc<'gc, Bytecode>) -> Result<(), Fault> {
         if code != self.code {
@@ -244,8 +255,8 @@ impl<'s, 'gc> Run<'s, 'gc> {
         Ok(())
     }
 
-    /// Goes back to the caller the frame's link names, or out of the loop if it's the bottom
-    /// frame.
+    /// Returns to the caller designated by the frame's link, or exits the inner loop with
+    /// `Exit::Underflow` if returning from the bottom frame.
     #[inline(always)]
     fn ret(&mut self) -> Result<(), Exit<'gc>> {
         let mc = self.cx.mc;
@@ -264,9 +275,8 @@ impl<'s, 'gc> Run<'s, 'gc> {
         Ok(())
     }
 
-    /// Calls host function `host` of the code's module on the `args` registers from `base`, and
-    /// goes on as it replies. Out of line, as the call through its function is the most of what
-    /// it costs.
+    /// Invokes module host function `host` using `args` registers starting at `base`, handling its reply.
+    /// Marked `#[inline(never)]` because the indirect function call dominates execution cost.
     #[inline(never)]
     fn host(&mut self, base: u8, args: u8, host: u32, tail: bool) -> Result<(), Exit<'gc>> {
         let mc = self.cx.mc;
@@ -301,16 +311,16 @@ impl<'s, 'gc> Run<'s, 'gc> {
         }
     }
 
-    /// Makes `apply` or `apply-values` a call, as it's laid out as one, with the list or
-    /// [`MultiValue`] to spread last, and a `with-mark`, `with-exception-handler` or `guard` of a
-    /// closure that isn't in tail position one that sets the mark, as Chez sets an attachment for
-    /// a call: the frame keeps its marks under the callee's frame, for the return to put back.
-    /// The outer loop carries out the other requests.
+    /// Optimizes `apply` and `apply-values` directly into calls by spreading the final list or
+    /// [`MultiValue`]. Non-tail invocations of `with-mark`, `with-exception-handler`, or `guard` set
+    /// continuation marks in the callee's frame window (preserving previous marks beneath it for return
+    /// restoration). All other requests exit to the outer loop.
     #[inline(always)]
     fn request(&mut self, base: u8, args: u8, request: Request, spread: bool, tail: bool) -> Result<(), Exit<'gc>> {
         let frame = self.cx.frame;
         let call = match request {
-            // (apply f x ... list) is already laid out as a call at `base`, with the list spread.
+            // An unspread `(apply f x ... list)` call is already laid out as a call frame starting at `base`, with
+            // the trailing list ready to spread.
             Request::Apply if !spread => {
                 let rest = frame.get(base + args - 1);
                 if rest.downcast::<MultiValue>(self.cx.mc).is_some() {
@@ -333,10 +343,9 @@ impl<'s, 'gc> Run<'s, 'gc> {
         if tail { self.tail_call(call) } else { self.call(call, false) }
     }
 
-    /// Calls the closure of a `with-mark`, or the thunk of a `with-exception-handler` or a
-    /// `guard`, which isn't in tail position, with the mark set, in a frame [`SAVED_MARKS`] past
-    /// `base`, if it takes the arguments as they are; a guard is kept in the register under the
-    /// frame. Out of line, as it's rare next to calls, and inlined, it slowed them.
+    /// Performs a non-tail marked call for `with-mark`, `with-exception-handler`, or `guard`. Sets the
+    /// active mark, offsets the new frame by `SAVED_MARKS` past `base` to save previous marks, and stores
+    /// guard state below the frame. Marked `#[inline(never)]` to prevent bloat in the common call path.
     #[inline(never)]
     fn marked_call(&mut self, base: u8, args: u8, request: Request) -> Result<(), Exit<'gc>> {
         let (mc, frame, task) = (self.cx.mc, self.cx.frame, self.cx.task);
@@ -381,7 +390,8 @@ impl<'s, 'gc> Run<'s, 'gc> {
     }
 }
 
-/// Faults unless a call's procedure and arguments are all in the frame.
+/// Validates that a call's procedure slot and arguments fit within the current frame window,
+/// returning `Fault::Malformed` otherwise.
 #[inline(always)]
 fn fits(call: Call<'_>) -> Result<(), Fault> {
     if usize::from(call.base) + usize::from(ARGS) + usize::from(call.argc) > WINDOW {
@@ -390,7 +400,8 @@ fn fits(call: Call<'_>) -> Result<(), Fault> {
     Ok(())
 }
 
-/// A closure's instructions, constants and upvalues, and where its frame's link is.
+/// Loads a closure's instruction slice, constant table, and return link slot offset from its
+/// bytecode.
 #[inline(always)]
 fn load<'gc>(mc: &Mutation<'gc>, code: Gc<'gc, Bytecode>) -> Result<(&'gc [Op], Constants<'gc>, u8), Fault> {
     let ops = code.ops(mc).ok_or(Fault::Malformed)?;
@@ -398,9 +409,9 @@ fn load<'gc>(mc: &Mutation<'gc>, code: Gc<'gc, Bytecode>) -> Result<(&'gc [Op], 
     Ok((ops, Constants::of(code.constants(mc)).ok_or(Fault::Malformed)?, link))
 }
 
-/// Binds `argc` arguments, in the registers from [`ARGS`], then the elements of the list `rest`,
-/// to the parameters of code that takes `arity`. If the list it makes of the rest makes the step
-/// due, the run pauses at its next call or jump.
+/// Binds `argc` register arguments starting at `ARGS` followed by elements of `rest` to match `arity`.
+/// If allocating the rest list triggers a GC step threshold, the run will pause at the next call or
+/// jump.
 #[inline(always)]
 pub(crate) fn bind<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, argc: u8, rest: Value<'gc>, fuel: &mut Fuel) -> Result<(), Fault> {
     if arity == i64::from(argc) && argc <= MAX_PARAMS && rest == Value::NIL {
@@ -451,8 +462,8 @@ fn bind_slow<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, mut arg
     Ok(())
 }
 
-/// The parameters of `shape` that must have arguments, and those before its rest list, which
-/// fit in registers.
+/// Calculates the count of required parameters and the total number of fixed register parameters
+/// before the rest argument list.
 fn counts(shape: Shape) -> Result<(u8, u8), Fault> {
     let fixed = u8::try_from(shape.required + shape.optional)
         .ok()
@@ -461,11 +472,13 @@ fn counts(shape: Shape) -> Result<(u8, u8), Fault> {
     Ok((shape.required as u8, fixed))
 }
 
-/// Binds as [`bind`] does, for code with more parameters than [`MAX_PARAMS`]: the first
-/// `MAX_PARAMS - 1` arguments in their registers, then a list of the others in the last.
+/// Binds arguments for procedures with more parameters than `MAX_PARAMS`: places the first `MAX_PARAMS
+/// - 1` arguments into registers and collects remaining arguments into a rest list in the final
+/// register.
 #[inline(never)]
 fn bind_spread<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, shape: Shape, mut argc: u8, mut rest: Value<'gc>) -> Result<(), Fault> {
-    // The compiler keeps optional parameters to code that takes few enough.
+    // Procedures with optional parameters are constrained by the compiler to fit within `MAX_PARAMS`, so
+    // optional parameters here indicate malformed bytecode.
     if shape.optional > 0 {
         return Err(Fault::Malformed);
     }
@@ -495,7 +508,8 @@ fn bind_spread<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, shape: Shape, mut
     Ok(())
 }
 
-/// Binds as [`bind`] does when `rest` is a [`MultiValue`] from `apply-values`.
+/// Binds arguments when trailing arguments are provided as a [`MultiValue`] object from
+/// `apply-values`.
 fn bind_values<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, mut argc: u8, mv: Gc<'gc, MultiValue>) -> Result<(), Fault> {
     let items = mv.items(mc);
     let shape = Shape::of(arity);

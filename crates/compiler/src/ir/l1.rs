@@ -1,5 +1,5 @@
-//! `L1`, lexical core forms after lowering module variables, as a table of nodes like
-//! [`L2`](super::l2)'s, with `letrec` still to fix.
+//! `L1`: lexical core forms after module variables have been lowered to slot operations. Uses a
+//! node table like [`L2`](super::l2), but still contains `letrec` forms.
 
 use ragwort_types::gc::Value;
 
@@ -34,12 +34,12 @@ impl<'id, 'gc> Bodies<'id, 'gc> for (Var, Id<'id>) {
     fn bodies(self, _: &L1<'id, 'gc>, _: &mut impl FnMut(Id<'id>)) {}
 }
 
-/// A lambda's function.
+/// A lambda's function record.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Function<'id> {
     /// Distinguishes this lambda from every other in the expression being compiled.
     pub(crate) id: u32,
-    /// How many of the last of `params` a call can leave out.
+    /// Number of trailing entries in `params` that a call may omit.
     pub(crate) optional: u32,
     pub(crate) params: Span<'id, Var>,
     /// Receives the arguments past `params` as a list, if any.

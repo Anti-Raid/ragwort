@@ -1,20 +1,19 @@
-//! [`language!`], which makes an IR's table of nodes: everything but what's particular to the
-//! language, which its module adds.
+//! The [`language!`] macro generates an IR's node table and traversal support. Each language module
+//! supplies its own records and validation rules.
 
-/// A language's table of nodes, in the module it's invoked in, with its own `Id`, `Span` and
-/// function id types, whose constructors are private to it:
+/// Generates a node table in the invoking module, with private constructors for its distinct node,
+/// span, and function IDs.
 ///
-/// - `table`, the table, and `scope`, which makes one under a lifetime of its own;
-/// - `node`, its nodes, each field named, its children in the frame, from its fields in order,
-///   in the order they're evaluated;
-/// - `functions`, the list of its functions, what they're ids of, the table's method that adds
-///   one, and their field that's their body;
-/// - `lists`, those spans can be of;
-/// - `leaves`, the types of fields that have no children in the frame.
+/// - `table` names the table type; `scope` creates a table with a fresh lifetime brand.
+/// - `node` declares named node fields. Field order determines the traversal order of children
+///   within the current frame.
+/// - `functions` declares the function records, their ID type, insertion method, and body field.
+/// - `lists` declares the element types supported by spans.
+/// - `leaves` declares field types with no children in the current frame.
 ///
-/// What else has children, as a binding does, implements the made `Children` trait itself, and
-/// what else refers to functions, as a binding of them does, `Bodies`. A function id has neither:
-/// its body is another frame.
+/// Additional compound types implement the generated `Children` trait to expose child nodes, or
+/// `Bodies` to expose function bodies. Function IDs implement neither: entering a function body
+/// crosses a frame boundary.
 macro_rules! language {
     (
         $(#[$table_meta:meta])*
@@ -27,19 +26,19 @@ macro_rules! language {
         lists { $($list:ident: $item:ty),* $(,)? }
         leaves { $($leaf:ty),* $(,)? }
     ) => {
-        /// Ties ids to the one table that made them: a lifetime only [`scope`] names, invariant
-        /// so no other can stand for it.
+        /// An invariant lifetime marker that prevents IDs from different tables from being mixed. Only
+        /// [`scope`] introduces the brand.
         type Brand<'id> = std::marker::PhantomData<fn(&'id ()) -> &'id ()>;
 
-        /// A node of the table branded `'id`.
+        /// Identifies a node in the table branded `'id`.
         #[derive(Clone, Copy, PartialEq, Eq, Hash)]
         pub(crate) struct Id<'id>(u32, Brand<'id>);
 
-        /// A function of the table branded `'id`.
+        /// Identifies a function in the table branded `'id`.
         #[derive(Clone, Copy, PartialEq, Eq, Hash)]
         pub(crate) struct $fun<'id>(u32, Brand<'id>);
 
-        /// Items of the table one after another.
+        /// A contiguous range of elements in one of the table's lists.
         pub(crate) struct Span<'id, T> {
             start: u32,
             len: u32,
@@ -85,7 +84,7 @@ macro_rules! language {
             $($list: Vec<$item>,)*
         }
 
-        /// What a [`Span`] can be of: each kept in a list of the table's.
+        /// An element type supported by [`Span`], stored in its own list within the table.
         pub(crate) trait Item<'id, 'gc>: Copy {
             fn all<'t>(tree: &'t $table<'id, 'gc>) -> &'t Vec<Self>;
             fn all_mut<'t>(tree: &'t mut $table<'id, 'gc>) -> &'t mut Vec<Self>;
@@ -102,7 +101,7 @@ macro_rules! language {
             }
         )*
 
-        /// What has children in the frame: their ids, to `f`, in the order they're evaluated.
+        /// Passes child node IDs in the current frame to `f`, in evaluation order.
         pub(crate) trait Children<'id, 'gc>: Copy {
             fn each(self, tree: &$table<'id, 'gc>, f: &mut impl FnMut(Id<'id>));
         }
@@ -131,7 +130,7 @@ macro_rules! language {
             fn each(self, _: &$table<'id, 'gc>, _: &mut impl FnMut(Id<'id>)) {}
         }
 
-        /// What refers to functions: their bodies, to `f`.
+        /// Passes referenced function bodies to `f`.
         pub(crate) trait Bodies<'id, 'gc>: Copy {
             fn bodies(self, tree: &$table<'id, 'gc>, f: &mut impl FnMut(Id<'id>));
         }
@@ -160,7 +159,7 @@ macro_rules! language {
             }
         )*
 
-        /// `f` with a new, empty table, branded with a lifetime of its own.
+        /// Calls `f` with a new empty table and a fresh lifetime brand.
         pub(crate) fn scope<'gc, R>(f: impl for<'id> FnOnce($table<'id, 'gc>) -> R) -> R {
             f($table { nodes: Vec::new(), $functions: Vec::new(), $($list: Vec::new(),)* })
         }
@@ -176,7 +175,7 @@ macro_rules! language {
                 id
             }
 
-            /// Puts `node` in `id`'s place, as a pass that rewrites the table does.
+            /// Replaces the node at `id` during an in-place rewrite.
             #[allow(dead_code)]
             pub(crate) fn set(&mut self, id: Id<'id>, node: $node<'id, 'gc>) {
                 self.nodes[id.0 as usize] = node;
@@ -195,15 +194,15 @@ macro_rules! language {
                 Span { start: count(start), len: count(all.len() - start), of: std::marker::PhantomData }
             }
 
-            /// `id`'s children in its function's frame, in the order they're evaluated: not the
-            /// bodies of its functions, which are other frames.
+            /// Visits `id`'s children in evaluation order within the current function frame. Excludes nested
+            /// function bodies.
             pub(crate) fn children(&self, id: Id<'id>, mut f: impl FnMut(Id<'id>)) {
                 match self[id] {
                     $( $node::$variant($($field),*) => { $( Children::each($field, self, &mut f); )* } )*
                 }
             }
 
-            /// The bodies of the functions `id` refers to, which are other frames.
+            /// Visits the bodies of functions referenced by `id`, each of which belongs to a separate frame.
             #[allow(dead_code)]
             pub(crate) fn bodies(&self, id: Id<'id>, mut f: impl FnMut(Id<'id>)) {
                 match self[id] {
@@ -211,15 +210,15 @@ macro_rules! language {
                 }
             }
 
-            /// The nodes of `root`'s function's frame from it: each before its children, in the
-            /// order they're evaluated.
+            /// Iterates over nodes reachable from `root` in the same frame, visiting each parent before its
+            /// children and preserving child evaluation order.
             #[allow(dead_code)]
             pub(crate) fn frame(&self, root: Id<'id>) -> Frame<'_, 'id, 'gc> {
                 Frame { tree: self, next: Some(root), stack: Vec::new(), deep: false }
             }
 
-            /// The nodes from `root`, as [`frame`](Self::frame) has them, and those of the
-            /// functions in them, each function's after the node that refers to it.
+            /// Traverses as [`frame`](Self::frame) does, but also enters nested functions after the nodes that
+            /// reference them.
             #[allow(dead_code)]
             pub(crate) fn deep(&self, root: Id<'id>) -> Frame<'_, 'id, 'gc> {
                 Frame { tree: self, next: Some(root), stack: Vec::new(), deep: true }
@@ -256,8 +255,8 @@ macro_rules! language {
             }
         }
 
-        /// An iterator of the nodes of a function's frame, as the table's `frame` makes, or
-        /// `deep`, with those of its functions too.
+        /// An iterator for a single function frame, or for that frame and nested functions when created by
+        /// `deep`.
         pub(crate) struct Frame<'t, 'id, 'gc> {
             tree: &'t $table<'id, 'gc>,
             next: Option<Id<'id>>,

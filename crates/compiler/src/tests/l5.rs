@@ -18,7 +18,7 @@ fn var<'gc>(v: u32) -> Core<'gc> {
     Core::Ref(Place::Local(Var(v)))
 }
 
-/// A module variable, whose value the compiler can't know.
+/// Builds a module-variable reference whose value is unknown at compile time.
 fn slot<'gc>(slot: u32) -> Core<'gc> {
     Core::Ref(Place::Slot { slot, checked: false })
 }
@@ -43,7 +43,7 @@ fn letrec<'gc>(binds: Vec<(u32, Core<'gc>)>, body: Core<'gc>) -> Core<'gc> {
     Core::Letrec(binds.into_iter().map(|(v, e)| (Var(v), e)).collect(), Box::new(body))
 }
 
-/// `a`, then `b`, with `a`'s value bound to `v`, which nothing reads.
+/// Builds a sequence that binds `a` to unused variable `v`, then evaluates `b`.
 fn seq<'gc>(v: u32, a: Core<'gc>, b: Core<'gc>) -> Core<'gc> {
     let_(vec![(v, a)], b)
 }
@@ -60,7 +60,7 @@ fn set<'gc>(v: u32, value: Core<'gc>) -> Core<'gc> {
     Core::Set(Place::Local(Var(v)), Box::new(value))
 }
 
-/// The L5 that what `build` makes lowers to, checked.
+/// Lowers the expression from `build` to L5 and validates the result.
 fn l5_of(build: impl for<'gc> FnOnce(&Mutation<'gc>) -> Core<'gc>) -> String {
     let mut arena = Arena::new(1 << 24, 0);
     arena.mutate(|mc| {
@@ -111,7 +111,7 @@ fn calls<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
 
 #[test]
 fn lowers_to_blocks_taking_what_paths_meet_with() {
-    // `total` goes round the loop as a parameter of its block.
+    // Pass `total` through the loop as a block parameter.
     assert_eq!(l5_of(summed), "\
 function () closure v0:
 b0:
@@ -130,7 +130,7 @@ b3:
   v9 = + v3 v8
   jump b1(v9 v7)
 ");
-    // The ways out of the `if` meet with what each gives `x`.
+    // Merge the two branches using their respective values of `x`.
     assert_eq!(l5_of(merged), "\
 function () closure v0:
 b0:
@@ -149,7 +149,7 @@ b3(v6 v7):
   v9 = + v7 v8
   return v9
 ");
-    // A loop in a value's place goes on to a block taking its value.
+    // A loop in value position continues at a block that accepts its result.
     assert_eq!(l5_of(inner_loop), "\
 function () closure v0:
 b0:
@@ -199,7 +199,8 @@ b0:
   v4 = + v1 v3
   tail-call v2 v4
 ");
-    // An assigned variable goes round a loop, through an `if`, and out with the loop's value.
+    // Thread an assigned variable through the loop and conditional, then pass it out alongside the
+    // loop's result.
     assert_eq!(l5_of(counted), "\
 function () closure v0:
 b0:
@@ -231,7 +232,7 @@ b7(v16 v17):
   v18 = + v16 v17
   return v18
 ");
-    // call/cc as an argument is a call, and in tail position a tail request.
+    // Lower argument-position `call/cc` as a call and tail-position `call/cc` as a tail request.
     assert_eq!(l5_of(calls), "\
 function () closure v0:
 b0:
@@ -299,8 +300,8 @@ fn quote<'id, 'gc>(t: &mut L4<'id, 'gc>, v: Value<'gc>) -> Id<'id> {
     t.add(Node::Quote(v))
 }
 
-/// `(if #f (lambda () (lambda () ... 0)) (+ (if #t (+ ... 1) 0) 1))`, far deeper than the front
-/// end makes, which returns `ADDS`.
+/// Builds deeply nested dead closures and arithmetic: `(if #f (lambda () (lambda () ... 0)) (+ (if
+/// #t (+ ... 1) 0) 1))`. The result is `ADDS`.
 fn deep<'id, 'gc>(t: &mut L4<'id, 'gc>) -> Id<'id> {
     let mut adds = quote(t, Value::fixnum(0).unwrap());
     for i in 0..ADDS {
@@ -325,7 +326,8 @@ fn deep<'id, 'gc>(t: &mut L4<'id, 'gc>) -> Id<'id> {
 const ADDS: u32 = 100_000;
 const LAMBDAS: u32 = 10_000;
 
-/// Deep code is checked, lowered and emitted, and its trees dropped, on a small stack, and runs.
+/// Checks, lowers, emits, and drops deeply nested compiler trees on a small stack, then verifies
+/// the generated program's result.
 #[test]
 fn deep_code_needs_no_stack() {
     let compile = |run: bool| {
@@ -355,6 +357,7 @@ fn deep_code_needs_no_stack() {
         });
     };
     std::thread::Builder::new().stack_size(256 << 10).spawn(move || compile(false)).expect("spawned").join().expect("compiled");
-    // The machine takes more than the small stack in a debug build, whatever it runs.
+    // Run the VM separately: its debug-build stack requirements exceed this test's deliberately small
+    // compiler stack.
     compile(true);
 }

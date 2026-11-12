@@ -1,29 +1,27 @@
-//! A Chez-style micropass compiler from [`Core`] forms to [`ragwort_vm`]'s [`Bytecode`](ragwort_vm::objects::Bytecode).
+//! A Chez-style micropass compiler compiling [`Core`] forms into [`ragwort_vm`] [`Bytecode`](ragwort_vm::objects::Bytecode).
 //!
-//! Each pass either simplifies within an intermediate representation or reduces the grammar by
+//! Each pass either optimizes code within an intermediate representation or simplifies the grammar by
 //! eliminating forms:
-//! 1. `lower`: validates [`Core`] and lowers module variables (`Place::Slot`) to slot
-//!    primitives, producing `L1`.
-//! 2. `letrec`: Waddell–Sarkar–Dybvig `letrec` / `letrec*` fixing (`L1 -> L2`), replacing
-//!    `Letrec` with one `Let` of bindings in order, values and `Fix` groups (SCCs of unassigned
-//!    mutually recursive lambdas), so a body's definitions nest no deeper however many there are.
-//! 3. `cp0`: source-level optimizer (`L2 -> L2`) performing copy/constant propagation,
-//!    pure intrinsic constant folding, beta-reduction, local procedure
-//!    inlining, conditional simplification, and dead-binding elimination.
-//! 4. `assign`: assignment conversion (`L2 -> L3`), rewriting only mutated (`Set`) variables into
-//!    explicit `MakeBox` / `Unbox` / `SetBox` intrinsics so all variables in `L3` are
-//!    immutable.
-//! 5. `contify`: contification (`L3 -> L3`), turning local functions only ever called in tail
-//!    position of one place, loops among them, into in-frame joins (`L3::Join` / `L3::Jump`).
-//! 6. `closure`: closure conversion (`L3 -> L4`), resolving lexical references into
-//!    [`ir::VarRef::Local`] vs [`ir::VarRef::Upvalue`] and computing each closure's capture table.
-//! 7. `l5`: each function as a graph of basic blocks in SSA form (`L4 -> L5`). A debug build
-//!    checks the L5 of everything it compiles.
-//! 8. `emit`: register allocation and bytecode emission from L5 (`L5 -> Closure`).
+//! 1. `lower`: Validates [`Core`] AST structures and lowers module-level variable references (`Place::Slot`)
+//!    into slot primitives, producing `L1`.
+//! 2. `letrec`: Implements Waddell–Sarkar–Dybvig `letrec` / `letrec*` fixing (`L1 -> L2`), transforming
+//!    `Letrec` blocks into flat, sequential `Let` bindings of values and `Fix` groups (strongly connected
+//!    components of unassigned mutually recursive lambdas) to prevent deep nesting of definitions.
+//! 3. `cp0`: A source-level optimizer (`L2 -> L2`) performing copy and constant propagation, pure intrinsic
+//!    constant folding, beta-reduction, local procedure inlining, conditional branch simplification, and dead-binding elimination.
+//! 4. `assign`: Performs assignment conversion (`L2 -> L3`), transforming mutated (`Set`) variables into
+//!    explicit heap boxes (`MakeBox`, `Unbox`, `SetBox`) so that all remaining variables in `L3` are immutable.
+//! 5. `contify`: Contification pass (`L3 -> L3`), converting local functions called exclusively from tail position
+//!    at a single call site (including self-recursive loops) into in-frame control-flow joins (`L3::Join` / `L3::Jump`).
+//! 6. `closure`: Closure conversion (`L3 -> L4`), resolving lexical variable references into [`ir::VarRef::Local`]
+//!    versus [`ir::VarRef::Upvalue`] and computing each closure's upvalue capture table.
+//! 7. `l5`: Lowers each function into a control flow graph of basic blocks in SSA form (`L4 -> L5`). Debug builds
+//!    verify SSA and block invariants across all compiled functions.
+//! 8. `emit`: Performs register allocation and bytecode emission from L5 CFGs (`L5 -> Closure`).
 //!
-//! Each IR is a table of nodes, and every pass after `lower` is a loop over a stack of its own,
-//! so how deeply code nests, or inlining makes it nest, takes no more of the machine's stack.
-//! A debug build checks each table a pass makes.
+//! Each IR is represented as a flat arena table of nodes. Every pass following `lower` processes expressions
+//! iteratively using its own explicit work stack, preventing machine call stack exhaustion regardless of expression
+//! nesting or inlining depth. In debug builds, invariant assertions validate the IR tables produced by each pass.
 
 mod assign;
 mod closure;
@@ -55,15 +53,16 @@ use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Value};
 use ragwort_vm::objects::Module;
 use ragwort_vm::{HostDef, Intrinsic, Request};
 
-/// A local variable, numbered by the expander so no two bindings share one.
+/// A local variable identifier, numbered uniquely by the expander so no two bindings share the same ID.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct Var(pub u32);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Place {
     Local(Var),
-    /// Variable `slot` of the module the code is compiled into. Unless `checked`, the front end
-    /// knows it's defined wherever this runs, and a [`Core::Set`] of it is its definition.
+    /// A reference to module variable slot `slot`. If `checked` is false, the front end has verified
+    /// that the slot is already defined wherever this code executes, and any [`Core::Set`] targeting it
+    /// acts as its initialization.
     Slot { slot: u32, checked: bool },
 }
 
@@ -71,14 +70,14 @@ pub enum Place {
 pub enum Prim {
     Intrinsic(Intrinsic),
     Request(Request),
-    /// A host function, from a static table, which the code's module carries.
+    /// An invocation of a host function defined in the enclosing module's static host table.
     Host(&'static HostDef),
-    /// An access of variable `slot` of the code's module, which [`Place::Slot`] lowers to.
+    /// An access to module variable slot `slot`, lowered from a [`Place::Slot`].
     Slot(SlotOp, u32),
 }
 
-/// What a [`Prim::Slot`] does: a load takes no arguments and a store one, its value. A checked
-/// one faults if the variable isn't defined yet.
+/// The operation performed by a [`Prim::Slot`]: load operations take 0 arguments, while store operations
+/// take 1 argument (the value to write). Checked variants raise an error at runtime if the slot is uninitialized.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
 pub enum SlotOp {
     Load,
@@ -88,7 +87,7 @@ pub enum SlotOp {
 }
 
 impl SlotOp {
-    /// How many arguments it takes.
+    /// Returns the argument arity expected by this slot operation.
     pub fn arity(self) -> usize {
         match self {
             SlotOp::Load | SlotOp::LoadChecked => 0,
@@ -97,16 +96,16 @@ impl SlotOp {
     }
 }
 
-/// A lambda expression in [`Core`].
+/// A lambda expression in the [`Core`] AST.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Lambda<'gc> {
-    /// Distinguishes this lambda from every other in the expression being compiled.
+    /// A unique identifier distinguishing this lambda from all others within the compilation unit.
     pub id: u32,
-    /// How many of the last of `params` a call can leave out, which are then
+    /// The number of trailing parameters in `params` that callers may omit, which default to
     /// [`Value::UNSUPPLIED`](ragwort_types::gc::Value::UNSUPPLIED).
     pub optional: u32,
     pub params: Vec<Var>,
-    /// Receives the arguments past `params` as a list, if any.
+    /// An optional rest parameter that receives any excess arguments as a list.
     pub rest: Option<Var>,
     pub body: Box<Core<'gc>>,
 }
@@ -116,17 +115,17 @@ pub enum Core<'gc> {
     Quote(Value<'gc>),
     Ref(Place),
     If(Box<Core<'gc>>, Box<Core<'gc>>, Box<Core<'gc>>),
-    /// Parallel bindings: none of the `Var`s are in scope in the right-hand sides.
+    /// Parallel lexical bindings: none of the bound `Var`s are in scope within the initialization expressions.
     Let(Vec<(Var, Core<'gc>)>, Box<Core<'gc>>),
-    /// Recursive bindings (`letrec` / `letrec*`): all of the `Var`s are in scope in the
-    /// right-hand sides and the body.
+    /// Recursive lexical bindings (`letrec` / `letrec*`): all bound `Var`s are in scope across all
+    /// initialization expressions and the body.
     Letrec(Vec<(Var, Core<'gc>)>, Box<Core<'gc>>),
-    /// Evaluates to void.
+    /// Mutates a local variable or module slot; evaluates to `#<void>`.
     Set(Place, Box<Core<'gc>>),
     App(Box<Core<'gc>>, Vec<Core<'gc>>),
     Lambda(Lambda<'gc>),
     Intrinsic(Prim, Vec<Core<'gc>>),
-    /// Like `Intrinsic`, with the last argument a list of the rest, as `apply` takes them.
+    /// Invokes an intrinsic whose final argument is a list that is spread into remaining arguments, analogous to `apply`.
     ApplyIntrinsic(Prim, Vec<Core<'gc>>),
 }
 
@@ -135,7 +134,7 @@ impl Core<'_> {
         matches!(self, Core::Quote(_) | Core::Ref(_))
     }
 
-    /// Moves the parts of `self` that have parts of their own onto `out`, leaving leaves.
+    /// Extracts non-leaf child expressions from `self` and pushes them onto `out`, replacing them with leaf placeholder nodes.
     fn take_parts(&mut self, out: &mut std::vec::Vec<Self>) {
         let mut take = |part: &mut Self| {
             if !part.is_leaf() {
@@ -160,8 +159,8 @@ impl Core<'_> {
     }
 }
 
-/// Drops the parts of a form from a stack of its own, so dropping it takes no more of the
-/// machine's stack however deeply it nests.
+/// Iteratively drops child subexpressions using an explicit heap stack, preventing call stack overflow
+/// when deallocating deeply nested AST structures.
 impl Drop for Core<'_> {
     fn drop(&mut self) {
         let mut parts = std::vec::Vec::new();
@@ -174,25 +173,25 @@ impl Drop for Core<'_> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompileError {
-    /// A [`Var`] used where no enclosing binding bound it.
+    /// A [`Var`] was referenced without an enclosing lexical binding in scope.
     Unbound(Var),
-    /// A [`Var`] bound more than once.
+    /// A [`Var`] identifier was bound multiple times within the same scope.
     Rebound(Var),
-    /// Two [`Lambda`]s with the same `id`.
+    /// Multiple [`Lambda`] nodes share the same identifier `id`.
     SameLambda(u32),
-    /// A [`Lambda`], by `id`, with more optional parameters than parameters.
+    /// A [`Lambda`] specifies an optional parameter count exceeding its total parameter count.
     TooManyOptional(u32),
-    /// A [`Core::Intrinsic`] with a number of arguments the [`Prim`] doesn't take.
+    /// An intrinsic was invoked with an unsupported number of arguments.
     Arity(Prim),
-    /// More constants than a [`u32`] index can name.
+    /// The number of constants in the compilation unit exceeded the 2^32 indexable limit.
     TooManyConstants,
-    /// A call of a host function the module the code is compiled into doesn't have.
+    /// Attempted to call a host function not registered in the target module's host table.
     UnknownHost(&'static HostDef),
-    /// A variable the module the code is compiled into doesn't have.
+    /// Attempted to access a variable slot not present in the target module.
     UnknownSlot(u32),
-    /// More parameters or spilled locals than a [`u32`] can count.
+    /// The combined count of parameters and spilled local variables exceeded the 2^32 limit.
     TooManyRegisters,
-    /// A call of a host function with more arguments than fit a frame.
+    /// A host function call supplied more arguments than can fit into an execution frame.
     TooManyArguments,
     OutOfMemory,
 }
@@ -232,9 +231,8 @@ impl fmt::Display for CompileError {
 
 impl std::error::Error for CompileError {}
 
-/// Compiles `core`, as code of `module`, if any, through the micropass pipeline into a
-/// [`Closure`](ragwort_vm::objects::Closure) of no arguments, ready to pass to
-/// [`ragwort_vm::Machine::new`].
+/// Compiles AST expression `core` in the context of `module` through the micropass pipeline into a
+/// zero-argument [`Closure`](ragwort_vm::objects::Closure) ready for execution by [`ragwort_vm::Machine::new`].
 pub fn compile<'gc>(mc: &Mutation<'gc>, module: Option<Gc<'gc, Module>>, core: &Core<'gc>) -> Result<Value<'gc>, CompileError> {
     let arena = Arena::new();
     let mut l5 = to_l5(mc, &arena, core)?;
@@ -244,9 +242,9 @@ pub fn compile<'gc>(mc: &Mutation<'gc>, module: Option<Gc<'gc, Module>>, core: &
     emit::emit(mc, module, &l5)
 }
 
-/// `core` through the passes to L5.
+/// Transforms `core` through the lowering, fixing, optimization, assignment conversion, and closure conversion passes to produce an L5 SSA program.
 fn to_l5<'a, 'gc>(mc: &Mutation<'gc>, arena: &'a Arena, core: &Core<'gc>) -> Result<l5::Program<'a, 'gc>, CompileError> {
-    // Each table is dropped once the next is made from it.
+    // Each intermediate IR table is deallocated as soon as the subsequent pass completes.
     ir::l1::scope(|mut l1| {
         let (root, supply) = lower::lower(&mut l1, core)?;
         ir::l2::scope(move |mut src| {

@@ -1,4 +1,4 @@
-//! The VM's objects. Their type numbers follow ragwort-types' own.
+//! Garbage-collected object types used by the virtual machine. Type identifiers extend the base types in `ragwort-types`.
 
 use ragwort_types::gc::{Segment, objects};
 
@@ -11,10 +11,7 @@ mod tests;
 objects! {
     pub kind Vm;
 
-    /// A function's code: its instructions, the constant table they index, shared by what was
-    /// compiled with it, where its closures' upvalues come from, one capture for each, how many
-    /// arguments it takes, as Chez encodes it: `n >= 0` for exactly `n`, `-(n + 1)` for at least
-    /// `n`, the rest in a list, and the [`Module`] it's from, if any.
+    /// Compiled procedure bytecode: contains the instruction array ([`Op`]), the constant pool table shared across co-compiled code, capture descriptors mapping upvalues for instantiated closures, encoded parameter arity (following Chez Scheme conventions), and an optional reference to the enclosing [`Module`].
     pub struct Bytecode {
         ops: Frozen<std::boxed::Box<[Op]>>,
         constants: Value,
@@ -22,24 +19,17 @@ objects! {
         arity: i64,
         module: Member<Module>,
     }
-    /// A `syntax-case` pattern, and the literals and data it refers to: see
-    /// [`syntax_case`](crate::syntax_case).
+    /// A compiled `syntax-case` pattern descriptor along with the literal identifiers and pattern data it references (see [`crate::syntax_case`]).
     pub struct SyntaxPattern { shape: Frozen<std::boxed::Box<crate::syntax_case::PatternShape>> } items Value
-    /// A `syntax` template, and the syntax it's made of.
+    /// A compiled `syntax` template descriptor and its constituent syntax objects used for macro output expansion.
     pub struct SyntaxTemplate { shape: Frozen<std::boxed::Box<crate::syntax_case::TemplateShape>> } items Value
-    /// A procedure: its code, and the values it captured, which `LoadUpvalue` reads.
+    /// A procedure closure: pairs a compiled [`Bytecode`] object with its captured upvalue environment, read by `LoadUpvalue`.
     pub struct Closure { code: Member<Bytecode> } items Value
-    /// An assigned variable, shared by the closures that capture it.
+    /// A mutable heap cell (indirection box) representing a mutated variable shared across multiple capturing closures.
     pub struct Box { value: Value }
-    /// Frames handed to a continuation, as Chez's continuation objects hold them: slots
-    /// `start..end` of `segment`, which the stack no longer writes. They end where the frame
-    /// above them would start, and `link` is that frame's link, where the top one goes on.
-    /// `next` is the record below, or `#f`.
+    /// A slice of stack frames preserved for a continuation, modeled after Chez Scheme continuation records: occupies slots `start..end` within `segment` that are protected from stack overwrites. They end at the boundary where the overlying frame would begin, with `link` specifying the return link where the topmost frame resumes, and `next` referencing the next record down the continuation chain (or `#f`).
     ///
-    /// `attachments` are the marks to restore when they're resumed, so a mark set above them is
-    /// gone once they return. A `one_shot` record no continuation holds, so it's resumed in place
-    /// rather than copied: on the stack's own segment if it ends where the stack's frames start,
-    /// or, if it `owns` the rest of its segment, as an overflow leaves it, by moving back onto it.
+    /// `attachments` contains continuation marks restored upon resumption so that marks created above them disappear upon return. When `one_shot` is true (indicating no escaping continuation retains the record), the frames are resumed in place rather than copied to the heap—either directly on the stack segment if adjacent to active frames, or by transferring execution back onto the segment if `owns` is true (as when unwinding a stack overflow).
     pub struct Frames {
         segment: Member<Segment>,
         start: u32,
@@ -50,51 +40,25 @@ objects! {
         owns: bool,
         next: Value,
     }
-    /// A prompt, as Racket CS keeps one: a frame of the metacontinuation. `chain`,
-    /// `attachments` and `winders` are the continuation the prompt returns to, which its body
-    /// doesn't see: it runs on an empty one. An abort to `tag` calls `handler` there. A prompt a
-    /// composable continuation pushes to return to where it's called has no tag, only void.
+    /// A delimited continuation prompt, represented as a frame in the metacontinuation (modeled after Racket CS). `chain`, `attachments`, and `winders` preserve the outer continuation to which the prompt eventually returns, isolating it from the prompt body. An abort targeting `tag` transfers control to `handler`. Prompts pushed by composable continuations to resume execution at their call site carry no prompt tag (storing void).
     pub struct Prompt { tag: Value, handler: Value, chain: Value, attachments: Value, winders: Value }
-    /// A continuation prompt tag. `name` is what `make-continuation-prompt-tag` was given, or
-    /// void.
+    /// A continuation prompt tag used for delimited control. `name` holds the optional name passed to `make-continuation-prompt-tag`, or void.
     pub struct Tag { name: Value }
-    /// A continuation, which is called like a procedure: the records of `chain` and the prompts
-    /// in the list `prompts`, up to a prompt it doesn't include. `attachments` are the marks
-    /// where it was captured, with those of a frame it was captured in tail position of, whose
-    /// continuation it is, and `winders` the task's there. A composable one goes on on top of
-    /// the continuation it's called in; an `escape`, as `call/cc` makes, replaces that one up to
-    /// the nearest default prompt.
+    /// A first-class, callable continuation object: encapsulates the continuation record chain (`chain`) and delimited prompts (`prompts`) delimited by an enclosing prompt. `attachments` preserves continuation marks present at capture time (including any tail-position marks from the capturing frame), and `winders` records the dynamic-wind stack. A composable continuation splices on top of the calling continuation; an `escape` continuation (created by `call/cc`) aborts and replaces the current continuation up to the nearest default prompt.
     pub struct Continuation { chain: Value, attachments: Value, winders: Value, prompts: Value, escape: bool }
-    /// An error object: `fault` says what went wrong, and for [`Fault::Error`], `message` and
-    /// `irritants` are what `error` was called with.
+    /// An exception condition object: `fault` classifies the error type, while `message` and `irritants` hold the error message and detail values passed to `error`.
     pub struct Condition { fault: Frozen<Fault>, message: Value, irritants: Value }
-    /// What `dynamic-wind` runs on the way in and out: a task's `winders`, and a prompt's, hold
-    /// a list of them for a prompt's part of the continuation, innermost first.
+    /// Represents a `dynamic-wind` guard holding `before` and `after` thunks executed when entering or exiting a dynamic extent. Maintained innermost-first in task and prompt winders lists.
     pub struct Winder { before: Value, after: Value }
-    /// What `guard` and `co/try-resume` put in the handlers mark: a raise that reaches it goes
-    /// back to where it was set and calls `handler` there with what was raised, or if that's
-    /// `#f`, returns `#f` and it, with the task's winders as `winders` were. It's kept where it
-    /// goes back to: in the register under the frame of the thunk it was set for, or in a
-    /// [`Native`] record the outer loop pushed.
+    /// An exception handler record installed by `guard` or `co/try-resume` in continuation marks. When an unhandled exception reaches this guard, execution unwinds to its installation site and invokes `handler` with the raised value (or, if `handler` is `#f`, returns `#f` and the value), restoring the dynamic `winders` in place when the guard was established. Stored in a register beneath the protected thunk's frame or within an outer [`Native`] continuation record.
     pub struct Guard { handler: Value, winders: Value }
-    /// A record of a chain that the VM goes on from itself: once what's above it returns, its
-    /// `kind` says what to do next, with `a` and `b`. `attachments` and
-    /// `next` are as a [`Frames`] record's. It's never changed, so a continuation can go on from
-    /// it any number of times.
+    /// A continuation boundary record representing an internal VM control point on the stack chain. When overlying frames return, `kind` specifies the next VM action using operands `a` and `b`. `attachments` and `next` function like those in [`Frames`]. Immutable once constructed, allowing a continuation to resume from it repeatedly.
     pub struct Native { kind: u32, a: Value, b: Value, attachments: Value, next: Value }
-    /// A coroutine, and what a [`crate::Machine`] keeps of the one it runs in the arena: the
-    /// accumulator between runs, the chain of records under its stack, its marks, as a list of
-    /// `(key . value)` pairs, its [`Winder`]s, as `dynamic-wind` sets them, up to the nearest
-    /// prompt, and the list of prompts the chain runs under. `spare` is a segment
-    /// the stack left, which an overflow takes from `spare_base` up.
+    /// A coroutine task representing an arena-allocated execution state managed by a [`crate::Machine`]: preserves the result accumulator (`acc`) between run steps, the continuation record chain (`chain`), continuation marks (`attachments` as an association list of `(key . value)` pairs), active dynamic [`Winder`]s, and enclosing delimited prompts (`prompts`). `spare` and `spare_base` retain a cached stack segment reused during stack overflows.
     ///
-    /// `body` is the procedure it starts with, until it does. `resumer` is the task that resumed
-    /// it, and `resumed` the one it's resuming, if any. While it's suspended, its frames are on
-    /// `segment` from `base` up, or if it has none, its chain holds them all. `state` says
-    /// whether it's pending, running, finished or failed.
+    /// `body` contains the initial entry procedure before execution begins. `resumer` points to the task that resumed this one, while `resumed` points to any task currently resumed by it. While suspended, active stack frames reside on `segment` starting at `base` (or are preserved entirely within `chain`). `state` tracks whether the coroutine is pending, running, finished, or failed.
     ///
-    /// A machine's own task keeps `idle`, the coroutine that suspended last in it, whose frames
-    /// stay on their segment until another suspends, and `none`, the values of none, made once.
+    /// The machine's primary root task also tracks `idle` (the most recently suspended coroutine whose frames remain resident on their segment until another task suspends) and pre-allocated singleton sentinel values in `none`.
     pub struct Task {
         acc: Value,
         chain: Value,
@@ -112,41 +76,30 @@ objects! {
         base: u32,
         state: u32,
     }
-    /// A module, which ragwort code sees only as a whole: its variables, its items, each
-    /// `UNDEFINED` until it's defined, which its code's slot instructions read and write, their
-    /// names, for messages, in the immutable vector `names`, the host functions its native code
-    /// calls, which [`Op::CallHost`] indexes, and what the compiler knows of what it exports,
-    /// for the code that requires it.
+    /// A runtime module instance: holds top-level variable slots (initialized to `UNDEFINED` until defined) accessed by slot instructions, an immutable vector of variable `names` for diagnostic messages, a host function table indexed by [`Op::CallHost`], and an opaque compiler-defined `interface` describing exports for importing modules.
     pub struct Module {
         name: Value,
         names: Value,
         hosts: Frozen<std::boxed::Box<[&'static crate::module::HostDef]>>,
         interface: Frozen<std::boxed::Box<dyn std::any::Any>>,
     } items Value
-    /// Something of the host's, for its procedures to be passed, such as a machine's own state:
-    /// `data` outside the arena, dropped once the object is collected, and `held`, which the
-    /// collector traces, for what of the arena's the host keeps with it.
+    /// A host reference wrapper passed to host procedures: contains arbitrary host `data` allocated outside the arena (dropped upon GC finalization) and a `held` garbage-collected value traced by the GC to preserve associated arena objects.
     pub struct ExternalRef { held: Value, data: Frozen<std::boxed::Box<dyn std::any::Any>> }
-    /// What `(values ...)` makes of other than one value: an object like any other, which the
-    /// `values` intrinsics take apart.
+    /// Represents multiple return values produced by `(values ...)` when returning zero or multiple (other than exactly one) values, unpacked by values intrinsics.
     pub struct MultiValue {} items Value
-    /// What a `lambda` with keyword parameters makes: see [`crate::keyword`]. `keywords` are
-    /// the ones it takes and `required` the ones it needs, as sorted lists.
+    /// A procedure accepting keyword arguments (see [`crate::keyword`]): wraps a `core` procedure and an optional `plain` procedure, accompanied by sorted lists of accepted `keywords` and `required` keywords.
     pub struct KeywordProcedure { plain: Value, core: Value, keywords: Value, required: Value }
-    /// A struct type: see [`crate::structs`].
+    /// Descriptor for a record structure type (see [`crate::structs`]):
     ///
-    /// - `name`: the type's name, a symbol.
-    /// - `names`: an immutable vector of the field names, the supertype's first.
-    /// - `field_flags`: an immutable bytevector with one byte per field, the bits of its
-    ///   [`FieldFlags`](crate::structs::FieldFlags).
-    /// - `fields`: how many fields there are.
-    /// - `flags`: the bits of its [`TypeFlags`](crate::structs::TypeFlags).
-    /// - The items are the supertypes, outermost first.
+    /// - `name`: The structure type name (symbol).
+    /// - `names`: An immutable vector of field name symbols, ordered supertype fields first.
+    /// - `field_flags`: An immutable bytevector containing per-field [`FieldFlags`](crate::structs::FieldFlags) bits.
+    /// - `fields`: Total number of fields across this type and its ancestors.
+    /// - `flags`: Encoded [`TypeFlags`](crate::structs::TypeFlags) bitfield.
+    /// - Trailing items store the ancestor supertypes, ordered outermost first.
     pub struct StructType { name: Value, names: Value, field_flags: Value, fields: u32, flags: u32 } items Value
-    /// An instance of a struct type. `kind` is the type it was created with, and the items are
-    /// its fields.
+    /// An instance of a record structure type: `kind` references its defining [`StructType`] descriptor, and trailing items store its field values.
     pub struct Struct { kind: Member<StructType> } items Value
-    /// What a frame's code keeps past its registers, which `NewSpill` makes and `LoadSpill` and
-    /// `StoreSpill` read and write. Each slot holds one value for one stretch of the code.
+    /// A register-spill buffer allocated by `NewSpill` for execution frames that require more local variable storage than the fixed register window provides, accessed via `LoadSpill` and `StoreSpill`.
     pub struct Spill {} items Value
 }

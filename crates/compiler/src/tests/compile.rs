@@ -50,17 +50,17 @@ fn letrec<'gc>(binds: Vec<(u32, Core<'gc>)>, body: Core<'gc>) -> Core<'gc> {
     Core::Letrec(binds.into_iter().map(|(v, e)| (Var(v), e)).collect(), Box::new(body))
 }
 
-/// `a`, then `b`, with `a`'s value bound to `v`, which nothing reads.
+/// Builds a sequence that binds `a` to unused variable `v`, then evaluates `b`.
 fn seq<'gc>(v: u32, a: Core<'gc>, b: Core<'gc>) -> Core<'gc> {
     let_(vec![(v, a)], b)
 }
 
-/// A lambda, numbered apart from every other the tests make.
+/// Builds a lambda with an ID distinct from every other test lambda.
 fn lambda<'gc>(params: &[u32], rest: Option<u32>, body: Core<'gc>) -> Core<'gc> {
     optional_lambda(params, 0, rest, body)
 }
 
-/// A lambda whose last `optional` parameters a call can leave out.
+/// Builds a lambda with `optional` trailing optional parameters.
 fn optional_lambda<'gc>(params: &[u32], optional: u32, rest: Option<u32>, body: Core<'gc>) -> Core<'gc> {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -75,8 +75,7 @@ fn set<'gc>(v: u32, value: Core<'gc>) -> Core<'gc> {
     Core::Set(Place::Local(Var(v)), Box::new(value))
 }
 
-/// Compiles what `build` makes, runs it to the end, and hands what it returned, or the fault
-/// it raised, to `check`.
+/// Compiles and runs the expression from `build`, then passes its result or fault to `check`.
 fn eval(build: impl for<'gc> FnOnce(&Mutation<'gc>) -> Core<'gc>, check: impl for<'gc> FnOnce(&Mutation<'gc>, Result<Value<'gc>, Fault>)) {
     let mut arena = Arena::new(1 << 24, 0);
     arena.mutate(|mc| {
@@ -94,7 +93,7 @@ fn eval(build: impl for<'gc> FnOnce(&Mutation<'gc>) -> Core<'gc>, check: impl fo
     });
 }
 
-/// What `build` returns, as a fixnum.
+/// Compiles and runs the expression from `build`, returning its fixnum result.
 fn number(build: impl for<'gc> FnOnce(&Mutation<'gc>) -> Core<'gc>) -> Result<i64, Fault> {
     let mut got = Err(Fault::Malformed);
     eval(build, |_, result| got = result.map(|v| v.as_fixnum().unwrap()));
@@ -149,8 +148,8 @@ fn closures_share_boxes() {
     }
     assert_eq!(number(|_| let_(vec![(0, q(0))], let_(vec![(1, inc())], seq(3, app(var(1), vec![]), seq(4, app(var(1), vec![]), app(var(1), vec![])))))), Ok(3));
 
-    // ((lambda (x) (let ((get (lambda () x))) (set! x 41) (+ (get) 1))) 0): a captured
-    // parameter is boxed on entry, and the closure sees it assigned after it was made.
+    // ((lambda (x) (let ((get (lambda () x))) (set! x 41) (+ (get) 1))) 0): box the captured parameter
+    // on entry so the closure observes later assignments.
     fn get<'gc>() -> Core<'gc> {
         lambda(&[0], None, let_(vec![(1, lambda(&[], None, var(0)))], seq(2, set(0, q(41)), add(app(var(1), vec![]), q(1)))))
     }
@@ -197,16 +196,16 @@ fn letrec_and_tail_calls() {
     );
 }
 
-/// `(lambda (a) (+ (+ a x) (+ (+ a a) (+ x x))))`, with `x` variable 0: too big to inline at
-/// each call.
+/// Builds `(lambda (a) (+ (+ a x) (+ (+ a a) (+ x x))))` with `x` as variable 0. The body exceeds
+/// the multi-use inlining budget.
 fn big<'gc>(a: u32) -> Core<'gc> {
     lambda(&[a], None, add(add(var(a), var(0)), add(add(var(a), var(a)), add(var(0), var(0)))))
 }
 
 #[test]
 fn lambdas_only_called_in_tail_position_are_jumps() {
-    // `(letrec ((f (lambda (x) body))) (f 0), (f 1) and (f 2))`, as one number in base 1000, and
-    // how many closures `f` makes.
+    // Run `(f 0)`, `(f 1)`, and `(f 2)` for the generated recursive `f`, encode their results in base
+    // 1000, and count generated closures.
     fn check(name: &str, body: impl for<'gc> Fn(&Mutation<'gc>) -> Core<'gc>, expect: i64, closures: usize) {
         let mut arena = Arena::new(1 << 24, 0);
         arena.mutate(|mc| {
@@ -226,7 +225,7 @@ fn lambdas_only_called_in_tail_position_are_jumps() {
         let_(vec![(1, k)], when(eq(var(0), q(0)), app(var(1), vec![q(1)]), when(eq(var(0), q(1)), app(var(1), vec![q(2)]), other)))
     }
     check("tail", |_| branches(big(2), q(5)), 3_009_005, 0);
-    // In the `let`'s tail position, not the function's.
+    // The calls are in tail position relative to the `let`, not the enclosing function.
     check("in an argument", |_| add(q(100), branches(big(2), q(5))), 103_109_105, 0);
     // `(let loop ((n x)) (let ((k (lambda (m) (if (eq? m 0) 7 (loop (+ m -1)))))) (if (eq? n 0)
     // (k 0) (k n))))`: a loop's body jumps to a join, and the join to the loop.
@@ -240,8 +239,8 @@ fn lambdas_only_called_in_tail_position_are_jumps() {
         7_007_007,
         0,
     );
-    // `(let ((k big)) (+ 100 (if ...)))`: in tail position of the `if`, not the `let`, so its
-    // code goes at the `if`.
+    // `(let ((k big)) (+ 100 (if ...)))`: calls share the `if`'s tail context, so place the join at the
+    // `if`, not at the `let`.
     check("under an argument", |_| let_(vec![(1, big(2))], add(q(100), when(eq(var(0), q(0)), app(var(1), vec![q(1)]), when(eq(var(0), q(1)), app(var(1), vec![q(2)]), q(5))))), 103_109_105, 0);
     // `(let loop ((n 3) (acc 0)) (if (eq? n 0) acc (loop (+ n -1) (+ acc (let ((k big)) (if ...))))))`.
     check(
@@ -254,7 +253,7 @@ fn lambdas_only_called_in_tail_position_are_jumps() {
         9_027_015,
         0,
     );
-    // Calls in two arguments return to two places.
+    // Calls in separate arguments have different return destinations.
     check("in two arguments", |_| let_(vec![(1, big(2))], add(app(var(1), vec![q(1)]), app(var(1), vec![q(2)]))), 9_015_021, 1);
     // `(let ((k big)) (let ((g (lambda (z) (if (eq? z c) (k 1) (k 2)))) (h 0)) (set! h g) (+ (h 0)
     // (* 10 (h 1)))))`: `k`'s code can go in `g`, which then captures what it uses instead.
@@ -264,9 +263,10 @@ fn lambdas_only_called_in_tail_position_are_jumps() {
         let_(vec![(1, k)], let_(vec![(3, g), (6, q(0))], seq(10, set(6, var(3)), calls)))
     }
     check("in the lambda that calls it", |_| inside(big(2), q(0)), 63_096_129, 1);
-    // `g` capturing `x` already.
+    // `g` already captures `x`, so moving the join does not add that capture.
     check("in a lambda capturing what it does", |_| inside(big(2), var(0)), 63_069_132, 1);
-    // `(let ((w (+ x 1))) ...)`, `k` adding `w`: `g` would capture two for one, so it stays.
+    // With `(let ((w (+ x 1))) ...)` and `k` also using `w`, moving `k` would replace one capture with
+    // two. Keep the closure.
     check(
         "not in a lambda that'd capture more",
         |_| {
@@ -276,7 +276,7 @@ fn lambdas_only_called_in_tail_position_are_jumps() {
         74_118_162,
         2,
     );
-    // A lambda that escapes, or that's called other than in tail position, is a closure.
+    // Keep a closure when the lambda escapes or lacks a common tail context.
     // `(let ((y 0)) (set! y k) (y 2))`.
     check("escaping", |_| branches(big(2), let_(vec![(3, q(0))], seq(10, set(3, var(1)), app(var(3), vec![q(2)])))), 3_009_012, 1);
     check("not in tail position", |_| branches(big(2), add(q(1), app(var(1), vec![q(2)]))), 3_009_013, 1);
@@ -284,8 +284,7 @@ fn lambdas_only_called_in_tail_position_are_jumps() {
 
 #[test]
 fn letrec_groups_only_called_in_tail_position_are_jumps() {
-    // Runs what `build` makes, through pauses, checking how many closures its code makes and
-    // whether it calls.
+    // Runs the generated program through pauses and checks its closure-allocation and call counts.
     fn check(name: &str, build: impl for<'gc> Fn(&Mutation<'gc>) -> Core<'gc>, expect: i64, closures: usize, calls: bool) {
         let mut arena = Arena::new(1 << 24, 0);
         arena.mutate(|mc| {
@@ -310,7 +309,8 @@ fn letrec_groups_only_called_in_tail_position_are_jumps() {
         lambda(&[v], None, when(eq(var(v), q(0)), q(done), app(var(next), vec![add(var(v), q(-1))])))
     }
     check("even and odd", |_| letrec(vec![(0, state(2, 1, 1)), (1, state(3, 0, 0))], app(var(0), vec![q(1_000_001)])), 0, 0, false);
-    // Three states, a to b to c to a, a million steps from a: b's.
+    // Run a three-state cycle, a -> b -> c -> a, for one million steps starting at a; the final state
+    // is b.
     check("three states", |_| letrec(vec![(0, state(3, 1, 1)), (1, state(4, 2, 2)), (2, state(5, 3, 0))], app(var(0), vec![q(1_000_000)])), 2, 0, false);
     // `(+ 100 (letrec ((lp (lambda (n acc) (if (eq? n 0) (+ acc x) ...)))) (if (eq? x 1) (lp 10 0)
     // (lp 3 0))))`, a loop started from two places, for x of 1 and of 0. It captures `x`, so it'd
@@ -344,7 +344,7 @@ fn letrec_groups_only_called_in_tail_position_are_jumps() {
         0,
         false,
     );
-    // A group one of which escapes stays closures.
+    // If any function in a recursive group escapes, retain the group's closures.
     check(
         "escaping",
         |_| letrec(vec![(0, state(2, 1, 1)), (1, state(3, 0, 0))], when(prim(Intrinsic::IsProcedure, vec![var(1)]), app(var(0), vec![q(10)]), q(5))),
@@ -352,7 +352,7 @@ fn letrec_groups_only_called_in_tail_position_are_jumps() {
         1,
         true,
     );
-    // Recursion other than in tail position stays a call.
+    // Nontail recursion remains a call.
     check(
         "not in tail position",
         |_| letrec(vec![(0, lambda(&[1], None, when(eq(var(1), q(0)), q(0), add(var(1), app(var(0), vec![add(var(1), q(-1))])))))], app(var(0), vec![q(100)])),
@@ -388,7 +388,7 @@ fn optional_parameters_are_unsupplied_when_left_out() {
             assert_eq!((direct, applied), (expect, expect), "{args:?}, rest {rest}");
         }
     }
-    // Optional parameters are bound in registers, so there can't be more than fit.
+    // Optional parameters must fit in the frame's parameter registers.
     let params: Vec<u32> = (0..=u32::from(MAX_PARAMS)).collect();
     assert_eq!(error(|_| optional_lambda(&params, 1, None, q(0))), CompileError::TooManyRegisters);
 }
@@ -421,7 +421,7 @@ fn bad_forms_dont_compile() {
         Core::Lambda(Lambda { id: 7, params: Vec::new(), optional: 0, rest: None, body: Box::new(body) })
     }
     assert_eq!(error(|_| app(numbered(q(1)), vec![numbered(q(2))])), CompileError::SameLambda(7));
-    // A lambda of one parameter, two of them optional.
+    // Reject a lambda with one parameter but an optional-parameter count of two.
     assert_eq!(error(|_| Core::Lambda(Lambda { id: 7, params: vec![Var(0)], optional: 2, rest: None, body: Box::new(q(1)) })), CompileError::TooManyOptional(7));
     assert_eq!(error(|_| Core::Intrinsic(Prim::Request(Request::Capture), vec![q(1)])), CompileError::Arity(Prim::Request(Request::Capture)));
 }
@@ -470,9 +470,10 @@ fn big_frames_spill() {
         }),
         Ok(349)
     );
-    // A two-argument intrinsic whose first argument is spilled and whose second is worked out into a
-    // spilled register: (let ((k (make-box 0))) (with-mark k 7 (lambda () (let ((v1 (make-box 1))
-    // ... (v250 ...)) (+ (mark-value k (unbox v5)) (unbox v1) ... (unbox v250))))))
+    // A two-argument intrinsic with a spilled first argument and a second argument computed into spill
+    // storage:
+    // (let ((k (make-box 0))) (with-mark k 7 (lambda () (let ((v1 (make-box 1)) ... (v250 ...)) (+
+    // (mark-value k (unbox v5)) (unbox v1) ... (unbox v250))))))
     assert_eq!(
         number(|_| {
             let boxes: Vec<(u32, Core)> = (1..=250).map(|v| (v, prim(MakeBox, vec![q(i64::from(v))]))).collect();
@@ -499,8 +500,8 @@ fn big_frames_spill() {
     );
 }
 
-/// Calls of `argc` values made with `live` boxes held across them, around where the frame's own
-/// registers end and its scratch ones, which stage calls, begin.
+/// Tests calls with `argc` arguments while `live` boxes remain live across the call, around the
+/// boundary between working registers and scratch registers used for argument staging.
 #[test]
 fn calls_around_the_last_registers() {
     let stage = WINDOW as u32 / 4;
@@ -542,7 +543,7 @@ fn lambdas_take_more_parameters_than_registers() {
             });
         }
     }
-    // Captured and assigned parameters past the registers.
+    // Test captured and assigned parameters beyond the parameter-register range.
     assert_eq!(number(|_| app(app(lambda(&ids(300), None, lambda(&[], None, add(var(0), var(299)))), nums(300)), vec![])), Ok(299));
     assert_eq!(number(|_| app(lambda(&ids(300), None, seq(300, set(299, q(7)), var(299))), nums(300))), Ok(7));
 }
@@ -607,7 +608,7 @@ fn assigned_variables_stay_in_registers_where_nothing_else_sees_them() {
         let mut arena = Arena::new(1 << 24, 0);
         arena.mutate(|mc| all_ops(mc, compile(mc, Some(hosting(mc)), &build(mc)).unwrap()))
     }
-    // A call cp0 can't see into, where a continuation could be captured.
+    // An opaque call may capture a continuation.
     fn call<'gc>() -> Core<'gc> {
         app(Core::Ref(Place::Slot { slot: 0, checked: false }), vec![])
     }
@@ -730,7 +731,8 @@ fn long_chains_of_definitions_compile_without_deep_recursion() {
         letrec(binds, app(var(0), vec![q(0)]))
     });
     assert_eq!(chain, Ok(i64::from(n)));
-    // Each is called once, so all of it's inlined, however deep that nests, and folds to `n`.
+    // Each function is called once, so inline the entire chain and fold it to `n`, regardless of the
+    // resulting nesting depth.
     let mut arena = Arena::new(1 << 26, 0);
     arena.mutate(|mc| {
         let mut binds: Vec<_> = (0..n).map(|i| (i, lambda(&[x(i)], None, add(q(1), app(var(i + 1), vec![var(x(i))]))))).collect();
@@ -755,8 +757,9 @@ fn long_chains_of_definitions_compile_without_deep_recursion() {
 
 #[test]
 fn deeply_nested_loops_compile_quickly() {
-    // (let ((x 0)) (let l0 ((k0 1)) (if (eq? k0 0) (let l1 ((k1 1)) ... (begin (set! x (+ x 1)) x)
-    // ...) (l0 (+ k0 -1))))): each loop a join in the one around it's code.
+    // (let ((x 0)) (let l0 ((k0 1)) (if (eq? k0 0) (let l1 ((k1 1)) ... (begin (set! x (+ x 1)) x) ...)
+    // (l0 (+ k0 -1))))): each loop a join in the one around it's code.`
+    // Each nested loop becomes a join inside the enclosing loop's code.
     let x = number(|_| {
         let mut inner = seq(1000, set(0, add(var(0), q(1))), var(0));
         for i in (0..60).rev() {
@@ -771,9 +774,10 @@ fn deeply_nested_loops_compile_quickly() {
 
 #[test]
 fn joins_go_where_they_are_called_however_deep() {
-    // (let ((x 1)) (set! x 2) (let ((k (lambda (a) (+ x (+ x ... (+ x a)))))) (if (eq? x -1) -1
-    // (if (eq? x -2) -2 ... (if (eq? x 0) (k 1) (k 2)))))): the ifs and k's code each nearly as
-    // deep as the front end takes, so k's code is deeper still where it goes, as a join.
+    // (let ((x 1)) (set! x 2) (let ((k (lambda (a) (+ x (+ x ... (+ x a)))))) (if (eq? x -1) -1 (if
+    // (eq? x -2) -2 ... (if (eq? x 0) (k 1) (k 2)))))): the ifs and k's code each nearly as deep as the
+    // front end takes, so k's code is deeper still where it goes, as a join.`
+    // Placing `k` as a join combines a deep conditional chain with a deep function body.
     let (ifs, height) = (200, 150);
     let mut arena = Arena::new(1 << 24, 0);
     arena.mutate(|mc| {
@@ -806,7 +810,7 @@ fn values_are_made_where_they_go() {
     let ops = ops_of(|_| lambda(&[0], None, prim(Car, vec![var(0)])));
     assert!(moves(&ops) == 0 && ops.contains(&Op::TailCallIntrinsic { base: ARGS, args: 1, intrinsic: Car }), "{ops:?}");
     // (let loop ((xs '(1 2 3)) (acc '())) (if (null? xs) acc (loop (cdr xs) (cons (car xs) acc)))):
-    // each new value is made in its parameter's register, the new xs once the old is read.
+    // reuse each parameter's register for its next value only after all reads of the old value.
     fn reverse<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
         let nil = || Core::Quote(Value::NIL);
         let list = prim(Cons, vec![q(1), prim(Cons, vec![q(2), prim(Cons, vec![q(3), nil()])])]);
@@ -888,14 +892,14 @@ fn micropass_optimizations() {
         let compared = when(prim(Intrinsic::Lt, vec![q(1), q(2), q(3)]), prim(Intrinsic::Le, vec![q(2), q(1)]), q(0));
         let ops = all_ops(mc, compile(mc, None, &compared).unwrap());
         assert!(matches!(ops.as_slice(), [Op::LoadConst { .. }, Op::Return { .. }]), "{ops:?}");
-        //    A small power folds; one that would take long to compute is left to run.
+        // Fold a small exponentiation, but leave an expensive one for runtime evaluation.
         let ops = all_ops(mc, compile(mc, None, &prim(Intrinsic::Expt, vec![q(2), q(10)])).unwrap());
         assert!(matches!(ops.as_slice(), [Op::LoadConst { .. }, Op::Return { .. }]), "{ops:?}");
         let ops = all_ops(mc, compile(mc, None, &prim(Intrinsic::Expt, vec![q(3), q(1_000_000)])).unwrap());
         assert!(ops.len() > 2, "{ops:?}");
 
-        // 4. A call of an imported wrapper of an intrinsic inlines to it, so `(+ x 1)` compiles to
-        //    `AddImm`, as do two calls of an imported `add1`, with no calls left.
+        // 4. Inline imported intrinsic wrappers. `(+ x 1)` and calls to imported `add1` become `AddImm`
+        // without procedure calls.
         let lib = exporting(mc, vec![
             ("add", lambda(&[], Some(0), Core::ApplyIntrinsic(Prim::Intrinsic(Add), vec![var(0)])), false),
             ("add1", lambda(&[0], None, add(var(0), q(1))), false),
@@ -950,8 +954,8 @@ fn micropass_optimizations() {
             );
         }
 
-        // 4c. A leading effect floats out of an intrinsic's first argument, so the constant behind
-        //     it counts: `(+ (begin (f) 1) x)` compiles to `AddImm`, `(+ (begin (f) 2) 3)` to 5.
+        // 4c. Preserve a leading effect while exposing the following constant for optimization: `(+ (begin
+        // (f) 1) x)` uses `AddImm`; `(+ (begin (f) 2) 3)` returns 5 after calling `f`.
         let effect_first = add(seq(9, app(var(1), vec![]), q(1)), var(0));
         let ops = all_ops(mc, compile(mc, None, &lambda(&[0, 1], None, effect_first)).unwrap());
         assert!(ops.iter().any(|op| matches!(op, Op::AddImm { imm: 1, .. })), "expected AddImm: {ops:?}");
@@ -990,18 +994,18 @@ fn micropass_optimizations() {
                 })
                 .count()
         };
-        //    A pair bound to a variable forwards too, and goes once nothing else uses it:
-        //    (lambda (x y) (let ((p (cons x y))) (+ (car p) (cdr p)))) -> (lambda (x y) (+ x y))
+        // Forward fields from a pair bound to a variable, then remove the allocation when no uses remain:
+        // (lambda (x y) (let ((p (cons x y))) (+ (car p) (cdr p)))) -> (lambda (x y) (+ x y))
         let parts = |p: u32| add(prim(Intrinsic::Car, vec![var(p)]), prim(Intrinsic::Cdr, vec![var(p)]));
         let bound = lambda(&[0, 1], None, let_(vec![(2, prim(Cons, vec![var(0), var(1)]))], parts(2)));
         let ops = all_ops(mc, compile(mc, None, &bound).unwrap());
         assert_eq!(conses(&ops), 0, "expected the bound pair to go: {ops:?}");
-        //    And one an inlined call leaves in a `let`:
-        //    (lambda (f) (car (let ((x (f))) (cons x 1)))) -> (lambda (f) (f))
+        // Forward through a `let` left by inlining:
+        // (lambda (f) (car (let ((x (f))) (cons x 1)))) -> (lambda (f) (f))
         let in_let = lambda(&[0], None, prim(Intrinsic::Car, vec![let_(vec![(1, app(var(0), vec![]))], prim(Cons, vec![var(1), q(1)]))]));
         let ops = all_ops(mc, compile(mc, None, &in_let).unwrap());
         assert_eq!(conses(&ops), 0, "expected the pair in the let to go: {ops:?}");
-        //    `list?` keeps the pair it's asked of, rather than making it again.
+        // `list?` must reuse the existing pair rather than allocate it again.
         let listy = lambda(&[0], None, let_(vec![(1, prim(Cons, vec![var(0), Core::Quote(Value::NIL)]))], prim(Intrinsic::IsList, vec![var(1)])));
         let ops = all_ops(mc, compile(mc, None, &listy).unwrap());
         assert_eq!(conses(&ops), 1, "{ops:?}");
@@ -1162,10 +1166,8 @@ fn micropass_optimizations() {
     //     register-resident and spill-slot-resident outer variables.
     assert_eq!(
         number(|_| {
-            // Bind 260 non-foldable variables `v_0 .. v_259` via `(unbox (box 1))`? Wait: `cp0`
-            // folds `(unbox (box 1))`! Use `(car (cdr (list 0 1)))`? `cp0` folds that too!
-            // Use `MakeBox(1)` for 260 distinct live boxes and unbox the first and last inside a
-            // contified loop!
+            // Keep 260 distinct boxes live to force spilling. A contified loop reads the first and last boxes,
+            // exercising both register and spill-slot access.
             let binds: Vec<_> = (0..260u32)
                 .map(|i| (i, prim(MakeBox, vec![q(1)])))
                 .collect();
@@ -1231,7 +1233,7 @@ fn micropass_optimizations() {
             "expected the 4-instruction list-length loop: {ops:?}"
         );
 
-        // And it counts: run the compiled `length` on lists of 0, 1, and 1000 elements.
+        // Run the compiled `length` on lists with 0, 1, and 1000 elements.
         let mut machine = Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap();
         let Outcome::Done(length) = machine.run(mc).unwrap() else { panic!() };
         let pairs = Pairs::new(mc);
@@ -1244,7 +1246,7 @@ fn micropass_optimizations() {
     });
 }
 
-/// New locals, numbered apart from the tests' own.
+/// Supplies fresh local IDs that do not overlap with IDs used explicitly by tests.
 fn fresher() -> impl FnMut() -> Var {
     let mut next = 1000;
     move || {
@@ -1258,14 +1260,14 @@ fn symbol<'gc>(mc: &Mutation<'gc>, name: &str) -> Value<'gc> {
     symbols.intern_str(&Strings::new(mc), name).unwrap().value(mc)
 }
 
-/// A module that defines and exports each of `defs`, assigning those marked so, once its code
-/// has run.
+/// Builds and runs a module that defines and exports `defs`, including assignments for definitions
+/// marked mutable.
 fn exporting<'gc>(mc: &Mutation<'gc>, defs: Vec<(&str, Core<'gc>, bool)>) -> Gc<'gc, ragwort_vm::objects::Module> {
     exporting_with(mc, &[], &[], defs)
 }
 
-/// A module of `defs`, as [`exporting`] makes, whose code calls `hosts` and which requires
-/// `imports`, by the names given.
+/// Builds a module as [`exporting`] does, with host functions `hosts` and named dependencies
+/// `imports`.
 fn exporting_with<'gc>(mc: &Mutation<'gc>, hosts: &'static [HostDef], imports: &[(&str, Import<'gc>)], defs: Vec<(&str, Core<'gc>, bool)>) -> Gc<'gc, ragwort_vm::objects::Module> {
     let mut builder = ModuleBuilder::new(Value::FALSE, hosts);
     let symbols = Symbols::with_seed(mc, 1).unwrap();
@@ -1318,11 +1320,11 @@ fn modules_export_what_code_that_requires_them_needs() {
             ("car-cons", lambda(&[], Some(0), prim(Car, vec![spread(Cons)])), false),
             ("counter", q(0), true),
             ("five", q(5), false),
-            // It refers to a variable of its module's that nothing assigns, which is its value.
+            // An immutable module-variable reference can be replaced with its value.
             ("first", lambda(&[0], None, add(var(0), slot(4))), false),
-            // And this to one the module assigns, which it has to read where it's called.
+            // A mutable module-variable reference must read its current value at the call site.
             ("counted", lambda(&[0], None, add(var(0), slot(3))), false),
-            // A call of a procedure it's given, or of one in such a variable.
+            // Call a procedure passed as an argument or obtained from a module variable.
             ("applied", lambda(&[0, 1], None, Core::App(Box::new(var(0)), vec![var(1), slot(4)])), false),
         ]);
         let interface = ragwort_compiler_interface(mc, lib);
@@ -1330,12 +1332,12 @@ fn modules_export_what_code_that_requires_them_needs() {
         assert!(interface.get("counter").unwrap().mutable && interface.get("counter").unwrap().inline.is_none());
         assert!(interface.get("first").unwrap().inline.is_some() && interface.get("applied").unwrap().inline.is_some());
         assert!(interface.get("counted").unwrap().inline.is_none() && interface.get("nothing").is_none());
-        // The inlined call of a procedure value calls it, with the variable's value.
+        // Inlining preserves the procedure call and supplies the module variable's value.
         let sum = imported(mc, lib, "sum").reference(mc).unwrap();
         let applied = imported(mc, lib, "applied").call(mc, vec![sum, q(2)], &mut fresher()).unwrap();
         assert!(matches!(&applied, Core::App(..)), "{applied:?}");
         assert_eq!(run_to_end(mc, compile(mc, None, &applied).unwrap()), Ok(fix(7)));
-        // An inlined call does what the call would.
+        // Compare inlined execution with the original call's behavior.
         let mut fresh = fresher();
         for (name, want) in [("sum", fix(7)), ("sum-not", Value::FALSE), ("car-cons", fix(3)), ("first", fix(8))] {
             let call = imported(mc, lib, name).call(mc, vec![q(3), q(4)].into_iter().take(if name == "first" { 1 } else { 2 }).collect(), &mut fresh).unwrap();
@@ -1347,11 +1349,11 @@ fn modules_export_what_code_that_requires_them_needs() {
         assert!(matches!(counter, Core::Intrinsic(Prim::Intrinsic(ModuleRef), _)), "{counter:?}");
         ragwort_vm::objects::ModuleFields::items(lib, mc).set(mc, 3, fix(9));
         assert_eq!(run_to_end(mc, compile(mc, None, &counter).unwrap()), Ok(fix(9)));
-        // A call that the template doesn't take is a call of the procedure, which faults.
+        // An arity mismatch bypasses the template and remains an ordinary call that faults.
         let wrong = imported(mc, lib, "first").call(mc, vec![], &mut fresh).unwrap();
         assert_eq!(run_to_end(mc, compile(mc, None, &wrong).unwrap()), Err(Fault::Arity));
-        // A template that uses its arguments out of order still evaluates them in order, so the
-        // first fault is the first argument's.
+        // Even when the template uses parameters out of order, evaluate arguments in source order so the
+        // first argument's fault occurs first.
         let lib2 = exporting(mc, vec![
             ("swap", lambda(&[0, 1], None, prim(Cons, vec![var(1), var(0)])), false),
             ("rest-first", lambda(&[0], Some(1), prim(Cons, vec![var(1), var(0)])), false),
@@ -1364,7 +1366,7 @@ fn modules_export_what_code_that_requires_them_needs() {
         let rest = imported(mc, lib2, "rest-first").call(mc, vec![q(1), add(q(1), q(1)), q(3)], &mut fresh).unwrap();
         let rest = run_to_end(mc, compile(mc, None, &prim(Car, vec![rest])).unwrap()).unwrap();
         assert_eq!(items(mc, rest), [2, 3]);
-        // An optional parameter a call leaves out is unsupplied, so its default's test folds:
+        // An omitted optional argument becomes the unsupplied value, allowing its default test to fold:
         // (lambda (a [b]) (let ([c (if (eq? b #<unsupplied>) 100 b)]) (+ a c))).
         let default = when(eq(var(1), Core::Quote(Value::UNSUPPLIED)), q(100), var(1));
         let lib3 = exporting(mc, vec![("plus", optional_lambda(&[0, 1], 1, None, let_(vec![(2, default)], add(var(0), var(2)))), false)]);
@@ -1377,11 +1379,11 @@ fn modules_export_what_code_that_requires_them_needs() {
         let one = plus.call(mc, vec![var(0)], &mut fresh).unwrap();
         let ops = all_ops(mc, compile(mc, None, &lambda(&[0], None, one)).unwrap());
         assert!(matches!(ops.as_slice(), [.., Op::AddImm { imm: 100, .. }, Op::Return { .. }]), "expected the default to fold: {ops:?}");
-        // A parameter used in an `if`'s test and a branch is used twice, so its argument is bound.
+        // Bind an argument used in both an `if` test and a branch so it is evaluated only once.
         let lib4 = exporting(mc, vec![("car-or", lambda(&[0], None, when(prim(ragwort_vm::Intrinsic::IsPair, vec![var(0)]), prim(Car, vec![var(0)]), var(0))), false)]);
         let call = imported(mc, lib4, "car-or").call(mc, vec![prim(Cons, vec![q(1), q(2)])], &mut fresh).unwrap();
         assert_eq!(run_to_end(mc, compile(mc, None, &call).unwrap()), Ok(fix(1)));
-        // An export its module hasn't defined yet can't be referred to.
+        // Reject references to immutable exports that have not been initialized.
         let mut builder = ModuleBuilder::new(Value::FALSE, &[]);
         builder.define(symbol(mc, "x"), 0).unwrap();
         builder.provide_all(mc).unwrap();
@@ -1394,9 +1396,8 @@ fn modules_export_what_code_that_requires_them_needs() {
 fn host_calls_inline_into_the_modules_that_require_them() {
     let mut arena = Arena::new(1 << 24, 0);
     arena.mutate(|mc| {
-        // A module whose export wraps a host call; one that requires it, whose own export calls
-        // that, inlined; and code of a third, which requires only the second and has no host
-        // functions of its own.
+        // Test transitive host-function imports: the first module exports a host-call wrapper, the second
+        // inlines that wrapper, and the third imports only the second with no host functions of its own.
         let host = |args| Core::Intrinsic(Prim::Host(ADD_HOST), args);
         let lib = exporting_with(mc, &HOSTS, &[], vec![("plus", lambda(&[0, 1], None, host(vec![var(0), var(1)])), false)]);
         let plus = imported(mc, lib, "plus");
@@ -1439,13 +1440,14 @@ fn module_builders_check_names_and_where_variables_are_defined() {
         assert_eq!(builder.provide("a", a), Ok(()));
         assert_eq!(builder.provide("a", c), Err(ModuleError::Duplicate));
         assert_eq!(builder.provide("b", b), Err(ModuleError::NotDefined));
-        // Defined by an earlier form, or the variable inside its own lambda: unchecked.
+        // References after an earlier defining form, or within the defining lambda itself, omit
+        // initialization checks.
         assert_eq!(builder.place(0, 1, None), Place::Slot { slot: 0, checked: false });
         assert_eq!(builder.place(0, 0, None), Place::Slot { slot: 0, checked: true });
         assert_eq!(builder.place(1, 1, None), Place::Slot { slot: 1, checked: true });
         assert_eq!(builder.place(1, 2, Some(1)), Place::Slot { slot: 1, checked: false });
         assert_eq!(builder.place(1, 1, Some(0)), Place::Slot { slot: 1, checked: true });
-        // What a require spec takes from and renames.
+        // Test require-spec selection and renaming.
         let all = Imports::all(mc, lib).unwrap();
         let names = |imports: Imports<'_>| imports.0.into_iter().map(|(n, _)| n).collect::<Vec<_>>();
         let strings = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
@@ -1459,7 +1461,7 @@ fn module_builders_check_names_and_where_variables_are_defined() {
     });
 }
 
-/// How many ops call `intrinsic`, in any form.
+/// Counts all bytecode instruction forms that invoke `intrinsic`.
 fn calls(ops: &[Op], intrinsic: Intrinsic) -> usize {
     ops.iter()
         .filter(|op| match **op {
@@ -1476,18 +1478,18 @@ fn calls(ops: &[Op], intrinsic: Intrinsic) -> usize {
         .count()
 }
 
-/// A vector literal of `xs`.
+/// Builds a vector literal containing `xs`.
 fn constant<'gc>(mc: &Mutation<'gc>, xs: &[i64]) -> Core<'gc> {
     let items: Vec<_> = xs.iter().map(|&x| fix(x)).collect();
     Core::Quote(ragwort_types::vector::Vectors::new(mc).immutable_from_slice(&items).unwrap().value(mc))
 }
 
-/// Whether `core` compiles to just loading a constant.
+/// Checks whether `core` compiles to a constant load alone.
 fn folds<'gc>(mc: &Mutation<'gc>, core: Core<'gc>) -> bool {
     matches!(all_ops(mc, compile(mc, None, &core).unwrap()).as_slice(), [Op::LoadConst { .. }, Op::Return { .. }])
 }
 
-/// How many calls of `asked` are left in a procedure of one parameter whose body is `test`.
+/// Counts remaining calls to `asked` in a one-parameter procedure with body `test`.
 fn asked_in<'gc>(mc: &Mutation<'gc>, test: Core<'gc>, asked: Intrinsic) -> usize {
     calls(&all_ops(mc, compile(mc, None, &lambda(&[0], None, test)).unwrap()), asked)
 }
@@ -1502,11 +1504,11 @@ fn reads_of_constant_vectors_fold() {
         assert!(folds(mc, prim(IsVector, vec![constant(mc, &[])])));
         assert!(folds(mc, prim(IsVector, vec![q(1)])));
 
-        // An index past the end is left to fault when it runs.
+        // Preserve an out-of-bounds access so it faults at runtime.
         let past = all_ops(mc, compile(mc, None, &prim(VectorRef, vec![constant(mc, &[1]), q(1)])).unwrap());
         assert_eq!(calls(&past, VectorRef), 1, "{past:?}");
 
-        // A vector `vector` makes can change, so reading one isn't folded.
+        // Vectors created by `vector` are mutable, so their element reads cannot be constant-folded.
         let made = prim(VectorRef, vec![prim(MakeVectorOf, vec![q(1), q(2)]), q(0)]);
         let ops = all_ops(mc, compile(mc, None, &made).unwrap());
         assert_eq!(calls(&ops, VectorRef), 1, "{ops:?}");
@@ -1518,9 +1520,9 @@ fn reads_of_constant_vectors_fold() {
         let ops = all_ops(mc, compile(mc, None, &lambda(&[0], None, tests)).unwrap());
         assert_eq!(calls(&ops, IsVector), 1, "{ops:?}");
 
-        // What one type predicate says of a value tells what others would: under `(integer? x)`,
-        // `x` is a number and a real, and no pair; where it's no number, it's no integer either.
-        // But an integer may or may not be exact, and a number may or may not be an integer.
+        // Infer related type predicates: an integer is a real and a number, but not a pair; a non-number
+        // cannot be an integer. Integer status alone does not determine exactness, and number status does
+        // not imply integer status.
         use Intrinsic::{IsExactInteger, IsIdentifier, IsInteger, IsList, IsNull, IsNumber, IsReal, IsSyntax};
         for (known, asked) in [
             (IsInteger, IsNumber),
@@ -1567,12 +1569,13 @@ fn intrinsics_on_the_task_get_register_forms_and_unused_ones_go() {
         assert!(used.iter().any(|op| matches!(op, Op::CallIntrinsic { args: 0, intrinsic: Running, .. })), "{used:?}");
         let unused = ops(lambda(&[0], None, let_(vec![(1, prim(MarkValue, vec![var(0), q(0)]))], q(1))));
         assert!(!unused.iter().any(|op| matches!(op, Op::CallIntrinsic2 { .. } | Op::CallIntrinsic { .. })), "{unused:?}");
-        // One that can fault stays, and so does the one that sets.
+        // Retain faulting `FrameMarks` and effectful `SetWinders` operations even when their results are
+        // unused.
         let faulting = ops(lambda(&[0], None, let_(vec![(1, prim(FrameMarks, vec![var(0), q(0), var(0)]))], q(1))));
         assert!(faulting.iter().any(|op| matches!(op, Op::CallIntrinsic3 { intrinsic: FrameMarks, .. })), "{faulting:?}");
         let setting = ops(lambda(&[0], None, let_(vec![(1, prim(SetWinders, vec![var(0)]))], q(1))));
         assert!(setting.iter().any(|op| matches!(op, Op::CallIntrinsic1 { intrinsic: SetWinders, .. })), "{setting:?}");
-        // One of constants isn't worked out by the compiler, which has no task.
+        // Do not fold `MarkValue` even with constant arguments: its result depends on the runtime task.
         let constant = ops(lambda(&[], None, prim(MarkValue, vec![q(1), q(2)])));
         assert!(constant.iter().any(|op| matches!(op, Op::TailCallIntrinsic { intrinsic: MarkValue, .. })), "{constant:?}");
     });
@@ -1597,8 +1600,7 @@ static ADD_DISCARDABLE: &HostDef = &HOSTS[1];
 static CALL_WITH: &HostDef = &HOSTS[2];
 static ELSEWHERE: HostDef = ragwort_vm::host!("elsewhere", 0, Purity::Impure, add_host);
 
-/// The module tests compile into: three variables, none defined, and code that can call
-/// [`HOSTS`].
+/// Creates the test module with three uninitialized variables and access to [`HOSTS`].
 fn hosting<'gc>(mc: &Mutation<'gc>) -> Gc<'gc, ragwort_vm::objects::Module> {
     ragwort_vm::module::new(mc, Value::FALSE, &[fix(0), fix(1), fix(2)], &HOSTS).unwrap()
 }
@@ -1625,10 +1627,10 @@ fn module_variables_are_slots() {
     assert_eq!(number(|_| checked(1)), Err(Fault::Unbound));
     assert_eq!(number(|_| set_checked(1, q(1))), Err(Fault::Unbound));
     assert_eq!(number(|_| seq(9, define(1, q(1)), seq(8, set_checked(1, q(2)), checked(1)))), Ok(2));
-    // A load is read where it is, not where its value is used.
+    // Evaluate a module load at its original position, not later at its use.
     assert_eq!(number(|_| seq(9, define(0, q(5)), let_(vec![(1, slot(0))], seq(8, define(0, q(7)), var(1))))), Ok(5));
     assert_eq!(number(|_| seq(9, define(0, q(5)), let_(vec![(1, checked(0))], seq(8, define(0, q(7)), var(1))))), Ok(5));
-    // Closures are code of the module too, and can call themselves through its variables.
+    // Closures retain their defining module and can call themselves through its variables.
     fn countdown<'gc>() -> Core<'gc> {
         lambda(&[0], None, when(eq(var(0), q(0)), q(0), app(slot(2), vec![add(var(0), q(-1))])))
     }
@@ -1647,7 +1649,7 @@ fn module_variables_are_slots() {
     let mut arena = Arena::new(1 << 22, 0);
     arena.mutate(|mc| {
         assert_eq!(compile(mc, None, &slot(0)), Err(CompileError::UnknownSlot(0)));
-        // An unused load goes, unless it's checked, which can fault.
+        // Remove unused unchecked loads, but preserve checked loads because they may fault.
         let unused = |load| ops(mc, lambda(&[0], None, seq(1, load, q(1))));
         assert!(!unused(slot(0)).iter().any(|op| matches!(op, Op::LoadSlot { .. })));
         assert!(unused(checked(0)).iter().any(|op| matches!(op, Op::LoadSlotChecked { slot: 0, .. })));
@@ -1681,7 +1683,8 @@ fn host<'gc>(def: &'static HostDef, args: Vec<Core<'gc>>) -> Core<'gc> {
 fn host_functions_are_called_in_the_loop() {
     assert_eq!(number(|_| add(q(1), host(ADD_HOST, vec![q(10), q(20)]))), Ok(31));
     assert_eq!(number(|_| host(CALL_WITH, vec![lambda(&[0], None, add(var(0), q(1))), q(10)])), Ok(11));
-    // Nothing else can call one, so its arguments must fit a frame, and aren't spread.
+    // Host functions are called only through direct primitives, so their arguments must fit in a frame
+    // and cannot be spread.
     assert_eq!(error(|_| host(ADD_HOST, (1..=60).map(q).collect())), CompileError::TooManyArguments);
     assert_eq!(error(|_| host(CALL_WITH, vec![q(1)])), CompileError::Arity(Prim::Host(CALL_WITH)));
     assert_eq!(error(|_| Core::ApplyIntrinsic(Prim::Host(ADD_HOST), vec![q(1)])), CompileError::Arity(Prim::Host(ADD_HOST)));
@@ -1694,7 +1697,7 @@ fn host_functions_are_called_in_the_loop() {
         assert!(called.iter().any(|op| matches!(op, Op::CallHost { args: 2, .. })), "{called:?}");
         let tail = ops(mc, lambda(&[0], None, host(ADD_HOST, vec![var(0)])));
         assert!(tail.iter().any(|op| matches!(op, Op::TailCallHost { args: 1, .. })), "{tail:?}");
-        // An unused call goes only if the host says it can.
+        // Remove an unused host call only when its metadata permits discarding it.
         let unused = |def: &'static HostDef| ops(mc, lambda(&[0], None, let_(vec![(1, host(def, vec![var(0)]))], q(1))));
         assert!(unused(ADD_HOST).iter().any(|op| matches!(op, Op::CallHost { .. })));
         assert!(!unused(ADD_DISCARDABLE).iter().any(|op| matches!(op, Op::CallHost { .. })));

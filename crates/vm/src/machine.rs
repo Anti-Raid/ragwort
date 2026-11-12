@@ -16,44 +16,48 @@ use crate::{Fault, Fuel, Request, coroutine, keyword, prompts};
 #[path = "tests/machine.rs"]
 mod tests;
 
-/// The smallest segment a machine takes: room for a chunk and a frame above it.
+/// The minimum stack segment capacity required by a machine: allocates enough space for a
+/// continuation chunk (`CHUNK`) and two frame windows (`2 * WINDOW`).
 pub const MIN_SEGMENT: usize = CHUNK + 2 * WINDOW;
-/// The segment size to use when there's no reason to pick another.
+/// The default stack segment capacity (16,384 slots), used when no custom segment size is
+/// specified.
 pub const SEGMENT: usize = 1 << 14;
 
-/// How a run ended.
+/// The outcome of executing a VM task run.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome<'gc> {
-    /// The task returned this.
+    /// The task completed successfully and produced this return value.
     Done(Value<'gc>),
-    /// It made enough that the step should end, and goes on with the next run.
+    /// The task paused because a GC step became due (or fuel was exhausted); execution can resume in a
+    /// subsequent run.
     Paused,
-    /// What was raised with no handler to take it, once the task's `dynamic-wind` `after`s
-    /// have run: for a VM fault, a `Condition`.
+    /// An unhandled exception or condition raised by the task, returned after executing all intervening
+    /// `dynamic-wind` `after` thunks. For VM faults, this contains a `Condition` object.
     Raised(Value<'gc>),
-    /// The task yielded these values, as one: `co/yield` in it, not in a coroutine it resumed.
-    /// [`Machine::resume`] goes on with it.
+    /// The root task yielded these values directly via `co/yield` (rather than an inner resumed
+    /// coroutine). Can be resumed by calling [`Machine::resume`].
     Yielded(Value<'gc>),
-    /// A host function's call replied [`Reply::Defer`](crate::Reply::Defer) with this.
-    /// [`Machine::reply`] goes on with what the call returns, or [`Machine::raise`] raises from
-    /// it.
+    /// A host function returned [`Reply::Defer`](crate::Reply::Defer), suspending execution. Resumed by
+    /// calling [`Machine::reply`] with the result or [`Machine::raise`] to raise an exception at the
+    /// call site.
     Deferred(Deferred),
 }
 
-/// What the next run goes on from, if not where the last one paused.
+/// Tracks the state from which the next execution run should resume if the previous run did not
+/// pause normally.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Waiting {
     No,
-    /// The task yielded.
+    /// The task suspended via a yield operation.
     Yield,
-    /// A host function deferred.
+    /// The task suspended because a host function deferred completion.
     Host,
-    /// The host raised from where the task waits on it.
+    /// The host requested that an exception be raised at the point where the task suspended.
     Raise,
 }
 
-/// A task: a procedure call run on its own stack. It holds no brand, so it lives outside the
-/// arena.
+/// An execution machine for running Scheme tasks on a segmented stack. Holds no GC lifetime
+/// parameters, allowing it to exist outside the garbage-collected arena.
 pub struct Machine {
     stack: Stack,
     task: Root<Task>,
@@ -66,8 +70,8 @@ pub struct Machine {
 }
 
 impl Machine {
-    /// A task that calls `procedure` with `args`, on segments of `segment` slots, at least
-    /// [`MIN_SEGMENT`].
+    /// Creates a new machine initialized to call `procedure` with `args`, allocating stack segments of
+    /// at least `MIN_SEGMENT` slots (or `segment` if larger).
     pub fn new<'gc>(mc: &Mutation<'gc>, segment: usize, procedure: Value<'gc>, args: &[Value<'gc>]) -> Result<Self, Fault> {
         let segment = segment.max(MIN_SEGMENT);
         let mut stack = mc.stack(Segment::new(mc, segment)?)?;
@@ -79,10 +83,10 @@ impl Machine {
         Ok(machine)
     }
 
-    /// Starts a new task in a machine whose last one finished, calling `procedure` with `args`
-    /// on the stack it left, from where continuations it made hold no more of it, so a host
-    /// that runs one call after another doesn't make a stack for each. Its fuel is as it was.
-    /// Faults with [`Fault::NotPending`] if the last task hasn't finished.
+    /// Restarts a completed machine with a new procedure call and arguments, reusing the existing stack
+    /// above any retained continuation frames to avoid reallocating stack segments across sequential
+    /// runs. Preserves remaining fuel. Returns `Err(Fault::NotPending)` if the previous task has not
+    /// finished.
     pub fn restart<'gc>(&mut self, mc: &Mutation<'gc>, procedure: Value<'gc>, args: &[Value<'gc>]) -> Result<(), Fault> {
         if !self.finished {
             return Err(Fault::NotPending);
@@ -98,9 +102,8 @@ impl Machine {
         Ok(())
     }
 
-    /// Sets how much fuel the task has left in all, unlimited at first. Calls and jumps spend
-    /// a unit each, as do intrinsics for each stretch of work they do. Once it runs out, the
-    /// task is finished, with [`Fault::OutOfFuel`].
+    /// Sets the total execution fuel available to the task. Each call, jump, and intrinsic execution
+    /// unit consumes one unit of fuel; exhausting fuel terminates the task with [`Fault::OutOfFuel`].
     pub fn set_fuel(&mut self, fuel: u64) {
         self.fuel = fuel;
     }
@@ -109,12 +112,10 @@ impl Machine {
         self.fuel
     }
 
-    /// Runs until the task finishes, yields or its fuel runs out, or until it has made enough
-    /// that the step should end so the collector can keep up, as [`Mutation::step_due`] says:
-    /// then it pauses at its next call or jump, and the next run goes on from there. After a
-    /// yield, it goes on as [`Machine::resume`] with no values does, and after a deferred host
-    /// call, as [`Machine::reply`] with void. Running it again once it's finished faults with
-    /// [`Fault::Finished`].
+    /// Executes the task until it finishes, yields, exhausts its fuel, or pauses because a GC collection
+    /// step is due ([`Mutation::step_due`]). If previously paused on a yield or a deferred host call, it
+    /// automatically resumes (with an empty value list or void, respectively). Returns
+    /// `Err(Fault::Finished)` if called on an already completed machine.
     pub fn run<'gc>(&mut self, mc: &Mutation<'gc>) -> Result<Outcome<'gc>, Fault> {
         if self.finished {
             return Err(Fault::Finished);
@@ -141,30 +142,31 @@ impl Machine {
         outcome
     }
 
-    /// Goes on with a task that yielded, as [`Machine::run`] does, with its `co/yield` returning
-    /// `args`. Faults with [`Fault::NotPending`] if it isn't waiting on a yield.
+    /// Resumes a machine that suspended via `co/yield`, passing `args` as the return value of the yield
+    /// expression. Returns `Err(Fault::NotPending)` if the machine is not waiting on a yield.
     pub fn resume<'gc>(&mut self, mc: &Mutation<'gc>, args: &[Value<'gc>]) -> Result<Outcome<'gc>, Fault> {
         self.answer(mc, Waiting::Yield, values(mc, args.iter().copied())?)?;
         self.run(mc)
     }
 
-    /// Goes on with a task whose host function deferred, as [`Machine::run`] does, with that
-    /// returning `answer`. Faults with [`Fault::NotPending`] if
-    /// it isn't waiting on one.
+    /// Resumes a machine that suspended on a deferred host function call, supplying `answer` as the host
+    /// function's return value. Returns `Err(Fault::NotPending)` if the machine is not waiting on a
+    /// deferred host call.
     pub fn reply<'gc>(&mut self, mc: &Mutation<'gc>, answer: Value<'gc>) -> Result<Outcome<'gc>, Fault> {
         self.answer(mc, Waiting::Host, answer)?;
         self.run(mc)
     }
 
-    /// Goes on with a task waiting as [`Machine::reply`] takes, raising `raised` from what it
-    /// waits on, as `raise` does.
+    /// Resumes a machine waiting on a deferred host function call by raising `raised` as an exception at
+    /// the point of suspension.
     pub fn raise<'gc>(&mut self, mc: &Mutation<'gc>, raised: Value<'gc>) -> Result<Outcome<'gc>, Fault> {
         self.answer(mc, Waiting::Host, raised)?;
         self.waiting = Waiting::Raise;
         self.run(mc)
     }
 
-    /// Gives the task `value`, for the next run, if it's waiting `on` that.
+    /// Delivers `value` to the suspended task if it is currently waiting on `on`, preparing it to resume
+    /// on the next run.
     fn answer<'gc>(&mut self, mc: &Mutation<'gc>, on: Waiting, value: Value<'gc>) -> Result<(), Fault> {
         if self.waiting != on {
             return Err(if self.finished { Fault::Finished } else { Fault::NotPending });
@@ -173,7 +175,8 @@ impl Machine {
         Ok(())
     }
 
-    /// Keeps what the next run needs where a collection finds it.
+    /// Persists the current execution registers (frame pointer, program counter, and fuel) into the
+    /// root task object so GC tracing finds them between steps.
     fn save<'gc>(&mut self, mc: &Mutation<'gc>, task: Gc<'gc, Task>, regs: &Regs<'gc>) {
         (self.fp, self.pc) = (regs.fp, regs.pc);
         task.set_acc(mc, regs.acc);
@@ -181,8 +184,9 @@ impl Machine {
         self.stack.set_top((regs.fp + WINDOW).min(len));
     }
 
-    /// Runs the inner loop, and carries out what it stops for, until the task ends or the run's
-    /// fuel runs out. `task` is the running one, which switching coroutines changes.
+    /// Drives the outer VM loop, dispatching inner loop execution and handling exit conditions (stack
+    /// adjustments, requests, host calls, and coroutine context switches) until the task pauses or
+    /// terminates.
     fn drive<'gc>(&mut self, mc: &Mutation<'gc>, task: &mut Gc<'gc, Task>, regs: &mut Regs<'gc>, fuel: &mut Fuel) -> Result<Outcome<'gc>, Fault> {
         let root = self.task.get(mc).expect("a machine runs in its own arena");
         let waiting = std::mem::replace(&mut self.waiting, Waiting::No);
@@ -219,31 +223,35 @@ fn args_of<'gc>(mc: &Mutation<'gc>, args: &[Value<'gc>]) -> Result<Args<'gc>, Fa
     })
 }
 
-/// What a step of the outer loop leads to: going on, or the end of the run.
+/// The result of an outer loop step: returns `Ok(Some(outcome))` when execution finishes or pauses,
+/// `Ok(None)` to continue running, or `Err(fault)` on error.
 pub(crate) type Step<'gc> = Result<Option<Outcome<'gc>>, Fault>;
 
-/// What a request leads to, once it has done what it does to the continuation.
+/// The next execution action to perform in the outer loop after a request has processed its
+/// continuation modifications.
 pub(crate) enum Then<'gc> {
-    /// A call of the procedure with the arguments, which returns to the current continuation.
+    /// Calls the specified procedure with arguments, returning to the current continuation.
     Call(Value<'gc>, Args<'gc>),
-    /// The value, returned to the current continuation.
+    /// Returns the given value to the current continuation.
     Return(Value<'gc>),
-    /// A resume of the coroutine with the arguments.
+    /// Resumes the specified coroutine with arguments.
     Resume(Value<'gc>, Args<'gc>),
-    /// The value, raised, and whether the raise goes on with what the handler returns.
+    /// Raises an exception value, indicating whether execution resumes with the handler's return value
+    /// (continuable).
     Raise(Value<'gc>, bool),
-    /// The value, raised with no handler to take it, and whether the `after`s have run.
+    /// An uncaught exception value, indicating whether all `dynamic-wind` `after` thunks have already
+    /// run.
     Uncaught(Value<'gc>, bool),
-    /// A yield of the value, as one, from the running coroutine.
+    /// Yields the given value from the currently executing coroutine.
     Yield(Value<'gc>),
 }
 
-/// The outer loop's state, between two stretches of the inner loop: the stack, and the
-/// registers the inner loop goes on with.
+/// State for the outer execution loop between inner loop invocations, providing access to the stack,
+/// current task, and VM registers.
 pub(crate) struct Outer<'a, 'gc> {
     pub(crate) segments: Segments<'a, 'gc>,
     pub(crate) regs: &'a mut Regs<'gc>,
-    /// The machine's own task.
+    /// The root task created by the machine.
     pub(crate) root: Gc<'gc, Task>,
 }
 
@@ -260,8 +268,8 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         self.segments.task
     }
 
-    /// Carries out what the inner loop stopped for. A fault that isn't fatal is raised, as a
-    /// `Condition`, as is one in calling the handler, which is then outside the handlers.
+    /// Processes the exit condition that paused the inner loop. Non-fatal faults are raised as
+    /// `Condition` objects, including faults that occur while invoking exception handlers.
     fn exit(&mut self, exit: Exit<'gc>, deferred: &mut Option<Deferred>) -> Step<'gc> {
         let mut step = match exit {
             Exit::Paused => return Ok(Some(Outcome::Paused)),
@@ -271,7 +279,7 @@ impl<'a, 'gc> Outer<'a, 'gc> {
             Exit::Call { base, argc, rest, tail } => self.call(base, argc, rest, tail),
             Exit::Request { base, args, request, spread, tail } => self.request(base, args, request, spread, tail),
             Exit::Host { base, tail, then } => {
-                // Taken first, so it doesn't outlive a call `keep` fails.
+                // Take the deferred value beforehand so it is properly dropped if `keep` fails.
                 let deferred = deferred.take();
                 self.keep(base, tail).and_then(|()| self.host_then(then, deferred))
             }
@@ -284,7 +292,8 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         step
     }
 
-    /// Raises a condition for `fault`, in place of the frame that faulted.
+    /// Creates and raises a `Condition` object for `fault`, replacing the frame where the fault
+    /// occurred.
     fn fault(&mut self, fault: Fault) -> Step<'gc> {
         let mc = self.mc();
         let raised = condition(mc, fault, Value::VOID, Value::NIL)?;
@@ -297,15 +306,16 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         self.raise(raised, false)
     }
 
-    /// Raises `obj`, as `raise` does, or `raise-continuable` if it's `continuable`.
+    /// Raises `obj`, behaving as `raise` (non-continuable) or `raise-continuable` depending on the
+    /// `continuable` flag.
     fn raise(&mut self, obj: Value<'gc>, continuable: bool) -> Step<'gc> {
         let then = self.raising(obj, continuable)?;
         self.then(then)
     }
 
-    /// What `obj`, raised with no handler, leads to: the task's `after`s run, unless `unwound`
-    /// says they have, and then a coroutine fails, and `obj` is raised again where it was
-    /// resumed, and a machine's own task ends with it.
+    /// Handles an uncaught exception: runs any remaining `dynamic-wind` `after` thunks (unless already
+    /// unwound), then fails the coroutine and propagates the exception to its resumer, or terminates the
+    /// root task with [`Outcome::Raised`].
     fn uncaught(&mut self, obj: Value<'gc>, unwound: bool) -> Step<'gc> {
         let mc = self.mc();
         let task = self.task();
@@ -318,8 +328,8 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         self.raise(obj, false)
     }
 
-    /// Carries out `request` on the `args` registers from `base`, the last a list of more if
-    /// it's a `spread`. They stay where they are, past what's kept.
+    /// Executes `request` using arguments starting at register `base` (spreading the final argument as a
+    /// list if `spread` is set), while preserving registers beyond the retained continuation.
     fn request(&mut self, base: u8, args: u8, request: Request, spread: bool, tail: bool) -> Step<'gc> {
         let mut args = Args::slots(self.registers(base, args)?, Value::NIL);
         if spread {
@@ -333,8 +343,8 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         self.then(then)
     }
 
-    /// Carries out a call of something other than a closure, in register `base`, with the
-    /// `argc` registers after it and the elements of `rest` as its arguments.
+    /// Invokes a non-closure procedure located in register `base`, passing `argc` following registers
+    /// and elements of `rest` as arguments.
     fn call(&mut self, base: u8, argc: u8, rest: Value<'gc>, tail: bool) -> Step<'gc> {
         let slots = self.registers(base, argc + 1)?;
         let args = Args::slots(slots.slice(1..slots.len()).ok_or(Fault::Malformed)?, rest);
@@ -342,7 +352,7 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         self.then(Then::Call(slots.get(0), args))
     }
 
-    /// The `n` registers of the current frame from `base`.
+    /// Returns a slice of `n` registers starting at offset `base` within the current frame window.
     fn registers(&self, base: u8, n: u8) -> Result<Slots<'gc>, Fault> {
         let (mc, at) = (self.mc(), self.regs.fp + usize::from(base));
         if usize::from(base) + usize::from(n) > WINDOW {
@@ -365,9 +375,8 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         }
     }
 
-    /// Calls `procedure` with `args`. A closure gets a frame at the bottom of the stack; a
-    /// continuation goes on, and gets the values, once the winders it leaves and enters have
-    /// run.
+    /// Applies `procedure` to `args`. For a closure, establishes a new bottom frame; for a continuation,
+    /// unwinds and rewinds intervening winders before resuming with the provided arguments.
     fn apply(&mut self, procedure: Value<'gc>, args: Args<'gc>) -> Step<'gc> {
         if let Some(k) = procedure.downcast::<Continuation>(self.mc()) {
             let then = self.go_to(k, args)?;
@@ -381,7 +390,8 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         Ok(None)
     }
 
-    /// Raises or defers from a host function's call, whose continuation is the current one.
+    /// Handles a host function exit action (raising an exception or deferring completion) within the
+    /// current continuation.
     fn host_then(&mut self, then: HostThen<'gc>, deferred: Option<Deferred>) -> Step<'gc> {
         match then {
             HostThen::Raise(raised) => self.raise(raised, false),
@@ -392,9 +402,9 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         }
     }
 
-    /// Hands the frames under the continuation of the current call or request to the chain. A
-    /// tail call's continuation is the current frame's caller; any other's is the instruction
-    /// after it, whose `base` must be past the frame's link, as a call's is.
+    /// Slices and saves active stack frames below the current call or request into the continuation
+    /// chain. For tail calls, the continuation is the caller; for non-tail calls, it is the succeeding
+    /// instruction.
     pub(crate) fn keep(&mut self, base: u8, tail: bool) -> Result<(), Fault> {
         let (mc, fp) = (self.mc(), self.regs.fp);
         let frame = self.segments.frame(fp)?;
@@ -410,7 +420,7 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         self.segments.reify(end, link)
     }
 
-    /// Makes the frame of a call that doesn't fit, with its caller's, on another segment.
+    /// Transfers an overflowing call frame and its caller's linkage onto a new stack segment.
     fn overflow(&mut self, callee: usize, argc: u8, rest: Value<'gc>) -> Result<(), Fault> {
         let base = callee - self.regs.fp;
         let link = Link::to(self.regs.pc, u8::try_from(base).map_err(|_| Fault::Malformed)?);
@@ -419,9 +429,9 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         self.enter(fp + base, argc, rest, link)
     }
 
-    /// Goes back to the continuation with the value in the accumulator: the records under the
-    /// stack, then the prompts'. If none is left, the task is done, and that's its value: a
-    /// coroutine's goes back to what resumed it. A [`Native`] record goes on as its kind says.
+    /// Returns the accumulator value to the current continuation, popping stack records, prompts, and
+    /// native continuation frames. If no continuation frames remain, completes the task (returning to the
+    /// resumer for coroutines).
     pub(crate) fn resume(&mut self) -> Step<'gc> {
         let mc = self.mc();
         loop {
@@ -450,8 +460,8 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         }
     }
 
-    /// Calls the closure `procedure` with `args` in a frame at the bottom of the stack, which
-    /// binding takes those past its held ones from.
+    /// Sets up the initial stack frame at the base of the stack and binds `args` to enter closure
+    /// `procedure`.
     fn start(&mut self, procedure: Value<'gc>, mut args: Args<'gc>) -> Result<(), Fault> {
         let mc = self.mc();
         let fp = if self.segments.fits(0) {
@@ -466,13 +476,13 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         self.enter(fp, argc, args.rest, Link::BOTTOM)
     }
 
-    /// Enters the closure in the frame at `fp`, with `argc` arguments and the list `rest` after
-    /// them, and `link`.
+    /// Enters a closure in the frame at `fp`, binding `argc` register arguments and subsequent `rest`
+    /// list arguments under `link`.
     fn enter(&mut self, fp: usize, argc: u8, rest: Value<'gc>, link: Link) -> Result<(), Fault> {
         let mc = self.mc();
         let frame = self.segments.frame(fp)?;
         let closure = frame.get(CLOSURE).downcast::<Closure>(mc).ok_or(Fault::NotProcedure)?;
-        // The outer loop sees for itself when the step is due.
+        // The outer loop independently checks whether a GC step is due, so fuel tracking is omitted here.
         let mut fuel = Fuel { run: 0, rest: 0 };
         bind(mc, frame, closure.code(mc).ok_or(Fault::Malformed)?.arity(mc), argc, rest, &mut fuel)?;
         frame::set_link(mc, frame, link)?;
@@ -481,7 +491,8 @@ impl<'a, 'gc> Outer<'a, 'gc> {
     }
 }
 
-/// An error object for `fault`.
+/// Constructs a Scheme `Condition` object representing `fault`, with the specified message and
+/// irritants.
 pub(crate) fn condition<'gc>(mc: &Mutation<'gc>, fault: Fault, message: Value<'gc>, irritants: Value<'gc>) -> Result<Value<'gc>, Fault> {
     Ok(Value::object(mc, Condition::new(mc, mc.frozen(fault)?, message, irritants)?))
 }

@@ -1,28 +1,30 @@
-//! Contification (`L3 -> L3`): local functions that are joins, code in the frame that calls jump to.
+//! Pass 5 (`L3 -> L3`): Contification optimization.
 //!
-//! A function is one when each use of it is a call, with as many arguments as it has parameters,
-//! and all of them are in tail position of one expression, `P`, with no lambda between: they all
-//! return what `P` does, so its code can go at `P` and the calls can jump to it. The functions a
-//! `Fix` binding binds are one group, joins together, when the calls from outside them are so,
-//! and those in their code are in tail position of it. `P` is where the calls' tail positions meet, the
-//! nearest node above them all. A call in a join's code is where that join is, as the code is
-//! there. A loop is a group whose code goes at the call that starts it. `P` can be in a lambda
-//! inside the one that binds the function, when every call is in it, if that doesn't have the
-//! lambdas between capture more: their captures of the function go, its code's come.
+//! Contification turns local functions into join points (intra-procedural continuations), replacing
+//! function calls with direct jumps within the same stack frame.
 //!
-//! The survey walks the tree once, noting each node's *chain*: the nodes from the top of the run
-//! of tail positions it's at the bottom of down to it. Calls whose chains start at the same node
-//! are in tail position of each node their chains share, so `P` is the last of those. Functions
-//! are decided innermost first, as one can only call those it's inside the scope of. Then the
-//! calls become [`Node::Jump`]s, each `P` a [`Node::Join`] of the code there, its node moved into
-//! the join's scope, and the bindings of the joins go, the functions now the joins' code.
+//! A function is eligible for contification when every reference to it is a full call (matching its arity),
+//! and all such calls share a single common continuation point `P` (the lowest common ancestor in the
+//! tail-call forest) with no intervening closures. Because all call sites return to `P`, the function's
+//! body can be placed at `P` and callers can jump to it directly. Mutually recursive functions bound by a
+//! `Fix` are contified together as a group when all external calls target `P` and internal recursive calls
+//! are in tail position. A tail-recursive loop becomes a join point placed at the loop's initial entry call.
+//! If all calls reside within an inner lambda nested under the binding site, the join point may be moved
+//! into that inner lambda, provided doing so does not increase the net number of captured upvalues across
+//! intermediate closures.
+//!
+//! The pass runs a bottom-up survey that tracks each expression's *tail chain* (the sequence of ancestors
+//! in mutual tail position). When call sites share an ancestor chain, their common continuation `P` is the
+//! deepest shared node. Functions are evaluated from innermost to outermost scope. After decisions are made,
+//! call sites are rewritten to [`Node::Jump`]s, each target `P` is wrapped in a [`Node::Join`] node, and
+//! the original function bindings are eliminated.
 
 use crate::hash::{HashMap, HashSet};
 
 use crate::Var;
 use crate::ir::l3::{Bind, Fun, Id, JoinCode, L3, Node};
 
-/// Most parameters a group of joins can have, as their values move in its own registers.
+/// Maximum aggregate number of parameters allowed for a group of join points, bounded by register capacity.
 const MAX_PARAMS: usize = 32;
 
 pub(crate) fn contify<'id>(tree: &mut L3<'id, '_>, root: Id<'id>) {
@@ -56,7 +58,7 @@ pub(crate) fn contify<'id>(tree: &mut L3<'id, '_>, root: Id<'id>) {
             tree.set(at, Node::Jump(*v, args));
         }
     }
-    // Where the node each join goes at is now: in its scope.
+    // Maps original node IDs to their replacement IDs within the new Join node's scope.
     let mut moved = HashMap::default();
     for (at, groups) in plan.at {
         let codes: Vec<JoinCode<'id>> = groups.iter().flatten().map(|&v| JoinCode { id: v, fun: plan.funs[&v] }).collect();
@@ -64,7 +66,7 @@ pub(crate) fn contify<'id>(tree: &mut L3<'id, '_>, root: Id<'id>) {
         tree.set(at, Node::Join(scope, codes));
         moved.insert(at, scope);
     }
-    // Innermost first, as a `Let` left with no bindings takes its body's place.
+    // Processes bindings innermost-first so that a `Let` with all bindings contified can be collapsed into its body.
     let mut done = HashSet::default();
     for binding in bindings.iter().filter(|b| plan.joins.contains(&b.members[0])) {
         if !done.insert(binding.at) {
@@ -77,7 +79,7 @@ pub(crate) fn contify<'id>(tree: &mut L3<'id, '_>, root: Id<'id>) {
             .copied()
             .filter(|&bind| match bind {
                 Bind::Val(v, _) => !plan.joins.contains(&v),
-                // A group's members are joins together, or none are.
+                // All members of a mutually recursive `Fix` group are contified together, or none are.
                 Bind::Fix(group) => !plan.joins.contains(&tree[group][0].0),
             })
             .collect();
@@ -86,61 +88,61 @@ pub(crate) fn contify<'id>(tree: &mut L3<'id, '_>, root: Id<'id>) {
     }
 }
 
-/// What contification decided.
+/// Results of the contification analysis, specifying placement sites and functions to convert into joins.
 struct Plan<'id> {
-    /// The groups of joins whose code goes at each node, those decided first innermost.
+    /// Groups of contified functions to attach at each target node ID, ordered from innermost to outermost.
     at: HashMap<Id<'id>, Vec<Vec<Var>>>,
     joins: HashSet<Var>,
-    /// Each join's code.
+    /// Maps each contified function variable to its original function definition.
     funs: HashMap<Var, Fun<'id>>,
 }
 
-/// A local function that could be a join.
+/// Analysis state for a candidate function eligible for contification.
 struct Candidate<'id> {
     arity: usize,
-    /// Whether every use so far is a call of `arity` arguments.
+    /// True if every observed use is an exact-arity direct call with no escaping references.
     called: bool,
     calls: Vec<Site<Box<[Id<'id>]>>>,
 }
 
-/// Where a call is, or a join goes: the chain down to it, and the frame it's in.
+/// Location metadata for a call site or join placement: the tail chain of ancestor nodes and the enclosing stack frame.
 struct Site<C> {
     chain: C,
     frame: u32,
 }
 
-/// A binding of candidates, which are decided together, and the `Let` it's in.
+/// Group of candidate functions bound at a single `Let` or `Fix` site, evaluated together for contification.
 struct Binding<'id> {
     members: Vec<Var>,
     frame: u32,
     at: Id<'id>,
 }
 
-/// A lambda body's frame.
+/// Represents a stack frame corresponding to a lambda body.
 struct Frame<'id> {
-    /// The frame the lambda is in.
+    /// ID of the enclosing parent stack frame.
     outer: u32,
     lambda: Fun<'id>,
-    /// The candidate it's the code of.
+    /// Candidate function variable associated with this frame body, if any.
     of: Option<Var>,
 }
 
-/// What's left of the survey's walk.
+/// A deferred worklist task for the bottom-up contification survey traversal.
 enum Task<'id> {
-    /// A node in tail position of the one above it.
+    /// Visits an AST node that is in tail position relative to its parent.
     Tail(Id<'id>),
-    /// A node that starts a chain.
+    /// Visits an AST node that begins a new tail chain (not in tail position of its parent).
     Fresh(Id<'id>),
-    /// Back from a node's children.
+    /// Pops the current node from the tail chain after traversing its children.
     Pop,
-    /// Back from a node that started a chain.
+    /// Restores the previous tail chain base index after returning from a non-tail subtree.
     Restore,
-    /// The body of a function, a frame of its own, which is candidate `of`'s code.
+    /// Enters a function body in a new stack frame, recording its candidate variable if applicable.
     Body(Fun<'id>, Option<Var>),
     Leave,
-    /// A `Let`'s binding, once those before it are walked.
+    /// Processes a single `Let` or `Fix` binding after preceding bindings have been visited.
     Bind(Id<'id>, Bind<'id>),
-    /// After a `Let`'s body: its bindings of candidates, decided after those inside it.
+    /// Finalizes candidate bindings for a `Let` expression after its body has been traversed.
     Bound,
 }
 
@@ -148,19 +150,19 @@ struct Survey<'t, 'id, 'gc> {
     tree: &'t L3<'id, 'gc>,
     candidates: HashMap<Var, Candidate<'id>>,
     funs: HashMap<Var, Fun<'id>>,
-    /// The candidate whose code each function body is.
+    /// Maps each function body node ID to the candidate variable it implements.
     bodies: HashMap<Id<'id>, Var>,
-    /// Bindings, innermost first.
+    /// Collected candidate binding groups, ordered from innermost to outermost.
     bindings: Vec<Binding<'id>>,
-    /// Those of each `Let` the walk is in.
+    /// Candidate binding groups for each currently enclosing `Let` scope.
     mine: Vec<Vec<Binding<'id>>>,
-    /// The nodes from the walk's top to where it is; the current chain is `chain[base..]`.
+    /// Current path of ancestor nodes; the active tail chain is `chain[base..]`.
     chain: Vec<Id<'id>>,
     base: usize,
     bases: Vec<usize>,
     frame: u32,
     outer: Vec<u32>,
-    /// Frame `n`'s at `n - 1`.
+    /// Frame descriptor arena, indexed as `frames[frame_id - 1]`.
     frames: Vec<Frame<'id>>,
 }
 
@@ -192,14 +194,14 @@ impl<'id> Survey<'_, 'id, '_> {
             Task::Bind(at, bind) => self.bind(at, bind, todo),
             Task::Bound => {
                 let mine = self.mine.pop().expect("a let was entered");
-                // The last first, as it's in the scope of those before.
+                // Reverse order ensures inner bindings are evaluated before outer ones.
                 self.bindings.extend(mine.into_iter().rev());
             }
         }
         todo[at..].reverse();
     }
 
-    /// Pushes the tasks of `id`'s children, in the order they're walked.
+    /// Traverses child expressions of node `id`, pushing appropriate tail or non-tail worklist tasks.
     fn node(&mut self, id: Id<'id>, todo: &mut Vec<Task<'id>>) {
         let tree = self.tree;
         let fresh = |ids: &[Id<'id>], todo: &mut Vec<Task<'id>>| todo.extend(ids.iter().map(|&a| Task::Fresh(a)));
@@ -241,14 +243,14 @@ impl<'id> Survey<'_, 'id, '_> {
         }
     }
 
-    /// Notes that `v` is used other than called, if it's a candidate.
+    /// Disqualifies candidate `v` if it is passed as a value, stored, or referenced other than in a direct call.
     fn unfit(&mut self, v: Var) {
         if let Some(c) = self.candidates.get_mut(&v) {
             c.called = false;
         }
     }
 
-    /// Notes `var`, bound to `fun`, as a candidate if it can be one.
+    /// Registers `var` as a contification candidate if `fun` has no rest or optional parameters and fits parameter limits.
     fn candidate(&mut self, var: Var, fun: Fun<'id>) -> bool {
         let f = self.tree[fun];
         let params = self.tree[f.params].len();
@@ -277,7 +279,7 @@ impl<'id> Survey<'_, 'id, '_> {
             Bind::Fix(group) => {
                 let group = &tree[group];
                 let fits: Vec<bool> = group.iter().map(|&(v, fun)| self.candidate(v, fun)).collect();
-                // The group's parameters all have registers across the code the joins are placed at.
+                // Verifies that total parameters across all group members do not exceed available registers.
                 let params: usize = group.iter().map(|&(_, fun)| tree[tree[fun].params].len()).sum();
                 if fits.iter().all(|&f| f) && params <= MAX_PARAMS {
                     self.mine.last_mut().expect("in a let").push(Binding { members: group.iter().map(|&(v, _)| v).collect(), frame, at });
@@ -289,7 +291,7 @@ impl<'id> Survey<'_, 'id, '_> {
 
     fn decide(&self) -> Plan<'id> {
         let mut plan = Plan { at: HashMap::default(), joins: HashSet::default(), funs: HashMap::default() };
-        // Where each join decided on is.
+        // Tracks the chosen placement site and stack frame for each successfully contified function.
         let mut placed: HashMap<Var, Site<Vec<Id<'id>>>> = HashMap::default();
         for binding in &self.bindings {
             let members = &binding.members;
@@ -300,14 +302,14 @@ impl<'id> Survey<'_, 'id, '_> {
             let mut fits = true;
             'calls: for v in members {
                 for call in &self.candidates[v].calls {
-                    // Through each join whose code it's in, which may be in another's, decided after.
+                    // If the call site is located inside another join body that was already placed, prepend its tail chain.
                     let mut chain = call.chain.to_vec();
                     let mut frame = call.frame;
                     while let Some(join) = self.bodies.get(&chain[0]).and_then(|w| placed.get(w)) {
                         chain = join.chain.iter().chain(&chain).copied().collect();
                         frame = join.frame;
                     }
-                    // A call in a member's own code goes to it from there.
+                    // Recursive self-calls or mutual calls within group members execute locally without changing the common continuation.
                     if self.bodies.get(&chain[0]).is_some_and(|w| members.contains(w)) {
                         continue;
                     }
@@ -337,8 +339,8 @@ impl<'id> Survey<'_, 'id, '_> {
         plan
     }
 
-    /// Whether `binding`'s functions' code can go in `frame`, inside the frame that binds them and
-    /// not in their own: if none of the lambdas between captures more than it does now.
+    /// Checks whether `binding`'s functions can be placed into `frame` (nested inside their binding frame)
+    /// without increasing the number of upvalues captured by intermediate closures.
     fn moves(&self, binding: &Binding<'id>, frame: u32) -> bool {
         let (mut uses, mut bound) = (HashSet::default(), HashSet::default());
         for v in &binding.members {
@@ -364,7 +366,7 @@ impl<'id> Survey<'_, 'id, '_> {
         true
     }
 
-    /// Adds the variables `fun` refers to to `uses`, and those it binds to `bound`.
+    /// Collects all variables referenced by `fun` into `uses` and all variables locally bound within it into `bound`.
     fn vars(&self, fun: Fun<'id>, uses: &mut HashSet<Var>, bound: &mut HashSet<Var>) {
         let tree = self.tree;
         bound.extend(tree.params(fun));

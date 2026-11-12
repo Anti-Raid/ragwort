@@ -1,10 +1,6 @@
-//! [`Args`]: what a call the outer loop makes gets, read where they are rather than copied out.
+//! Implements [`Args`]: represents procedure call arguments dispatched by the outer VM loop, reading values in place rather than eagerly allocating heap storage.
 //!
-//! A request's arguments are still in its registers once the frame is kept: in the slots just
-//! above the stack's base, or for a tail request, in the frame the chain no longer needs. The
-//! frame of what it calls starts at or below them, so they're copied into it from there. The
-//! stack voids those slots once it moves to another segment, so they're [detached](Args::detach)
-//! before it does.
+//! When a runtime operation yields to the dispatch loop, argument registers remain in the stack slots above the stack base (or, for tail requests, in the deallocated frame). When initiating the callee, arguments are transferred into the new frame. Because the stack clears abandoned slots when migrating between stack segments, arguments must be [detached](Args::detach) into safe inline or heap representations before segment switching.
 
 use ragwort_types::gc::{Frame, Mutation, Slots, Stack, Value};
 use ragwort_types::pair::{Pair, Pairs};
@@ -15,8 +11,7 @@ use crate::intrinsic::values;
 use crate::run::MAX_ARGS;
 use crate::objects::{MultiValue, MultiValueFields};
 
-/// The arguments of a call the outer loop makes: values held in slots, as a request's registers
-/// left them, or inline, then the elements of `rest`, a list or a [`MultiValue`].
+/// Represents arguments passed to a call by the outer execution loop: holds arguments either directly in stack slots or inlined in an array, followed by remaining arguments in `rest` (represented as a Scheme list or a [`MultiValue`]).
 #[derive(Clone, Copy)]
 pub(crate) struct Args<'gc> {
     held: Held<'gc>,
@@ -42,17 +37,17 @@ impl<'gc> Args<'gc> {
         Args { held: Held::Inline([a, b], 2), rest: Value::NIL }
     }
 
-    /// `first`, then the elements of `rest`, a list or a [`MultiValue`].
+    /// Constructs an `Args` sequence starting with `first`, followed by the elements in `rest` (a list or [`MultiValue`]).
     pub(crate) fn before(first: Value<'gc>, rest: Value<'gc>) -> Self {
         Args { held: Held::Inline([first, Value::VOID], 1), rest }
     }
 
-    /// The elements of `rest`, a list or a [`MultiValue`].
+    /// Constructs an `Args` sequence containing the elements of `rest` (a list or [`MultiValue`]).
     pub(crate) fn list(rest: Value<'gc>) -> Self {
         Args { held: Held::Inline([Value::VOID; 2], 0), rest }
     }
 
-    /// The values in `slots`, then the elements of `rest`.
+    /// Constructs an `Args` sequence backed by stack `slots`, followed by trailing elements in `rest`.
     pub(crate) fn slots(slots: Slots<'gc>, rest: Value<'gc>) -> Self {
         Args { held: Held::Slots(slots), rest }
     }
@@ -71,7 +66,7 @@ impl<'gc> Args<'gc> {
         }
     }
 
-    /// How many there are. Faults if `rest` isn't a proper list.
+    /// Computes the total number of arguments, returning [`Fault::WrongType`] if `rest` is not a proper list.
     pub(crate) fn len(self, mc: &Mutation<'gc>) -> Result<usize, Fault> {
         if let Some(mv) = self.rest.downcast::<MultiValue>(mc) {
             return Ok(self.held() + mv.items(mc).len());
@@ -86,7 +81,7 @@ impl<'gc> Args<'gc> {
         Ok(n)
     }
 
-    /// Argument `i`.
+    /// Retrieves the argument at 0-based index `i`, returning [`Fault::Arity`] if `i` is out of bounds.
     pub(crate) fn get(self, mc: &Mutation<'gc>, i: usize) -> Result<Value<'gc>, Fault> {
         if i < self.held() {
             return Ok(self.held_get(i));
@@ -103,7 +98,7 @@ impl<'gc> Args<'gc> {
         Ok(Pair::of(at).ok_or(Fault::Arity)?.head(mc))
     }
 
-    /// The arguments from `k` on.
+    /// Returns a new `Args` slice containing the arguments starting from index `k` onward.
     pub(crate) fn tail(self, mc: &Mutation<'gc>, k: usize) -> Result<Self, Fault> {
         let held = self.held();
         if k <= held {
@@ -127,7 +122,7 @@ impl<'gc> Args<'gc> {
         Ok(Args::list(at))
     }
 
-    /// These, with the last, a list, spread in its place, as `apply` takes them.
+    /// Spreads the final argument (which must be a list) in place, matching `apply` calling semantics.
     pub(crate) fn spread_last(self, mc: &Mutation<'gc>) -> Result<Self, Fault> {
         if self.rest == Value::NIL {
             let n = self.held().checked_sub(1).ok_or(Fault::Arity)?;
@@ -151,8 +146,7 @@ impl<'gc> Args<'gc> {
         Ok(Args { held: self.held, rest })
     }
 
-    /// Writes the held values to the argument registers of `frame`, at `fp` on `stack`, which
-    /// may overlap the slots they're in, and returns how many there are: the rest are in `rest`.
+    /// Writes the held positional arguments into the argument register slots of `frame` starting at `fp` on `stack` (handling potential overlap), and returns the number of written arguments. Any remaining arguments remain in `rest`.
     pub(crate) fn write(self, mc: &Mutation<'gc>, stack: &Stack, frame: Frame<'_, 'gc>, fp: usize) -> Result<u8, Fault> {
         let argc = u8::try_from(self.held()).ok().filter(|&n| usize::from(n) <= MAX_ARGS).ok_or(Fault::Malformed)?;
         match self.held {
@@ -166,7 +160,7 @@ impl<'gc> Args<'gc> {
         Ok(argc)
     }
 
-    /// What `(values arg ...)` of them returns.
+    /// Formats these arguments as the return value of `(values arg ...)`, returning the single value directly if there is exactly one argument, or wrapping them in a [`MultiValue`].
     pub(crate) fn values(self, mc: &Mutation<'gc>) -> Result<Value<'gc>, Fault> {
         match (self.held(), self.rest) {
             (1, Value::NIL) => Ok(self.held_get(0)),
@@ -176,8 +170,7 @@ impl<'gc> Args<'gc> {
         }
     }
 
-    /// These, held so they don't depend on the slots they're in, which the stack voids once it
-    /// moves to another segment.
+    /// Detaches arguments from stack slot references by copying them into inline arrays or heap lists, ensuring they survive stack segment relocation.
     pub(crate) fn detach(self, mc: &Mutation<'gc>) -> Result<Self, Fault> {
         let Held::Slots(slots) = self.held else { return Ok(self) };
         Ok(match slots.len() {
@@ -188,7 +181,7 @@ impl<'gc> Args<'gc> {
         })
     }
 
-    /// All of them, as a list.
+    /// Converts all arguments into a standard Scheme proper list.
     pub(crate) fn to_list(self, mc: &Mutation<'gc>) -> Result<Value<'gc>, Fault> {
         let pairs = Pairs::new(mc);
         let mut list = match self.rest.downcast::<MultiValue>(mc) {
@@ -208,7 +201,7 @@ impl<'gc> Args<'gc> {
         Ok(list)
     }
 
-    /// All of them, in order.
+    /// Returns an exact-size iterator yielding all arguments in order.
     pub(crate) fn iter<'a>(self, mc: &'a Mutation<'gc>) -> Result<Iter<'a, 'gc>, Fault> {
         let items = self.rest.downcast::<MultiValue>(mc).map(|mv| mv.items(mc));
         Ok(Iter { mc, args: self, i: 0, rest: self.rest, items, left: self.len(mc)? })

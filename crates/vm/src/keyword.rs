@@ -1,8 +1,4 @@
-//! Keyword procedures: what a `lambda` with keyword parameters makes. One is a
-//! [`KeywordProcedure`]: a core procedure, which takes a value for each keyword it accepts,
-//! sorted by name, [`Value::UNSUPPLIED`] for an optional one left out, then the positional
-//! arguments; and a plain one, which a call with no keywords calls, or `#f` if some keyword is
-//! required. `keyword-apply` matches a call's keywords to the core's.
+//! Implements keyword procedures created by `lambda` forms with keyword parameters. Represented by [`KeywordProcedure`], which wraps two procedures: a `core` procedure (which takes arguments corresponding to all accepted keywords sorted lexicographically by name—substituting [`Value::UNSUPPLIED`] for omitted optional keywords—followed by positional arguments) and a `plain` procedure (called when no keywords are supplied, or `#f` if at least one keyword is required). The `keyword-apply` procedure dynamically binds a call's supplied keyword arguments to the core procedure's parameter list.
 
 use std::cmp::Ordering;
 
@@ -17,14 +13,13 @@ use crate::frame::Shape;
 use crate::machine::{Then, condition};
 use crate::objects::{BytecodeFields, Closure, ClosureFields, KeywordProcedure, KeywordProcedureFields};
 
-/// The order keywords are sorted in, by their names' characters, as Racket's `keyword<?`.
+/// Orders two keywords lexicographically by their string names, matching the behavior of Racket's `keyword<?`.
 pub fn order<'gc>(mc: &Mutation<'gc>, a: Keyword<'gc>, b: Keyword<'gc>) -> Ordering {
     let strings = Strings::new(mc);
     string::compare(&strings, a.symbol(mc).name(mc), b.symbol(mc).name(mc)).unwrap_or(Ordering::Equal)
 }
 
-/// What keyword procedure `f` takes, if it's one: its keywords, sorted, each with whether it's
-/// required, and the shape of its positional parameters.
+/// Returns the signature of procedure `f` if it is a [`KeywordProcedure`]: a sorted list of accepted keywords (each paired with a boolean indicating whether it is required) and the [`Shape`] of its positional parameters.
 pub fn signature<'gc>(mc: &Mutation<'gc>, f: Value<'gc>) -> Option<(Vec<(Keyword<'gc>, bool)>, Shape)> {
     let f = f.downcast::<KeywordProcedure>(mc)?;
     let pairs = Pairs::new(mc);
@@ -35,7 +30,7 @@ pub fn signature<'gc>(mc: &Mutation<'gc>, f: Value<'gc>) -> Option<(Vec<(Keyword
     Some((keywords, shape))
 }
 
-/// A call of `f` with no keywords, and `args`.
+/// Dispatches a call to keyword procedure `f` when no keyword arguments are supplied, passing positional `args`.
 pub(crate) fn positional<'gc>(mc: &Mutation<'gc>, f: Gc<'gc, KeywordProcedure>, args: Args<'gc>) -> Result<Then<'gc>, Fault> {
     match f.plain(mc) {
         Value::FALSE => apply(mc, Value::object(mc, f), Value::NIL, Value::NIL, args),
@@ -43,9 +38,7 @@ pub(crate) fn positional<'gc>(mc: &Mutation<'gc>, f: Gc<'gc, KeywordProcedure>, 
     }
 }
 
-/// `(keyword-apply f kws vals arg ...)`: calls `f` with the keywords `kws`, sorted, each passed
-/// its value in `vals`, and `args`. A keyword `f` doesn't take, or one it requires left out,
-/// raises a keyword error of it.
+/// Implements `(keyword-apply f kws vals arg ...)`: invokes `f` with keyword arguments `kws` (which must be sorted and distinct) and corresponding values `vals`, followed by positional arguments `args`. Raises a keyword fault if an unexpected keyword is supplied or if a required keyword is missing.
 pub(crate) fn apply<'gc>(mc: &Mutation<'gc>, f: Value<'gc>, kws: Value<'gc>, vals: Value<'gc>, args: Args<'gc>) -> Result<Then<'gc>, Fault> {
     let pairs = Pairs::new(mc);
     let mut given = Vec::new();
@@ -66,7 +59,7 @@ pub(crate) fn apply<'gc>(mc: &Mutation<'gc>, f: Value<'gc>, kws: Value<'gc>, val
         };
     };
     let accepted: Vec<Keyword<'gc>> = pairs.elements(f.keywords(mc)).map(Keyword::of).collect::<Option<_>>().ok_or(Fault::Malformed)?;
-    // An unknown keyword is reported before a missing one, as it's likely the other misspelled.
+    // Report unknown keywords before missing required ones, as an unexpected keyword often indicates a misspelled parameter name.
     if let Some(&(kw, _)) = given.iter().find(|(kw, _)| !accepted.contains(kw)) {
         return raise(mc, "procedure doesn't take keyword", kw.value(mc));
     }

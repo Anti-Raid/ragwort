@@ -1,13 +1,16 @@
-//! Modules as the compiler sees them: a [`ModuleBuilder`] for the front ends, which lower a
-//! module's files to forms it compiles into one [`Module`], and the [`Interface`] that tells code
-//! requiring a module what each of its exports is.
+//! Compiler representations and builder infrastructure for modules.
 //!
-//! A module's variables are its slots. A reference to one the front end knows is defined where
-//! it runs is unchecked: one defined by an earlier top-level form, or the variable itself inside
-//! the lambda that's directly its definition. An export no code of its module assigns is
-//! immutable, so a module requiring it quotes its value, and if its definition is a small lambda
-//! of no variables but its parameters and other immutable variables of its module, inlines its
-//! calls. Code reads an export its module assigns with `module-ref`.
+//! This module provides:
+//! - [`ModuleBuilder`]: Used by language front ends to lower source files into compiled top-level forms
+//!   that assemble a [`Module`].
+//! - [`Interface`]: Specifies a compiled module's exported definitions for downstream consumers.
+//!
+//! A module's top-level variables occupy numbered slots in its runtime storage. Variable accesses are emitted
+//! as unchecked loads when the front end can verify prior initialization (for instance, when defined in an earlier
+//! top-level form, or when referenced self-recursively inside its own initializing lambda). Exports that are never
+//! mutated within the module are treated as immutable: importing modules may directly embed (quote) their values or,
+//! for small lambdas capturing only parameters and other immutable module slots, inline their call sites directly.
+//! Mutable exports are accessed dynamically at runtime via `module-ref`.
 
 use crate::hash::{HashMap, HashSet};
 
@@ -24,12 +27,12 @@ use crate::keyword::CallShape;
 use crate::structs::{Call, Member};
 use crate::{CompileError, Core, Lambda, Place, Prim, Var, compile};
 
-/// How many forms an inlined export's body can have.
+/// Maximum number of AST nodes permitted in the body of an inlined export.
 const MAX_INLINE: usize = 16;
-/// How long a rest list an inlined call can make, a `cons` in another for each.
+/// Maximum length of a rest-argument list generated during inlining, where each element introduces a nested `cons`.
 const MAX_REST: usize = 16;
 
-/// What a module exports, by the names other modules require them by.
+/// The export table of a compiled module, mapping public export names to their export descriptors.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Interface {
     exports: HashMap<Box<str>, Export>,
@@ -45,7 +48,7 @@ impl Interface {
     }
 }
 
-/// A module's exports are saved in the order of their names.
+/// Serializes module exports sorted lexicographically by export name.
 impl Wire for Interface {
     const SHAPE: u64 = shape_of("Interface");
 
@@ -69,8 +72,7 @@ impl Wire for Interface {
     }
 }
 
-/// Saves what a module's compiler knows of it: its [`Interface`], or nothing, for a module
-/// that isn't finished. What something else has put there isn't saved.
+/// Serializes a module's compiler interface into a heap image, writing the [`Interface`] if compilation succeeded, or an empty record if the module is incomplete. Unrecognized user data is ignored.
 fn save_interface(value: &dyn std::any::Any, out: &mut Writer) -> bool {
     let Some(held) = value.downcast_ref::<Box<dyn std::any::Any>>() else { return false };
     if let Some(interface) = held.downcast_ref::<Interface>() {
@@ -94,11 +96,10 @@ fn load_interface<'gc>(mc: &Mutation<'gc>, input: &mut Reader<'_>, cost: usize) 
     Ok(freeze(mc, held, cost)?)
 }
 
-/// The kind of frozen value a module's interface is, for an image: see
-/// [`ragwort_types::gc::image`].
+/// The GC image serialization descriptor for frozen module interfaces; see [`ragwort_types::gc::image`].
 pub const INTERFACE: Kind = Kind { save: save_interface, load: load_interface, shape: SHAPE };
 
-/// A number that changes when the form of anything in an [`Interface`] does.
+/// Type shape hash for [`Interface`], updated whenever the binary wire format of any interface type changes.
 const SHAPE: u64 = {
     let shapes = [Interface::SHAPE, Export::SHAPE, StructDef::SHAPE, Field::SHAPE, Inline::SHAPE, Template::SHAPE, Prim::SHAPE, crate::SlotOp::SHAPE];
     let (mut shape, mut i) = (0, 0);
@@ -109,56 +110,52 @@ const SHAPE: u64 = {
     shape
 };
 
-/// One of a module's variables, as it exports it.
+/// Describes an exported module variable and its inlining/structure metadata.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
 pub struct Export {
     pub slot: u32,
-    /// Whether its module assigns it, so it's read as it is when code reads it.
+    /// Indicates whether this variable is mutated within the defining module, requiring dynamic reads via `module-ref`.
     pub mutable: bool,
-    /// What a call of it inlines to, if its definition is a closed lambda.
+    /// Optional inlining template used when calls to this export can be inlined directly at call sites.
     pub inline: Option<Inline>,
-    /// For a keyword procedure, the variable of its core, which a call with keywords that the
-    /// front end matches can call itself.
+    /// For keyword procedures, points to the underlying core procedure that statically matched keyword calls can invoke directly.
     pub core: Option<Box<Export>>,
-    /// For the constructor a struct form names as its type, the type.
+    /// Type definition metadata associated with this export when it represents a struct constructor or type name.
     pub structure: Option<Box<StructDef>>,
 }
 
-/// A field of a struct type, as code that uses the type knows it.
+/// A field definition within a struct type as exposed to client modules.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
 pub struct Field {
     pub name: Box<str>,
     pub mutable: bool,
 }
 
-/// A struct type, as code that uses its name knows it.
+/// The structural definition and capabilities of an exported struct type.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
 pub struct StructDef {
-    /// The variable of its module that holds the type.
+    /// The module slot index holding the struct type descriptor object.
     pub kind: u32,
-    /// Its fields, its supertype's first.
+    /// The struct's fields, ordered with supertype fields preceding subtype fields.
     pub fields: Box<[Field]>,
-    /// Whether it's sealed, so it can't be a supertype.
+    /// Whether the struct type is sealed against further subtyping.
     pub sealed: bool,
-    /// Whether its name is only for `match` here, as it is where a module requires a struct
-    /// that's provided without its constructor: the name isn't a value, and the type is sealed.
+    /// Indicates that the struct identifier is imported exclusively for pattern matching (e.g. when exported without its constructor); the name cannot be evaluated as a runtime value and the type is sealed.
     pub match_only: bool,
 }
 
-/// The interface of `module`, once it's built.
+/// Retrieves the compiled [`Interface`] of `module`, if compilation has completed.
 pub fn interface<'gc>(mc: &Mutation<'gc>, module: Gc<'gc, Module>) -> Option<&'gc Interface> {
     ragwort_vm::module::interface(mc, module)
 }
 
-/// Finds the modules code requires.
+/// Resolves imported module names to compiled [`Module`] instances.
 pub trait Resolver<'gc> {
-    /// The module named `name`, which the module named `from` requires, once it's run: its
-    /// immutable exports must be defined. A module that requires itself, or one that requires it,
-    /// isn't one this can give.
+    /// Resolves module `name` imported by `from`. The target module must have already executed so that its immutable exports are fully initialized; circular dependencies return `None`.
     fn resolve(&mut self, mc: &Mutation<'gc>, name: &str, from: Value<'gc>) -> Option<Gc<'gc, Module>>;
 }
 
-/// A [`Resolver`] that has no modules, for a module that requires none.
+/// A dummy [`Resolver`] that resolves no modules, suitable for standalone modules with no dependencies.
 pub struct NoModules;
 
 impl<'gc> Resolver<'gc> for NoModules {
@@ -167,29 +164,26 @@ impl<'gc> Resolver<'gc> for NoModules {
     }
 }
 
-/// A module a front end built, and a procedure of no arguments for each of its top-level forms
-/// with code to run, to run in order. Once they have, a resolver can give it to code that
-/// requires it.
+/// A compiled module and its sequence of top-level zero-argument initialization thunks, which must be executed in order before the module can be resolved by downstream modules.
 #[derive(Clone, Debug)]
 pub struct Loaded<'gc> {
     pub module: Gc<'gc, Module>,
     pub thunks: Vec<Value<'gc>>,
 }
 
-/// An export of a module that code requires.
+/// A specific export imported from a required module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Import<'gc> {
     pub module: Gc<'gc, Module>,
     pub export: &'gc Export,
 }
 
-/// Why an import has no value for code to use.
+/// Explains why an imported identifier cannot be evaluated as an expression value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unusable {
-    /// It's an immutable export of a module that hasn't defined it, which the module's resolver
-    /// shouldn't have given.
+    /// The imported identifier is an immutable export that was never initialized by its defining module.
     Uninitialized,
-    /// It's the name of a struct provided without its constructor, which is only for `match`.
+    /// The imported identifier is a struct name exported without a constructor, usable only within `match` patterns.
     MatchOnly,
 }
 
@@ -198,7 +192,7 @@ impl<'gc> Import<'gc> {
         self.module == other.module && self.export.slot == other.export.slot && self.export.structure == other.export.structure
     }
 
-    /// A reference to it: its value, or for a mutable export, a read of it.
+    /// Emits a reference to the imported binding: either an inlined constant quote for immutable slots, or a dynamic `module-ref` intrinsic for mutable slots.
     pub fn reference(self, mc: &Mutation<'gc>) -> Result<Core<'gc>, Unusable> {
         if self.export.structure.as_deref().is_some_and(|def| def.match_only) {
             return Err(Unusable::MatchOnly);
@@ -212,25 +206,24 @@ impl<'gc> Import<'gc> {
         self.variable(mc, slot).map(Core::Quote).ok_or(Unusable::Uninitialized)
     }
 
-    /// For a keyword procedure, its core, as [`Export::core`] is.
+    /// Returns an [`Import`] pointing to the underlying core procedure if this import represents a keyword procedure.
     pub fn keyword_core(self) -> Option<Self> {
         Some(Self { module: self.module, export: self.export.core.as_deref()? })
     }
 
-    /// For the constructor a struct form names as its type, the type as its module exports it,
-    /// and the type itself.
+    /// Returns the struct definition metadata and runtime type descriptor if this import represents a struct constructor or type name.
     pub fn struct_def(self, mc: &Mutation<'gc>) -> Option<(&'gc StructDef, Value<'gc>)> {
         let def = self.export.structure.as_deref()?;
         Some((def, self.variable(mc, def.kind)?))
     }
 
-    /// The value of its module's variable `slot`, once it's defined.
+    /// Retrieves the value stored in the module's variable `slot`, returning `None` if the slot is out of bounds or still undefined.
     fn variable(self, mc: &Mutation<'gc>, slot: u32) -> Option<Value<'gc>> {
         let items = self.module.items(mc);
         (slot as usize).lt(&items.len()).then(|| items.get(slot as usize)).filter(|&v| v != Value::UNDEFINED)
     }
 
-    /// A call of it on `args`, inlined if it can be, with new locals from `fresh`.
+    /// Generates an invocation of the imported procedure with `args`, inlining the call if an inline template is available and valid.
     pub fn call(self, mc: &Mutation<'gc>, args: Vec<Core<'gc>>, fresh: &mut dyn FnMut() -> Var) -> Result<Core<'gc>, Unusable> {
         let quoted = |slot: u32| self.variable(mc, slot).map(Core::Quote);
         match &self.export.inline {
@@ -242,13 +235,12 @@ impl<'gc> Import<'gc> {
     }
 }
 
-/// The exports of the modules a module requires, by the names it gives them, which a require
-/// spec's parts take from and rename.
+/// A collection of resolved imports mapped to local binding names, transformed by import filters (such as `only`, `except`, `prefix`, and `rename`).
 #[derive(Clone, Debug, Default)]
 pub struct Imports<'gc>(pub Vec<(String, Import<'gc>)>);
 
 impl<'gc> Imports<'gc> {
-    /// All of what `module` exports, by the names it exports them by.
+    /// Imports all public definitions exported by `module` under their original export names.
     pub fn all(mc: &Mutation<'gc>, module: Gc<'gc, Module>) -> Option<Self> {
         let interface = interface(mc, module)?;
         let mut imports: Vec<_> = interface.iter().map(|(name, export)| (name.to_owned(), Import { module, export })).collect();
@@ -256,13 +248,13 @@ impl<'gc> Imports<'gc> {
         Some(Self(imports))
     }
 
-    /// Just `names`, or the first of them not among these.
+    /// Filters imports to retain only those matching `names`, returning an error identifying the first unrecognized name if any are missing.
     pub fn only(self, names: &[String]) -> Result<Self, String> {
         self.has(names)?;
         Ok(Self(self.0.into_iter().filter(|(n, _)| names.contains(n)).collect()))
     }
 
-    /// All but `names`, or the first of them not among these.
+    /// Filters imports to exclude `names`, returning an error identifying the first unrecognized name if any specified name was not present.
     pub fn except(self, names: &[String]) -> Result<Self, String> {
         self.has(names)?;
         Ok(Self(self.0.into_iter().filter(|(n, _)| !names.contains(n)).collect()))
@@ -272,7 +264,7 @@ impl<'gc> Imports<'gc> {
         Self(self.0.into_iter().map(|(n, import)| (format!("{prefix}{n}"), import)).collect())
     }
 
-    /// These, with each name in `renames` given its new name, or the first not among these.
+    /// Renames imported bindings according to `renames`, returning an error identifying the first missing original name if any cannot be found.
     pub fn rename(self, renames: &[(String, String)]) -> Result<Self, String> {
         let olds: Vec<String> = renames.iter().map(|(old, _)| old.clone()).collect();
         self.has(&olds)?;
@@ -291,9 +283,8 @@ impl<'gc> Imports<'gc> {
     }
 }
 
-/// A require spec, with where each part of it is written, `L`: what a front end reads one as.
-/// It's what the module of a name exports, through each of its filters in turn, the innermost
-/// first, as `(prefix-in p: (only-in m a))` has `only-in` then `prefix-in`.
+/// An import specification parsed by a language front end, annotated with source locations `L`.
+/// Applies nested import filters sequentially from innermost to outermost (e.g. `(prefix-in p: (only-in m a))` applies `only-in` prior to `prefix-in`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RequireSpec<L> {
     pub module: String,
@@ -301,27 +292,27 @@ pub struct RequireSpec<L> {
     pub filters: Vec<Filter<L>>,
 }
 
-/// What a require spec keeps of what's inside it, and what it names it.
+/// Filtering or renaming operations applied to an imported module's export set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Filter<L> {
     Only(Vec<(String, L)>),
     Except(Vec<(String, L)>),
     Prefix(String),
-    /// Each old name, renamed to the new.
+    /// Renames imported identifiers from `(old_name, new_name, source_location)`.
     Rename(Vec<(String, String, L)>),
 }
 
-/// What's wrong with a require spec, and where.
+/// Errors encountered while evaluating an import specification, paired with source locations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpecError<L> {
-    /// A module the resolver doesn't have, or one that no [`ModuleBuilder`] built.
+    /// The requested module could not be found by the resolver or was never constructed.
     Resolve(L),
-    /// A name the spec it's in doesn't import.
+    /// The specified identifier is not exported by the target module.
     NotProvided(L),
 }
 
 impl<L: Copy> RequireSpec<L> {
-    /// What it imports, of the modules `resolver` finds for the module named `from`.
+    /// Resolves and filters the module imports for a requiring module named `from` using `resolver`.
     pub fn imports<'gc>(&self, mc: &Mutation<'gc>, resolver: &mut dyn Resolver<'gc>, from: Value<'gc>) -> Result<Imports<'gc>, SpecError<L>> {
         let at = |names: &[(String, L)], missing: String| names.iter().find(|(n, _)| *n == missing).map(|&(_, at)| SpecError::NotProvided(at));
         let module = resolver.resolve(mc, &self.module, from).ok_or(SpecError::Resolve(self.at))?;
@@ -345,66 +336,61 @@ impl<L: Copy> RequireSpec<L> {
     }
 }
 
-/// What a module export's call inlines to: the body of a lambda whose constants are immediates
-/// and whose only variables are its parameters, the locals it binds, and variables of its own
-/// module that are never assigned, which a module that inlines it has by their values. It calls
-/// intrinsics and requests, which mean the same in any module, and procedure values.
+/// Inline expansion template for an exported procedure. Represents a lambda body whose constants are immediate values,
+/// and whose variable references are restricted to parameters, local `let` bindings, and immutable module slots whose
+/// values can be constant-quoted at inline sites. Inlined bodies invoke intrinsics, requests, or procedure values.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
 pub struct Inline {
     params: u32,
-    /// How many of the last parameters a call can leave out, which it passes as unsupplied.
+    /// The number of trailing optional parameters that callers may omit, which default to unsupplied values.
     optional: u32,
     rest: bool,
-    /// How many locals the body binds, which each call has its own of.
+    /// The number of local variables bound in the template body, allocated freshly for each inlined call site.
     locals: u32,
     body: Template,
-    /// Whether the body uses each parameter once, in order, before it calls anything, so its
-    /// arguments go in its place, evaluated as they would be for the call.
+    /// Indicates whether every parameter is referenced exactly once and in evaluation order prior to any other side effects,
+    /// allowing argument expressions to be directly substituted without introducing temporary variables.
     linear: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
 enum Template {
     Param(u32),
-    /// A local the body binds, by the order its `let`s bind them in.
+    /// References a local variable introduced in the template body, indexed by binding order.
     Local(u32),
-    /// A `let` of the locals from the first, to the values, around the body.
+    /// A `let` binding form introducing consecutive local variables initialized to the given values around the body.
     Let(u32, Vec<Template>, Box<Template>),
     Immediate(Immediate),
-    /// The value of a variable of the module the template is from, which is never assigned.
+    /// References an immutable slot from the defining module, resolved to a constant quote upon inlining.
     Slot(u32),
     If(Box<[Template; 3]>),
     Prim(Prim, Vec<Template>),
     Apply(Prim, Vec<Template>),
-    /// A call of the procedure the first makes, on the rest.
+    /// Invokes the procedure produced by evaluating the first expression with the remaining expressions as arguments.
     Call(Vec<Template>),
 }
 
-/// What a template does as it's evaluated: uses a parameter, or anything else that isn't just a
-/// value.
+/// Tracks evaluation events in a template body: either referencing a formal parameter or performing an operation with potential side effects.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Event {
     Param(u32),
     Other,
 }
 
-/// What an inlined call's parameter stands for: an argument that goes in its place, or the
-/// local it's bound to.
+/// Represents the substitution target for a parameter in an inlined call: either an expression directly inlined or a local variable holding the argument.
 enum Arg<'gc> {
     Core(Option<Core<'gc>>),
     Var(Var),
 }
 
 impl Arg<'_> {
-    /// Whether `core` can go wherever it's used, as often: a constant. A local can't, as a call
-    /// before a use could assign it.
+    /// Returns true if `core` is a pure constant (such as a quote) that can be duplicated at every reference without changing semantics.
     fn is_trivial(core: &Core<'_>) -> bool {
         matches!(core, Core::Quote(_))
     }
 }
 
-/// An argument of the one call a struct procedure makes: one of its parameters, the value of a
-/// variable of its module, which holds its type, or a field's index.
+/// An operand supplied to a struct accessor or constructor intrinsic: a parameter index, a module slot holding the struct type, or a constant field index.
 #[derive(Clone, Copy, Debug)]
 pub enum Operand {
     Param(u32),
@@ -413,7 +399,7 @@ pub enum Operand {
 }
 
 impl Inline {
-    /// What `lambda`'s calls inline to, if it can be inlined.
+    /// Generates an [`Inline`] template from `lambda` if its body meets inlining size and purity constraints.
     pub fn of(lambda: &Lambda<'_>) -> Option<Self> {
         let params: Vec<Var> = lambda.params.iter().copied().chain(lambda.rest).collect();
         let (mut left, mut locals) = (MAX_INLINE, Vec::new());
@@ -422,8 +408,7 @@ impl Inline {
         Some(Self::new(params, lambda.optional, lambda.rest.is_some(), locals, body))
     }
 
-    /// What the calls of a procedure of `params` parameters that just calls `intrinsic` on
-    /// `operands` inline to, as a struct's procedures do.
+    /// Constructs an [`Inline`] template for a procedure with `params` parameters that delegates directly to `intrinsic` with `operands` (e.g. struct getters/setters/constructors).
     pub fn of_call(intrinsic: Intrinsic, params: u32, operands: &[Operand]) -> Self {
         let operand = |operand: &Operand| match *operand {
             Operand::Param(i) => Template::Param(i),
@@ -444,7 +429,7 @@ impl Inline {
         Self { params, optional, rest, locals, body, linear }
     }
 
-    /// The variables of its module that it reads.
+    /// Returns an iterator over all module slot indices referenced by the inline template.
     pub fn slots(&self) -> impl Iterator<Item = u32> {
         let mut slots = Vec::new();
         self.body.slots(&mut slots);
@@ -455,16 +440,13 @@ impl Inline {
         n >= (self.params - self.optional) as usize && (self.rest || n <= self.params as usize)
     }
 
-    /// Whether a call of `n` arguments is inlined: if it takes them, and any rest list it makes
-    /// nests no deeper than `MAX_REST`.
+    /// Determines whether a call with `n` arguments can be inlined: checks arity compatibility and verifies that any rest-argument list does not exceed `MAX_REST`.
     pub fn inlines(&self, n: usize) -> bool {
         let rest = n.saturating_sub(self.params as usize);
         self.takes(n) && (!self.rest || rest <= MAX_REST || !self.body.uses_list(self.params, rest))
     }
 
-    /// The body, with its parameters standing for `args`, which it takes, and the rest in a
-    /// list, new locals from `fresh`, and what `slot` gives for each variable of its module it
-    /// reads. An `apply` of the rest list calls its primitive on them, if it takes that many.
+    /// Expands the inline template with the given `args`, generating fresh local variable IDs via `fresh` and resolving referenced module slots via `slot`. Gathers excess arguments into a rest list or flattens them into apply operations.
     pub fn call<'gc>(&self, mut args: Vec<Core<'gc>>, fresh: &mut dyn FnMut() -> Var, slot: &dyn Fn(u32) -> Core<'gc>) -> Core<'gc> {
         if args.len() < self.params as usize {
             args.resize(self.params as usize, Core::Quote(Value::UNSUPPLIED));
@@ -490,9 +472,7 @@ impl Inline {
             let list_uses = self.body.list_uses(self.params, rest.len());
             let mut cx = Instance { params: args, rest: Some(&mut rest), list: None, locals: &locals, slot };
             if list_uses > 0 {
-                // The rest's list, made once, of the rest, each bound once. Where the body uses
-                // it in one place, it's made there, so a path that doesn't use it doesn't make
-                // it: unless the template is linear, its parts are locals and constants.
+                // Construct the rest list once from individual arguments. If referenced at only a single site, instantiate it at the use site to avoid constructing unused lists on alternate code branches.
                 let items: Vec<Core<'gc>> = cx.rest.as_deref_mut().into_iter().flatten().map(|a| a.take()).collect();
                 let list = items.into_iter().rfold(Core::Quote(Value::NIL), |tail, item| Core::Intrinsic(Prim::Intrinsic(Intrinsic::Cons), vec![item, tail]));
                 if self.linear || list_uses == 1 {
@@ -507,7 +487,7 @@ impl Inline {
         } else {
             self.body.core(&mut Instance { params: args, rest: None, list: None, locals: &locals, slot }, self.params)
         };
-        // The list is of the rest's locals, so it's bound inside them.
+        // Wrap the body in a `Let` binding for the rest list, located inside the scope of the rest argument temporaries.
         let body = match inner {
             Some(list) => Core::Let(vec![list], Box::new(body)),
             None => body,
@@ -516,7 +496,7 @@ impl Inline {
     }
 }
 
-/// What an inlined call's parameters stand for, as its template is made into code.
+/// Context maintained while instantiating an inlined template into concrete AST nodes.
 struct Instance<'r, 'gc> {
     params: Vec<Arg<'gc>>,
     rest: Option<&'r mut Vec<Arg<'gc>>>,
@@ -526,7 +506,7 @@ struct Instance<'r, 'gc> {
 }
 
 impl<'gc> Arg<'gc> {
-    /// What it stands for: a trivial argument as often as it's used, any other only once.
+    /// Extracts the expression for this argument: duplicates trivial constant arguments, but yields non-trivial expressions only once.
     fn take(&mut self) -> Core<'gc> {
         match self {
             Arg::Var(var) => Core::Ref(Place::Local(*var)),
@@ -538,7 +518,7 @@ impl<'gc> Arg<'gc> {
     }
 }
 
-/// Whether `prim` takes `n` arguments.
+/// Checks whether the primitive `prim` accepts an argument count of `n`.
 fn takes(prim: Prim, n: usize) -> bool {
     match prim {
         Prim::Intrinsic(i) => i.arity().is_none_or(|a| usize::from(a) == n),
@@ -549,11 +529,10 @@ fn takes(prim: Prim, n: usize) -> bool {
 }
 
 impl Template {
-    /// The template of `core`, a body of `params`, in which `locals` are the locals bound so far,
-    /// if it's one of at most `left` forms, which it's taken from.
+    /// Converts `core` into a `Template` given formal parameters `params` and visible `locals`, returning `None` if AST complexity exceeds the remaining quota in `left`.
     fn of(core: &Core<'_>, params: &[Var], locals: &mut Vec<Var>, left: &mut usize) -> Option<Self> {
         *left = left.checked_sub(1)?;
-        // A host function is in the table of any module that requires this one.
+        // Host functions are transitively propagated into the host table of any requiring module, so they may be safely inlined.
         let closed = |prim: &Prim| !matches!(prim, Prim::Slot(..));
         let mut all = |args: &[Core<'_>], locals: &mut Vec<Var>| args.iter().map(|a| Self::of(a, params, locals, left)).collect::<Option<Vec<_>>>();
         Some(match core {
@@ -561,7 +540,7 @@ impl Template {
                 Some(i) => Self::Param(i as u32),
                 None => Self::Local(locals.iter().position(|l| l == v)? as u32),
             },
-            // A variable of the module's: kept only if nothing assigns it, once that's known.
+            // Module variable reference: retained for inlining only if verified to be immutable.
             Core::Ref(Place::Slot { slot, .. }) => Self::Slot(*slot),
             Core::App(f, args) => {
                 let f = Self::of(f, params, locals, left)?;
@@ -584,7 +563,7 @@ impl Template {
         })
     }
 
-    /// What it does, in the order it does it. An `if` counts as anything, after its test.
+    /// Records the sequence of parameter references and effectful operations performed by the template. Conditional branches are marked as non-linear operations following the test expression.
     fn events(&self, out: &mut Vec<Event>) {
         match self {
             Self::Param(i) => out.push(Event::Param(*i)),
@@ -597,7 +576,7 @@ impl Template {
             }
             Self::If(parts) => {
                 parts[0].events(out);
-                // A parameter used in a branch is used after this, if at all, so the call isn't linear.
+                // Mark subsequent uses as non-linear because branch evaluation is conditional.
                 out.push(Event::Other);
                 for branch in &parts[1..] {
                     branch.events(out);
@@ -612,7 +591,7 @@ impl Template {
         }
     }
 
-    /// The variables of its module that it reads, onto `out`.
+    /// Appends all module slot indices referenced by this template to `out`.
     fn slots(&self, out: &mut Vec<u32>) {
         match self {
             Self::Slot(slot) => out.push(*slot),
@@ -623,14 +602,12 @@ impl Template {
         }
     }
 
-    /// Whether a call with `count` arguments past the parameters uses the rest parameter,
-    /// `rest`, as a list, rather than as arguments an `apply` spreads.
+    /// Determines whether a call with `count` excess arguments uses the rest parameter as a materialized list rather than spreading it into an `apply` primitive.
     fn uses_list(&self, rest: u32, count: usize) -> bool {
         self.list_uses(rest, count) > 0
     }
 
-    /// In how many places a call with `count` arguments past the parameters uses the rest
-    /// parameter, `rest`, as a list.
+    /// Counts the number of occurrences where the rest parameter `rest` is used as a materialized list when called with `count` excess arguments.
     fn list_uses(&self, rest: u32, count: usize) -> usize {
         let of = |parts: &[Template]| parts.iter().map(|p| p.list_uses(rest, count)).sum::<usize>();
         match self {
@@ -646,7 +623,7 @@ impl Template {
         }
     }
 
-    /// This, with its parameters as `cx` has them, and `rest` the index of the rest parameter.
+    /// Instantiates the template into a concrete [`Core`] AST expression using the substitution bindings in `cx` and rest parameter index `rest`.
     fn core<'gc>(&self, cx: &mut Instance<'_, 'gc>, rest: u32) -> Core<'gc> {
         match self {
             Self::Param(i) if *i == rest && cx.rest.is_some() => cx.list.as_mut().expect("the rest's list is made when it's used").take(),
@@ -686,17 +663,16 @@ impl Template {
     }
 }
 
-/// What went wrong building a module, which the front end says where.
+/// Errors encountered during module construction, reported with source locations by the language front end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModuleError {
-    /// A name the module defines twice, or provides twice.
+    /// An identifier was defined multiple times or exported multiple times.
     Duplicate,
-    /// A name the module both defines and requires, or requires as two different things.
+    /// Identifier collision: an identifier was both defined and imported, or imported from conflicting sources.
     Conflict,
-    /// A provide of a name the module doesn't define.
+    /// Attempted to export an identifier that is not defined in the module.
     NotDefined,
-    /// An assignment of a keyword procedure the module defines, whose calls the front ends
-    /// that see its definition make of its core, or of a variable a struct form defines.
+    /// Attempted to mutate an immutable definition, such as a keyword procedure core or a struct type descriptor.
     Immutable,
     OutOfMemory,
 }
@@ -707,52 +683,51 @@ impl From<OutOfMemory> for ModuleError {
     }
 }
 
-/// What a name refers to at a module's top level.
+/// The top-level resolution of an identifier in a module.
 #[derive(Clone, Copy, Debug)]
 pub enum Binding<'gc> {
-    /// The module's own variable.
+    /// A variable slot defined locally within this module.
     Slot(u32),
     Import(Import<'gc>),
 }
 
-/// What a module provides by a name.
+/// The kind of definition exported under an export name.
 #[derive(Clone, Copy)]
 enum Provided {
-    /// One of its variables.
+    /// Exports a module variable slot.
     Variable(u32),
-    /// The struct type that the variable is the constructor named for, for `match` only.
+    /// Exports the struct type descriptor for pattern matching only, omitting its constructor.
     Matching(u32),
 }
 
-/// A module as its front ends build it. First they declare its definitions, requires and
-/// provides, then [`ModuleBuilder::start`] makes it, and they lower and [`ModuleBuilder::compile`]
-/// each of its forms, in order, and [`ModuleBuilder::finish`] gives it its [`Interface`].
+/// Incremental module builder for language front ends.
+/// Front ends first declare imports, definitions, and exports; call [`ModuleBuilder::start`] to allocate the module;
+/// sequentially lower and compile top-level forms via [`ModuleBuilder::compile`]; and finally call [`ModuleBuilder::finish`]
+/// to publish the module's [`Interface`].
 pub struct ModuleBuilder<'gc> {
     name: Value<'gc>,
     hosts: &'static [HostDef],
-    /// Each variable's name, and the form that defines it.
+    /// Names of module variables and the index of the top-level form that defines each.
     names: Vec<Value<'gc>>,
     defined_by: Vec<u32>,
-    /// What the module's definitions and requires bind, by name, and what it requires
-    /// implicitly, which they shadow.
+    /// Top-level bindings declared by definitions and explicit imports, as well as fallback implicit imports shadowed by them.
     bindings: HashMap<u64, Binding<'gc>>,
     implicit: HashMap<u64, Import<'gc>>,
     exports: Vec<(Box<str>, Provided)>,
     assigned: HashSet<u32>,
     inlines: HashMap<u32, Inline>,
-    /// The cores of the keyword procedures it defines, and their shapes, by their variables.
+    /// Maps keyword procedure slots to their underlying core implementation slot and keyword call shape.
     cores: HashMap<u32, (u32, CallShape<'gc>)>,
-    /// The struct types it defines, by the variables that hold them, each with the variables its
-    /// form defines, and by the constructors named as they are, what they are.
+    /// Maps struct type descriptor slots to their type object and member slots, and maps constructor slots to their struct definitions.
     kinds: HashMap<u32, (Value<'gc>, Vec<(u32, Member)>)>,
     structs: HashMap<u32, StructDef>,
-    /// What a call of each procedure a struct form defines does, and its type.
+    /// Maps struct procedure slots to their inline templates and associated struct type objects.
     procedures: HashMap<u32, (Inline, Value<'gc>)>,
     module: Option<Gc<'gc, Module>>,
 }
 
 impl<'gc> ModuleBuilder<'gc> {
-    /// A module named `name`, whose native code calls `hosts`.
+    /// Creates a new `ModuleBuilder` for a module named `name` with host function bindings `hosts`.
     pub fn new(name: Value<'gc>, hosts: &'static [HostDef]) -> Self {
         Self {
             name,
@@ -780,7 +755,7 @@ impl<'gc> ModuleBuilder<'gc> {
         self.hosts
     }
 
-    /// Defines the variable `name`, a symbol, in top-level form `form`, and gives its slot.
+    /// Declares a module variable named `name` in top-level form `form`, returning its assigned slot index.
     pub fn define(&mut self, name: Value<'gc>, form: u32) -> Result<u32, ModuleError> {
         match self.bindings.get(&name.to_bits()) {
             Some(Binding::Slot(_)) => return Err(ModuleError::Duplicate),
@@ -792,8 +767,7 @@ impl<'gc> ModuleBuilder<'gc> {
         Ok(slot)
     }
 
-    /// Defines a variable that no name refers to at the top level, such as one a macro defines
-    /// hygienically, named `name` for what it's shown as, and gives its slot.
+    /// Declares an anonymous or hygienic module variable (such as one generated by a macro) with display name `name`, returning its assigned slot index.
     pub fn define_private(&mut self, name: Value<'gc>, form: u32) -> Result<u32, ModuleError> {
         let slot = u32::try_from(self.names.len()).map_err(|_| ModuleError::OutOfMemory)?;
         self.names.push(name);
@@ -801,7 +775,7 @@ impl<'gc> ModuleBuilder<'gc> {
         Ok(slot)
     }
 
-    /// Binds `name`, a symbol, to `import`.
+    /// Binds symbol `name` to an imported definition.
     pub fn import(&mut self, name: Value<'gc>, import: Import<'gc>) -> Result<(), ModuleError> {
         match self.bindings.get(&name.to_bits()) {
             Some(&Binding::Import(other)) if other.same(import) => Ok(()),
@@ -813,7 +787,7 @@ impl<'gc> ModuleBuilder<'gc> {
         }
     }
 
-    /// Binds what `imports` names, as a require of them does.
+    /// Binds all exported names in `imports` into the module's top-level scope.
     pub fn require(&mut self, mc: &Mutation<'gc>, symbols: Symbols<'gc>, imports: Imports<'gc>) -> Result<(), ModuleError> {
         let strings = Strings::new(mc);
         for (name, import) in imports.0 {
@@ -823,9 +797,7 @@ impl<'gc> ModuleBuilder<'gc> {
         Ok(())
     }
 
-    /// Requires all of what `module` exports implicitly, as a language does what it's built on:
-    /// what the module defines or requires shadows it, as it does what's implicitly required
-    /// before it.
+    /// Implicitly imports all exports of `module` (such as a base language prelude), allowing explicit definitions and imports to shadow them.
     pub fn require_implicitly(&mut self, mc: &Mutation<'gc>, symbols: Symbols<'gc>, module: Gc<'gc, Module>) -> Result<(), ModuleError> {
         let strings = Strings::new(mc);
         for (name, import) in Imports::all(mc, module).unwrap_or_default().0 {
@@ -835,7 +807,7 @@ impl<'gc> ModuleBuilder<'gc> {
         Ok(())
     }
 
-    /// Exports the variable `name`, a symbol, as `external`.
+    /// Exports the module variable named `name` under public export name `external`.
     pub fn provide(&mut self, external: &str, name: Value<'gc>) -> Result<(), ModuleError> {
         let Some(&Binding::Slot(slot)) = self.bindings.get(&name.to_bits()) else { return Err(ModuleError::NotDefined) };
         self.provide_as(external, Provided::Variable(slot))
@@ -849,13 +821,11 @@ impl<'gc> ModuleBuilder<'gc> {
         Ok(())
     }
 
-    /// Exports each variable the form of the struct type that variable `constructor` is named
-    /// for defines, by its name.
+    /// Exports all identifiers defined by the struct form associated with `constructor`.
     ///
-    /// Without `constructors`, none of the form's constructors is exported, and the struct's
-    /// name is exported for `match` only: see [`StructDef::match_only`]. So a module that
-    /// requires it can take such structs apart, and only what else the module provides makes
-    /// them.
+    /// If `constructors` is false, constructors are omitted from exports and the struct name is exported solely for pattern matching
+    /// (see [`StructDef::match_only`]). Client modules can then destructure instances via `match`, but can only instantiate them
+    /// through custom constructor procedures exported by this module.
     pub fn provide_struct(&mut self, mc: &Mutation<'gc>, constructor: u32, constructors: bool) -> Result<(), ModuleError> {
         let members = self.structs.get(&constructor).and_then(|def| self.kinds.get(&def.kind)).ok_or(ModuleError::NotDefined)?.1.clone();
         let strings = Strings::new(mc);
@@ -871,7 +841,7 @@ impl<'gc> ModuleBuilder<'gc> {
         Ok(())
     }
 
-    /// Exports each of the module's variables that a name refers to, by that name.
+    /// Exports all uniquely named top-level module variables under their respective symbol names.
     pub fn provide_all(&mut self, mc: &Mutation<'gc>) -> Result<(), ModuleError> {
         let strings = Strings::new(mc);
         let public = self.names.iter().enumerate().filter(|&(slot, name)| matches!(self.bindings.get(&name.to_bits()), Some(&Binding::Slot(s)) if s as usize == slot));
@@ -883,15 +853,14 @@ impl<'gc> ModuleBuilder<'gc> {
         Ok(())
     }
 
-    /// What `name`, a symbol, refers to at the top level, if anything.
+    /// Resolves symbol `name` in the module's top-level scope, checking explicit definitions/imports first, then implicit imports.
     pub fn binding(&self, name: Value<'gc>) -> Option<Binding<'gc>> {
         let k = name.to_bits();
         self.bindings.get(&k).copied().or_else(|| self.implicit.get(&k).copied().map(Binding::Import))
     }
 
-    /// Makes the module, once all its definitions are known. Its host functions are its own and
-    /// those of each module it requires, which have those of the modules they require, so its
-    /// code can call any that an inlined call of their exports does.
+    /// Allocates and initializes the runtime [`Module`] once all definitions are declared. Combines the module's own host functions
+    /// with all host functions transitively required by imported modules, ensuring host calls in inlined functions resolve correctly.
     pub fn start(&mut self, mc: &Mutation<'gc>) -> Result<Gc<'gc, Module>, OutOfMemory> {
         let mut hosts: Vec<&'static HostDef> = self.hosts.iter().collect();
         let imported = self.bindings.values().filter_map(|b| if let Binding::Import(i) = b { Some(i) } else { None }).chain(self.implicit.values());
@@ -912,62 +881,54 @@ impl<'gc> ModuleBuilder<'gc> {
         Ok(module)
     }
 
-    /// The place of variable `slot` in code of top-level form `form`, inside the definition of
-    /// `defining`'s lambda, if it is: unchecked if it's defined there.
+    /// Returns the [`Place`] for accessing variable `slot` within top-level form `form`, optionally within the initializing lambda `defining`.
+    /// Emits an unchecked access if the slot is guaranteed to have already been defined.
     pub fn place(&self, slot: u32, form: u32, defining: Option<u32>) -> Place {
         let defined = self.defined_by.get(slot as usize).is_some_and(|&by| by < form) || defining == Some(slot);
         Place::Slot { slot, checked: !defined }
     }
 
-    /// Notes that variable `procedure` is a keyword procedure of shape `shape` whose core is
-    /// variable `core`, so the code of any language can call the core.
+    /// Registers `procedure` as a keyword procedure with shape `shape` implemented by underlying core procedure `core`, allowing language front ends to bypass wrapper dispatch when keywords match.
     pub fn keyword_core(&mut self, procedure: u32, core: u32, shape: CallShape<'gc>) {
         self.cores.insert(procedure, (core, shape));
     }
 
-    /// The core of the keyword procedure variable `slot` is, and its shape, if it's one.
+    /// Retrieves the core procedure slot and call shape for keyword procedure `slot`, if registered.
     pub fn keyword_def(&self, slot: u32) -> Option<(u32, &CallShape<'gc>)> {
         self.cores.get(&slot).map(|(core, shape)| (*core, shape))
     }
 
-    /// Notes that variable `def.kind` holds the struct type `kind`, which `def` describes, that
-    /// variable `constructor`, named as the type is, constructs it, and that `members` are the
-    /// variables its form defines.
+    /// Registers struct type metadata: associates type descriptor slot `def.kind` with runtime object `kind` and member slots `members`, and associates constructor slot `constructor` with `def`.
     pub fn define_struct(&mut self, constructor: u32, def: StructDef, kind: Value<'gc>, members: Vec<(u32, Member)>) {
         self.kinds.insert(def.kind, (kind, members));
         self.structs.insert(constructor, def);
     }
 
-    /// Notes that variable `slot` is a procedure of the struct type `kind` whose calls do what
-    /// `inline` does, so the code of any language can do that itself.
+    /// Registers `slot` as an accessor or constructor for struct type `kind` with inlining template `inline`.
     pub fn struct_procedure(&mut self, slot: u32, inline: Inline, kind: Value<'gc>) {
         self.procedures.insert(slot, (inline, kind));
     }
 
-    /// The struct type variable `slot` is the constructor named for, and the type itself.
+    /// Retrieves the struct definition and runtime type object associated with constructor slot `slot`.
     pub fn struct_def(&self, slot: u32) -> Option<(&StructDef, Value<'gc>)> {
         let def = self.structs.get(&slot)?;
         Some((def, self.kinds.get(&def.kind)?.0))
     }
 
-    /// A call of variable `slot` in top-level form `form`, if it's a procedure of a struct type:
-    /// one that does what the procedure does, after reading the variable if the form that
-    /// defines it may not have run yet.
+    /// Generates a struct procedure call for `slot` within form `form`, checking for slot initialization if the defining form has not yet executed.
     pub fn struct_call(&self, slot: u32, form: u32) -> Option<Call<'gc>> {
         let (inline, kind) = self.procedures.get(&slot)?;
         let defined = self.defined_by.get(slot as usize).is_some_and(|&by| by < form);
         Some(Call::new(inline.clone(), Core::Quote(*kind), (!defined).then_some(Place::Slot { slot, checked: true })))
     }
 
-    /// The value of variable `slot` in top-level form `form`, if it's known now: a struct type
-    /// whose form has run by then.
+    /// Returns the constant value of variable `slot` in form `form` if it has already been initialized (such as a struct type descriptor defined in an earlier form).
     pub fn constant(&self, slot: u32, form: u32) -> Option<Value<'gc>> {
         let (kind, _) = self.kinds.get(&slot)?;
         self.defined_by.get(slot as usize).is_some_and(|&by| by < form).then_some(*kind)
     }
 
-    /// Notes that code assigns variable `slot`, so it isn't immutable, unless it's a keyword
-    /// procedure or one a struct form defines, which can't be assigned.
+    /// Marks variable `slot` as mutated. Returns an error if `slot` represents an immutable keyword procedure core or struct procedure.
     pub fn assign(&mut self, slot: u32) -> Result<(), ModuleError> {
         if self.cores.contains_key(&slot) || self.procedures.contains_key(&slot) || self.kinds.contains_key(&slot) {
             return Err(ModuleError::Immutable);
@@ -976,7 +937,7 @@ impl<'gc> ModuleBuilder<'gc> {
         Ok(())
     }
 
-    /// Notes that `value` defines variable `slot`, for what its calls can inline to.
+    /// Records `value` as the initializing expression for `slot`, analyzing it for potential inlining if it is a lambda.
     pub fn defined(&mut self, slot: u32, value: &Core<'gc>) {
         if let Core::Lambda(lambda) = value
             && let Some(inline) = Inline::of(lambda)
@@ -985,12 +946,12 @@ impl<'gc> ModuleBuilder<'gc> {
         }
     }
 
-    /// Compiles `core`, a top-level form of the module, once it's started.
+    /// Compiles top-level form `core` in the context of the active module.
     pub fn compile(&self, mc: &Mutation<'gc>, core: &Core<'gc>) -> Result<Value<'gc>, CompileError> {
         compile(mc, self.module, core)
     }
 
-    /// The module, with what it exports, once each of its forms is compiled.
+    /// Finalizes the module after all top-level forms are compiled, publishing its [`Interface`] and returning the module instance.
     pub fn finish(mut self, mc: &Mutation<'gc>) -> Result<Gc<'gc, Module>, OutOfMemory> {
         let module = match self.module {
             Some(module) => module,
@@ -998,8 +959,7 @@ impl<'gc> ModuleBuilder<'gc> {
         };
         let export = |slot: u32| {
             let mutable = self.assigned.contains(&slot);
-            // What reads a variable the module assigns isn't inlined: it would have the value the
-            // variable had when it was required.
+            // Do not inline procedures that read mutated module slots; otherwise callers would observe stale values captured at import time.
             let fixed = |inline: &&Inline| inline.slots().all(|read| !self.assigned.contains(&read));
             let inline = if mutable { None } else { self.procedures.get(&slot).map(|(inline, _)| inline).or(self.inlines.get(&slot)).filter(fixed).cloned() };
             Export { slot, mutable, inline, core: None, structure: self.structs.get(&slot).cloned().map(Box::new) }
@@ -1014,7 +974,7 @@ impl<'gc> ModuleBuilder<'gc> {
                     }
                     out
                 }
-                // The name stands for the type's variable, so nothing gets the constructor by it.
+                // Bind the export to the struct type descriptor slot rather than the constructor, restricting use to pattern matching.
                 Provided::Matching(constructor) => {
                     let def = self.structs.get(&constructor).expect("a struct's constructor").clone();
                     let mut out = export(def.kind);

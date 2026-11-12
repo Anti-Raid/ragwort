@@ -1,20 +1,22 @@
-//! Coroutines, as Lua has them: each is a [`Task`] with a stack of its own, which `co/resume`
-//! runs until it yields, finishes or fails. Each has its own marks, prompts and continuation, so
-//! a yield doesn't leave what it's in: it's still there when the coroutine is resumed.
+//! Asymmetric coroutines modeled after Lua. Each coroutine is represented as a [`Task`] with its own
+//! stack, executed via `co/resume` until it yields, terminates, or encounters an uncaught error.
+//! Coroutines maintain independent continuation marks, prompts, and metacontinuations, preserving
+//! delimited context across yields.
 //!
-//! Switching is a cut, as a call of a one-shot continuation is: the side that's switched away
-//! from hands its frames to its chain, keeps where its stack's live part starts, and the stack
-//! moves to the other side's segment, whose chain then goes on in place. Nothing is copied.
+//! Coroutine context switching is implemented as a stack cut (analogous to invoking a one-shot
+//! continuation): the suspended task reifies its active frames into its continuation chain and
+//! preserves its base offset, while the VM stack switches to the target task's segment to resume in
+//! place without copying frames.
 //!
-//! A suspended coroutine needs no room past its frames, so once another has suspended since, its
-//! frames are copied to a segment of their own size when nothing else holds the segment they
-//! were on, which then goes to the task that's running as its spare: the next coroutine it
-//! resumes runs there, and the frames of one that was copied are copied back as it returns into
-//! them. Only the one that suspended last keeps its segment, so one resumed again and again, as a
-//! generator is, isn't copied at all.
+//! Suspended coroutines require no stack headroom beyond their live frames. When a coroutine suspends
+//! and another task runs, if its underlying segment is not referenced by any continuation, its live
+//! frames are compacted into a tightly-sized segment and the original segment is recycled as the
+//! active task's spare segment. Only the most recently suspended coroutine retains its full segment in
+//! place, allowing generators that alternate execution with a consumer to switch without any frame
+//! copying.
 //!
-//! A machine's own task is a coroutine too, which nothing in the arena resumed: a yield in it
-//! ends the run, and the machine is resumed from the host.
+//! The machine's root task is also structured as a coroutine; yielding from the root task suspends the
+//! machine and returns control to the host.
 
 use ragwort_types::gc::raw::Raw;
 use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Segment, Value, WINDOW};
@@ -25,8 +27,9 @@ use crate::machine::{Outer, Step, Then};
 use crate::objects::{Frames, FramesFields, Native, NativeFields, Task, TaskFields};
 use crate::{Fault, Outcome};
 
-/// The slots of a coroutine's first segment: a frame's window, and room past it for calls from
-/// it. Deeper calls move to a bigger segment, as any overflow does.
+/// The initial capacity allocated for a coroutine's first stack segment: accommodates one frame window
+/// plus 64 slots for immediate calls. Deeper calls trigger segment overflow and allocate larger
+/// segments.
 const FIRST_SEGMENT: usize = WINDOW + 64;
 
 pub(crate) const PENDING: u32 = 0;
@@ -34,12 +37,12 @@ pub(crate) const RUNNING: u32 = 1;
 pub(crate) const FINISHED: u32 = 2;
 pub(crate) const FAILED: u32 = 3;
 
-/// A pending coroutine that starts by calling `body`.
+/// Creates a pending coroutine initialized to invoke procedure `body` upon its first resumption.
 pub(crate) fn new<'gc>(mc: &Mutation<'gc>, body: Value<'gc>) -> Result<Gc<'gc, Task>, OutOfMemory> {
     task(mc, body, PENDING)
 }
 
-/// A machine's own task, running.
+/// Creates the root task for a machine, initialized in the running state.
 pub(crate) fn root<'gc>(mc: &Mutation<'gc>) -> Result<Gc<'gc, Task>, OutOfMemory> {
     task(mc, Value::FALSE, RUNNING)
 }
@@ -53,7 +56,8 @@ pub(crate) fn of<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> Option<Gc<'gc, Task>
     v.downcast::<Task>(mc)
 }
 
-/// The task running in a machine whose own task is `root`: the innermost one it resumed.
+/// Returns the currently active task in a machine rooted at `root` by traversing to the innermost
+/// resumed coroutine.
 pub(crate) fn current<'gc>(mc: &Mutation<'gc>, root: Gc<'gc, Task>) -> Gc<'gc, Task> {
     let mut task = root;
     while let Some(inner) = of(mc, task.resumed(mc)) {
@@ -62,7 +66,7 @@ pub(crate) fn current<'gc>(mc: &Mutation<'gc>, root: Gc<'gc, Task>) -> Gc<'gc, T
     task
 }
 
-/// Makes `segment`, which nothing holds, `task`'s spare, unless it has one.
+/// Assigns unreferenced `segment` as `task`'s spare segment if `task` does not already hold one.
 fn give<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, segment: Gc<'gc, Segment>) {
     if task.spare(mc).is_none() {
         task.set_spare(mc, Some(segment));
@@ -71,8 +75,8 @@ fn give<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, segment: Gc<'gc, Segment>)
 }
 
 impl<'gc> Outer<'_, 'gc> {
-    /// Resumes the coroutine `co` with `args`, for `co/resume`. The caller's continuation is on
-    /// its chain already.
+    /// Resumes coroutine `co` with arguments `args` (implementing `co/resume`), assuming the caller's
+    /// continuation has already been saved to its chain.
     pub(crate) fn resume_coroutine(&mut self, co: Value<'gc>, args: Args<'gc>) -> Step<'gc> {
         let mc = self.mc();
         let co = of(mc, co).ok_or(Fault::WrongType)?;
@@ -103,8 +107,8 @@ impl<'gc> Outer<'_, 'gc> {
         self.then(Then::Call(body, args))
     }
 
-    /// Suspends the running coroutine, for `co/yield`, so what resumed it goes on with
-    /// `yielded`. The coroutine's continuation is on its chain already.
+    /// Suspends the active coroutine (implementing `co/yield`), returning `yielded` to its resumer,
+    /// assuming the coroutine's continuation is already preserved on its chain.
     pub(crate) fn yield_coroutine(&mut self, yielded: Value<'gc>) -> Step<'gc> {
         let mc = self.mc();
         let from = self.task();
@@ -113,7 +117,7 @@ impl<'gc> Outer<'_, 'gc> {
             return Ok(Some(Outcome::Yielded(yielded)));
         };
         self.leave(from)?;
-        // A suspended coroutine keeps only the segments its frames are on.
+        // Clear any cached spare segment so a suspended coroutine retains only segments holding live frames.
         from.set_spare(mc, None);
         from.set_state(mc, PENDING);
         from.set_resumer(mc, Value::FALSE);
@@ -128,7 +132,8 @@ impl<'gc> Outer<'_, 'gc> {
         self.then(Then::Return(yielded))
     }
 
-    /// `args` as values, which for none are the same each time.
+    /// Converts `args` into a return value representation: returns a single value if one argument was
+    /// passed, a `MultiValue` if multiple, or an empty `MultiValue` if none.
     pub(crate) fn values(&self, args: Args<'gc>) -> Result<Value<'gc>, Fault> {
         let (mc, root) = (self.mc(), self.root);
         if args.len(mc)? != 0 {
@@ -140,14 +145,15 @@ impl<'gc> Outer<'_, 'gc> {
         Ok(root.none(mc))
     }
 
-    /// Ends the running coroutine as `state`, finished or failed, and goes back to `to`, which
-    /// resumed it, with nothing of it kept.
+    /// Terminates the active coroutine with final status `state` (completed or failed) and switches back
+    /// to its resumer `to`, releasing unheld stack segments.
     pub(crate) fn end(&mut self, task: Gc<'gc, Task>, state: u32, to: Gc<'gc, Task>) -> Result<(), Fault> {
         let mc = self.mc();
         let stack = &self.segments.stack;
         let base = stack.base();
         stack.set_top(base);
-        // With nothing below its base, nothing holds the segment.
+        // If base is 0, no continuation records hold frames on this segment, so the entire segment can be
+        // reclaimed.
         let freed = (base == 0).then(|| stack.segment(mc));
         task.set_state(mc, state);
         task.set_resumer(mc, Value::FALSE);
@@ -163,8 +169,8 @@ impl<'gc> Outer<'_, 'gc> {
         Ok(())
     }
 
-    /// A segment for a coroutine `from` resumes to run on: its spare, if that's free and big
-    /// enough, or a new one.
+    /// Allocates a segment for coroutine resumption: reuses `from`'s spare segment if available and
+    /// sufficiently sized, or allocates a new segment.
     fn free_segment(&self, from: Gc<'gc, Task>) -> Result<Gc<'gc, Segment>, Fault> {
         let mc = self.mc();
         if let Some(spare) = from.spare(mc)
@@ -178,8 +184,8 @@ impl<'gc> Outer<'_, 'gc> {
         Ok(Segment::new(mc, FIRST_SEGMENT)?)
     }
 
-    /// Keeps where the running task's frames are, for when it's resumed: none are live past
-    /// the stack's base, as its continuation is on its chain.
+    /// Preserves the active task's base offset and compacts idle segments before switching away, since
+    /// all live frames below base have been reified into its chain.
     fn leave(&mut self, task: Gc<'gc, Task>) -> Result<(), Fault> {
         let (mc, stack) = (self.mc(), &self.segments.stack);
         let base = stack.base();
@@ -189,13 +195,14 @@ impl<'gc> Outer<'_, 'gc> {
         Ok(())
     }
 
-    /// Goes back to `to`, which resumed the running task.
+    /// Switches execution context back to coroutine `to`, which originally resumed the active task.
     fn back(&mut self, to: Gc<'gc, Task>) -> Result<(), Fault> {
         to.set_resumed(self.mc(), Value::FALSE);
         self.enter_task(to)
     }
 
-    /// Moves the stack to where `task` left its frames, and makes it the running task.
+    /// Restores the stack segment and base pointer to where `task` suspended and sets it as the active
+    /// running task.
     fn enter_task(&mut self, task: Gc<'gc, Task>) -> Result<(), Fault> {
         let mc = self.mc();
         let segment = task.segment(mc).ok_or(Fault::Malformed)?;
@@ -208,10 +215,10 @@ impl<'gc> Outer<'_, 'gc> {
     }
 }
 
-/// Copies the frames of `task`, suspended, to a segment of their own size, if its chain's
-/// records hold all its segment has below its base and no continuation holds them, and returns
-/// that segment, which is then free. Only a few frames are copied, a window's worth, as a yield
-/// from deeper would copy them each time: their segment is mostly theirs anyway.
+/// Compacts a suspended task's frames into a tightly-sized segment if its continuation chain contains
+/// all frames below base and no external continuation references them, freeing the original segment.
+/// Only shallow stacks (within one frame window) are compacted to avoid repeated copying costs for
+/// deep call stacks.
 fn compact<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>) -> Result<Option<Gc<'gc, Segment>>, Fault> {
     let Some(segment) = task.segment(mc).filter(|_| task.state(mc) == PENDING) else { return Ok(None) };
     let (base, chain) = (task.base(mc) as usize, task.chain(mc));
@@ -229,8 +236,8 @@ fn compact<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>) -> Result<Option<Gc<'gc
     Ok(Some(segment))
 }
 
-/// Whether the records on top of `chain`, past natives, hold all of `segment` below `end`,
-/// one-shot and not owning it, as `each` is given them.
+/// Verifies whether one-shot records at the head of `chain` (skipping native records) encompass all
+/// frames in `segment` below `end` without retaining ownership, passing each visited record to `each`.
 fn holds<'gc>(mc: &Mutation<'gc>, mut chain: Value<'gc>, segment: Gc<'gc, Segment>, mut end: usize, mut each: impl FnMut(Gc<'gc, Frames>)) -> bool {
     while end > 0 {
         if let Some(native) = chain.downcast::<Native>(mc) {

@@ -12,7 +12,7 @@ fn error<'id>(t: &L3<'id, 'static>, root: Id<'id>) -> String {
     t.verify(root).expect_err("malformed")
 }
 
-/// A function of `params` and `body`.
+/// Builds a function with `params` and `body`.
 fn function<'id>(t: &mut L3<'id, 'static>, params: &[u32], body: Id<'id>) -> Fun<'id> {
     let params = t.list(params.iter().map(|&v| Var(v)));
     t.function(Function { id: 0, optional: 0, params, rest: None, body })
@@ -60,7 +60,7 @@ fn joins_take_their_parameters_and_have_one_parent() {
     });
 }
 
-/// A tree a million deep is checked and walked on a small stack.
+/// Checks and walks a tree one million nodes deep on a small machine stack.
 #[test]
 fn deep_trees_need_no_stack() {
     let run = || {

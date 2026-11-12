@@ -12,25 +12,26 @@ use crate::Fault;
 use crate::objects::{self, BoxFields, StructFields};
 use crate::structs::{self, TypeFlags};
 
-/// How many values `equal?` compares for each unit of fuel it spends.
+/// The number of value comparisons performed by `equal?` per unit of VM fuel consumed.
 pub(crate) const PER_FUEL: u64 = 1024;
 
-/// How many compound values `equal?` compares before it keeps classes, so comparing small
-/// values never hashes. It's Chez's `k0`, and the mean length of the stretches between.
+/// Threshold of compound value comparisons performed before activating union-find cycle detection
+/// (avoiding hash table overhead when comparing small values). Corresponds to Chez Scheme's `k0`
+/// and defines the mean length of fast comparison intervals.
 const PRECHECK: u64 = 200;
-/// How many compound values each stretch that keeps classes takes: Chez's `-kb`.
+/// Duration (in compound value comparisons) of each cycle-tracking interval, corresponding to Chez Scheme's `-kb`.
 const SLOW: u64 = 20;
 
-/// What each compound value in [`Classes`] is charged against the arena's budget.
+/// Memory allocation cost (in bytes) debited from the GC arena budget for each tracked compound value in [`Classes`].
 const CLASS_COST: usize = size_of::<(u64, usize, usize, u32)>() + 16;
 
-/// `eqv?`: the same object, or numbers of the same exactness and value.
+/// Implements Scheme `eqv?`: returns `true` if `a` and `b` are identical values/objects, or numbers with equal value and identical exactness.
 #[inline]
 pub(crate) fn eqv<'gc>(mc: &Mutation<'gc>, a: Value<'gc>, b: Value<'gc>) -> bool {
     if a == b {
         return true;
     }
-    // Different fixnums are different numbers.
+    // Two distinct fixnum bit patterns represent distinct integers and cannot be `eqv?`.
     if a.as_fixnum().is_some() && b.as_fixnum().is_some() {
         return false;
     }
@@ -41,11 +42,17 @@ pub(crate) fn eqv<'gc>(mc: &Mutation<'gc>, a: Value<'gc>, b: Value<'gc>) -> bool
     }
 }
 
-/// `equal?`: [`eqv?`](eqv), or strings of the same characters, or bytevectors of the same
-/// bytes, or pairs, vectors or boxes whose contents are `equal?`, or structs of one type whose
-/// fields are, unless it's an identity type. A vector's mutability doesn't matter, as in Racket. Also returns how many values it compared, a string or bytevector
-/// counting as one plus one per eight characters or bytes, or faults with [`Fault::OutOfFuel`]
-/// once that's past `most`.
+/// Implements Scheme `equal?` structural comparison with cycle detection and bounded fuel consumption.
+///
+/// Returns `Ok((true, compared_count))` if `a` and `b` are:
+/// - Equivalent under [`eqv?`](eqv);
+/// - Strings with identical character sequences;
+/// - Bytevectors with identical byte sequences;
+/// - Pairs, vectors, or boxes whose contents are recursively `equal?` (ignoring vector mutability, per Racket semantics);
+/// - Struct instances of the same struct type whose fields are pairwise `equal?`, provided the type is not an identity type.
+///
+/// Tracks fuel consumption (counting strings/bytevectors as 1 plus 1 per 8 characters or bytes)
+/// and raises [`Fault::OutOfFuel`] if comparison steps exceed `most`.
 pub(crate) fn equal<'gc>(mc: &Mutation<'gc>, a: Value<'gc>, b: Value<'gc>, most: u64) -> Result<(bool, u64), Fault> {
     let (strings, vectors) = (Strings::new(mc), Vectors::new(mc));
     let (mut next, mut todo, mut phases) = (Some((a, b)), ScratchVec::new(mc), Phases::new(mc));
@@ -129,15 +136,15 @@ pub(crate) fn equal<'gc>(mc: &Mutation<'gc>, a: Value<'gc>, b: Value<'gc>, most:
     }
 }
 
-/// What's still to compare: two values, or the items of two vectors, or the fields of two
-/// structs of one type, from an index on.
+/// Pending comparison tasks on the traversal stack: either a pair of arbitrary values,
+/// or corresponding elements of two vectors or struct instances starting from a given index offset.
 enum Work<'gc> {
     Values(Value<'gc>, Value<'gc>),
     Items(AnyVector<'gc>, AnyVector<'gc>, usize),
     Fields(Gc<'gc, objects::Struct>, Gc<'gc, objects::Struct>, usize),
 }
 
-/// A value `equal?` compares by its contents.
+/// A compound data type compared recursively by content in `equal?` (pair, vector, box, or non-identity struct).
 #[derive(Clone, Copy)]
 enum Compound<'gc> {
     Pair(Pair<'gc>),
@@ -154,7 +161,7 @@ impl<'gc> Compound<'gc> {
         if let Some(vector) = vectors.vector(v) {
             return Some(Compound::Vector(vector));
         }
-        // A struct of an identity type is `equal?` only to itself.
+        // Struct instances belonging to an identity type compare `equal?` strictly by pointer identity (`eq?`).
         if let Some(made) = v.downcast::<objects::Struct>(mc) {
             return made.kind(mc).is_some_and(|kind| !structs::type_flags(mc, kind).contains(TypeFlags::IDENTITY)).then_some(Compound::Struct(made));
         }
@@ -162,9 +169,11 @@ impl<'gc> Compound<'gc> {
     }
 }
 
-/// Which stretch a comparison is in: Chez's `k`, counted down by each two compound values
-/// compared. Above zero, they're compared as they are; from zero down to `-SLOW`, they're put
-/// in one class first, and two already in one aren't compared again.
+/// Tracks comparison phases using Chez Scheme's `k` counter, decremented for each compound pair compared.
+///
+/// When `k >= 0` (fast phase), values are compared directly without cycle tracking.
+/// When `-SLOW <= k < 0` (slow phase), values are merged into union-find equivalence classes
+/// to detect cycles and terminate recursion on circular structures.
 struct Phases<'gc> {
     k: i64,
     classes: Classes<'gc>,
@@ -180,8 +189,8 @@ impl<'gc> Phases<'gc> {
         }
     }
 
-    /// Whether `a` and `b`, compound values about to be compared by their contents, are
-    /// already known to be equal if the rest of the comparison finds so.
+    /// Checks whether compound values `a` and `b` have already been unified into the same equivalence class
+    /// during cycle detection, returning `true` to avoid re-comparing cycles.
     fn seen(&mut self, a: Value<'_>, b: Value<'_>) -> Result<bool, OutOfMemory> {
         if self.k == -(SLOW as i64) {
             self.k = (self.next_random() % (2 * PRECHECK)) as i64;
@@ -197,8 +206,8 @@ impl<'gc> Phases<'gc> {
         Ok(false)
     }
 
-    /// A xorshift generator, seeded from the process's random hash keys the first time, so the
-    /// stretches can't be lined up with a value made to defeat them.
+    /// A 64-bit xorshift pseudo-random number generator, initialized with process-randomized hash keys
+    /// on first access to randomize phase transitions and prevent adversarial inputs from triggering worst-case hashing behavior.
     fn next_random(&mut self) -> u64 {
         if self.random == 0 {
             self.random = RandomState::new().hash_one(self.classes.parent.len()) | 1;
@@ -212,7 +221,8 @@ impl<'gc> Phases<'gc> {
     }
 }
 
-/// Classes of compound values met, by identity: a union-find, by size, with path halving.
+/// Disjoint-set (union-find) data structure maintaining equivalence classes of visited compound values
+/// by object address, using union-by-size and path halving.
 struct Classes<'gc> {
     index: HashMap<u64, usize, BuildHasherDefault<WordHasher>>,
     parent: Vec<usize>,
@@ -221,7 +231,7 @@ struct Classes<'gc> {
 }
 
 impl Classes<'_> {
-    /// Puts `a` and `b` in one class. Returns whether they already were.
+    /// Merges the equivalence classes of values `a` and `b`. Returns `true` if they were already in the same equivalence class.
     fn union(&mut self, a: Value<'_>, b: Value<'_>) -> Result<bool, OutOfMemory> {
         let (x, y) = (self.find(a)?, self.find(b)?);
         if x == y {
@@ -253,9 +263,9 @@ impl Classes<'_> {
     }
 }
 
-/// Hashes the word of an object reference, whose index is in the high half and whose low bits
-/// are the same for every object of a type, by a folded multiply, which spreads both halves
-/// over all the bits.
+/// A fast 64-bit word hasher for object references whose index bits reside in the upper half and whose
+/// lower bits contain common type tags. Uses a 64-bit multiplicative constant with 128-bit XOR-folded products
+/// to disperse both high and low bits uniformly.
 #[derive(Default)]
 struct WordHasher(u64);
 

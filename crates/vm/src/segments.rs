@@ -1,16 +1,18 @@
-//! Chez Scheme's segmented stack: the live frames on the current segment, and under them, the
-//! chain of [`Frames`] records that hold the rest of the continuation.
+//! Segmented stack implementation based on Chez Scheme. Active execution frames reside on the current
+//! stack segment, while older continuation frames are reified into a linked chain of immutable
+//! [`Frames`] records.
 //!
-//! The frame at the stack's `base` has the [`Link::BOTTOM`] link, so returning from it
-//! underflows into the record on top of the chain. Making a record is a cut of the stack, not
-//! a copy, and no record is written again, so a continuation can be resumed any number of
-//! times. A record no continuation holds is one-shot, and is resumed in place, as Chez resumes
-//! one-shot continuations; any other is copied back a chunk at a time.
+//! The frame at the stack's `base` contains a sentinel [`Link::BOTTOM`] return link, causing a return
+//! to trigger an underflow that restores the topmost continuation record from the chain. Reifying
+//! frames cuts the active stack rather than copying it, and continuation records are immutable,
+//! allowing continuations to be invoked multiple times. One-shot continuation records (unreferenced by
+//! any stored continuation) are reclaimed in place, while multi-shot records are copied back onto the
+//! stack in chunks of [`CHUNK`] slots as needed.
 //!
-//! Marks are Chez's continuation attachments: a list in the task, which each record keeps as its
-//! top frame has it, and puts back when it's resumed, so marks set since are dropped. A frame
-//! that sets one for a call keeps its own under the callee's frame, as its link says, so the
-//! records cut between them keep those.
+//! Continuation marks (analogous to Chez Scheme continuation attachments) are maintained as an
+//! association list in the task. Each continuation record preserves the mark list of its top frame
+//! and restores it upon resumption. Frames that set marks for a call store them directly beneath the
+//! callee's frame, ensuring stack cuts preserve mark state across delimited extents.
 
 use ragwort_types::gc::raw::Raw;
 use ragwort_types::gc::{Frame, Gc, Mutation, Segment, Stack, Value, WINDOW};
@@ -21,29 +23,31 @@ use crate::frame::{self, Kept, Link};
 use crate::objects::{Frames, FramesFields, Native, NativeFields, Spill, SpillFields, Task, TaskFields};
 use crate::wind::Kind;
 
-/// The most slots of a record copied back onto the stack at once. The top frame is always
-/// copied whole; a deep continuation comes back a chunk at a time, as its frames return.
+/// The maximum number of stack slots copied from a multi-shot continuation record at one time. The
+/// topmost frame is always copied in full, while deep continuations are copied back incrementally in
+/// chunks as frames return.
 pub const CHUNK: usize = 1024;
 
-/// Where the inner loop goes on: the frame at `fp`, at instruction `pc`.
+/// Resume state for the inner loop, specifying the active frame pointer `fp` and instruction counter
+/// `pc`.
 pub(crate) struct Resume {
     pub(crate) fp: usize,
     pub(crate) pc: usize,
 }
 
-/// A task's stack and the records under it.
+/// Encapsulates a task's active stack segment and its underlying chain of continuation records.
 pub(crate) struct Segments<'a, 'gc> {
     pub(crate) mc: &'a Mutation<'gc>,
     pub(crate) stack: &'a mut Stack,
     pub(crate) task: Gc<'gc, Task>,
-    /// How many slots a new segment has.
+    /// The capacity (in slots) allocated for newly created stack segments.
     pub(crate) size: usize,
 }
 
 impl<'gc> Segments<'_, 'gc> {
-    /// Hands the live frames below `end` to a one-shot record on the chain, as Chez reifies a
-    /// continuation; the frame at `end` would have had `link`. If there are none, the frame at
-    /// `end` is the bottom one already, and the chain is its continuation as it is.
+    /// Reifies the live stack frames below `end` into a one-shot continuation record on the chain,
+    /// writing `link` as the return link for the frame at `end`. If no frames exist below `end`, the frame
+    /// at `end` is already at the base of the stack and the chain remains unchanged.
     pub(crate) fn reify(&mut self, end: usize, link: Link) -> Result<(), Fault> {
         let start = self.stack.base();
         if end <= start {
@@ -55,10 +59,10 @@ impl<'gc> Segments<'_, 'gc> {
         self.push(segment, start, end, link, marks, false)
     }
 
-    /// Moves the frame at `fp`, with the slots up to `end` it holds a call in, to another
-    /// segment, where it's the bottom frame, as Chez does when a segment overflows. The frames
-    /// under it go to a one-shot record that owns the rest of this segment. `need` is how many
-    /// slots it takes from `fp` on. Returns where the frame is now.
+    /// Handles segment overflow by transferring the call frame at `fp` (up to `end`) onto a new stack
+    /// segment as the bottom frame, requiring `need` slots. Frames below `fp` are reified into a one-shot
+    /// record owning the remainder of the current segment. Returns the frame's new pointer on the fresh
+    /// segment.
     pub(crate) fn overflow(&mut self, fp: usize, end: usize, need: usize) -> Result<usize, Fault> {
         let mc = self.mc;
         let len = end.checked_sub(fp).filter(|&n| n <= WINDOW).ok_or(Fault::Malformed)?;
@@ -84,9 +88,10 @@ impl<'gc> Segments<'_, 'gc> {
         Ok(at)
     }
 
-    /// Resumes the record on top of the chain, as Chez's `dounderflow` does, putting its marks
-    /// back. A one-shot record is taken back in place; any other is split if it's deep, and its
-    /// top frames copied to the stack. Returns `None` if the chain is empty.
+    /// Handles stack underflow by restoring the topmost continuation record from the chain (analogous to
+    /// Chez Scheme's `dounderflow`), restoring its continuation marks. Reclaims one-shot records in
+    /// place; splits deep multi-shot records and copies their topmost frames onto the stack. Returns
+    /// `None` if the continuation chain is empty.
     pub(crate) fn underflow(&mut self) -> Result<Option<Resume>, Fault> {
         let (mc, task) = (self.mc, self.task);
         let head = task.chain(mc);
@@ -149,9 +154,9 @@ impl<'gc> Segments<'_, 'gc> {
         Ok(Some(Resume { fp: at + (top - split), pc: link.pc }))
     }
 
-    /// Gives the frames just copied to `slots` spills of their own. A spill holds what its frame's
-    /// registers can't, and the record they're copied from, which a continuation may resume
-    /// again, keeps its frames' as they were.
+    /// Duplicates spill tables for frames copied into `slots`, ensuring newly active frames have
+    /// independent spill storage while preserving original spills in multi-shot continuation records for
+    /// future resumptions.
     fn own_spills(&self, slots: std::ops::Range<usize>) -> Result<(), Fault> {
         let mc = self.mc;
         for i in slots {
@@ -169,13 +174,13 @@ impl<'gc> Segments<'_, 'gc> {
         Ok(())
     }
 
-    /// Whether a bottom frame with `len` slots under it fits on this segment.
+    /// Returns whether a base frame with `len` underlying slots can fit within the current stack segment.
     pub(crate) fn fits(&self, len: usize) -> bool {
         self.stack.base() + len + WINDOW <= self.stack.segment(self.mc).len(self.mc)
     }
 
-    /// Where a bottom frame goes with `len` slots under it: at the stack's base, or on another
-    /// segment if this one has no room.
+    /// Determines the frame pointer for a bottom frame requiring `len` underlying slots: places it at the
+    /// current segment base if space permits, or allocates a new segment.
     pub(crate) fn bottom(&mut self, len: usize) -> Result<usize, Fault> {
         let base = self.stack.base();
         if self.fits(len) {
@@ -186,10 +191,9 @@ impl<'gc> Segments<'_, 'gc> {
         Ok(self.stack.base())
     }
 
-    /// Sets the mark for `key` on the frame at the bottom of the stack, as Chez sets an
-    /// attachment: the frame's own marks are the ones above those its continuation puts back,
-    /// and one for `key` among them is replaced rather than pushed, so a loop that sets one in
-    /// tail position stays in constant space.
+    /// Sets continuation mark `key` on the base stack frame. Replaces any existing mark for `key`
+    /// belonging to this frame rather than prepending a new entry, ensuring tail-recursive loops setting
+    /// marks operate in constant space.
     pub(crate) fn set_mark(&self, key: Value<'gc>, value: Value<'gc>) -> Result<(), Fault> {
         let (mc, task) = (self.mc, self.task);
         let restored = restored(mc, task.chain(mc));
@@ -217,9 +221,9 @@ impl<'gc> Segments<'_, 'gc> {
         self.stack.frame(self.mc, fp).ok_or(Fault::Malformed)
     }
 
-    /// Moves the stack to the spare segment, if it has `need` slots past its base, or a new one,
-    /// twice the size of the one it's on, up to the task's `size`, as a coroutine's stack starts
-    /// small.
+    /// Switches the stack to the task's spare segment if it provides `need` available slots, or allocates
+    /// a new segment doubling the current capacity (up to `Segments.size`), allowing coroutine stacks to
+    /// grow dynamically from an initial small size.
     fn move_to(&mut self, need: usize) -> Result<(), Fault> {
         let (mc, task) = (self.mc, self.task);
         if let Some(spare) = task.spare(mc) {
@@ -237,8 +241,9 @@ impl<'gc> Segments<'_, 'gc> {
         Ok(())
     }
 
-    /// The marks of the caller of the frame at `fp`, whose link is `link`: the task's, unless the
-    /// call set a mark, and the caller kept its own under the frame.
+    /// Retrieves the continuation marks belonging to the caller of the frame at `fp` (governed by
+    /// `link`): returns the task's active marks unless the call established marks, in which case previous
+    /// marks were preserved directly beneath the frame.
     fn marks_under(&self, fp: usize, link: Link) -> Result<Value<'gc>, Fault> {
         if !link.marks {
             return Ok(self.task.attachments(self.mc));
@@ -255,9 +260,9 @@ impl<'gc> Segments<'_, 'gc> {
     }
 }
 
-/// Makes the records of `chain` multi-shot, as a continuation that holds them needs: they're
-/// copied when resumed from then on, not taken back in place. One-shot records are only ever on
-/// top of a chain, as in Chez, so this stops at the first that isn't.
+/// Marks one-shot continuation records in `chain` as multi-shot, ensuring they are copied rather than
+/// resumed in place when reinstated by captured continuations. Traversal stops at the first multi-shot
+/// record since one-shot records only ever reside at the head of the chain.
 pub(crate) fn promote<'gc>(mc: &Mutation<'gc>, mut chain: Value<'gc>) {
     loop {
         if let Some(record) = chain.downcast::<Frames>(mc) {
@@ -274,10 +279,10 @@ pub(crate) fn promote<'gc>(mc: &Mutation<'gc>, mut chain: Value<'gc>) {
     }
 }
 
-/// The continuation `chain` goes on with from where `guard` was set, or `None` if it's not in
-/// `chain`: from the caller of the frame it was set for, which keeps it under that frame, or
-/// from under the [`Kind::Guarded`] record that holds it. What's above is dropped, and the
-/// records under it are shared, not copied.
+/// Slices `chain` down to the continuation where `guard` was established, returning `None` if `guard`
+/// is not present in `chain`. Unwinds either to the caller of the guarded frame (stored below its
+/// frame) or below the [`Kind::Guarded`] native record. Discards intervening records while sharing
+/// underlying records without copying.
 pub(crate) fn cut_at<'gc>(mc: &Mutation<'gc>, mut chain: Value<'gc>, guard: Value<'gc>) -> Result<Option<Cut<'gc>>, Fault> {
     loop {
         if let Some(native) = chain.downcast::<Native>(mc) {
@@ -317,23 +322,24 @@ pub(crate) fn cut_at<'gc>(mc: &Mutation<'gc>, mut chain: Value<'gc>, guard: Valu
     }
 }
 
-/// A continuation [`cut_at`] a guard: its chain and marks, and if the record on top is one-shot,
-/// its segment from where it ends now. Those above it were one-shot too, and nothing else holds
-/// what they had of the segment, so the stack can take it back.
+/// Represents a continuation sliced at a guard boundary via [`cut_at`]: contains the resumed
+/// continuation chain, active marks, and, if the topmost record was one-shot, its segment bounds so
+/// the stack can reclaim the freed segment space.
 pub(crate) struct Cut<'gc> {
     pub(crate) chain: Value<'gc>,
     pub(crate) marks: Value<'gc>,
     pub(crate) free: Option<(Gc<'gc, Segment>, usize)>,
 }
 
-/// Where the segment of the record on top of `chain` is free from, if it's one-shot: where it
-/// ends, or `at` if it's cut there.
+/// Returns the segment and free offset for the head record of `chain` if it is one-shot, returning
+/// either `at` (if cut at a specific boundary) or the record's natural end offset.
 fn free<'gc>(mc: &Mutation<'gc>, chain: Value<'gc>, at: Option<usize>) -> Option<(Gc<'gc, Segment>, usize)> {
     let record = chain.downcast::<Frames>(mc).filter(|record| record.one_shot(mc))?;
     Some((record.segment(mc)?, at.unwrap_or(record.end(mc) as usize)))
 }
 
-/// The marks the record on top of `chain` puts back, or none if it's empty.
+/// Returns the continuation marks restored by the topmost record in `chain`, or `Value::NIL` if the
+/// chain is empty.
 pub(crate) fn restored<'gc>(mc: &Mutation<'gc>, chain: Value<'gc>) -> Value<'gc> {
     if let Some(record) = chain.downcast::<Frames>(mc) {
         record.attachments(mc)

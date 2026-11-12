@@ -1,9 +1,8 @@
-//! What an image needs to hold the VM's objects: see [`ragwort_types::gc::image`].
+//! Defines the metadata and registries required to serialize and deserialize VM objects in heap images (see [`ragwort_types::gc::image`]).
 //!
-//! - [`descs`]: the VM's object types.
-//! - [`kinds`]: the frozen values they hold, such as a function's instructions.
-//! - [`Hosts`]: the host functions a loaded image's code can call. A module's host functions
-//!   are saved by name, and found again among these.
+//! - [`descs`]: Garbage collector descriptors for all VM object types.
+//! - [`kinds`]: Registrations for frozen value types embedded within VM objects (such as compiled instruction buffers).
+//! - [`Hosts`]: Registry of host functions callable by code in a loaded image. When serialized, host functions are referenced by module path and re-resolved against this table upon deserialization.
 
 use std::cell::RefCell;
 
@@ -15,7 +14,7 @@ use crate::objects::Vm;
 use crate::syntax_case::{Item, Pattern, PatternShape, Repeat, Template, TemplateShape};
 use crate::{Capture, Fault, HostDef, Intrinsic, Op, Request};
 
-/// A number that changes when the form of anything the VM saves does, for an image's stamp.
+/// A combined hash of the serialized layout (wire shape) of all VM structures, used as a schema stamp to validate image compatibility upon loading.
 pub const SHAPE: u64 = {
     let shapes = [
         Op::SHAPE,
@@ -39,39 +38,48 @@ pub const SHAPE: u64 = {
     shape
 };
 
-/// The host functions an image is loaded with, which a [`Reader`] is given to find those the
-/// image names.
+/// Registry of available host functions provided when loading an image, used by the image [`Reader`] to resolve host function references by path.
 pub struct Hosts {
     hosts: Vec<&'static HostDef>,
     missing: RefCell<Option<String>>,
 }
 
 impl Hosts {
-    pub fn new(hosts: impl IntoIterator<Item = &'static HostDef>) -> Self {
-        Self { hosts: hosts.into_iter().collect(), missing: RefCell::new(None) }
+    /// Creates a host function registry from an iterator of [`HostDef`] definitions. Returns an error containing the colliding path if multiple distinct host functions share the same [`HostDef::path`].
+    pub fn new(given: impl IntoIterator<Item = &'static HostDef>) -> Result<Self, &'static str> {
+        let mut hosts: Vec<&'static HostDef> = Vec::new();
+        for host in given {
+            match hosts.iter().find(|other| other.path == host.path) {
+                Some(other) if other.id == host.id => {}
+                Some(_) => return Err(host.path),
+                None => hosts.push(host),
+            }
+        }
+        Ok(Self { hosts, missing: RefCell::new(None) })
     }
 
-    /// The name of a host function the image named that isn't among these, if a load failed
-    /// for that.
+    /// Returns the name of the missing host function if image deserialization failed due to an unresolved host function reference.
     pub fn missing(&self) -> Option<String> {
         self.missing.borrow().clone()
     }
 }
 
-/// A host function is saved as its name and how many arguments it takes.
+/// Serializes a host function reference by its module path, function name, and expected arity. When deserialized, these attributes must match an entry registered in [`Hosts`].
 impl Wire for &'static HostDef {
-    const SHAPE: u64 = shape_of("HostDef name arity");
+    const SHAPE: u64 = shape_of("HostDef path name arity");
 
     fn write(&self, out: &mut Writer) {
+        out.bytes(self.path.as_bytes());
         out.bytes(self.name.as_bytes());
         self.arity.write(out);
     }
 
     fn read(input: &mut Reader<'_>) -> Result<Self, Malformed> {
+        let path = std::str::from_utf8(input.bytes()?).map_err(|_| Malformed)?;
         let name = std::str::from_utf8(input.bytes()?).map_err(|_| Malformed)?;
         let arity = i64::read(input)?;
         let hosts = input.context::<Hosts>()?;
-        let found = hosts.hosts.iter().find(|host| host.name == name && host.arity == arity).copied();
+        let found = hosts.hosts.iter().find(|host| host.path == path && host.name == name && host.arity == arity).copied();
         if found.is_none() {
             hosts.missing.borrow_mut().get_or_insert_with(|| name.to_string());
         }
@@ -79,13 +87,12 @@ impl Wire for &'static HostDef {
     }
 }
 
-/// The VM's object types.
+/// Returns the slice of garbage collector descriptors ([`Desc`]) for all VM object types.
 pub fn descs() -> &'static [&'static Desc] {
     Vm::DESCS
 }
 
-/// The kinds of frozen value the VM's objects hold, but a module's interface, which is its
-/// compiler's.
+/// Returns the list of [`Kind`] registrations for all frozen value types stored inside VM objects, excluding the module interface (which is defined by the compiler).
 pub fn kinds() -> Vec<Kind> {
     vec![
         Kind::of::<Box<[Op]>>(),

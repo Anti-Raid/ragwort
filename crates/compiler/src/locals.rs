@@ -1,14 +1,12 @@
-//! Pass 3b (`L2 -> L2`): a struct that only the code that makes it uses becomes variables.
+//! Scalar replacement of local structs (`L2 -> L2`).
 //!
-//! It runs on what cp0 made, so a struct handed to a procedure that cp0 inlined counts as used
-//! only by what that procedure did with it.
+//! Runs after cp0 so uses exposed by inlining can qualify. A struct used only through eligible
+//! field reads and writes can be replaced by field variables. For example, `(let ((c (cell 0)))
+//! (set-cell-v! c 5) (cell-v c))` becomes a local variable initialized to zero, assigned five, then
+//! read.
 //!
-//! In `(let ((c (cell 0))) (set-cell-v! c 5) (cell-v c))`, nothing but the reads and the set
-//! can tell `c` from a variable that holds its field, so that's what it becomes: the `let`
-//! binds the variable, the set assigns it, and the read is a reference to it.
-//!
-//! A struct is left as it is if any use of its variable is something else: it's passed to a
-//! procedure that's still called, returned, stored, compared, or tested for being true.
+//! Keep the allocation if any use requires the struct itself, such as a remaining procedure call,
+//! return, store, comparison, or truth test.
 
 use ragwort_types::gc::{Gc, Mutation};
 use ragwort_vm::objects::{StructType, StructTypeFields};
@@ -19,22 +17,23 @@ use crate::ir::Supply;
 use crate::ir::l2::{Bind, Id, L2, Node};
 use crate::{Prim, Var};
 
-/// A struct a `let` binds a variable to: its type, and the `let`.
+/// A struct allocation bound by a `let`, recording its type and binding node.
 struct Made<'id, 'gc> {
     kind: Gc<'gc, StructType>,
     binder: Id<'id>,
-    /// The reads and sets of its fields, which are all its variable's uses if it's replaced.
+    /// Field reads and writes. Replacement is allowed only when these account for every use of the
+    /// struct variable.
     uses: Vec<(Id<'id>, Use<'id>)>,
 }
 
-/// A use of a struct's variable that a variable for the field can stand in for.
+/// A field operation that can be replaced by a read or write of a local variable.
 #[derive(Clone, Copy)]
 enum Use<'id> {
     Read(usize),
     Write(usize, Id<'id>),
 }
 
-/// Replaces each struct from `root` that only reads and sets of its fields use.
+/// Replaces eligible structs reachable from `root` when all uses are field reads or writes.
 pub(crate) fn replace<'id, 'gc>(mc: &Mutation<'gc>, tree: &mut L2<'id, 'gc>, root: Id<'id>, supply: &mut Supply) {
     let (mut made, mut refs, mut assigned) = (HashMap::<Var, Made<'id, 'gc>>::default(), HashMap::<Var, usize>::default(), HashSet::default());
     for id in tree.deep(root) {
@@ -67,8 +66,8 @@ pub(crate) fn replace<'id, 'gc>(mc: &Mutation<'gc>, tree: &mut L2<'id, 'gc>, roo
     }
 }
 
-/// What `id` does with a field of one of the `made` structs, and the struct's variable, if it
-/// reads or sets one in a way that can't fault.
+/// Recognizes a nonfaulting field operation at `id` on a struct in `made`, returning its variable
+/// and field operation.
 fn field_use<'id, 'gc>(mc: &Mutation<'gc>, tree: &L2<'id, 'gc>, made: &HashMap<Var, Made<'id, 'gc>>, id: Id<'id>) -> Option<(Var, Use<'id>)> {
     let Node::Intrinsic(Prim::Intrinsic(intrinsic), args) = tree[id] else { return None };
     let args = &tree[args];
@@ -79,7 +78,8 @@ fn field_use<'id, 'gc>(mc: &Mutation<'gc>, tree: &L2<'id, 'gc>, made: &HashMap<V
         _ => None,
     };
     let index = |at: usize| usize::try_from(constant(at)?.as_fixnum()?).ok();
-    // A field read or set by a type is one of the struct's if the struct is of the type.
+    // A typed field access is valid when the allocated struct derives from the requested type and the
+    // index is in range.
     let by_type = |at: usize| {
         let kind = constant(1)?.downcast::<StructType>(mc)?;
         index(at).filter(|&k| structs::derives(mc, made_as, kind) && k < kind.fields(mc) as usize)
@@ -93,8 +93,8 @@ fn field_use<'id, 'gc>(mc: &Mutation<'gc>, tree: &L2<'id, 'gc>, made: &HashMap<V
     Some((v, field))
 }
 
-/// Makes the struct `v` is bound to into its fields: a variable for each that's set or whose
-/// value has to be evaluated, and the value itself for any other.
+/// Replaces the struct bound to `v` with its fields. Creates variables for mutable fields and
+/// initializers that require evaluation; reuses other field values directly.
 fn fields_for<'id, 'gc>(tree: &mut L2<'id, 'gc>, v: Var, made: &Made<'id, 'gc>, assigned: &HashSet<Var>, supply: &mut Supply) {
     let Node::Let(binds, body) = tree[made.binder] else { unreachable!("a struct's variable is bound by a let") };
     let mut binds = tree[binds].to_vec();

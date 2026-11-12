@@ -86,6 +86,13 @@ fn code_requires_the_modules_the_command_line_names() {
     let failing = file(&root, "failing.rg", "(require lib/text)\n(twice 'two)");
     assert_eq!(Program::new(library(&root)).unwrap().run_file(&failing, true), Err(vec!["uncaught: #<error WrongType>".to_string()]));
     assert_eq!(Program::new(library(&root)).unwrap().run_file(&failing, false), Ok(()));
+    // A module that's required runs as an entry point does: what it drops as it starts is
+    // collected as it goes, however much that is.
+    let churn = "(define (churn i last) (if (= i 0) (vector-length last) (churn (- i 1) (make-vector 200000 i))))";
+    file(&root, "heavy/heavy.rg", &format!("(provide made)\n{churn}\n(define made (churn 400 #f))"));
+    let mut heavy = Program::new(vec![dir("heavy", &root.join("heavy"))]).unwrap();
+    assert_eq!(eval(&mut heavy, "(require heavy) made"), values(&["200000"]));
+    assert_eq!(eval(&mut heavy, &format!("{churn} (churn 400 #f)")), values(&["200000"]));
     // A long run is stepped, so what it drops is collected as it goes.
     let long = file(&root, "long.rg", "(define (count i acc) (if (= i 0) (length acc) (count (- i 1) (cons i '()))))\n(count 3000000 '())");
     assert_eq!(Program::new(Vec::new()).unwrap().run_file(&long, true), Ok(()));

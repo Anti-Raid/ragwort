@@ -237,6 +237,76 @@ fn an_image_holds_modules_for_another_arena() {
     assert_eq!(cut, Err(image::ImageError::Load(ragwort_types::gc::image::LoadError::Malformed)));
 }
 
+/// Two host functions of one name, which do different things: each is a module's own.
+mod sums {
+    use super::*;
+
+    fn combine<'s, 'gc>(_: &mut ragwort_vm::HostContext<'s, 'gc>, args: ragwort_vm::HostArgs<'s, 'gc>) -> Result<ragwort_vm::Reply<'gc>, Fault> {
+        let sum = args.iter().map(|v| v.as_fixnum().ok_or(Fault::WrongType)).sum::<Result<i64, _>>()?;
+        Ok(ragwort_vm::Reply::Value(Value::fixnum(sum).ok_or(Fault::OutOfRange)?))
+    }
+
+    pub static HOSTS: [HostDef; 1] = [ragwort_vm::host!("combine", 2, ragwort_vm::Purity::Impure, combine)];
+}
+
+mod products {
+    use super::*;
+
+    fn combine<'s, 'gc>(_: &mut ragwort_vm::HostContext<'s, 'gc>, args: ragwort_vm::HostArgs<'s, 'gc>) -> Result<ragwort_vm::Reply<'gc>, Fault> {
+        let product = args.iter().map(|v| v.as_fixnum().ok_or(Fault::WrongType)).product::<Result<i64, _>>()?;
+        Ok(ragwort_vm::Reply::Value(Value::fixnum(product).ok_or(Fault::OutOfRange)?))
+    }
+
+    pub static HOSTS: [HostDef; 1] = [ragwort_vm::host!("combine", 2, ragwort_vm::Purity::Impure, combine)];
+}
+
+/// Two different functions written the same way in one place, which nothing tells apart by
+/// where they are.
+static TWINS: [HostDef; 2] = [
+    {
+        fn twin<'s, 'gc>(_: &mut ragwort_vm::HostContext<'s, 'gc>, _: ragwort_vm::HostArgs<'s, 'gc>) -> Result<ragwort_vm::Reply<'gc>, Fault> {
+            Ok(ragwort_vm::Reply::Value(Value::TRUE))
+        }
+        ragwort_vm::host!("twin", 0, ragwort_vm::Purity::Impure, twin)
+    },
+    {
+        fn twin<'s, 'gc>(_: &mut ragwort_vm::HostContext<'s, 'gc>, _: ragwort_vm::HostArgs<'s, 'gc>) -> Result<ragwort_vm::Reply<'gc>, Fault> {
+            Ok(ragwort_vm::Reply::Value(Value::FALSE))
+        }
+        ragwort_vm::host!("twin", 0, ragwort_vm::Purity::Impure, twin)
+    },
+];
+
+#[test]
+fn an_image_names_each_host_function_by_where_it_is() {
+    assert_ne!(sums::HOSTS[0].path, products::HOSTS[0].path);
+    assert!(sums::HOSTS[0].path.ends_with("tests::sums::combine"), "{}", sums::HOSTS[0].path);
+    let wrapper = "(%provide combine) (%define combine (%lambda (a b) (%call-host combine a b)))";
+    let user = "(require (prefix-in s: sums) (prefix-in p: products)) (list (s:combine 3 4) (p:combine 3 4) (map s:combine '(1 2) '(3 4)) (map p:combine '(1 2) '(3 4)))";
+    let mut arena = arena();
+    module_hosting(&mut arena, "sums", &sums::HOSTS, &[(Native, wrapper)]).unwrap().unwrap();
+    module_hosting(&mut arena, "products", &products::HOSTS, &[(Native, wrapper)]).unwrap().unwrap();
+    assert_eq!(module_in(&mut arena, "user", &[(Scheme, user)]), Ok(Ok("(7 12 (4 6) (3 8))".into())));
+    arena.collect();
+    let bytes = arena.mutate(|mc| image::save(mc, &[mc.root(0), mc.root(1), mc.root(2)])).unwrap();
+    // Whichever order they're given in, each module calls its own.
+    for hosts in [[&sums::HOSTS[0], &products::HOSTS[0]], [&products::HOSTS[0], &sums::HOSTS[0]]] {
+        let mut other = Arena::new(1 << 24, 3);
+        other.mutate(|mc| {
+            let roots = image::load(mc, &bytes, hosts).unwrap();
+            roots.iter().enumerate().for_each(|(i, &root)| mc.set_root(i, root));
+        });
+        assert_eq!(module_in(&mut other, "after", &[(Scheme, user)]), Ok(Ok("(7 12 (4 6) (3 8))".into())));
+    }
+    let load = |hosts: Vec<&'static HostDef>| Arena::new(1 << 24, 3).mutate(|mc| image::load(mc, &bytes, hosts).map(|roots| roots.len()));
+    // One that's given twice is one, and one that isn't given is missed by name.
+    assert_eq!(load(vec![&sums::HOSTS[0], &products::HOSTS[0], &sums::HOSTS[0]]), Ok(3));
+    assert_eq!(load(vec![&sums::HOSTS[0]]), Err(image::ImageError::Host("combine".into())));
+    // Two that an image couldn't tell apart aren't taken.
+    assert_eq!(TWINS[0].path, TWINS[1].path);
+    assert_eq!(load(vec![&sums::HOSTS[0], &products::HOSTS[0], &TWINS[0], &TWINS[1]]), Err(image::ImageError::SameHost(TWINS[0].path)));
+}
+
 #[test]
 fn structs_provided_without_their_constructor_are_only_matched() {
     use ragwort_native::LowerErrorKind;

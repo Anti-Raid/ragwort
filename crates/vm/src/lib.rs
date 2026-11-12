@@ -1,4 +1,4 @@
-//! Ragwort's virtual machine: register-based bytecode run over the arena's segmented stacks.
+//! Ragwort's virtual machine: executes register-based bytecode using segmented stacks allocated in the garbage-collected arena.
 
 mod args;
 mod coroutine;

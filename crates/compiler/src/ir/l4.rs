@@ -1,9 +1,9 @@
-//! `L4`, after closure conversion, as a table of nodes that refer to their children by [`Id`].
+//! `L4`: closure-converted nodes whose children are referenced by [`Id`].
 //!
-//! Nothing in a node owns anything: the table is a few flat vectors, which drop without
-//! recursion however deep the tree in them. Each table is made by [`scope`] under a lifetime of
-//! its own, which its ids carry, so an id of one table can't index another. Only the table makes
-//! ids and spans, and it only grows, so they're always in bounds.
+//! Nodes do not own subtrees. Flat vectors own the data, so destruction does not recurse through
+//! the tree. [`scope`] gives each table a fresh lifetime brand, preventing IDs from different
+//! tables from being mixed. Only the table constructs IDs and spans; append-only storage keeps
+//! those indices valid.
 
 use ragwort_types::gc::Value;
 
@@ -22,12 +22,12 @@ language! {
         If(test: Id<'id>, then: Id<'id>, other: Id<'id>),
         Seq(first: Id<'id>, second: Id<'id>),
         Let(binds: Span<'id, Bind<'id>>, body: Id<'id>),
-        /// Its scope, in which [`Node::Jump`]s to one of its codes go to it, as they do in the
-        /// codes.
+        /// A scope and its join definitions. [`Node::Jump`] can target these joins from the scope or from
+        /// any join body in the group.
         Join(scope: Id<'id>, codes: Span<'id, JoinCode<'id>>),
         /// A jump to a join of an enclosing [`Node::Join`] with values for its parameters.
         Jump(join: Var, args: Span<'id, Id<'id>>),
-        /// An assignment of a local of the frame, which evaluates to void.
+        /// Assigns a local variable in the current frame and evaluates to void.
         Set(var: Var, value: Id<'id>),
         App(callee: Id<'id>, args: Span<'id, Id<'id>>),
         Lambda(fun: Fun<'id>),
@@ -39,11 +39,11 @@ language! {
     leaves { Value<'gc>, VarRef, Var, Prim }
 }
 
-/// One of a [`Node::Let`]'s bindings, in scope for those after it and its body.
+/// A [`Node::Let`] binding, visible to subsequent bindings and the body.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Bind<'id> {
     Val(Var, Id<'id>),
-    /// Closures, in scope in each other's code too.
+    /// A mutually recursive closure group, with every closure visible in every body.
     Fix(Span<'id, (Var, Fun<'id>)>),
 }
 
@@ -63,7 +63,7 @@ impl<'id, 'gc> Bodies<'id, 'gc> for Bind<'id> {
     }
 }
 
-/// A join's code: `body`, with `params` bound to the values a jump to `id` has.
+/// Join body `body`, with `params` bound to the values supplied by a jump to `id`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct JoinCode<'id> {
     pub(crate) id: Var,
@@ -93,7 +93,7 @@ pub(crate) struct Closure<'id> {
 }
 
 impl<'id, 'gc> L4<'id, 'gc> {
-    /// The variables `bind` binds.
+    /// Returns the variables introduced by `bind`.
     pub(crate) fn vars(&self, bind: Bind<'id>) -> impl Iterator<Item = Var> + '_ {
         let (one, group) = match bind {
             Bind::Val(v, _) => (Some(v), &[][..]),
@@ -102,7 +102,7 @@ impl<'id, 'gc> L4<'id, 'gc> {
         one.into_iter().chain(group.iter().map(|&(v, _)| v))
     }
 
-    /// Panics if the tree from `root` isn't well-formed, as a debug build checks.
+    /// Panics if the tree rooted at `root` is malformed. Used by debug-build checks.
     #[cfg(debug_assertions)]
     pub(crate) fn check(&self, root: Id<'id>) {
         if let Err(e) = self.verify(root) {
@@ -110,10 +110,10 @@ impl<'id, 'gc> L4<'id, 'gc> {
         }
     }
 
-    /// Whether the tree from `root`, and the code of each closure in it, is well-formed: each node
-    /// and closure has one parent, each variable is bound once and used only in scope, each jump
-    /// is to a join in scope in its function with as many values as the join takes, and each
-    /// upvalue and capture is one the function has. Nodes nothing reaches aren't checked.
+    /// Checks the tree and closure bodies reachable from `root`. Nodes and closures must have one
+    /// parent; variables must be uniquely bound and used within scope. Jumps must target an in-scope
+    /// join in the same function with matching arity. Upvalue and capture references must be valid for
+    /// their functions. Unreachable nodes are ignored.
     #[cfg(any(debug_assertions, test))]
     pub(crate) fn verify(&self, root: Id<'id>) -> Result<(), String> {
         use crate::hash::{HashMap, HashSet};
@@ -127,7 +127,7 @@ impl<'id, 'gc> L4<'id, 'gc> {
             Unjoin(Span<'id, JoinCode<'id>>),
             Leave,
         }
-        /// What's in scope in a function.
+        /// The lexical bindings and joins in scope within a function.
         #[derive(Default)]
         struct Scope {
             locals: HashSet<Var>,

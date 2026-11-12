@@ -1,49 +1,47 @@
-//! Work that would recurse as deeply as what it works on nests, as the front ends' expansion
-//! into [`Core`](crate::Core) would, done from a stack of its own instead.
+//! An explicit continuation stack for work that would otherwise recurse with input depth, such as
+//! expansion into [`Core`](crate::Core).
 //!
-//! A step is done, with what it makes, or needs what a call makes first: it goes on with that
-//! once it's made, or, if it makes just what the call does, it's the call's. What goes on after
-//! each call waits on a stack in the heap, so the machine's stack holds one step at a time, and
-//! the work is done in the order the recursion would have done it.
+//! Each step returns a result, requests a call followed by a continuation, delegates to a tail
+//! call, or requests several calls in order. Pending continuations live on a heap-allocated stack.
+//! The driver preserves recursive execution order while using a bounded machine stack.
 
-/// What a step of work over a state `S` does next, with calls `C` that each make a `T`.
+/// The next action over state `S`, where calls of type `C` produce results of type `T`.
 pub enum Step<'k, S: ?Sized, C, T, E> {
     Done(T),
-    /// Makes what `C` does, then goes on with it.
+    /// Runs a call, then passes its result to the continuation.
     Call(C, Then<'k, S, C, T, E>),
-    /// Makes just what `C` does.
+    /// Delegates to a call and returns its result directly.
     Tail(C),
-    /// Makes what each of the calls does, in order, then goes on with all they made.
+    /// Runs calls in order, then passes all results to the continuation.
     All(Vec<C>, Gathered<'k, S, C, T, E>),
 }
 
-/// What goes on once a call is done, with what it made.
+/// A continuation that receives a completed call's result.
 pub type Then<'k, S, C, T, E> = Box<dyn FnOnce(&mut S, T) -> Result<Step<'k, S, C, T, E>, E> + 'k>;
 
-/// What goes on once each of some calls is done, with all they made.
+/// A continuation that receives the results of a completed sequence of calls.
 pub type Gathered<'k, S, C, T, E> = Box<dyn FnOnce(&mut S, Vec<T>) -> Result<Step<'k, S, C, T, E>, E> + 'k>;
 
 impl<'k, S: ?Sized, C, T, E> Step<'k, S, C, T, E> {
-    /// Makes what `call` does, then goes on with `then`.
+    /// Schedules `call`, then resumes with `then`.
     pub fn then(call: C, then: impl FnOnce(&mut S, T) -> Result<Self, E> + 'k) -> Self {
         Step::Call(call, Box::new(then))
     }
 }
 
-/// Makes what each of `calls` does, in order, then goes on with all they made: a step, as a
-/// step's work gives one.
+/// Schedules `calls` in order, then passes their results to a continuation that produces the next
+/// step.
 pub fn all<'k, S: ?Sized, C, T, E>(calls: Vec<C>, then: impl FnOnce(&mut S, Vec<T>) -> Result<Step<'k, S, C, T, E>, E> + 'k) -> Result<Step<'k, S, C, T, E>, E> {
     Ok(Step::All(calls, Box::new(then)))
 }
 
-/// What's waiting on the call being made: what goes on with it, or the calls after it of an
-/// [`Step::All`], with what those before it made.
+/// A suspended continuation, or the remaining calls and accumulated results of a [`Step::All`].
 enum Waiting<'k, S: ?Sized, C, T, E> {
     Then(Then<'k, S, C, T, E>),
     All { calls: std::vec::IntoIter<C>, made: Vec<T>, then: Gathered<'k, S, C, T, E> },
 }
 
-/// What `call` makes, each call done by `step`.
+/// Runs `call` to completion, using `step` to execute each requested call.
 pub fn run<'k, S: ?Sized, C, T, E>(state: &mut S, call: C, mut step: impl FnMut(&mut S, C) -> Result<Step<'k, S, C, T, E>, E>) -> Result<T, E> {
     let mut waiting: Vec<Waiting<'k, S, C, T, E>> = Vec::new();
     let mut next = Step::Tail(call);

@@ -16,14 +16,14 @@ fn error<'id>(t: &L4<'id, 'static>, root: Id<'id>) -> String {
     t.verify(root).expect_err("malformed")
 }
 
-/// A join of `scope`, whose one code, `5`, takes `params`.
+/// Builds a join with `scope` and one body, named `5`, accepting `params`.
 fn join<'id>(t: &mut L4<'id, 'static>, params: &[u32], scope: Id<'id>) -> Id<'id> {
     let (params, body) = (t.list(params.iter().map(|&v| Var(v))), void(t));
     let codes = t.list([JoinCode { id: Var(5), params, body }]);
     t.add(Node::Join(scope, codes))
 }
 
-/// A closure of no parameters with `captures` and `body`.
+/// Builds a zero-argument closure with `captures` and `body`.
 fn closure<'id>(t: &mut L4<'id, 'static>, captures: &[UpvalSource], body: Id<'id>) -> Fun<'id> {
     let (params, captures) = (t.list([]), t.list(captures.iter().copied()));
     t.closure(Closure { id: 0, optional: 0, params, rest: None, captures, body })
@@ -106,7 +106,7 @@ fn closures_capture_and_use_what_they_have() {
     });
 }
 
-/// A tree a million deep is checked, walked and dropped on a small stack.
+/// Checks, walks, and drops a tree one million nodes deep on a small machine stack.
 #[test]
 fn deep_trees_need_no_stack() {
     let run = || {

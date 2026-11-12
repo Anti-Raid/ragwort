@@ -1,5 +1,4 @@
-//! The instruction set. Registers are `u8`s, slots of the current frame's window; jumps are
-//! relative to the instruction after them.
+//! Defines the virtual machine instruction set. Register operands are `u8` indices within the active frame window; jump offsets are relative to the instruction immediately following the jump.
 
 use ragwort_types::{Error, Wire, named};
 use ragwort_types::gc::{Frame, Gc, Mutation, OutOfMemory, Slots, Value, WINDOW};
@@ -17,106 +16,76 @@ use crate::{Intrinsic, Request, structs};
 mod tests;
 
 named! {
-    /// One instruction. Every variant fits in 8 bytes: an opcode, registers, and up to a 32-bit
-    /// index or offset.
+    /// A virtual machine instruction. Each variant is packed into 8 bytes, comprising an opcode tag, register operands, and an optional 32-bit immediate index or jump offset.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
     pub enum Op {
-        /// Move contents of register `src` to `dst`
+        /// Copies the value from register `src` into register `dst`.
         Move { dst: u8, src: u8 } = "move",
-        /// Moves `(src1, src2)` to `(dst1, dst2)` in parallel.
+        /// Performs a parallel copy of registers `(src1, src2)` into `(dst1, dst2)`.
         Move2 { dst1: u8, src1: u8, dst2: u8, src2: u8 } = "move2",
-        /// Loads constant `index` of the constant pool
+        /// Loads the constant value at index `index` from the module constant pool into register `dst`.
         LoadConst { dst: u8, index: u32 } = "load-const",
-        /// Jump to offset `offset`
+        /// Unconditionally jumps by `offset` instructions relative to the next instruction.
         Jump { offset: i32 } = "jump",
-        /// Jumps to offset `offset` if register `test` holds `#f`.
+        /// Branches by `offset` instructions if register `test` contains `#f` (`Value::FALSE`).
         JumpIfFalse { test: u8, offset: i32 } = "jump-if-false",
-        /// Runs 1-argument `intrinsic` on register `a` and jumps to `offset` if `(result != #f) == branch_if`.
+        /// Executes unary `intrinsic` on operand `a`, branching by `offset` if the boolean truthiness of the result matches `branch_if`.
         BranchIntrinsic1 { a: u8, intrinsic: Intrinsic, branch_if: bool, offset: i16 } = "branch-intrinsic1",
-        /// Runs 2-argument `intrinsic` on registers `(a, b)` and jumps to `offset` if `(result != #f) == branch_if`.
+        /// Executes binary `intrinsic` on operands `(a, b)`, branching by `offset` if the boolean truthiness of the result matches `branch_if`.
         BranchIntrinsic2 { a: u8, b: u8, intrinsic: Intrinsic, branch_if: bool, offset: i16 } = "branch-intrinsic2",
-        /// Calls the procedure in register `base` with the `args` registers after it, in a frame
-        /// starting at `base`, as laid out in [`crate::frame`]: the callee's frame overlaps its
-        /// caller's, so the arguments are already where it reads them. Anything the caller needs
-        /// after the call is below `base`, which must be past the caller's link.
+        /// Invokes the procedure in register `base` with `args` arguments located in subsequent registers. The callee's frame begins at `base` and overlaps the caller's frame, placing arguments directly in the callee's argument registers without copying. Any caller-saved state must reside below `base`, which must be located beyond the caller's link slot.
         Call { base: u8, args: u8 } = "call",
-        /// Calls the procedure in register `base` with the `args` registers after it, moved down
-        /// into the current frame. The frame's link stays, so the callee returns to this frame's
-        /// caller.
+        /// Performs a tail call to the procedure in register `base` with `args` arguments, shifting arguments down into the current frame window. The existing return link is preserved so the callee returns directly to the current caller.
         TailCall { base: u8, args: u8 } = "tail-call",
-        /// Sets the accumulator to register `src` and returns it
+        /// Copies register `src` into the accumulator and returns control to the caller.
         Return { src: u8 } = "return",
-        /// Loads the accumulator, where a call leaves its result, into `dst`.
+        /// Loads the return value currently in the accumulator into register `dst`.
         LoadAcc { dst: u8 } = "load-acc",
-        /// Loads upvalue `index` of the current closure. Upvalues are copied in when a closure is
-        /// made, so an assigned variable is captured as a box, which the box intrinsics read and write.
+        /// Loads upvalue `index` of the current closure into register `dst`. Upvalues are populated upon closure creation; mutable variables are captured within indirection boxes accessed via box intrinsics.
         LoadUpvalue { dst: u8, index: u32 } = "load-upvalue",
-        /// Makes `count` closures, of the code in constants `code..code + count`, into registers
-        /// `dst..dst + count`, then fills each one's upvalues from its code's capture list. All are
-        /// made before any is filled, so closures that refer to each other, as a `letrec` of lambdas
-        /// makes, capture each other as registers.
+        /// Instantiates `count` closures from bytecode objects in constant pool indices `code..code + count` into registers `dst..dst + count`, then initializes each closure's upvalues according to its capture list. All closures are allocated before initializing upvalues, allowing mutually recursive procedures (such as from `letrec`) to capture each other via register references.
         NewClosure { dst: u8, count: u8, code: u32 } = "new-closure",
-        /// Runs `intrinsic` on the `args` registers from `base`, leaving its result in the
-        /// accumulator as a call does, and goes on. The compiler emits it for a primitive that can't
-        /// have been rebound, so an intrinsic can take fast paths, such as adding fixnums in place.
+        /// Invokes `intrinsic` on `args` operand registers starting at `base`, storing the result in the accumulator. Emitted by the compiler for non-rebound primitive procedures, enabling optimized execution paths such as in-place fixnum arithmetic.
         CallIntrinsic { base: u8, args: u8, intrinsic: Intrinsic } = "call-intrinsic",
-        /// Runs 1-argument `intrinsic` on register `a` and stores its result in `dst`.
+        /// Executes unary `intrinsic` on register operand `a` and writes the result into register `dst`.
         CallIntrinsic1 { dst: u8, a: u8, intrinsic: Intrinsic } = "call-intrinsic1",
-        /// Runs 2-argument `intrinsic` on registers `(a, b)` and stores its result in `dst`.
+        /// Executes binary `intrinsic` on register operands `(a, b)` and writes the result into register `dst`.
         CallIntrinsic2 { dst: u8, a: u8, b: u8, intrinsic: Intrinsic } = "call-intrinsic2",
-        /// Adds the constant `imm` to register `a` and stores the sum in `dst`: fixnums in place,
-        /// anything else by the generic add, as `(+ a imm)`. The compiler emits it for `(+ x k)`
-        /// and `(- x k)` with a small fixnum `k`, so the constant needs no register.
+        /// Adds the immediate constant `imm` to register `a` and writes the result into register `dst`. Performs in-place fixnum addition if `a` is a fixnum and the sum does not overflow, falling back to generic addition (`+`) otherwise. Emitted for additions or subtractions with small integer literals without allocating a constant register.
         AddImm { dst: u8, a: u8, imm: i16 } = "add-imm",
-        /// Stores field `k` of the struct in register `a` in `dst`, as `(struct-field a k)`
-        /// does. The compiler emits it where it has proved that `a` holds a struct with the
-        /// field, so the index needs no register.
+        /// Reads field `k` from the structure in register `a` and stores it in `dst` (corresponding to `(struct-field a k)`). Emitted when static analysis confirms `a` is a struct containing field index `k`, avoiding a register for the field offset.
         StructField { dst: u8, a: u8, k: u16 } = "struct-field",
-        /// Stores field `k` of the struct in register `a` in `dst`, as `(struct-ref a type k)`
-        /// does, the type being constant `kind`: `a` has to hold an instance of it. The type
-        /// and the index need no registers.
+        /// Reads field `k` from the structure in register `a` and stores it in `dst`, verifying that `a` is an instance of the struct type stored in constant pool index `kind` (corresponding to `(struct-ref a type k)`). Neither the type descriptor nor field index occupies a register.
         StructRef { dst: u8, a: u8, k: u8, kind: u32 } = "struct-ref",
-        /// Runs 3-argument `intrinsic` on registers `(a, b, c)` and stores its result in `dst`.
+        /// Executes ternary `intrinsic` on register operands `(a, b, c)` and writes the result into register `dst`.
         CallIntrinsic3 { dst: u8, a: u8, b: u8, c: u8, intrinsic: Intrinsic } = "call-intrinsic3",
-        /// Runs `intrinsic` like `CallIntrinsic`, then returns its result. A built-in used as a value
-        /// is a closure whose code is just this.
+        /// Executes `intrinsic` on the argument registers and immediately returns the result to the caller. Built-in procedures referenced as first-class values compile to a closure wrapping this single instruction.
         TailCallIntrinsic { base: u8, args: u8, intrinsic: Intrinsic } = "tail-call-intrinsic",
-        /// Has the run loop carry out `request` on the `args` registers from `base`. One that calls a
-        /// procedure, as `call/cc` does, goes on here when it returns, so `base` must be past the
-        /// frame's link, as a call's is.
+        /// Dispatches runtime control operation `request` to the execution loop with `args` argument registers starting at `base`. For requests that invoke procedures (such as `call/cc`), execution resumes at this instruction upon return; `base` must therefore be positioned past the current frame's link slot.
         CallRequest { base: u8, args: u8, request: Request } = "call-request",
-        /// Like `CallRequest`, but a procedure the request calls takes this frame's place, so it
-        /// returns to this frame's caller, as `(call/cc f)` in tail position needs.
+        /// Tail-call variant of `CallRequest`: any procedure invoked by the request replaces the current frame and returns directly to the caller of the current frame (e.g. for `(call/cc f)` in tail position).
         TailCallRequest { base: u8, args: u8, request: Request } = "tail-call-request",
-        /// Runs `intrinsic` like `CallIntrinsic`, but the last of the `args` registers holds a list of
-        /// the arguments after the others, as many as it takes, past what a frame's registers hold.
+        /// Executes `intrinsic` with variadic arguments like `apply`: preceding argument registers are passed positionally, and the final argument register provides a list containing the remaining arguments.
         ApplyIntrinsic { base: u8, args: u8, intrinsic: Intrinsic } = "apply-intrinsic",
-        /// Carries out `request` like `CallRequest`, with the last of the `args` registers a list of
-        /// the arguments after the others.
+        /// Executes runtime control operation `request` with `apply`-style argument spreading, where the final register among the `args` contains a list of trailing arguments.
         ApplyRequest { base: u8, args: u8, request: Request } = "apply-request",
-        /// `ApplyRequest` in tail position, as `TailCallRequest` is `CallRequest`'s.
+        /// Tail-call variant of `ApplyRequest`, reusing the current frame so any invoked procedure returns directly to this frame's caller.
         TailApplyRequest { base: u8, args: u8, request: Request } = "tail-apply-request",
-        /// Makes a [`Spill`](crate::objects::Spill) of `count` slots, all void, in `dst`. Code that
-        /// needs more registers than a frame has makes one as it starts.
+        /// Allocates a new [`crate::objects::Spill`] buffer initialized with `count` void slots and stores it in register `dst`. Emitted at procedure entry for frames whose local variables exceed available registers.
         NewSpill { dst: u8, count: u32 } = "new-spill",
-        /// Loads slot `slot` of the spill in register `spill`.
+        /// Loads the value at index `slot` from the spill buffer in register `spill` into register `dst`.
         LoadSpill { dst: u8, spill: u8, slot: u32 } = "load-spill",
-        /// Stores register `src` in slot `slot` of the spill in register `spill`.
+        /// Stores the value in register `src` into index `slot` of the spill buffer in register `spill`.
         StoreSpill { src: u8, spill: u8, slot: u32 } = "store-spill",
-        /// Loads variable `slot` of the code's [`Module`](crate::objects::Module), which the
-        /// compiler knows is defined.
+        /// Loads top-level variable index `slot` from the enclosing [`crate::objects::Module`] into register `dst`, used when the compiler has proven the variable is already defined.
         LoadSlot { dst: u8, slot: u32 } = "load-slot",
-        /// Loads variable `slot` of the code's module, faulting with [`Fault::Unbound`] if it
-        /// isn't defined yet.
+        /// Loads top-level variable index `slot` from the enclosing [`crate::objects::Module`] into register `dst`, raising [`Fault::Unbound`] if the variable is still `UNDEFINED`.
         LoadSlotChecked { dst: u8, slot: u32 } = "load-slot-checked",
-        /// Stores register `src` in variable `slot` of the code's module, as its definition does.
+        /// Stores register `src` into top-level variable index `slot` of the enclosing [`crate::objects::Module`], used for initial variable definitions.
         StoreSlot { src: u8, slot: u32 } = "store-slot",
-        /// Stores register `src` in variable `slot` of the code's module, as `set!` does,
-        /// faulting with [`Fault::Unbound`] if it isn't defined yet.
+        /// Stores register `src` into top-level variable index `slot` of the enclosing [`crate::objects::Module`] (as in `set!`), raising [`Fault::Unbound`] if the variable is currently `UNDEFINED`.
         StoreSlotChecked { src: u8, slot: u32 } = "store-slot-checked",
-        /// Calls host function `host` of the code's module on the `args` registers from `base`,
-        /// which is laid out as a call's, as its [`Reply`](crate::module::Reply) can call a
-        /// procedure there.
+        /// Invokes host function index `host` from the enclosing module's host table on `args` argument registers starting at `base`. Arguments are laid out like a procedure call, allowing a returned [`crate::Reply::Call`] to invoke a procedure in place.
         CallHost { base: u8, args: u8, host: u32 } = "call-host",
         TailCallHost { base: u8, args: u8, host: u32 } = "tail-call-host",
     }
@@ -124,36 +93,32 @@ named! {
 
 const _: () = assert!(size_of::<Op>() == 8);
 
-/// Where a new closure's upvalue comes from, in its code's capture list.
+/// Specifies the source location from which a captured upvalue is loaded when creating a closure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
 pub enum Capture {
-    /// A register of the frame making the closure, read once all of a `NewClosure`'s closures
-    /// are in theirs.
+    /// Captures the value from register `r` of the enclosing frame, read after all closures in a `NewClosure` instruction have been allocated.
     Register(u8),
-    /// An upvalue of the closure making it.
+    /// Captures upvalue index `u` from the enclosing closure.
     Upvalue(u32),
-    /// Slot `slot` of the spill in register `spill` of the frame making it.
+    /// Captures index `slot` from the spill buffer residing in register `spill` of the enclosing frame.
     Spill { spill: u8, slot: u32 },
 }
 
-/// What an instruction runs against.
+/// Execution context provided to instruction execution, encapsulating VM registers, stack frame, constant pool, upvalues, and fuel.
 pub struct Context<'s, 'gc> {
     pub mc: &'s Mutation<'gc>,
-    /// The running task, whose state [some intrinsics](Intrinsic::is_dynamic) work on.
+    /// The currently executing coroutine [`Task`], accessed by dynamic-wind and continuation intrinsics.
     pub task: Gc<'gc, Task>,
     pub frame: Frame<'s, 'gc>,
-    /// The module's constants, which `LoadConst` indexes.
+    /// The active module's constant pool table, indexed by `LoadConst` and struct instructions.
     pub constants: Constants<'gc>,
-    /// The current closure's upvalues.
+    /// Captured upvalues belonging to the currently executing closure.
     pub upvalues: Slots<'gc>,
     pub acc: Value<'gc>,
     pub fuel: Fuel,
 }
 
-/// What's left of a machine's fuel, as a run spends it. Calls and jumps spend a unit each of
-/// `run`, and pause the run at the first of them once it's gone; an intrinsic that does a lot
-/// of work spends from `run`, then `rest`. Pausing so the step can end, for a collection, moves
-/// what's left of `run` to `rest`.
+/// Tracks remaining execution fuel for cooperative multitasking and bounded execution: calls and branches consume one unit from `run`, pausing execution when exhausted. Computationally heavy intrinsics deduct from `run` and then `rest`. Pausing execution (e.g. for GC step cycles) transfers remaining `run` fuel to `rest`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fuel {
     pub run: u64,
@@ -161,18 +126,17 @@ pub struct Fuel {
 }
 
 impl Fuel {
-    /// All that's left.
+    /// Returns the total remaining execution fuel (`run + rest`), saturating on overflow.
     pub fn left(self) -> u64 {
         self.run.saturating_add(self.rest)
     }
 
-    /// Has the run pause at its next call or jump, keeping the fuel for the next run.
+    /// Forces the virtual machine to pause at the next call or branch by moving all active `run` fuel into `rest`.
     pub fn pause(&mut self) {
         (self.run, self.rest) = (0, self.left());
     }
 
-    /// Spends `units`, from `run` first, or faults with [`Fault::OutOfFuel`] if there aren't
-    /// that many.
+    /// Deducts `units` of fuel, consuming from `run` first and then `rest`. Returns [`Fault::OutOfFuel`] if the total remaining fuel is insufficient.
     pub fn spend(&mut self, units: u64) -> Result<(), Fault> {
         let past = units.saturating_sub(self.run);
         if past > self.rest {
@@ -183,68 +147,62 @@ impl Fuel {
     }
 }
 
-/// Where the run loop goes after an instruction.
+/// Specifies the control-flow action to be taken by the VM dispatch loop after executing an instruction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Control {
     Next,
-    /// `offset` instructions past the next one.
+    /// Relative branch by `offset` instructions from the instruction following this one.
     Jump(i32),
-    /// All the *many* Call insts
+    /// Transfers control to a procedure call starting at register `base` with `args` arguments.
     Call { base: u8, args: u8 },
     TailCall { base: u8, args: u8 },
-    /// A request on the `args` registers from `base`, the last of them a list of more if
-    /// `spread`.
+    /// Dispatches a control operation `request` with `args` argument registers starting at `base`, unpacking trailing list elements if `spread` is true.
     CallRequest { base: u8, args: u8, request: Request, spread: bool },
     TailCallRequest { base: u8, args: u8, request: Request, spread: bool },
-    /// A call of host function `host` of the code's module on the `args` registers from `base`.
+    /// Invokes host function index `host` from the active module with `args` registers starting at `base`.
     Host { base: u8, args: u8, host: u32, tail: bool },
-    /// Back to the caller, with the accumulator.
+    /// Returns from the current frame to the caller, passing the accumulator value.
     Return,
 }
 
-/// Why an instruction couldn't run. All but the fatal ones are raised in the program, as a
-/// `Condition`, and end the run only if no handler takes them.
+/// Represents virtual machine runtime faults and errors. Non-fatal faults are raised within the Scheme program as [`crate::objects::Condition`] objects and terminate execution only if unhandled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
 pub enum Fault {
-    /// The bytecode broke a rule the compiler keeps: a constant or upvalue that isn't there,
-    /// registers past the frame, or an intrinsic or request passed a number of arguments it
-    /// doesn't take.
+    /// Indicates corrupt or invalid bytecode: an out-of-bounds constant or upvalue index, invalid register operand, or invalid arity passed to an intrinsic or request.
     Malformed,
     OutOfMemory,
-    /// An intrinsic got an argument it doesn't take, such as `car` of a non-pair.
+    /// An intrinsic received an argument of an incompatible type (e.g. calling `car` on a non-pair value).
     WrongType,
-    /// An index past the end of what it indexes, or negative.
+    /// An index argument was negative or exceeded the valid bounds of the sequence.
     OutOfRange,
-    /// A write to something that can't change, such as a literal.
+    /// Attempted mutation of an immutable object, such as a literal constant.
     Immutable,
-    /// A procedure was called with a number of arguments it doesn't take.
+    /// A procedure was called with an incorrect number of arguments.
     Arity,
-    /// A call of something that isn't a procedure.
+    /// Attempted to invoke a value that is not a callable procedure.
     NotProcedure,
-    /// An abort or capture to a prompt tag with no prompt.
+    /// An abort or continuation capture targeted a prompt tag with no matching active prompt on the continuation chain.
     NoPrompt,
-    /// A reference to, or `set!` of, a variable that isn't defined yet.
+    /// Attempted to reference or mutate an undefined top-level variable.
     Unbound,
-    /// A run of a machine whose task already finished.
+    /// Attempted to resume or execute a virtual machine whose task has already terminated.
     Finished,
-    /// The machine's fuel ran out, which finishes its task.
+    /// The virtual machine exhausted its allocated execution fuel, terminating task execution.
     OutOfFuel,
-    /// What `make-error` makes a condition of.
+    /// User-level exception raised via `error` or `make-error`.
     Error,
-    /// A resume of a coroutine that isn't pending: one that's running, or that has finished
-    /// or failed.
+    /// Attempted to resume a coroutine that is not in a pending state (i.e. already running, finished, or failed).
     NotPending,
-    /// What `make-syntax-error` makes a condition of: syntax that's malformed, such as a macro
-    /// use no clause of its `syntax-case` matches.
+    /// Syntax error (as created by `make-syntax-error`), indicating malformed syntax such as a macro use unmatched by any `syntax-case` pattern.
     Syntax,
-    /// A call passed a keyword its procedure doesn't take, or left out one it requires.
+    /// Keyword argument error: an unsupported keyword was supplied or a required keyword parameter was omitted.
     Keyword,
     Num(NumError),
     Str(StrError),
 }
 
 impl Fault {
-    /// The names of the kinds [`Fault::kind`] numbers, as `error-object-kind` gives them.
+    /// String names corresponding to fault kind codes, matching Scheme's `error-object-kind`.
     pub const KINDS: [&str; 20] = [
         "malformed",
         "out-of-memory",
@@ -268,7 +226,7 @@ impl Fault {
         "not-utf8",
     ];
 
-    /// Which of [`Fault::KINDS`] it is.
+    /// Returns the integer index corresponding to this fault in [`Fault::KINDS`].
     pub fn kind(self) -> usize {
         match self {
             Fault::Malformed | Fault::Str(StrError::NotNarrowest) => 0,
@@ -294,8 +252,7 @@ impl Fault {
         }
     }
 
-    /// Whether it ends the run, rather than being raised: the bytecode or the machine is broken,
-    /// or the arena is out of room, or the machine is out of fuel.
+    /// Returns `true` if this fault is fatal (terminating the run immediately without raising an in-program condition), caused by corrupt bytecode, an exhausted heap, an already-finished task, or fuel exhaustion.
     pub fn is_fatal(self) -> bool {
         matches!(self, Fault::Malformed | Fault::OutOfMemory | Fault::Finished | Fault::OutOfFuel)
     }
@@ -318,7 +275,7 @@ impl From<Error> for Fault {
 }
 
 impl Op {
-    /// Runs the instruction, or, for one that changes frames, says what the run loop should do.
+    /// Executes the instruction against context `cx`, returning a [`Control`] directive indicating the next action for the dispatch loop.
     #[inline(always)]
     pub fn step<'gc>(self, cx: &mut Context<'_, 'gc>) -> Result<Control, Fault> {
         let (mc, frame) = (cx.mc, cx.frame);
@@ -504,7 +461,7 @@ impl Op {
     }
 }
 
-/// The slots of the spill in register `spill`, which has a slot `slot`.
+/// Retrieves the spill buffer slots from register `spill`, verifying that `slot` is within bounds.
 #[inline]
 fn spilled<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, spill: u8, slot: u32) -> Result<Slots<'gc>, Fault> {
     let slots = frame.get(spill).downcast::<objects::Spill>(mc).ok_or(Fault::Malformed)?.items(mc);
@@ -514,14 +471,14 @@ fn spilled<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, spill: u8, slot: u32)
     Ok(slots)
 }
 
-/// The variables of the module of the code running in `frame`, which have a slot `slot`.
+/// Retrieves the variable slots of the module enclosing the bytecode executing in `frame`, verifying that `slot` is within bounds.
 #[inline]
 fn variables<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, slot: u32) -> Result<Slots<'gc>, Fault> {
     let module = frame.get(CLOSURE).downcast::<objects::Closure>(mc).and_then(|c| c.code(mc)).and_then(|code| code.module(mc));
     module.map(|m| m.items(mc)).filter(|slots| (slot as usize) < slots.len()).ok_or(Fault::Malformed)
 }
 
-/// The elements of the proper list `list`.
+/// Unpacks the elements of a proper Scheme list into a `Vec<Value>`, returning [`Fault::WrongType`] if the list is improper or non-nil terminated.
 fn list<'gc>(mc: &Mutation<'gc>, mut list: Value<'gc>) -> Result<Vec<Value<'gc>>, Fault> {
     let mut items = Vec::new();
     while let Some(pair) = Pair::of(list) {

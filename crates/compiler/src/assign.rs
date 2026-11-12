@@ -1,15 +1,16 @@
-//! Pass 4: assignment conversion, in two parts around [`contify`](crate::contify).
+//! Pass 4: Assignment conversion, performed in two phases surrounding [`contify`](crate::contify).
 //!
-//! [`lower`] (`L2 -> L3`) keeps each `Set` as an [`l3::Node::Set`], so contification sees loops as
-//! they are. After it, [`convert`] puts an assigned variable in a box (`MakeBox`, `Unbox`, `SetBox`)
-//! only where its frame's register can't hold it:
-//! - a closure uses it. A join's code doesn't count, as it runs in the frame.
-//! - it can be assigned after a continuation is captured, since it was bound. A continuation
-//!   that's re-entered copies the frame as it was when captured, where a box would be shared.
-//! - an argument reads it and a later one of the same call assigns it. The bytecode backend
-//!   before L5 read a variable's register in place; L5's values already keep the read apart.
+//! [`lower`] (`L2 -> L3`) preserves `Set` expressions as [`l3::Node::Set`] so that contification
+//! can analyze loop structure accurately. Afterwards, [`convert`] wraps assigned variables in heap
+//! boxes (`MakeBox`, `Unbox`, `SetBox`) only when they cannot safely reside in stack-frame registers:
+//! - A nested closure references the variable (references within join points do not require boxing
+//!   because joins execute in the parent stack frame).
+//! - The variable may be mutated after a continuation is captured subsequent to its binding (re-invoking
+//!   a continuation restores a snapshot of the frame, whereas a heap box maintains shared mutable state).
+//! - An argument reads the variable while a later argument in the same call assigns to it (preventing
+//!   argument evaluation from observing unexpected in-place register mutations).
 //!
-//! The rest are assigned in their registers.
+//! All other assigned variables remain in registers without heap allocation.
 
 use crate::hash::{HashMap, HashSet};
 
@@ -20,9 +21,11 @@ use crate::ir::l3::{self, Fun, Id, JoinCode, Node, Span};
 use crate::ir::Supply;
 use crate::{Prim, Var};
 
-/// `root` of `from` as [`L3`](l3::L3), its assignments kept, and the variables they assign.
+/// Lowers the L2 AST rooted at `root` in `from` into an L3 AST in `tree`, preserving
+/// assignment nodes (`Set`) and collecting the set of all assigned variables.
 pub(crate) fn lower<'s, 'id, 'gc>(tree: &mut l3::L3<'id, 'gc>, from: &L2<'s, 'gc>, root: l2::Id<'s>) -> (Id<'id>, HashSet<Var>) {
-    /// A node to lower, or to make from those its children lowered to.
+    /// A task in the lowering worklist: either an L2 expression to traverse, or an action
+    /// to assemble lowered child expressions into an L3 node.
     enum Task<'s> {
         Expr(l2::Id<'s>),
         Make(l2::Id<'s>),
@@ -110,7 +113,8 @@ pub(crate) fn lower<'s, 'id, 'gc>(tree: &mut l3::L3<'id, 'gc>, from: &L2<'s, 'gc
     (vals.pop().expect("the root's lowered"), assigned)
 }
 
-/// Boxes those of the `assigned` variables of `root` its frames' registers can't hold.
+/// Wraps in heap boxes (`MakeBox`/`Unbox`/`SetBox`) any assigned variables in `root`
+/// that cannot safely reside in frame registers.
 pub(crate) fn convert<'id, 'gc>(tree: &mut l3::L3<'id, 'gc>, root: Id<'id>, assigned: &HashSet<Var>, supply: &mut Supply) {
     if assigned.is_empty() {
         return;
@@ -136,18 +140,18 @@ pub(crate) fn convert<'id, 'gc>(tree: &mut l3::L3<'id, 'gc>, root: Id<'id>, assi
     }
 }
 
-/// What's left of the survey's walk: an expression, which ends the frame if it's in tail
-/// position, or what to do once those before it are walked.
+/// A step in the survey traversal: either an expression to inspect (marking whether it is
+/// in tail position), or an action to update frame and continuation-capture state.
 enum Step<'id> {
     Expr(Id<'id>, bool),
     Set(Var),
     Bind(Var),
     Capture,
-    /// Before an `If`'s branches: notes the capture points so far.
+    /// Pre-branch marker for `If`: records the current continuation capture count before traversing branches.
     Mark,
-    /// Between them: notes those after the first, and goes back to before it.
+    /// Intermediate step between `If` branches: saves the capture count after the `then` branch and resets to the pre-branch count for the `else` branch.
     Branch,
-    /// After them: the most of either.
+    /// Post-branch merge for `If`: sets the current capture count to the maximum observed across both branches.
     Merge,
     Enter(Fun<'id>),
     Leave,
@@ -157,24 +161,23 @@ enum Step<'id> {
     Joined,
 }
 
-/// Which assigned variables need boxes, walking each frame in the order it runs.
+/// Analysis pass that traverses stack frames in execution order to identify which assigned variables must be boxed.
 struct Survey<'s, 't, 'id, 'gc> {
     tree: &'t l3::L3<'id, 'gc>,
     assigned: &'s HashSet<Var>,
     bound: HashMap<Var, Bound>,
     frame: u32,
     frames: u32,
-    /// The points where a continuation could be captured, so far on the way the walk follows.
+    /// The number of potential continuation-capture points encountered along the current execution path.
     captures: u32,
-    /// The frame and capture points of each function the walk is in, outermost first.
+    /// Stack of `(frame_id, capture_count)` pairs for enclosing functions, ordered from outermost to innermost.
     outer: std::vec::Vec<(u32, u32)>,
-    /// Capture points noted for the `If`s and `Join`s the walk is in.
+    /// Saved capture counts for managing branching paths and loop join points currently being traversed.
     saved: std::vec::Vec<u32>,
     boxed: HashSet<Var>,
 }
 
-/// Where an assigned variable is bound: in which frame, and how many capture points the walk had
-/// passed.
+/// Binding site metadata for an assigned variable: its enclosing stack frame ID and the continuation capture count when it was bound.
 #[derive(Clone, Copy)]
 struct Bound {
     frame: u32,
@@ -223,16 +226,16 @@ impl<'id> Survey<'_, '_, 'id, '_> {
                 let after_then = self.save();
                 self.captures = self.captures.max(after_then);
             }
-            // The body of a closure, a frame of its own.
+            // Entering a closure body, which executes in a new stack frame.
             Step::Enter(fun) => {
                 self.frames += 1;
                 self.outer.push((std::mem::replace(&mut self.frame, self.frames), std::mem::replace(&mut self.captures, 0)));
                 tree.params(fun).for_each(|p| self.bind(p));
             }
             Step::Leave => (self.frame, self.captures) = self.outer.pop().expect("entered"),
-            // A join's code runs after any jump to it, and loops go round again, so it's walked as
-            // if any capture point in it had come before all of it. Once, not twice, as joins
-            // nest in joins' code.
+            // Join points can be entered via jumps, and loops can repeat; therefore, if any join body
+            // contains a continuation capture point, we treat it as preceding the entire join body.
+            // A single pass suffices even when join points are nested.
             Step::Joins(codes, tail) => {
                 let again = tree[codes].iter().any(|code| captures(tree, tree[code.fun].body, tail));
                 let start = self.captures + u32::from(again);
@@ -253,7 +256,7 @@ impl<'id> Survey<'_, '_, 'id, '_> {
         }
     }
 
-    /// Walks what has no children, and pushes the steps of what has, last first.
+    /// Inspects leaf expressions immediately and pushes traversal steps for compound expressions onto the worklist in reverse order.
     fn expr(&mut self, id: Id<'id>, tail: bool, todo: &mut std::vec::Vec<Step<'id>>) {
         let tree = self.tree;
         let at = todo.len();
@@ -310,7 +313,7 @@ impl<'id> Survey<'_, '_, 'id, '_> {
         todo[at..].reverse();
     }
 
-    /// Boxes each variable an argument assigns that one before it reads.
+    /// Marks for boxing any variable that is assigned by one argument while being read by an earlier argument within the same call.
     fn arguments(&mut self, args: &[Id<'id>]) {
         let tree = self.tree;
         for (j, &arg) in args.iter().enumerate() {
@@ -325,8 +328,8 @@ impl<'id> Survey<'_, '_, 'id, '_> {
     }
 }
 
-/// Whether `e`, which ends the frame if it's in `tail` position, has a point a continuation could
-/// be captured at, as [`Survey`] counts them.
+/// Checks whether expression `e` contains any non-tail calls or operations that could capture a continuation,
+/// taking into account whether `e` itself is in tail position.
 fn captures<'id>(tree: &l3::L3<'id, '_>, e: Id<'id>, tail: bool) -> bool {
     let mut todo = vec![(e, tail)];
     while let Some((id, tail)) = todo.pop() {
@@ -363,14 +366,15 @@ fn captures<'id>(tree: &l3::L3<'id, '_>, e: Id<'id>, tail: bool) -> bool {
     false
 }
 
-/// What's left of the rewrite's walk, which goes through each function's body before taking its
-/// boxed parameters as fresh ones, and a join's code before its scope.
+/// Worklist task for rewriting expressions to use boxes; processes function bodies before
+/// rebinding boxed parameters to fresh variables, and traverses join definitions before their scopes.
 enum Redo<'id> {
     Node(Id<'id>),
     Function(Fun<'id>),
 }
 
-/// `root` with the `boxed` variables in boxes.
+/// Rewrites the AST rooted at `root` in place, replacing accesses and assignments to variables in `boxed`
+/// with heap box operations (`MakeBox`, `Unbox`, and `SetBox`).
 fn rewrite<'id, 'gc>(tree: &mut l3::L3<'id, 'gc>, root: Id<'id>, boxed: &HashSet<Var>, supply: &mut Supply) {
     let boxing = |tree: &mut l3::L3<'id, 'gc>, intrinsic, args: &[Id<'id>]| {
         let args = tree.list(args.iter().copied());

@@ -1,11 +1,10 @@
 //! Pass 9 (`L5 -> Closure`): register allocation and bytecode emission from [`L5`](crate::l5).
 //!
-//! Each value used is given a register, or past a frame's own registers a slot of its spill, by
-//! colouring in dominator order: SSA values that are live at once are all live where the last of
-//! them is defined, so each takes the lowest register none of those has, and no more are needed
-//! than are ever live at once. A call goes past every register live after it, as the callee's
-//! frame overlaps its caller's there, with its arguments moved in, and a jump moves its values into
-//! its block's parameters, both as parallel moves.
+//! Allocates physical frame registers and spill slots for SSA values via greedy graph coloring in dominator
+//! order. Values with overlapping live ranges receive distinct registers, selecting the lowest available
+//! register index not currently occupied. Non-tail calls are staged beyond all registers currently live across
+//! the call boundary, aligning with the caller-callee overlapping frame window. Jumps and call argument
+//! setup emit parallel moves to resolve multi-register assignments without clobbering live values.
 
 use ragwort_alloc::{Arena, CollectIn, Vec as AVec};
 use ragwort_types::gc::{Gc, Mutation, Value, WINDOW};
@@ -18,10 +17,10 @@ use crate::hash::HashMap;
 use crate::l5::{self, Block, Captured, Code, End, Function, Inst, Program, Val};
 use crate::{CompileError, Prim, SlotOp};
 
-/// How many scratch registers there are, the last of a frame's, so how many values a call made
-/// in them can take.
+/// The number of scratch registers reserved at the top of the register window (`WINDOW / 4`),
+/// which sets the maximum number of arguments that can be staged for an outgoing call in scratch space.
 const STAGE: usize = WINDOW / 4;
-/// The first scratch register: those below are a function's own.
+/// The boundary register index separating general-purpose function registers (`0..LIMIT`) from reserved scratch registers (`LIMIT..WINDOW`).
 const LIMIT: u8 = (WINDOW - STAGE) as u8;
 const SCRATCH: u8 = LIMIT;
 
@@ -41,11 +40,11 @@ pub(crate) fn emit<'gc>(mc: &Mutation<'gc>, owner: Option<Gc<'gc, objects::Modul
     Ok(Value::object(mc, Closure::new(mc, Some(code), 0, Value::VOID)?))
 }
 
-/// Where a value is.
+/// The physical storage location assigned to an SSA value (either a hardware register or a spill slot).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Loc {
     Reg(u8),
-    /// A slot of the frame's spill.
+    /// A slot index within the frame's heap-allocated spill array.
     Slot(u32),
 }
 
@@ -53,7 +52,7 @@ fn has(set: &[u64], v: Val) -> bool {
     set[v.0 as usize / 64] & (1 << (v.0 % 64)) != 0
 }
 
-/// Adds `v`, and returns whether it wasn't there.
+/// Inserts value `v` into bitset `set`, returning `true` if `v` was not previously present.
 fn add(set: &mut [u64], v: Val) -> bool {
     let (word, bit) = (&mut set[v.0 as usize / 64], 1 << (v.0 % 64));
     let new = *word & bit == 0;
@@ -65,7 +64,7 @@ fn remove(set: &mut [u64], v: Val) {
     set[v.0 as usize / 64] &= !(1 << (v.0 % 64));
 }
 
-/// A set of registers.
+/// A bitset representing a set of physical registers within the register window (`WINDOW`).
 type Regs = [u64; WINDOW / 64];
 
 fn has_reg(regs: &Regs, r: u8) -> bool {
@@ -82,8 +81,8 @@ fn highest(regs: &Regs) -> Option<u8> {
     Some((i * 64 + 63 - regs[i].leading_zeros() as usize) as u8)
 }
 
-/// Where the one use of a value wants it: at a register past the base of a call, or of a tail
-/// call, or at a register of a block's parameter.
+/// Target register preference for a value with a single use: designates an argument register at an outgoing
+/// call base (standard or tail call) or the register assigned to a target block parameter.
 #[derive(Clone, Copy)]
 enum Aim {
     Base(u8),
@@ -91,19 +90,19 @@ enum Aim {
     Reg(u8),
 }
 
-/// The constants an instruction has in itself, in place of registers that hold them. Its
-/// first argument is the only one it reads.
+/// Immediate constants embedded directly within an opcode rather than loaded from registers.
+/// Instructions using immediate operands read only their first argument register.
 #[derive(Clone, Copy)]
 enum Imm<'gc> {
-    /// `(+ a k)` of a small `k`, which `AddImm` has.
+    /// Immediate integer offset for `(+ a k)` represented by `Op::AddImm`.
     Add(i16),
-    /// `(struct-field s k)` or `(struct-fixed-field s k)`, which `StructField` has the index of.
+    /// Field index for `(struct-field s k)` or `(struct-fixed-field s k)` encoded in `Op::StructField`.
     Field(u16),
-    /// `(struct-ref s type k)`, which `StructRef` has the type and the index of.
+    /// Type descriptor and field index for `(struct-ref s type k)` encoded in `Op::StructRef`.
     FieldOf(Value<'gc>, u8),
 }
 
-/// For each value an instruction with constants in itself defines, the constants.
+/// Precomputes embedded immediate constants for each SSA instruction that supports immediate operands.
 type Imms<'t, 'gc> = AVec<'t, Option<Imm<'gc>>>;
 
 fn imms<'t, 'gc>(arena: &'t Arena, f: &Function<'_, 'gc>) -> Imms<'t, 'gc> {
@@ -127,8 +126,8 @@ fn imms<'t, 'gc>(arena: &'t Arena, f: &Function<'_, 'gc>) -> Imms<'t, 'gc> {
     imms
 }
 
-/// What an instruction reads before it defines anything: a group's closures capture each other
-/// once they're all made, and one with constants in itself reads only its first argument.
+/// Iterates over every SSA value read by `inst` before its destination is assigned. Mutual closures
+/// capture each other once instantiated, and instructions with immediate constants read only their first argument.
 fn each_read(inst: &Inst<'_, '_>, imms: &Imms<'_, '_>, mut f: impl FnMut(Val)) {
     match inst {
         Inst::Prim { dst, args, .. } if imms[dst.0 as usize].is_some() => f(args[0]),
@@ -141,13 +140,14 @@ fn each_read(inst: &Inst<'_, '_>, imms: &Imms<'_, '_>, mut f: impl FnMut(Val)) {
     }
 }
 
-/// The values live out of each block, each block's in order, and the blocks before each.
+/// Live-out variable analysis results: contains the set of SSA values live exiting each basic block
+/// and the predecessor list for every block.
 struct Live<'t> {
     preds: AVec<'t, AVec<'t, usize>>,
-    /// Block `b`'s are `outs[starts[b]..starts[b + 1]]`.
+    /// Slice index bounds into `outs`: the live-out values for block `b` are located in `outs[starts[b]..starts[b + 1]]`.
     starts: AVec<'t, usize>,
     outs: AVec<'t, Val>,
-    /// How many words a set of the function's values takes, as bits.
+    /// The number of 64-bit words required for a bitset spanning all SSA values in the function.
     words: usize,
 }
 
@@ -157,12 +157,11 @@ impl Live<'_> {
     }
 }
 
-/// Where no value is, or the block of a value the function has from the start.
+/// Sentinel value representing an unassigned block index, or indicating that a value is defined at function entry.
 const NOWHERE: u32 = u32::MAX;
 
-/// What's live out of each block, found by walking back from each block a value's used in
-/// through those before it, as far as where it's defined, so it takes as much room as is live
-/// rather than blocks times values.
+/// Computes live-out value sets for each basic block by traversing backwards from each use site
+/// to its definition block. This sparse backward traversal avoids the memory overhead of a full dense block-by-value matrix.
 fn liveness<'t>(arena: &'t Arena, f: &Function<'_, '_>, imms: &Imms<'_, '_>) -> Live<'t> {
     let (n, values) = (f.blocks.len(), f.values as usize);
     let mut preds = arena.vec_of(arena.vec(), n);
@@ -176,7 +175,7 @@ fn liveness<'t>(arena: &'t Arena, f: &Function<'_, '_>, imms: &Imms<'_, '_>) -> 
         block.params.iter().for_each(|p| home[p.0 as usize] = b as u32);
         block.insts.iter().flat_map(|inst| inst.defs()).for_each(|d| home[d.0 as usize] = b as u32);
     }
-    // Each value, and a block it's used in but not defined in.
+    // Identifies upwards-exposed values: values used in a block before being defined in that block.
     let mut exposed = arena.vec();
     for (b, block) in f.blocks.iter().enumerate() {
         let mut note = |u: Val| {
@@ -188,7 +187,7 @@ fn liveness<'t>(arena: &'t Arena, f: &Function<'_, '_>, imms: &Imms<'_, '_>) -> 
         block.end.each_use(&mut note);
     }
     exposed.sort_unstable();
-    // The value each block was last found live into, and out of.
+    // Tracks the most recent SSA value processed for each block's live-in and live-out sets to avoid redundant visits.
     let (mut into, mut out) = (arena.vec_of(NOWHERE, n), arena.vec_of(NOWHERE, n));
     let (mut found, mut stack) = (arena.vec(), arena.vec());
     for &(v, b) in exposed.iter() {
@@ -210,7 +209,7 @@ fn liveness<'t>(arena: &'t Arena, f: &Function<'_, '_>, imms: &Imms<'_, '_>) -> 
             }
         }
     }
-    // By block, each block's in the order they were found, of value.
+    // Groups live-out values by basic block, sorted by SSA value index to build compact contiguous slices.
     let mut starts = arena.vec_of(0, n + 1);
     found.iter().for_each(|&(b, _)| starts[b + 1] += 1);
     (0..n).for_each(|b| starts[b + 1] += starts[b]);
@@ -223,13 +222,14 @@ fn liveness<'t>(arena: &'t Arena, f: &Function<'_, '_>, imms: &Imms<'_, '_>) -> 
     Live { preds, starts, outs, words: values.div_ceil(64).max(1) }
 }
 
-/// Each value's colour, if it takes one, and how many there are.
+/// Register allocation colors (virtual register indices) assigned to SSA values, along with the total color count.
 struct Colours<'t> {
     of: AVec<'t, Option<u32>>,
     count: u32,
 }
 
-/// Colours the values used that aren't `pinned` to registers, the entry's `defined` first.
+/// Performs register coloring on all unpinned SSA values in dominator tree order, allocating values defined
+/// at function entry first.
 fn colour<'t>(
     arena: &'t Arena,
     f: &Function<'_, '_>,
@@ -249,9 +249,9 @@ fn colour<'t>(
     }
     let colours = Colours { of: arena.vec_of(None, f.values as usize), count: 0 };
     let mut c = Colouring { colours, taken: arena.vec(), pinned, uses };
-    // What's live where the walk back through a block is, as bits, and the values it's had.
+    // Bitset of values currently live during backward block scanning, accompanied by an undo log of visited values.
     let (mut at, mut seen) = (arena.vec_of(0, live.words), arena.vec());
-    // What each instruction reads for the last time: `dying[spans[i].0..spans[i].1]`.
+    // Records values whose live ranges terminate at instruction `i`, indexed via `dying[spans[i].0..spans[i].1]`.
     let (mut dying, mut spans) = (arena.vec(), arena.vec());
     let mut stack = ragwort_alloc::vec_in![arena; 0];
     while let Some(b) = stack.pop() {
@@ -287,7 +287,7 @@ fn colour<'t>(
                 }
             });
         }
-        // What's left is live into the block, and its parameters, which have no colours yet.
+        // Reclaims colors for values that are live-in to the block, then assigns colors to uncolored block parameters.
         c.taken.clear();
         c.taken.resize(c.colours.count as usize, false);
         for &v in seen.iter() {
@@ -303,7 +303,7 @@ fn colour<'t>(
         }
         block.params.iter().for_each(|&p| c.take(p));
         for (inst, &(start, end)) in block.insts.iter().zip(&spans) {
-            // A closure is in its register before it captures anything.
+            // The closure object's destination register is defined prior to capturing environment values.
             if let Inst::Closures { .. } = inst {
                 inst.defs().iter().for_each(|&d| c.take(d));
                 dying[start..end].iter().for_each(|&u| c.free(u));
@@ -316,7 +316,7 @@ fn colour<'t>(
     c.colours
 }
 
-/// Colours being given out, and which are taken where the walk is.
+/// State for greedy register coloring: maintains assigned colors and tracks which colors are currently occupied.
 struct Colouring<'t, 'f> {
     colours: Colours<'t>,
     taken: AVec<'t, bool>,
@@ -325,7 +325,7 @@ struct Colouring<'t, 'f> {
 }
 
 impl Colouring<'_, '_> {
-    /// Gives `v` the lowest free colour, if it's used and not pinned to a register.
+    /// Assigns the lowest available register color to value `v`, provided `v` is used and not pinned to a fixed register.
     fn take(&mut self, v: Val) {
         if self.pinned[v.0 as usize] || self.uses[v.0 as usize] == 0 {
             return;
@@ -346,9 +346,8 @@ impl Colouring<'_, '_> {
     }
 }
 
-/// A closure's code, function `function` of the program, to be emitted after the function that
-/// makes the closure, into constant `slot`: its bytecode, or, if `closure`, a closure of it that
-/// captures nothing.
+/// A deferred closure compilation job: function `function` in the program to be emitted into constant pool
+/// index `slot`. It is emitted as compiled bytecode, or as a pre-instantiated closure if it captures no upvalues.
 struct Pending {
     slot: u32,
     function: u32,
@@ -356,15 +355,15 @@ struct Pending {
     closure: bool,
 }
 
-/// The constants and bytecode the code compiled makes.
+/// Compilation context holding the constant pool and bytecode generated during module code emission.
 struct Module<'a, 'gc> {
     mc: &'a Mutation<'gc>,
-    /// The module the code is from, whose variables and host functions it uses.
+    /// The owning runtime module whose imported variables and host function tables are accessed.
     owner: Option<Gc<'gc, objects::Module>>,
     constants: Vec<Value<'gc>>,
     index: HashMap<u64, u32>,
     codes: Vec<Gc<'gc, Bytecode>>,
-    /// The codes of closures of the functions emitted, not yet emitted, the next last.
+    /// Deferred closure functions awaiting bytecode emission, organized as a work stack.
     pending: Vec<Pending>,
 }
 
@@ -379,15 +378,15 @@ impl<'a, 'gc> Module<'a, 'gc> {
         Ok(i)
     }
 
-    /// Where `def` is in the module's host functions.
+    /// Returns the index of host function `def` in the module's host table, registering it if not yet present.
     fn host(&self, def: &'static HostDef) -> Result<u32, CompileError> {
         let hosts = self.owner.and_then(|m| m.hosts(self.mc)).map_or(&[][..], |h| &h[..]);
         let i = hosts.iter().position(|&h| h == def).ok_or(CompileError::UnknownHost(def))?;
         u32::try_from(i).map_err(|_| CompileError::TooManyConstants)
     }
 
-    /// A constant for `function`'s code, or a closure of it if `closure`, which is emitted later.
-    /// Those of one call after another are one after another, as `NewClosure` takes them.
+    /// Allocates a constant pool slot for deferred compilation of `function` (or a constant closure if `closure` is true).
+    /// Consecutive closures within a group are allocated sequential constant slots matching `Op::NewClosure` expectations.
     fn defer(&mut self, function: u32, captures: Vec<Capture>, closure: bool) -> Result<u32, CompileError> {
         let slot = u32::try_from(self.constants.len()).map_err(|_| CompileError::TooManyConstants)?;
         self.constants.push(Value::VOID);
@@ -395,8 +394,8 @@ impl<'a, 'gc> Module<'a, 'gc> {
         Ok(slot)
     }
 
-    /// `f`'s bytecode, with 1- and 2-argument intrinsic tests fused into their branches unless one
-    /// lands past an `i16` offset.
+    /// Emits bytecode for function `f`, fusing 1- and 2-argument intrinsic tests into conditional branches
+    /// unless jump targets exceed the 16-bit signed branch offset limit.
     fn function(&mut self, f: &Function<'_, 'gc>, captures: &[Capture]) -> Result<Gc<'gc, Bytecode>, CompileError> {
         let (constants, codes, pending) = (self.constants.len(), self.codes.len(), self.pending.len());
         if let Some(code) = self.attempt(f, captures, true)? {
@@ -416,21 +415,21 @@ impl<'a, 'gc> Module<'a, 'gc> {
     fn attempt(&mut self, f: &Function<'_, 'gc>, captures: &[Capture], near: bool) -> Result<Option<Gc<'gc, Bytecode>>, CompileError> {
         let (n, optional) = (f.params.len() as u64, u64::from(f.optional));
         let shape = Shape { required: n - optional, optional, rest: f.rest.is_some() };
-        // Optional parameters are bound in registers, past which code can't take them.
+        // Optional parameters must reside in frame registers; reject parameter shapes exceeding `MAX_PARAMS`.
         if optional > 0 && shape.slots() > u64::from(MAX_PARAMS) {
             return Err(CompileError::TooManyRegisters);
         }
         let arity = shape.encode().ok_or(CompileError::TooManyRegisters)?;
         let link = frame::link_slot(arity);
         let values = f.values as usize;
-        // The function's working data, gone once it's emitted, before the next one's.
+        // Scratch arena for intra-function compiler data structures, deallocated immediately after function emission.
         let scratch = Arena::new();
         let arena = &scratch;
         let mut fixed = arena.vec_of(None, values);
         fixed[f.this.0 as usize] = Some(CLOSURE);
         let all: AVec<'_, Val> = f.params.iter().chain(&f.rest).copied().collect_in(arena);
         let list = ARGS + MAX_PARAMS - 1;
-        // Past what a frame's registers take, the last of them holds the rest in a list.
+        // When parameter count exceeds available frame registers, the final register stores overflow arguments as a list.
         let unpacked = if all.len() <= usize::from(MAX_PARAMS) {
             all.iter().zip(ARGS..).for_each(|(v, r)| fixed[v.0 as usize] = Some(r));
             &[][..]
@@ -501,7 +500,7 @@ impl<'a, 'gc> Module<'a, 'gc> {
             e.block(f, b, &live, order.get(i + 1).copied())?;
         }
         let Emitter { mut ops, mut starts, mut jumps, .. } = e;
-        // A jump to the next instruction, as to a block whose moves came to nothing, goes.
+        // Eliminates redundant jumps to the immediately following instruction (e.g. blocks where parallel moves collapsed to no-ops).
         loop {
             let gone: AVec<'_, usize> = jumps
                 .iter()
@@ -541,8 +540,8 @@ impl<'a, 'gc> Module<'a, 'gc> {
     }
 }
 
-/// The 1- or 2-argument intrinsic test that `block` makes last for its branch alone, which can be
-/// the branch.
+/// Identifies whether the final instruction in `block` is a 1- or 2-argument intrinsic comparison
+/// that can be fused directly into the conditional branch terminator.
 fn fused_test<'b>(block: &'b l5::BlockData<'_, '_>, uses: &[u32], imms: &Imms<'_, '_>) -> Option<(Intrinsic, &'b [Val])> {
     let (Some(Inst::Prim { dst, prim: Prim::Intrinsic(intrinsic), args, spread: false }), End::Branch { test, .. }) = (block.insts.last(), &block.end) else {
         return None;
@@ -551,8 +550,8 @@ fn fused_test<'b>(block: &'b l5::BlockData<'_, '_>, uses: &[u32], imms: &Imms<'_
     fusable.then_some((*intrinsic, args.as_slice()))
 }
 
-/// The order blocks go in, depth first, each followed where it can be by the one it goes on to;
-/// and the branches inverted, to fall through to code that goes round a loop and jump out of it.
+/// Computes basic block layout order via depth-first traversal, arranging fall-through jumps along hot edges
+/// and inverting loop condition branches so that loop bodies fall through while loop exits branch away.
 fn layout<'t>(arena: &'t Arena, f: &Function<'_, '_>, to: &[usize], fusable: &[bool]) -> (AVec<'t, usize>, AVec<'t, bool>) {
     let n = f.blocks.len();
     let (mut order, mut placed, mut inverted) = (AVec::with_capacity_in(n, arena), arena.vec_of(false, n), arena.vec_of(false, n));
@@ -578,8 +577,8 @@ fn layout<'t>(arena: &'t Arena, f: &Function<'_, '_>, to: &[usize], fusable: &[b
     (order, inverted)
 }
 
-/// Whether every way on from `b` jumps back to a block already placed, as a loop goes round,
-/// as far as a few blocks show.
+/// Heuristically checks (up to a small bounded depth) whether all outgoing paths from block `b` lead to
+/// an already placed block, indicating a backward loop edge.
 fn recurs(arena: &Arena, f: &Function<'_, '_>, to: &[usize], placed: &[bool], b: usize) -> bool {
     let mut ways = ragwort_alloc::vec_in![arena; b];
     let mut seen = 0;
@@ -601,7 +600,7 @@ fn recurs(arena: &Arena, f: &Function<'_, '_>, to: &[usize], placed: &[bool], b:
     true
 }
 
-/// Where a jump to each block goes: past those that only jump on, which are left out.
+/// Computes the effective jump target for each basic block, bypassing intermediate blocks that contain only an unconditional jump.
 fn forwards<'t>(arena: &'t Arena, f: &Function<'_, '_>) -> AVec<'t, usize> {
     let on = |b: usize| match &f.blocks[b] {
         block if b > 0 && block.params.is_empty() && block.insts.is_empty() => match &block.end {
@@ -636,28 +635,27 @@ struct Emitter<'m, 'a, 't, 'gc> {
     uses: AVec<'t, u32>,
     imms: Imms<'t, 'gc>,
     to: AVec<'t, usize>,
-    /// Buffers kept from block to block and move to move.
-    /// What's live where the walk back through a block is, as bits, clear between blocks, and
-    /// the values it's had.
+    /// Reusable scratch buffers retained across blocks and parallel move sequences.
+    /// `at` is a bitset of values active during backward block scanning; `seen` records modified indices for rapid resetting.
     at: AVec<'t, u64>,
     seen: AVec<'t, Val>,
     highs: AVec<'t, Option<u8>>,
     after: AVec<'t, Regs>,
     moves: AVec<'t, (Loc, Loc)>,
-    /// Where each value used once is wanted: in which block, by which instruction (past the last
-    /// for the block's end), and where.
+    /// Preferred register targets for singly-used values: records the destination block, instruction index,
+    /// and target register position.
     aims: AVec<'t, Option<(u32, u32, Aim)>>,
-    /// Where the block being emitted starts, before which no move fuses with the next.
+    /// The starting opcode index of the basic block currently being emitted; moves cannot fuse across this boundary.
     fence: usize,
-    /// Which blocks' branches are fused with their tests, and which of those are inverted.
+    /// Tracks which basic blocks have their test conditions fused into branch instructions, and which branch conditions are inverted.
     fusable: AVec<'t, bool>,
     inverted: AVec<'t, bool>,
     spill: Option<u8>,
-    /// The first of the function's own registers.
+    /// The first register index allocated for this function's local variables, following incoming parameters.
     first: u8,
-    /// Where each block's code starts.
+    /// The bytecode offset where each basic block begins.
     starts: AVec<'t, usize>,
-    /// The jumps to blocks, to land once they're all there.
+    /// Jump instructions with unresolved target offsets, patched once all block start positions are determined.
     jumps: AVec<'t, (usize, Block)>,
 }
 
@@ -668,8 +666,8 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         let block = &f.blocks[b];
         let n = block.insts.len();
         let tail = self.tail(block);
-        // The registers live after each instruction, and the highest live across it, past which a
-        // call it makes can go.
+        // Computes the set of active registers following each instruction, identifying the highest live register
+        // to establish the frame base for nested calls.
         let mut taken = [0; WINDOW / 64];
         let arena = self.arena;
         let (mut at, mut seen, mut highs, mut after) = (
@@ -744,8 +742,8 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         }
     }
 
-    /// The intrinsic whose value `block` returns as its last instruction makes it, which can
-    /// return it itself.
+    /// If `block` ends by returning the result of an intrinsic instruction, returns the intrinsic and its arguments
+    /// so it can be emitted using a specialized tail-return opcode.
     fn tail<'b>(&self, block: &'b l5::BlockData<'_, 'gc>) -> Option<(Prim, &'b [Val])> {
         let (Some(Inst::Prim { dst, prim, args, spread: false }), End::Return(v)) = (block.insts.last(), &block.end) else { return None };
         let tail = matches!(prim, Prim::Intrinsic(_)) && self.imms[dst.0 as usize].is_none();
@@ -771,7 +769,7 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         }
     }
 
-    /// Notes where the values `inst` stages, `at` in block `b`, are wanted.
+    /// Registers target preferences for argument values staged by `inst` at instruction `at` in block `b`.
     fn aim_args(&mut self, b: usize, at: usize, inst: &Inst<'_, 'gc>, tail: bool) {
         let (head, args) = match inst {
             Inst::Call { f, args, .. } => (Some(*f), args),
@@ -784,7 +782,7 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         }
     }
 
-    /// Notes where the values block `b`'s end passes on are wanted.
+    /// Registers target preferences for values passed as block arguments by block `b`'s terminator.
     fn aim_end(&mut self, f: &Function<'_, 'gc>, b: usize) {
         let block = &f.blocks[b];
         let at = block.insts.len();
@@ -816,8 +814,8 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         }
     }
 
-    /// Puts `v`, made by instruction `j` of block `b`, where its one use wants it, if that's free
-    /// until then; calls in between go past it.
+    /// Pre-assigns `v` (defined at instruction `j` in block `b`) directly to its preferred destination register,
+    /// provided that register remains unallocated throughout the intervening range.
     fn aim(&mut self, b: usize, j: usize, v: Val, highs: &mut [Option<u8>], after: &mut [Regs]) {
         let Some((block, k, aim)) = self.aims[v.0 as usize] else { return };
         let k = k as usize;
@@ -842,7 +840,7 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         highs[j + 1..k].iter_mut().for_each(|h| *h = Some(h.map_or(t, |h| h.max(t))));
     }
 
-    /// Whether a primitive making `dst` from `args` takes them in a row of registers.
+    /// Determines whether the primitive producing `dst` requires its arguments to be staged in a contiguous sequence of registers.
     fn stages(&self, dst: Val, prim: Prim, args: usize, spread: bool) -> bool {
         match prim {
             Prim::Slot(..) => false,
@@ -852,7 +850,7 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         }
     }
 
-    /// `inst`, whose calls go at `base` or past it.
+    /// Emits bytecode for instruction `inst`. Outgoing calls are staged at or above register index `base`.
     fn inst(&mut self, inst: &Inst<'_, 'gc>, base: u8) -> Result<(), CompileError> {
         match inst {
             Inst::Const(dst, value) => {
@@ -940,7 +938,7 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         Ok(())
     }
 
-    /// An access of variable `slot` of the module, a store's value in `args`.
+    /// Emits a load or store operation for module variable `slot`. For stores, the value to write is provided in `args`.
     fn slot(&mut self, dst: Val, op: SlotOp, slot: u32, args: &[Val]) -> Result<(), CompileError> {
         let len = self.module.owner.map_or(0, |m| m.items(self.module.mc).len());
         if slot as usize >= len {
@@ -968,7 +966,7 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
 
     #[inline(never)]
     fn closures(&mut self, dsts: &[Val], codes: &[Code<'_>]) -> Result<(), CompileError> {
-        // Code that captures nothing is a constant closure.
+        // A closure with no captured upvalues is emitted as a compile-time constant closure object.
         if codes.iter().all(|code| code.captures.is_empty()) {
             for (&dst, code) in dsts.iter().zip(codes) {
                 if self.used(dst) {
@@ -984,7 +982,7 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
             self.write(dst, |dst| Op::NewClosure { dst, count: 1, code: index });
             return Ok(());
         }
-        // A group is made in the scratch registers, where its closures capture each other.
+        // Mutually recursive closure groups are staged in scratch registers so they can capture one another's references.
         if codes.len() > STAGE {
             return Err(CompileError::TooManyRegisters);
         }
@@ -1019,7 +1017,7 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         captured.iter().map(capture).collect()
     }
 
-    /// `end`, before the block at `next`, to which it needn't jump.
+    /// Emits bytecode for block terminator `end`. If the target block matches `next`, redundant jumps can fall through.
     fn end(&mut self, f: &Function<'_, 'gc>, end: &End<'_>, next: Option<usize>) -> Result<(), CompileError> {
         match end {
             End::Return(v) => {
@@ -1052,8 +1050,8 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
                 let n = args.len() as u8;
                 let request = *request;
                 match (self.stage(self.first, None, args, false), spread) {
-                    // A guard holds the frame it's called from anyway, and called from it, the VM
-                    // keeps its handler there, with no prompt.
+                    // A guard continuation retains its caller frame; invoking it from that frame allows the VM
+                    // to reuse the existing handler in place without creating a new prompt.
                     (Some(base), false) if request == Request::Guard => self.ops.extend([
                         Op::CallRequest { base, args: n, request },
                         Op::LoadAcc { dst: SCRATCH },
@@ -1082,16 +1080,17 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         self.ops.push(op);
     }
 
-    /// Goes on to `to`, which is where it goes if it's `next`.
+    /// Emits an unconditional jump to block `to`, omitting the instruction if execution naturally falls through to `next`.
     fn go(&mut self, to: Block, next: Option<usize>) {
         if Some(self.to[to.0 as usize]) != next {
             self.jump(Op::Jump { offset: 0 }, to);
         }
     }
 
-    /// Moves `head`, if any, then `vals` to registers from `base`, or past it, as many as fit, or
-    /// failing that the scratch registers, and returns where; `None` if there are too many for those.
-    /// Values already in a row from `base` or past it, or anywhere if it's `free`, stay there.
+    /// Stages `head` (if present) followed by `vals` into contiguous registers starting at or above `base`.
+    /// If they do not fit in available local registers, attempts staging into scratch registers.
+    /// Returns the starting register index, or `None` if argument count exceeds available scratch registers.
+    /// Values already arranged consecutively in eligible registers remain in place.
     fn stage(&mut self, base: u8, head: Option<Val>, vals: &[Val], free: bool) -> Option<u8> {
         let n = usize::from(head.is_some()) + vals.len();
         if let Some(r) = self.row(head.iter().chain(vals))
@@ -1113,7 +1112,7 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         Some(base)
     }
 
-    /// The register `vals` are in, if they're in a row of them.
+    /// Returns the starting register index if `vals` already occupy a contiguous sequence of hardware registers, or `None` otherwise.
     fn row<'v>(&self, mut vals: impl Iterator<Item = &'v Val>) -> Option<u8> {
         let Loc::Reg(r) = self.loc(*vals.next()?) else { return None };
         let mut next = r;
@@ -1126,8 +1125,8 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         Some(r)
     }
 
-    /// A list of `args` in a scratch register, which it returns, or if `spread`, of all but the
-    /// last, before the last, a list itself.
+    /// Builds a Scheme list from `args` into a scratch register and returns that register. If `spread` is true,
+    /// prepends all leading arguments onto the final argument (which must already evaluate to a list).
     fn spread(&mut self, args: &[Val], spread: bool) -> u8 {
         if spread {
             let (last, rest) = args.split_last().expect("a spread call has a list");
@@ -1153,7 +1152,8 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         list
     }
 
-    /// Makes each `(to, from)` move as if all at once, then keeps the buffer.
+    /// Emits a sequence of register/slot moves simulating parallel assignment, resolving cycles using a scratch register.
+    /// Retains the allocated vector buffer for future reuse.
     fn parallel(&mut self, mut moves: AVec<'t, (Loc, Loc)>) {
         moves.retain(|(to, from)| to != from);
         while !moves.is_empty() {
@@ -1161,7 +1161,7 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
                 let (to, from) = moves.remove(i);
                 self.mov(to, from);
             } else {
-                // A cycle: one goes by a scratch register.
+                // Breaks a cyclic dependency permutation by buffering one source location through a scratch register.
                 let from = moves[0].1;
                 self.mov(Loc::Reg(SCRATCH), from);
                 for m in &mut moves {
@@ -1204,14 +1204,14 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         self.spill.expect("only a function with a spill has slots")
     }
 
-    /// The result a call left in the accumulator into `dst`, if it's used.
+    /// Moves the call result from the accumulator register into destination `dst`, if `dst` is used.
     fn take(&mut self, dst: Val) {
         if self.used(dst) {
             self.write(dst, |dst| Op::LoadAcc { dst });
         }
     }
 
-    /// Where operand `k` of an instruction reading `v` is.
+    /// Resolves the physical register holding operand value `v` for instruction input `k`, loading spilled values into scratch if necessary.
     fn read(&mut self, v: Val, k: u8) -> u8 {
         match self.loc(v) {
             Loc::Reg(r) => r,
@@ -1223,7 +1223,7 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         }
     }
 
-    /// `op` writing `v`, or a scratch register if nothing uses it.
+    /// Emits `op` targeting the physical register assigned to `v`, or redirects to a scratch register if `v` is unused.
     fn write(&mut self, v: Val, op: impl FnOnce(u8) -> Op) {
         match self.locs[v.0 as usize].filter(|_| self.used(v)) {
             Some(Loc::Reg(r)) => self.ops.push(op(r)),

@@ -1,12 +1,13 @@
-//! Prompts, as Racket CS builds them over Chez's continuations: a task's continuation is its
-//! chain of records, then a list of [`Prompt`]s, its metacontinuation. A prompt keeps the
-//! continuation it returns to, and its body runs on an empty one, so the chain only ever runs
-//! up to the nearest prompt. When the chain runs out, the prompt on top is popped and its
-//! continuation goes on.
+//! Delimited continuation prompts, structured as in Racket CS on Chez Scheme. A task's full
+//! continuation consists of its active chain of frame records followed by a list of [`Prompt`]s (the
+//! metacontinuation). Each prompt encapsulates the continuation to which it returns, while its inner
+//! body executes with an empty continuation chain, ensuring the active chain extends only to the
+//! nearest prompt. When the chain underflows, the topmost prompt is popped and its outer continuation
+//! resumes.
 //!
-//! Capturing up to a prompt takes the chain as it is, and the prompts above that one; calling
-//! what's captured puts the current continuation in a prompt of its own and goes on with the
-//! captured one. No record is copied for either.
+//! Capturing a continuation up to a prompt extracts the active chain along with any intermediate
+//! prompts above the target. Invoking a captured composable continuation encloses the caller's
+//! continuation in a fresh prompt and reinstates the captured segments without copying records.
 
 use ragwort_types::gc::{Gc, Mutation, Value};
 use ragwort_types::pair::{Pair, Pairs};
@@ -15,18 +16,19 @@ use crate::Fault;
 use crate::objects::{Continuation, ContinuationFields, Prompt, PromptFields, Tag, Task, TaskFields, Winder};
 use crate::segments::promote;
 
-/// The default continuation prompt tag.
+/// Returns the default continuation prompt tag used by root prompts and `call/cc`.
 pub(crate) const fn default_tag<'gc>() -> Value<'gc> {
     Value::from_bits(4 << 32 | 0b1101)
 }
 
-/// The key of the marks that hold the procedure a raise calls, or `#f` for none.
+/// Returns the continuation mark key used to store active exception handlers (or `#f` if none are
+/// installed).
 pub(crate) const fn handler_key<'gc>() -> Value<'gc> {
     Value::from_bits(5 << 32 | 0b1101)
 }
 
-/// Puts the current continuation in a prompt for `tag`, with `handler` for aborts to it, and
-/// starts an empty one.
+/// Pushes a delimited prompt for `tag` with the specified abort `handler` onto the metacontinuation,
+/// saving the active continuation and starting an empty continuation chain for the prompt's body.
 pub(crate) fn push<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, tag: Value<'gc>, handler: Value<'gc>) -> Result<(), Fault> {
     let prompt = Prompt::new(mc, tag, handler, task.chain(mc), task.attachments(mc), task.winders(mc))?;
     task.set_prompts(mc, Pairs::new(mc).cons(Value::object(mc, prompt), task.prompts(mc))?.value(mc));
@@ -34,8 +36,8 @@ pub(crate) fn push<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, tag: Value<'gc>
     Ok(())
 }
 
-/// Goes on with the continuation of the prompt on top, for a chain that has run out. Returns
-/// `false` if there's none, and the task is done.
+/// Pops the topmost prompt and reinstates its continuation when the active continuation chain
+/// exhausts. Returns `Ok(false)` if no prompts remain, indicating the task has completed.
 pub(crate) fn pop<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>) -> Result<bool, Fault> {
     let Some(cell) = Pair::of(task.prompts(mc)) else { return Ok(false) };
     restore(mc, task, prompt(mc, cell.head(mc))?);
@@ -43,9 +45,9 @@ pub(crate) fn pop<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>) -> Result<bool, 
     Ok(true)
 }
 
-/// Drops the continuation up to the nearest prompt for `tag`, and the prompt, so it goes on
-/// with that prompt's continuation. Returns the prompt's handler, or `None` for the implicit
-/// default prompt at the bottom of the stack.
+/// Aborts to the nearest prompt matching `tag`, discarding the delimited continuation up to and
+/// including that prompt, and resuming the prompt's outer continuation. Returns the prompt's handler
+/// procedure, or `None` if aborting to the root default prompt.
 pub(crate) fn abort<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, tag: Value<'gc>) -> Result<Option<Value<'gc>>, Fault> {
     match find(mc, task, tag)? {
         Some(found) => {
@@ -61,8 +63,9 @@ pub(crate) fn abort<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, tag: Value<'gc
     }
 }
 
-/// The continuation up to the nearest prompt for `tag`, composable or an `escape`. What it holds
-/// is only ever copied from then on.
+/// Captures the delimited continuation up to the nearest prompt matching `tag` as either a composable
+/// continuation or an escape continuation. Promotes captured one-shot records so they are copied on
+/// subsequent multi-shot resumptions.
 pub(crate) fn capture<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, tag: Value<'gc>, escape: bool) -> Result<Value<'gc>, Fault> {
     let prompts = match find(mc, task, tag)? {
         Some(found) => {
@@ -82,8 +85,9 @@ pub(crate) fn capture<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, tag: Value<'
     Ok(Value::object(mc, Continuation::new(mc, task.chain(mc), task.attachments(mc), task.winders(mc), prompts, escape)?))
 }
 
-/// Goes on with `k` on top of the current continuation, which a prompt with no tag keeps, unless
-/// it's empty, as it is in tail position under a prompt.
+/// Composes continuation `k` on top of the current continuation. Preserves the active continuation in
+/// an untagged prompt unless the current continuation is already empty (such as in tail position under
+/// a prompt).
 pub(crate) fn compose<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, k: Gc<'gc, Continuation>) -> Result<(), Fault> {
     if task.chain(mc) != Value::FALSE || task.attachments(mc) != Value::NIL || task.winders(mc) != Value::NIL {
         push(mc, task, Value::VOID, Value::VOID)?;
@@ -101,8 +105,8 @@ pub(crate) fn compose<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, k: Gc<'gc, C
     Ok(())
 }
 
-/// Drops the continuation up to the nearest prompt for the default tag, which stays, as calling
-/// an escape continuation does.
+/// Discards all continuation frames and intermediate prompts up to the nearest default prompt while
+/// leaving that default prompt intact, matching escape continuation invocation behavior.
 pub(crate) fn clear_to_default<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>) -> Result<(), Fault> {
     let mut at = task.prompts(mc);
     while let Some(cell) = Pair::of(at) {
@@ -116,8 +120,8 @@ pub(crate) fn clear_to_default<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>) -> 
     Ok(())
 }
 
-/// The value of the nearest mark for `key`, in the current continuation or under any prompt,
-/// or `default` if there's none.
+/// Retrieves the value of the nearest continuation mark associated with `key` across all prompt
+/// segments, returning `default` if no matching mark is found.
 pub(crate) fn mark<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, key: Value<'gc>, default: Value<'gc>) -> Result<Value<'gc>, Fault> {
     if let Some(value) = nearest(mc, task.attachments(mc), key)? {
         return Ok(value);
@@ -132,14 +136,15 @@ pub(crate) fn mark<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, key: Value<'gc>
     Ok(default)
 }
 
-/// The value of the nearest mark for `key` up to the nearest prompt, or `default`.
+/// Retrieves the value of the nearest continuation mark for `key` within the current prompt slice (up
+/// to the nearest prompt boundary), or returns `default` if absent.
 pub(crate) fn frame_mark<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, key: Value<'gc>, default: Value<'gc>) -> Result<Value<'gc>, Fault> {
     Ok(nearest(mc, task.attachments(mc), key)?.unwrap_or(default))
 }
 
-/// The value of the nearest mark for `key` in each prompt's part of the continuation, innermost
-/// first, or `default` for a part with none: from the current part to the one just inside the
-/// nearest prompt for `tag`, or to the bottom if it's `None`.
+/// Collects the nearest mark for `key` within each prompt segment (innermost first) up to the prompt
+/// matching `tag` (or to the bottom of the stack if `tag` is `None`), substituting `default` for
+/// segments containing no mark for `key`.
 pub(crate) fn part_marks<'gc>(
     mc: &Mutation<'gc>,
     task: Gc<'gc, Task>,
@@ -150,19 +155,20 @@ pub(crate) fn part_marks<'gc>(
     nearest_each(mc, &parts(mc, task, tag)?, key, default)
 }
 
-/// The [`Winder`]s of the continuation of `task`, up to the nearest prompt for `tag` or all of
-/// them, innermost first, each with the list of those outside it in its prompt's part.
+/// Collects all active [`Winder`]s in `task` up to the nearest prompt matching `tag` (or all winders
+/// if `tag` is `None`), ordered innermost first, pairing each winder with the enclosing winders in its
+/// prompt segment.
 pub(crate) fn winds<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, tag: Option<Value<'gc>>) -> Result<Vec<Wind<'gc>>, Fault> {
     winds_in(mc, task.winders(mc), task.prompts(mc), tag)
 }
 
-/// [`winds`] of the continuation `k`, all of it.
+/// Retrieves the complete list of [`Winder`] pairs throughout continuation `k`.
 pub(crate) fn winds_of<'gc>(mc: &Mutation<'gc>, k: Gc<'gc, Continuation>) -> Result<Vec<Wind<'gc>>, Fault> {
     winds_in(mc, k.winders(mc), k.prompts(mc), None)
 }
 
-/// The winds of the first `parts` prompt parts of the continuation of `task`, then those of the
-/// next part down to the list `winders`, whose own stay.
+/// Collects winders across the innermost `parts` prompt segments of `task`, plus the winders of the
+/// subsequent segment down to `winders` (retaining the entries in `winders` themselves).
 pub(crate) fn winds_above<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, parts: usize, winders: Value<'gc>) -> Result<Vec<Wind<'gc>>, Fault> {
     let (mut winds, mut at, mut prompts) = (Vec::new(), task.winders(mc), task.prompts(mc));
     for part in 0..=parts {
@@ -180,11 +186,12 @@ pub(crate) fn winds_above<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, parts: u
     Ok(winds)
 }
 
-/// A [`Winder`], and the list of those outside it in its prompt's part of the continuation.
+/// Represents a [`Winder`] paired with the list of outer winders enclosing it within its prompt
+/// segment.
 pub(crate) type Wind<'gc> = (Gc<'gc, Winder>, Value<'gc>);
 
-/// The winds of `winders`, then of those under each of `prompts`, up to the nearest prompt for
-/// `tag`, or all of them.
+/// Gathers winders starting from `winders` and descending through enclosing `prompts` up to the
+/// nearest prompt matching `tag` (or through all prompts if `tag` is `None`).
 fn winds_in<'gc>(mc: &Mutation<'gc>, mut winders: Value<'gc>, mut prompts: Value<'gc>, tag: Option<Value<'gc>>) -> Result<Vec<Wind<'gc>>, Fault> {
     let mut winds = Vec::new();
     loop {
@@ -205,8 +212,8 @@ fn winds_in<'gc>(mc: &Mutation<'gc>, mut winders: Value<'gc>, mut prompts: Value
     }
 }
 
-/// The marks of each prompt's part of the continuation of `task`, innermost first, up to the
-/// nearest prompt for `tag`, or all of them.
+/// Extracts the continuation marks from each prompt segment of `task` (innermost first) up to the
+/// prompt matching `tag`, or across all prompts if `tag` is `None`.
 fn parts<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, tag: Option<Value<'gc>>) -> Result<Vec<Value<'gc>>, Fault> {
     let mut parts = vec![task.attachments(mc)];
     let mut at = task.prompts(mc);
@@ -244,7 +251,8 @@ fn nearest_each<'gc>(mc: &Mutation<'gc>, parts: &[Value<'gc>], key: Value<'gc>, 
     Ok(list)
 }
 
-/// `value`, if it's a prompt tag.
+/// Validates that `value` is a valid continuation prompt tag (either the default tag or a `Tag`
+/// object), returning it or `Err(Fault::WrongType)`.
 pub(crate) fn tag_of<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Result<Value<'gc>, Fault> {
     if value == default_tag() || value.downcast::<Tag>(mc).is_some() {
         Ok(value)
@@ -253,7 +261,8 @@ pub(crate) fn tag_of<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Result<Value
     }
 }
 
-/// The nearest prompt for a tag, the ones above it, and the list under it.
+/// Search result locating a target prompt: contains the prompt itself, intermediate prompts above it,
+/// and the remaining prompt list below it.
 struct Found<'gc> {
     above: Vec<Gc<'gc, Prompt>>,
     prompt: Gc<'gc, Prompt>,
@@ -283,7 +292,8 @@ fn restore<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, prompt: Gc<'gc, Prompt>
     task.set_winders(mc, prompt.winders(mc));
 }
 
-/// Starts an empty continuation, up to the nearest prompt.
+/// Clears the active continuation chain, marks, and winders in `task`, establishing an empty
+/// delimited continuation up to the nearest prompt.
 fn empty<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>) {
     task.set_chain(mc, Value::FALSE);
     task.set_attachments(mc, Value::NIL);
@@ -294,7 +304,7 @@ fn prompt<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Result<Gc<'gc, Prompt>,
     value.downcast::<Prompt>(mc).ok_or(Fault::Malformed)
 }
 
-/// `prompts`, innermost first, on top of the list `under`.
+/// Constructs a Scheme list prepending `prompts` (innermost first) onto the tail list `under`.
 fn list<'gc>(mc: &Mutation<'gc>, prompts: &[Gc<'gc, Prompt>], under: Value<'gc>) -> Result<Value<'gc>, Fault> {
     let pairs = Pairs::new(mc);
     let mut list = under;

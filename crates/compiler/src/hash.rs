@@ -1,5 +1,6 @@
-//! Hash maps and sets for keys already spread, such as variables, values and node numbers,
-//! which don't need SipHash.
+//! Hash map and set type aliases configured with a fast, lightweight mixer for keys that already
+//! possess good bit dispersion (such as variable IDs, values, and node indices), avoiding the
+//! overhead of SipHash.
 
 use std::hash::{BuildHasherDefault, Hasher};
 

@@ -1,11 +1,14 @@
-//! `syntax-case`'s patterns and `syntax`'s templates, as values code holds as constants:
-//! [`SyntaxPattern`]s, which `syntax-match` matches syntax with, giving a vector of what their
-//! variables matched, a list of those for each ellipsis a variable's under, and
-//! [`SyntaxTemplate`]s, which `syntax-build` makes syntax of, from what its pattern variables
-//! matched. Each is a shape, with the syntax and data it refers to in its items, by index.
+//! Compiled pattern and template representations for `syntax-case` and `syntax` forms.
 //!
-//! What's matched and made is a transformer's syntax: lists of syntax, or the syntax of lists, as
-//! a pattern's rest is a list of the rest of the syntax it matched.
+//! Provides two constant structures:
+//! - [`SyntaxPattern`]: Compiled pattern structure matched against input syntax via `syntax-match`,
+//!   yielding a vector of matched pattern variable bindings (nested in lists for variables bound under ellipses).
+//! - [`SyntaxTemplate`]: Compiled template structure used by `syntax-build` to construct output syntax
+//!   by substituting matched pattern variable bindings into the template shape.
+//!
+//! Literals, constants, and nested pattern/template nodes are stored in indexed item arrays.
+//! Matched inputs and generated outputs maintain transformer syntax representation invariants
+//! (nested lists of syntax objects or syntax objects wrapping lists).
 
 use std::ops::Range;
 
@@ -21,31 +24,34 @@ use crate::objects::{SyntaxPattern, SyntaxPatternFields, SyntaxTemplate, SyntaxT
 use crate::op::Fuel;
 use crate::syntax;
 
-/// A pattern, its literals and data the items of the [`SyntaxPattern`] it's in. Its parts are
-/// nodes of the [`PatternShape`] it's in, by index, and lists of them its ranges of `lists`.
+/// A compiled pattern matching node. Literals and datums are referenced by index into the
+/// enclosing [`SyntaxPattern`] item table, while sub-pattern nodes and sequences are referenced
+/// by index ranges in [`PatternShape`].
 #[derive(Clone, Debug, Wire)]
 pub enum Pattern {
-    /// `_`.
+    /// Wildcard pattern (`_`), matching any syntax input without binding a pattern variable.
     Any,
-    /// The variable matched into this slot.
+    /// Pattern variable node, binding the matched syntax into output vector slot `u32`.
     Var(u32),
-    /// An identifier that refers to what the identifier in this item does.
+    /// Literal identifier pattern, matching any input identifier that resolves to the same binding as the identifier at constant index `u32`.
     Literal(u32),
-    /// A datum `equal?` to the one in this item.
+    /// Constant datum pattern, matching any input whose unwrapped datum is `equal?` to the constant datum at index `u32`.
     Datum(u32),
-    /// A list, or a vector, of items that match `before`, then any number that match `repeat`,
-    /// then items that match `after`, and for a list, what's left matching `tail`, or nothing.
+    /// Sequence pattern (matching a list or vector) with three segments: fixed elements before an ellipsis (`before`),
+    /// an optional repeated pattern under an ellipsis (`repeat`), fixed elements following the ellipsis (`after`),
+    /// and an optional improper list tail pattern (`tail`).
     Seq { before: Range<u32>, repeat: Option<Repeat>, after: Range<u32>, tail: Option<u32>, vector: bool },
 }
 
-/// A pattern under an ellipsis, and the slots of its variables.
+/// Describes an ellipsized sub-pattern: the node index `each` to match repeatedly, and the slot range `slots` receiving accumulated match lists.
 #[derive(Clone, Debug, Wire)]
 pub struct Repeat {
     pub each: u32,
     pub slots: Range<u32>,
 }
 
-/// A pattern, its last node, the nodes of its parts before it, and how many variables it has.
+/// The AST layout of a compiled pattern, containing a flat vector of pattern `nodes`, sequence element index ranges in `lists`,
+/// and the total count of pattern variables `vars`.
 #[derive(Clone, Debug, Default, Wire)]
 pub struct PatternShape {
     pub nodes: Vec<Pattern>,
@@ -54,13 +60,13 @@ pub struct PatternShape {
 }
 
 impl PatternShape {
-    /// `p`'s node, the last so far.
+    /// Appends pattern node `p` to `nodes` and returns its 0-based node index.
     pub fn add(&mut self, p: Pattern) -> u32 {
         self.nodes.push(p);
         index(self.nodes.len() - 1)
     }
 
-    /// The list of `nodes`.
+    /// Appends an iterator of pattern node indices to `lists` and returns the corresponding index range.
     pub fn list(&mut self, nodes: impl IntoIterator<Item = u32>) -> Range<u32> {
         let start = index(self.lists.len());
         self.lists.extend(nodes);
@@ -72,21 +78,21 @@ impl PatternShape {
     }
 }
 
-/// A template, its constants the items of the [`SyntaxTemplate`] it's in. Its parts are nodes of
-/// the [`TemplateShape`] it's in, by index, and its items a range of its `items`.
+/// A compiled syntax template node. Constant syntax objects are stored in the enclosing [`SyntaxTemplate`]
+/// item table, and composite sequence items are stored in [`TemplateShape`].
 #[derive(Clone, Debug, Wire)]
 pub enum Template {
-    /// The syntax in this item.
+    /// Emits the constant syntax object stored at item index `u32`.
     Const(u32),
-    /// What the variable passed in this place matched.
+    /// Emits the value bound to the pattern variable in slot `u32`.
     Var(u32),
-    /// A list or vector of items, a tail for a list, made with the scopes and span of the
-    /// syntax in item `like`.
+    /// Constructs a list or vector from template `items` (with an optional improper `tail` for lists),
+    /// transferring source spans and lexical scopes from the prototype syntax object at item index `like`.
     Seq { items: Range<u32>, tail: Option<u32>, vector: bool, like: u32 },
 }
 
-/// An item of a list or vector template, made once for each match of the pattern variables in
-/// it under `ellipses` ellipses, which are in `slots`, a range of the shape's.
+/// An element within a sequence template, instantiated once per iteration across the pattern variables
+/// in `slots` nested under `ellipses` ellipsis levels.
 #[derive(Clone, Debug, Wire)]
 pub struct Item {
     pub template: u32,
@@ -94,8 +100,8 @@ pub struct Item {
     pub slots: Range<u32>,
 }
 
-/// A template, its last node, the nodes of its parts before it, and how many ellipses each
-/// pattern variable it's passed is under in its pattern.
+/// The structural layout of a compiled syntax template, containing template nodes (`nodes`), sequence items (`items`),
+/// variable slot ranges (`slots`), and the ellipsis nesting depth (`depths`) of each pattern variable.
 #[derive(Clone, Debug, Default, Wire)]
 pub struct TemplateShape {
     pub nodes: Vec<Template>,
@@ -105,13 +111,13 @@ pub struct TemplateShape {
 }
 
 impl TemplateShape {
-    /// `t`'s node, the last so far.
+    /// Appends template node `t` to `nodes` and returns its 0-based node index.
     pub fn add(&mut self, t: Template) -> u32 {
         self.nodes.push(t);
         index(self.nodes.len() - 1)
     }
 
-    /// The items `items`, each a template, how many ellipses it's under, and its slots.
+    /// Appends sequence template items and their associated variable slots to `items` and `slots`, returning the allocated index range in `items`.
     pub fn items(&mut self, items: impl IntoIterator<Item = (u32, u32, Vec<u32>)>) -> Range<u32> {
         let start = index(self.items.len());
         for (template, ellipses, slots) in items {
@@ -122,7 +128,7 @@ impl TemplateShape {
         start..index(self.items.len())
     }
 
-    /// Forgets the nodes, items and slots from these on.
+    /// Truncates the `nodes`, `items`, and `slots` vectors back to the specified lengths (used during template compilation rollbacks).
     pub fn truncate(&mut self, nodes: usize, items: usize, slots: usize) {
         self.nodes.truncate(nodes);
         self.items.truncate(items);
@@ -134,7 +140,7 @@ fn index(n: usize) -> u32 {
     u32::try_from(n).expect("fewer than 2^32 parts")
 }
 
-/// A pattern for `syntax-match`.
+/// Constructs a heap-allocated [`SyntaxPattern`] object containing frozen `shape` metadata and constant `items`.
 pub fn pattern<'gc>(mc: &Mutation<'gc>, shape: PatternShape, items: &[Value<'gc>]) -> Result<Value<'gc>, OutOfMemory> {
     let pattern = SyntaxPattern::new(mc, mc.frozen(Box::new(shape))?, items.len(), Value::FALSE)?;
     let slots = pattern.items(mc);
@@ -144,7 +150,7 @@ pub fn pattern<'gc>(mc: &Mutation<'gc>, shape: PatternShape, items: &[Value<'gc>
     Ok(Value::object(mc, pattern))
 }
 
-/// A template for `syntax-build`.
+/// Constructs a heap-allocated [`SyntaxTemplate`] object containing frozen `shape` metadata and constant `items`.
 pub fn template<'gc>(mc: &Mutation<'gc>, shape: TemplateShape, items: &[Value<'gc>]) -> Result<Value<'gc>, OutOfMemory> {
     let template = SyntaxTemplate::new(mc, mc.frozen(Box::new(shape))?, items.len(), Value::FALSE)?;
     let slots = template.items(mc);
@@ -154,7 +160,8 @@ pub fn template<'gc>(mc: &Mutation<'gc>, shape: TemplateShape, items: &[Value<'g
     Ok(Value::object(mc, template))
 }
 
-/// `(syntax-match pattern input)`.
+/// Matches syntax `input` against compiled `pattern` (implements the `syntax-match` intrinsic).
+/// Returns an immutable vector of matched variable values on success, or `#f` if the pattern does not match.
 pub(crate) fn matched<'gc>(mc: &Mutation<'gc>, pattern: Value<'gc>, input: Value<'gc>, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
     let pattern = pattern.downcast::<SyntaxPattern>(mc).ok_or(Fault::WrongType)?;
     let shape = pattern.shape(mc).ok_or(Fault::Malformed)?;
@@ -170,13 +177,13 @@ pub(crate) fn matched<'gc>(mc: &Mutation<'gc>, pattern: Value<'gc>, input: Value
     Ok(Vectors::new(mc).immutable_from_slice(&matcher.out)?.value(mc))
 }
 
-/// What's left of a match: a node to match a value with, or what to do once a repeated
-/// pattern's matched an item, or all of them.
+/// A task on the pattern-matcher work stack: match a pattern node against a syntax value (`Node`),
+/// append repeated variable matches into intermediate lists (`Each`), or finalize repeated lists into output slots (`Lists`).
 enum Match<'p, 'gc> {
     Node(u32, Value<'gc>),
-    /// What the repeated pattern's variables matched, added to their lists.
+    /// Appends current iteration values of pattern variables in `slots` to their respective accumulation lists.
     Each(&'p Range<u32>),
-    /// The lists, into the variables' slots.
+    /// Converts accumulated repeated match lists for variables in `slots` into Scheme lists and stores them into the corresponding output slots.
     Lists(&'p Range<u32>),
 }
 
@@ -184,7 +191,7 @@ struct Matcher<'m, 'gc> {
     mc: &'m Mutation<'gc>,
     pattern: Gc<'gc, SyntaxPattern>,
     out: Vec<Value<'gc>>,
-    /// How much it's compared, and the most it can.
+    /// Cumulative number of matching comparisons performed, bounded by `most` to enforce fuel limits.
     count: u64,
     most: u64,
 }
@@ -207,8 +214,9 @@ impl<'gc> Matcher<'_, 'gc> {
         self.out.get_mut(slot as usize).ok_or(Fault::Malformed)
     }
 
-    /// Whether `v` matches node `root` of `shape`, any pattern in which that doesn't match
-    /// failing the whole of it. A repeated pattern's lists are made innermost first, on a stack.
+    /// Recursively matches input value `v` against the pattern node at `root` in `shape`.
+    /// Populates matched variable slots in `self.out` and returns `true` on success, or `false` on mismatch.
+    /// Manages nested ellipsis repetition via an evaluation stack of accumulated list vectors.
     fn matches(&mut self, shape: &PatternShape, root: u32, v: Value<'gc>) -> Result<bool, Fault> {
         let mc = self.mc;
         let mut todo = vec![Match::Node(root, v)];
@@ -287,8 +295,9 @@ impl<'gc> Matcher<'_, 'gc> {
     }
 }
 
-/// The items of the list `v` is, or is the syntax of, and what's left of it from each, and
-/// after the last; `None` if it's neither.
+/// Deconstructs a Scheme list or syntax-wrapped list `v` into a pair of vectors `(items, rests)`,
+/// where `items` contains the list elements and `rests` contains the successive tail values at each step
+/// and after the final element; returns `None` if `v` is neither a list nor list syntax.
 fn list_items<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> Option<(Vec<Value<'gc>>, Vec<Value<'gc>>)> {
     let mut at = match Syntax::of(v) {
         Some(s) if s.kind(mc) == Some(SyntaxKind::List) => s.datum(mc),
@@ -326,8 +335,8 @@ fn vector_items<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> Option<(Vec<Value<'gc
     Some((items, rests))
 }
 
-/// `(syntax-build template value ...)`. Variables under ellipses that are repeated together
-/// have to have matched as many times, or it's a syntax error.
+/// Instantiates syntax from `template` using pattern variable bindings in `values` (implements the `syntax-build` intrinsic).
+/// Raises [`Fault::Syntax`] if synchronized pattern variables under the same ellipsis level have mismatched iteration lengths.
 pub(crate) fn build<'gc>(mc: &Mutation<'gc>, template: Value<'gc>, values: &[Value<'gc>], fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
     let template = template.downcast::<SyntaxTemplate>(mc).ok_or(Fault::WrongType)?;
     let shape = template.shape(mc).ok_or(Fault::Malformed)?;
@@ -342,9 +351,9 @@ pub(crate) fn build<'gc>(mc: &Mutation<'gc>, template: Value<'gc>, values: &[Val
     Ok(built)
 }
 
-/// What's left of making a template: a node to make, an item to make under so many of its
-/// ellipses, what its variables stand for in a run of it, or a list or vector to make of what's
-/// been made since it was reached.
+/// A task on the template construction work stack: instantiate a template node (`Node`),
+/// expand an ellipsized item at a given nesting depth (`Item`), restore previous variable bindings after an iteration (`Bind`),
+/// or assemble constructed elements into a list or vector sequence (`Seq`).
 enum Build<'gc> {
     Node(u32),
     Item(u32, u32),
@@ -355,7 +364,7 @@ enum Build<'gc> {
 struct Builder<'m, 'gc> {
     mc: &'m Mutation<'gc>,
     template: Gc<'gc, SyntaxTemplate>,
-    /// What each variable's matched, and how many ellipses that's under.
+    /// Evaluation environment mapping each pattern variable slot to its currently bound value and remaining ellipsis nesting depth.
     env: Vec<(Value<'gc>, u32)>,
     count: u64,
     most: u64,
@@ -374,8 +383,8 @@ impl<'gc> Builder<'_, 'gc> {
         self.env.get(slot as usize).copied().ok_or(Fault::Malformed)
     }
 
-    /// Makes node `root` of `shape`. An item under ellipses is made once for each match of
-    /// the variables in it, each of those binding them to what they matched in it.
+    /// Evaluates template node `root` of `shape`, returning the constructed syntax object.
+    /// Sub-items under ellipses are iteratively expanded for each element of their driver variable lists.
     fn make(&mut self, shape: &TemplateShape, root: u32) -> Result<Value<'gc>, Fault> {
         let mc = self.mc;
         let mut todo = vec![Build::Node(root)];
@@ -418,8 +427,9 @@ impl<'gc> Builder<'_, 'gc> {
         Ok(made.pop().expect("the root's made"))
     }
 
-    /// Item `i` under `ellipses` of its ellipses, once for each match of the variables in it
-    /// with matches left, each binding them to what they matched in it, then as they were.
+    /// Expands repeated template item `i` at ellipsis depth `ellipses`. Validates that all active driver variables
+    /// have matching list lengths (raising [`Fault::Syntax`] on mismatch), and schedules iterations on the `todo` stack
+    /// to bind sub-elements and restore bindings.
     fn repeat(&mut self, shape: &TemplateShape, i: u32, ellipses: u32, todo: &mut Vec<Build<'gc>>) -> Result<(), Fault> {
         let item = &shape.items[i as usize];
         let mut drivers = Vec::new();
