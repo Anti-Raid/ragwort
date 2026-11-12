@@ -10,7 +10,7 @@ use ragwort_types::string::StrError;
 
 use crate::frame::CLOSURE;
 use crate::objects::{self, BytecodeFields, ClosureFields, ModuleFields, SpillFields, Task};
-use crate::{Intrinsic, Read, Request, structs};
+use crate::{Intrinsic, Request, structs};
 
 #[cfg(test)]
 #[path = "tests/op.rs"]
@@ -81,15 +81,6 @@ named! {
         /// Runs `intrinsic` like `CallIntrinsic`, then returns its result. A built-in used as a value
         /// is a closure whose code is just this.
         TailCallIntrinsic { base: u8, args: u8, intrinsic: Intrinsic } = "tail-call-intrinsic",
-        /// Runs `read` on the `args` registers from `base`, leaving its result in the accumulator,
-        /// and goes on.
-        CallRead { base: u8, args: u8, read: Read } = "call-read",
-        /// Runs `read` like `CallRead`, then returns its result.
-        TailCallRead { base: u8, args: u8, read: Read } = "tail-call-read",
-        /// Runs 1-argument `read` on register `a` and stores its result in `dst`.
-        Read1 { dst: u8, a: u8, read: Read } = "read1",
-        /// Runs 2-argument `read` on registers `(a, b)` and stores its result in `dst`.
-        Read2 { dst: u8, a: u8, b: u8, read: Read } = "read2",
         /// Has the run loop carry out `request` on the `args` registers from `base`. One that calls a
         /// procedure, as `call/cc` does, goes on here when it returns, so `base` must be past the
         /// frame's link, as a call's is.
@@ -148,7 +139,7 @@ pub enum Capture {
 /// What an instruction runs against.
 pub struct Context<'s, 'gc> {
     pub mc: &'s Mutation<'gc>,
-    /// The running task, whose marks and prompts a [`Read`] reads.
+    /// The running task, whose state [some intrinsics](Intrinsic::is_dynamic) work on.
     pub task: Gc<'gc, Task>,
     pub frame: Frame<'s, 'gc>,
     /// The module's constants, which `LoadConst` indexes.
@@ -349,7 +340,7 @@ impl Op {
                 if intrinsic.arity().is_some_and(|n| n != 1) {
                     return Err(Fault::Malformed);
                 }
-                let val = intrinsic.exec1(mc, frame, a, &mut cx.fuel)?;
+                let val = intrinsic.exec1(cx, a)?;
                 if (val != Value::FALSE) == branch_if {
                     return Ok(Control::Jump(i32::from(offset)));
                 }
@@ -358,7 +349,7 @@ impl Op {
                 if intrinsic.arity().is_some_and(|n| n != 2) {
                     return Err(Fault::Malformed);
                 }
-                let val = intrinsic.exec2(mc, frame, a, b, &mut cx.fuel)?;
+                let val = intrinsic.exec2(cx, a, b)?;
                 if (val != Value::FALSE) == branch_if {
                     return Ok(Control::Jump(i32::from(offset)));
                 }
@@ -413,7 +404,7 @@ impl Op {
                 if usize::from(base) + usize::from(args) > WINDOW || intrinsic.arity().is_some_and(|n| n != args) {
                     return Err(Fault::Malformed);
                 }
-                cx.acc = intrinsic.exec(mc, frame, base, args, &mut cx.fuel)?;
+                cx.acc = intrinsic.exec(cx, base, args)?;
                 if matches!(self, Op::TailCallIntrinsic { .. }) {
                     return Ok(Control::Return);
                 }
@@ -422,14 +413,14 @@ impl Op {
                 if intrinsic.arity().is_some_and(|n| n != 1) {
                     return Err(Fault::Malformed);
                 }
-                let val = intrinsic.exec1(mc, frame, a, &mut cx.fuel)?;
+                let val = intrinsic.exec1(cx, a)?;
                 frame.set(dst, val);
             }
             Op::CallIntrinsic2 { dst, a, b, intrinsic } => {
                 if intrinsic.arity().is_some_and(|n| n != 2) {
                     return Err(Fault::Malformed);
                 }
-                let val = intrinsic.exec2(mc, frame, a, b, &mut cx.fuel)?;
+                let val = intrinsic.exec2(cx, a, b)?;
                 frame.set(dst, val);
             }
             Op::AddImm { dst, a, imm } => {
@@ -449,30 +440,7 @@ impl Op {
                 if intrinsic.arity().is_some_and(|n| n != 3) {
                     return Err(Fault::Malformed);
                 }
-                let val = intrinsic.exec3(mc, frame, a, b, c, &mut cx.fuel)?;
-                frame.set(dst, val);
-            }
-            Op::CallRead { base, args, read } | Op::TailCallRead { base, args, read } => {
-                if usize::from(base) + usize::from(args) > WINDOW || read.arity() != args {
-                    return Err(Fault::Malformed);
-                }
-                cx.acc = read.exec(mc, cx.task, frame, base, &mut cx.fuel)?;
-                if matches!(self, Op::TailCallRead { .. }) {
-                    return Ok(Control::Return);
-                }
-            }
-            Op::Read1 { dst, a, read } => {
-                if read.arity() != 1 {
-                    return Err(Fault::Malformed);
-                }
-                let val = read.apply(mc, cx.task, |_| frame.get(a), &mut cx.fuel)?;
-                frame.set(dst, val);
-            }
-            Op::Read2 { dst, a, b, read } => {
-                if read.arity() != 2 {
-                    return Err(Fault::Malformed);
-                }
-                let val = read.apply(mc, cx.task, |i| frame.get(if i == 0 { a } else { b }), &mut cx.fuel)?;
+                let val = intrinsic.exec3(cx, a, b, c)?;
                 frame.set(dst, val);
             }
             Op::CallRequest { base, args, request } | Op::TailCallRequest { base, args, request } => {
@@ -496,7 +464,7 @@ impl Op {
                 }
                 let mut values: Vec<_> = (0..args - 1).map(|i| frame.get(base + i)).collect();
                 values.extend(list(mc, frame.get(base + args - 1))?);
-                cx.acc = intrinsic.run(mc, &values, &mut cx.fuel)?;
+                cx.acc = intrinsic.run_in(mc, Some(cx.task), &values, &mut cx.fuel)?;
             }
             Op::ApplyRequest { base, args, request } | Op::TailApplyRequest { base, args, request } => {
                 if args == 0 || usize::from(base) + usize::from(args) > WINDOW {

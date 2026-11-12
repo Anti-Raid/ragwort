@@ -109,9 +109,9 @@ fn malformed_bytecode_faults() {
         frame.set(0, fix(1));
         let requests = [
             Op::CallRequest { base: 1, args: 1, request: Request::WithMark },
-            Op::CallRead { base: 1, args: 1, read: Read::MarkValue },
-            Op::Read1 { dst: 1, a: 0, read: Read::FrameMark },
-            Op::Read2 { dst: 1, a: 0, b: 0, read: Read::Running },
+            Op::CallIntrinsic { base: 1, args: 1, intrinsic: Intrinsic::MarkValue },
+            Op::CallIntrinsic1 { dst: 1, a: 0, intrinsic: Intrinsic::FrameMark },
+            Op::CallIntrinsic2 { dst: 1, a: 0, b: 0, intrinsic: Intrinsic::Running },
             Op::TailCallRequest { base: 1, args: 3, request: Request::Capture },
             Op::CallRequest { base: 1, args: 1, request: Request::Apply },
             Op::CallIntrinsic1 { dst: 1, a: 0, intrinsic: Intrinsic::Cons },
@@ -492,6 +492,37 @@ fn run<'gc>(mc: &Mutation<'gc>, op: Intrinsic, args: &[Value<'gc>]) -> Result<Va
 /// A struct is of its type and its type's supertypes, and `equal?` to one of its type with
 /// `equal?` fields, unless its type is an identity one, whose structs are `equal?` only to
 /// themselves.
+#[test]
+fn intrinsics_on_the_task_need_one_and_are_never_folded_or_moved() {
+    let dynamic: Vec<Intrinsic> = Intrinsic::ALL.iter().copied().filter(|i| i.is_dynamic()).collect();
+    assert_eq!(dynamic.len(), 6);
+    for &i in &dynamic {
+        assert!(!i.is_pure_foldable() && !i.is_reorderable() && !i.is_type_predicate() && !i.is_internal(), "{i:?}");
+        assert!(i.arity().is_some(), "{i:?}");
+    }
+    assert!(!Intrinsic::SetWinders.is_discardable() && !Intrinsic::FrameMarks.is_discardable() && Intrinsic::MarkValue.is_discardable());
+    // What each intrinsic is declared as agrees with itself: a type predicate takes one
+    // argument and never faults, and what can be dropped can be moved, unless it's on the task.
+    for &i in Intrinsic::ALL {
+        if i.is_type_predicate() {
+            assert!(i.arity() == Some(1) && i.is_discardable(), "{i:?}");
+        }
+        if i.is_discardable() {
+            assert_eq!(i.is_reorderable(), !i.is_dynamic(), "{i:?}");
+        }
+        if i.is_commutative_binary() {
+            assert!(i.arity().is_none_or(|n| n == 2), "{i:?}");
+        }
+    }
+    let mut arena = Arena::new(1 << 20, 0);
+    arena.mutate(|mc| {
+        for &i in &dynamic {
+            let args = vec![Value::NIL; usize::from(i.arity().unwrap())];
+            assert_eq!(run(mc, i, &args), Err(Fault::Malformed), "{i:?}");
+        }
+    });
+}
+
 #[test]
 fn structs_are_of_their_types_and_equal_by_their_fields_or_themselves() {
     let mut arena = Arena::new(1 << 20, 0);

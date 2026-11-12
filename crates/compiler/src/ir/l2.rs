@@ -109,7 +109,6 @@ impl<'id, 'gc> L2<'id, 'gc> {
                     continue;
                 }
                 Node::Intrinsic(Prim::Intrinsic(i), args) if i.is_discardable() => args,
-                Node::Intrinsic(Prim::Read(r), args) if r.is_discardable() => args,
                 Node::Intrinsic(Prim::Host(h), args) if h.purity == Purity::Discardable => args,
                 Node::Intrinsic(_, args) if self.made_struct(mc, id).is_some() => args,
                 Node::Set(..) | Node::App(..) | Node::Intrinsic(..) | Node::ApplyIntrinsic(..) => return false,
@@ -127,7 +126,6 @@ impl<'id, 'gc> L2<'id, 'gc> {
                 Node::Quote(v) => v != Value::FALSE,
                 Node::Lambda(_) | Node::Set(..) => true,
                 Node::Intrinsic(Prim::Intrinsic(i), _) => i.is_always_truthy(),
-                Node::Intrinsic(Prim::Read(r), _) => r.is_always_truthy(),
                 Node::Seq(_, b) | Node::Let(_, b) => {
                     todo.push(b);
                     true

@@ -270,7 +270,7 @@ impl<L: Copy> RequireSpec<L> {
 /// What a module export's call inlines to: the body of a lambda whose constants are immediates
 /// and whose only variables are its parameters, the locals it binds, and variables of its own
 /// module that are never assigned, which a module that inlines it has by their values. It calls
-/// intrinsics, reads and requests, which mean the same in any module, and procedure values.
+/// intrinsics and requests, which mean the same in any module, and procedure values.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Inline {
     params: u32,
@@ -464,7 +464,6 @@ impl<'gc> Arg<'gc> {
 fn takes(prim: Prim, n: usize) -> bool {
     match prim {
         Prim::Intrinsic(i) => i.arity().is_none_or(|a| usize::from(a) == n),
-        Prim::Read(r) => usize::from(r.arity()) == n,
         Prim::Request(r) => r.takes(n),
         Prim::Host(h) => h.takes(n),
         Prim::Slot(op, _) => op.arity() == n,

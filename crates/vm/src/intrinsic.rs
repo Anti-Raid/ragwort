@@ -1,12 +1,15 @@
 //! An [`Intrinsic`] computes a value from its arguments in place, inside a step: it never touches frames
 //! or calls a procedure, so it can't be captured halfway or re-enter the VM. Anything that calls a
 //! procedure or changes the continuation is a [`crate::Request`] instead.
+//!
+//! A few work on the running task's state as well as their arguments: see
+//! [`Intrinsic::is_dynamic`].
 
 use std::cmp::Ordering;
 
 use ragwort_types::Error;
 use ragwort_types::bytevector::{AnyBytevector, Bytevectors};
-use ragwort_types::gc::{Frame, Mutation, ScratchVec, Value};
+use ragwort_types::gc::{Gc, Mutation, ScratchVec, Value};
 use ragwort_types::named;
 use ragwort_types::num::rational::Round;
 use ragwort_types::num::{ComplexHost, ComplexView, Integer, Number, NumError, Nums, RationalHost, RationalView, RealHost, RealView, complex, int, literal, real};
@@ -16,849 +19,638 @@ use ragwort_types::symbol::{Keyword, Symbol, Symbols};
 use ragwort_types::syntax::Syntax;
 use ragwort_types::vector::{AnyVector, Vectors};
 
-use crate::op::Fuel;
+use crate::op::{Context, Fuel};
 use crate::{Fault, coroutine, equal, prompts, structs, syntax};
-use crate::objects::{self, BoxFields, Condition, ConditionFields, KeywordProcedureFields, ModuleFields, MultiValue, MultiValueFields, StructFields, StructTypeFields, Tag, TaskFields};
+use crate::objects::{self, BoxFields, Condition, ConditionFields, KeywordProcedureFields, ModuleFields, MultiValue, MultiValueFields, StructFields, StructTypeFields, Tag, Task, TaskFields};
 
 named! {
     #[repr(u16)]
+    #[data(Traits)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub enum Intrinsic {
         /// `+`: fixnums are added in place, anything else by the generic add.
-        Add = "+",
+        Add = ("+", any(FOLD | REORDER | TRUTHY | COMMUTE)),
         /// `(- z)` negates, `(- z1 z2 ...)` subtracts the rest from the first.
-        Sub = "-",
+        Sub = ("-", any(FOLD | REORDER | TRUTHY)),
         /// `*`: fixnums are multiplied in place, anything else by the generic multiply.
-        Mul = "*",
+        Mul = ("*", any(FOLD | REORDER | TRUTHY | COMMUTE)),
         /// `(/ z)` is the reciprocal, `(/ z1 z2 ...)` divides the first by the rest. Fixnums that
         /// divide exactly stay in place; an exact zero divisor faults with
         /// [`NumError::DivideByZero`](ragwort_types::num::NumError::DivideByZero).
-        Div = "/",
+        Div = ("/", any(FOLD | TRUTHY)),
         /// `(= z1 z2 ...)`: whether the numbers are all the same value, whatever their
         /// exactness. NaN is `=` to nothing.
-        NumEq = "=",
+        NumEq = ("=", any(FOLD)),
         /// `(< x1 x2 ...)`: whether the reals increase. Each argument is checked, whatever the
         /// answer; NaN makes it, and the others, `#f`.
-        Lt = "<",
+        Lt = ("<", any(FOLD)),
         /// `(> x1 x2 ...)`: whether the reals decrease.
-        Gt = ">",
+        Gt = (">", any(FOLD)),
         /// `(<= x1 x2 ...)`: whether no real is less than the one before it.
-        Le = "<=",
+        Le = ("<=", any(FOLD)),
         /// `(>= x1 x2 ...)`: whether no real is more than the one before it.
-        Ge = ">=",
+        Ge = (">=", any(FOLD)),
         /// `(expt z w)`: `z` to the power `w`, exact when both are exact and `w` is an integer.
         /// An exact result is charged fuel for its size before it's computed.
-        Expt = "expt",
+        Expt = ("expt", takes(2, FOLD | TRUTHY)),
         /// `(quotient n m)`: `n / m` truncated, of integers, exact or not.
-        Quotient = "quotient",
+        Quotient = ("quotient", takes(2, FOLD | TRUTHY)),
         /// `(remainder n m)`: what `quotient` leaves, with `n`'s sign.
-        Remainder = "remainder",
+        Remainder = ("remainder", takes(2, FOLD | TRUTHY)),
         /// `(modulo n m)`: `n` mod `m`, with `m`'s sign.
-        Modulo = "modulo",
+        Modulo = ("modulo", takes(2, FOLD | TRUTHY)),
         /// `(floor-quotient n m)`: `n / m` rounded down, of integers, exact or not.
-        FloorQuotient = "floor-quotient",
+        FloorQuotient = ("floor-quotient", takes(2, FOLD | TRUTHY)),
         /// `(bitwise-and n ...)`: of exact integers, in two's complement; `-1` of none.
-        BitwiseAnd = "bitwise-and",
+        BitwiseAnd = ("bitwise-and", any(FOLD | TRUTHY | COMMUTE)),
         /// `(bitwise-ior n ...)`; `0` of none.
-        BitwiseIor = "bitwise-ior",
+        BitwiseIor = ("bitwise-ior", any(FOLD | TRUTHY | COMMUTE)),
         /// `(bitwise-xor n ...)`; `0` of none.
-        BitwiseXor = "bitwise-xor",
+        BitwiseXor = ("bitwise-xor", any(FOLD | TRUTHY | COMMUTE)),
         /// `(bitwise-not n)`: `-n - 1`.
-        BitwiseNot = "bitwise-not",
+        BitwiseNot = ("bitwise-not", takes(1, FOLD | TRUTHY)),
         /// `(arithmetic-shift n count)`: `n` times `2^count`, rounded down when `count` is negative.
-        ArithmeticShift = "arithmetic-shift",
+        ArithmeticShift = ("arithmetic-shift", takes(2, FOLD | TRUTHY)),
         /// `(integer-length n)`: the bits `n` takes in two's complement, but its sign.
-        IntegerLength = "integer-length",
+        IntegerLength = ("integer-length", takes(1, FOLD | TRUTHY)),
         /// `(bit-count n)`: the bits set in `n`, or clear if it's negative.
-        BitCount = "bit-count",
+        BitCount = ("bit-count", takes(1, FOLD | TRUTHY)),
         /// `(bit-set? index n)`: whether bit `index` of `n` is set.
-        IsBitSet = "bit-set?",
+        IsBitSet = ("bit-set?", takes(2, FOLD)),
         /// `(bit-field n start end)`: bits `start` to `end` of `n`, as a non-negative integer.
-        BitField = "bit-field",
+        BitField = ("bit-field", takes(3, FOLD | TRUTHY)),
         /// `(bit-field-replace dest source start end)`: `dest` with bits `start` to `end`
         /// replaced by the low bits of `source`.
-        BitFieldReplace = "bit-field-replace",
+        BitFieldReplace = ("bit-field-replace", takes(4, FOLD | TRUTHY)),
         /// `number?`, which is `complex?` too.
-        IsNumber = "number?",
+        IsNumber = ("number?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `real?`: whether `x` is a number with no imaginary part.
-        IsReal = "real?",
+        IsReal = ("real?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `rational?`: whether `x` is an exact rational or a finite flonum.
-        IsRational = "rational?",
+        IsRational = ("rational?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `integer?`: whether `x` is an exact integer or a flonum with no fraction.
-        IsInteger = "integer?",
+        IsInteger = ("integer?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `exact-integer?`
-        IsExactInteger = "exact-integer?",
+        IsExactInteger = ("exact-integer?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `(exact? z)`
-        IsExact = "exact?",
+        IsExact = ("exact?", takes(1, FOLD)),
         /// `(inexact? z)`
-        IsInexact = "inexact?",
+        IsInexact = ("inexact?", takes(1, FOLD)),
         /// `(nan? z)`: whether a part of `z` is NaN.
-        IsNan = "nan?",
+        IsNan = ("nan?", takes(1, FOLD)),
         /// `(infinite? z)`: whether a part of `z` is infinite.
-        IsInfinite = "infinite?",
+        IsInfinite = ("infinite?", takes(1, FOLD)),
         /// `(finite? z)`: whether each part of `z` is neither infinite nor NaN.
-        IsFinite = "finite?",
+        IsFinite = ("finite?", takes(1, FOLD)),
         /// `(zero? z)`, whichever zero it is.
-        IsZero = "zero?",
+        IsZero = ("zero?", takes(1, FOLD)),
         /// `(positive? x)`: NaN isn't.
-        IsPositive = "positive?",
+        IsPositive = ("positive?", takes(1, FOLD)),
         /// `(negative? x)`: nor is -0.0.
-        IsNegative = "negative?",
+        IsNegative = ("negative?", takes(1, FOLD)),
         /// `(odd? n)`, of an integer, exact or not.
-        IsOdd = "odd?",
+        IsOdd = ("odd?", takes(1, FOLD)),
         /// `(even? n)`
-        IsEven = "even?",
+        IsEven = ("even?", takes(1, FOLD)),
         /// `(max x1 x2 ...)`: inexact if any of them is.
-        Max = "max",
+        Max = ("max", any(FOLD | TRUTHY)),
         /// `(min x1 x2 ...)`
-        Min = "min",
+        Min = ("min", any(FOLD | TRUTHY)),
         /// `(abs x)`
-        Abs = "abs",
+        Abs = ("abs", takes(1, FOLD | TRUTHY)),
         /// `(gcd n ...)`: never negative; `0` of none. Inexact if any of the integers is.
-        Gcd = "gcd",
+        Gcd = ("gcd", any(FOLD | TRUTHY)),
         /// `(lcm n ...)`: never negative; `1` of none.
-        Lcm = "lcm",
+        Lcm = ("lcm", any(FOLD | TRUTHY)),
         /// `(numerator x)`, in lowest terms, as exact as `x`.
-        Numerator = "numerator",
+        Numerator = ("numerator", takes(1, FOLD | TRUTHY)),
         /// `(denominator x)`: positive.
-        Denominator = "denominator",
+        Denominator = ("denominator", takes(1, FOLD | TRUTHY)),
         /// `(floor x)`: flonums stay flonums.
-        Floor = "floor",
+        Floor = ("floor", takes(1, FOLD | TRUTHY)),
         /// `(ceiling x)`
-        Ceiling = "ceiling",
+        Ceiling = ("ceiling", takes(1, FOLD | TRUTHY)),
         /// `(truncate x)`: toward zero.
-        Truncate = "truncate",
+        Truncate = ("truncate", takes(1, FOLD | TRUTHY)),
         /// `(round x)`: to the nearest integer, ties to even.
-        Round = "round",
+        Round = ("round", takes(1, FOLD | TRUTHY)),
         /// `(integer-sqrt n)`: `⌊√n⌋` of an exact integer that isn't negative.
-        IntegerSqrt = "integer-sqrt",
+        IntegerSqrt = ("integer-sqrt", takes(1, FOLD | TRUTHY)),
         /// `(exact z)`: infinities and NaN have no exact value.
-        Exact = "exact",
+        Exact = ("exact", takes(1, FOLD | TRUTHY)),
         /// `(inexact z)`
-        Inexact = "inexact",
+        Inexact = ("inexact", takes(1, FOLD | TRUTHY)),
         /// `(string->number s [radix])`: the number `s` writes, as the reader reads it in radix 2,
         /// 8, 10 or 16 unless a prefix says otherwise, or `#f`.
-        StringToNumber = "string->number",
+        StringToNumber = ("string->number", any(FOLD)),
         /// `(exp z)`: exact 1 for exact 0.
-        Exp = "exp",
+        Exp = ("exp", takes(1, FOLD | TRUTHY)),
         /// `(log z [base])`: the natural log, or the log to `base`.
-        Log = "log",
+        Log = ("log", any(FOLD | TRUTHY)),
         /// `(sin z)`
-        Sin = "sin",
+        Sin = ("sin", takes(1, FOLD | TRUTHY)),
         /// `(cos z)`
-        Cos = "cos",
+        Cos = ("cos", takes(1, FOLD | TRUTHY)),
         /// `(tan z)`
-        Tan = "tan",
+        Tan = ("tan", takes(1, FOLD | TRUTHY)),
         /// `(asin z)`
-        Asin = "asin",
+        Asin = ("asin", takes(1, FOLD | TRUTHY)),
         /// `(acos z)`
-        Acos = "acos",
+        Acos = ("acos", takes(1, FOLD | TRUTHY)),
         /// `(atan z)` or `(atan y x)`, the angle of the point `(x, y)`.
-        Atan = "atan",
+        Atan = ("atan", any(FOLD | TRUTHY)),
         /// `(sqrt z)`: the principal root, exact when `z` is exact and its root is too.
-        Sqrt = "sqrt",
+        Sqrt = ("sqrt", takes(1, FOLD | TRUTHY)),
         /// `(make-rectangular x y)`: `x + yi`.
-        MakeRectangular = "make-rectangular",
+        MakeRectangular = ("make-rectangular", takes(2, FOLD | TRUTHY)),
         /// `(make-polar m a)`: magnitude `m` at angle `a`.
-        MakePolar = "make-polar",
+        MakePolar = ("make-polar", takes(2, FOLD | TRUTHY)),
         /// `(real-part z)`
-        RealPart = "real-part",
+        RealPart = ("real-part", takes(1, FOLD | TRUTHY)),
         /// `(imag-part z)`: exact 0 of a real.
-        ImagPart = "imag-part",
+        ImagPart = ("imag-part", takes(1, FOLD | TRUTHY)),
         /// `(magnitude z)`
-        Magnitude = "magnitude",
+        Magnitude = ("magnitude", takes(1, FOLD | TRUTHY)),
         /// `(angle z)`
-        Angle = "angle",
+        Angle = ("angle", takes(1, FOLD | TRUTHY)),
         /// (cons a d)
-        Cons = "cons",
+        Cons = ("cons", takes(2, DISCARD | TRUTHY)),
         /// (car lst)
-        Car = "car",
+        Car = ("car", takes(1, FOLD | REORDER)),
         // `caar` to `cddddr`: the `car`s and `cdr`s their names spell, the last letter first.
         /// (cdr lst)
-        Cdr = "cdr",
-        Caar = "caar",
-        Cadr = "cadr",
-        Cdar = "cdar",
-        Cddr = "cddr",
-        Caaar = "caaar",
-        Caadr = "caadr",
-        Cadar = "cadar",
-        Caddr = "caddr",
-        Cdaar = "cdaar",
-        Cdadr = "cdadr",
-        Cddar = "cddar",
-        Cdddr = "cdddr",
-        Caaaar = "caaaar",
-        Caaadr = "caaadr",
-        Caadar = "caadar",
-        Caaddr = "caaddr",
-        Cadaar = "cadaar",
-        Cadadr = "cadadr",
-        Caddar = "caddar",
-        Cadddr = "cadddr",
-        Cdaaar = "cdaaar",
-        Cdaadr = "cdaadr",
-        Cdadar = "cdadar",
-        Cdaddr = "cdaddr",
-        Cddaar = "cddaar",
-        Cddadr = "cddadr",
-        Cdddar = "cdddar",
-        Cddddr = "cddddr",
+        Cdr = ("cdr", takes(1, FOLD | REORDER)),
+        Caar = ("caar", takes(1, FOLD | REORDER)),
+        Cadr = ("cadr", takes(1, FOLD | REORDER)),
+        Cdar = ("cdar", takes(1, FOLD | REORDER)),
+        Cddr = ("cddr", takes(1, FOLD | REORDER)),
+        Caaar = ("caaar", takes(1, FOLD)),
+        Caadr = ("caadr", takes(1, FOLD)),
+        Cadar = ("cadar", takes(1, FOLD)),
+        Caddr = ("caddr", takes(1, FOLD)),
+        Cdaar = ("cdaar", takes(1, FOLD)),
+        Cdadr = ("cdadr", takes(1, FOLD)),
+        Cddar = ("cddar", takes(1, FOLD)),
+        Cdddr = ("cdddr", takes(1, FOLD)),
+        Caaaar = ("caaaar", takes(1, FOLD)),
+        Caaadr = ("caaadr", takes(1, FOLD)),
+        Caadar = ("caadar", takes(1, FOLD)),
+        Caaddr = ("caaddr", takes(1, FOLD)),
+        Cadaar = ("cadaar", takes(1, FOLD)),
+        Cadadr = ("cadadr", takes(1, FOLD)),
+        Caddar = ("caddar", takes(1, FOLD)),
+        Cadddr = ("cadddr", takes(1, FOLD)),
+        Cdaaar = ("cdaaar", takes(1, FOLD)),
+        Cdaadr = ("cdaadr", takes(1, FOLD)),
+        Cdadar = ("cdadar", takes(1, FOLD)),
+        Cdaddr = ("cdaddr", takes(1, FOLD)),
+        Cddaar = ("cddaar", takes(1, FOLD)),
+        Cddadr = ("cddadr", takes(1, FOLD)),
+        Cdddar = ("cdddar", takes(1, FOLD)),
+        Cddddr = ("cddddr", takes(1, FOLD)),
         /// `eq?`.
-        Eq = "eq?",
+        Eq = ("eq?", takes(2, FOLD | DISCARD | COMMUTE)),
         /// `eqv?`: `eq?`, or numbers of the same exactness and value.
-        Eqv = "eqv?",
+        Eqv = ("eqv?", takes(2, FOLD | DISCARD | COMMUTE)),
         /// `equal?`: `eqv?`, or strings, pairs, vectors or boxes with `equal?` contents. It ends on
         /// cyclic ones, and spends a unit of fuel for each 1024 values it compares, faulting with
         /// [`Fault::OutOfFuel`] as soon as there's none left.
-        Equal = "equal?",
+        Equal = ("equal?", takes(2, FOLD | COMMUTE)),
         /// `null?`.
-        IsNull = "null?",
+        IsNull = ("null?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `pair?`.
-        IsPair = "pair?",
+        IsPair = ("pair?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `list?`: whether `x` is `()` or a chain of pairs ending in `()`, in constant time.
-        IsList = "list?",
+        IsList = ("list?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `(length xs)`: the length of the proper list `xs`, in constant time.
-        Length = "length",
+        Length = ("length", takes(1, FOLD | TRUTHY)),
         /// `(list-tail xs k)`.
-        ListTail = "list-tail",
+        ListTail = ("list-tail", takes(2, FOLD)),
         /// `(list-ref xs k)`.
-        ListRef = "list-ref",
+        ListRef = ("list-ref", takes(2, FOLD)),
         /// `(reverse xs)`.
-        Reverse = "reverse",
+        Reverse = ("reverse", takes(1, TRUTHY)),
         /// `(append list ... [obj])`.
-        Append = "append",
+        Append = ("append", any(0)),
         /// `(memq x xs)`.
-        Memq = "memq",
+        Memq = ("memq", takes(2, FOLD)),
         /// `(memv x xs)`.
-        Memv = "memv",
+        Memv = ("memv", takes(2, FOLD)),
         /// `(member x xs)`.
-        Member = "member",
+        Member = ("member", takes(2, FOLD)),
         /// `(assq x xs)`.
-        Assq = "assq",
+        Assq = ("assq", takes(2, FOLD)),
         /// `(assv x xs)`.
-        Assv = "assv",
+        Assv = ("assv", takes(2, FOLD)),
         /// `(assoc x xs)`.
-        Assoc = "assoc",
+        Assoc = ("assoc", takes(2, FOLD)),
         /// `box?`.
-        IsBox = "box?",
+        IsBox = ("box?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `not`: `#t` if `x` is `#f`, `#f` otherwise.
-        Not = "not",
+        Not = ("not", takes(1, FOLD | DISCARD)),
         /// `boolean?`.
-        IsBoolean = "boolean?",
+        IsBoolean = ("boolean?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `keyword?`: whether `x` is a keyword, `#:name`.
-        IsKeyword = "keyword?",
+        IsKeyword = ("keyword?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `symbol?`: whether `x` is a symbol.
-        IsSymbol = "symbol?",
+        IsSymbol = ("symbol?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `string?`: whether `x` is a string.
-        IsString = "string?",
+        IsString = ("string?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `(string-length s)`: how many characters `s` has.
-        StringLength = "string-length",
+        StringLength = ("string-length", takes(1, FOLD | TRUTHY)),
         /// `(string-append s ...)`: the strings' characters, in order, in a new string. Long
         /// ones are joined, not copied.
-        StringAppend = "string-append",
+        StringAppend = ("string-append", any(TRUTHY)),
         /// `(substring s start [end])`: the characters of `s` from `start` up to `end`, or its end.
-        Substring = "substring",
+        Substring = ("substring", any(TRUTHY)),
         /// `(string-ref s k)`: the `k`th character of `s`, from 0.
-        StringRef = "string-ref",
+        StringRef = ("string-ref", takes(2, FOLD | TRUTHY)),
         /// `(string=? s1 s2 ...)`: whether the strings have the same characters. Each argument is
         /// checked, whatever the answer.
-        StringEq = "string=?",
+        StringEq = ("string=?", any(FOLD)),
         /// `(string<? s1 s2 ...)`: whether the strings increase, by code point, a prefix first.
-        StringLt = "string<?",
+        StringLt = ("string<?", any(FOLD)),
         /// `(string>? s1 s2 ...)`: whether the strings decrease.
-        StringGt = "string>?",
+        StringGt = ("string>?", any(FOLD)),
         /// `(string<=? s1 s2 ...)`: whether no string is less than the one before it.
-        StringLe = "string<=?",
+        StringLe = ("string<=?", any(FOLD)),
         /// `(string>=? s1 s2 ...)`: whether no string is more than the one before it.
-        StringGe = "string>=?",
+        StringGe = ("string>=?", any(FOLD)),
         /// `(string->list s [start [end]])`: a list of the characters of `s`, or of that range.
-        StringToList = "string->list",
+        StringToList = ("string->list", any(TRUTHY)),
         /// `(number->string z [radix])`: `z` written as the reader reads it, in radix 2, 8, 10
         /// or 16. Inexact numbers are exact in radixes but 10.
-        NumberToString = "number->string",
+        NumberToString = ("number->string", any(TRUTHY)),
         /// `(string-join strs [sep])`: the strings of list `strs`, `sep` between each two, `" "`
         /// if it's not given.
-        StringJoin = "string-join",
+        StringJoin = ("string-join", any(TRUTHY)),
         /// `char?`: whether `x` is a character.
-        IsChar = "char?",
+        IsChar = ("char?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `(char->integer c)`: `c`'s code point.
-        CharToInteger = "char->integer",
+        CharToInteger = ("char->integer", takes(1, FOLD | TRUTHY)),
         /// `(integer->char n)`: the character whose code point is `n`, which is a Unicode scalar
         /// value: up to `#x10FFFF`, and not a surrogate.
-        IntegerToChar = "integer->char",
+        IntegerToChar = ("integer->char", takes(1, FOLD | TRUTHY)),
         /// `(char-alphabetic? c)`: whether `c` is Unicode `Alphabetic`.
-        IsCharAlphabetic = "char-alphabetic?",
+        IsCharAlphabetic = ("char-alphabetic?", takes(1, FOLD)),
         /// `(char-numeric? c)`: whether `c` is a decimal digit, of any script.
-        IsCharNumeric = "char-numeric?",
+        IsCharNumeric = ("char-numeric?", takes(1, FOLD)),
         /// `(char-whitespace? c)`: whether `c` is Unicode `White_Space`.
-        IsCharWhitespace = "char-whitespace?",
+        IsCharWhitespace = ("char-whitespace?", takes(1, FOLD)),
         /// `(char-upper-case? c)`: whether `c` is Unicode `Uppercase`.
-        IsCharUpperCase = "char-upper-case?",
+        IsCharUpperCase = ("char-upper-case?", takes(1, FOLD)),
         /// `(char-lower-case? c)`: whether `c` is Unicode `Lowercase`.
-        IsCharLowerCase = "char-lower-case?",
+        IsCharLowerCase = ("char-lower-case?", takes(1, FOLD)),
         /// `(digit-value c)`: the value of `c` if it's a decimal digit, of any script, or `#f`.
-        DigitValue = "digit-value",
+        DigitValue = ("digit-value", takes(1, FOLD)),
         /// `(char-upcase c)`: `c` in upper case, if that's one character, or else `c`.
-        CharUpcase = "char-upcase",
+        CharUpcase = ("char-upcase", takes(1, FOLD | TRUTHY)),
         /// `(char-downcase c)`
-        CharDowncase = "char-downcase",
+        CharDowncase = ("char-downcase", takes(1, FOLD | TRUTHY)),
         /// `(char-foldcase c)`: `c` folded as `string-foldcase` folds it, if that's one character.
-        CharFoldcase = "char-foldcase",
+        CharFoldcase = ("char-foldcase", takes(1, FOLD | TRUTHY)),
         /// `(char-ci=? c1 c2 ...)`: `char=?` of the characters folded.
-        CharCiEq = "char-ci=?",
+        CharCiEq = ("char-ci=?", any(FOLD)),
         /// `(char-ci<? c1 c2 ...)`
-        CharCiLt = "char-ci<?",
+        CharCiLt = ("char-ci<?", any(FOLD)),
         /// `(char-ci>? c1 c2 ...)`
-        CharCiGt = "char-ci>?",
+        CharCiGt = ("char-ci>?", any(FOLD)),
         /// `(char-ci<=? c1 c2 ...)`
-        CharCiLe = "char-ci<=?",
+        CharCiLe = ("char-ci<=?", any(FOLD)),
         /// `(char-ci>=? c1 c2 ...)`
-        CharCiGe = "char-ci>=?",
+        CharCiGe = ("char-ci>=?", any(FOLD)),
         /// `(make-string k [c])`: `k` of `c`, or of spaces.
-        MakeString = "make-string",
+        MakeString = ("make-string", any(TRUTHY)),
         /// `(list->string chars)`
-        ListToString = "list->string",
+        ListToString = ("list->string", takes(1, TRUTHY)),
         /// `(string-upcase s)`: by the full mappings, so a character may become several.
-        StringUpcase = "string-upcase",
+        StringUpcase = ("string-upcase", takes(1, TRUTHY)),
         /// `(string-downcase s)`
-        StringDowncase = "string-downcase",
+        StringDowncase = ("string-downcase", takes(1, TRUTHY)),
         /// `(string-foldcase s)`: Unicode's full case folding, so strings that differ only in case
         /// fold alike.
-        StringFoldcase = "string-foldcase",
+        StringFoldcase = ("string-foldcase", takes(1, TRUTHY)),
         /// `(string-ci=? s1 s2 ...)`: `string=?` of the strings folded.
-        StringCiEq = "string-ci=?",
+        StringCiEq = ("string-ci=?", any(FOLD)),
         /// `(string-ci<? s1 s2 ...)`
-        StringCiLt = "string-ci<?",
+        StringCiLt = ("string-ci<?", any(FOLD)),
         /// `(string-ci>? s1 s2 ...)`
-        StringCiGt = "string-ci>?",
+        StringCiGt = ("string-ci>?", any(FOLD)),
         /// `(string-ci<=? s1 s2 ...)`
-        StringCiLe = "string-ci<=?",
+        StringCiLe = ("string-ci<=?", any(FOLD)),
         /// `(string-ci>=? s1 s2 ...)`
-        StringCiGe = "string-ci>=?",
+        StringCiGe = ("string-ci>=?", any(FOLD)),
         /// `(string->vector s [start [end]])`: a new vector of the characters.
-        StringToVector = "string->vector",
+        StringToVector = ("string->vector", any(TRUTHY)),
         /// `(vector->string v [start [end]])`: the characters of `v`, or of that range.
-        VectorToString = "vector->string",
+        VectorToString = ("vector->string", any(TRUTHY)),
         /// `(string->utf8 s [start [end]])`: a new bytevector of the characters' UTF-8.
-        StringToUtf8 = "string->utf8",
+        StringToUtf8 = ("string->utf8", any(TRUTHY)),
         /// `(utf8->string bv [start [end]])`: the text the bytes are, which must be UTF-8.
-        Utf8ToString = "utf8->string",
+        Utf8ToString = ("utf8->string", any(TRUTHY)),
         /// `(string-prefix? s prefix)`: whether `s` starts with `prefix`.
-        IsStringPrefix = "string-prefix?",
+        IsStringPrefix = ("string-prefix?", takes(2, FOLD)),
         /// `(string-suffix? s suffix)`
-        IsStringSuffix = "string-suffix?",
+        IsStringSuffix = ("string-suffix?", takes(2, FOLD)),
         /// `(string-contains? s part)`: whether `part` is anywhere in `s`.
-        IsStringContains = "string-contains?",
+        IsStringContains = ("string-contains?", takes(2, FOLD)),
         /// `(string-find s part [start])`: where `part` first is in `s` at or after `start`, or `#f`.
-        StringFind = "string-find",
+        StringFind = ("string-find", any(FOLD)),
         /// `(string-find-last s part [end])`: where `part` last is in `s`, all of it before `end`,
         /// or `#f`.
-        StringFindLast = "string-find-last",
+        StringFindLast = ("string-find-last", any(FOLD)),
         /// `(string-split s sep trim? repeat?)`: the pieces of `s` between `sep`s, or between runs
         /// of whitespace if `sep` is `#f`, as Racket's `string-split` makes them.
-        StringSplit = "string-split",
+        StringSplit = ("string-split", takes(4, TRUTHY)),
         /// `(string-trim s sep left? right? repeat?)`: `s` without `sep`, or whitespace if it's
         /// `#f`, at the ends it says, as Racket's `string-trim` takes it off.
-        StringTrim = "string-trim",
+        StringTrim = ("string-trim", takes(5, TRUTHY)),
         /// `(string-replace s from to all?)`: `s` with `to` for each `from` in it, or the first.
-        StringReplace = "string-replace",
+        StringReplace = ("string-replace", takes(4, TRUTHY)),
         /// `(char=? c1 c2 ...)`: whether the characters are the same. Each argument is checked,
         /// whatever the answer.
-        CharEq = "char=?",
+        CharEq = ("char=?", any(FOLD)),
         /// `(char<? c1 c2 ...)`: whether the characters' code points increase.
-        CharLt = "char<?",
+        CharLt = ("char<?", any(FOLD)),
         /// `(char>? c1 c2 ...)`: whether they decrease.
-        CharGt = "char>?",
+        CharGt = ("char>?", any(FOLD)),
         /// `(char<=? c1 c2 ...)`: whether no code point is less than the one before it.
-        CharLe = "char<=?",
+        CharLe = ("char<=?", any(FOLD)),
         /// `(char>=? c1 c2 ...)`: whether no code point is more than the one before it.
-        CharGe = "char>=?",
+        CharGe = ("char>=?", any(FOLD)),
         /// `(%keyword-procedure plain core keywords required)`: a keyword procedure, as a `lambda`
         /// with keyword parameters makes. See [`crate::keyword`].
-        MakeKeywordProcedure = "%keyword-procedure",
+        MakeKeywordProcedure = ("%keyword-procedure", takes(4, 0)),
         /// `(make-struct-type name parent fields field-flags flags)`: a new struct type. See
         /// [`crate::structs::make_type`] for the arguments. [Internal](Intrinsic::is_internal).
-        MakeStructType = "make-struct-type",
+        MakeStructType = ("make-struct-type", takes(5, TRUTHY | INTERNAL)),
         /// `(make-struct type v ...)`: a new instance of the type. There must be one value for
         /// each of the type's fields. [Internal](Intrinsic::is_internal).
-        MakeStruct = "make-struct",
+        MakeStruct = ("make-struct", any(TRUTHY | INTERNAL)),
         /// `(struct? v)`: whether `v` is an instance of any struct type.
-        IsStruct = "struct?",
+        IsStruct = ("struct?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `(struct-type? v)`: whether `v` is a struct type, as `struct:name` is.
-        IsStructType = "struct-type?",
+        IsStructType = ("struct-type?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `(struct-derived-from? v type)`: whether `v` is an instance of the type or of a
         /// subtype of it.
-        IsStructDerivedFrom = "struct-derived-from?",
+        IsStructDerivedFrom = ("struct-derived-from?", takes(2, FOLD | REORDER)),
         /// `(struct-ref s type k)`: field `k` of `s`, which must be an instance of the type. `k`
         /// is the position of the field's name in `(struct-fields type)`.
         /// [Internal](Intrinsic::is_internal).
-        StructRef = "struct-ref",
+        StructRef = ("struct-ref", takes(3, REORDER | INTERNAL)),
         /// `(struct-field s k)`: field `k` of `s`, with no check of what type `s` is of. A
         /// compiler emits it in place of `struct-ref` where it has proved that `s` is an
         /// instance of a type with that field, so it can't fault there.
         /// [Internal](Intrinsic::is_internal).
-        StructField = "struct-field",
+        StructField = ("struct-field", takes(2, DISCARD | INTERNAL)),
         /// `(struct-fixed-field s k)`: as `struct-field`, of a field that can't be set. A
         /// compiler emits it where it knows that too, so that it can read the field once for
         /// all the reads of it. [Internal](Intrinsic::is_internal).
-        StructFixedField = "struct-fixed-field",
+        StructFixedField = ("struct-fixed-field", takes(2, DISCARD | INTERNAL)),
         /// `(struct-set! s type k v)`: sets field `k` of `s`, which must be an instance of the
         /// type, to `v`. It faults with `immutable` if the field is not mutable.
         /// [Internal](Intrinsic::is_internal).
-        StructSet = "struct-set!",
+        StructSet = ("struct-set!", takes(4, INTERNAL)),
         /// `(struct-fields type)`: the list of the type's field names, its supertype's first.
-        StructFields = "struct-fields",
+        StructFields = ("struct-fields", takes(1, TRUTHY)),
         /// `(struct-field-mutable? type k)`: whether field `k` of the type is mutable.
-        IsStructFieldMutable = "struct-field-mutable?",
+        IsStructFieldMutable = ("struct-field-mutable?", takes(2, FOLD | REORDER)),
         /// `(struct-type s)`: the type `s` was made as, where `s` is an instance of a struct type.
-        StructType = "struct-type",
+        StructType = ("struct-type", takes(1, FOLD | REORDER | TRUTHY)),
         /// `(struct->list s)`: a new list of the values of the fields of `s`, in the order
         /// `(struct-fields (struct-type s))` names them.
-        StructToList = "struct->list",
+        StructToList = ("struct->list", takes(1, TRUTHY)),
         /// `(procedure-keywords f)`: the keywords `f` requires and those it takes, as two sorted
         /// lists, both empty for a procedure without keyword parameters.
-        ProcedureKeywords = "procedure-keywords",
+        ProcedureKeywords = ("procedure-keywords", takes(1, 0)),
         /// `(symbol->string s)`: the symbol's name.
-        SymbolToString = "symbol->string",
+        SymbolToString = ("symbol->string", takes(1, 0)),
         /// `(string->symbol s)`: the symbol named `s`, the one the reader reads for that name.
-        StringToSymbol = "string->symbol",
+        StringToSymbol = ("string->symbol", takes(1, 0)),
         /// `(keyword->string k)`: the keyword's name, without its `#:`.
-        KeywordToString = "keyword->string",
+        KeywordToString = ("keyword->string", takes(1, 0)),
         /// `(string->keyword s)`: the keyword named `s`, the one the reader reads as `#:s`.
-        StringToKeyword = "string->keyword",
+        StringToKeyword = ("string->keyword", takes(1, 0)),
         /// `(void x ...)`: void, whatever it's given.
-        Void = "void",
+        Void = ("void", any(FOLD | DISCARD | TRUTHY)),
         /// `bytevector?`.
-        IsBytevector = "bytevector?",
+        IsBytevector = ("bytevector?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `(make-bytevector k [byte])`: a mutable bytevector of `k` copies of `byte`, or of 0.
-        MakeBytevector = "make-bytevector",
+        MakeBytevector = ("make-bytevector", any(TRUTHY)),
         /// `(bytevector-length bv)`.
-        BytevectorLength = "bytevector-length",
+        BytevectorLength = ("bytevector-length", takes(1, FOLD | TRUTHY)),
         /// `(bytevector-int-ref bv k big kind)`: the integer in the bytes from `k`, most
         /// significant first if `big` is `#t` or last if it's `#f`. `kind` is how many bytes, 1 to
         /// 8, negated if the integer is signed.
-        BytevectorRef = "bytevector-int-ref",
+        BytevectorRef = ("bytevector-int-ref", takes(4, FOLD | TRUTHY)),
         /// `(bytevector-int-set! bv k n big kind)` of a mutable bytevector, `n` an exact integer
         /// that fits, returning void.
-        BytevectorSet = "bytevector-int-set!",
+        BytevectorSet = ("bytevector-int-set!", takes(5, TRUTHY)),
         /// `vector?`.
-        IsVector = "vector?",
+        IsVector = ("vector?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `(make-vector k [fill])`: a mutable vector of `k` copies of `fill`, or of 0.
-        MakeVector = "make-vector",
+        MakeVector = ("make-vector", any(TRUTHY)),
         /// `(vector x ...)`: a mutable vector of the `x`s.
-        MakeVectorOf = "vector",
+        MakeVectorOf = ("vector", any(DISCARD | TRUTHY)),
         /// `(vector-length v)`.
-        VectorLength = "vector-length",
+        VectorLength = ("vector-length", takes(1, FOLD | TRUTHY)),
         /// `(vector-ref v k)`.
-        VectorRef = "vector-ref",
+        VectorRef = ("vector-ref", takes(2, FOLD)),
         /// `(vector-set! v k x)` of a mutable vector, returning void.
-        VectorSet = "vector-set!",
+        VectorSet = ("vector-set!", takes(3, TRUTHY)),
         /// `(vector->list v)`: a new list of `v`'s elements.
-        VectorToList = "vector->list",
+        VectorToList = ("vector->list", takes(1, TRUTHY)),
         /// `(list->vector xs)`: a mutable vector of the proper list `xs`'s elements.
-        ListToVector = "list->vector",
+        ListToVector = ("list->vector", takes(1, TRUTHY)),
         /// `(box x)`: create a new box holding `x` returning the newly created box
-        MakeBox = "box",
+        MakeBox = ("box", takes(1, DISCARD | TRUTHY)),
         /// `(unbox b)`: returns the contents of the box `b`
-        Unbox = "unbox",
+        Unbox = ("unbox", takes(1, REORDER)),
         /// `(set-box! b x)`: sets the contents of the box `b` to `x` returning void.
-        SetBox = "set-box!",
+        SetBox = ("set-box!", takes(2, TRUTHY)),
         /// `(make-winder before after)`: what `dynamic-wind` puts in the task's winders.
-        MakeWinder = "make-winder",
+        MakeWinder = ("make-winder", takes(2, DISCARD | TRUTHY)),
         /// `(default-continuation-prompt-tag)`.
-        DefaultPromptTag = "default-continuation-prompt-tag",
+        DefaultPromptTag = ("default-continuation-prompt-tag", takes(0, FOLD | DISCARD | TRUTHY)),
         /// `(make-continuation-prompt-tag [name])`.
-        MakePromptTag = "make-continuation-prompt-tag",
+        MakePromptTag = ("make-continuation-prompt-tag", any(TRUTHY)),
         /// `(values x ...)`: `x` alone, or any other number of values as a [`MultiValue`].
-        Values = "values",
+        Values = ("values", any(DISCARD)),
         /// `(values? x)`: whether `x` is a [`MultiValue`].
-        IsValues = "values?",
+        IsValues = ("values?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `(values-length mv)`.
-        ValuesLength = "values-length",
+        ValuesLength = ("values-length", takes(1, FOLD | TRUTHY)),
         /// `(values-ref mv k)`.
-        ValuesRef = "values-ref",
+        ValuesRef = ("values-ref", takes(2, FOLD)),
         /// `(module-ref m k)`: variable `k` of the [`objects::Module`] `m`, or
         /// [`Fault::Unbound`] if it isn't defined, as code of another module reads one it
         /// exports that it sets.
-        ModuleRef = "module-ref",
+        ModuleRef = ("module-ref", takes(2, 0)),
         /// `(make-error message irritant ...)`: a `Condition` of [`Fault::Error`], which the
         /// prelude's `error` raises.
-        MakeError = "make-error",
+        MakeError = ("make-error", any(TRUTHY)),
         /// `(make-syntax-error message form subform ...)`: a condition of kind `syntax`, its
         /// irritants the malformed `form` and the `subform`s of it that are.
-        MakeSyntaxError = "make-syntax-error",
+        MakeSyntaxError = ("make-syntax-error", any(TRUTHY)),
         /// `procedure?`: whether `x` is a [`objects::Closure`] or [`objects::Continuation`].
-        IsProcedure = "procedure?",
+        IsProcedure = ("procedure?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `continuation?`: whether `x` is a [`objects::Continuation`], composable or not.
-        IsContinuation = "continuation?",
+        IsContinuation = ("continuation?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `(make-coroutine f)`: a pending coroutine that the first `co/resume` of it starts by
         /// calling the procedure `f`.
-        MakeCoroutine = "make-coroutine",
+        MakeCoroutine = ("make-coroutine", takes(1, TRUTHY)),
         /// `coroutine?`.
-        IsCoroutine = "coroutine?",
+        IsCoroutine = ("coroutine?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `(coroutine-state co)`: 0 if `co` is pending, 1 running, 2 finished and 3 failed.
-        CoroutineState = "coroutine-state",
+        CoroutineState = ("coroutine-state", takes(1, TRUTHY)),
         /// `error-object?`: whether `x` is a `Condition`, as `make-error` and VM faults make.
-        IsErrorObject = "error-object?",
+        IsErrorObject = ("error-object?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `(error-object-message c)`: what `error` was given, or for a VM fault, its kind in
         /// words.
-        ErrorObjectMessage = "error-object-message",
+        ErrorObjectMessage = ("error-object-message", takes(1, TRUTHY)),
         /// `(error-object-irritants c)`.
-        ErrorObjectIrritants = "error-object-irritants",
+        ErrorObjectIrritants = ("error-object-irritants", takes(1, TRUTHY)),
         /// `(error-object-kind c)`: which of [`Fault::KINDS`] the condition is, as a symbol.
-        ErrorObjectKind = "error-object-kind",
+        ErrorObjectKind = ("error-object-kind", takes(1, TRUTHY)),
         /// `syntax?`.
-        IsSyntax = "syntax?",
+        IsSyntax = ("syntax?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `identifier?`: whether `x` is the syntax of a symbol.
-        IsIdentifier = "identifier?",
+        IsIdentifier = ("identifier?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `(syntax-e stx)`: what `stx` wraps, a symbol, a list or vector of syntax, or a
         /// literal.
-        SyntaxE = "syntax-e",
+        SyntaxE = ("syntax-e", takes(1, 0)),
         /// `(syntax->datum stx)`: the datum `stx` stands for, with all its syntax unwrapped.
-        SyntaxToDatum = "syntax->datum",
+        SyntaxToDatum = ("syntax->datum", takes(1, 0)),
         /// `(datum->syntax context datum)`: `datum` as syntax, with the scopes and span of the
         /// syntax `context`, or none if it's `#f`. What's syntax already in it stays as it is. Its
         /// identifiers named as `context` is refer to what it does.
-        DatumToSyntax = "datum->syntax",
+        DatumToSyntax = ("datum->syntax", takes(2, 0)),
         /// `(bound-identifier=? a b)`: whether a binding of the identifier `a` would bind `b`:
         /// they have the same name and scopes.
-        BoundIdentifierEq = "bound-identifier=?",
+        BoundIdentifierEq = ("bound-identifier=?", takes(2, 0)),
         /// `(free-identifier=? a b)`: whether the identifiers `a` and `b` refer to the same
         /// binding, as the expander found it when it made them. Identifiers it didn't make, such as
         /// temporaries, are the same only as each other, by name.
-        FreeIdentifierEq = "free-identifier=?",
+        FreeIdentifierEq = ("free-identifier=?", takes(2, 0)),
         /// `(generate-temporaries list name)`: an identifier for each element of `list`, of
         /// syntax or not, each in a new scope of its own, so it's apart from every other. It's
         /// named as the element is if that's an identifier, or else `name`.
-        GenerateTemporaries = "generate-temporaries",
+        GenerateTemporaries = ("generate-temporaries", takes(2, 0)),
         /// `(syntax-match pattern input)`: a vector of what the variables of the
         /// [`SyntaxPattern`](crate::objects::SyntaxPattern) matched in `input`, or `#f`.
-        SyntaxMatch = "syntax-match",
+        SyntaxMatch = ("syntax-match", takes(2, 0)),
         /// `(syntax-build template value ...)`: the syntax the
         /// [`SyntaxTemplate`](crate::objects::SyntaxTemplate) makes of what its pattern variables
         /// matched.
-        SyntaxBuild = "syntax-build",
+        SyntaxBuild = ("syntax-build", any(0)),
+        /// `(mark-value key default)`: the value of the running task's nearest mark for `key`, or
+        /// `default`.
+        MarkValue = ("mark-value", takes(2, DISCARD | DYNAMIC)),
+        /// `(frame-mark key default)`: the value of the nearest mark for `key` up to the nearest
+        /// prompt, or `default`.
+        FrameMark = ("frame-mark", takes(2, DISCARD | DYNAMIC)),
+        /// `(frame-marks key default tag)`: a list of the value of the nearest mark for `key` in
+        /// each prompt's part of the continuation, innermost first, or `default` for a part with
+        /// none, up to the nearest prompt for `tag`, or if `tag` is `#f`, all of them.
+        FrameMarks = ("frame-marks", takes(3, DYNAMIC)),
+        /// `(co/running)`: the running coroutine, or in a machine's own task, that task, which
+        /// is running until the machine finishes, and never pending, so nothing can resume it.
+        Running = ("co/running", takes(0, DISCARD | TRUTHY | DYNAMIC)),
+        /// `(winders)`: the running task's winders, up to the nearest prompt, innermost first.
+        Winders = ("winders", takes(0, DISCARD | DYNAMIC)),
+        /// `(set-winders! winders)`: sets them, to `()` or a list whose first is a winder.
+        SetWinders = ("set-winders!", takes(1, DYNAMIC)),
     }
 }
 
-/// Each intrinsic's arity, by its place in [`Intrinsic::ALL`], so the VM's check of one is a load.
-const ARITIES: [Option<u8>; Intrinsic::ALL.len()] = {
-    let mut arities = [None; Intrinsic::ALL.len()];
+/// What's true of an intrinsic, which it's declared with.
+#[derive(Clone, Copy)]
+struct Traits {
+    /// How many arguments it takes, or `None` for any number.
+    arity: Option<u8>,
+    /// Which of [`FOLD`], [`DISCARD`] and the rest it is.
+    is: u16,
+}
+
+/// An intrinsic of `arity` arguments that is each of what's in `is`: `FOLD | TRUTHY`, say, or
+/// `0` for none of them.
+const fn takes(arity: u8, is: u16) -> Traits {
+    Traits { arity: Some(arity), is }
+}
+
+/// One of any number of arguments.
+const fn any(is: u16) -> Traits {
+    Traits { arity: None, is }
+}
+
+/// A compiler can work out a call of it on constants: [`Intrinsic::is_pure_foldable`].
+const FOLD: u16 = 1 << 0;
+/// A call of it whose value goes unused can go: [`Intrinsic::is_discardable`]. Calls of it can
+/// then be made in any order too, unless it's [`DYNAMIC`].
+const DISCARD: u16 = 1 << 1;
+/// Calls of it can be made in any order, though it can fault: [`Intrinsic::is_reorderable`].
+const REORDER: u16 = 1 << 2;
+/// It says what kind of value its one argument is: [`Intrinsic::is_type_predicate`].
+const PREDICATE: u16 = 1 << 3;
+/// Its value is never `#f`: [`Intrinsic::is_always_truthy`].
+const TRUTHY: u16 = 1 << 4;
+/// Only a compiler writes a call of it: [`Intrinsic::is_internal`].
+const INTERNAL: u16 = 1 << 5;
+/// It works on the running task's state: [`Intrinsic::is_dynamic`].
+const DYNAMIC: u16 = 1 << 6;
+/// A call of it on two arguments is the same either way round:
+/// [`Intrinsic::is_commutative_binary`].
+const COMMUTE: u16 = 1 << 7;
+
+/// Each intrinsic's traits, by its place in [`Intrinsic::ALL`], so the VM's check of one is a load.
+const TRAITS: [Traits; Intrinsic::ALL.len()] = {
+    let mut traits = [any(0); Intrinsic::ALL.len()];
     let mut i = 0;
-    while i < arities.len() {
-        arities[i] = Intrinsic::ALL[i].arity_of();
+    while i < traits.len() {
+        traits[i] = Intrinsic::ALL[i].data();
         i += 1;
     }
-    arities
+    traits
 };
 
 impl Intrinsic {
     /// How many arguments it takes, or `None` for any number.
     #[inline]
     pub fn arity(self) -> Option<u8> {
-        ARITIES[self as usize]
+        TRAITS[self as usize].arity
     }
 
-    const fn arity_of(self) -> Option<u8> {
-        match self {
-            Intrinsic::Add | Intrinsic::Sub | Intrinsic::Mul | Intrinsic::Div | Intrinsic::Append => None,
-            Intrinsic::NumEq | Intrinsic::Lt | Intrinsic::Gt | Intrinsic::Le | Intrinsic::Ge => None,
-            Intrinsic::MakePromptTag | Intrinsic::Values | Intrinsic::MakeError | Intrinsic::MakeSyntaxError | Intrinsic::Void | Intrinsic::MakeBytevector | Intrinsic::SyntaxBuild => None,
-            Intrinsic::MakeVector | Intrinsic::MakeVectorOf => None,
-            Intrinsic::IsVector | Intrinsic::VectorLength | Intrinsic::VectorToList | Intrinsic::ListToVector => Some(1),
-            Intrinsic::VectorRef => Some(2),
-            Intrinsic::VectorSet => Some(3),
-            Intrinsic::DefaultPromptTag => Some(0),
-            Intrinsic::IsErrorObject => Some(1),
-            Intrinsic::ErrorObjectMessage | Intrinsic::ErrorObjectIrritants | Intrinsic::ErrorObjectKind => Some(1),
-            Intrinsic::IsBytevector | Intrinsic::BytevectorLength | Intrinsic::IsProcedure | Intrinsic::IsContinuation => Some(1),
-            Intrinsic::MakeCoroutine | Intrinsic::IsCoroutine | Intrinsic::CoroutineState => Some(1),
-            Intrinsic::Car | Intrinsic::Cdr | Intrinsic::IsNull | Intrinsic::IsPair | Intrinsic::IsList | Intrinsic::Length | Intrinsic::Reverse | Intrinsic::IsBox | Intrinsic::MakeBox | Intrinsic::Unbox => Some(1),
-            Intrinsic::IsValues | Intrinsic::ValuesLength | Intrinsic::Not | Intrinsic::IsBoolean | Intrinsic::IsKeyword => Some(1),
-            Intrinsic::KeywordToString | Intrinsic::StringToKeyword | Intrinsic::IsSymbol => Some(1),
-            Intrinsic::SymbolToString | Intrinsic::StringToSymbol => Some(1),
-            Intrinsic::Expt | Intrinsic::Quotient | Intrinsic::Remainder | Intrinsic::Modulo | Intrinsic::FloorQuotient => Some(2),
-            Intrinsic::IsNumber | Intrinsic::IsReal | Intrinsic::IsRational | Intrinsic::IsInteger | Intrinsic::IsExactInteger => Some(1),
-            Intrinsic::IsExact | Intrinsic::IsInexact | Intrinsic::IsNan | Intrinsic::IsInfinite | Intrinsic::IsFinite => Some(1),
-            Intrinsic::IsZero | Intrinsic::IsPositive | Intrinsic::IsNegative | Intrinsic::IsOdd | Intrinsic::IsEven => Some(1),
-            Intrinsic::Abs | Intrinsic::Numerator | Intrinsic::Denominator | Intrinsic::IntegerSqrt | Intrinsic::Exact | Intrinsic::Inexact => Some(1),
-            Intrinsic::Floor | Intrinsic::Ceiling | Intrinsic::Truncate | Intrinsic::Round => Some(1),
-            Intrinsic::Exp | Intrinsic::Sin | Intrinsic::Cos | Intrinsic::Tan | Intrinsic::Asin | Intrinsic::Acos | Intrinsic::Sqrt => Some(1),
-            Intrinsic::RealPart | Intrinsic::ImagPart | Intrinsic::Magnitude | Intrinsic::Angle => Some(1),
-            Intrinsic::MakeRectangular | Intrinsic::MakePolar => Some(2),
-            Intrinsic::Max | Intrinsic::Min | Intrinsic::Gcd | Intrinsic::Lcm | Intrinsic::StringToNumber | Intrinsic::Log | Intrinsic::Atan => None,
-            Intrinsic::BitwiseAnd | Intrinsic::BitwiseIor | Intrinsic::BitwiseXor => None,
-            Intrinsic::BitwiseNot | Intrinsic::IntegerLength | Intrinsic::BitCount => Some(1),
-            Intrinsic::ArithmeticShift | Intrinsic::IsBitSet => Some(2),
-            Intrinsic::BitField => Some(3),
-            Intrinsic::BitFieldReplace => Some(4),
-            Intrinsic::IsString | Intrinsic::StringLength => Some(1),
-            Intrinsic::StringAppend | Intrinsic::Substring | Intrinsic::StringToList | Intrinsic::NumberToString => None,
-            Intrinsic::StringEq | Intrinsic::StringLt | Intrinsic::StringGt | Intrinsic::StringLe | Intrinsic::StringGe => None,
-            Intrinsic::StringRef => Some(2),
-            Intrinsic::StringJoin => None,
-            Intrinsic::MakeKeywordProcedure | Intrinsic::StructSet => Some(4),
-            Intrinsic::MakeStructType => Some(5),
-            Intrinsic::StructRef => Some(3),
-            Intrinsic::IsStructDerivedFrom | Intrinsic::IsStructFieldMutable | Intrinsic::StructField | Intrinsic::StructFixedField => Some(2),
-            Intrinsic::IsStruct | Intrinsic::IsStructType | Intrinsic::StructType | Intrinsic::StructToList => Some(1),
-            Intrinsic::MakeStruct => None,
-            Intrinsic::StructFields => Some(1),
-            Intrinsic::ProcedureKeywords => Some(1),
-            Intrinsic::IsChar | Intrinsic::CharToInteger | Intrinsic::IntegerToChar => Some(1),
-            Intrinsic::CharEq | Intrinsic::CharLt | Intrinsic::CharGt | Intrinsic::CharLe | Intrinsic::CharGe => None,
-            Intrinsic::IsCharAlphabetic | Intrinsic::IsCharNumeric | Intrinsic::IsCharWhitespace | Intrinsic::IsCharUpperCase | Intrinsic::IsCharLowerCase => Some(1),
-            Intrinsic::DigitValue | Intrinsic::CharUpcase | Intrinsic::CharDowncase | Intrinsic::CharFoldcase => Some(1),
-            Intrinsic::CharCiEq | Intrinsic::CharCiLt | Intrinsic::CharCiGt | Intrinsic::CharCiLe | Intrinsic::CharCiGe => None,
-            Intrinsic::ListToString | Intrinsic::StringUpcase | Intrinsic::StringDowncase | Intrinsic::StringFoldcase => Some(1),
-            Intrinsic::StringCiEq | Intrinsic::StringCiLt | Intrinsic::StringCiGt | Intrinsic::StringCiLe | Intrinsic::StringCiGe => None,
-            Intrinsic::MakeString | Intrinsic::StringToVector | Intrinsic::VectorToString | Intrinsic::StringToUtf8 | Intrinsic::Utf8ToString => None,
-            Intrinsic::IsStringPrefix | Intrinsic::IsStringSuffix | Intrinsic::IsStringContains => Some(2),
-            Intrinsic::StringFind | Intrinsic::StringFindLast => None,
-            Intrinsic::StringSplit | Intrinsic::StringReplace => Some(4),
-            Intrinsic::StringTrim => Some(5),
-            Intrinsic::IsSyntax | Intrinsic::IsIdentifier | Intrinsic::SyntaxE | Intrinsic::SyntaxToDatum => Some(1),
-            Intrinsic::DatumToSyntax | Intrinsic::BoundIdentifierEq | Intrinsic::FreeIdentifierEq | Intrinsic::GenerateTemporaries | Intrinsic::SyntaxMatch => Some(2),
-            Intrinsic::Caar | Intrinsic::Cadr | Intrinsic::Cdar | Intrinsic::Cddr | Intrinsic::Caaar | Intrinsic::Caadr | Intrinsic::Cadar | Intrinsic::Caddr | Intrinsic::Cdaar | Intrinsic::Cdadr | Intrinsic::Cddar | Intrinsic::Cdddr | Intrinsic::Caaaar | Intrinsic::Caaadr | Intrinsic::Caadar | Intrinsic::Caaddr | Intrinsic::Cadaar | Intrinsic::Cadadr | Intrinsic::Caddar | Intrinsic::Cadddr | Intrinsic::Cdaaar | Intrinsic::Cdaadr | Intrinsic::Cdadar | Intrinsic::Cdaddr | Intrinsic::Cddaar | Intrinsic::Cddadr | Intrinsic::Cdddar | Intrinsic::Cddddr => Some(1),
-            Intrinsic::BytevectorRef => Some(4),
-            Intrinsic::ListTail | Intrinsic::ListRef | Intrinsic::Memq | Intrinsic::Memv | Intrinsic::Member | Intrinsic::Assq | Intrinsic::Assv | Intrinsic::Assoc => Some(2),
-            Intrinsic::BytevectorSet => Some(5),
-            Intrinsic::Cons | Intrinsic::Eq | Intrinsic::Eqv | Intrinsic::Equal | Intrinsic::SetBox | Intrinsic::ValuesRef | Intrinsic::MakeWinder | Intrinsic::ModuleRef => Some(2),
-        }
+    /// Whether it's declared with all of `flags`.
+    const fn has(self, flags: u16) -> bool {
+        TRAITS[self as usize].is & flags == flags
     }
 
     /// Whether a call on constant arguments has no side effects, reads no mutable state, and
     /// allocates no fresh identity-bearing objects, so a compiler can evaluate it at compile time
     /// via [`Intrinsic::run`].
     pub const fn is_pure_foldable(self) -> bool {
-        use Intrinsic::*;
-        matches!(
-            self,
-            Add | Sub
-                | Mul
-                | Div
-                | NumEq
-                | Lt
-                | Gt
-                | Le
-                | Ge
-                | Expt
-                | Quotient
-                | Remainder
-                | Modulo
-                | BitwiseAnd
-                | BitwiseIor
-                | BitwiseXor
-                | BitwiseNot
-                | ArithmeticShift
-                | IntegerLength
-                | BitCount
-                | IsBitSet
-                | BitField
-                | BitFieldReplace
-                | IsNumber | IsReal | IsRational | IsInteger | IsExactInteger | IsExact | IsInexact | IsNan | IsInfinite | IsFinite | IsZero | IsPositive | IsNegative | IsOdd | IsEven | Max | Min | Abs | Gcd | Lcm | Numerator | Denominator | Floor | Ceiling | Truncate | Round | FloorQuotient | IntegerSqrt | Exact | Inexact | StringToNumber | Exp | Log | Sin | Cos | Tan | Asin | Acos | Atan | Sqrt | MakeRectangular | MakePolar | RealPart | ImagPart | Magnitude | Angle
-                | StringLength
-                | StringRef
-                | StringEq
-                | StringLt
-                | StringGt
-                | StringLe
-                | StringGe
-                | CharToInteger
-                | IntegerToChar
-                | IsCharAlphabetic
-                | IsCharNumeric
-                | IsCharWhitespace
-                | IsCharUpperCase
-                | IsCharLowerCase
-                | DigitValue
-                | CharUpcase
-                | CharDowncase
-                | CharFoldcase
-                | CharCiEq
-                | CharCiLt
-                | CharCiGt
-                | CharCiLe
-                | CharCiGe
-                | StringCiEq
-                | StringCiLt
-                | StringCiGt
-                | StringCiLe
-                | StringCiGe
-                | IsStringPrefix
-                | IsStringSuffix
-                | IsStringContains
-                | StringFind
-                | StringFindLast
-                | IsStruct
-                | IsStructType
-                | IsStructDerivedFrom
-                | IsStructFieldMutable
-                | StructType
-                | CharEq
-                | CharLt
-                | CharGt
-                | CharLe
-                | CharGe
-                | Car
-                | Cdr
-                | Caar
-                | Cadr
-                | Cdar
-                | Cddr
-                | Caaar
-                | Caadr
-                | Cadar
-                | Caddr
-                | Cdaar
-                | Cdadr
-                | Cddar
-                | Cdddr
-                | Caaaar
-                | Caaadr
-                | Caadar
-                | Caaddr
-                | Cadaar
-                | Cadadr
-                | Caddar
-                | Cadddr
-                | Cdaaar
-                | Cdaadr
-                | Cdadar
-                | Cdaddr
-                | Cddaar
-                | Cddadr
-                | Cdddar
-                | Cddddr
-                | Eq
-                | Eqv
-                | Equal
-                | IsNull
-                | IsPair
-                | IsList
-                | Length
-                | ListTail
-                | ListRef
-                | Memq
-                | Memv
-                | Member
-                | Assq
-                | Assv
-                | Assoc
-                | IsBox
-                | Not
-                | IsBoolean
-                | IsKeyword
-                | IsSymbol
-                | IsString
-                | IsChar
-                | Void
-                | IsBytevector
-                | BytevectorLength
-                | BytevectorRef
-                | IsVector
-                | VectorLength
-                | VectorRef
-                | DefaultPromptTag
-                | IsValues
-                | ValuesLength
-                | ValuesRef
-                | IsProcedure
-                | IsContinuation
-                | IsCoroutine
-                | IsErrorObject
-                | IsSyntax
-                | IsIdentifier
-        )
+        self.has(FOLD)
     }
 
     /// Whether a direct call with valid arity cannot fault and has no side effects, so it can be
     /// dropped in an effect context once its arguments have been evaluated for their effects.
     pub const fn is_discardable(self) -> bool {
-        use Intrinsic::*;
-        matches!(
-            self,
-            Cons | MakeBox
-                | MakeWinder
-                | IsNumber
-                | IsReal
-                | IsRational
-                | IsInteger
-                | IsExactInteger
-                | Eq
-                | Eqv
-                | IsNull
-                | IsPair
-                | IsList
-                | IsBox
-                | Not
-                | IsBoolean
-                | IsKeyword
-                | IsSymbol
-                | IsString
-                | IsChar
-                | Void
-                | IsBytevector
-                | IsVector
-                | MakeVectorOf
-                | DefaultPromptTag
-                | Values
-                | IsValues
-                | IsProcedure
-                | IsContinuation
-                | IsCoroutine
-                | IsErrorObject
-                | IsStruct
-                | IsStructType
-                | StructField
-                | StructFixedField
-                | IsSyntax
-                | IsIdentifier
-        )
+        self.has(DISCARD)
     }
 
     /// Whether a direct call with valid arity has no side effects and reads nothing that can
     /// change, so calls of it and others like it can be made in any order: one that can fault,
-    /// as `car` of a non-pair does, only changes which of them faults first.
+    /// as `car` of a non-pair does, only changes which of them faults first. One that reads the
+    /// running task's state [isn't](Intrinsic::is_dynamic).
     pub const fn is_reorderable(self) -> bool {
-        use Intrinsic::*;
-        self.is_discardable() || matches!(self, Add | Sub | Mul | Car | Cdr | Caar | Cadr | Cdar | Cddr | Unbox | IsStructDerivedFrom | IsStructFieldMutable | StructType | StructRef)
+        (self.has(DISCARD) && !self.has(DYNAMIC)) || self.has(REORDER)
     }
 
     /// Whether `self` is a type predicate: one of one argument, any value, that says what kind
     /// of value it is and never faults. What one is true of, one it doesn't
     /// [imply](Intrinsic::implies) or share values with is false of.
     pub const fn is_type_predicate(self) -> bool {
-        use Intrinsic::*;
-        matches!(
-            self,
-            IsNull
-                | IsPair
-                | IsNumber
-                | IsReal
-                | IsRational
-                | IsInteger
-                | IsExactInteger
-                | IsSyntax
-                | IsIdentifier
-                | IsBoolean
-                | IsKeyword
-                | IsSymbol
-                | IsString
-                | IsChar
-                | IsBox
-                | IsBytevector
-                | IsVector
-                | IsList
-                | IsValues
-                | IsProcedure
-                | IsContinuation
-                | IsCoroutine
-                | IsErrorObject
-                | IsStruct
-                | IsStructType
-        )
+        self.has(PREDICATE)
     }
 
     /// Whether every value the type predicate `self` is true of, the type predicate `other` is
@@ -886,83 +678,7 @@ impl Intrinsic {
 
     /// Whether any normal return value of `self` is guaranteed not to be `#f`.
     pub const fn is_always_truthy(self) -> bool {
-        use Intrinsic::*;
-        matches!(
-            self,
-            Add | Sub
-                | Mul
-                | Div
-                | Expt
-                | Quotient
-                | Remainder
-                | Modulo
-                | BitwiseAnd
-                | BitwiseIor
-                | BitwiseXor
-                | BitwiseNot
-                | ArithmeticShift
-                | IntegerLength
-                | BitCount
-                | BitField
-                | BitFieldReplace
-                | Max | Min | Abs | Gcd | Lcm | Numerator | Denominator | Floor | Ceiling | Truncate | Round | FloorQuotient | IntegerSqrt | Exact | Inexact | Exp | Log | Sin | Cos | Tan | Asin | Acos | Atan | Sqrt | MakeRectangular | MakePolar | RealPart | ImagPart | Magnitude | Angle
-                | StringLength
-                | StringAppend
-                | Substring
-                | StringRef
-                | StringToList
-                | NumberToString
-                | StringJoin
-                | CharUpcase
-                | CharDowncase
-                | CharFoldcase
-                | MakeString
-                | ListToString
-                | StringUpcase
-                | StringDowncase
-                | StringFoldcase
-                | StringToVector
-                | VectorToString
-                | StringToUtf8
-                | Utf8ToString
-                | StringSplit
-                | StringTrim
-                | StringReplace
-                | CharToInteger
-                | IntegerToChar
-                | Cons
-                | Length
-                | Reverse
-                | Void
-                | MakeBytevector
-                | BytevectorLength
-                | BytevectorRef
-                | MakeVector
-                | MakeVectorOf
-                | VectorLength
-                | VectorSet
-                | VectorToList
-                | ListToVector
-                | MakeBox
-                | MakeWinder
-                | DefaultPromptTag
-                | MakePromptTag
-                | ValuesLength
-                | BytevectorSet
-                | SetBox
-                | MakeError
-                | MakeSyntaxError
-                | MakeCoroutine
-                | CoroutineState
-                | ErrorObjectMessage
-                | ErrorObjectIrritants
-                | ErrorObjectKind
-                | MakeStructType
-                | MakeStruct
-                | StructFields
-                | StructType
-                | StructToList
-        )
+        self.has(TRUTHY)
     }
 
     /// Whether only a compiler may emit a call of `self`. A front end doesn't let source name
@@ -980,14 +696,27 @@ impl Intrinsic {
     /// Used directly, they would make an instance or reach a field by a number, where a struct's
     /// own procedures are the only way to.
     pub const fn is_internal(self) -> bool {
-        use Intrinsic::*;
-        matches!(self, MakeStructType | MakeStruct | StructRef | StructField | StructFixedField | StructSet)
+        self.has(INTERNAL)
+    }
+
+    /// Whether it works on the running task's state as well as its arguments: its marks,
+    /// prompts and winders, and which task it is. `(mark-value key default)` is one, which a
+    /// parameter's value is read with.
+    ///
+    /// - All of them but `set-winders!` only read that state.
+    /// - A frame's code sees its marks and prompts change only across a request. The winders
+    ///   change when `set-winders!` sets them, which `dynamic-wind` does.
+    /// - A compiler never moves one or folds one, and drops only those whose values go
+    ///   unused, never `set-winders!`: none is [reorderable](Intrinsic::is_reorderable) or
+    ///   [foldable](Intrinsic::is_pure_foldable).
+    /// - [`Intrinsic::run`] has no task, so one faults there.
+    pub const fn is_dynamic(self) -> bool {
+        self.has(DYNAMIC)
     }
 
     /// Whether a 2-argument call of `self` is commutative (`f(a, b) == f(b, a)`).
     pub const fn is_commutative_binary(self) -> bool {
-        use Intrinsic::*;
-        matches!(self, Add | Mul | Eq | Eqv | Equal | BitwiseAnd | BitwiseIor | BitwiseXor)
+        self.has(COMMUTE)
     }
 
     /// Decomposes `car`..`cddddr` into `(first_is_car, remaining_cxr)`.
@@ -1386,47 +1115,80 @@ impl Intrinsic {
         Ok(made(mc, fuel, made_of.value()))
     }
 
-    /// Runs it on `args`, as the VM does on registers, but without a frame: for a compiler folding
-    /// a call of constants, for one. Whether a call can be folded, as one that makes a new box
-    /// or sets one can't, is the caller's to know.
+    /// Runs it on `args`, as the VM does on registers, but without a frame or a task: for a
+    /// compiler folding a call of constants, for one. Whether a call can be folded, as one that
+    /// makes a new box or sets one can't, is the caller's to know. One that works on the
+    /// running task's state [faults](Fault::Malformed).
     #[inline]
     pub fn run<'gc>(self, mc: &Mutation<'gc>, args: &[Value<'gc>], fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
+        self.run_in(mc, None, args, fuel)
+    }
+
+    /// Runs it on `args` in `task`, if there's one running.
+    #[inline]
+    pub(crate) fn run_in<'gc>(self, mc: &Mutation<'gc>, task: Option<Gc<'gc, Task>>, args: &[Value<'gc>], fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
         if self.arity().is_some_and(|arity| usize::from(arity) != args.len()) {
             return Err(Fault::Arity);
         }
-        self.apply(mc, |i| args[i], args.len(), fuel)
+        self.apply(mc, task, |i| args[i], args.len(), fuel)
     }
 
-    /// Runs it on the `args` registers from `base`, which the caller has checked are in the
-    /// frame and as many as it takes, spending `fuel` on what does a lot of work.
+    /// Runs it in `cx`, on the `args` registers from `base` of its frame, which the caller has
+    /// checked are in the frame and as many as it takes, spending fuel on what does a lot of
+    /// work.
     #[inline(always)]
-    pub(crate) fn exec<'gc>(self, mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, base: u8, args: u8, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
-        self.apply(mc, |i| frame.get(base + i as u8), usize::from(args), fuel)
+    pub(crate) fn exec<'gc>(self, cx: &mut Context<'_, 'gc>, base: u8, args: u8) -> Result<Value<'gc>, Fault> {
+        let frame = cx.frame;
+        self.apply(cx.mc, Some(cx.task), |i| frame.get(base + i as u8), usize::from(args), &mut cx.fuel)
     }
 
     /// Runs a 1-argument intrinsic on register `a`, which the caller has checked it takes.
     #[inline(always)]
-    pub(crate) fn exec1<'gc>(self, mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, a: u8, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
-        self.apply(mc, |_| frame.get(a), 1, fuel)
+    pub(crate) fn exec1<'gc>(self, cx: &mut Context<'_, 'gc>, a: u8) -> Result<Value<'gc>, Fault> {
+        let frame = cx.frame;
+        self.apply(cx.mc, Some(cx.task), |_| frame.get(a), 1, &mut cx.fuel)
     }
 
     /// Runs a 2-argument intrinsic on registers `(a, b)`, which the caller has checked it takes.
     #[inline(always)]
-    pub(crate) fn exec2<'gc>(self, mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, a: u8, b: u8, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
-        self.apply(mc, |i| frame.get(if i == 0 { a } else { b }), 2, fuel)
+    pub(crate) fn exec2<'gc>(self, cx: &mut Context<'_, 'gc>, a: u8, b: u8) -> Result<Value<'gc>, Fault> {
+        let frame = cx.frame;
+        self.apply(cx.mc, Some(cx.task), |i| frame.get(if i == 0 { a } else { b }), 2, &mut cx.fuel)
     }
 
     /// Runs a 3-argument intrinsic on registers `(a, b, c)`, which the caller has checked it takes.
     #[inline(always)]
-    pub(crate) fn exec3<'gc>(self, mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, a: u8, b: u8, c: u8, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
-        self.apply(mc, |i| frame.get([a, b, c][i]), 3, fuel)
+    pub(crate) fn exec3<'gc>(self, cx: &mut Context<'_, 'gc>, a: u8, b: u8, c: u8) -> Result<Value<'gc>, Fault> {
+        let frame = cx.frame;
+        self.apply(cx.mc, Some(cx.task), |i| frame.get([a, b, c][i]), 3, &mut cx.fuel)
     }
 
-    /// Runs it on the `args` values `arg` reads, as many as it takes.
+    /// The rarer of those that work on the running task's state, on `task`.
+    #[inline(never)]
+    fn dynamic<'gc>(self, mc: &Mutation<'gc>, task: Gc<'gc, Task>, arg: impl Fn(usize) -> Value<'gc>, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
+        if self == Intrinsic::FrameMarks {
+            let tag = if arg(2) == Value::FALSE { None } else { Some(prompts::tag_of(mc, arg(2))?) };
+            return Ok(made(mc, fuel, prompts::part_marks(mc, task, arg(0), arg(1), tag)?));
+        }
+        let winders = arg(0);
+        if winders != Value::NIL && !Pair::of(winders).is_some_and(|cell| cell.head(mc).downcast::<objects::Winder>(mc).is_some()) {
+            return Err(Fault::WrongType);
+        }
+        task.set_winders(mc, winders);
+        Ok(Value::VOID)
+    }
+
+    /// Runs it on the `args` values `arg` reads, as many as it takes, in `task` if there's one
+    /// running.
     #[inline(always)]
-    fn apply<'gc>(self, mc: &Mutation<'gc>, arg: impl Fn(usize) -> Value<'gc>, args: usize, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
+    fn apply<'gc>(self, mc: &Mutation<'gc>, task: Option<Gc<'gc, Task>>, arg: impl Fn(usize) -> Value<'gc>, args: usize, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
         let boolean = |b: bool| if b { Value::TRUE } else { Value::FALSE };
         Ok(match self {
+            Intrinsic::MarkValue => prompts::mark(mc, task.ok_or(Fault::Malformed)?, arg(0), arg(1))?,
+            Intrinsic::FrameMark => prompts::frame_mark(mc, task.ok_or(Fault::Malformed)?, arg(0), arg(1))?,
+            Intrinsic::Running => Value::object(mc, task.ok_or(Fault::Malformed)?),
+            Intrinsic::Winders => task.ok_or(Fault::Malformed)?.winders(mc),
+            Intrinsic::FrameMarks | Intrinsic::SetWinders => self.dynamic(mc, task.ok_or(Fault::Malformed)?, arg, fuel)?,
             Intrinsic::Add => arith(mc, fuel, fixnum(0), (0..args).map(&arg), Value::fixnum_add, |h, a, b| complex::add(h, a, b))?,
             Intrinsic::Mul => arith(mc, fuel, fixnum(1), (0..args).map(&arg), Value::fixnum_mul, |h, a, b| complex::mul(h, a, b))?,
             Intrinsic::Sub | Intrinsic::Div if args == 0 => return Err(Fault::Arity),

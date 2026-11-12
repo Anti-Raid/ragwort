@@ -1,6 +1,6 @@
 use ragwort_types::gc::{Arena, Gc, Value, WINDOW};
 use ragwort_vm::objects::{Condition, ConditionFields, Module};
-use ragwort_vm::{Fault, Intrinsic, MIN_SEGMENT, Machine, Outcome, Purity, Read, Request};
+use ragwort_vm::{Fault, Intrinsic, MIN_SEGMENT, Machine, Outcome, Purity, Request};
 
 use ragwort_types::pair::Pair;
 use ragwort_types::string::Strings;
@@ -434,14 +434,15 @@ fn reads_see_the_marks_where_they_run() {
     let all = "(%intrinsic with-mark k 'a
                  (%lambda () (%intrinsic cons (%intrinsic frame-mark k 0) (%intrinsic frame-marks k 0 #f))))";
     assert_eq!(eval(&format!("{k} {all}")), "(a a)");
-    let spread = eval_in(&mut arena(), "(%apply-intrinsic mark-value 'k '(0))");
-    assert!(format!("{spread:?}").contains("Arity(Read(MarkValue))"), "{spread:?}");
+    // It takes its arguments from a list as any intrinsic does, and as many as it takes.
+    assert_eq!(eval(&format!("{k} (%intrinsic with-mark k 3 (%lambda () (%apply-intrinsic mark-value k '(0))))")), "3");
+    let spread = eval_in(&mut arena(), "(%apply-intrinsic mark-value 'k '())");
+    assert!(format!("{spread:?}").contains("Arity"), "{spread:?}");
 }
 
 #[test]
-fn intrinsics_reads_and_requests_have_different_names() {
+fn intrinsics_and_requests_have_different_names() {
     let mut names: Vec<&str> = Intrinsic::ALL.iter().map(|i| i.name()).collect();
-    names.extend(Read::ALL.iter().map(|r| r.name()));
     names.extend(Request::ALL.iter().map(|r| r.name()));
     let count = names.len();
     names.sort_unstable();

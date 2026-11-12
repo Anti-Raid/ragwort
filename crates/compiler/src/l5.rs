@@ -1152,7 +1152,6 @@ impl fmt::Display for PrimName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
             Prim::Intrinsic(i) => f.write_str(i.name()),
-            Prim::Read(r) => f.write_str(r.name()),
             Prim::Request(r) => f.write_str(r.name()),
             Prim::Host(h) => write!(f, "host {}", h.name),
             Prim::Slot(op, slot) => {

@@ -15,7 +15,7 @@ use ragwort_types::symbol::{Keyword, Symbol, Symbols};
 use ragwort_types::vector::Vectors;
 use ragwort_types::syntax::{Abbreviation, Syntax, SyntaxKind};
 use ragwort_vm::structs::TypeFlags;
-use ragwort_vm::{Fault, HostDef, Intrinsic, Read, Request};
+use ragwort_vm::{Fault, HostDef, Intrinsic, Request};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LowerErrorKind {
@@ -187,9 +187,6 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             if internals || !i.is_internal() {
                 prims.insert(symbol(i.name())?.to_bits(), Prim::Intrinsic(i));
             }
-        }
-        for &r in Read::ALL {
-            prims.insert(symbol(r.name())?.to_bits(), Prim::Read(r));
         }
         for &r in Request::ALL {
             prims.insert(symbol(r.name())?.to_bits(), Prim::Request(r));
@@ -1071,7 +1068,6 @@ impl<'s, 'a, 'gc> Lowering<'s, 'a, 'gc> {
         }
         let takes = match prim {
             Prim::Intrinsic(i) => i.arity().is_none_or(|arity| usize::from(arity) == args.len()),
-            Prim::Read(r) => usize::from(r.arity()) == args.len(),
             Prim::Request(r) => r.takes(args.len()),
             Prim::Host(h) => h.takes(args.len()),
             Prim::Slot(op, _) => op.arity() == args.len(),

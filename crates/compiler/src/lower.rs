@@ -109,7 +109,6 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
             Core::Intrinsic(prim, args) => {
                 let takes = match *prim {
                     Prim::Intrinsic(i) => i.arity().is_none_or(|n| usize::from(n) == args.len()),
-                    Prim::Read(r) => usize::from(r.arity()) == args.len(),
                     Prim::Request(r) => r.takes(args.len()),
                     Prim::Host(h) => h.takes(args.len()),
                     Prim::Slot(op, _) => op.arity() == args.len(),
@@ -120,9 +119,8 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
                 all(args, then);
             }
             Core::ApplyIntrinsic(prim, args) => {
-                // A read takes a fixed number of arguments, so its prelude wrapper spreads them, and
-                // a host function's arguments must fit a frame.
-                if args.is_empty() || matches!(prim, Prim::Read(_) | Prim::Host(_) | Prim::Slot(..)) {
+                // A host function's arguments must fit a frame.
+                if args.is_empty() || matches!(prim, Prim::Host(_) | Prim::Slot(..)) {
                     return Err(CompileError::Arity(*prim));
                 }
                 all(args, then);

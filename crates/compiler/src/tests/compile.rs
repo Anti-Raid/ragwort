@@ -3,10 +3,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use ragwort_types::constant::Constants;
 use ragwort_types::gc::{Arena, Gc, Mutation, Value, WINDOW};
 use ragwort_types::pair::{Pair, Pairs};
-use ragwort_vm::Intrinsic::{Add, Car, Cons, Eq, MakeBox, MakePromptTag, ModuleRef, Not, SetBox, Unbox};
+use ragwort_vm::Intrinsic::{Add, Car, Cons, Eq, FrameMarks, MakeBox, MakePromptTag, MarkValue, ModuleRef, Not, Running, SetBox, SetWinders, Unbox};
 use ragwort_vm::frame::{ARGS, MAX_PARAMS};
 use ragwort_vm::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Condition, ConditionFields};
-use ragwort_vm::{Fault, HostDef, Intrinsic, MIN_SEGMENT, Machine, Op, Outcome, Purity, Read, Request};
+use ragwort_vm::{Fault, HostDef, Intrinsic, MIN_SEGMENT, Machine, Op, Outcome, Purity, Request};
 
 use ragwort_types::string::Strings;
 use ragwort_types::symbol::Symbols;
@@ -470,13 +470,13 @@ fn big_frames_spill() {
         }),
         Ok(349)
     );
-    // A two-argument read whose first argument is spilled and whose second is worked out into a
+    // A two-argument intrinsic whose first argument is spilled and whose second is worked out into a
     // spilled register: (let ((k (make-box 0))) (with-mark k 7 (lambda () (let ((v1 (make-box 1))
     // ... (v250 ...)) (+ (mark-value k (unbox v5)) (unbox v1) ... (unbox v250))))))
     assert_eq!(
         number(|_| {
             let boxes: Vec<(u32, Core)> = (1..=250).map(|v| (v, prim(MakeBox, vec![q(i64::from(v))]))).collect();
-            let marked = Core::Intrinsic(Prim::Read(Read::MarkValue), vec![var(0), prim(Unbox, vec![var(5)])]);
+            let marked = prim(MarkValue, vec![var(0), prim(Unbox, vec![var(5)])]);
             let all = std::iter::once(marked).chain((1..=250).map(|v| prim(Unbox, vec![var(v)]))).collect();
             let thunk = lambda(&[], None, let_(boxes, prim(Add, all)));
             let_(vec![(0, prim(MakeBox, vec![q(0)]))], Core::Intrinsic(Prim::Request(Request::WithMark), vec![var(0), q(7), thunk]))
@@ -1551,32 +1551,32 @@ fn reads_of_constant_vectors_fold() {
     eval(|mc| prim(IsVector, vec![constant(mc, &[])]), |_, v| assert_eq!(v, Ok(Value::TRUE)));
 }
 
-fn read<'gc>(r: Read, args: Vec<Core<'gc>>) -> Core<'gc> {
-    Core::Intrinsic(Prim::Read(r), args)
-}
-
 fn ops<'gc>(mc: &Mutation<'gc>, core: Core<'gc>) -> Vec<Op> {
     all_ops(mc, compile(mc, Some(hosting(mc)), &core).unwrap())
 }
 
 #[test]
-fn reads_get_register_forms_and_unused_ones_go() {
+fn intrinsics_on_the_task_get_register_forms_and_unused_ones_go() {
     let mut arena = Arena::new(1 << 22, 0);
     arena.mutate(|mc| {
         let ops = |core| ops(mc, core);
-        let tail = ops(lambda(&[0], None, read(Read::MarkValue, vec![var(0), q(0)])));
-        assert!(tail.iter().any(|op| matches!(op, Op::TailCallRead { args: 2, read: Read::MarkValue, .. })), "{tail:?}");
-        let used = ops(lambda(&[0], None, prim(Cons, vec![read(Read::MarkValue, vec![var(0), q(0)]), read(Read::Running, vec![])])));
-        assert!(used.iter().any(|op| matches!(op, Op::Read2 { read: Read::MarkValue, .. })), "{used:?}");
-        assert!(used.iter().any(|op| matches!(op, Op::CallRead { args: 0, read: Read::Running, .. })), "{used:?}");
-        let unused = ops(lambda(&[0], None, let_(vec![(1, read(Read::MarkValue, vec![var(0), q(0)]))], q(1))));
-        assert!(!unused.iter().any(|op| matches!(op, Op::Read2 { .. } | Op::CallRead { .. })), "{unused:?}");
-        // One that can fault stays.
-        let faulting = ops(lambda(&[0], None, let_(vec![(1, read(Read::FrameMarks, vec![var(0), q(0), var(0)]))], q(1))));
-        assert!(faulting.iter().any(|op| matches!(op, Op::CallRead { args: 3, read: Read::FrameMarks, .. })), "{faulting:?}");
+        let tail = ops(lambda(&[0], None, prim(MarkValue, vec![var(0), q(0)])));
+        assert!(tail.iter().any(|op| matches!(op, Op::TailCallIntrinsic { args: 2, intrinsic: MarkValue, .. })), "{tail:?}");
+        let used = ops(lambda(&[0], None, prim(Cons, vec![prim(MarkValue, vec![var(0), q(0)]), prim(Running, vec![])])));
+        assert!(used.iter().any(|op| matches!(op, Op::CallIntrinsic2 { intrinsic: MarkValue, .. })), "{used:?}");
+        assert!(used.iter().any(|op| matches!(op, Op::CallIntrinsic { args: 0, intrinsic: Running, .. })), "{used:?}");
+        let unused = ops(lambda(&[0], None, let_(vec![(1, prim(MarkValue, vec![var(0), q(0)]))], q(1))));
+        assert!(!unused.iter().any(|op| matches!(op, Op::CallIntrinsic2 { .. } | Op::CallIntrinsic { .. })), "{unused:?}");
+        // One that can fault stays, and so does the one that sets.
+        let faulting = ops(lambda(&[0], None, let_(vec![(1, prim(FrameMarks, vec![var(0), q(0), var(0)]))], q(1))));
+        assert!(faulting.iter().any(|op| matches!(op, Op::CallIntrinsic3 { intrinsic: FrameMarks, .. })), "{faulting:?}");
+        let setting = ops(lambda(&[0], None, let_(vec![(1, prim(SetWinders, vec![var(0)]))], q(1))));
+        assert!(setting.iter().any(|op| matches!(op, Op::CallIntrinsic1 { intrinsic: SetWinders, .. })), "{setting:?}");
+        // One of constants isn't worked out by the compiler, which has no task.
+        let constant = ops(lambda(&[], None, prim(MarkValue, vec![q(1), q(2)])));
+        assert!(constant.iter().any(|op| matches!(op, Op::TailCallIntrinsic { intrinsic: MarkValue, .. })), "{constant:?}");
     });
-    assert_eq!(error(|_| read(Read::MarkValue, vec![q(1)])), CompileError::Arity(Prim::Read(Read::MarkValue)));
-    assert_eq!(error(|_| Core::ApplyIntrinsic(Prim::Read(Read::Running), vec![q(1)])), CompileError::Arity(Prim::Read(Read::Running)));
+    assert_eq!(error(|_| prim(MarkValue, vec![q(1)])), CompileError::Arity(Prim::Intrinsic(MarkValue)));
 }
 
 fn add_host<'s, 'gc>(_: &mut ragwort_vm::HostContext<'s, 'gc>, args: ragwort_vm::HostArgs<'s, 'gc>) -> Result<ragwort_vm::Reply<'gc>, Fault> {

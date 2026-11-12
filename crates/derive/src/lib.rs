@@ -14,6 +14,23 @@ pub fn objects(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
 /// Declares an enum whose variants are each named, written `Variant = "name"` after any fields,
 /// with `name` each one's name. If none has fields, it also has `ALL`, its variants in order, and
 /// `FromStr` back from a name, failing with `ragwort_types::UnknownName`. Names must differ.
+///
+/// # Data
+///
+/// With `#[data(Type)]` on an enum whose variants have no fields, each variant is written
+/// `Variant = ("name", value)`, and the enum has a private `const fn data(&self) -> Type` that
+/// gives its value. What's true of each variant is then written once, where it's declared:
+///
+/// ```text
+/// named! {
+///     #[data(u8)]
+///     pub enum Shape {
+///         /// Three sides.
+///         Triangle = ("triangle", 3),
+///         Square = ("square", 4),
+///     }
+/// }
+/// ```
 #[proc_macro]
 pub fn named(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     named::expand(input.into()).unwrap_or_else(syn::Error::into_compile_error).into()

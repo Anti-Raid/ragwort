@@ -744,28 +744,23 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         }
     }
 
-    /// The read or intrinsic whose value `block` returns as its last instruction makes it, which
-    /// can return it itself.
+    /// The intrinsic whose value `block` returns as its last instruction makes it, which can
+    /// return it itself.
     fn tail<'b>(&self, block: &'b l5::BlockData<'_, 'gc>) -> Option<(Prim, &'b [Val])> {
         let (Some(Inst::Prim { dst, prim, args, spread: false }), End::Return(v)) = (block.insts.last(), &block.end) else { return None };
-        let tail = match prim {
-            Prim::Read(_) => true,
-            Prim::Intrinsic(_) => self.imms[dst.0 as usize].is_none(),
-            _ => false,
-        };
+        let tail = matches!(prim, Prim::Intrinsic(_)) && self.imms[dst.0 as usize].is_none();
         (tail && dst == v && self.uses[dst.0 as usize] == 1).then_some((*prim, args.as_slice()))
     }
 
     fn tail_prim(&mut self, prim: Prim, args: &[Val]) -> Result<(), CompileError> {
         let n = args.len() as u8;
         match (prim, self.stage(self.first, None, args, true)) {
-            (Prim::Read(read), Some(base)) => self.ops.push(Op::TailCallRead { base, args: n, read }),
             (Prim::Intrinsic(intrinsic), Some(base)) => self.ops.push(Op::TailCallIntrinsic { base, args: n, intrinsic }),
             (Prim::Intrinsic(intrinsic), None) => {
                 let base = self.list(args, None);
                 self.ops.extend([Op::ApplyIntrinsic { base, args: 1, intrinsic }, Op::LoadAcc { dst: SCRATCH }, Op::Return { src: SCRATCH }]);
             }
-            _ => unreachable!("only reads and intrinsics return their own values"),
+            _ => unreachable!("only intrinsics return their own values"),
         }
         Ok(())
     }
@@ -853,7 +848,6 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
             Prim::Slot(..) => false,
             _ if self.imms[dst.0 as usize].is_some() => false,
             Prim::Intrinsic(_) if !spread => args > 3,
-            Prim::Read(_) if !spread => args > 2,
             _ => true,
         }
     }
@@ -922,35 +916,23 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
                     self.write(dst, |dst| Op::CallIntrinsic3 { dst, a, b, c, intrinsic });
                     return Ok(());
                 }
-                (Prim::Read(read), &[a0]) => {
-                    let a = self.read(a0, 0);
-                    self.write(dst, |dst| Op::Read1 { dst, a, read });
-                    return Ok(());
-                }
-                (Prim::Read(read), &[a0, a1]) => {
-                    let (a, b) = (self.read(a0, 0), self.read(a1, 1));
-                    self.write(dst, |dst| Op::Read2 { dst, a, b, read });
-                    return Ok(());
-                }
                 _ => {}
             }
         }
         let host = if let Prim::Host(def) = prim { Some(self.module.host(def)?) } else { None };
         let n = args.len() as u8;
-        let staged = self.stage(base, None, args, matches!(prim, Prim::Intrinsic(_) | Prim::Read(_)));
+        let staged = self.stage(base, None, args, matches!(prim, Prim::Intrinsic(_)));
         let op = match (prim, spread, staged) {
             (Prim::Intrinsic(intrinsic), false, Some(base)) => Op::CallIntrinsic { base, args: n, intrinsic },
             (Prim::Intrinsic(intrinsic), true, Some(base)) => Op::ApplyIntrinsic { base, args: n, intrinsic },
             (Prim::Intrinsic(intrinsic), _, None) => Op::ApplyIntrinsic { base: self.spread(args, spread), args: 1, intrinsic },
-            (Prim::Read(read), false, Some(base)) => Op::CallRead { base, args: n, read },
             (Prim::Request(request), false, Some(base)) => Op::CallRequest { base, args: n, request },
             (Prim::Request(request), true, Some(base)) => Op::ApplyRequest { base, args: n, request },
             (Prim::Request(request), _, None) => Op::ApplyRequest { base: self.spread(args, spread), args: 1, request },
             (Prim::Host(_), false, Some(base)) => Op::CallHost { base, args: n, host: host.expect("looked up") },
             (Prim::Host(_), false, None) => return Err(CompileError::TooManyArguments),
-            (Prim::Read(_), false, None) => unreachable!("a read takes at most 3 arguments"),
-            (Prim::Read(_) | Prim::Host(_) | Prim::Slot(..), true, _) | (Prim::Slot(..), false, _) => {
-                unreachable!("lowering spreads no read, host function or slot access")
+            (Prim::Host(_) | Prim::Slot(..), true, _) | (Prim::Slot(..), false, _) => {
+                unreachable!("lowering spreads no host function or slot access")
             }
         };
         self.ops.push(op);

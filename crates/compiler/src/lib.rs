@@ -52,7 +52,7 @@ use ragwort_alloc::Arena;
 
 use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Value};
 use ragwort_vm::objects::Module;
-use ragwort_vm::{HostDef, Intrinsic, Read, Request};
+use ragwort_vm::{HostDef, Intrinsic, Request};
 
 /// A local variable, numbered by the expander so no two bindings share one.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -69,7 +69,6 @@ pub enum Place {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Prim {
     Intrinsic(Intrinsic),
-    Read(Read),
     Request(Request),
     /// A host function, from a static table, which the code's module carries.
     Host(&'static HostDef),
@@ -217,7 +216,6 @@ impl fmt::Display for CompileError {
             Self::SameLambda(id) => write!(f, "lambda {id} appears more than once"),
             Self::TooManyOptional(id) => write!(f, "lambda {id} has more optional parameters than parameters"),
             Self::Arity(Prim::Intrinsic(i)) => write!(f, "wrong number of arguments to {}", i.name()),
-            Self::Arity(Prim::Read(r)) => write!(f, "wrong number of arguments to {}", r.name()),
             Self::Arity(Prim::Request(r)) => write!(f, "wrong number of arguments to {}", r.name()),
             Self::Arity(Prim::Host(h)) => write!(f, "wrong number of arguments to host function {}", h.name),
             Self::Arity(Prim::Slot(_, slot)) => write!(f, "wrong number of arguments to an access of module variable {slot}"),

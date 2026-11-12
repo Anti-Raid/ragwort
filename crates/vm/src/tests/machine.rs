@@ -3,10 +3,10 @@ use ragwort_types::pair::{Pair, Pairs};
 use ragwort_types::vector::Vectors;
 
 use super::*;
-use crate::Intrinsic::{Add, Car, Cons, Eq, IsValues, MakeBox, MakePromptTag, SetBox, Unbox, Values, ValuesLength, ValuesRef};
+use crate::Intrinsic::{Add, Car, Cons, Eq, IsValues, MakeBox, MakePromptTag, MarkValue, SetBox, Unbox, Values, ValuesLength, ValuesRef};
 use crate::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Condition, ConditionFields, MultiValue, MultiValueFields, Tag};
 use crate::objects::{ExternalRef, ExternalRefFields, Module};
-use crate::{Capture, Fault, HostArgs, HostContext, HostDef, Op, Purity, Read, Reply, Request};
+use crate::{Capture, Fault, HostArgs, HostContext, HostDef, Op, Purity, Reply, Request};
 
 fn fix<'gc>(n: i64) -> Value<'gc> {
     Value::fixnum(n).unwrap()
@@ -558,11 +558,11 @@ fn marks_are_dropped_on_return_and_replaced_in_tail_position() {
         Op::LoadAcc { dst: 2 },
         Op::LoadConst { dst: 3, index: 0 },
         Op::LoadConst { dst: 4, index: 2 },
-        Op::CallRead { base: 3, args: 2, read: Read::MarkValue },
+        Op::CallIntrinsic { base: 3, args: 2, intrinsic: MarkValue },
         Op::LoadAcc { dst: 3 },
         Op::TailCallIntrinsic { base: 2, args: 2, intrinsic: Values },
     ];
-    let get = [Op::LoadConst { dst: 2, index: 0 }, Op::LoadConst { dst: 3, index: 2 }, Op::TailCallRead { base: 2, args: 2, read: Read::MarkValue }];
+    let get = [Op::LoadConst { dst: 2, index: 0 }, Op::LoadConst { dst: 3, index: 2 }, Op::TailCallIntrinsic { base: 2, args: 2, intrinsic: MarkValue }];
     let constants = [TAG, 1, 0, 100_000, -1];
     assert_eq!(call(&constants, &[(0, &[], &main), (0, &[], &get)], &[]), Ok(vec![1, 0]));
 
@@ -595,7 +595,7 @@ fn marks_are_dropped_on_return_and_replaced_in_tail_position() {
         Op::JumpIfFalse { test: 5, offset: 3 },
         Op::LoadConst { dst: 3, index: 0 },
         Op::LoadConst { dst: 4, index: 2 },
-        Op::TailCallRead { base: 3, args: 2, read: Read::MarkValue },
+        Op::TailCallIntrinsic { base: 3, args: 2, intrinsic: MarkValue },
         Op::LoadConst { dst: 3, index: 0 },
         Op::Move { dst: 4, src: 1 },
         Op::NewClosure { dst: 5, count: 1, code: 7 },

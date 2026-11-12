@@ -1,7 +1,8 @@
 //! A [`Request`] calls a procedure or changes the continuation, so the outer loop carries it
 //! out. It reads its arguments out of the frame, keeps the continuation it returns to, then
-//! runs, and what it leads to is a [`Then`]. What only reads the continuation's marks is a
-//! [`Read`](crate::Read), which the inner loop runs.
+//! runs, and what it leads to is a [`Then`]. What only works on the running task's state, as
+//! `mark-value` reads a mark, is an [intrinsic](crate::Intrinsic::is_dynamic), which the inner
+//! loop runs.
 //!
 //! These are marks, prompts and continuations, as Racket has them, exceptions and the jumps that
 //! run `dynamic-wind`'s winders, which the VM runs between calls of Scheme code, and switching

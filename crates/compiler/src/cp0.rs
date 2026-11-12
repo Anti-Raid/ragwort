@@ -700,7 +700,6 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             match self.out[e] {
                 Node::Seq(a, b) => todo.extend([b, a]),
                 Node::Intrinsic(Prim::Intrinsic(i), args) if i.is_discardable() => todo.extend(self.out[args].iter().rev()),
-                Node::Intrinsic(Prim::Read(r), args) if r.is_discardable() => todo.extend(self.out[args].iter().rev()),
                 Node::Intrinsic(Prim::Host(h), args) if h.purity == Purity::Discardable => todo.extend(self.out[args].iter().rev()),
                 Node::If(test, t, o) if self.out.is_pure(self.mc, t) && self.out.is_pure(self.mc, o) => todo.push(test),
                 _ => effects.push(e),
@@ -1215,7 +1214,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
     /// can call a procedure, or an assignment of a module's variable. What's known of the
     /// module's variables may no longer hold.
     fn ran(&mut self, prim: Prim) {
-        if !matches!(prim, Prim::Intrinsic(_) | Prim::Read(_) | Prim::Slot(SlotOp::Load | SlotOp::LoadChecked, _)) {
+        if !matches!(prim, Prim::Intrinsic(_) | Prim::Slot(SlotOp::Load | SlotOp::LoadChecked, _)) {
             self.slot_derived.clear();
         }
     }
