@@ -55,6 +55,12 @@ fn the_repl_keeps_what_each_input_defines() {
     assert_eq!(eval(&mut program, "(car 5)"), Err(vec!["error: car: wrong type of argument: 5\n  at <input>:1".to_string()]));
     assert_eq!(eval(&mut program, "1 (car 5) 2"), Err(vec!["error: car: wrong type of argument: 5\n  at <input>:1".to_string()]));
     assert_eq!(eval(&mut program, "\n (nope)"), Err(vec!["<input>:2:3: a name nothing defines".to_string()]));
+    // An input that fails keeps what it defined before the error, and nothing after it: neither a reference nor a call reaches a procedure whose definition never ran.
+    assert_eq!(eval(&mut program, "(define (kept) 10) (car 7) (define (lost) 20)").map_err(|e| e.len()), Err(1));
+    assert_eq!(eval(&mut program, "(kept)"), values(&["10"]));
+    assert_eq!(eval(&mut program, "lost"), Err(vec!["<input>:1:1: a name nothing defines".to_string()]));
+    assert_eq!(eval(&mut program, "(lost)"), Err(vec!["<input>:1:2: a name nothing defines".to_string()]));
+    assert_eq!(eval(&mut program, "(define (lost) 21) (lost)"), values(&["21"]));
     assert_eq!(eval(&mut program, "(set! x 2)"), Err(vec!["<input>:1:7: an assignment of an import".to_string()]));
     assert_eq!(eval(&mut program, "(f x)"), values(&["14"]));
 }
@@ -209,4 +215,33 @@ fn an_uncaught_error_lists_the_calls_in_progress() {
     let at = anonymous.display();
     let report = format!("error: car: wrong type of argument: 5\n  in (anonymous) ({at}:2)\n  in apply-it ({at}:1)");
     assert_eq!(Program::new(HEAP, Vec::new()).unwrap().run_file(&anonymous, true), Err(vec![report]));
+}
+
+#[test]
+fn a_procedure_inlined_from_another_module_keeps_its_entry() {
+    let root = scratch("inlined");
+    let util = file(&root, "util/u.rg", "(provide second)\n(define (second xs)\n  (car\n    (cdr xs)))");
+    let main = file(&root, "main.rg", "(require util)\n(define (use x)\n  (+ 1 (second x)))\n(+ 1 (use 5))");
+    let dirs = || vec![dir("util", &root.join("util"))];
+    // The entry has the line of the operation that failed, not the line where the procedure's definition starts.
+    let report = format!("error: cdr: wrong type of argument: 5\n  in second [inlined] ({}:4)\n  in use ({at}:3)\n  at {at}:4", util.display(), at = main.display());
+    assert_eq!(Program::new(HEAP, dirs()).unwrap().run_file(&main, true), Err(vec![report.clone()]));
+    // The entry survives an image, which saves the inline template with the lines of its operations.
+    let mut library = Program::new(HEAP, dirs()).unwrap();
+    assert_eq!(library.load_all(), Ok(()));
+    let bytes = library.save_image().unwrap();
+    assert_eq!(Program::from_image(HEAP, Vec::new(), &bytes).unwrap().run_file(&main, true), Err(vec![report]));
+}
+
+#[test]
+fn native_code_and_keyword_calls_report_their_lines() {
+    let root = scratch("positions");
+    let native = file(&root, "main.rgn", "(%define inner (%lambda (x)\n  (%intrinsic car x)))\n(%define outer (%lambda (x)\n  (%intrinsic + 1 (%app inner x))))\n(%intrinsic + 1 (%app outer 5))");
+    let at = native.display();
+    let report = format!("error: car: wrong type of argument: 5\n  in inner ({at}:2)\n  in outer ({at}:4)\n  at {at}:5");
+    assert_eq!(Program::new(HEAP, Vec::new()).unwrap().run_file(&native, true), Err(vec![report]));
+    let keyword = file(&root, "keyword.rg", "(define (pick xs #:from [from 0])\n  (vector-ref xs from))\n(define (use xs)\n  (+ 1\n     (pick xs #:from 9)))\n(+ 1 (use (vector 1)))");
+    let at = keyword.display();
+    let report = format!("error: vector-ref: value out of range: #(1) 9\n  in pick ({at}:2)\n  in use ({at}:5)\n  at {at}:6");
+    assert_eq!(Program::new(HEAP, Vec::new()).unwrap().run_file(&keyword, true), Err(vec![report]));
 }

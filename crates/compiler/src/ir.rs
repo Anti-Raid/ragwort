@@ -48,7 +48,13 @@ impl<'gc> Origins<'gc> {
     /// Records the name and position of `lambda`, where it has them.
     pub(crate) fn describe(&mut self, lambda: u32, name: Option<Value<'gc>>, at: Option<Position<'gc>>) {
         if name.is_some() || at.is_some() {
-            self.lambdas.insert(lambda, Described { name, at });
+            let entry = self.lambdas.entry(lambda).or_default();
+            if name.is_some() {
+                entry.name = name;
+            }
+            if at.is_some() {
+                entry.at = at;
+            }
         }
     }
 
@@ -68,10 +74,11 @@ impl<'gc> Origins<'gc> {
     }
 }
 
-/// An inlined call: the lambda whose body was copied into its caller, and the site of the call it replaced.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct Inlined {
-    pub(crate) lambda: u32,
+/// An inlined call: the procedure whose body was copied into its caller, and the site of the call it replaced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Inlined<'gc> {
+    /// The procedure's name, a symbol.
+    pub(crate) name: Value<'gc>,
     pub(crate) call: u32,
 }
 
@@ -86,7 +93,7 @@ pub(crate) struct Site<'gc> {
 #[derive(Default)]
 pub(crate) struct Sites<'gc> {
     pub(crate) sites: Vec<Site<'gc>>,
-    pub(crate) inlined: Vec<Inlined>,
+    pub(crate) inlined: Vec<Inlined<'gc>>,
     /// The site already made for a site moved into an inlined call, keyed by the original site and the inlined call.
     moved: HashMap<(u32, u32), u32>,
 }
@@ -102,9 +109,15 @@ impl<'gc> Sites<'gc> {
         self.sites.get((site as usize).checked_sub(1)?).copied()
     }
 
-    /// Records that the body of `lambda` was inlined in place of the call at `call`, and returns the inlined call's number.
-    pub(crate) fn inline(&mut self, lambda: u32, call: u32) -> u32 {
-        self.inlined.push(Inlined { lambda, call });
+    /// Adds a site for code at `at` that is part of the inlined call numbered `inlined`.
+    pub(crate) fn add_in(&mut self, at: Position<'gc>, inlined: u32) -> u32 {
+        self.sites.push(Site { at, inlined });
+        self.sites.len() as u32
+    }
+
+    /// Records that the body of the procedure named `name` was inlined in place of the call at `call`, and returns the inlined call's number.
+    pub(crate) fn inline(&mut self, name: Value<'gc>, call: u32) -> u32 {
+        self.inlined.push(Inlined { name, call });
         self.inlined.len() as u32
     }
 
@@ -117,7 +130,7 @@ impl<'gc> Sites<'gc> {
         let inlined = match self.inlined.get((original.inlined as usize).wrapping_sub(1)).copied() {
             Some(inner) => {
                 let call = self.within(inner.call, within);
-                self.inline(inner.lambda, call)
+                self.inline(inner.name, call)
             }
             None => within,
         };

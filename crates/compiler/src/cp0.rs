@@ -446,10 +446,8 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
 
     /// Records that the body of the lambda `lambda`, rooted at `body` in the source table, takes the place of the call at `site`. Errors raised in the body then report the lambda as an inlined call. A lambda without a name is not recorded.
     fn inlined_src(&mut self, lambda: u32, body: Id<'s>, site: u32) {
-        if self.names.get(lambda).name.is_none() {
-            return;
-        }
-        let inlined = self.names.sites.inline(lambda, site);
+        let Some(name) = self.names.get(lambda).name else { return };
+        let inlined = self.names.sites.inline(name, site);
         let ids: Vec<Id<'s>> = self.src.frame(body).collect();
         for id in ids {
             let moved = self.names.sites.within(self.src.site(id), inlined);
@@ -459,10 +457,8 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
 
     /// As [`Cp0::inlined_src`], for a body that is already in the output table.
     fn inlined_out(&mut self, lambda: u32, body: Id<'d>, site: u32) {
-        if self.names.get(lambda).name.is_none() {
-            return;
-        }
-        let inlined = self.names.sites.inline(lambda, site);
+        let Some(name) = self.names.get(lambda).name else { return };
+        let inlined = self.names.sites.inline(name, site);
         let ids: Vec<Id<'d>> = self.out.frame(body).collect();
         for id in ids {
             let moved = self.names.sites.within(self.out.site(id), inlined);

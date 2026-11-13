@@ -3,9 +3,9 @@
 //! written `#<...>`. Symbols that wouldn't read back as themselves are written in `|`, as the
 //! parser would read them.
 //!
-//! Pairs and the other data but mutable vectors can't change, so a cycle goes through a mutable
-//! vector: those a cycle comes back to are labelled `#n=`, and with `write-shared`, every datum
-//! that's shared, so printing always ends. Without `write-shared`, data shared without a cycle
+//! Pairs and the other data but mutable vectors and structs can't change, so a cycle goes
+//! through a mutable vector or a struct: those a cycle comes back to are labelled `#n=`, and with
+//! `write-shared`, every datum that's shared, so printing always ends. Without `write-shared`, data shared without a cycle
 //! are written out each time, which can be exponentially long, so output stops at a limit, and
 //! so does the walk that finds the cycles, which writes no more than it walks. Neither recurses
 //! on the native stack.
@@ -123,7 +123,7 @@ pub fn to_string<'gc>(mc: &Mutation<'gc>, value: Value<'gc>, mode: Mode, limit: 
 pub fn print<'gc>(mc: &Mutation<'gc>, value: Value<'gc>, mode: Mode, limit: usize, out: &mut String) -> Result<(), PrintError> {
     let labels = match mode {
         _ if !is_container(mc, value) => Map::default(),
-        Mode::Shared => shared(mc, value),
+        Mode::Shared => shared(mc, value, limit)?,
         Mode::Write | Mode::Display => cycles(mc, value, limit)?,
     };
     let start = out.len();
@@ -194,7 +194,7 @@ fn child<'gc>(mc: &Mutation<'gc>, v: Value<'gc>, i: usize) -> Option<Value<'gc>>
     [condition.message(mc), condition.irritants(mc)].get(i).copied()
 }
 
-/// The mutable vectors in `root` that a cycle comes back to. What's walked is written at least
+/// The mutable vectors and structs in `root` that a cycle comes back to. What's walked is written at least
 /// as long, but for syntax, which is written as its datum, so the walk stops past `limit`.
 fn cycles<'gc>(mc: &Mutation<'gc>, root: Value<'gc>, limit: usize) -> Result<Map<Label>, PrintError> {
     let (mut on_path, mut labels) = (Map::default(), Map::default());
@@ -232,11 +232,12 @@ fn cycles<'gc>(mc: &Mutation<'gc>, root: Value<'gc>, limit: usize) -> Result<Map
     Ok(labels)
 }
 
-/// What in `root` is reached more than once.
-fn shared<'gc>(mc: &Mutation<'gc>, root: Value<'gc>) -> Map<Label> {
+/// What in `root` is reached more than once. Each datum is walked once and written at least as
+/// long, but for syntax, as in [`cycles`], so the walk stops past `limit`.
+fn shared<'gc>(mc: &Mutation<'gc>, root: Value<'gc>, limit: usize) -> Result<Map<Label>, PrintError> {
     let (mut seen, mut labels) = (Map::default(), Map::default());
     seen.insert(root.to_bits(), ());
-    let mut path = vec![(root, 0)];
+    let (mut path, mut walked) = (vec![(root, 0)], 0usize);
     while let Some((v, i)) = path.last_mut() {
         let Some(c) = child(mc, *v, *i) else {
             path.pop();
@@ -249,10 +250,14 @@ fn shared<'gc>(mc: &Mutation<'gc>, root: Value<'gc>) -> Map<Label> {
         if seen.insert(c.to_bits(), ()).is_some() {
             labels.insert(c.to_bits(), Label::Pending);
         } else {
+            walked += usize::from(Syntax::of(c).is_none());
+            if walked > limit {
+                return Err(PrintError::TooLong);
+            }
             path.push((c, 0));
         }
     }
-    labels
+    Ok(labels)
 }
 
 /// What's left to write, last first.
@@ -424,7 +429,17 @@ impl<'gc> Printer<'_, 'gc> {
             if write {
                 self.write_string(s, '"');
             } else {
-                write!(self.out, "{}", string::display(&self.strings, s))?;
+                // Stop writing once we exceed the remaining byte budget, so multi-byte UTF-8 doesn't overshoot it.
+                let mut written = 0;
+                let room = self.room();
+                for c in string::chars(&self.strings, s) {
+                    let len = c.len_utf8();
+                    self.out.push(c);
+                    written += len;
+                    if written > room {
+                        break;
+                    }
+                }
             }
         } else if let Some(symbol) = Symbol::of(v) {
             self.symbol(symbol, write)?;
@@ -443,7 +458,9 @@ impl<'gc> Printer<'_, 'gc> {
             self.number(z)?;
         } else if let Some(bytes) = Bytevectors::new(mc).bytevector(v) {
             self.out.push_str("#u8(");
-            for (i, b) in bytes.to_vec(mc).into_iter().enumerate() {
+            // Each byte is written as a character or more, so no more bytes are copied out than there is room to write.
+            let shown = bytes.len(mc).min(self.room().saturating_add(1));
+            for (i, b) in bytes.bytes(mc, 0, shown).iter().enumerate() {
                 if i > 0 {
                     self.out.push(' ');
                 }
@@ -500,8 +517,14 @@ impl<'gc> Printer<'_, 'gc> {
     }
 
     fn write_string(&mut self, s: ragwort_types::string::Str<'gc>, quote: char) {
-        let chars: Vec<char> = string::chars(&self.strings, s).collect();
+        // Each character is written as a byte or more, so no more characters are taken than there is room to write.
+        let chars: Vec<char> = string::chars(&self.strings, s).take(self.room().saturating_add(1)).collect();
         self.write_text(chars.into_iter(), quote);
+    }
+
+    /// Returns the number of bytes that can still be written before the output is past its limit.
+    fn room(&self) -> usize {
+        self.limit.saturating_sub(self.out.len())
     }
 
     /// `chars` between `quote`s, with escapes for what wouldn't read back.
@@ -554,7 +577,6 @@ impl<'gc> Printer<'_, 'gc> {
     }
 }
 
-/// What `a` is written as.
 /// Whether `c` shows nothing where it's written: controls, noncharacters, and the marks that
 /// only steer layout, such as zero-width spaces and direction marks. Joiners and variation
 /// selectors are left out, as emoji are made of them.
@@ -566,6 +588,7 @@ fn unseen(c: char) -> bool {
         || matches!(n, 0xAD | 0x200B | 0x200C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB)
 }
 
+/// What `a` is written as.
 fn prefix(a: Abbreviation) -> &'static str {
     match a {
         Abbreviation::Quote => "'",

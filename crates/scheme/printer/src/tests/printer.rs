@@ -180,6 +180,24 @@ fn output_stops_at_the_limit() {
         assert_eq!(to_string(mc, pairs.list(&[long]).unwrap(), Mode::Display, 1000), Err(PrintError::TooLong));
         assert_eq!(to_string(mc, number(mc, "12345"), Mode::Write, 4), Err(PrintError::TooLong));
         assert_eq!(to_string(mc, number(mc, "12345"), Mode::Write, 5).unwrap(), "12345");
+        // One long string or bytevector is cut off just past the limit, not written out whole first.
+        let huge = text(mc, &"y".repeat(100_000));
+        let bytes = Bytevectors::new(mc).immutable_from_slice(&[7; 100_000]).unwrap().value(mc);
+        for (value, mode) in [(huge, Mode::Write), (huge, Mode::Display), (bytes, Mode::Write)] {
+            let mut out = String::new();
+            assert_eq!(print(mc, value, mode, 50, &mut out), Err(PrintError::TooLong));
+            assert!(out.len() > 50 && out.len() < 200, "{}", out.len());
+        }
+        assert_eq!(to_string(mc, text(mc, "abc"), Mode::Display, 3).unwrap(), "abc");
+        assert_eq!(to_string(mc, text(mc, "abc"), Mode::Write, 5).unwrap(), "\"abc\"");
+        assert_eq!(to_string(mc, text(mc, "abcd"), Mode::Display, 3), Err(PrintError::TooLong));
+        // The walk that finds what is shared stops at the limit too.
+        let mut wide = Value::NIL;
+        for _ in 0..500 {
+            wide = pairs.cons(pairs.list(&[number(mc, "1")]).unwrap(), wide).unwrap().value(mc);
+        }
+        assert_eq!(to_string(mc, wide, Mode::Shared, 100), Err(PrintError::TooLong));
+        assert!(to_string(mc, wide, Mode::Shared, 10_000).is_ok());
     });
 }
 

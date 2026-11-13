@@ -106,12 +106,11 @@
 //! [`ragwort_compiler::structs`], which native ragwort's `%struct` uses too. The form's type is
 //! created once, when its module is expanded.
 
-use ragwort_compiler::module::{Field, StructDef};
-use ragwort_compiler::structs::{self, Declaration, Declared, Member};
+use ragwort_compiler::module::{Field, ModuleError, StructDef};
+use ragwort_compiler::structs::{self, Declaration, Declared, Named, Supertype};
 use ragwort_compiler::Core;
 use ragwort_types::gc::{OutOfMemory, Value};
 use ragwort_types::string::chars;
-use ragwort_vm::Fault;
 use ragwort_vm::structs::TypeFlags;
 
 use crate::expand::{Binding, Expander};
@@ -132,16 +131,6 @@ struct Form {
     fields: Vec<FieldSpec>,
     constructors: Vec<Stx>,
     flags: TypeFlags,
-}
-
-/// What a struct form says of its type.
-struct Parts<'gc> {
-    parent: Option<Info<'gc>>,
-    /// All the type's fields, its supertype's first.
-    fields: Vec<Field>,
-    /// What the form defines, each with its identifier: the type, then the constructor that has
-    /// the struct's name, then the rest.
-    members: Vec<(Stx, Member)>,
 }
 
 /// A struct type, as the name of its constructor stands for it: its fields are all of them, its
@@ -235,64 +224,52 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         })
     }
 
-    /// What `form` says of its type. Its supertype is a struct that isn't sealed.
-    fn struct_parts(&mut self, form: &Form) -> Result<Parts<'gc>, ExpandError> {
-        let parent = match form.parent {
-            None => None,
-            Some(id) => match self.struct_info(id)? {
-                Some(parent) if !parent.sealed => Some(parent),
-                _ => return Err(self.error(ExpandErrorKind::BadSyntax, id)),
-            },
-        };
-        let name = self.text(form.name).expect("an identifier");
-        let mut fields = parent.as_ref().map_or(Vec::new(), |parent| parent.fields.clone());
-        let inherited = fields.len();
-        for field in &form.fields {
-            fields.push(Field { name: self.text(field.id).expect("an identifier").into(), mutable: field.mutable });
+    /// Builds the declaration that `form` makes, with its names as symbols, which the compiler works out the struct's type and bindings from.
+    fn struct_item(&self, form: &Form, whole: Stx) -> structs::Form<'gc> {
+        let named = |id: Stx| (self.tree.symbol(id).expect("an identifier").value(self.mc), self.tree.span(id));
+        structs::Form {
+            name: named(form.name),
+            span: self.tree.span(whole),
+            parent: form.parent.map(named),
+            fields: form.fields.iter().map(|field| Declaration { name: named(field.id).0, mutable: field.mutable }).collect(),
+            flags: form.flags,
+            constructors: form.constructors.iter().map(|&id| named(id)).collect(),
         }
-        let Some(named) = structs::members(&name, &fields[inherited..], inherited) else { return Err(self.error(OutOfMemory, form.name)) };
-        let mut members = Vec::with_capacity(named.len() + form.constructors.len());
-        for (name, member) in named {
-            members.push((if member == Member::Make { form.name } else { self.named_after(form.name, &name)? }, member));
-            // The constructors of other names go after the one that has the struct's name.
-            if member == Member::Make {
-                members.extend(form.constructors.iter().map(|&id| (id, Member::Make)));
-            }
-        }
-        Ok(Parts { parent, fields, members })
-    }
-
-    /// The symbol of a struct form's name, and the fields it declares, as its type is made of
-    /// them.
-    fn struct_names(&self, form: &Form) -> (Value<'gc>, Vec<Declaration<'gc>>) {
-        let symbol = |id: Stx| self.tree.symbol(id).expect("an identifier").value(self.mc);
-        let declared = |field: &FieldSpec| Declaration { name: symbol(field.id), mutable: field.mutable };
-        (symbol(form.name), form.fields.iter().map(declared).collect())
     }
 
     /// Declares what `form`, a struct form that's the module's top-level form `index`, defines,
     /// and makes its type, which the module's code has as a constant.
+    ///
+    /// The compiler works out the type and the bindings from the declaration. The names are bound here, because an identifier's scopes decide what it refers to: the supertype is what its identifier resolves to, and each binding is defined for an identifier that has the scopes of the struct's name.
     pub(crate) fn declare_struct(&mut self, form: Stx, index: u32) -> Result<Declared, ExpandError> {
         let parts = self.struct_form(form)?;
-        let Parts { parent, fields, members } = self.struct_parts(&parts)?;
-        let above = parent.map_or(Value::FALSE, |parent| parent.kind);
-        let (name, own) = self.struct_names(&parts);
-        let kind = structs::make_type(self.mc, name, above, &own, parts.flags).map_err(|fault| match fault {
-            Fault::OutOfMemory => self.error(OutOfMemory, form),
-            _ => self.error(ExpandErrorKind::BadSyntax, form),
+        let parent = match parts.parent {
+            None => None,
+            Some(id) => match self.struct_info(id)? {
+                Some(info) => Some(Supertype { kind: info.kind, fields: info.fields, sealed: info.sealed }),
+                None => return Err(self.error(ExpandErrorKind::BadSyntax, id)),
+            },
+        };
+        let planned = self.struct_item(&parts, form).plan(self.mc, parent).map_err(|e| match (e, parts.parent) {
+            (ModuleError::Supertype, Some(id)) => self.error(ExpandErrorKind::BadSyntax, id),
+            _ => self.module_error(e, form),
         })?;
-        let mut slots = Vec::with_capacity(members.len());
-        for (id, member) in members {
-            slots.push((self.define_top(id, index)?, member));
+        let mut slots = Vec::with_capacity(planned.members.len());
+        for (named, _) in &planned.members {
+            let id = match named {
+                Named::Own => parts.name,
+                Named::Constructor(i) => parts.constructors[*i],
+                Named::Derived(name) => self.named_after(parts.name, name)?,
+            };
+            slots.push(self.define_top(id, index)?);
         }
-        let sealed = parts.flags.contains(TypeFlags::SEALED);
-        Ok(Declared::new(&mut self.builder, kind, fields, sealed, slots))
+        Ok(planned.declare(&mut self.builder, slots))
     }
 
     /// The code of a struct form at the top level, which defines each of the form's variables.
     pub(crate) fn lower_struct(&mut self, declared: Declared) -> Core<'gc> {
         let (_, kind) = self.builder.struct_def(declared.constructor()).expect("a declared struct");
-        declared.define(kind, self)
+        declared.define(kind, self.builder.locals())
     }
 
     /// An expression for the type of `info`, at `at`.

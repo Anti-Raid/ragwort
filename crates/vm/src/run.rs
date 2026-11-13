@@ -458,7 +458,11 @@ fn bind_slow<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, mut arg
             () => Ok(()),
         };
     }
+    // What is left of the caller's list becomes the tail of the rest parameter, so it must be a proper list. A pair knows whether it starts one, so the check does not walk the list.
     let pairs = Pairs::new(mc);
+    if !pairs.is_list(rest) {
+        return Err(Fault::WrongType);
+    }
     for i in (fixed..argc).rev() {
         rest = pairs.cons(frame.get(ARGS + i), rest)?.value(mc);
     }
@@ -497,13 +501,7 @@ fn bind_spread<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, shape: Shape, mut
     for i in (keep..argc).rev() {
         rest = pairs.cons(frame.get(ARGS + i), rest)?.value(mc);
     }
-    let (mut count, mut tail) = (0u64, rest);
-    while let Some(pair) = Pair::of(tail) {
-        (count, tail) = (count + 1, pair.tail(mc));
-    }
-    if tail != Value::NIL {
-        return Err(Fault::WrongType);
-    }
+    let count = pairs.list_len(rest).ok_or(Fault::WrongType)?;
     let required = slots - u64::from(variadic) - u64::from(keep);
     if count < required || (!variadic && count > required) {
         return Err(Fault::Arity);

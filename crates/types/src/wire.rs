@@ -75,7 +75,7 @@ impl Writer {
     ///
     /// # Panics
     ///
-    /// If it's `u32::MAX` or more, which nothing an arena holds is.
+    /// If it's more than `u32::MAX`, which nothing an arena holds is.
     pub fn length(&mut self, len: usize) {
         self.u32(u32::try_from(len).expect("a sequence shorter than 2^32"));
     }

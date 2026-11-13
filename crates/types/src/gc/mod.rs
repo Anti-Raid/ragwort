@@ -6,7 +6,7 @@
 //! collections, major cycles marked in incremental slices, weak references and ephemerons,
 //! evacuation of fragmented pages through forwarding headers in the atomic phase, and lazy
 //! sweeping. Free pages past a nursery's worth go back to the system through
-//! `ragwort-gc-region`, which holds the only unsafe code in Ragwort (atleast in interpreter mode).
+//! `ragwort-gc-region`, which holds the only unsafe code in Ragwort (at least in interpreter mode).
 //! Memory is counted against a budget with a reserve, and VM stacks have segments, continuation capture and parking.
 //!
 //! The arena has a fixed number of value roots, set when it's made. A [`Root`] keeps an object

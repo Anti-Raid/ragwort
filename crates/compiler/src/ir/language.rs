@@ -1,4 +1,4 @@
-//! The [`language!`] macro generates an IR's node table and traversal support. Each language module
+//! The `language!` macro generates an IR's node table and traversal support. Each language module
 //! supplies its own records and validation rules.
 
 /// Generates a node table in the invoking module, with private constructors for its distinct node,

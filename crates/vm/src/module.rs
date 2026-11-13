@@ -214,7 +214,7 @@ pub fn external_data<'gc, T: Any>(mc: &Mutation<'gc>, external: Value<'gc>) -> O
     external.downcast::<ExternalRef>(mc)?.data(mc)?.downcast_ref()
 }
 
-/// Returns `true` if an encoded arity integer (formatted as in [`Bytecode`]) accepts `n` arguments.
+/// Returns `true` if an encoded arity integer (formatted as in [`Bytecode`](crate::objects::Bytecode)) accepts `n` arguments.
 #[inline]
 pub(crate) fn takes(arity: i64, n: usize) -> bool {
     let n = n as i64;

@@ -12,13 +12,13 @@ pub mod image;
 mod tests;
 
 use ragwort_compiler::CompileError;
-use ragwort_compiler::module::{Loaded, NoModules, Resolver};
+use ragwort_compiler::module::{Item, Loaded, NoModules, Resolver};
 use ragwort_native::{LowerError, Lowerer};
 use ragwort_reader_scheme::{ReadError, Reader};
 use ragwort_scheme::{ExpandError, Expander, PRELUDE, PRELUDE_NAME, Top};
 use ragwort_types::gc::{Gc, Mutation, OutOfMemory};
 use ragwort_types::symbol::Symbols;
-use ragwort_types::syntax::{Syntax, SyntaxSession};
+use ragwort_types::syntax::SyntaxSession;
 use ragwort_vm::HostDef;
 use ragwort_vm::objects::Module;
 
@@ -52,7 +52,11 @@ impl From<LowerError> for Error {
 
 impl From<CompileError> for Error {
     fn from(e: CompileError) -> Self {
-        Error::Compile(e)
+        // The compiler resolves the top-level names of native forms, and reports a misused one as the lowerer would.
+        match LowerError::located(e) {
+            Some(lower) => Error::Lower(lower),
+            None => Error::Compile(e),
+        }
     }
 }
 
@@ -114,7 +118,7 @@ pub struct Source<'a, 'gc> {
 /// A top-level form of a module, from a file in either language.
 enum Form<'gc> {
     Scheme(Top),
-    Native(Syntax<'gc>),
+    Native(Item<'gc>),
 }
 
 /// A [`load`] that failed: what's wrong, and which of the module's files it's in, by its place in
@@ -178,28 +182,27 @@ fn load_from<'gc>(
                         Some(lowerer) => lowerer,
                         None => lowerer.insert(Lowerer::new(mc, symbols, source.hosts, source.internals).map_err(LowerError::from)?),
                     };
-                    lowerer.declare(expander.builder(), node, first, resolver)?;
-                    forms.push((k, Form::Native(node)));
+                    let item = lowerer.item(expander.builder().locals(), node)?;
+                    expander.builder().declare(mc, resolver, first, &item).map_err(|(e, span)| LowerError::declared(e, span))?;
+                    forms.push((k, Form::Native(item)));
                 }
             }
         }
     }
     *at = None;
     expander.provide()?;
-    if let Some(lowerer) = &mut lowerer {
-        lowerer.provide(expander.builder())?;
-    }
+    expander.builder().provide_items(mc).map_err(|(e, span)| LowerError::declared(e, span))?;
     expander.builder().start(mc)?;
     let mut thunks = Vec::with_capacity(forms.len());
     for (i, (k, form)) in forms.into_iter().enumerate() {
         *at = Some(k);
         let i = u32::try_from(i).map_err(|_| OutOfMemory)?;
-        let core = match form {
-            Form::Scheme(top) => Some(expander.lower(top, i)?),
-            Form::Native(node) => lowerer.as_mut().expect("native forms are declared").lower(expander.builder(), node, i)?,
-        };
-        if let Some(core) = core {
-            thunks.push(expander.builder().compile(mc, &core)?);
+        match form {
+            Form::Scheme(top) => {
+                let form = expander.lower(top, i)?;
+                thunks.push(expander.builder().compile(mc, i, form)?);
+            }
+            Form::Native(item) => thunks.extend(expander.builder().compile_item(mc, i, item)?),
         }
     }
     *at = None;

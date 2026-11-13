@@ -254,7 +254,7 @@ impl<'a, 'gc> Reader<'a, 'gc> {
         Err(ReadError::new(ErrorKind::BadDot, at, at + 1))
     }
 
-    /// The list or vector a `byte` at `start` closes.
+    /// The list or vector a `bracket` at `start` closes.
     fn close(&mut self, start: usize, bracket: Bracket) -> Result<Syntax<'gc>, ReadError> {
         match self.open.pop() {
             Some(Open::List { start: open, close, first, tail, shape }) if close == bracket => {

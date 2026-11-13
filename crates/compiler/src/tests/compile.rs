@@ -9,10 +9,11 @@ use ragwort_vm::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Cond
 use ragwort_vm::{Fault, HostDef, Intrinsic, MIN_SEGMENT, Machine, Op, Outcome, Purity, Request};
 
 use ragwort_types::string::Strings;
-use ragwort_types::symbol::Symbols;
+use ragwort_types::symbol::{Keyword, Symbols};
+use ragwort_types::syntax::SyntaxSpan;
 
 use super::*;
-use crate::module::{Import, Imports, ModuleBuilder, ModuleError, Unusable};
+use crate::module::{BuildError, Description, Filter, Form, Import, Imports, Item, Locals, ModuleBuilder, ModuleError, NoModules, Provide, Require, RequireSpec, Unusable};
 
 fn fix<'gc>(n: i64) -> Value<'gc> {
     Value::fixnum(n).unwrap()
@@ -27,7 +28,7 @@ fn var<'gc>(v: u32) -> Core<'gc> {
 }
 
 fn prim<'gc>(i: Intrinsic, args: Vec<Core<'gc>>) -> Core<'gc> {
-    Core::Intrinsic(Prim::Intrinsic(i), args)
+    Core::Intrinsic(Prim::Intrinsic(i), args, None)
 }
 
 fn add<'gc>(a: Core<'gc>, b: Core<'gc>) -> Core<'gc> {
@@ -68,7 +69,12 @@ fn optional_lambda<'gc>(params: &[u32], optional: u32, rest: Option<u32>, body: 
 }
 
 fn app<'gc>(f: Core<'gc>, args: Vec<Core<'gc>>) -> Core<'gc> {
-    Core::App(Box::new(f), args)
+    Core::App(Box::new(f), args, None)
+}
+
+/// Builds a call of the imported procedure `import`.
+fn call<'gc>(import: Import<'gc>, args: Vec<Core<'gc>>) -> Core<'gc> {
+    Core::App(Box::new(Core::Import(import)), args, None)
 }
 
 fn set<'gc>(v: u32, value: Core<'gc>) -> Core<'gc> {
@@ -383,7 +389,7 @@ fn optional_parameters_are_unsupplied_when_left_out() {
             let direct = number(|_| app(f(rest), args.iter().map(|&n| q(n)).collect()));
             let applied = number(|_| {
                 let args = std::iter::once(f(rest)).chain(args.iter().map(|&n| q(n))).chain([Core::Quote(Value::NIL)]).collect();
-                Core::Intrinsic(Prim::Request(Request::Apply), args)
+                Core::Intrinsic(Prim::Request(Request::Apply), args, None)
             });
             assert_eq!((direct, applied), (expect, expect), "{args:?}, rest {rest}");
         }
@@ -393,12 +399,117 @@ fn optional_parameters_are_unsupplied_when_left_out() {
     assert_eq!(error(|_| optional_lambda(&params, 1, None, q(0))), CompileError::TooManyRegisters);
 }
 
+/// Interns the keyword `#:name`.
+fn keyword<'gc>(mc: &Mutation<'gc>, name: &str) -> Keyword<'gc> {
+    let symbols = Symbols::of_arena(mc).unwrap();
+    symbols.keyword(mc, symbols.intern_str(&Strings::new(mc), name).unwrap()).unwrap()
+}
+
+/// Builds `(lambda (v0 [v1 (+ v0 10)] #:b v2 #:a [v3 (+ v1 100)]) (cons v0 (cons v1 (cons v2 (cons v3 '())))))`.
+fn keyword_lambda<'gc>(mc: &Mutation<'gc>) -> Core<'gc> {
+    static NEXT: AtomicU32 = AtomicU32::new(1 << 20);
+    let formal = |var, keyword: Option<&str>, default| Formal { var: Var(var), keyword: keyword.map(|name| self::keyword(mc, name)), default };
+    let params = vec![formal(0, None, None), formal(1, None, Some(add(var(0), q(10)))), formal(2, Some("b"), None), formal(3, Some("a"), Some(add(var(1), q(100))))];
+    let body = [3, 2, 1, 0].into_iter().fold(Core::Quote(Value::NIL), |rest, v| prim(Cons, vec![var(v), rest]));
+    Core::OptionalLambda(OptionalLambda { id: NEXT.fetch_add(1, Ordering::Relaxed), params, rest: None, body: Box::new(body), name: None, at: None })
+}
+
+/// Builds a call of `f` whose arguments are fixnums, each passed by the keyword it is paired with, if any.
+fn keyword_app<'gc>(mc: &Mutation<'gc>, f: Core<'gc>, args: &[(Option<&str>, i64)]) -> Core<'gc> {
+    let args = args.iter().map(|&(name, n)| Arg { keyword: name.map(|name| keyword(mc, name)), value: q(n) }).collect();
+    Core::KeywordApp(Box::new(f), args, None)
+}
+
+#[test]
+fn optional_lambdas_evaluate_defaults_in_order() {
+    // (lambda (a [b (+ a 1)] [c (+ a b)]) (cons a (cons b (cons c '())))): a default sees the parameters before it.
+    fn f<'gc>() -> Core<'gc> {
+        static NEXT: AtomicU32 = AtomicU32::new(1 << 21);
+        let formal = |var, default| Formal { var: Var(var), keyword: None, default };
+        let params = vec![formal(0, None), formal(1, Some(add(var(0), q(1)))), formal(2, Some(add(var(0), var(1))))];
+        let body = [2, 1, 0].into_iter().fold(Core::Quote(Value::NIL), |rest, v| prim(Cons, vec![var(v), rest]));
+        Core::OptionalLambda(OptionalLambda { id: NEXT.fetch_add(1, Ordering::Relaxed), params, rest: None, body: Box::new(body), name: None, at: None })
+    }
+    for (args, expect) in [(vec![1], Ok(vec![1, 2, 3])), (vec![1, 5], Ok(vec![1, 5, 6])), (vec![1, 5, 9], Ok(vec![1, 5, 9])), (vec![], Err(Fault::Arity)), (vec![1, 2, 3, 4], Err(Fault::Arity))] {
+        eval(|_| app(f(), args.iter().map(|&n| q(n)).collect()), |mc, result| assert_eq!(result.map(|v| items(mc, v)), expect, "{args:?}"));
+    }
+}
+
+#[test]
+fn keyword_calls_reach_the_core_or_match_at_run_time() {
+    type Args = Vec<(Option<&'static str>, i64)>;
+    let cases: Vec<(Args, Result<Vec<i64>, Fault>)> = vec![
+        (vec![(None, 1), (Some("b"), 2)], Ok(vec![1, 11, 2, 111])),
+        (vec![(Some("a"), 7), (None, 1), (Some("b"), 2), (None, 5)], Ok(vec![1, 5, 2, 7])),
+        (vec![(None, 1)], Err(Fault::Keyword)),
+        (vec![(None, 1), (Some("b"), 2), (Some("c"), 3)], Err(Fault::Keyword)),
+        (vec![(Some("b"), 2)], Err(Fault::Arity)),
+    ];
+    for (args, expect) in cases {
+        // Called where the lambda is written, where a `letrec` binds it and the call goes straight to its core, and through a variable that is assigned, where the keywords are matched as the call runs.
+        eval(|mc| keyword_app(mc, keyword_lambda(mc), &args), |mc, result| assert_eq!(result.map(|v| items(mc, v)), expect, "written {args:?}"));
+        eval(|mc| letrec(vec![(10, keyword_lambda(mc))], keyword_app(mc, var(10), &args)), |mc, result| assert_eq!(result.map(|v| items(mc, v)), expect, "bound {args:?}"));
+        eval(
+            |mc| letrec(vec![(10, keyword_lambda(mc))], seq(11, set(10, var(10)), keyword_app(mc, var(10), &args))),
+            |mc, result| assert_eq!(result.map(|v| items(mc, v)), expect, "assigned {args:?}"),
+        );
+    }
+    // A plain call of a procedure whose keywords all have defaults leaves them out.
+    fn defaulted<'gc>(mc: &Mutation<'gc>) -> Core<'gc> {
+        static NEXT: AtomicU32 = AtomicU32::new(1 << 22);
+        let params = vec![Formal { var: Var(0), keyword: None, default: None }, Formal { var: Var(1), keyword: Some(keyword(mc, "k")), default: Some(q(40)) }];
+        Core::OptionalLambda(OptionalLambda { id: NEXT.fetch_add(1, Ordering::Relaxed), params, rest: None, body: Box::new(add(var(0), var(1))), name: None, at: None })
+    }
+    assert_eq!(number(|mc| letrec(vec![(10, defaulted(mc))], app(var(10), vec![q(2)]))), Ok(42));
+    assert_eq!(number(|mc| let_(vec![(10, defaulted(mc))], app(var(10), vec![q(2)]))), Ok(42));
+    assert_eq!(number(|mc| letrec(vec![(10, defaulted(mc))], keyword_app(mc, var(10), &[(Some("k"), 1), (None, 2)]))), Ok(3));
+    assert_eq!(number(|mc| letrec(vec![(10, defaulted(mc))], app(var(10), vec![]))), Err(Fault::Arity));
+}
+
+#[test]
+fn malformed_optional_lambdas_and_keyword_calls_dont_compile() {
+    fn f<'gc>(id: u32, params: Vec<Formal<'gc>>, body: Core<'gc>) -> Core<'gc> {
+        Core::OptionalLambda(OptionalLambda { id, params, rest: Some(Var(9)), body: Box::new(body), name: None, at: None })
+    }
+    fn formal<'gc>(var: u32, keyword: Option<Keyword<'gc>>, default: Option<Core<'gc>>) -> Formal<'gc> {
+        Formal { var: Var(var), keyword, default }
+    }
+    // A default refers only to the parameters before it, not to its own parameter, a later one or the rest parameter.
+    for seen in [0, 1, 2, 9] {
+        let got = error(|_| f(0, vec![formal(0, None, Some(var(seen))), formal(1, None, Some(q(1))), formal(2, None, Some(q(2)))], q(0)));
+        assert_eq!(got, CompileError::Unbound(Var(seen)));
+    }
+    assert_eq!(number(|_| app(f(0, vec![formal(0, None, None), formal(1, None, Some(var(0)))], add(var(0), var(1))), vec![q(4)])), Ok(8));
+    assert_eq!(error(|_| f(7, vec![formal(0, None, Some(q(1))), formal(1, None, None)], q(0))), CompileError::Formals(7));
+    assert_eq!(error(|mc| f(8, vec![formal(0, Some(keyword(mc, "k")), None), formal(1, Some(keyword(mc, "k")), None)], q(0))), CompileError::Formals(8));
+    assert_eq!(error(|_| f(0, vec![formal(0, None, None), formal(0, None, Some(q(1)))], q(0))), CompileError::Rebound(Var(0)));
+    assert_eq!(error(|mc| keyword_app(mc, q(0), &[(Some("k"), 1), (None, 2), (Some("k"), 3)])), CompileError::SameKeyword);
+}
+
+#[test]
+fn keyword_call_arguments_are_evaluated_as_written() {
+    // (letrec ([f (lambda (#:a a #:b b c) 0)]) (let ([log (box '())]) (f #:b (note 1) (note 2) #:a (note 3)) (unbox log))), where `note` conses onto the log.
+    fn noted<'gc>(n: i64) -> Core<'gc> {
+        prim(SetBox, vec![var(20), prim(Cons, vec![q(n), prim(Unbox, vec![var(20)])])])
+    }
+    eval(
+        |mc| {
+            let formal = |var, name: Option<&str>| Formal { var: Var(var), keyword: name.map(|name| keyword(mc, name)), default: None };
+            let f = OptionalLambda { id: 1 << 23, params: vec![formal(0, Some("a")), formal(1, Some("b")), formal(2, None)], rest: None, body: Box::new(q(0)), name: None, at: None };
+            let arg = |name: Option<&str>, n| Arg { keyword: name.map(|name| keyword(mc, name)), value: noted(n) };
+            let call = Core::KeywordApp(Box::new(var(10)), vec![arg(Some("b"), 1), arg(None, 2), arg(Some("a"), 3)], None);
+            letrec(vec![(10, Core::OptionalLambda(f))], let_(vec![(20, prim(MakeBox, vec![Core::Quote(Value::NIL)]))], seq(21, call, prim(Unbox, vec![var(20)]))))
+        },
+        |mc, result| assert_eq!(result.map(|v| items(mc, v)), Ok(vec![3, 2, 1])),
+    );
+}
+
 #[test]
 fn requests() {
     // (let ((tag (make-continuation-prompt-tag)))
     //   (call-with-prompt tag (lambda (v) (+ v 1)) (lambda () (+ 100 (abort tag 5)))))
     fn request<'gc>(r: Request, args: Vec<Core<'gc>>) -> Core<'gc> {
-        Core::Intrinsic(Prim::Request(r), args)
+        Core::Intrinsic(Prim::Request(r), args, None)
     }
     assert_eq!(
         number(|_| {
@@ -423,7 +534,7 @@ fn bad_forms_dont_compile() {
     assert_eq!(error(|_| app(numbered(q(1)), vec![numbered(q(2))])), CompileError::SameLambda(7));
     // Reject a lambda with one parameter but an optional-parameter count of two.
     assert_eq!(error(|_| Core::Lambda(Lambda { id: 7, params: vec![Var(0)], optional: 2, rest: None, body: Box::new(q(1)), name: None, at: None })), CompileError::TooManyOptional(7));
-    assert_eq!(error(|_| Core::Intrinsic(Prim::Request(Request::Capture), vec![q(1)])), CompileError::Arity(Prim::Request(Request::Capture)));
+    assert_eq!(error(|_| Core::Intrinsic(Prim::Request(Request::Capture), vec![q(1)], None)), CompileError::Arity(Prim::Request(Request::Capture)));
 }
 
 
@@ -480,7 +591,7 @@ fn big_frames_spill() {
             let marked = prim(MarkValue, vec![var(0), prim(Unbox, vec![var(5)])]);
             let all = std::iter::once(marked).chain((1..=250).map(|v| prim(Unbox, vec![var(v)]))).collect();
             let thunk = lambda(&[], None, let_(boxes, prim(Add, all)));
-            let_(vec![(0, prim(MakeBox, vec![q(0)]))], Core::Intrinsic(Prim::Request(Request::WithMark), vec![var(0), q(7), thunk]))
+            let_(vec![(0, prim(MakeBox, vec![q(0)]))], Core::Intrinsic(Prim::Request(Request::WithMark), vec![var(0), q(7), thunk], None))
         }),
         Ok(7 + 250 * 251 / 2)
     );
@@ -551,7 +662,7 @@ fn lambdas_take_more_parameters_than_registers() {
 #[test]
 fn requests_take_any_number_of_arguments() {
     fn request<'gc>(r: Request, args: Vec<Core<'gc>>) -> Core<'gc> {
-        Core::Intrinsic(Prim::Request(r), args)
+        Core::Intrinsic(Prim::Request(r), args, None)
     }
     // (call-with-prompt tag (lambda vs vs) (lambda () (abort tag 0 ... 299))), with the abort in
     // tail position and not.
@@ -901,19 +1012,18 @@ fn micropass_optimizations() {
         // 4. Inline imported intrinsic wrappers. `(+ x 1)` and calls to imported `add1` become `AddImm`
         // without procedure calls.
         let lib = exporting(mc, vec![
-            ("add", lambda(&[], Some(0), Core::ApplyIntrinsic(Prim::Intrinsic(Add), vec![var(0)])), false),
+            ("add", lambda(&[], Some(0), Core::ApplyIntrinsic(Prim::Intrinsic(Add), vec![var(0)], None)), false),
             ("add1", lambda(&[0], None, add(var(0), q(1))), false),
         ]);
-        let mut fresh = fresher();
-        let call_import = imported(mc, lib, "add").call(mc, vec![var(0), q(1)], &mut fresh).unwrap();
+        let call_import = call(imported(mc, lib, "add"), vec![var(0), q(1)]);
         let ops = all_ops(mc, compile(mc, None, &lambda(&[0], None, call_import)).unwrap());
         assert!(
             matches!(ops.as_slice(), [.., Op::AddImm { dst, a: 1, imm: 1 }, Op::Return { src }] if dst == src),
             "expected imported `(+ x 1)` to compile to AddImm: {ops:?}"
         );
         let add1 = imported(mc, lib, "add1");
-        let inner = add1.call(mc, vec![var(0)], &mut fresh).unwrap();
-        let twice = add1.call(mc, vec![inner], &mut fresh).unwrap();
+        let inner = call(add1, vec![var(0)]);
+        let twice = call(add1, vec![inner]);
         let ops = all_ops(mc, compile(mc, None, &lambda(&[0], None, twice)).unwrap());
         assert!(!ops.iter().any(|op| matches!(op, Op::Call { .. } | Op::TailCall { .. })), "expected add1 to inline: {ops:?}");
         assert_eq!(ops.iter().filter(|op| matches!(op, Op::AddImm { imm: 1, .. })).count(), 2, "{ops:?}");
@@ -1246,15 +1356,6 @@ fn micropass_optimizations() {
     });
 }
 
-/// Supplies fresh local IDs that do not overlap with IDs used explicitly by tests.
-fn fresher() -> impl FnMut() -> Var {
-    let mut next = 1000;
-    move || {
-        next += 1;
-        Var(next)
-    }
-}
-
 fn symbol<'gc>(mc: &Mutation<'gc>, name: &str) -> Value<'gc> {
     let symbols = Symbols::with_seed(mc, 1).unwrap();
     symbols.intern_str(&Strings::new(mc), name).unwrap().value(mc)
@@ -1282,14 +1383,137 @@ fn exporting_with<'gc>(mc: &Mutation<'gc>, hosts: &'static [HostDef], imports: &
     builder.start(mc).unwrap();
     for (slot, (_, value, assigned)) in defs.into_iter().enumerate() {
         let slot = slot as u32;
-        builder.defined(slot, &value);
         if assigned {
             builder.assign(slot).unwrap();
         }
-        let thunk = builder.compile(mc, &Core::Set(Place::Slot { slot, checked: false }, Box::new(value))).unwrap();
+        let thunk = builder.compile(mc, slot, Form::Define(slot, value)).unwrap();
         run_to_end(mc, thunk).unwrap();
     }
     builder.finish(mc).unwrap()
+}
+
+#[test]
+fn items_refer_to_the_module_by_name() {
+    let mut arena = Arena::new(1 << 24, 0);
+    arena.mutate(|mc| {
+        let symbols = Symbols::of_arena(mc).unwrap();
+        let name = |text: &str| symbols.intern_str(&Strings::new(mc), text).unwrap().value(mc);
+        let (f, g, x, plus) = (name("f"), name("g"), name("x"), name("plus"));
+        let global = |name| Core::Global(name, SyntaxSpan::default());
+        let lib = exporting_with(mc, &[], &[], vec![("plus", lambda(&[0, 1], None, add(var(0), var(1))), false)]);
+        // (define g (lambda () (f 1 #:k 2))), which calls the core of `f` although `f` is defined later.
+        // (define f (lambda (a #:k [k 10]) (plus a k)))
+        // (define x (g))
+        // (set! x (plus x (f 5)))
+        // x
+        let call = Core::KeywordApp(Box::new(global(f)), vec![Arg { keyword: None, value: q(1) }, Arg { keyword: Some(keyword(mc, "k")), value: q(2) }], None);
+        let params = vec![Formal { var: Var(0), keyword: None, default: None }, Formal { var: Var(1), keyword: Some(keyword(mc, "k")), default: Some(q(10)) }];
+        let body = app(global(plus), vec![var(0), var(1)]);
+        let made = Core::OptionalLambda(OptionalLambda { id: 0, params, rest: None, body: Box::new(body), name: None, at: None });
+        let assign = Core::SetGlobal(x, Box::new(app(global(plus), vec![global(x), app(global(f), vec![q(5)])])), SyntaxSpan::default());
+        let define = |name, value| Item::Define(name, SyntaxSpan::default(), value);
+        let items = vec![define(g, lambda(&[], None, call)), define(f, made), define(x, app(global(g), vec![])), Item::Expr(assign), Item::Expr(global(x))];
+        let mut builder = ModuleBuilder::new(Value::FALSE, &[]);
+        builder.import(plus, imported(mc, lib, "plus")).unwrap();
+        for (i, item) in items.iter().enumerate() {
+            builder.declare(mc, &mut NoModules, i as u32, item).unwrap();
+        }
+        builder.start(mc).unwrap();
+        let mut last = Value::VOID;
+        for (i, item) in items.into_iter().enumerate() {
+            let thunk = builder.compile_item(mc, i as u32, item).unwrap().unwrap();
+            let ops = all_ops(mc, thunk);
+            assert!(!ops.iter().any(|op| matches!(op, Op::CallRequest { .. } | Op::TailCallRequest { .. })), "form {i}: {ops:?}");
+            last = run_to_end(mc, thunk).unwrap();
+        }
+        assert_eq!(last, fix(3 + 15));
+
+        // A name that nothing binds, and an assignment of an import or of a keyword procedure, are errors at the name.
+        let span = SyntaxSpan::default();
+        let misuse = |kind| CompileError::Global { kind, start: span.start(), end: span.end() };
+        assert_eq!(builder.compile_item(mc, 5, Item::Expr(global(name("nothing")))).unwrap_err(), misuse(GlobalError::Unbound));
+        assert_eq!(builder.compile_item(mc, 5, Item::Expr(app(global(name("nothing")), vec![]))).unwrap_err(), misuse(GlobalError::Unbound));
+        assert_eq!(builder.compile_item(mc, 5, Item::Expr(Core::SetGlobal(plus, Box::new(q(1)), span))).unwrap_err(), misuse(GlobalError::Immutable));
+        assert_eq!(builder.compile_item(mc, 5, Item::Expr(Core::SetGlobal(f, Box::new(q(1)), span))).unwrap_err(), misuse(GlobalError::Immutable));
+        assert_eq!(compile(mc, None, &global(x)).unwrap_err(), misuse(GlobalError::Unbound));
+    });
+}
+
+/// Resolves the name `lib` to one module.
+struct OnlyLib<'gc>(Gc<'gc, ragwort_vm::objects::Module>);
+
+impl<'gc> crate::module::Resolver<'gc> for OnlyLib<'gc> {
+    fn resolve(&mut self, _: &Mutation<'gc>, name: &str, _: Value<'gc>) -> Option<Gc<'gc, ragwort_vm::objects::Module>> {
+        (name == "lib").then_some(self.0)
+    }
+}
+
+#[test]
+fn a_description_builds_a_whole_module() {
+    let mut arena = Arena::new(1 << 24, 0);
+    arena.mutate(|mc| {
+        let symbols = Symbols::of_arena(mc).unwrap();
+        let name = |text: &str| symbols.intern_str(&Strings::new(mc), text).unwrap().value(mc);
+        let span = SyntaxSpan::default();
+        let global = |text: &str| Core::Global(name(text), span);
+        let lib = exporting_with(mc, &[], &[], vec![("plus", lambda(&[0, 1], None, add(var(0), var(1))), false), ("minus", lambda(&[0], None, var(0)), false)]);
+        let require = |filters| Item::Require(vec![Require { spec: RequireSpec { module: "lib".into(), at: span, filters }, span }]);
+        let point = |parent: Option<&str>| structs::Form {
+            name: (name("point"), span),
+            span,
+            parent: parent.map(|parent| (name(parent), span)),
+            fields: vec![structs::Declaration { name: name("x"), mutable: false }, structs::Declaration { name: name("y"), mutable: true }],
+            flags: ragwort_vm::structs::TypeFlags::empty(),
+            constructors: Vec::new(),
+        };
+        // (provide total (rename-out (sum add)) (struct-out point))
+        // (require (only-in lib plus))
+        // (struct point (x [y #:mutable]))
+        // (define (sum p) (plus (point-x p) (point-y p)))
+        // (define total (let ([p (point 1 2)]) (set-point-y! p 40) (sum p)))
+        // total
+        let items = |provided: &str, parent: Option<&str>| {
+            let mut locals = Locals::default();
+            let (p, made, unused) = (locals.fresh(), locals.fresh(), locals.fresh());
+            let sum = Core::Lambda(Lambda { id: locals.lambda(), optional: 0, params: vec![p], rest: None, body: Box::new(app(global("plus"), vec![app(global("point-x"), vec![Core::Ref(Place::Local(p))]), app(global("point-y"), vec![Core::Ref(Place::Local(p))])])), name: None, at: None });
+            let set = app(global("set-point-y!"), vec![Core::Ref(Place::Local(made)), q(40)]);
+            let total = Core::Let(vec![(made, app(global("point"), vec![q(1), q(2)]))], Box::new(Core::Let(vec![(unused, set)], Box::new(app(global("sum"), vec![Core::Ref(Place::Local(made))])))));
+            let provides = vec![
+                Provide::Variable { name: name(provided), external: provided.into(), span },
+                Provide::Variable { name: name("sum"), external: "add".into(), span },
+                Provide::Struct { name: name("point"), constructors: true, span },
+            ];
+            let items = vec![
+                Item::Provide(provides),
+                require(vec![Filter::Only(vec![("plus".into(), span)])]),
+                Item::Struct(point(parent)),
+                Item::Define(name("sum"), span, sum),
+                Item::Define(name("total"), span, total),
+                Item::Expr(global("total")),
+            ];
+            Description { name: name("made"), hosts: &[], locals, items }
+        };
+        let built = items("total", None).build(mc, &mut OnlyLib(lib)).unwrap();
+        let mut last = Value::VOID;
+        for &thunk in &built.thunks {
+            last = run_to_end(mc, thunk).unwrap();
+        }
+        assert_eq!((built.thunks.len(), last), (4, fix(41)));
+        let interface = ragwort_compiler_interface(mc, built.module);
+        let mut exported: Vec<&str> = interface.iter().map(|(name, _)| name).collect();
+        exported.sort_unstable();
+        assert_eq!(exported, ["add", "point", "point-x", "point-y", "point?", "set-point-y!", "struct:point", "total"]);
+
+        // Each mistake in a declaration is reported with its span.
+        assert_eq!(items("missing", None).build(mc, &mut OnlyLib(lib)).unwrap_err(), BuildError::Declare(ModuleError::NotDefined, span));
+        assert_eq!(items("total", Some("plus")).build(mc, &mut OnlyLib(lib)).unwrap_err(), BuildError::Declare(ModuleError::Supertype, span));
+        assert_eq!(items("total", None).build(mc, &mut NoModules).unwrap_err(), BuildError::Declare(ModuleError::Resolve, span));
+        let unprovided = Description { name: name("made"), hosts: &[], locals: Locals::default(), items: vec![require(vec![Filter::Only(vec![("times".into(), span)])])] };
+        assert_eq!(unprovided.build(mc, &mut OnlyLib(lib)).unwrap_err(), BuildError::Declare(ModuleError::NotProvided, span));
+        // The require leaves out `minus`, so the name is unbound.
+        let unbound = Description { name: name("made"), hosts: &[], locals: Locals::default(), items: vec![require(vec![Filter::Only(vec![("plus".into(), span)])]), Item::Expr(global("minus"))] };
+        assert_eq!(unbound.build(mc, &mut OnlyLib(lib)).unwrap_err(), BuildError::Compile(CompileError::Global { kind: GlobalError::Unbound, start: span.start(), end: span.end() }));
+    });
 }
 
 fn imported<'gc>(mc: &Mutation<'gc>, module: Gc<'gc, ragwort_vm::objects::Module>, name: &str) -> Import<'gc> {
@@ -1313,7 +1537,7 @@ fn run_to_end<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Result<Value<'gc>, 
 fn modules_export_what_code_that_requires_them_needs() {
     let mut arena = Arena::new(1 << 24, 0);
     arena.mutate(|mc| {
-        let spread = |i| Core::ApplyIntrinsic(Prim::Intrinsic(i), vec![var(0)]);
+        let spread = |i| Core::ApplyIntrinsic(Prim::Intrinsic(i), vec![var(0)], None);
         let lib = exporting(mc, vec![
             ("sum", lambda(&[], Some(0), spread(Add)), false),
             ("sum-not", lambda(&[], Some(0), prim(Not, vec![spread(Add)])), false),
@@ -1325,7 +1549,7 @@ fn modules_export_what_code_that_requires_them_needs() {
             // A mutable module-variable reference must read its current value at the call site.
             ("counted", lambda(&[0], None, add(var(0), slot(3))), false),
             // Call a procedure passed as an argument or obtained from a module variable.
-            ("applied", lambda(&[0, 1], None, Core::App(Box::new(var(0)), vec![var(1), slot(4)])), false),
+            ("applied", lambda(&[0, 1], None, Core::App(Box::new(var(0)), vec![var(1), slot(4)], None)), false),
         ]);
         let interface = ragwort_compiler_interface(mc, lib);
         assert!(interface.get("sum").unwrap().inline.is_some());
@@ -1334,23 +1558,22 @@ fn modules_export_what_code_that_requires_them_needs() {
         assert!(interface.get("counted").unwrap().inline.is_none() && interface.get("nothing").is_none());
         // Inlining preserves the procedure call and supplies the module variable's value.
         let sum = imported(mc, lib, "sum").reference(mc).unwrap();
-        let applied = imported(mc, lib, "applied").call(mc, vec![sum, q(2)], &mut fresher()).unwrap();
+        let applied = call(imported(mc, lib, "applied"), vec![sum, q(2)]);
         assert!(matches!(&applied, Core::App(..)), "{applied:?}");
         assert_eq!(run_to_end(mc, compile(mc, None, &applied).unwrap()), Ok(fix(7)));
         // Compare inlined execution with the original call's behavior.
-        let mut fresh = fresher();
         for (name, want) in [("sum", fix(7)), ("sum-not", Value::FALSE), ("car-cons", fix(3)), ("first", fix(8))] {
-            let call = imported(mc, lib, name).call(mc, vec![q(3), q(4)].into_iter().take(if name == "first" { 1 } else { 2 }).collect(), &mut fresh).unwrap();
+            let call = call(imported(mc, lib, name), vec![q(3), q(4)].into_iter().take(if name == "first" { 1 } else { 2 }).collect());
             assert_eq!(run_to_end(mc, compile(mc, None, &call).unwrap()), Ok(want), "{name}");
         }
         // Immutable exports are their values; mutable ones are read with module-ref.
         assert_eq!(imported(mc, lib, "five").reference(mc), Ok(Core::Quote(fix(5))));
         let counter = imported(mc, lib, "counter").reference(mc).unwrap();
-        assert!(matches!(counter, Core::Intrinsic(Prim::Intrinsic(ModuleRef), _)), "{counter:?}");
+        assert!(matches!(counter, Core::Intrinsic(Prim::Intrinsic(ModuleRef), _, None)), "{counter:?}");
         ragwort_vm::objects::ModuleFields::items(lib, mc).set(mc, 3, fix(9));
         assert_eq!(run_to_end(mc, compile(mc, None, &counter).unwrap()), Ok(fix(9)));
         // An arity mismatch bypasses the template and remains an ordinary call that faults.
-        let wrong = imported(mc, lib, "first").call(mc, vec![], &mut fresh).unwrap();
+        let wrong = call(imported(mc, lib, "first"), vec![]);
         assert_eq!(run_to_end(mc, compile(mc, None, &wrong).unwrap()), Err(Fault::Arity));
         // Even when the template uses parameters out of order, evaluate arguments in source order so the
         // first argument's fault occurs first.
@@ -1359,11 +1582,11 @@ fn modules_export_what_code_that_requires_them_needs() {
             ("rest-first", lambda(&[0], Some(1), prim(Cons, vec![var(1), var(0)])), false),
         ]);
         let faulting = vec![prim(Car, vec![q(1)]), prim(ragwort_vm::Intrinsic::VectorRef, vec![constant(mc, &[]), q(0)])];
-        let swapped = imported(mc, lib2, "swap").call(mc, faulting, &mut fresh).unwrap();
+        let swapped = call(imported(mc, lib2, "swap"), faulting);
         assert_eq!(run_to_end(mc, compile(mc, None, &swapped).unwrap()), Err(Fault::WrongType));
-        let ok = imported(mc, lib2, "swap").call(mc, vec![q(1), add(q(1), q(1))], &mut fresh).unwrap();
+        let ok = call(imported(mc, lib2, "swap"), vec![q(1), add(q(1), q(1))]);
         assert_eq!(run_to_end(mc, compile(mc, None, &prim(Car, vec![ok])).unwrap()), Ok(fix(2)));
-        let rest = imported(mc, lib2, "rest-first").call(mc, vec![q(1), add(q(1), q(1)), q(3)], &mut fresh).unwrap();
+        let rest = call(imported(mc, lib2, "rest-first"), vec![q(1), add(q(1), q(1)), q(3)]);
         let rest = run_to_end(mc, compile(mc, None, &prim(Car, vec![rest])).unwrap()).unwrap();
         assert_eq!(items(mc, rest), [2, 3]);
         // An omitted optional argument becomes the unsupplied value, allowing its default test to fold:
@@ -1373,15 +1596,15 @@ fn modules_export_what_code_that_requires_them_needs() {
         let plus = imported(mc, lib3, "plus");
         assert!(ragwort_compiler_interface(mc, lib3).get("plus").unwrap().inline.is_some());
         for (args, want) in [(vec![3], Ok(fix(103))), (vec![3, 4], Ok(fix(7))), (vec![], Err(Fault::Arity)), (vec![3, 4, 5], Err(Fault::Arity))] {
-            let call = plus.call(mc, args.iter().map(|&n| q(n)).collect(), &mut fresh).unwrap();
+            let call = call(plus, args.iter().map(|&n| q(n)).collect());
             assert_eq!(run_to_end(mc, compile(mc, None, &call).unwrap()), want, "{args:?}");
         }
-        let one = plus.call(mc, vec![var(0)], &mut fresh).unwrap();
+        let one = call(plus, vec![var(0)]);
         let ops = all_ops(mc, compile(mc, None, &lambda(&[0], None, one)).unwrap());
         assert!(matches!(ops.as_slice(), [.., Op::AddImm { imm: 100, .. }, Op::Return { .. }]), "expected the default to fold: {ops:?}");
         // Bind an argument used in both an `if` test and a branch so it is evaluated only once.
         let lib4 = exporting(mc, vec![("car-or", lambda(&[0], None, when(prim(ragwort_vm::Intrinsic::IsPair, vec![var(0)]), prim(Car, vec![var(0)]), var(0))), false)]);
-        let call = imported(mc, lib4, "car-or").call(mc, vec![prim(Cons, vec![q(1), q(2)])], &mut fresh).unwrap();
+        let call = call(imported(mc, lib4, "car-or"), vec![prim(Cons, vec![q(1), q(2)])]);
         assert_eq!(run_to_end(mc, compile(mc, None, &call).unwrap()), Ok(fix(1)));
         // Reject references to immutable exports that have not been initialized.
         let mut builder = ModuleBuilder::new(Value::FALSE, &[]);
@@ -1398,19 +1621,18 @@ fn host_calls_inline_into_the_modules_that_require_them() {
     arena.mutate(|mc| {
         // Test transitive host-function imports: the first module exports a host-call wrapper, the second
         // inlines that wrapper, and the third imports only the second with no host functions of its own.
-        let host = |args| Core::Intrinsic(Prim::Host(ADD_HOST), args);
+        let host = |args| Core::Intrinsic(Prim::Host(ADD_HOST), args, None);
         let lib = exporting_with(mc, &HOSTS, &[], vec![("plus", lambda(&[0, 1], None, host(vec![var(0), var(1)])), false)]);
         let plus = imported(mc, lib, "plus");
-        let mut fresh = fresher();
-        let body = plus.call(mc, vec![var(0), q(10)], &mut fresh).unwrap();
+        let body = call(plus, vec![var(0), q(10)]);
         let mid = exporting_with(mc, &[], &[("plus", plus)], vec![("add10", lambda(&[0], None, body), false)]);
         let add10 = imported(mc, mid, "add10");
         assert!(ragwort_compiler_interface(mc, mid).get("add10").unwrap().inline.is_some());
         let mut user = ModuleBuilder::new(Value::FALSE, &[]);
         user.import(symbol(mc, "add10"), add10).unwrap();
         user.start(mc).unwrap();
-        let call = add10.call(mc, vec![q(5)], &mut fresh).unwrap();
-        let thunk = user.compile(mc, &call).unwrap();
+        let call = call(add10, vec![q(5)]);
+        let thunk = user.compile(mc, 0, Form::Expr(call)).unwrap();
         let ops = all_ops(mc, thunk);
         assert!(ops.iter().any(|op| matches!(op, Op::CallHost { .. } | Op::TailCallHost { .. })), "{ops:?}");
         assert!(!ops.iter().any(|op| matches!(op, Op::Call { .. } | Op::TailCall { .. })), "{ops:?}");
@@ -1644,8 +1866,8 @@ fn module_variables_are_slots() {
     assert_eq!(number(|_| seq(9, define(0, lambda(&[0], None, add(var(0), q(1)))), app(checked(0), vec![q(41)]))), Ok(42));
     assert_eq!(error(|_| slot(3)), CompileError::UnknownSlot(3));
     assert_eq!(error(|_| define(3, q(1))), CompileError::UnknownSlot(3));
-    assert_eq!(error(|_| Core::Intrinsic(Prim::Slot(SlotOp::Store, 0), vec![])), CompileError::Arity(Prim::Slot(SlotOp::Store, 0)));
-    assert_eq!(error(|_| Core::ApplyIntrinsic(Prim::Slot(SlotOp::Load, 0), vec![q(1)])), CompileError::Arity(Prim::Slot(SlotOp::Load, 0)));
+    assert_eq!(error(|_| Core::Intrinsic(Prim::Slot(SlotOp::Store, 0), vec![], None)), CompileError::Arity(Prim::Slot(SlotOp::Store, 0)));
+    assert_eq!(error(|_| Core::ApplyIntrinsic(Prim::Slot(SlotOp::Load, 0), vec![q(1)], None)), CompileError::Arity(Prim::Slot(SlotOp::Load, 0)));
     let mut arena = Arena::new(1 << 22, 0);
     arena.mutate(|mc| {
         assert_eq!(compile(mc, None, &slot(0)), Err(CompileError::UnknownSlot(0)));
@@ -1676,7 +1898,7 @@ fn other_modules_variables_are_read_with_module_ref() {
 }
 
 fn host<'gc>(def: &'static HostDef, args: Vec<Core<'gc>>) -> Core<'gc> {
-    Core::Intrinsic(Prim::Host(def), args)
+    Core::Intrinsic(Prim::Host(def), args, None)
 }
 
 #[test]
@@ -1687,7 +1909,7 @@ fn host_functions_are_called_in_the_loop() {
     // and cannot be spread.
     assert_eq!(error(|_| host(ADD_HOST, (1..=60).map(q).collect())), CompileError::TooManyArguments);
     assert_eq!(error(|_| host(CALL_WITH, vec![q(1)])), CompileError::Arity(Prim::Host(CALL_WITH)));
-    assert_eq!(error(|_| Core::ApplyIntrinsic(Prim::Host(ADD_HOST), vec![q(1)])), CompileError::Arity(Prim::Host(ADD_HOST)));
+    assert_eq!(error(|_| Core::ApplyIntrinsic(Prim::Host(ADD_HOST), vec![q(1)], None)), CompileError::Arity(Prim::Host(ADD_HOST)));
     assert_eq!(error(|_| host(&ELSEWHERE, vec![])), CompileError::UnknownHost(&ELSEWHERE));
     let mut arena = Arena::new(1 << 22, 0);
     arena.mutate(|mc| assert_eq!(compile(mc, None, &host(ADD_HOST, vec![])), Err(CompileError::UnknownHost(ADD_HOST))));

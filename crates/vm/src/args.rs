@@ -33,6 +33,11 @@ enum Held<'gc> {
 
 const _: () = assert!(size_of::<Held<'static>>() <= size_of::<Slots<'static>>() + size_of::<u64>());
 
+/// Returns `last`, the final argument of an `apply`, as the list of arguments it spreads into. Multiple values are not a list, although the arguments of `call-with-values` are held the same way, so they are a [`Fault::WrongType`]. Whether `last` is a proper list is checked where its elements are bound.
+fn spread<'gc>(mc: &Mutation<'gc>, last: Value<'gc>) -> Result<Value<'gc>, Fault> {
+    if last.downcast::<MultiValue>(mc).is_some() { Err(Fault::WrongType) } else { Ok(last) }
+}
+
 /// Stores `from`, which holds at most [`INLINE`] values, inline.
 fn inline<'gc>(from: &[Value<'gc>]) -> Held<'gc> {
     let mut values = [Value::VOID; INLINE];
@@ -87,14 +92,9 @@ impl<'gc> Args<'gc> {
         if let Some(mv) = self.rest.downcast::<MultiValue>(mc) {
             return Ok(self.held() + mv.items(mc).len());
         }
-        let (mut n, mut at) = (self.held(), self.rest);
-        while let Some(pair) = Pair::of(at) {
-            (n, at) = (n + 1, pair.tail(mc));
-        }
-        if at != Value::NIL {
-            return Err(Fault::WrongType);
-        }
-        Ok(n)
+        // A pair knows the length of the list it starts, so the rest is not walked.
+        let rest = Pairs::new(mc).list_len(self.rest).ok_or(Fault::WrongType)?;
+        usize::try_from(rest).ok().and_then(|rest| self.held().checked_add(rest)).ok_or(Fault::OutOfRange)
     }
 
     /// Retrieves the argument at 0-based index `i`, returning [`Fault::Arity`] if `i` is out of bounds.
@@ -142,16 +142,20 @@ impl<'gc> Args<'gc> {
                 Held::Slots(slots) => Held::Slots(slots.slice(0..n).ok_or(Fault::Malformed)?),
                 Held::Inline(values, _) => inline(&values[..n]),
             };
-            return Ok(Args { held, rest: self.held_get(n) });
+            return Ok(Args { held, rest: spread(mc, self.held_get(n))? });
         }
+        // The arguments past the held ones are a list that the caller supplied, such as the list of an outer `apply`.
         let mut before = Vec::new();
-        let mut at = Pair::of(self.rest).ok_or(Fault::Malformed)?;
+        let mut at = Pair::of(self.rest).ok_or(Fault::WrongType)?;
         while let Some(next) = Pair::of(at.tail(mc)) {
             before.push(at.head(mc));
             at = next;
         }
+        if at.tail(mc) != Value::NIL {
+            return Err(Fault::WrongType);
+        }
         let pairs = Pairs::new(mc);
-        let mut rest = at.head(mc);
+        let mut rest = spread(mc, at.head(mc))?;
         for &v in before.iter().rev() {
             rest = pairs.cons(v, rest)?.value(mc);
         }
@@ -195,7 +199,7 @@ impl<'gc> Args<'gc> {
         Ok(Args { held: Held::Inline(values, slots.len() as u8), rest: self.rest })
     }
 
-    /// Converts all arguments into a standard Scheme proper list.
+    /// Converts all arguments into a Scheme list, preserving `self.rest` as the tail.
     pub(crate) fn to_list(self, mc: &Mutation<'gc>) -> Result<Value<'gc>, Fault> {
         let pairs = Pairs::new(mc);
         let mut list = match self.rest.downcast::<MultiValue>(mc) {

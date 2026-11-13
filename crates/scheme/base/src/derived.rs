@@ -81,9 +81,9 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             (Macro::Case, &[key, ref clauses @ ..]) => self.case(stx, key, clauses),
             (Macro::Do, &[specs, end, ref commands @ ..]) => self.do_loop(stx, specs, end, commands),
             (Macro::Guard, &[spec, ref body @ ..]) if !body.is_empty() => self.guard(stx, spec, body),
-            // `(call-with-mark key value (lambda () body))`, as Racket's, whose body is in tail
-            // position, so one in tail position replaces the mark of the frame it's in.
             (Macro::SyntaxRules, &[literals, ref rules @ ..]) if !self.is_id(literals) => self.syntax_rules(stx, literals, rules),
+            // An identifier before the literals names an ellipsis of the form's own, which isn't supported yet.
+            (Macro::SyntaxRules, &[ellipsis, ..]) => Err(self.error(ExpandErrorKind::Unsupported, ellipsis)),
             // `(syntax-case (list e ...) () ((pattern ...) (let () body ...)))`.
             (Macro::WithSyntax, &[binds, ref body @ ..]) if !body.is_empty() => {
                 let (mut patterns, mut exprs) = (Vec::new(), Vec::new());
@@ -98,6 +98,8 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 let clause = self.list(&[patterns, body], stx)?;
                 self.build(stx, "syntax-case", &[&[exprs, none, clause]])
             }
+            // `(call-with-mark key value (lambda () body))`, as Racket's, whose body is in tail
+            // position, so one in tail position replaces the mark of the frame it's in.
             (Macro::WithMark, &[key, value, body]) => {
                 let none = self.list(&[], stx)?;
                 let thunk = self.build(stx, "lambda", &[&[none, body]])?;

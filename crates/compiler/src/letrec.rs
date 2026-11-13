@@ -17,8 +17,8 @@ use crate::ir::l1::{self, L1};
 use crate::ir::l2::{self, Bind, Fun, Id, L2, Node};
 use crate::ir::Supply;
 
-/// Maximum number of mutually recursive closures allowed in a single `Fix` group, bounded by available `STAGE` scratch registers.
-const MAX_FIX_GROUP: usize = 30;
+/// Maximum number of mutually recursive closures allowed in a single `Fix` group: the emitter stages a group's closures in its `STAGE` scratch registers, one each.
+const MAX_FIX_GROUP: usize = crate::emit::STAGE;
 
 /// Lowers `root` from `from` into `tree` with all `letrec` bindings fixed, returning the new root node ID and updated `Supply`.
 pub(crate) fn fix_letrec<'s, 'id, 'gc>(mc: &Mutation<'gc>, from: &L1<'s, 'gc>, root: l1::Id<'s>, tree: &mut L2<'id, 'gc>, mut supply: Supply) -> (Id<'id>, Supply) {
@@ -427,7 +427,7 @@ impl<'id> Cx<'_, '_, 'id, '_> {
                 let group = self.tree.list(group);
                 out.push(Bind::Fix(group));
             } else {
-                // Fall back to desugared assignment for mutually recursive SCCs exceeding MAX_FIX_GROUP (30 functions), which exceed available staging registers.
+                // Fall back to desugared assignment for mutually recursive SCCs exceeding MAX_FIX_GROUP, which exceed available staging registers.
                 let members: HashSet<Var> = scc.iter().map(|&(v, _)| v).collect();
                 self.fallback(scc, &members, out);
             }

@@ -24,7 +24,7 @@ fn slot<'gc>(slot: u32) -> Core<'gc> {
 }
 
 fn prim<'gc>(prim: Prim, args: Vec<Core<'gc>>) -> Core<'gc> {
-    Core::Intrinsic(prim, args)
+    Core::Intrinsic(prim, args, None)
 }
 
 fn add<'gc>(a: Core<'gc>, b: Core<'gc>) -> Core<'gc> {
@@ -53,7 +53,7 @@ fn lambda<'gc>(id: u32, params: &[u32], body: Core<'gc>) -> Core<'gc> {
 }
 
 fn app<'gc>(f: Core<'gc>, args: Vec<Core<'gc>>) -> Core<'gc> {
-    Core::App(Box::new(f), args)
+    Core::App(Box::new(f), args, None)
 }
 
 fn set<'gc>(v: u32, value: Core<'gc>) -> Core<'gc> {
@@ -65,7 +65,7 @@ fn l5_of(build: impl for<'gc> FnOnce(&Mutation<'gc>) -> Core<'gc>) -> String {
     let mut arena = Arena::new(1 << 24, 0);
     arena.mutate(|mc| {
         let trees = ragwort_alloc::Arena::new();
-        let f = to_l5(mc, &trees, &build(mc), &mut crate::ir::Origins::default(), &|_| None).unwrap();
+        let f = to_l5(mc, &trees, &build(mc), &mut crate::ir::Origins::default(), &|_| None, None, &mut None).unwrap();
         verify(&f).unwrap_or_else(|e| panic!("{e}\n{f}"));
         f.to_string()
     })

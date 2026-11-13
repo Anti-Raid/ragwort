@@ -1,4 +1,4 @@
-//! Pass 9 (`L5 -> Closure`): register allocation and bytecode emission from [`L5`](crate::l5).
+//! Pass 8 (`L5 -> Closure`): register allocation and bytecode emission from [`L5`](crate::l5).
 //!
 //! Allocates physical frame registers and spill slots for SSA values via greedy graph coloring in dominator
 //! order. Values with overlapping live ranges receive distinct registers, selecting the lowest available
@@ -21,7 +21,7 @@ use crate::{CompileError, Prim, SlotOp};
 
 /// The number of scratch registers reserved at the top of the register window (`WINDOW / 4`),
 /// which sets the maximum number of arguments that can be staged for an outgoing call in scratch space.
-const STAGE: usize = WINDOW / 4;
+pub(crate) const STAGE: usize = WINDOW / 4;
 /// The boundary register index separating general-purpose function registers (`0..LIMIT`) from reserved scratch registers (`LIMIT..WINDOW`).
 const LIMIT: u8 = (WINDOW - STAGE) as u8;
 const SCRATCH: u8 = LIMIT;
@@ -431,8 +431,8 @@ impl<'a, 'gc> Module<'a, 'gc> {
         // Inlined calls keep their numbers: the compilation numbers an inlined call after the call that encloses it, and rows refer to those numbers.
         let mut scopes = Vec::with_capacity(self.names.sites.inlined.len());
         for i in 0..self.names.sites.inlined.len() {
-            let Inlined { lambda, call } = self.names.sites.inlined[i];
-            let name = self.item(self.names.get(lambda).name.unwrap_or(Value::FALSE));
+            let Inlined { name, call } = self.names.sites.inlined[i];
+            let name = self.item(name);
             let (source, offset, inlined) = self.located(call).unwrap_or((u32::MAX, 0, 0));
             scopes.push(Scope { name, source, offset, inlined });
         }

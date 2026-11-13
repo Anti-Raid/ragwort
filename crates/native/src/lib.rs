@@ -5,6 +5,7 @@
 //! (%quote datum)  'datum
 //! (%if test then else)
 //! (%let ((name init) ...) body ...)
+//! (%let* ((name init) ...) body ...)
 //! (%letrec ((name init) ...) body ...)
 //! (%set! name value)
 //! (%define name value)
@@ -56,9 +57,9 @@ mod tests;
 pub use lower::{LowerError, LowerErrorKind, Lowerer};
 
 use ragwort_compiler::CompileError;
-use ragwort_compiler::module::{Loaded, ModuleBuilder, Resolver};
+use ragwort_compiler::module::{BuildError, Description, Loaded, Locals, Resolver};
 use ragwort_reader_scheme::{ReadError, Reader};
-use ragwort_types::gc::{Mutation, OutOfMemory};
+use ragwort_types::gc::Mutation;
 use ragwort_types::string::Strings;
 use ragwort_types::symbol::Symbols;
 use ragwort_types::syntax::SyntaxSession;
@@ -83,9 +84,21 @@ impl From<LowerError> for Error {
     }
 }
 
+impl From<BuildError<'_>> for Error {
+    fn from(e: BuildError<'_>) -> Self {
+        match e {
+            BuildError::Declare(e, span) => Error::Lower(LowerError::declared(e, span)),
+            BuildError::Compile(e) => e.into(),
+        }
+    }
+}
+
 impl From<CompileError> for Error {
     fn from(e: CompileError) -> Self {
-        Error::Compile(e)
+        match LowerError::located(e) {
+            Some(lower) => Error::Lower(lower),
+            None => Error::Compile(e),
+        }
     }
 }
 
@@ -101,26 +114,13 @@ pub fn load<'gc>(
     resolver: &mut dyn Resolver<'gc>,
 ) -> Result<Loaded<'gc>, Error> {
     let name = symbols.intern_str(&Strings::new(mc), name).map_err(LowerError::from)?;
-    let mut builder = ModuleBuilder::new(name.value(mc), hosts);
     let mut lowerer = Lowerer::new(mc, symbols, hosts, false).map_err(LowerError::from)?;
-    let mut forms = Vec::new();
+    let mut locals = Locals::default();
+    let mut items = Vec::new();
     for session in files {
         for node in Reader::new(mc, symbols, session)? {
-            forms.push(node?);
+            items.push(lowerer.item(&mut locals, node?)?);
         }
     }
-    let top = |i: usize| u32::try_from(i).map_err(|_| LowerError::from(ragwort_types::Error::from(OutOfMemory)));
-    for (i, &node) in forms.iter().enumerate() {
-        lowerer.declare(&mut builder, node, top(i)?, resolver)?;
-    }
-    lowerer.provide(&mut builder)?;
-    builder.start(mc).map_err(|e| LowerError::from(ragwort_types::Error::from(e)))?;
-    let mut thunks = Vec::new();
-    for (i, &node) in forms.iter().enumerate() {
-        if let Some(core) = lowerer.lower(&mut builder, node, top(i)?)? {
-            thunks.push(builder.compile(mc, &core)?);
-        }
-    }
-    let module = builder.finish(mc).map_err(CompileError::from)?;
-    Ok(Loaded { module, thunks })
+    Ok(Description { name: name.value(mc), hosts, locals, items }.build(mc, resolver)?)
 }

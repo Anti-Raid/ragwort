@@ -73,7 +73,7 @@ pub struct Link {
 /// The number of slots below a frame whose link has `marks` where the caller stores its own continuation marks, with any active [`crate::objects::Guard`] stored immediately above them.
 pub const SAVED_MARKS: u8 = 2;
 
-/// Slot offsets beneath a callee frame where a caller that established continuation marks saves its own marks and any exception [`Guard`] installed for the call.
+/// Slot offsets beneath a callee frame where a caller that established continuation marks saves its own marks and any exception [`Guard`](crate::objects::Guard) installed for the call.
 #[derive(Clone, Copy)]
 pub(crate) struct Kept {
     pub(crate) marks: usize,

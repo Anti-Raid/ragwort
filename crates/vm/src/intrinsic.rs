@@ -41,7 +41,7 @@ named! {
         Mul = ("*", any(FOLD | REORDER | TRUTHY | COMMUTE)),
         /// `/`: unary `(/ z)` computes the reciprocal `1 / z`; variadic `(/ z1 z2 ...)` divides `z1` by each
         /// subsequent number. Exact integer divisions that divide evenly remain fixnums; dividing by an
-        /// exact zero raises [`NumError::DivideByZero`](ragwort_types::num::NumError::DivideByZero).
+        /// exact zero raises [`NumError::DivideByZero`].
         Div = ("/", any(FOLD | TRUTHY)),
         /// `(= z1 z2 ...)`: returns `#t` if all numeric arguments are numerically equal, regardless of
         /// exactness, and `#f` otherwise. Any comparison involving NaN evaluates to `#f`.
@@ -487,8 +487,8 @@ named! {
         /// sequence by Unicode code point value.
         CharGe = ("char>=?", any(FOLD)),
         /// `(%keyword-procedure plain core keywords required)`: constructs a keyword-accepting procedure
-        /// wrapper from a plain procedure, core implementation, accepted keyword vector, and required
-        /// keyword vector; see [`crate::keyword`].
+        /// wrapper from a plain procedure, core implementation, list of accepted keywords, and list of
+        /// required keywords; see [`crate::keyword`].
         MakeKeywordProcedure = ("%keyword-procedure", takes(4, 0)),
         /// `(make-struct-type name parent fields field-flags flags)`: internal compiler intrinsic
         /// constructing a new struct type descriptor; see [`crate::structs::make_type`]. Flagged as
@@ -1472,7 +1472,7 @@ impl Intrinsic {
             Intrinsic::IsChar => boolean(arg(0).as_char().is_some()),
             Intrinsic::CharToInteger => fixnum(i64::from(u32::from(arg(0).as_char().ok_or(Fault::WrongType)?))),
             Intrinsic::IntegerToChar => {
-                let n = arg(0).as_fixnum().ok_or(Fault::WrongType)?;
+                let n = arg(0).as_fixnum().ok_or_else(|| not_fixnum(mc, arg(0)))?;
                 Value::char(u32::try_from(n).ok().and_then(char::from_u32).ok_or(Fault::OutOfRange)?)
             }
             Intrinsic::CharEq | Intrinsic::CharLt | Intrinsic::CharGt | Intrinsic::CharLe | Intrinsic::CharGe if args == 0 => {
@@ -1672,7 +1672,7 @@ impl Intrinsic {
             Intrinsic::MakeBytevector => {
                 let fill = match args {
                     1 => 0,
-                    2 => byte(arg(1))?,
+                    2 => byte(mc, arg(1))?,
                     _ => return Err(Fault::Arity),
                 };
                 made(mc, fuel, Bytevectors::new(mc).make(index(arg(0))?, fill)?.value(mc))
@@ -2523,10 +2523,18 @@ fn list_tail<'gc>(mc: &Mutation<'gc>, mut xs: Value<'gc>, k: usize, need_pair: b
     Ok(xs)
 }
 
-/// Validates that `v` is a fixnum in the range `0..=255`, returning `u8` on success or
-/// [`Fault::WrongType`]/[`Fault::OutOfRange`].
-fn byte(v: Value<'_>) -> Result<u8, Fault> {
-    v.as_fixnum().and_then(|b| u8::try_from(b).ok()).ok_or(Fault::WrongType)
+/// Validates that `v` is a fixnum in the range `0..=255`, returning `u8` on success,
+/// [`Fault::OutOfRange`] for any other exact integer, or [`Fault::WrongType`].
+fn byte<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> Result<u8, Fault> {
+    let b = v.as_fixnum().ok_or_else(|| not_fixnum(mc, v))?;
+    u8::try_from(b).map_err(|_| Fault::OutOfRange)
+}
+
+/// Returns the fault for `v`, which is not a fixnum, as an argument that must be an integer in a
+/// range that fixnums cover: [`Fault::OutOfRange`] for an exact integer too large to be a fixnum,
+/// and [`Fault::WrongType`] for anything else.
+fn not_fixnum<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> Fault {
+    if Nums::new(mc).integer(v).is_some() { Fault::OutOfRange } else { Fault::WrongType }
 }
 
 /// Validates that `v` is a non-negative fixnum, returning `usize` on success, or

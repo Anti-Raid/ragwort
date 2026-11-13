@@ -1,5 +1,5 @@
 //! `syntax-case` and `syntax`, as R6RS has them, compiled to the VM's
-//! [`syntax_case`](ragwort_vm::syntax_case) patterns and templates: a clause's pattern is a
+//! [`syntax_case`] patterns and templates: a clause's pattern is a
 //! constant the code matches its input with, which gives a vector of what its variables matched,
 //! a list of those for each ellipsis a variable's under. A template with pattern variables in it
 //! is a constant too, which the code makes syntax of with theirs; one without any is the syntax
@@ -42,8 +42,8 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     /// The clauses from `at` on, each tried if those before it don't match.
     fn clauses(&mut self, input: Var, literals: Rc<[Stx]>, clauses: Rc<[Stx]>, at: usize) -> Result<Ex<'a, 'gc>, ExpandError> {
         let Some(&clause) = clauses.get(at) else {
-            let error = Core::Intrinsic(Prim::Intrinsic(Intrinsic::MakeSyntaxError), vec![Core::Quote(Value::VOID), local(input)]);
-            return Ok(Step::Done(Core::Intrinsic(Prim::Request(Request::Raise), vec![error])));
+            let error = Core::Intrinsic(Prim::Intrinsic(Intrinsic::MakeSyntaxError), vec![Core::Quote(Value::VOID), local(input)], None);
+            return Ok(Step::Done(Core::Intrinsic(Prim::Request(Request::Raise), vec![error], None)));
         };
         let (pattern, fender, output) = match *self.proper(clause)?.as_slice() {
             [pattern, output] => (pattern, None, output),
@@ -54,7 +54,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let mut shape = self.pattern(pattern, &literals, &mut vars, &mut items)?;
         shape.vars = u32::try_from(vars.len()).expect("fewer than 2^32 variables");
         let pattern = Core::Quote(syntax_case::pattern(self.mc, shape, &items)?);
-        let asked = Core::Intrinsic(Prim::Intrinsic(Intrinsic::SyntaxMatch), vec![pattern, local(input)]);
+        let asked = Core::Intrinsic(Prim::Intrinsic(Intrinsic::SyntaxMatch), vec![pattern, local(input)], None);
         let scope = self.tree.scopes.fresh()?;
         let ids = vars.iter().map(|&(id, _)| self.tree.with(id, scope, Op::Add)).collect::<Result<Vec<_>, _>>()?;
         self.distinct(&ids)?;
@@ -64,7 +64,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             let var = self.fresh();
             self.bind(id, Binding::Pattern { var, depth })?;
             let at = Core::Quote(Value::fixnum(k as i64).expect("a fixnum"));
-            binds.push((var, Core::Intrinsic(Prim::Intrinsic(Intrinsic::VectorRef), vec![local(matched), at])));
+            binds.push((var, Core::Intrinsic(Prim::Intrinsic(Intrinsic::VectorRef), vec![local(matched), at], None)));
         }
         let output = self.tree.with(output, scope, Op::Add)?;
         let fender = fender.map(|fender| self.tree.with(fender, scope, Op::Add)).transpose()?;
@@ -79,7 +79,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 let k = this.fresh();
                 let thunk = Core::Lambda(Lambda { id: this.lambda_id(), params: Vec::new(), optional: 0, rest: None, body: Box::new(next), name: None, at: None });
                 Self::expr(fender, move |_, fender| {
-                    let again = || Core::App(Box::new(local(k)), Vec::new());
+                    let again = || Core::App(Box::new(local(k)), Vec::new(), None);
                     let body = Core::If(Box::new(fender), Box::new(output), Box::new(again()));
                     let body = Core::Let(binds, Box::new(body));
                     let tried = Core::If(Box::new(local(matched)), Box::new(body), Box::new(again()));
@@ -203,7 +203,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 shape.depths = used.iter().map(|&(_, depth)| depth).collect();
                 let template = Core::Quote(syntax_case::template(self.mc, shape, &parts)?);
                 let args = std::iter::once(template).chain(used.iter().map(|&(var, _)| local(var)));
-                Core::Intrinsic(Prim::Intrinsic(Intrinsic::SyntaxBuild), args.collect())
+                Core::Intrinsic(Prim::Intrinsic(Intrinsic::SyntaxBuild), args.collect(), None)
             }
         })
     }

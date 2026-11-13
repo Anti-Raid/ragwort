@@ -83,6 +83,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let thunk = compile(self.mc, None, core).map_err(|e| match e {
             // It refers to a variable of the code around it, which isn't there yet.
             CompileError::Unbound(_) | CompileError::UnknownSlot(_) => self.error(ExpandErrorKind::Phase, expr),
+            CompileError::OutOfMemory => self.error(OutOfMemory, at),
             _ => self.error(ExpandErrorKind::Transformer, at),
         })?;
         let transformer = self.run(thunk, &[], at)?;

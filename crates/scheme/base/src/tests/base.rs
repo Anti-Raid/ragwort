@@ -443,6 +443,13 @@ fn bytevectors_hold_multibyte_integers_little_or_big_endian() {
     assert_eq!(eval_in(&mut arena(), "(bytevector-u32be-ref #u8(1 2 3 4) 1)"), Ok(Err(Fault::OutOfRange)));
     assert_eq!(eval_in(&mut arena(), "(bytevector-u16be-set! (make-bytevector 2 0) 0 65536)"), Ok(Err(Fault::OutOfRange)));
     assert_eq!(eval_in(&mut arena(), "(bytevector-u16be-set! (make-bytevector 2 0) 0 -1)"), Ok(Err(Fault::OutOfRange)));
+    // A fill that is an integer but not a byte is out of range, and anything else is the wrong type.
+    for fill in ["256", "-1", "(expt 2 100)"] {
+        assert_eq!(eval_in(&mut arena(), &format!("(make-bytevector 2 {fill})")), Ok(Err(Fault::OutOfRange)), "{fill}");
+    }
+    assert_eq!(eval_in(&mut arena(), "(make-bytevector 2 'x)"), Ok(Err(Fault::WrongType)));
+    assert_eq!(eval_in(&mut arena(), "(integer->char (expt 2 100))"), Ok(Err(Fault::OutOfRange)));
+    assert_eq!(eval_in(&mut arena(), "(integer->char 1.5)"), Ok(Err(Fault::WrongType)));
     assert_eq!(eval_in(&mut arena(), "(bytevector-u16be-set! #u8(1 2) 0 1)"), Ok(Err(Fault::Immutable)));
 }
 
@@ -578,6 +585,7 @@ fn bad_syntax_points_at_itself() {
     assert_eq!(error("(set! if 1)"), (BadSyntax, "if"));
     assert_eq!(error("(define-syntax m 1)"), (Transformer, "(define-syntax m 1)"));
     assert_eq!(error("(car #`x)"), (Unsupported, "#`x"));
+    assert_eq!(error("(define-syntax my (syntax-rules ::: () ((_ a :::) (list a :::))))"), (Unsupported, ":::"));
     assert_eq!(error("(car '(a #`(b #,c)) #`d)"), (Unsupported, "#`d"));
     assert_eq!(error("(cond (else 1) (#t 2))"), (BadSyntax, "(else 1)"));
     assert_eq!(error("(let ((x)) x)"), (BadSyntax, "(x)"));
@@ -1051,7 +1059,7 @@ fn mutable_bytevectors() {
     assert_eq!(eval("(let ((b (make-bytevector 3))) (list (bytevector-u8-ref b 2) (equal? b #u8(0 0 0)) (bytevector-length #u8())))"), "(0 #t 0)");
     assert_eq!(eval("(list (bytevector? #u8()) (bytevector? '(1)) (bytevector? \"s\"))"), "(#t #f #f)");
     assert_eq!(eval_in(&mut arena(), "(make-bytevector -1)"), Ok(Err(Fault::OutOfRange)));
-    assert_eq!(eval_in(&mut arena(), "(make-bytevector 2 256)"), Ok(Err(Fault::WrongType)));
+    assert_eq!(eval_in(&mut arena(), "(make-bytevector 2 256)"), Ok(Err(Fault::OutOfRange)));
     assert_eq!(eval_in(&mut arena(), "(make-bytevector 2 0 0)"), Ok(Err(Fault::Arity)));
     assert_eq!(eval_in(&mut arena(), "(bytevector-length '())"), Ok(Err(Fault::WrongType)));
 }
@@ -1589,11 +1597,39 @@ fn keyword_mistakes_name_the_keyword() {
     assert_eq!(caught("(car #:a 1)"), "(keyword (#:a))");
     assert_eq!(caught("(keyword-apply list '(#:b #:a) '(1 2) '())"), "(keyword (#:a))");
     assert_eq!(error("(define (f #:k k) k) (set! f 1)"), (Immutable, "f"));
-    assert_eq!(error("(let () (define (f #:k k) k) (set! f 1) 2)"), (Immutable, "f"));
+    assert_eq!(eval("(let () (define (f #:k k) k) (define g f) (set! f (lambda (#:k k) (+ k 1))) (list (f #:k 1) (g #:k 1)))"), "(2 1)");
     assert_eq!(error("(define (f #:k k) k) (f #:k 1 #:k 2)"), (Duplicate, "#:k"));
     assert_eq!(error("(lambda (#:k a #:k b) 1)"), (Duplicate, "#:k"));
     assert_eq!(error("(lambda (#:k) 1)"), (BadSyntax, "#:k"));
     assert_eq!(error("(car #:k)"), (BadSyntax, "#:k"));
+}
+
+#[test]
+fn apply_spreads_only_a_proper_list() {
+    let caught = |text: &str| eval(&format!("(define mv (values 1 2)) (define a (car (list apply))) (guard (e (#t (error-object-kind e))) {text})"));
+    // The last argument is a proper list, whether or not the procedure takes a rest parameter.
+    assert_eq!(caught("(apply list 1 2 '(3 4))"), "(1 2 3 4)");
+    assert_eq!(caught("(apply apply list 1 '(2 (3 4)))"), "(1 2 3 4)");
+    assert_eq!(caught("(apply (lambda (a . r) (list a r)) '(1 2 3))"), "(1 (2 3))");
+    for improper in ["(apply list 1)", "(apply list 1 2 '(3 . 4))", "(apply (lambda (a . r) r) 1 2)", "(apply apply list 1 '(2 3))", "(keyword-apply list '() '() 1 2)"] {
+        assert_eq!(caught(improper), "wrong-type", "{improper}");
+    }
+    // Multiple values are not a list of arguments, however `apply` is reached, and the error can be caught.
+    for values in ["(apply list mv)", "(a list mv)", "(a apply list mv)", "(a a list mv)", "(a keyword-apply list '() '() mv)", "(a (lambda (x . r) r) 0 mv)"] {
+        assert_eq!(caught(values), "wrong-type", "{values}");
+    }
+    assert_eq!(caught("(call-with-values (lambda () (values 1 2 3)) (lambda (a . r) (list a r)))"), "(1 (2 3))");
+}
+
+#[test]
+fn large_groups_of_mutually_recursive_closures_compile() {
+    // Each procedure calls the next and captures `n`, so the group is one cycle of closures that escape.
+    for size in [2, 16, 17, 20, 30, 31, 40] {
+        let defines: String = (0..size).map(|i| format!("(define (f{i} k) (if (= k 0) (+ n {i}) (f{} (- k 1))))", (i + 1) % size)).collect();
+        let all: String = (0..size).map(|i| format!("f{i} ")).collect();
+        let text = format!("(define (make n) {defines} (list {all})) ((car (make 100)) {})", size + 1);
+        assert_eq!(eval(&text), "101", "{size}");
+    }
 }
 
 #[test]

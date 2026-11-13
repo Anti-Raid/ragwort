@@ -1,4 +1,4 @@
-//! Pass 8 (`L4 -> L5`): transforms each function into a control-flow graph of basic blocks in SSA form.
+//! Pass 7 (`L4 -> L5`): transforms each function into a control-flow graph of basic blocks in SSA form.
 //!
 //! Every SSA value ([`Val`]) is defined exactly once: at function entry, as a basic block parameter,
 //! or as the destination of an instruction. Control-flow merges are represented using block parameters

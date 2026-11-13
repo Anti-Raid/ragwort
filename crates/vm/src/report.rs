@@ -282,8 +282,13 @@ fn recorded<'gc>(mc: &Mutation<'gc>, condition: Gc<'gc, Condition>) -> (Vec<Entr
     (entries, len % 2 == 1)
 }
 
-/// Returns the name of the source `source` and the one-based line of byte `offset` in it. The name is `None` for a source without one, and the line 0 when `source` is not a source.
+/// Returns the name of the source `source` and the one-based line of byte `offset` in it. The name is `None` for a source without one, and the line 0 when `source` is neither a source nor a string.
 fn place<'gc>(mc: &Mutation<'gc>, source: Value<'gc>, offset: u32) -> (Option<String>, u32) {
+    let strings = Strings::new(mc);
+    // A string names a source directly, and the offset is then the line itself: code inlined from another module records its origin this way.
+    if let Some(name) = strings.string(source) {
+        return (Some(string::display(&strings, name).to_string()), offset);
+    }
     let Some(source) = SyntaxSource::of(source) else { return (None, 0) };
     let file = source.name(mc).map(|name| String::from_utf8_lossy(name.bytes(mc)).into_owned());
     let line = source.location(mc, offset).map_or(0, |location| location.line);

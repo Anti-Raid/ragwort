@@ -1,10 +1,11 @@
 //! Ragwort's base language: Scheme, as R7RS and Racket write it, expanded to the compiler's core
 //! forms and compiled.
 //!
-//! The expander knows `quote`, `if`, `lambda`, `define`, `set!`, `begin`, `let` (named too),
-//! `letrec` and `letrec*` itself. `let*`, `and`, `or`, `when`, `unless`, `cond`, `case`, `do`,
-//! `quasiquote`, `guard`, `syntax-rules` and `with-syntax` are macros written in Rust, which
-//! expand hygienically by sets of scopes, as the code's own do.
+//! The expander knows `quote`, `if`, `lambda`, `define`, `set!`, `begin`, `let`, `letrec` and
+//! `letrec*` itself. A named `let`, `let*`, `and`, `or`, `when`, `unless`, `cond`, `case`, `do`,
+//! `quasiquote`, `guard`, `match`, `struct-copy`, `with-continuation-mark`, `syntax-rules` and
+//! `with-syntax` are macros written in Rust, which expand hygienically by sets of scopes, as the
+//! code's own do.
 //!
 //! `struct` defines a struct type, as Racket's `struct` does: `(struct point (x y))` defines the
 //! constructor `point`, the predicate `point?` and the accessors `point-x` and `point-y`. A
@@ -155,7 +156,8 @@ impl fmt::Display for ExpandErrorKind {
             ExpandErrorKind::Unsupported => "syntax that isn't supported yet",
             ExpandErrorKind::Transformer => "a macro's transformer that failed",
             ExpandErrorKind::Phase => "a macro's transformer that refers to a variable that doesn't exist yet",
-            ExpandErrorKind::Arena(_) => "running out of memory",
+            ExpandErrorKind::Arena(ragwort_types::Error::OutOfMemory) => "running out of memory",
+            ExpandErrorKind::Arena(other) => ragwort_vm::Fault::from(*other).message(),
         })
     }
 }
@@ -229,8 +231,9 @@ pub fn load<'gc>(
     expander.builder().start(mc)?;
     let mut thunks = Vec::with_capacity(tops.len());
     for (i, top) in tops.into_iter().enumerate() {
-        let core = expander.lower(top, u32::try_from(i).map_err(|_| OutOfMemory)?)?;
-        thunks.push(expander.builder().compile(mc, &core)?);
+        let i = u32::try_from(i).map_err(|_| OutOfMemory)?;
+        let form = expander.lower(top, i)?;
+        thunks.push(expander.builder().compile(mc, i, form)?);
     }
     let module = expander.finish()?;
     Ok(Loaded { module, thunks })
