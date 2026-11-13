@@ -288,16 +288,16 @@ const ZERO: u64 = 0x8000_0000_0000_0003;
 const LAST_SPECIAL: u64 = 4 * (SPECIALS.len() as u64 - 1);
 
 #[inline]
-fn encode(f: f64) -> Option<u64> {
-    let bits = f.to_bits();
+fn encode(double: f64) -> Option<u64> {
+    let bits = double.to_bits();
     // Exponents starting 011 or 100: the second and third bits copy the inverse of the first.
     let top = bits >> 60 & 0b111;
     if top == 0b011 || top == 0b100 {
         let word = bits.rotate_left(3) | FLONUM;
         return (word.wrapping_sub(ZERO) > LAST_SPECIAL).then_some(word);
     }
-    let i = SPECIALS.iter().position(|&s| s == bits)?;
-    Some(ZERO + 4 * i as u64)
+    let index = SPECIALS.iter().position(|&special| special == bits)?;
+    Some(ZERO + 4 * index as u64)
 }
 
 #[inline]
@@ -349,14 +349,14 @@ impl From<OutOfMemory> for Error {
 }
 
 impl From<ragwort_num::NumError> for Error {
-    fn from(e: ragwort_num::NumError) -> Self {
-        Self::Num(e)
+    fn from(error: ragwort_num::NumError) -> Self {
+        Self::Num(error)
     }
 }
 
 impl From<ragwort_string::StrError> for Error {
-    fn from(e: ragwort_string::StrError) -> Self {
-        Self::Str(e)
+    fn from(error: ragwort_string::StrError) -> Self {
+        Self::Str(error)
     }
 }
 
@@ -554,8 +554,8 @@ impl<'gc> Value<'gc> {
 
     /// A character: a constant whose id has its top bit set, the code point below it.
     #[inline]
-    pub const fn char(c: char) -> Self {
-        Self::constant(CHAR | c as u64)
+    pub const fn char(character: char) -> Self {
+        Self::constant(CHAR | character as u64)
     }
 
     #[inline]
@@ -577,9 +577,9 @@ impl<'gc> Value<'gc> {
     }
 
     #[inline]
-    pub fn fixnum(n: i64) -> Option<Self> {
-        let word = (n as u64) << 1;
-        ((word as i64) >> 1 == n).then_some(Self::from_bits(word))
+    pub fn fixnum(number: i64) -> Option<Self> {
+        let word = (number as u64) << 1;
+        ((word as i64) >> 1 == number).then_some(Self::from_bits(word))
     }
 
     #[inline]
@@ -600,7 +600,7 @@ impl<'gc> Value<'gc> {
         if (self.word | other.word) & 1 != 0 {
             return None;
         }
-        (self.word as i64).checked_add(other.word as i64).map(|w| Self::from_bits(w as u64))
+        (self.word as i64).checked_add(other.word as i64).map(|word| Self::from_bits(word as u64))
     }
 
     #[inline]
@@ -608,7 +608,7 @@ impl<'gc> Value<'gc> {
         if (self.word | other.word) & 1 != 0 {
             return None;
         }
-        (self.word as i64).checked_sub(other.word as i64).map(|w| Self::from_bits(w as u64))
+        (self.word as i64).checked_sub(other.word as i64).map(|word| Self::from_bits(word as u64))
     }
 
     /// Twice `a` times `b` is twice their product, so one operand stays shifted.
@@ -617,22 +617,22 @@ impl<'gc> Value<'gc> {
         if (self.word | other.word) & 1 != 0 {
             return None;
         }
-        (self.word as i64).checked_mul(other.word as i64 >> 1).map(|w| Self::from_bits(w as u64))
+        (self.word as i64).checked_mul(other.word as i64 >> 1).map(|word| Self::from_bits(word as u64))
     }
 
     /// Stores the double in the word when it fits, and boxes it otherwise.
     #[inline]
-    pub fn flonum(mc: &Mutation<'gc>, f: f64) -> Result<Self, OutOfMemory> {
-        match encode(f) {
+    pub fn flonum(mc: &Mutation<'gc>, double: f64) -> Result<Self, OutOfMemory> {
+        match encode(double) {
             Some(word) => Ok(Self::from_bits(word)),
-            None => Ok(Self::object(mc, mc.alloc::<Boxed, 1>([f.to_bits()])?)),
+            None => Ok(Self::object(mc, mc.alloc::<Boxed, 1>([double.to_bits()])?)),
         }
     }
 
     /// The double as a value without allocating, if it fits in the word.
     #[inline]
-    pub fn inline_flonum(f: f64) -> Option<Self> {
-        encode(f).map(Self::from_bits)
+    pub fn inline_flonum(double: f64) -> Option<Self> {
+        encode(double).map(Self::from_bits)
     }
 
     /// Inline, or a reference to a boxed one: type 0 in every arena.
@@ -739,8 +739,8 @@ impl<T> PartialEq for Gc<'_, T> {
 impl<T> Eq for Gc<'_, T> {}
 
 impl<T> fmt::Debug for Gc<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Gc").field(&self.index).finish()
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_tuple("Gc").field(&self.index).finish()
     }
 }
 
@@ -775,18 +775,18 @@ impl<'gc, T: Object> Gc<'gc, T> {
         self.len(mc) == 0
     }
 
-    /// Entry `i` of `Items::Ephemerons` items, or `None` once its key has died. Panics past
+    /// Entry `index` of `Items::Ephemerons` items, or `None` once its key has died. Panics past
     /// the end.
     #[inline]
-    pub fn entry(self, mc: &Mutation<'gc>, i: usize) -> Option<(Value<'gc>, Value<'gc>)> {
-        assert!(2 * i + 1 < self.len(mc), "entry {i} out of bounds");
-        mc.heap.ephemeron_at(mask(items_start(self) + 2 * i))
+    pub fn entry(self, mc: &Mutation<'gc>, index: usize) -> Option<(Value<'gc>, Value<'gc>)> {
+        assert!(2 * index + 1 < self.len(mc), "entry {index} out of bounds");
+        mc.heap.ephemeron_at(mask(items_start(self) + 2 * index))
     }
 
     #[inline]
-    pub fn set_entry(self, mc: &Mutation<'gc>, i: usize, key: Value<'gc>, value: Value<'gc>) {
-        assert!(2 * i + 1 < self.len(mc), "entry {i} out of bounds");
-        mc.heap.set_ephemeron_at(mask(items_start(self) + 2 * i), key, value);
+    pub fn set_entry(self, mc: &Mutation<'gc>, index: usize, key: Value<'gc>, value: Value<'gc>) {
+        assert!(2 * index + 1 < self.len(mc), "entry {index} out of bounds");
+        mc.heap.set_ephemeron_at(mask(items_start(self) + 2 * index), key, value);
     }
 }
 
@@ -918,15 +918,15 @@ impl<'gc, S: Item> Slots<'gc, S> {
     }
 
     #[inline]
-    pub fn get(self, i: usize) -> S::Out<'gc> {
-        S::load(self.region, self.words[i].get())
+    pub fn get(self, index: usize) -> S::Out<'gc> {
+        S::load(self.region, self.words[index].get())
     }
 
     #[inline]
-    pub fn set(self, mc: &Mutation<'gc>, i: usize, value: S::In<'gc>) {
+    pub fn set(self, mc: &Mutation<'gc>, index: usize, value: S::In<'gc>) {
         let word = S::store(value);
-        self.words[i].set(word);
-        let slot = self.at + i;
+        self.words[index].set(word);
+        let slot = self.at + index;
         match S::REFS {
             Refs::None => {}
             Refs::Values => mc.heap.barrier(slot, self.owner, word),
@@ -946,14 +946,14 @@ impl<'gc, S: Item> Slots<'gc, S> {
     /// lengths differ.
     pub fn copy_from(self, mc: &Mutation<'gc>, src: Self) {
         assert_eq!(self.len(), src.len(), "copy between slices of different lengths");
-        let refs = S::REFS != Refs::None && src.words.iter().any(|s| S::REFS.refers(s.get()));
+        let refs = S::REFS != Refs::None && src.words.iter().any(|source| S::REFS.refers(source.get()));
         if self.at > src.at {
-            for (d, s) in self.words.iter().zip(src.words).rev() {
-                d.set(s.get());
+            for (target, source) in self.words.iter().zip(src.words).rev() {
+                target.set(source.get());
             }
         } else {
-            for (d, s) in self.words.iter().zip(src.words) {
-                d.set(s.get());
+            for (target, source) in self.words.iter().zip(src.words) {
+                target.set(source.get());
             }
         }
         if refs {
@@ -990,15 +990,15 @@ pub struct Window<'gc> {
 
 impl<'gc> Window<'gc> {
     #[inline]
-    pub fn get(self, r: u8) -> Value<'gc> {
-        Value::from_bits(self.slots[usize::from(r) % WINDOW].get())
+    pub fn get(self, register: u8) -> Value<'gc> {
+        Value::from_bits(self.slots[usize::from(register) % WINDOW].get())
     }
 
     #[inline]
-    pub fn set(self, mc: &Mutation<'gc>, r: u8, value: Value<'gc>) {
-        let r = usize::from(r) % WINDOW;
-        self.slots[r].set(value.word);
-        mc.heap.barrier(self.at + r, self.owner, value.word);
+    pub fn set(self, mc: &Mutation<'gc>, register: u8, value: Value<'gc>) {
+        let register = usize::from(register) % WINDOW;
+        self.slots[register].set(value.word);
+        mc.heap.barrier(self.at + register, self.owner, value.word);
     }
 }
 
@@ -1043,8 +1043,8 @@ impl<'gc, T: Any> HostRef<'gc, T> {
 }
 
 impl<T> fmt::Debug for HostRef<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("HostRef").field("id", &self.id).field("generation", &self.generation).finish()
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("HostRef").field("id", &self.id).field("generation", &self.generation).finish()
     }
 }
 
@@ -1069,7 +1069,7 @@ impl<'gc> AnyHostRef<'gc> {
     fn value(self, mc: &Mutation<'gc>) -> Option<Ref<'gc, dyn Any>> {
         let hosts = mc.heap.m.hosts.try_borrow().ok()?;
         Ref::filter_map(hosts, |hosts| {
-            let slot = hosts.get(self.id as usize).filter(|s| s.generation == self.generation)?;
+            let slot = hosts.get(self.id as usize).filter(|slot| slot.generation == self.generation)?;
             slot.value.as_deref()
         })
         .ok()
@@ -1077,14 +1077,14 @@ impl<'gc> AnyHostRef<'gc> {
 
     /// Whether the value is alive and a `T`.
     pub fn is<T: Any>(self, mc: &Mutation<'gc>) -> bool {
-        self.value(mc).is_some_and(|v| (*v).is::<T>())
+        self.value(mc).is_some_and(|value| (*value).is::<T>())
     }
 
     /// The value, if it's alive and a `T`. While the `Ref` is held, `Mutation::host` fails with
     /// `HostError::InUse`.
     #[inline]
     pub fn downcast_ref<T: Any>(self, mc: &Mutation<'gc>) -> Option<Ref<'gc, T>> {
-        Ref::filter_map(self.value(mc)?, |v| v.downcast_ref::<T>()).ok()
+        Ref::filter_map(self.value(mc)?, |value| value.downcast_ref::<T>()).ok()
     }
 
     /// Counts `bytes` the value owns outside the arena, such as a `String`'s characters, in place
@@ -1093,17 +1093,17 @@ impl<'gc> AnyHostRef<'gc> {
     /// nothing; shrinking gives the difference back at once. A freed value's reference does
     /// nothing. Fails with `HostError::InUse` while a `Ref` from a read is held.
     pub fn set_owned_bytes(self, mc: &Mutation<'gc>, bytes: usize) -> Result<(), HostError> {
-        let m = mc.heap.m;
-        let mut hosts = m.hosts.try_borrow_mut().map_err(|_| HostError::InUse)?;
-        let Some(slot) = hosts.get_mut(self.id as usize).filter(|s| s.generation == self.generation && s.value.is_some()) else {
+        let meta = mc.heap.m;
+        let mut hosts = meta.hosts.try_borrow_mut().map_err(|_| HostError::InUse)?;
+        let Some(slot) = hosts.get_mut(self.id as usize).filter(|slot| slot.generation == self.generation && slot.value.is_some()) else {
             return Ok(());
         };
         if bytes > slot.owned {
-            m.budget.charge(bytes - slot.owned)?;
+            meta.budget.charge(bytes - slot.owned)?;
         } else {
-            m.budget.refund(slot.owned - bytes);
+            meta.budget.refund(slot.owned - bytes);
         }
-        m.host_bytes.set(m.host_bytes.get() - slot.owned + bytes);
+        meta.host_bytes.set(meta.host_bytes.get() - slot.owned + bytes);
         slot.cost = slot.cost - slot.owned + bytes;
         slot.owned = bytes;
         Ok(())
@@ -1175,18 +1175,18 @@ impl<T: Default, const C: usize, const N: usize> Chunked<T, C, N> {
     }
 
     #[inline]
-    fn get(&self, i: usize) -> Option<&T> {
-        if i < C {
-            return Some(&self.first[i]);
+    fn get(&self, index: usize) -> Option<&T> {
+        if index < C {
+            return Some(&self.first[index]);
         }
-        Some(&self.chunks.get(i / C)?.get()?[i % C])
+        Some(&self.chunks.get(index / C)?.get()?[index % C])
     }
 
-    fn get_or_grow(&self, i: usize) -> Option<&T> {
-        if i < C {
-            return Some(&self.first[i]);
+    fn get_or_grow(&self, index: usize) -> Option<&T> {
+        if index < C {
+            return Some(&self.first[index]);
         }
-        Some(&self.chunks.get(i / C)?.get_or_init(Self::chunk)[i % C])
+        Some(&self.chunks.get(index / C)?.get_or_init(Self::chunk)[index % C])
     }
 }
 
@@ -1214,35 +1214,35 @@ struct Page {
 /// Gives the free ones of `pages`, in order, back to the system in runs, past the first
 /// nursery's worth. Only pages the system wholly took back stop being charged; the rest stay
 /// committed.
-fn give_back(memory: &mut Region, m: &Meta, pages: impl Iterator<Item = usize>) {
-    let mut warm = m.nursery / (PAGE * 8);
+fn give_back(memory: &mut Region, meta: &Meta, pages: impl Iterator<Item = usize>) {
+    let mut warm = meta.nursery / (PAGE * 8);
     let mut run: Option<Range<usize>> = None;
-    for p in pages.map(Some).chain([None]) {
-        let free = p.and_then(|p| m.pages[..m.used.get()].get(p)).is_some_and(|page| page.used.get() == 0 && !page.released.get());
+    for index in pages.map(Some).chain([None]) {
+        let free = index.and_then(|index| meta.pages[..meta.used.get()].get(index)).is_some_and(|page| page.used.get() == 0 && !page.released.get());
         let release = if free && warm > 0 {
             warm -= 1;
             false
         } else {
             free
         };
-        if let (Some(r), Some(p)) = (&mut run, p)
+        if let (Some(range), Some(index)) = (&mut run, index)
             && release
-            && r.end == p
+            && range.end == index
         {
-            r.end += 1;
+            range.end += 1;
             continue;
         }
-        if let Some(r) = run.take() {
-            let words = memory.release(r.start * PAGE..r.end * PAGE);
-            let gone = words.start.div_ceil(PAGE).max(r.start)..(words.end / PAGE).min(r.end);
-            for page in m.pages.get(gone).unwrap_or_default() {
+        if let Some(range) = run.take() {
+            let words = memory.release(range.start * PAGE..range.end * PAGE);
+            let gone = words.start.div_ceil(PAGE).max(range.start)..(words.end / PAGE).min(range.end);
+            for page in meta.pages.get(gone).unwrap_or_default() {
                 page.released.set(true);
-                m.budget.refund(PAGE_COST);
-                m.committed.set(m.committed.get() - 1);
+                meta.budget.refund(PAGE_COST);
+                meta.committed.set(meta.committed.get() - 1);
             }
         }
         if release {
-            run = p.map(|p| p..p + 1);
+            run = index.map(|index| index..index + 1);
         }
     }
 }
@@ -1263,7 +1263,7 @@ impl PageSet {
     }
 
     fn insert_all(&self, pages: Range<usize>) {
-        pages.for_each(|p| self.insert(p));
+        pages.for_each(|page| self.insert(page));
     }
 
     /// The pages in order, taken out if `take`.
@@ -1279,7 +1279,7 @@ impl PageSet {
     }
 
     fn clear(&self) {
-        self.0.iter().for_each(|w| w.set(0));
+        self.0.iter().for_each(|word| word.set(0));
     }
 }
 
@@ -1398,8 +1398,8 @@ struct Heap<'a> {
 /// Wraps an index into the region, so indexing it needs no bounds check: a bad index reads
 /// some other word, as a forged one would anyway. Small offsets past it land in `SLACK`.
 #[inline]
-fn mask(i: usize) -> usize {
-    i & (WORDS - 1)
+fn mask(index: usize) -> usize {
+    index & (WORDS - 1)
 }
 
 const MIN_THRESHOLD: usize = 64 << 10;
@@ -1578,29 +1578,29 @@ impl Arena {
             dead.split_off(keep)
         };
         drop(dead);
-        let m = &mut self.meta;
-        m.frozen.free_dead(&m.budget, free);
+        let meta = &mut self.meta;
+        meta.frozen.free_dead(&meta.budget, free);
         self.charge_tables();
     }
 
     /// Charges the work lists and tables outside the region for what they hold now. They grow
     /// within collections, which can't fail, so they're charged after.
     fn charge_tables(&self) {
-        let m = &self.meta;
-        let work = m.work.borrow();
+        let meta = &self.meta;
+        let work = meta.work.borrow();
         let bytes = (work.gray.capacity() + work.holders.capacity() + work.ephemerons.capacity()) * size_of::<u32>()
             + (work.fixups.capacity() + work.weak_runs.capacity()) * size_of::<(u32, u32)>()
-            + m.hosts.borrow().capacity() * size_of::<HostSlot>()
-            + m.free_hosts.borrow().capacity() * size_of::<u32>()
-            + m.dead_hosts.borrow().capacity() * size_of::<Box<dyn Any>>()
-            + m.stacks.borrow().capacity() * size_of::<Rc<StackRecord>>()
-            + m.handles.borrow().capacity() * size_of::<Rc<RootRecord>>()
-            + m.frozen.table_bytes();
-        let before = m.tables.replace(bytes);
+            + meta.hosts.borrow().capacity() * size_of::<HostSlot>()
+            + meta.free_hosts.borrow().capacity() * size_of::<u32>()
+            + meta.dead_hosts.borrow().capacity() * size_of::<Box<dyn Any>>()
+            + meta.stacks.borrow().capacity() * size_of::<Rc<StackRecord>>()
+            + meta.handles.borrow().capacity() * size_of::<Rc<RootRecord>>()
+            + meta.frozen.table_bytes();
+        let before = meta.tables.replace(bytes);
         if bytes > before {
-            m.budget.force(bytes - before);
+            meta.budget.force(bytes - before);
         } else {
-            m.budget.refund(before - bytes);
+            meta.budget.refund(before - bytes);
         }
     }
 
@@ -1608,27 +1608,27 @@ impl Arena {
     /// worth, which the next steps would fill again, and trims the pages handed out to the last
     /// one kept. A major cycle may have freed any page; a minor collection, those it emptied.
     fn settle(&mut self) {
-        let Self { memory, meta: m } = self;
-        if m.phase.get() != Phase::Idle {
+        let Self { memory, meta } = self;
+        if meta.phase.get() != Phase::Idle {
             return;
         }
-        let emptied = std::mem::take(&mut *m.emptied.borrow_mut());
-        if m.settle.replace(false) {
-            give_back(memory, m, 1..m.used.get());
+        let emptied = std::mem::take(&mut *meta.emptied.borrow_mut());
+        if meta.settle.replace(false) {
+            give_back(memory, meta, 1..meta.used.get());
         } else if !emptied.is_empty() {
-            give_back(memory, m, emptied.into_iter().map(|p| p as usize));
+            give_back(memory, meta, emptied.into_iter().map(|page| page as usize));
         } else {
             return;
         }
         // Pages past the last one still committed are handed out again as fresh ones.
-        let used = m.used.get();
-        m.used.set((1..used).rev().find(|&p| !m.pages[p].released.get()).map_or(1, |p| p + 1));
+        let used = meta.used.get();
+        meta.used.set((1..used).rev().find(|&page| !meta.pages[page].released.get()).map_or(1, |page| page + 1));
     }
 
-    pub fn mutate<R>(&mut self, f: impl for<'gc> FnOnce(&Mutation<'gc>) -> R) -> R {
-        let m = &self.meta;
-        m.step_end.set(m.made().saturating_add(m.step_allowance()));
-        f(&Mutation { heap: self.heap(), _brand: PhantomData })
+    pub fn mutate<R>(&mut self, body: impl for<'gc> FnOnce(&Mutation<'gc>) -> R) -> R {
+        let meta = &self.meta;
+        meta.step_end.set(meta.made().saturating_add(meta.step_allowance()));
+        body(&Mutation { heap: self.heap(), _brand: PhantomData })
     }
 
     /// Like `mutate`, then paces collection: a minor collection once the nursery fills, and a
@@ -1638,14 +1638,14 @@ impl Arena {
     /// or more when room is short, paid in slices of at least `MIN_SLICE`. Dead host and frozen
     /// values are freed a batch after each step.
     ///
-    /// If `f` drew on the reserve, a full collection runs instead. If an allocation failed,
-    /// even one `f` went on without, the result is dropped, a full collection runs, and the
-    /// step fails. Whatever `f` did before the failure stays done, so the caller picks up from
+    /// If `body` drew on the reserve, a full collection runs instead. If an allocation failed,
+    /// even one `body` went on without, the result is dropped, a full collection runs, and the
+    /// step fails. Whatever `body` did before the failure stays done, so the caller picks up from
     /// there: an interpreter runs the failed instruction again.
-    pub fn step<R>(&mut self, f: impl for<'gc> FnOnce(&Mutation<'gc>) -> R) -> Result<R, OutOfMemory> {
+    pub fn step<R>(&mut self, body: impl for<'gc> FnOnce(&Mutation<'gc>) -> R) -> Result<R, OutOfMemory> {
         self.meta.budget.clear_failed();
         let before = self.meta.made();
-        let result = self.mutate(f);
+        let result = self.mutate(body);
         if self.meta.budget.failed() {
             drop(result);
             self.collect();
@@ -1663,27 +1663,27 @@ impl Arena {
             self.finish(FREE_BATCH);
             return Ok(result);
         }
-        let m = &self.meta;
-        if m.phase.get() == Phase::Idle && m.young_bytes() >= m.nursery {
+        let meta = &self.meta;
+        if meta.phase.get() == Phase::Idle && meta.young_bytes() >= meta.nursery {
             self.heap().minor();
         }
-        let m = &self.meta;
-        if m.phase.get() == Phase::Idle && (m.paced_bytes() >= m.threshold.get() || m.short_of_room()) {
-            if m.young_bytes() > 0 {
+        let meta = &self.meta;
+        if meta.phase.get() == Phase::Idle && (meta.paced_bytes() >= meta.threshold.get() || meta.short_of_room()) {
+            if meta.young_bytes() > 0 {
                 self.heap().minor();
             }
             self.heap().start();
             // Fast enough to be done before the room runs out.
-            let m = &self.meta;
-            m.pace.set(m.cycle_work().div_ceil(m.room().max(1)).max(STEP_MUL));
-            m.debt.set(0);
+            let meta = &self.meta;
+            meta.pace.set(meta.cycle_work().div_ceil(meta.room().max(1)).max(STEP_MUL));
+            meta.debt.set(0);
         }
-        let m = &self.meta;
-        if m.phase.get() != Phase::Idle {
-            let debt = m.debt.get().saturating_add(allocated.saturating_mul(m.pace.get()));
-            m.debt.set(debt);
+        let meta = &self.meta;
+        if meta.phase.get() != Phase::Idle {
+            let debt = meta.debt.get().saturating_add(allocated.saturating_mul(meta.pace.get()));
+            meta.debt.set(debt);
             if debt >= MIN_SLICE {
-                m.debt.set(0);
+                meta.debt.set(0);
                 self.heap().work(debt);
             }
         }
@@ -1729,9 +1729,9 @@ impl Arena {
 
     /// Bytes of pages handed out and not given back: about what the arena holds in memory.
     pub fn committed_bytes(&self) -> usize {
-        let m = &self.meta;
-        let pages = &m.pages[1..m.used.get()];
-        (pages.len() - pages.iter().filter(|p| p.released.get()).count()) * PAGE * 8
+        let meta = &self.meta;
+        let pages = &meta.pages[1..meta.used.get()];
+        (pages.len() - pages.iter().filter(|page| page.released.get()).count()) * PAGE * 8
     }
 
     /// Bytes of pages holding something, as of the last sweep.
@@ -1742,7 +1742,7 @@ impl Arena {
     /// Objects marked and not yet swept away: after [`Arena::collect`], the live ones.
     pub fn objects(&self) -> usize {
         let pages = &self.meta.pages[..self.meta.used.get()];
-        pages.iter().flat_map(|p| p.starts.iter().zip(&p.marks)).map(|(s, k)| (s.get() & k.get()).count_ones() as usize).sum()
+        pages.iter().flat_map(|page| page.starts.iter().zip(&page.marks)).map(|(start, mark)| (start.get() & mark.get()).count_ones() as usize).sum()
     }
 
     pub fn hosts(&self) -> usize {
@@ -1778,9 +1778,9 @@ impl Arena {
     /// Testing: lets `allocations` more allocations through, then fails the next one, once.
     /// Objects, host values and stacks count.
     pub fn fail_after(&mut self, allocations: Option<u64>) {
-        let m = &self.meta;
-        m.budget.fail_after(allocations);
-        m.end.set(if m.budget.injecting() { m.cursor.get() } else { m.hole_end.get() });
+        let meta = &self.meta;
+        meta.budget.fail_after(allocations);
+        meta.end.set(if meta.budget.injecting() { meta.cursor.get() } else { meta.hole_end.get() });
     }
 
     /// Testing: a minor collection and a cycle slice of `work` bytes after every step.
@@ -1833,14 +1833,14 @@ impl<'gc> Mutation<'gc> {
         Some(TypeTag { ty, _marker: PhantomData })
     }
 
-    pub fn root(&self, i: usize) -> Value<'gc> {
+    pub fn root(&self, index: usize) -> Value<'gc> {
         let roots = &self.heap.m.roots;
-        Value::from_bits(roots[..roots.len() - 1][i].get())
+        Value::from_bits(roots[..roots.len() - 1][index].get())
     }
 
-    pub fn set_root(&self, i: usize, value: Value<'gc>) {
+    pub fn set_root(&self, index: usize, value: Value<'gc>) {
         let roots = &self.heap.m.roots;
-        roots[..roots.len() - 1][i].set(value.word);
+        roots[..roots.len() - 1][index].set(value.word);
     }
 
     /// The root that holds the arena's intern table, once there is one.
@@ -1851,41 +1851,41 @@ impl<'gc> Mutation<'gc> {
     /// Charged its size, plus `HOST_COST`. Memory the value owns elsewhere, such as a
     /// `String`'s bytes, can be counted with [`HostRef::set_owned_bytes`].
     pub fn host<T: Any>(&self, value: T) -> Result<HostRef<'gc, T>, HostError> {
-        let m = self.heap.m;
-        let mut hosts = m.hosts.try_borrow_mut().map_err(|_| HostError::InUse)?;
-        m.budget.count_allocation()?;
+        let meta = self.heap.m;
+        let mut hosts = meta.hosts.try_borrow_mut().map_err(|_| HostError::InUse)?;
+        meta.budget.count_allocation()?;
         let cost = size_of::<T>() + HOST_COST;
-        m.budget.ensure(cost)?;
+        meta.budget.ensure(cost)?;
         // Made while marking, it lives through the cycle, as objects do.
-        let marked = m.phase.get() == Phase::Marking;
+        let marked = meta.phase.get() == Phase::Marking;
         let value: Box<dyn Any> = Box::new(value);
-        let id = match m.free_hosts.borrow_mut().pop() {
+        let id = match meta.free_hosts.borrow_mut().pop() {
             Some(id) => id,
             None => {
                 let Some(id) = u32::try_from(hosts.len()).ok().filter(|&id| id < u32::MAX) else {
-                    return Err(m.budget.fail().into());
+                    return Err(meta.budget.fail().into());
                 };
                 if hosts.len() == hosts.capacity() {
                     // Charged as it grows, so growing fails as an allocation would.
                     let more = hosts.capacity().max(16);
-                    m.budget.ensure(cost + more * size_of::<HostSlot>())?;
+                    meta.budget.ensure(cost + more * size_of::<HostSlot>())?;
                     let before = hosts.capacity();
                     hosts.reserve_exact(more);
                     let grown = (hosts.capacity() - before) * size_of::<HostSlot>();
-                    m.budget.force(grown);
-                    m.tables.set(m.tables.get() + grown);
+                    meta.budget.force(grown);
+                    meta.tables.set(meta.tables.get() + grown);
                 }
-                hosts.push(HostSlot { generation: m.host_floor.get(), marked: false, cost: 0, owned: 0, value: None });
+                hosts.push(HostSlot { generation: meta.host_floor.get(), marked: false, cost: 0, owned: 0, value: None });
                 id
             }
         };
-        m.budget.force(cost);
+        meta.budget.force(cost);
         let slot = &mut hosts[id as usize];
         slot.value = Some(value);
         slot.marked = marked;
         slot.cost = cost;
         slot.owned = 0;
-        m.host_bytes.set(m.host_bytes.get() + cost);
+        meta.host_bytes.set(meta.host_bytes.get() + cost);
         Ok(HostRef { id, generation: slot.generation, _marker: PhantomData })
     }
 
@@ -1899,14 +1899,14 @@ impl<'gc> Mutation<'gc> {
     /// Like [`Mutation::frozen`], also charged `bytes` that `value` owns outside the arena, such
     /// as a string's characters, until it's freed.
     pub fn frozen_owning<T: Any>(&self, value: T, bytes: usize) -> Result<FrozenRef<'gc, T>, OutOfMemory> {
-        let m = self.heap.m;
-        m.frozen.alloc(&m.budget, false, value, bytes).map(FrozenRef::new)
+        let meta = self.heap.m;
+        meta.frozen.alloc(&meta.budget, false, value, bytes).map(FrozenRef::new)
     }
 
     /// Runs allocations the caller can do without, such as growing a buffer by more than it
     /// needs: failing them doesn't fail the step, and they don't draw on the reserve.
-    pub fn optional<R>(&self, f: impl FnOnce() -> Result<R, OutOfMemory>) -> Result<R, OutOfMemory> {
-        self.heap.m.budget.optional(f)
+    pub fn optional<R>(&self, allocate: impl FnOnce() -> Result<R, OutOfMemory>) -> Result<R, OutOfMemory> {
+        self.heap.m.budget.optional(allocate)
     }
 
     /// Fails the step as a failed allocation would, for a request too large to even size.
@@ -1924,8 +1924,8 @@ impl<'gc> Mutation<'gc> {
     /// ends, or a full collection is due. An interpreter checks it after it allocates, and ends
     /// the step at the next place it can go on from, so collection keeps up.
     pub fn step_due(&self) -> bool {
-        let m = self.heap.m;
-        m.made() >= m.step_end.get() || m.budget.due()
+        let meta = self.heap.m;
+        meta.made() >= meta.step_end.get() || meta.budget.due()
     }
 
     /// A charge of nothing yet against the budget, for memory kept outside the arena.
@@ -1947,25 +1947,25 @@ impl<'gc> Mutation<'gc> {
     }
 }
 
-/// Where `t`'s type number is cached: by what its hash writes, which is a hash already.
+/// Where `type_id`'s type number is cached: by what its hash writes, which is a hash already.
 #[inline]
-fn cache_slot(t: TypeId) -> usize {
+fn cache_slot(type_id: TypeId) -> usize {
     struct Bits(u64);
     impl std::hash::Hasher for Bits {
         fn finish(&self) -> u64 {
             self.0
         }
         fn write(&mut self, bytes: &[u8]) {
-            for &b in bytes {
-                self.0 = self.0.rotate_left(8) ^ u64::from(b);
+            for &byte in bytes {
+                self.0 = self.0.rotate_left(8) ^ u64::from(byte);
             }
         }
-        fn write_u64(&mut self, n: u64) {
-            self.0 ^= n;
+        fn write_u64(&mut self, number: u64) {
+            self.0 ^= number;
         }
     }
     let mut bits = Bits(0);
-    std::hash::Hash::hash(&t, &mut bits);
+    std::hash::Hash::hash(&type_id, &mut bits);
     (bits.0 as usize) % 64
 }
 
@@ -1974,37 +1974,37 @@ impl<'a> Heap<'a> {
     fn type_index(self, desc: &'static Desc) -> Option<u16> {
         // A type with a number is where its number says, once registered; others are cached.
         let found = if let Some(ty) = desc.number {
-            self.m.descs.get(usize::from(ty)).and_then(Cell::get).filter(|d| d.type_id == desc.type_id).map(|_| ty)
+            self.m.descs.get(usize::from(ty)).and_then(Cell::get).filter(|registered| registered.type_id == desc.type_id).map(|_| ty)
         } else {
-            self.m.cache[cache_slot(desc.type_id)].get().filter(|&(t, _)| t == desc.type_id).map(|(_, ty)| ty)
+            self.m.cache[cache_slot(desc.type_id)].get().filter(|&(type_id, _)| type_id == desc.type_id).map(|(_, ty)| ty)
         };
         found.or_else(|| self.type_index_slow(desc))
     }
 
     #[inline(never)]
     fn type_index_slow(self, desc: &'static Desc) -> Option<u16> {
-        let (m, next) = (self.m, self.m.next.get());
-        let same = |d: &'static Desc| d.type_id == desc.type_id;
+        let (meta, next) = (self.m, self.m.next.get());
+        let same = |other: &'static Desc| other.type_id == desc.type_id;
         let ty = if let Some(ty) = desc.number {
             let ty = usize::from(ty);
             if ty > next {
                 return None;
             }
-            let slot = m.descs.get_or_grow(ty)?;
+            let slot = meta.descs.get_or_grow(ty)?;
             match slot.get() {
                 None => slot.set(Some(desc)),
-                Some(d) if same(d) => {}
+                Some(registered) if same(registered) => {}
                 Some(_) => panic!("two types have type number {ty}: declare one objects! group `after` the other"),
             }
-            m.low.set(m.low.get().max(ty + 1));
+            meta.low.set(meta.low.get().max(ty + 1));
             ty
         } else {
-            match (next + 1..TYPES).find(|&i| m.descs.get(i).and_then(Cell::get).is_some_and(same)) {
+            match (next + 1..TYPES).find(|&i| meta.descs.get(i).and_then(Cell::get).is_some_and(same)) {
                 Some(ty) => ty,
-                None if next < m.low.get() => return None,
+                None if next < meta.low.get() => return None,
                 None => {
-                    m.descs.get_or_grow(next)?.set(Some(desc));
-                    m.next.set(next - 1);
+                    meta.descs.get_or_grow(next)?.set(Some(desc));
+                    meta.next.set(next - 1);
                     next
                 }
             }
@@ -2103,30 +2103,30 @@ impl<'a> Heap<'a> {
         } else {
             self.reserve_slow(size)?
         };
-        self.set_bit(at, |p| &p.starts);
+        self.set_bit(at, |page| &page.starts);
         Ok(at)
     }
 
     #[inline(never)]
     fn reserve_slow(self, size: usize) -> Result<usize, OutOfMemory> {
-        let m = self.m;
-        m.budget.count_allocation()?;
+        let meta = self.m;
+        meta.budget.count_allocation()?;
         // The hole still fits it if failures are injected, or just stopped being.
-        let at = m.cursor.get();
-        if at + size <= m.hole_end.get() {
-            m.cursor.set(at + size);
-            m.end.set(if m.budget.injecting() { at + size } else { m.hole_end.get() });
+        let at = meta.cursor.get();
+        if at + size <= meta.hole_end.get() {
+            meta.cursor.set(at + size);
+            meta.end.set(if meta.budget.injecting() { at + size } else { meta.hole_end.get() });
             return Ok(at);
         }
         if size > PAGE - LINE {
             // Its own run of free pages, its lines claimed so nothing else is put there.
-            let n = size.div_ceil(PAGE);
-            let first = match self.free_run(n, false)? {
+            let count = size.div_ceil(PAGE);
+            let first = match self.free_run(count, false)? {
                 Some(first) => first,
-                None => self.fresh_pages(n)?,
+                None => self.fresh_pages(count)?,
             };
-            self.cover_lines(first * PAGE, size, |p| &p.used);
-            self.m.pages[first..first + n].iter().for_each(|p| p.large.set(Some(first as u32)));
+            self.cover_lines(first * PAGE, size, |page| &page.used);
+            self.m.pages[first..first + count].iter().for_each(|page| page.large.set(Some(first as u32)));
             return Ok(first * PAGE);
         }
         loop {
@@ -2134,15 +2134,15 @@ impl<'a> Heap<'a> {
                 Some(hole) => hole,
                 None => {
                     let page = self.fresh_pages(1)?;
-                    m.pages[page].used.set(u128::MAX);
-                    m.scan.set((page + 1) * LINES);
+                    meta.pages[page].used.set(u128::MAX);
+                    meta.scan.set((page + 1) * LINES);
                     (page * PAGE, (page + 1) * PAGE)
                 }
             };
             if end - start >= size {
-                m.cursor.set(start + size);
-                m.hole_end.set(end);
-                m.end.set(if m.budget.injecting() { start + size } else { end });
+                meta.cursor.set(start + size);
+                meta.hole_end.set(end);
+                meta.end.set(if meta.budget.injecting() { start + size } else { end });
                 return Ok(start);
             }
         }
@@ -2154,11 +2154,11 @@ impl<'a> Heap<'a> {
         while scan < self.m.used.get() * LINES {
             let (page, line) = (scan / LINES, scan % LINES);
             self.sweep_before_use(page);
-            let p = &self.m.pages[page];
-            let used = p.used.get();
+            let entry = &self.m.pages[page];
+            let used = entry.used.get();
             let free = !used & (u128::MAX << line);
             // Filling pages chosen for evacuation would undo the compaction.
-            if free == 0 || p.evacuating.get() {
+            if free == 0 || entry.evacuating.get() {
                 scan = (page + 1) * LINES;
                 continue;
             }
@@ -2166,7 +2166,7 @@ impl<'a> Heap<'a> {
             self.m.young_pages.insert(page);
             let start = free.trailing_zeros() as usize;
             let end = (used & (u128::MAX << start)).trailing_zeros() as usize;
-            p.used.set(used | (u128::MAX >> (LINES - end)) & (u128::MAX << start));
+            entry.used.set(used | (u128::MAX >> (LINES - end)) & (u128::MAX << start));
             self.m.scan.set(page * LINES + end);
             return Ok(Some((page * PAGE + start * LINE, page * PAGE + end * LINE)));
         }
@@ -2177,47 +2177,47 @@ impl<'a> Heap<'a> {
     /// Charges again for pages given back to the system, before they're used.
     fn recommit(self, pages: Range<usize>) -> Result<(), OutOfMemory> {
         let pages = &self.m.pages[pages];
-        let released = pages.iter().filter(|p| p.released.get()).count();
+        let released = pages.iter().filter(|page| page.released.get()).count();
         if released > 0 {
             self.m.budget.charge(released * PAGE_COST)?;
             self.m.committed.set(self.m.committed.get() + released);
-            pages.iter().for_each(|p| p.released.set(false));
+            pages.iter().for_each(|page| page.released.set(false));
         }
         Ok(())
     }
 
-    /// The first of `n` free pages in a row among those handed out. Evacuation can't copy
+    /// The first of `count` free pages in a row among those handed out. Evacuation can't copy
     /// onto pages being evacuated.
-    fn free_run(self, n: usize, evacuation: bool) -> Result<Option<usize>, OutOfMemory> {
+    fn free_run(self, count: usize, evacuation: bool) -> Result<Option<usize>, OutOfMemory> {
         let mut run = 0;
-        for p in 1..self.m.used.get() {
-            self.sweep_before_use(p);
-            let page = &self.m.pages[p];
+        for index in 1..self.m.used.get() {
+            self.sweep_before_use(index);
+            let page = &self.m.pages[index];
             let free = page.used.get() == 0 && !(evacuation && page.evacuating.get());
             run = if free { run + 1 } else { 0 };
-            if run == n {
-                let first = p + 1 - n;
-                self.recommit(first..p + 1)?;
-                self.m.young_pages.insert_all(first..p + 1);
+            if run == count {
+                let first = index + 1 - count;
+                self.recommit(first..index + 1)?;
+                self.m.young_pages.insert_all(first..index + 1);
                 return Ok(Some(first));
             }
         }
         Ok(None)
     }
 
-    fn fresh_pages(self, n: usize) -> Result<usize, OutOfMemory> {
+    fn fresh_pages(self, count: usize) -> Result<usize, OutOfMemory> {
         let first = self.m.used.get();
-        if first + n > self.m.pages.len() {
+        if first + count > self.m.pages.len() {
             return Err(self.m.budget.fail());
         }
-        self.m.budget.charge(n * PAGE_COST)?;
-        self.m.committed.set(self.m.committed.get() + n);
-        self.m.used.set(first + n);
-        self.m.young_pages.insert_all(first..first + n);
+        self.m.budget.charge(count * PAGE_COST)?;
+        self.m.committed.set(self.m.committed.get() + count);
+        self.m.used.set(first + count);
+        self.m.young_pages.insert_all(first..first + count);
         // Nothing on them is from before the cycle, so a lazy sweep has nothing to do there.
-        for p in &self.m.pages[first..first + n] {
-            p.swept.set(true);
-            p.released.set(false);
+        for page in &self.m.pages[first..first + count] {
+            page.swept.set(true);
+            page.released.set(false);
         }
         Ok(first)
     }
@@ -2240,13 +2240,13 @@ impl<'a> Heap<'a> {
     }
 
     #[inline]
-    fn set_bit(self, i: usize, bits: impl FnOnce(&Page) -> &[Cell<u64>; PAGE / 64]) {
-        let word = &bits(&self.m.pages[i / PAGE])[i % PAGE / 64];
-        word.set(word.get() | 1 << (i % 64));
+    fn set_bit(self, index: usize, bits: impl FnOnce(&Page) -> &[Cell<u64>; PAGE / 64]) {
+        let word = &bits(&self.m.pages[index / PAGE])[index % PAGE / 64];
+        word.set(word.get() | 1 << (index % 64));
     }
 
-    fn has_bit(self, i: usize, bits: impl FnOnce(&Page) -> &[Cell<u64>; PAGE / 64]) -> bool {
-        self.m.pages.get(i / PAGE).is_some_and(|p| bits(p)[i % PAGE / 64].get() & 1 << (i % 64) != 0)
+    fn has_bit(self, index: usize, bits: impl FnOnce(&Page) -> &[Cell<u64>; PAGE / 64]) -> bool {
+        self.m.pages.get(index / PAGE).is_some_and(|page| bits(page)[index % PAGE / 64].get() & 1 << (index % 64) != 0)
     }
 
     /// Sets the lines under `size` words at `start` in one of a page's line maps.
@@ -2276,7 +2276,7 @@ impl<'a> Heap<'a> {
     /// Marks the host a word names, if its generation still matches.
     fn mark_host(self, word: u64) {
         let Some((id, generation)) = host_parts(word) else { return };
-        if let Some(host) = self.m.hosts.borrow_mut().get_mut(id as usize).filter(|h| h.generation == generation) {
+        if let Some(host) = self.m.hosts.borrow_mut().get_mut(id as usize).filter(|host| host.generation == generation) {
             host.marked = true;
         }
     }
@@ -2308,7 +2308,7 @@ impl<'a> Heap<'a> {
     fn barrier_ref(self, slot: usize, owner: u32, target: u32) {
         // Minor collections trace only marked objects from their cards: an unmarked one is young,
         // and traced anyway if it's reached.
-        if self.has_bit(owner as usize, |p| &p.marks) {
+        if self.has_bit(owner as usize, |page| &page.marks) {
             self.dirty(slot);
             if self.m.phase.get() == Phase::Marking {
                 shade(self.words, self.m, slot, owner, target);
@@ -2319,7 +2319,7 @@ impl<'a> Heap<'a> {
     /// While marking, a store into a marked object marks its target, and if the target is to
     /// move, notes the slot to fix.
     fn shade(self, slot: usize, owner: u32, target: u32) {
-        if self.has_bit(owner as usize, |p| &p.marks) {
+        if self.has_bit(owner as usize, |page| &page.marks) {
             self.shade_marked(slot, owner, target);
         }
     }
@@ -2348,16 +2348,16 @@ impl<'a> Heap<'a> {
             i = to;
         }
         if self.m.phase.get() == Phase::Marking && matches!(refs, Refs::Values | Refs::Members) {
-            for (k, slot) in slots.iter().enumerate() {
+            for (offset, slot) in slots.iter().enumerate() {
                 if let Some(target) = refs.target(slot.get()) {
-                    self.shade(at + k, owner, target);
+                    self.shade(at + offset, owner, target);
                 }
             }
         }
     }
 
     fn in_evacuation(self, index: u32) -> bool {
-        self.m.pages.get(index as usize / PAGE).is_some_and(|p| p.evacuating.get())
+        self.m.pages.get(index as usize / PAGE).is_some_and(|page| page.evacuating.get())
     }
 
     // Collection.
@@ -2384,19 +2384,19 @@ impl<'a> Heap<'a> {
 
     /// Starts a major cycle: clears the marks and marks the roots.
     fn start(self) {
-        let m = self.m;
-        if m.phase.get() != Phase::Idle {
+        let meta = self.m;
+        if meta.phase.get() != Phase::Idle {
             return;
         }
         // Pages at most a quarter in use are evacuated while half the free room covers them.
         // Pages of large objects stay.
-        let pages = &m.pages[..m.used.get()];
-        let all = m.evacuate_all.get();
-        let occupied: usize = pages.iter().map(|p| p.used.get().count_ones() as usize * LINE).sum();
-        let mut room = (m.budget.limit() / 8).saturating_sub(occupied) / 2;
+        let pages = &meta.pages[..meta.used.get()];
+        let all = meta.evacuate_all.get();
+        let occupied: usize = pages.iter().map(|page| page.used.get().count_ones() as usize * LINE).sum();
+        let mut room = (meta.budget.limit() / 8).saturating_sub(occupied) / 2;
         let mut count = 0;
         for page in pages {
-            page.marks.iter().for_each(|w| w.set(0));
+            page.marks.iter().for_each(|word| word.set(0));
             page.lines.set(0);
             page.cards.set(0);
             let used = page.used.get().count_ones() as usize * LINE;
@@ -2407,25 +2407,25 @@ impl<'a> Heap<'a> {
             }
             page.evacuating.set(candidate);
         }
-        m.dirty_pages.clear();
+        meta.dirty_pages.clear();
         let evacuating = count > 1 || all && count > 0;
         if !evacuating {
-            pages.iter().for_each(|p| p.evacuating.set(false));
+            pages.iter().for_each(|page| page.evacuating.set(false));
         }
-        m.hosts.borrow_mut().iter_mut().for_each(|h| h.marked = false);
-        m.frozen.clear_marks();
-        m.evacuating.set(evacuating);
-        m.to_cursor.set(0);
-        m.to_end.set(0);
-        m.phase.set(Phase::Marking);
-        m.cycle_work.set(0);
-        let mut work = std::mem::take(&mut *m.work.borrow_mut());
+        meta.hosts.borrow_mut().iter_mut().for_each(|host| host.marked = false);
+        meta.frozen.clear_marks();
+        meta.evacuating.set(evacuating);
+        meta.to_cursor.set(0);
+        meta.to_end.set(0);
+        meta.phase.set(Phase::Marking);
+        meta.cycle_work.set(0);
+        let mut work = std::mem::take(&mut *meta.work.borrow_mut());
         work.fixups.clear();
         work.holders.clear();
         work.weak_runs.clear();
         work.ephemerons.clear();
         self.mark_roots(&mut work);
-        *m.work.borrow_mut() = work;
+        *meta.work.borrow_mut() = work;
     }
 
     /// Does about `budget` bytes of the cycle: marking, the atomic phase once nothing is left
@@ -2473,8 +2473,8 @@ impl<'a> Heap<'a> {
     fn drain(self, work: &mut Work, budget: usize) -> Option<usize> {
         let mut left = budget;
         while left > 0 {
-            let Some(i) = work.gray.pop() else { return Some(left) };
-            left = left.saturating_sub(self.trace(i as usize, work) * 8);
+            let Some(index) = work.gray.pop() else { return Some(left) };
+            left = left.saturating_sub(self.trace(index as usize, work) * 8);
         }
         work.gray.is_empty().then_some(0)
     }
@@ -2482,28 +2482,28 @@ impl<'a> Heap<'a> {
     /// Ends marking: rescans the roots, which take no barrier, clears dead weak references,
     /// moves the objects being evacuated, and frees dead hosts. Sweeping comes after.
     fn atomic(self, work: &mut Work) {
-        let m = self.m;
+        let meta = self.m;
         self.mark_roots(work);
         self.drain(work, usize::MAX);
         self.trace_ephemerons(work);
         self.clear_weaks(work);
-        if m.evacuating.get() {
+        if meta.evacuating.get() {
             self.evacuate(work);
-            m.evacuations.set(m.evacuations.get() + 1);
+            meta.evacuations.set(meta.evacuations.get() + 1);
         }
-        m.frozen.sweep_all();
+        meta.frozen.sweep_all();
         self.sweep_hosts();
-        for page in &m.pages[..m.used.get()] {
+        for page in &meta.pages[..meta.used.get()] {
             page.cards.set(0);
             page.evacuating.set(false);
             page.swept.set(false);
         }
-        m.dirty_pages.clear();
-        m.young_pages.clear();
+        meta.dirty_pages.clear();
+        meta.young_pages.clear();
         self.reset_allocator(LINES);
-        m.evacuating.set(false);
-        m.sweep_cursor.set(0);
-        m.phase.set(Phase::Sweeping);
+        meta.evacuating.set(false);
+        meta.sweep_cursor.set(0);
+        meta.phase.set(Phase::Sweeping);
         work.fixups.clear();
         work.holders.clear();
         work.weak_runs.clear();
@@ -2514,46 +2514,46 @@ impl<'a> Heap<'a> {
     /// and gives back room the table no longer needs. The free list hands out the lowest ids
     /// first, so live values gather at the front and the end keeps emptying.
     fn sweep_hosts(self) {
-        let m = self.m;
-        let mut hosts = m.hosts.borrow_mut();
-        let mut dead = m.dead_hosts.borrow_mut();
+        let meta = self.m;
+        let mut hosts = meta.hosts.borrow_mut();
+        let mut dead = meta.dead_hosts.borrow_mut();
         for host in hosts.iter_mut() {
             if !host.marked && let Some(value) = host.value.take() {
                 dead.push(value);
-                m.budget.refund(host.cost);
-                m.host_bytes.set(m.host_bytes.get() - std::mem::take(&mut host.cost));
+                meta.budget.refund(host.cost);
+                meta.host_bytes.set(meta.host_bytes.get() - std::mem::take(&mut host.cost));
                 // A slot whose generation reaches the last one is retired.
                 host.generation = host.generation.saturating_add(1);
             }
         }
-        let free = |h: &HostSlot| h.value.is_none() && h.generation < u32::MAX;
-        let len = hosts.iter().rposition(|h| !free(h)).map_or(0, |i| i + 1);
-        let floor = hosts[len..].iter().map(|h| h.generation).max().unwrap_or(0);
-        m.host_floor.set(m.host_floor.get().max(floor));
+        let free = |host: &HostSlot| host.value.is_none() && host.generation < u32::MAX;
+        let len = hosts.iter().rposition(|host| !free(host)).map_or(0, |index| index + 1);
+        let floor = hosts[len..].iter().map(|host| host.generation).max().unwrap_or(0);
+        meta.host_floor.set(meta.host_floor.get().max(floor));
         hosts.truncate(len);
         shrink(&mut hosts);
-        let mut ids = m.free_hosts.borrow_mut();
+        let mut ids = meta.free_hosts.borrow_mut();
         ids.clear();
         ids.extend((0..len as u32).rev().filter(|&id| free(&hosts[id as usize])));
         shrink(&mut ids);
     }
 
     fn finish_cycle(self) {
-        let m = self.m;
+        let meta = self.m;
         // Pages handed out fresh while sweeping held nothing to sweep, so they're counted here.
         let mut occupied = 0;
-        for page in &m.pages[..m.used.get()] {
+        for page in &meta.pages[..meta.used.get()] {
             page.counted.set(page.used.get() != 0);
             occupied += usize::from(page.counted.get());
         }
-        m.occupied.set(occupied);
-        let size = m.paced_bytes();
-        let limit = m.budget.limit();
-        m.threshold.set((size * 2).max(MIN_THRESHOLD).min(size + limit.saturating_sub(size) / 2));
-        m.last_work.set(m.cycle_work.get());
-        m.phase.set(Phase::Idle);
-        m.settle.set(true);
-        m.collections.set(m.collections.get() + 1);
+        meta.occupied.set(occupied);
+        let size = meta.paced_bytes();
+        let limit = meta.budget.limit();
+        meta.threshold.set((size * 2).max(MIN_THRESHOLD).min(size + limit.saturating_sub(size) / 2));
+        meta.last_work.set(meta.cycle_work.get());
+        meta.phase.set(Phase::Idle);
+        meta.settle.set(true);
+        meta.collections.set(meta.collections.get() + 1);
     }
 
     fn mark_roots(self, work: &mut Work) {
@@ -2566,11 +2566,11 @@ impl<'a> Heap<'a> {
         }
         // A dropped stack, traced once more for what it wrote, is done with.
         let before = stacks.len();
-        stacks.retain(|s| Rc::strong_count(s) > 1);
+        stacks.retain(|stack| Rc::strong_count(stack) > 1);
         self.m.budget.refund((before - stacks.len()) * STACK_COST);
         let mut handles = self.m.handles.borrow_mut();
         let before = handles.len();
-        handles.retain(|h| Rc::strong_count(h) > 1);
+        handles.retain(|handle| Rc::strong_count(handle) > 1);
         self.m.budget.refund((before - handles.len()) * ROOT_COST);
         for handle in handles.iter() {
             self.visit(&handle.word, work);
@@ -2581,29 +2581,29 @@ impl<'a> Heap<'a> {
     /// allocator looks again from the first young page with a free line: those before it that it
     /// looked at, it found full, and they still are.
     fn sweep_young(self) {
-        let m = self.m;
-        for p in m.dirty_pages.iter(true) {
-            m.pages[p].cards.set(0);
+        let meta = self.m;
+        for page in meta.dirty_pages.iter(true) {
+            meta.pages[page].cards.set(0);
         }
-        let (mut first, mut emptied) = (None, m.emptied.borrow_mut());
-        for p in m.young_pages.iter(true) {
-            self.sweep_page(p);
-            let used = m.pages[p].used.get();
+        let (mut first, mut emptied) = (None, meta.emptied.borrow_mut());
+        for page in meta.young_pages.iter(true) {
+            self.sweep_page(page);
+            let used = meta.pages[page].used.get();
             if used != u128::MAX {
-                first = first.or(Some(p));
+                first = first.or(Some(page));
             }
             if used == 0 {
-                emptied.push(p as u32);
+                emptied.push(page as u32);
             }
         }
-        self.reset_allocator(first.map_or(m.scan.get(), |p| m.scan.get().min(p * LINES)));
+        self.reset_allocator(first.map_or(meta.scan.get(), |page| meta.scan.get().min(page * LINES)));
     }
 
     /// Frees what wasn't marked and gives the allocator the lines that were.
-    fn sweep_page(self, p: usize) {
-        let page = &self.m.pages[p];
-        for (s, k) in page.starts.iter().zip(&page.marks) {
-            s.set(s.get() & k.get());
+    fn sweep_page(self, index: usize) {
+        let page = &self.m.pages[index];
+        for (start, mark) in page.starts.iter().zip(&page.marks) {
+            start.set(start.get() & mark.get());
         }
         let lines = page.lines.get();
         page.used.set(lines);
@@ -2612,7 +2612,7 @@ impl<'a> Heap<'a> {
             self.m.occupied.set(if lines != 0 { occupied + 1 } else { occupied - 1 });
         }
         // Its last page can hold small objects that outlive it.
-        if lines == 0 || page.large.get().is_some_and(|first| !self.has_bit(first as usize * PAGE, |p| &p.marks)) {
+        if lines == 0 || page.large.get().is_some_and(|first| !self.has_bit(first as usize * PAGE, |page| &page.marks)) {
             page.large.set(None);
         }
         page.swept.set(true);
@@ -2621,17 +2621,17 @@ impl<'a> Heap<'a> {
     /// Clears weak fields whose targets weren't marked.
     fn clear_weaks(self, work: &mut Work) {
         for &holder in &work.holders {
-            let i = holder as usize;
-            let Some(desc) = self.words.get(i).and_then(|h| self.desc(h.get())) else { continue };
+            let index = holder as usize;
+            let Some(desc) = self.words.get(index).and_then(|header| self.desc(header.get())) else { continue };
             let mut bits = desc.weaks;
             while bits != 0 {
-                if let Some(slot) = self.words.get(i + 1 + bits.trailing_zeros() as usize) {
+                if let Some(slot) = self.words.get(index + 1 + bits.trailing_zeros() as usize) {
                     self.clear_dead(slot);
                 }
                 bits &= bits - 1;
             }
             if desc.items == Items::Weaks {
-                for slot in self.items_of(i) {
+                for slot in self.items_of(index) {
                     self.clear_dead(slot);
                 }
             }
@@ -2655,45 +2655,45 @@ impl<'a> Heap<'a> {
     #[inline]
     fn clear_dead(self, slot: &Cell<u64>) {
         let target = slot.get() as u32;
-        if target != 0 && !self.has_bit(target as usize, |p| &p.marks) {
+        if target != 0 && !self.has_bit(target as usize, |page| &page.marks) {
             slot.set(0);
         }
     }
 
-    /// The items of the object at `i`.
-    fn items_of(self, i: usize) -> &'a [Cell<u64>] {
-        let Some(header) = self.words.get(i).map(Cell::get) else { return &[] };
+    /// The items of the object at `index`.
+    fn items_of(self, index: usize) -> &'a [Cell<u64>] {
+        let Some(header) = self.words.get(index).map(Cell::get) else { return &[] };
         let Some(desc) = self.desc(header) else { return &[] };
-        let start = i + 1 + desc.fields as usize;
+        let start = index + 1 + desc.fields as usize;
         self.words.get(start..start + (header >> 32) as usize).unwrap_or(&[])
     }
 
-    /// Calls `f` with the key and value slots of each ephemeron in the object at `i`.
-    fn each_ephemeron(self, i: usize, mut f: impl FnMut(&'a Cell<u64>, &'a Cell<u64>)) {
-        let Some(header) = self.words.get(i).map(Cell::get) else { return };
-        let Some(desc) = self.desc(header).filter(|d| d.has_ephemerons()) else { return };
+    /// Calls `visit` with the key and value slots of each ephemeron in the object at `index`.
+    fn each_ephemeron(self, index: usize, mut visit: impl FnMut(&'a Cell<u64>, &'a Cell<u64>)) {
+        let Some(header) = self.words.get(index).map(Cell::get) else { return };
+        let Some(desc) = self.desc(header).filter(|desc| desc.has_ephemerons()) else { return };
         let fields = desc.fields as usize;
         let mut bits = desc.ephemerons;
         while bits != 0 {
-            let k = bits.trailing_zeros() as usize;
-            if k + 1 < fields
-                && let Some([key, value]) = self.words.get(i + 1 + k..i + 3 + k).and_then(|p| p.as_array())
+            let field = bits.trailing_zeros() as usize;
+            if field + 1 < fields
+                && let Some([key, value]) = self.words.get(index + 1 + field..index + 3 + field).and_then(|pair| pair.as_array())
             {
-                f(key, value);
+                visit(key, value);
             }
             bits &= bits - 1;
         }
         if desc.items == Items::Ephemerons {
             let len = (header >> 32) as usize;
-            for [key, value] in self.words.get(i + 1 + fields..i + 1 + fields + len).unwrap_or(&[]).as_chunks().0 {
-                f(key, value);
+            for [key, value] in self.words.get(index + 1 + fields..index + 1 + fields + len).unwrap_or(&[]).as_chunks().0 {
+                visit(key, value);
             }
         }
     }
 
     /// Whether an ephemeron's key is reachable: marked, or not an object.
     fn key_live(self, word: u64) -> bool {
-        word & TAG != OBJECT || self.has_bit((word >> 32) as usize, |p| &p.marks)
+        word & TAG != OBJECT || self.has_bit((word >> 32) as usize, |page| &page.marks)
     }
 
     /// Marks the values of ephemerons whose keys are marked, and what they reach, until a pass
@@ -2701,15 +2701,15 @@ impl<'a> Heap<'a> {
     fn trace_ephemerons(self, work: &mut Work) {
         loop {
             let mut marked = false;
-            let mut h = 0;
-            while let Some(&holder) = work.ephemerons.get(h) {
+            let mut index = 0;
+            while let Some(&holder) = work.ephemerons.get(index) {
                 self.each_ephemeron(holder as usize, |key, value| {
                     let word = value.get();
                     if word & TAG == OBJECT && self.key_live(key.get()) {
                         marked |= self.mark((word >> 32) as u32, work);
                     }
                 });
-                h += 1;
+                index += 1;
             }
             if !marked {
                 return;
@@ -2730,15 +2730,15 @@ impl<'a> Heap<'a> {
     /// object's is left alone.
     /// Returns whether it wasn't marked before.
     fn mark(self, index: u32, work: &mut Work) -> bool {
-        let i = index as usize;
-        let Some(page) = self.m.pages.get(i / PAGE) else { return false };
-        let (marks, bit) = (&page.marks[i % PAGE / 64], 1 << (i % 64));
-        if marks.get() & bit != 0 || page.starts[i % PAGE / 64].get() & bit == 0 {
+        let at = index as usize;
+        let Some(page) = self.m.pages.get(at / PAGE) else { return false };
+        let (marks, bit) = (&page.marks[at % PAGE / 64], 1 << (at % 64));
+        if marks.get() & bit != 0 || page.starts[at % PAGE / 64].get() & bit == 0 {
             return false;
         }
-        let Some(desc) = self.desc(self.words[i].get()) else { return false };
+        let Some(desc) = self.desc(self.words[at].get()) else { return false };
         marks.set(marks.get() | bit);
-        self.cover_lines(i, desc.size(self.words[i].get()), |p| &p.lines);
+        self.cover_lines(at, desc.size(self.words[at].get()), |page| &page.lines);
         if desc.traces {
             work.gray.push(index);
         }
@@ -2746,62 +2746,62 @@ impl<'a> Heap<'a> {
     }
 
     /// Marks what the object refers to. Returns its size in words.
-    fn trace(self, i: usize, work: &mut Work) -> usize {
-        self.trace_parts(i, work, true)
+    fn trace(self, index: usize, work: &mut Work) -> usize {
+        self.trace_parts(index, work, true)
     }
 
     /// Traces the object's fields, and its items if `items`.
     #[inline(always)]
-    fn trace_parts(self, i: usize, work: &mut Work, items: bool) -> usize {
-        let Some(header) = self.words.get(i).map(Cell::get) else { return 1 };
+    fn trace_parts(self, index: usize, work: &mut Work, items: bool) -> usize {
+        let Some(header) = self.words.get(index).map(Cell::get) else { return 1 };
         let Some(desc) = self.desc(header) else { return 1 };
         let evacuating = self.m.evacuating.get();
-        let fields = self.words.get(i + 1..i + 1 + desc.fields as usize).unwrap_or(&[]);
+        let fields = self.words.get(index + 1..index + 1 + desc.fields as usize).unwrap_or(&[]);
         let note = |work: &mut Work, at: usize, target: u32| {
             if evacuating && self.in_evacuation(target) {
-                work.fixups.push((i as u32, at as u32 + 1));
+                work.fixups.push((index as u32, at as u32 + 1));
             }
         };
         let mut bits = desc.values;
         while bits != 0 {
-            let k = bits.trailing_zeros() as usize;
-            if let Some(slot) = fields.get(k) {
+            let field = bits.trailing_zeros() as usize;
+            if let Some(slot) = fields.get(field) {
                 let word = slot.get();
                 if word & TAG == OBJECT {
                     self.mark((word >> 32) as u32, work);
-                    note(work, k, (word >> 32) as u32);
+                    note(work, field, (word >> 32) as u32);
                 }
             }
             bits &= bits - 1;
         }
         let mut bits = desc.members;
         while bits != 0 {
-            let k = bits.trailing_zeros() as usize;
-            if let Some(slot) = fields.get(k) {
+            let field = bits.trailing_zeros() as usize;
+            if let Some(slot) = fields.get(field) {
                 let target = slot.get() as u32;
                 if target != 0 {
                     self.mark(target, work);
-                    note(work, k, target);
+                    note(work, field, target);
                 }
             }
             bits &= bits - 1;
         }
         if desc.has_ephemerons() {
-            work.ephemerons.push(i as u32);
+            work.ephemerons.push(index as u32);
             // Values whose keys are marked already; the rest wait for `trace_ephemerons`.
-            self.each_ephemeron(i, |key, value| {
+            self.each_ephemeron(index, |key, value| {
                 if self.key_live(key.get()) {
                     self.visit(value, work);
                 }
             });
         }
         if desc.weaks != 0 || items && desc.items == Items::Weaks {
-            work.holders.push(i as u32);
+            work.holders.push(index as u32);
             let mut bits = desc.weaks;
             while bits != 0 {
-                let k = bits.trailing_zeros() as usize;
-                if let Some(target) = fields.get(k).map(|s| s.get() as u32).filter(|&t| t != 0) {
-                    note(work, k, target);
+                let field = bits.trailing_zeros() as usize;
+                if let Some(target) = fields.get(field).map(|slot| slot.get() as u32).filter(|&target| target != 0) {
+                    note(work, field, target);
                 }
                 bits &= bits - 1;
             }
@@ -2824,9 +2824,9 @@ impl<'a> Heap<'a> {
         if desc.items != Items::None {
             let len = (header >> 32) as usize;
             size += len;
-            let traced = self.traced_items(i, header, desc);
+            let traced = self.traced_items(index, header, desc);
             let start = desc.fields as usize;
-            let slots = || self.words.get(i + 1 + start..i + 1 + start + traced).unwrap_or(&[]).iter().enumerate();
+            let slots = || self.words.get(index + 1 + start..index + 1 + start + traced).unwrap_or(&[]).iter().enumerate();
             if items && desc.items == Items::Values {
                 for (j, slot) in slots() {
                     let word = slot.get();
@@ -2848,13 +2848,13 @@ impl<'a> Heap<'a> {
         size
     }
 
-    /// How many items of the object at `i` are ordinary arena memory: for a [`Segment`], those
+    /// How many items of the object at `index` are ordinary arena memory: for a [`Segment`], those
     /// below the active stack's `base` (or `top` once retired).
     #[inline]
-    fn traced_items(self, i: usize, header: u64, desc: &'static Desc) -> usize {
+    fn traced_items(self, index: usize, header: u64, desc: &'static Desc) -> usize {
         let len = (header >> 32) as usize;
         if desc.number == Segment::DESC.number {
-            self.words.get(i + 1).map_or(0, |w| (w.get() as u32 as usize).min(len))
+            self.words.get(index + 1).map_or(0, |word| (word.get() as u32 as usize).min(len))
         } else {
             len
         }
@@ -2864,15 +2864,15 @@ impl<'a> Heap<'a> {
     /// to them: the roots, root handles and stacks, which are rescanned, and the slots noted while marking.
     fn evacuate(self, work: &mut Work) {
         let used = self.m.used.get();
-        for p in 0..used {
-            let page = &self.m.pages[p];
+        for index in 0..used {
+            let page = &self.m.pages[index];
             if !page.evacuating.get() {
                 continue;
             }
-            for (k, (starts, marks)) in page.starts.iter().zip(&page.marks).enumerate() {
+            for (word, (starts, marks)) in page.starts.iter().zip(&page.marks).enumerate() {
                 let mut live = starts.get() & marks.get();
                 while live != 0 {
-                    self.move_object(p * PAGE + k * 64 + live.trailing_zeros() as usize);
+                    self.move_object(index * PAGE + word * 64 + live.trailing_zeros() as usize);
                     live &= live - 1;
                 }
             }
@@ -2887,9 +2887,9 @@ impl<'a> Heap<'a> {
             self.fix_value(&handle.word);
         }
         for &(owner, at) in &work.fixups {
-            let o = self.resolve(owner) as usize;
-            let Some(desc) = self.words.get(o).and_then(|h| self.desc(h.get())) else { continue };
-            let Some(slot) = self.words.get(o + at as usize) else { continue };
+            let object = self.resolve(owner) as usize;
+            let Some(desc) = self.words.get(object).and_then(|header| self.desc(header.get())) else { continue };
+            let Some(slot) = self.words.get(object + at as usize) else { continue };
             let field = at as usize - 1;
             let bit = if field < 64 { 1 << field } else { 0 };
             let index = if field >= desc.fields as usize {
@@ -2904,17 +2904,17 @@ impl<'a> Heap<'a> {
             }
         }
         for &holder in &work.holders {
-            let o = self.resolve(holder) as usize;
-            let Some(desc) = self.words.get(o).and_then(|h| self.desc(h.get())) else { continue };
+            let object = self.resolve(holder) as usize;
+            let Some(desc) = self.words.get(object).and_then(|header| self.desc(header.get())) else { continue };
             let mut bits = desc.weaks;
             while bits != 0 {
-                if let Some(slot) = self.words.get(o + 1 + bits.trailing_zeros() as usize) {
+                if let Some(slot) = self.words.get(object + 1 + bits.trailing_zeros() as usize) {
                     self.fix_index(slot);
                 }
                 bits &= bits - 1;
             }
             if desc.items == Items::Weaks {
-                for slot in self.items_of(o) {
+                for slot in self.items_of(object) {
                     self.fix_index(slot);
                 }
             }
@@ -2931,17 +2931,17 @@ impl<'a> Heap<'a> {
                 page.lines.set(0);
             }
         }
-        for p in 0..used {
-            let page = &self.m.pages[p];
+        for index in 0..used {
+            let page = &self.m.pages[index];
             if !page.evacuating.get() {
                 continue;
             }
-            for (k, (starts, marks)) in page.starts.iter().zip(&page.marks).enumerate() {
+            for (word, (starts, marks)) in page.starts.iter().zip(&page.marks).enumerate() {
                 let mut live = starts.get() & marks.get();
                 while live != 0 {
-                    let i = p * PAGE + k * 64 + live.trailing_zeros() as usize;
-                    if let Some(desc) = self.desc(self.words[i].get()) {
-                        self.cover_lines(i, desc.size(self.words[i].get()), |p| &p.lines);
+                    let object = index * PAGE + word * 64 + live.trailing_zeros() as usize;
+                    if let Some(desc) = self.desc(self.words[object].get()) {
+                        self.cover_lines(object, desc.size(self.words[object].get()), |page| &page.lines);
                     }
                     live &= live - 1;
                 }
@@ -2951,21 +2951,21 @@ impl<'a> Heap<'a> {
 
     /// Copies a marked object to a fresh page and leaves a forwarding header. The copy is
     /// marked; the original isn't, so the sweep frees it.
-    fn move_object(self, i: usize) {
-        let header = self.words[i].get();
+    fn move_object(self, index: usize) {
+        let header = self.words[index].get();
         let Some(desc) = self.desc(header) else { return };
         let size = desc.size(header);
         let Some(new) = self.to_reserve(size) else { return };
-        let (Some(from), Some(to)) = (self.words.get(i..i + size), self.words.get(new..new + size)) else { return };
-        for (d, s) in to.iter().zip(from) {
-            d.set(s.get());
+        let (Some(from), Some(to)) = (self.words.get(index..index + size), self.words.get(new..new + size)) else { return };
+        for (target, source) in to.iter().zip(from) {
+            target.set(source.get());
         }
-        self.set_bit(new, |p| &p.starts);
-        self.set_bit(new, |p| &p.marks);
-        self.cover_lines(new, size, |p| &p.lines);
-        self.words[i].set((new as u64) << 32 | FORWARDED | header & TYPE_BITS);
-        let marks = &self.m.pages[i / PAGE].marks[i % PAGE / 64];
-        marks.set(marks.get() & !(1 << (i % 64)));
+        self.set_bit(new, |page| &page.starts);
+        self.set_bit(new, |page| &page.marks);
+        self.cover_lines(new, size, |page| &page.lines);
+        self.words[index].set((new as u64) << 32 | FORWARDED | header & TYPE_BITS);
+        let marks = &self.m.pages[index / PAGE].marks[index % PAGE / 64];
+        marks.set(marks.get() & !(1 << (index % 64)));
     }
 
     fn to_reserve(self, size: usize) -> Option<usize> {
@@ -2975,21 +2975,21 @@ impl<'a> Heap<'a> {
             return Some(at);
         }
         // An object that finds no room stays where it is.
-        let n = size.div_ceil(PAGE);
-        let first = self.m.budget.optional(|| self.free_run(n, true)?.map_or_else(|| self.fresh_pages(n), Ok)).ok()?;
+        let count = size.div_ceil(PAGE);
+        let first = self.m.budget.optional(|| self.free_run(count, true)?.map_or_else(|| self.fresh_pages(count), Ok)).ok()?;
         // Claimed until the sweep sets them from what's marked.
-        self.m.pages[first..first + n].iter().for_each(|p| p.used.set(u128::MAX));
+        self.m.pages[first..first + count].iter().for_each(|page| page.used.set(u128::MAX));
         let start = first * PAGE;
         self.m.to_cursor.set(start + size);
-        self.m.to_end.set(start + n * PAGE);
+        self.m.to_end.set(start + count * PAGE);
         Some(start)
     }
 
     /// Where the object at `index` is now.
     fn resolve(self, index: u32) -> u32 {
-        let i = index as usize;
-        match self.words.get(i).map(Cell::get) {
-            Some(header) if header & FORWARDED != 0 && self.has_bit(i, |p| &p.starts) => (header >> 32) as u32,
+        let at = index as usize;
+        match self.words.get(at).map(Cell::get) {
+            Some(header) if header & FORWARDED != 0 && self.has_bit(at, |page| &page.starts) => (header >> 32) as u32,
             _ => index,
         }
     }
@@ -3016,8 +3016,8 @@ impl<'a> Heap<'a> {
                 cards &= cards - 1;
                 let (from, to) = (page * PAGE + card * CARD, page * PAGE + (card + 1) * CARD);
                 let mut next = self.start_at_or_before(from).or_else(|| self.next_start(from, to));
-                while let Some(object) = next.filter(|&o| o < to) {
-                    if self.has_bit(object, |p| &p.marks) {
+                while let Some(object) = next.filter(|&object| object < to) {
+                    if self.has_bit(object, |page| &page.marks) {
                         self.trace_card(object, from..to, object != last, work);
                         last = object;
                     }
@@ -3031,33 +3031,33 @@ impl<'a> Heap<'a> {
     /// Traces what an old object on a dirty card refers to: for items of values, only those on
     /// the card, so storing into a large vector doesn't rescan all of it. The rest of the
     /// object is traced once, for its first card.
-    fn trace_card(self, i: usize, card: Range<usize>, first: bool, work: &mut Work) {
-        let header = self.words[mask(i)].get();
+    fn trace_card(self, index: usize, card: Range<usize>, first: bool, work: &mut Work) {
+        let header = self.words[mask(index)].get();
         let Some(desc) = self.desc(header) else { return };
         let Some(refs @ (Refs::Values | Refs::Members | Refs::Weaks)) = Refs::of(desc.items) else {
             if first {
-                self.trace(i, work);
+                self.trace(index, work);
             }
             return;
         };
         if first {
-            self.trace_parts(i, work, false);
+            self.trace_parts(index, work, false);
         }
-        let items = i + 1 + desc.fields as usize;
-        let traced = self.traced_items(i, header, desc);
+        let items = index + 1 + desc.fields as usize;
+        let traced = self.traced_items(index, header, desc);
         let (from, to) = (card.start.max(items), card.end.min(items + traced));
         let slots = self.words.get(from..to).unwrap_or(&[]);
         match refs {
             Refs::Values => slots.iter().for_each(|slot| self.visit(slot, work)),
-            Refs::Members => slots.iter().filter(|s| s.get() as u32 != 0).for_each(|s| _ = self.mark(s.get() as u32, work)),
+            Refs::Members => slots.iter().filter(|slot| slot.get() as u32 != 0).for_each(|slot| _ = self.mark(slot.get() as u32, work)),
             _ if from < to => work.weak_runs.push((from as u32, to as u32)),
             _ => {}
         }
     }
 
-    fn start_at_or_before(self, i: usize) -> Option<usize> {
-        let (mut page, mut word) = (i / PAGE, i % PAGE / 64);
-        let mut mask = u64::MAX >> (63 - i % 64);
+    fn start_at_or_before(self, index: usize) -> Option<usize> {
+        let (mut page, mut word) = (index / PAGE, index % PAGE / 64);
+        let mut mask = u64::MAX >> (63 - index % 64);
         loop {
             let starts = self.m.pages[page].starts[word].get() & mask;
             if starts != 0 {
@@ -3066,7 +3066,7 @@ impl<'a> Heap<'a> {
             mask = u64::MAX;
             if word > 0 {
                 word -= 1;
-            } else if let Some(first) = self.m.pages[page].large.get().map(|f| f as usize).filter(|&f| f < page) {
+            } else if let Some(first) = self.m.pages[page].large.get().map(|first| first as usize).filter(|&first| first < page) {
                 // Nothing starts between the large object's header and its pages' end.
                 (page, word) = (first, 0);
             } else if page > 0 {
@@ -3083,7 +3083,7 @@ impl<'a> Heap<'a> {
             let (page, word) = (i / PAGE, i % PAGE / 64);
             let starts = self.m.pages.get(page)?.starts[word].get() & (u64::MAX << (i % 64));
             if starts != 0 {
-                return Some(page * PAGE + word * 64 + starts.trailing_zeros() as usize).filter(|&s| s < to);
+                return Some(page * PAGE + word * 64 + starts.trailing_zeros() as usize).filter(|&start| start < to);
             }
             i = (i / 64 + 1) * 64;
         }
@@ -3095,6 +3095,6 @@ impl<'a> Heap<'a> {
 /// pass in registers: the caller would copy it to the stack on every store, slow path or not.
 #[cold]
 #[inline(never)]
-fn shade(words: &[Cell<u64>; WORDS + SLACK], m: &Meta, slot: usize, owner: u32, target: u32) {
-    Heap { words, m }.shade_marked(slot, owner, target);
+fn shade(words: &[Cell<u64>; WORDS + SLACK], meta: &Meta, slot: usize, owner: u32, target: u32) {
+    Heap { words, m: meta }.shade_marked(slot, owner, target);
 }

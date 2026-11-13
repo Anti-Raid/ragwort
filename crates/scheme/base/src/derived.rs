@@ -34,11 +34,11 @@ struct Built {
 }
 
 impl<'a, 'gc> Expander<'a, 'gc> {
-    pub(crate) fn derived(&mut self, m: Macro, stx: Stx) -> Result<Stx, ExpandError> {
+    pub(crate) fn derived(&mut self, kind: Macro, stx: Stx) -> Result<Stx, ExpandError> {
         let items = self.proper(stx)?;
         let args = &items[1..];
         let bad = |this: &Self| Err(this.error(ExpandErrorKind::BadSyntax, stx));
-        match (m, args) {
+        match (kind, args) {
             (Macro::LetStar, &[binds, ref body @ ..]) if !body.is_empty() => {
                 let binds = self.proper(binds)?;
                 match binds.split_first() {
@@ -55,18 +55,18 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 }
             }
             (Macro::And, []) => self.value(Value::TRUE, stx),
-            (Macro::And | Macro::Or, &[e]) => Ok(e),
-            (Macro::And, &[e, ref rest @ ..]) => {
+            (Macro::And | Macro::Or, &[expr]) => Ok(expr),
+            (Macro::And, &[expr, ref rest @ ..]) => {
                 let rest = self.build(stx, "and", &[rest])?;
                 let no = self.value(Value::FALSE, stx)?;
-                self.build(stx, "if", &[&[e, rest, no]])
+                self.build(stx, "if", &[&[expr, rest, no]])
             }
             (Macro::Or, []) => self.value(Value::FALSE, stx),
-            (Macro::Or, &[e, ref rest @ ..]) => {
-                let t = self.introduce("t", stx)?;
+            (Macro::Or, &[expr, ref rest @ ..]) => {
+                let temp = self.introduce("t", stx)?;
                 let rest = self.build(stx, "or", &[rest])?;
-                let test = self.build(stx, "if", &[&[t, t, rest]])?;
-                self.with_temp(stx, t, e, test)
+                let test = self.build(stx, "if", &[&[temp, temp, rest]])?;
+                self.with_temp(stx, temp, expr, test)
             }
             (Macro::When, &[test, ref body @ ..]) if !body.is_empty() => {
                 let body = self.build(stx, "begin", &[body])?;
@@ -88,9 +88,9 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             (Macro::WithSyntax, &[binds, ref body @ ..]) if !body.is_empty() => {
                 let (mut patterns, mut exprs) = (Vec::new(), Vec::new());
                 for bind in self.proper(binds)? {
-                    let &[pattern, e] = self.proper(bind)?.as_slice() else { return Err(self.error(ExpandErrorKind::BadSyntax, bind)) };
+                    let &[pattern, expr] = self.proper(bind)?.as_slice() else { return Err(self.error(ExpandErrorKind::BadSyntax, bind)) };
                     patterns.push(pattern);
-                    exprs.push(e);
+                    exprs.push(expr);
                 }
                 let (patterns, exprs) = (self.list(&patterns, stx)?, self.build(stx, "list", &[&exprs])?);
                 let none = self.list(&[], stx)?;
@@ -109,8 +109,8 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 Some(built) => Ok(built),
                 None => self.quoted(template, stx),
             },
-            (Macro::Match, &[e, ref clauses @ ..]) => self.match_form(stx, e, clauses),
-            (Macro::StructCopy, &[name, e, ref updates @ ..]) => self.struct_copy(stx, name, e, updates),
+            (Macro::Match, &[expr, ref clauses @ ..]) => self.match_form(stx, expr, clauses),
+            (Macro::StructCopy, &[name, expr, ref updates @ ..]) => self.struct_copy(stx, name, expr, updates),
             (Macro::NamedLet, &[name, binds, ref body @ ..]) => {
                 let (vars, inits) = self.bindings_of(binds)?;
                 let formals = self.list(&vars, stx)?;
@@ -144,9 +144,9 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         self.build(at, "quote", &[&[datum]])
     }
 
-    /// `(let ((t value)) body)`.
-    pub(crate) fn with_temp(&mut self, at: Stx, t: Stx, value: Stx, body: Stx) -> Result<Stx, ExpandError> {
-        let bind = self.list(&[t, value], at)?;
+    /// `(let ((temp value)) body)`.
+    pub(crate) fn with_temp(&mut self, at: Stx, temp: Stx, value: Stx, body: Stx) -> Result<Stx, ExpandError> {
+        let bind = self.list(&[temp, value], at)?;
         let binds = self.list(&[bind], at)?;
         self.build(at, "let", &[&[binds, body]])
     }
@@ -181,11 +181,11 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let more = self.build(stx, "cond", &[rest])?;
         match *body {
             [] => self.build(clause, "or", &[&[test, more]]),
-            [arrow, f] if self.is_aux(arrow, Aux::Arrow)? => {
-                let t = self.introduce("t", clause)?;
-                let call = self.list(&[f, t], clause)?;
-                let test_t = self.build(clause, "if", &[&[t, call, more]])?;
-                self.with_temp(clause, t, test, test_t)
+            [arrow, receiver] if self.is_aux(arrow, Aux::Arrow)? => {
+                let temp = self.introduce("t", clause)?;
+                let call = self.list(&[receiver, temp], clause)?;
+                let test_t = self.build(clause, "if", &[&[temp, call, more]])?;
+                self.with_temp(clause, temp, test, test_t)
             }
             [first, ..] if self.is_aux(first, Aux::Arrow)? => Err(self.error(ExpandErrorKind::BadSyntax, clause)),
             _ => {
@@ -198,7 +198,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     /// `(lambda (x) (syntax-case x (literal ...) ((_ . pattern) (syntax template)) ...))`, for
     /// rules `((keyword . pattern) template)`: the keyword isn't matched.
     fn syntax_rules(&mut self, stx: Stx, literals: Stx, rules: &[Stx]) -> Result<Stx, ExpandError> {
-        let x = self.introduce("x", stx)?;
+        let input = self.introduce("x", stx)?;
         let mut clauses = Vec::with_capacity(rules.len());
         for &rule in rules {
             let &[pattern, template] = self.proper(rule)?.as_slice() else { return Err(self.error(ExpandErrorKind::BadSyntax, rule)) };
@@ -212,8 +212,8 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             let template = self.build(rule, "syntax", &[&[template]])?;
             clauses.push(self.list(&[pattern, template], rule)?);
         }
-        let case = self.build(stx, "syntax-case", &[&[x, literals], &clauses])?;
-        let formals = self.list(&[x], stx)?;
+        let case = self.build(stx, "syntax-case", &[&[input, literals], &clauses])?;
+        let formals = self.list(&[input], stx)?;
         self.build(stx, "lambda", &[&[formals, case]])
     }
 
@@ -251,14 +251,14 @@ impl<'a, 'gc> Expander<'a, 'gc> {
 
     /// `(let ((t key)) (cond ((memv t '(datum ...)) body ...) ...))`, with `=> f` as `(f t)`.
     fn case(&mut self, stx: Stx, key: Stx, clauses: &[Stx]) -> Result<Stx, ExpandError> {
-        let t = self.introduce("t", stx)?;
+        let temp = self.introduce("t", stx)?;
         let mut tests = Vec::with_capacity(clauses.len());
         for &clause in clauses {
             let parts = self.proper(clause)?;
             let Some((&data, body)) = parts.split_first() else { return Err(self.error(ExpandErrorKind::BadSyntax, clause)) };
             let body = match *body {
                 [] => return Err(self.error(ExpandErrorKind::BadSyntax, clause)),
-                [arrow, f] if self.is_aux(arrow, Aux::Arrow)? => vec![self.list(&[f, t], clause)?],
+                [arrow, receiver] if self.is_aux(arrow, Aux::Arrow)? => vec![self.list(&[receiver, temp], clause)?],
                 _ => body.to_vec(),
             };
             let test = if self.is_aux(data, Aux::Else)? {
@@ -266,12 +266,12 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             } else {
                 self.proper(data)?;
                 let quoted = self.quoted(data, clause)?;
-                self.build(clause, "memv", &[&[t, quoted]])?
+                self.build(clause, "memv", &[&[temp, quoted]])?
             };
             tests.push(self.list(&[&[test], body.as_slice()].concat(), clause)?);
         }
         let cond = self.build(stx, "cond", &[&tests])?;
-        self.with_temp(stx, t, key, cond)
+        self.with_temp(stx, temp, key, cond)
     }
 
     /// `(let loop ((var init) ...) (if test (begin void result ...) (begin command ... (loop
@@ -306,14 +306,14 @@ impl<'a, 'gc> Expander<'a, 'gc> {
 
     /// The `(unquote x)`, `(unquote-splicing x)` or `(quasiquote x)` that `items` are, if so.
     fn tag(&mut self, items: &[Stx]) -> Result<Option<(Tag, Stx)>, ExpandError> {
-        let &[head, x] = items else { return Ok(None) };
+        let &[head, operand] = items else { return Ok(None) };
         if !self.is_id(head) {
             return Ok(None);
         }
         Ok(match self.resolve(head)? {
-            Binding::Keyword(Keyword::Aux(Aux::Unquote)) => Some((Tag::Unquote, x)),
-            Binding::Keyword(Keyword::Aux(Aux::UnquoteSplicing)) => Some((Tag::UnquoteSplicing, x)),
-            Binding::Keyword(Keyword::Macro(Macro::Quasiquote)) => Some((Tag::Quasiquote, x)),
+            Binding::Keyword(Keyword::Aux(Aux::Unquote)) => Some((Tag::Unquote, operand)),
+            Binding::Keyword(Keyword::Aux(Aux::UnquoteSplicing)) => Some((Tag::UnquoteSplicing, operand)),
+            Binding::Keyword(Keyword::Macro(Macro::Quasiquote)) => Some((Tag::Quasiquote, operand)),
             _ => None,
         })
     }
@@ -324,19 +324,19 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         match self.tree.view(template)? {
             View::List(items, tail) => {
                 if tail.is_none()
-                    && let Some((tag, x)) = self.tag(&items)?
+                    && let Some((tag, operand)) = self.tag(&items)?
                 {
                     let depth = match (tag, depth) {
-                        (Tag::Unquote, 0) => return Ok(Step::Done(Some(x))),
+                        (Tag::Unquote, 0) => return Ok(Step::Done(Some(operand))),
                         (Tag::UnquoteSplicing, 0) => return Err(self.error(ExpandErrorKind::BadSyntax, template)),
-                        (Tag::Unquote | Tag::UnquoteSplicing, d) => d - 1,
-                        (Tag::Quasiquote, d) => d + 1,
+                        (Tag::Unquote | Tag::UnquoteSplicing, depth) => depth - 1,
+                        (Tag::Quasiquote, depth) => depth + 1,
                     };
                     let name = items[0];
-                    return Ok(Step::then((x, depth), move |this: &mut Self, x| {
-                        let Some(x) = x else { return Ok(Step::Done(None)) };
+                    return Ok(Step::then((operand, depth), move |this: &mut Self, built| {
+                        let Some(built) = built else { return Ok(Step::Done(None)) };
                         let name = this.quoted(name, template)?;
-                        Ok(Step::Done(Some(this.build(template, "list", &[&[name, x]])?)))
+                        Ok(Step::Done(Some(this.build(template, "list", &[&[name, built]])?)))
                     }));
                 }
                 // `(a . ,b)` reads as `(a unquote b)`.
@@ -356,37 +356,37 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     }
 
     /// Builds the rest of a quasiquoted list's items, then its tail.
-    fn quasi_items(&mut self, mut b: Built) -> Result<Quasi<'a, 'gc>, ExpandError> {
-        while let Some(&item) = b.items.get(b.built.len()) {
+    fn quasi_items(&mut self, mut list: Built) -> Result<Quasi<'a, 'gc>, ExpandError> {
+        while let Some(&item) = list.items.get(list.built.len()) {
             let spliced = match self.tree.view(item)? {
-                View::List(parts, None) if b.depth == 0 => match self.tag(&parts)? {
-                    Some((Tag::UnquoteSplicing, x)) => Some(x),
+                View::List(parts, None) if list.depth == 0 => match self.tag(&parts)? {
+                    Some((Tag::UnquoteSplicing, operand)) => Some(operand),
                     _ => None,
                 },
                 _ => None,
             };
-            let Some(x) = spliced else {
-                return Ok(Step::then((item, b.depth), move |this: &mut Self, part: Option<Stx>| {
-                    b.any |= part.is_some();
-                    b.built.push(Ok(part));
-                    this.quasi_items(b)
+            let Some(spliced) = spliced else {
+                return Ok(Step::then((item, list.depth), move |this: &mut Self, part: Option<Stx>| {
+                    list.any |= part.is_some();
+                    list.built.push(Ok(part));
+                    this.quasi_items(list)
                 }));
             };
-            b.any = true;
-            b.built.push(Err(x));
+            list.any = true;
+            list.built.push(Err(spliced));
         }
-        match b.tail {
-            Some(tail) => Ok(Step::then((tail, b.depth), move |this: &mut Self, rest: Option<Stx>| this.quasi_list(b, rest.ok_or(tail)))),
+        match list.tail {
+            Some(tail) => Ok(Step::then((tail, list.depth), move |this: &mut Self, rest: Option<Stx>| this.quasi_list(list, rest.ok_or(tail)))),
             None => {
-                let empty = self.list(&[], b.template)?;
-                self.quasi_list(b, Err(empty))
+                let empty = self.list(&[], list.template)?;
+                self.quasi_list(list, Err(empty))
             }
         }
     }
 
     /// A quasiquoted list whose items are built, with its tail `rest` built or constant.
-    fn quasi_list(&mut self, b: Built, rest: Result<Stx, Stx>) -> Result<Quasi<'a, 'gc>, ExpandError> {
-        let Built { template, items, built, any, .. } = b;
+    fn quasi_list(&mut self, list: Built, rest: Result<Stx, Stx>) -> Result<Quasi<'a, 'gc>, ExpandError> {
+        let Built { template, items, built, any, .. } = list;
         if !any && rest.is_err() {
             return Ok(Step::Done(None));
         }

@@ -24,9 +24,9 @@ impl Arena {
         Self::default()
     }
 
-    /// `x` in a box in the arena.
-    pub fn boxed<T>(&self, x: T) -> Box<'_, T> {
-        Box::new_in(x, self)
+    /// `value` in a box in the arena.
+    pub fn boxed<T>(&self, value: T) -> Box<'_, T> {
+        Box::new_in(value, self)
     }
 
     /// An empty vector in the arena.
@@ -34,9 +34,9 @@ impl Arena {
         Vec::new_in(self)
     }
 
-    /// A vector in the arena of `n` copies of `x`.
-    pub fn vec_of<T: Clone>(&self, x: T, n: usize) -> Vec<'_, T> {
-        Vec::from_iter_in(std::iter::repeat_n(x, n), self)
+    /// A vector in the arena of `count` copies of `value`.
+    pub fn vec_of<T: Clone>(&self, value: T, count: usize) -> Vec<'_, T> {
+        Vec::from_iter_in(std::iter::repeat_n(value, count), self)
     }
 
     /// How many bytes it has taken for what's in it.
@@ -50,8 +50,8 @@ impl Arena {
 }
 
 impl fmt::Debug for Arena {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Arena").field("allocated", &self.allocated()).finish()
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("Arena").field("allocated", &self.allocated()).finish()
     }
 }
 
@@ -67,24 +67,24 @@ pub struct Box<'a, T> {
 }
 
 impl<'a, T> Box<'a, T> {
-    pub fn new_in(x: T, arena: &'a Arena) -> Self {
+    pub fn new_in(value: T, arena: &'a Arena) -> Self {
         #[cfg(feature = "bumpalo")]
-        let b = Box { inner: bumpalo::boxed::Box::new_in(x, &arena.bump) };
+        let boxed = Box { inner: bumpalo::boxed::Box::new_in(value, &arena.bump) };
         #[cfg(not(feature = "bumpalo"))]
-        let b = {
+        let boxed = {
             let _ = arena;
-            Box { inner: std::boxed::Box::new(x), arena: PhantomData }
+            Box { inner: std::boxed::Box::new(value), arena: PhantomData }
         };
-        b
+        boxed
     }
 
     /// The `T`, out of the box.
-    pub fn into_inner(b: Self) -> T {
+    pub fn into_inner(boxed: Self) -> T {
         #[cfg(feature = "bumpalo")]
-        let x = bumpalo::boxed::Box::into_inner(b.inner);
+        let value = bumpalo::boxed::Box::into_inner(boxed.inner);
         #[cfg(not(feature = "bumpalo"))]
-        let x = *b.inner;
-        x
+        let value = *boxed.inner;
+        value
     }
 }
 
@@ -115,8 +115,8 @@ impl<T> AsMut<T> for Box<'_, T> {
 }
 
 impl<T: fmt::Debug> fmt::Debug for Box<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        (**self).fmt(f)
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(formatter)
     }
 }
 
@@ -145,20 +145,20 @@ impl<'a, T> Vec<'a, T> {
 
     pub fn with_capacity_in(capacity: usize, arena: &'a Arena) -> Self {
         #[cfg(feature = "bumpalo")]
-        let v = Vec { inner: bumpalo::collections::Vec::with_capacity_in(capacity, &arena.bump) };
+        let vector = Vec { inner: bumpalo::collections::Vec::with_capacity_in(capacity, &arena.bump) };
         #[cfg(not(feature = "bumpalo"))]
-        let v = {
+        let vector = {
             let _ = arena;
             Vec { inner: std::vec::Vec::with_capacity(capacity), arena: PhantomData }
         };
-        v
+        vector
     }
 
     pub fn from_iter_in(iter: impl IntoIterator<Item = T>, arena: &'a Arena) -> Self {
         let iter = iter.into_iter();
-        let mut v = Self::with_capacity_in(iter.size_hint().0, arena);
-        v.extend(iter);
-        v
+        let mut vector = Self::with_capacity_in(iter.size_hint().0, arena);
+        vector.extend(iter);
+        vector
     }
 
     pub fn as_slice(&self) -> &[T] {
@@ -169,16 +169,16 @@ impl<'a, T> Vec<'a, T> {
         &mut self.inner
     }
 
-    pub fn push(&mut self, x: T) {
-        self.inner.push(x);
+    pub fn push(&mut self, value: T) {
+        self.inner.push(value);
     }
 
     pub fn pop(&mut self) -> Option<T> {
         self.inner.pop()
     }
 
-    pub fn insert(&mut self, at: usize, x: T) {
-        self.inner.insert(at, x);
+    pub fn insert(&mut self, at: usize, value: T) {
+        self.inner.insert(at, value);
     }
 
     pub fn remove(&mut self, at: usize) -> T {
@@ -224,9 +224,9 @@ impl<T: Clone> Vec<'_, T> {
         self.inner.extend_from_slice(xs);
     }
 
-    /// Grows or shrinks to `len`, with copies of `x` at the end if it grows.
-    pub fn resize(&mut self, len: usize, x: T) {
-        self.inner.resize(len, x);
+    /// Grows or shrinks to `len`, with copies of `value` at the end if it grows.
+    pub fn resize(&mut self, len: usize, value: T) {
+        self.inner.resize(len, value);
     }
 }
 
@@ -273,8 +273,8 @@ impl<T: Clone> Clone for Vec<'_, T> {
 }
 
 impl<T: fmt::Debug> fmt::Debug for Vec<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.as_slice().fmt(f)
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_slice().fmt(formatter)
     }
 }
 
@@ -358,11 +358,11 @@ pub trait CollectIn: Iterator + Sized {
     where
         Self: Iterator<Item = Result<T, E>>,
     {
-        let mut v = Vec::with_capacity_in(self.size_hint().0, arena);
-        for x in self {
-            v.push(x?);
+        let mut vector = Vec::with_capacity_in(self.size_hint().0, arena);
+        for item in self {
+            vector.push(item?);
         }
-        Ok(v)
+        Ok(vector)
     }
 }
 

@@ -91,7 +91,7 @@ fn os_page() -> Option<usize> {
     *PAGE.get_or_init(|| {
         // SAFETY: `sysconf` only reads a system setting.
         let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        usize::try_from(size).ok().filter(|s| s.is_power_of_two() && *s >= 8)
+        usize::try_from(size).ok().filter(|bytes| bytes.is_power_of_two() && *bytes >= 8)
     })
 }
 
@@ -114,7 +114,7 @@ pub(crate) fn held_bytes() -> usize {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let statm = std::fs::read_to_string("/proc/self/statm").expect("read statm");
-        let pages: usize = statm.split_whitespace().nth(1).and_then(|n| n.parse().ok()).expect("statm");
+        let pages: usize = statm.split_whitespace().nth(1).and_then(|field| field.parse().ok()).expect("statm");
         pages * os_page().expect("page size")
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]

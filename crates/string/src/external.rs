@@ -39,14 +39,14 @@ enum Repr<T> {
 
 impl<T: AsRef<str>> ExternalText<T> {
     pub fn new(text: T) -> Self {
-        let s = text.as_ref();
-        if s.is_ascii() {
+        let string = text.as_ref();
+        if string.is_ascii() {
             return Self(Repr::Ascii(text));
         }
-        let repr = match s.chars().map(Width::of).max().unwrap_or(Width::One) {
-            Width::One => Repr::One(s.chars().map(|c| c as u8).collect()),
-            Width::Two => Repr::Two(s.chars().map(|c| c as u16).collect()),
-            Width::Four => Repr::Four(s.chars().map(|c| c as u32).collect()),
+        let repr = match string.chars().map(Width::of).max().unwrap_or(Width::One) {
+            Width::One => Repr::One(string.chars().map(|character| character as u8).collect()),
+            Width::Two => Repr::Two(string.chars().map(|character| character as u16).collect()),
+            Width::Four => Repr::Four(string.chars().map(|character| character as u32).collect()),
         };
         Self(repr)
     }
@@ -56,9 +56,9 @@ impl<T: AsRef<str> + 'static> External for ExternalText<T> {
     fn units(&self) -> Units<'_> {
         match &self.0 {
             Repr::Ascii(text) => Units::One(text.as_ref().as_bytes()),
-            Repr::One(u) => Units::One(u),
-            Repr::Two(u) => Units::Two(u),
-            Repr::Four(u) => Units::Four(u),
+            Repr::One(units) => Units::One(units),
+            Repr::Two(units) => Units::Two(units),
+            Repr::Four(units) => Units::Four(units),
         }
     }
 }

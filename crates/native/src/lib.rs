@@ -73,31 +73,31 @@ pub enum Error {
 }
 
 impl From<ReadError> for Error {
-    fn from(e: ReadError) -> Self {
-        Error::Read(e)
+    fn from(error: ReadError) -> Self {
+        Error::Read(error)
     }
 }
 
 impl From<LowerError> for Error {
-    fn from(e: LowerError) -> Self {
-        Error::Lower(e)
+    fn from(error: LowerError) -> Self {
+        Error::Lower(error)
     }
 }
 
 impl From<BuildError<'_>> for Error {
-    fn from(e: BuildError<'_>) -> Self {
-        match e {
-            BuildError::Declare(e, span) => Error::Lower(LowerError::declared(e, span)),
-            BuildError::Compile(e) => e.into(),
+    fn from(error: BuildError<'_>) -> Self {
+        match error {
+            BuildError::Declare(error, span) => Error::Lower(LowerError::declared(error, span)),
+            BuildError::Compile(error) => error.into(),
         }
     }
 }
 
 impl From<CompileError> for Error {
-    fn from(e: CompileError) -> Self {
-        match LowerError::located(e) {
+    fn from(error: CompileError) -> Self {
+        match LowerError::located(error) {
             Some(lower) => Error::Lower(lower),
-            None => Error::Compile(e),
+            None => Error::Compile(error),
         }
     }
 }

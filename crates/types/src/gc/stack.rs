@@ -68,7 +68,7 @@ impl StackRecord {
         heap.mark(segment, work);
         if self.parked.get() {
             if dropped {
-                let end = heap.words.get(segment as usize + 1).map_or(0, |w| w.get() as u32 as usize);
+                let end = heap.words.get(segment as usize + 1).map_or(0, |word| word.get() as u32 as usize);
                 self.set_ordinary(heap, end, false);
             }
             return;
@@ -76,13 +76,13 @@ impl StackRecord {
         let slots = heap.segment_slots(segment);
         let live = self.live(slots.len());
         let evacuating = dropped && heap.m.evacuating.get();
-        for (k, slot) in slots[live.clone()].iter().enumerate() {
+        for (offset, slot) in slots[live.clone()].iter().enumerate() {
             let word = slot.get();
             if word & super::TAG == super::OBJECT {
                 let target = (word >> 32) as u32;
                 heap.mark(target, work);
                 if evacuating && heap.in_evacuation(target) {
-                    work.fixups.push((segment, (2 + live.start + k) as u32));
+                    work.fixups.push((segment, (2 + live.start + offset) as u32));
                 }
             }
         }
@@ -134,9 +134,9 @@ impl<'a> Heap<'a> {
     /// A segment's slots.
     #[inline]
     fn segment_slots(self, segment: u32) -> &'a [Cell<u64>] {
-        let s = segment as usize;
-        let len = self.words.get(s).map_or(0, |h| (h.get() >> 32) as usize);
-        self.words.get(s + 2..s + 2 + len).unwrap_or(&[])
+        let at = segment as usize;
+        let len = self.words.get(at).map_or(0, |header| (header.get() >> 32) as usize);
+        self.words.get(at + 2..at + 2 + len).unwrap_or(&[])
     }
 }
 
@@ -154,7 +154,7 @@ fn ensure_free<'gc>(mc: &Mutation<'gc>, segment: Gc<'gc, Segment>, mine: bool) {
 fn retire_dropped<'gc>(mc: &Mutation<'gc>, segment: Gc<'gc, Segment>, mine: bool) {
     let stacks = mc.heap.m.stacks.borrow();
     let mut live = 0;
-    for other in stacks.iter().filter(|s| s.segment.get() == segment.index) {
+    for other in stacks.iter().filter(|stack| stack.segment.get() == segment.index) {
         if Rc::strong_count(other) == 1 {
             // A dropped stack still waiting for its last trace. Retiring it now means that
             // trace can't void what the new stack writes.
@@ -194,9 +194,9 @@ impl<'gc> Mutation<'gc> {
     /// A stack on `segment`, with `base` 0 and `top` at the end of the segment. Panics if
     /// another stack uses the segment.
     pub fn stack(&self, segment: Gc<'gc, Segment>) -> Result<Stack, OutOfMemory> {
-        let m = self.heap.m;
-        m.budget.count_allocation()?;
-        m.budget.charge(STACK_COST)?;
+        let meta = self.heap.m;
+        meta.budget.count_allocation()?;
+        meta.budget.charge(STACK_COST)?;
         let record = Rc::new(StackRecord {
             segment: Cell::new(segment.index),
             base: Cell::new(0),
@@ -206,8 +206,8 @@ impl<'gc> Mutation<'gc> {
         });
         ensure_free(self, segment, false);
         attach(self, segment, &record);
-        m.stacks.borrow_mut().push(record.clone());
-        Ok(Stack { arena: m.id, record })
+        meta.stacks.borrow_mut().push(record.clone());
+        Ok(Stack { arena: meta.id, record })
     }
 }
 
@@ -247,15 +247,15 @@ impl Stack {
         Some(Frame { slots: self.live(mc, fp, WINDOW)?.first_chunk()?, _brand: PhantomData })
     }
 
-    /// `n` slots from `at`, which must be at or above `base`, for writing without a barrier.
+    /// `count` slots from `at`, which must be at or above `base`, for writing without a barrier.
     #[inline]
-    fn live<'gc>(&self, mc: &Mutation<'gc>, at: usize, n: usize) -> Option<&'gc [Cell<u64>]> {
+    fn live<'gc>(&self, mc: &Mutation<'gc>, at: usize, count: usize) -> Option<&'gc [Cell<u64>]> {
         self.check(mc);
         let record = &*self.record;
         if at < record.base.get() as usize {
             return None;
         }
-        let end = at.checked_add(n)?;
+        let end = at.checked_add(count)?;
         let slots = mc.heap.segment_slots(record.segment.get()).get(at..end)?;
         if record.written.get() < end as u32 {
             record.written.set(end as u32);
@@ -268,7 +268,7 @@ impl Stack {
 
     pub fn get<'gc>(&self, mc: &Mutation<'gc>, index: usize) -> Option<Value<'gc>> {
         self.check(mc);
-        mc.heap.segment_slots(self.record.segment.get()).get(index).map(|s| Value::from_bits(s.get()))
+        mc.heap.segment_slots(self.record.segment.get()).get(index).map(|slot| Value::from_bits(slot.get()))
     }
 
     /// Sets a slot at or above `base`. Returns whether it was in range.
@@ -284,9 +284,9 @@ impl Stack {
         let Some(dst) = self.live(mc, at, src.len()) else { return false };
         let dst_at = self.record.segment.get() as usize + 2 + at;
         if dst_at > src.at {
-            dst.iter().zip(src.words).rev().for_each(|(d, s)| d.set(s.get()));
+            dst.iter().zip(src.words).rev().for_each(|(target, source)| target.set(source.get()));
         } else {
-            dst.iter().zip(src.words).for_each(|(d, s)| d.set(s.get()));
+            dst.iter().zip(src.words).for_each(|(target, source)| target.set(source.get()));
         }
         true
     }
@@ -367,12 +367,12 @@ impl Stack {
 }
 
 impl fmt::Debug for Stack {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let r = &self.record;
-        f.debug_struct("Stack")
-            .field("base", &r.base.get())
-            .field("top", &r.top.get())
-            .field("parked", &r.parked.get())
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let record = &self.record;
+        formatter.debug_struct("Stack")
+            .field("base", &record.base.get())
+            .field("top", &record.top.get())
+            .field("parked", &record.parked.get())
             .finish()
     }
 }
@@ -412,12 +412,12 @@ pub struct Frame<'s, 'gc> {
 
 impl<'gc> Frame<'_, 'gc> {
     #[inline]
-    pub fn get(self, r: u8) -> Value<'gc> {
-        Value::from_bits(self.slots[usize::from(r) % WINDOW].get())
+    pub fn get(self, register: u8) -> Value<'gc> {
+        Value::from_bits(self.slots[usize::from(register) % WINDOW].get())
     }
 
     #[inline]
-    pub fn set(self, r: u8, value: Value<'gc>) {
-        self.slots[usize::from(r) % WINDOW].set(value.word);
+    pub fn set(self, register: u8, value: Value<'gc>) {
+        self.slots[usize::from(register) % WINDOW].set(value.word);
     }
 }

@@ -60,9 +60,9 @@ pub struct PatternShape {
 }
 
 impl PatternShape {
-    /// Appends pattern node `p` to `nodes` and returns its 0-based node index.
-    pub fn add(&mut self, p: Pattern) -> u32 {
-        self.nodes.push(p);
+    /// Appends pattern node `pattern` to `nodes` and returns its 0-based node index.
+    pub fn add(&mut self, pattern: Pattern) -> u32 {
+        self.nodes.push(pattern);
         index(self.nodes.len() - 1)
     }
 
@@ -111,9 +111,9 @@ pub struct TemplateShape {
 }
 
 impl TemplateShape {
-    /// Appends template node `t` to `nodes` and returns its 0-based node index.
-    pub fn add(&mut self, t: Template) -> u32 {
-        self.nodes.push(t);
+    /// Appends template node `template` to `nodes` and returns its 0-based node index.
+    pub fn add(&mut self, template: Template) -> u32 {
+        self.nodes.push(template);
         index(self.nodes.len() - 1)
     }
 
@@ -136,8 +136,8 @@ impl TemplateShape {
     }
 }
 
-fn index(n: usize) -> u32 {
-    u32::try_from(n).expect("fewer than 2^32 parts")
+fn index(count: usize) -> u32 {
+    u32::try_from(count).expect("fewer than 2^32 parts")
 }
 
 /// Constructs a heap-allocated [`SyntaxPattern`] object containing frozen `shape` metadata and constant `items`.
@@ -197,16 +197,16 @@ struct Matcher<'m, 'gc> {
 }
 
 impl<'gc> Matcher<'_, 'gc> {
-    fn item(&self, i: u32) -> Result<Value<'gc>, Fault> {
+    fn item(&self, index: u32) -> Result<Value<'gc>, Fault> {
         let items = self.pattern.items(self.mc);
-        if i as usize >= items.len() {
+        if index as usize >= items.len() {
             return Err(Fault::Malformed);
         }
-        Ok(items.get(i as usize))
+        Ok(items.get(index as usize))
     }
 
-    fn charge(&mut self, n: u64) -> Result<(), Fault> {
-        self.count = self.count.saturating_add(n);
+    fn charge(&mut self, amount: u64) -> Result<(), Fault> {
+        self.count = self.count.saturating_add(amount);
         if self.count > self.most { Err(Fault::OutOfFuel) } else { Ok(()) }
     }
 
@@ -214,16 +214,16 @@ impl<'gc> Matcher<'_, 'gc> {
         self.out.get_mut(slot as usize).ok_or(Fault::Malformed)
     }
 
-    /// Recursively matches input value `v` against the pattern node at `root` in `shape`.
+    /// Recursively matches input value `input` against the pattern node at `root` in `shape`.
     /// Populates matched variable slots in `self.out` and returns `true` on success, or `false` on mismatch.
     /// Manages nested ellipsis repetition via an evaluation stack of accumulated list vectors.
-    fn matches(&mut self, shape: &PatternShape, root: u32, v: Value<'gc>) -> Result<bool, Fault> {
+    fn matches(&mut self, shape: &PatternShape, root: u32, input: Value<'gc>) -> Result<bool, Fault> {
         let mc = self.mc;
-        let mut todo = vec![Match::Node(root, v)];
+        let mut todo = vec![Match::Node(root, input)];
         let mut lists: Vec<Vec<Vec<Value<'gc>>>> = Vec::new();
         while let Some(task) = todo.pop() {
-            let (p, v) = match task {
-                Match::Node(p, v) => (shape.nodes.get(p as usize).ok_or(Fault::Malformed)?, v),
+            let (pattern, value) = match task {
+                Match::Node(node, value) => (shape.nodes.get(node as usize).ok_or(Fault::Malformed)?, value),
                 Match::Each(slots) => {
                     let top = lists.last_mut().expect("a repeat's lists");
                     for (list, slot) in top.iter_mut().zip(slots.clone()) {
@@ -239,48 +239,48 @@ impl<'gc> Matcher<'_, 'gc> {
                 }
             };
             self.charge(1)?;
-            let matched = match p {
+            let matched = match pattern {
                 Pattern::Any => true,
                 Pattern::Var(slot) => {
-                    *self.slot(*slot)? = v;
+                    *self.slot(*slot)? = value;
                     true
                 }
-                Pattern::Literal(i) => syntax::is_identifier(mc, v) && syntax::same_binding(mc, self.item(*i)?, v)?,
-                Pattern::Datum(i) => {
-                    let v = Syntax::of(v).map_or(v, |s| s.datum(mc));
-                    let (same, compared) = equal::equal(mc, v, self.item(*i)?, self.most.saturating_sub(self.count))?;
+                Pattern::Literal(index) => syntax::is_identifier(mc, value) && syntax::same_binding(mc, self.item(*index)?, value)?,
+                Pattern::Datum(index) => {
+                    let datum = Syntax::of(value).map_or(value, |syntax| syntax.datum(mc));
+                    let (same, compared) = equal::equal(mc, datum, self.item(*index)?, self.most.saturating_sub(self.count))?;
                     self.charge(compared)?;
                     same
                 }
                 Pattern::Seq { before, repeat, after, tail, vector } => {
-                    let items = if *vector { vector_items(mc, v) } else { list_items(mc, v) };
+                    let items = if *vector { vector_items(mc, value) } else { list_items(mc, value) };
                     let Some((items, rests)) = items else { return Ok(false) };
                     self.charge(items.len() as u64)?;
                     let (before, after) = (shape.of(before), shape.of(after));
-                    let (k, m, n) = (before.len(), after.len(), items.len());
-                    let end = rests[n];
+                    let (before_len, after_len, len) = (before.len(), after.len(), items.len());
+                    let end = rests[len];
                     let fits = match (repeat, tail) {
-                        (None, None) => n == k && end == Value::NIL,
-                        (None, Some(_)) => n >= k,
-                        (Some(_), None) => n >= k + m && end == Value::NIL,
-                        (Some(_), Some(_)) => n >= k + m,
+                        (None, None) => len == before_len && end == Value::NIL,
+                        (None, Some(_)) => len >= before_len,
+                        (Some(_), None) => len >= before_len + after_len && end == Value::NIL,
+                        (Some(_), Some(_)) => len >= before_len + after_len,
                     };
                     if fits {
                         let at = todo.len();
-                        todo.extend(before.iter().zip(&items).map(|(&p, &item)| Match::Node(p, item)));
+                        todo.extend(before.iter().zip(&items).map(|(&node, &item)| Match::Node(node, item)));
                         if let Some(repeat) = repeat {
                             if repeat.slots.end as usize > self.out.len() {
                                 return Err(Fault::Malformed);
                             }
                             lists.push(vec![Vec::new(); repeat.slots.len()]);
-                            for &item in &items[k..n - m] {
+                            for &item in &items[before_len..len - after_len] {
                                 todo.extend([Match::Node(repeat.each, item), Match::Each(&repeat.slots)]);
                             }
                             todo.push(Match::Lists(&repeat.slots));
-                            todo.extend(after.iter().zip(&items[n - m..]).map(|(&p, &item)| Match::Node(p, item)));
+                            todo.extend(after.iter().zip(&items[len - after_len..]).map(|(&node, &item)| Match::Node(node, item)));
                         }
                         if let Some(tail) = tail {
-                            todo.push(Match::Node(*tail, rests[if repeat.is_some() { n } else { k }]));
+                            todo.push(Match::Node(*tail, rests[if repeat.is_some() { len } else { before_len }]));
                         }
                         todo[at..].reverse();
                     }
@@ -295,14 +295,14 @@ impl<'gc> Matcher<'_, 'gc> {
     }
 }
 
-/// Deconstructs a Scheme list or syntax-wrapped list `v` into a pair of vectors `(items, rests)`,
+/// Deconstructs a Scheme list or syntax-wrapped list `value` into a pair of vectors `(items, rests)`,
 /// where `items` contains the list elements and `rests` contains the successive tail values at each step
-/// and after the final element; returns `None` if `v` is neither a list nor list syntax.
-fn list_items<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> Option<(Vec<Value<'gc>>, Vec<Value<'gc>>)> {
-    let mut at = match Syntax::of(v) {
-        Some(s) if s.kind(mc) == Some(SyntaxKind::List) => s.datum(mc),
+/// and after the final element; returns `None` if `value` is neither a list nor list syntax.
+fn list_items<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Option<(Vec<Value<'gc>>, Vec<Value<'gc>>)> {
+    let mut at = match Syntax::of(value) {
+        Some(syntax) if syntax.kind(mc) == Some(SyntaxKind::List) => syntax.datum(mc),
         Some(_) => return None,
-        None => v,
+        None => value,
     };
     if at != Value::NIL && Pair::of(at).is_none() {
         return None;
@@ -313,7 +313,7 @@ fn list_items<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> Option<(Vec<Value<'gc>>
             items.push(pair.head(mc));
             rests.push(at);
             at = pair.tail(mc);
-        } else if let Some(datum) = Syntax::of(at).filter(|s| s.kind(mc) == Some(SyntaxKind::List)).map(|s| s.datum(mc)) {
+        } else if let Some(datum) = Syntax::of(at).filter(|syntax| syntax.kind(mc) == Some(SyntaxKind::List)).map(|syntax| syntax.datum(mc)) {
             at = datum;
         } else {
             break;
@@ -323,13 +323,13 @@ fn list_items<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> Option<(Vec<Value<'gc>>
     Some((items, rests))
 }
 
-fn vector_items<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> Option<(Vec<Value<'gc>>, Vec<Value<'gc>>)> {
-    let v = match Syntax::of(v) {
-        Some(s) if s.kind(mc) == Some(SyntaxKind::Vector) => s.datum(mc),
+fn vector_items<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Option<(Vec<Value<'gc>>, Vec<Value<'gc>>)> {
+    let datum = match Syntax::of(value) {
+        Some(syntax) if syntax.kind(mc) == Some(SyntaxKind::Vector) => syntax.datum(mc),
         Some(_) => return None,
-        None => v,
+        None => value,
     };
-    let vector = AnyVector::of(v)?;
+    let vector = AnyVector::of(datum)?;
     let items: Vec<_> = (0..vector.len(mc)).filter_map(|i| vector.get(mc, i)).collect();
     let rests = vec![Value::NIL; items.len() + 1];
     Some((items, rests))
@@ -371,12 +371,12 @@ struct Builder<'m, 'gc> {
 }
 
 impl<'gc> Builder<'_, 'gc> {
-    fn item(&self, i: u32) -> Result<Value<'gc>, Fault> {
+    fn item(&self, index: u32) -> Result<Value<'gc>, Fault> {
         let items = self.template.items(self.mc);
-        if i as usize >= items.len() {
+        if index as usize >= items.len() {
             return Err(Fault::Malformed);
         }
-        Ok(items.get(i as usize))
+        Ok(items.get(index as usize))
     }
 
     fn var(&self, slot: u32) -> Result<(Value<'gc>, u32), Fault> {
@@ -391,16 +391,16 @@ impl<'gc> Builder<'_, 'gc> {
         let mut made = Vec::new();
         while let Some(task) = todo.pop() {
             match task {
-                Build::Node(t) => {
+                Build::Node(node) => {
                     self.count = self.count.saturating_add(1);
                     if self.count > self.most {
                         return Err(Fault::OutOfFuel);
                     }
-                    match shape.nodes.get(t as usize).ok_or(Fault::Malformed)? {
-                        Template::Const(i) => made.push(self.item(*i)?),
+                    match shape.nodes.get(node as usize).ok_or(Fault::Malformed)? {
+                        Template::Const(index) => made.push(self.item(*index)?),
                         Template::Var(slot) => made.push(self.var(*slot)?.0),
                         Template::Seq { items, tail, vector, .. } => {
-                            todo.push(Build::Seq(t, made.len()));
+                            todo.push(Build::Seq(node, made.len()));
                             if let Some(tail) = tail.filter(|_| !vector) {
                                 todo.push(Build::Node(tail));
                             }
@@ -411,11 +411,11 @@ impl<'gc> Builder<'_, 'gc> {
                         }
                     }
                 }
-                Build::Item(i, 0) => todo.push(Build::Node(shape.items[i as usize].template)),
-                Build::Item(i, ellipses) => self.repeat(shape, i, ellipses, &mut todo)?,
+                Build::Item(index, 0) => todo.push(Build::Node(shape.items[index as usize].template)),
+                Build::Item(index, ellipses) => self.repeat(shape, index, ellipses, &mut todo)?,
                 Build::Bind(bound) => bound.into_iter().for_each(|(slot, was)| self.env[slot] = was),
-                Build::Seq(t, start) => {
-                    let Template::Seq { tail, vector, like, .. } = shape.nodes[t as usize] else { unreachable!("a sequence's node") };
+                Build::Seq(node, start) => {
+                    let Template::Seq { tail, vector, like, .. } = shape.nodes[node as usize] else { unreachable!("a sequence's node") };
                     let like = Syntax::of(self.item(like)?).ok_or(Fault::Malformed)?;
                     let tail = if tail.is_some() && !vector { made.pop().expect("a tail") } else { Value::NIL };
                     let out = made.split_off(start);
@@ -427,11 +427,11 @@ impl<'gc> Builder<'_, 'gc> {
         Ok(made.pop().expect("the root's made"))
     }
 
-    /// Expands repeated template item `i` at ellipsis depth `ellipses`. Validates that all active driver variables
+    /// Expands repeated template item `index` at ellipsis depth `ellipses`. Validates that all active driver variables
     /// have matching list lengths (raising [`Fault::Syntax`] on mismatch), and schedules iterations on the `todo` stack
     /// to bind sub-elements and restore bindings.
-    fn repeat(&mut self, shape: &TemplateShape, i: u32, ellipses: u32, todo: &mut Vec<Build<'gc>>) -> Result<(), Fault> {
-        let item = &shape.items[i as usize];
+    fn repeat(&mut self, shape: &TemplateShape, index: u32, ellipses: u32, todo: &mut Vec<Build<'gc>>) -> Result<(), Fault> {
+        let item = &shape.items[index as usize];
         let mut drivers = Vec::new();
         for &slot in shape.slots.get(item.slots.start as usize..item.slots.end as usize).ok_or(Fault::Malformed)? {
             if self.var(slot)?.1 > 0 {
@@ -446,9 +446,9 @@ impl<'gc> Builder<'_, 'gc> {
         }
         let saved: Vec<_> = drivers.iter().map(|&slot| (slot, self.env[slot])).collect();
         todo.push(Build::Bind(saved.clone()));
-        for k in (0..len).rev() {
-            todo.push(Build::Item(i, ellipses - 1));
-            todo.push(Build::Bind(saved.iter().zip(&lists).map(|(&(slot, (_, depth)), list)| (slot, (list[k], depth - 1))).collect()));
+        for iteration in (0..len).rev() {
+            todo.push(Build::Item(index, ellipses - 1));
+            todo.push(Build::Bind(saved.iter().zip(&lists).map(|(&(slot, (_, depth)), list)| (slot, (list[iteration], depth - 1))).collect()));
         }
         Ok(())
     }

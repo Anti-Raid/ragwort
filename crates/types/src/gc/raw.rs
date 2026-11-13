@@ -91,7 +91,7 @@ impl<'gc, T: Object> Raw<'gc> for Gc<'gc, T> {
     #[inline]
     fn set_member<U: Object>(self, mc: &Mutation<'gc>, field: usize, member: Option<Gc<'gc, U>>) {
         let slot = field_slot(self, field);
-        let index = member.map_or(0, |m| m.index);
+        let index = member.map_or(0, |member| member.index);
         mc.heap.words[slot].set(u64::from(index));
         if index != 0 {
             mc.heap.barrier_ref(slot, self.index, index);
@@ -106,7 +106,7 @@ impl<'gc, T: Object> Raw<'gc> for Gc<'gc, T> {
     #[inline]
     fn set_weak<U: Object>(self, mc: &Mutation<'gc>, field: usize, target: Option<Gc<'gc, U>>) {
         let slot = field_slot(self, field);
-        mc.heap.words[slot].set(u64::from(target.map_or(0, |t| t.index)));
+        mc.heap.words[slot].set(u64::from(target.map_or(0, |target| target.index)));
         mc.heap.dirty(slot);
     }
 
@@ -118,7 +118,7 @@ impl<'gc, T: Object> Raw<'gc> for Gc<'gc, T> {
 
     fn set_host(self, mc: &Mutation<'gc>, field: usize, host: AnyHostRef<'gc>) {
         mc.heap.words[field_slot(self, field)].set(host.to_word());
-        if mc.heap.m.phase.get() == Phase::Marking && mc.heap.has_bit(self.index as usize, |p| &p.marks) {
+        if mc.heap.m.phase.get() == Phase::Marking && mc.heap.has_bit(self.index as usize, |page| &page.marks) {
             mc.heap.mark_host(host.to_word());
         }
     }

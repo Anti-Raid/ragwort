@@ -25,7 +25,7 @@ impl<'gc> SyntaxText<'gc> {
     }
 
     pub fn bytes(self, mc: &Mutation<'gc>) -> &'gc [u8] {
-        self.0.bytes(mc).map_or(&[], |b| b)
+        self.0.bytes(mc).map_or(&[], |bytes| bytes)
     }
 }
 
@@ -63,7 +63,7 @@ impl<'gc> SyntaxSource<'gc> {
 
     /// Each line's first byte offset, from zero.
     pub fn line_starts(self, mc: &Mutation<'gc>) -> &'gc [u32] {
-        self.0.lines(mc).map_or(&[], |l| l)
+        self.0.lines(mc).map_or(&[], |lines| lines)
     }
 
     /// Looks up a byte offset, including EOF. Works after the text is collected.
@@ -105,8 +105,8 @@ impl SyntaxSession {
         let len = u32::try_from(bytes.len()).map_err(|_| mc.out_of_memory())?;
         let text = SyntaxText::new(mc, bytes)?;
         let name = name.map(|name| SyntaxText::new(mc, name)).transpose()?;
-        let lines = frozen_slice(mc, line_starts(bytes).count(), |out| out.iter_mut().zip(line_starts(bytes)).for_each(|(o, start)| *o = start))?;
-        let source = objects::SyntaxSource::new(mc, name.map(|n| n.0), Some(text.0), u64::from(len), lines)?;
+        let lines = frozen_slice(mc, line_starts(bytes).count(), |out| out.iter_mut().zip(line_starts(bytes)).for_each(|(entry, start)| *entry = start))?;
+        let source = objects::SyntaxSource::new(mc, name.map(|label| label.0), Some(text.0), u64::from(len), lines)?;
         let session = objects::Session::new(mc, Some(source), Some(text.0))?;
         Ok(Self { root: Root::new(mc, session)? })
     }
@@ -162,7 +162,7 @@ impl<'gc> SyntaxSpan<'gc> {
     }
 
     fn source_gc(self) -> Option<Gc<'gc, objects::SyntaxSource>> {
-        self.source.map(|s| s.0)
+        self.source.map(|source| source.0)
     }
 
     fn word(self) -> u64 {
@@ -233,7 +233,7 @@ pub struct SyntaxOrigin<'gc>(Gc<'gc, objects::SyntaxOrigin>);
 
 impl<'gc> SyntaxOrigin<'gc> {
     pub fn new(mc: &Mutation<'gc>, span: SyntaxSpan<'gc>, parent: Option<Self>) -> Result<Self, OutOfMemory> {
-        Ok(Self(objects::SyntaxOrigin::new(mc, span.source_gc(), span.word(), parent.map(|p| p.0))?))
+        Ok(Self(objects::SyntaxOrigin::new(mc, span.source_gc(), span.word(), parent.map(|origin| origin.0))?))
     }
 
     pub fn span(self, mc: &Mutation<'gc>) -> SyntaxSpan<'gc> {
@@ -333,7 +333,7 @@ impl<'gc> SyntaxMeta<'gc> {
         context: Option<SyntaxContext<'gc>>,
         origin: Option<SyntaxOrigin<'gc>>,
     ) -> Result<Self, OutOfMemory> {
-        Ok(Self(objects::SyntaxMeta::new(mc, kind.tag(), context.map(|c| c.0), origin.map(|o| o.0))?))
+        Ok(Self(objects::SyntaxMeta::new(mc, kind.tag(), context.map(|inner| inner.0), origin.map(|inner| inner.0))?))
     }
 
     /// Returns `None` if the stored tag is invalid.
@@ -372,13 +372,13 @@ impl<'gc> Syntax<'gc> {
         binding: Option<Value<'gc>>,
     ) -> Result<Self, OutOfMemory> {
         let binding = binding.unwrap_or(Value::FALSE);
-        Ok(Self(objects::Syntax::new(mc, datum, span.source_gc(), span.word(), meta.map(|m| m.0), binding)?))
+        Ok(Self(objects::Syntax::new(mc, datum, span.source_gc(), span.word(), meta.map(|inner| inner.0), binding)?))
     }
 
     #[inline]
-    pub fn of(v: Value<'gc>) -> Option<Self> {
-        match Data::of(v) {
-            Some(Data::Syntax(s)) => Some(Self(s)),
+    pub fn of(value: Value<'gc>) -> Option<Self> {
+        match Data::of(value) {
+            Some(Data::Syntax(syntax)) => Some(Self(syntax)),
             _ => None,
         }
     }
@@ -394,7 +394,7 @@ impl<'gc> Syntax<'gc> {
     /// What an identifier refers to, if what made it said: a value made to stand for its
     /// binding.
     pub fn binding(self, mc: &Mutation<'gc>) -> Option<Value<'gc>> {
-        Some(self.0.binding(mc)).filter(|&b| b != Value::FALSE)
+        Some(self.0.binding(mc)).filter(|&binding| binding != Value::FALSE)
     }
 
     /// Returns `None` if the stored tag is invalid.

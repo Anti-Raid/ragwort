@@ -45,17 +45,17 @@ pub(crate) enum Bind<'id> {
 }
 
 impl<'id, 'gc> Children<'id, 'gc> for Bind<'id> {
-    fn each(self, _: &L3<'id, 'gc>, f: &mut impl FnMut(Id<'id>)) {
+    fn each(self, _: &L3<'id, 'gc>, visit: &mut impl FnMut(Id<'id>)) {
         if let Bind::Val(_, init) = self {
-            f(init);
+            visit(init);
         }
     }
 }
 
 impl<'id, 'gc> Bodies<'id, 'gc> for Bind<'id> {
-    fn bodies(self, tree: &L3<'id, 'gc>, f: &mut impl FnMut(Id<'id>)) {
+    fn bodies(self, tree: &L3<'id, 'gc>, visit: &mut impl FnMut(Id<'id>)) {
         if let Bind::Fix(group) = self {
-            tree[group].iter().for_each(|&(_, fun)| f(tree[fun].body));
+            tree[group].iter().for_each(|&(_, fun)| visit(tree[fun].body));
         }
     }
 }
@@ -69,8 +69,8 @@ pub(crate) struct JoinCode<'id> {
 }
 
 impl<'id, 'gc> Children<'id, 'gc> for JoinCode<'id> {
-    fn each(self, tree: &L3<'id, 'gc>, f: &mut impl FnMut(Id<'id>)) {
-        f(tree[self.fun].body);
+    fn each(self, tree: &L3<'id, 'gc>, visit: &mut impl FnMut(Id<'id>)) {
+        visit(tree[self.fun].body);
     }
 }
 
@@ -95,10 +95,10 @@ impl<'id, 'gc> L3<'id, 'gc> {
     /// Returns the variables introduced by `bind`.
     pub(crate) fn vars(&self, bind: Bind<'id>) -> impl Iterator<Item = Var> + '_ {
         let (one, group) = match bind {
-            Bind::Val(v, _) => (Some(v), &[][..]),
+            Bind::Val(var, _) => (Some(var), &[][..]),
             Bind::Fix(group) => (None, &self[group]),
         };
-        one.into_iter().chain(group.iter().map(|&(v, _)| v))
+        one.into_iter().chain(group.iter().map(|&(var, _)| var))
     }
 
     /// Returns `fun`'s positional parameters and optional rest parameter.
@@ -109,8 +109,8 @@ impl<'id, 'gc> L3<'id, 'gc> {
     /// Panics if the tree rooted at `root` is malformed. Used by debug-build checks.
     #[cfg(debug_assertions)]
     pub(crate) fn check(&self, root: Id<'id>) {
-        if let Err(e) = self.verify(root) {
-            panic!("malformed L3: {e}");
+        if let Err(error) = self.verify(root) {
+            panic!("malformed L3: {error}");
         }
     }
 
@@ -151,13 +151,13 @@ impl<'id, 'gc> L3<'id, 'gc> {
         while let Some(task) = todo.pop() {
             let joins = frames.last_mut().expect("the code's frame is never left");
             match task {
-                Task::Bind(v) => {
-                    if !bound.insert(v) {
-                        return Err(format!("{v:?} is bound twice"));
+                Task::Bind(var) => {
+                    if !bound.insert(var) {
+                        return Err(format!("{var:?} is bound twice"));
                     }
-                    locals.insert(v);
+                    locals.insert(var);
                 }
-                Task::Unbind(v) => _ = locals.remove(&v),
+                Task::Unbind(var) => _ = locals.remove(&var),
                 Task::Joins(codes) => {
                     for code in &self[codes] {
                         own(code.fun)?;
@@ -185,7 +185,7 @@ impl<'id, 'gc> L3<'id, 'gc> {
                         return Err(format!("{id:?} has two parents"));
                     }
                     let in_scope = match self[id] {
-                        Node::Ref(v) | Node::Set(v, _) => locals.contains(&v),
+                        Node::Ref(var) | Node::Set(var, _) => locals.contains(&var),
                         Node::Jump(join, args) => joins.get(&join) == Some(&self[args].len()),
                         _ => true,
                     };
@@ -196,9 +196,9 @@ impl<'id, 'gc> L3<'id, 'gc> {
                         Node::Let(binds, body) => {
                             for &bind in &self[binds] {
                                 match bind {
-                                    Bind::Val(v, init) => then.extend([Task::Expr(init), Task::Bind(v)]),
+                                    Bind::Val(var, init) => then.extend([Task::Expr(init), Task::Bind(var)]),
                                     Bind::Fix(group) => {
-                                        then.extend(self[group].iter().map(|&(v, _)| Task::Bind(v)));
+                                        then.extend(self[group].iter().map(|&(var, _)| Task::Bind(var)));
                                         then.extend(self[group].iter().map(|&(_, fun)| Task::Function(fun)));
                                     }
                                 }

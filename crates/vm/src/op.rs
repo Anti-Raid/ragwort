@@ -294,11 +294,11 @@ impl From<OutOfMemory> for Fault {
 }
 
 impl From<Error> for Fault {
-    fn from(e: Error) -> Self {
-        match e {
+    fn from(error: Error) -> Self {
+        match error {
             Error::OutOfMemory => Self::OutOfMemory,
-            Error::Num(e) => Self::Num(e),
-            Error::Str(e) => Self::Str(e),
+            Error::Num(error) => Self::Num(error),
+            Error::Str(error) => Self::Str(error),
         }
     }
 }
@@ -322,20 +322,20 @@ impl Op {
                     return Ok(Control::Jump(offset));
                 }
             }
-            Op::BranchIntrinsic1 { a, intrinsic, branch_if, offset } => {
-                if intrinsic.arity().is_some_and(|n| n != 1) {
+            Op::BranchIntrinsic1 { a: operand, intrinsic, branch_if, offset } => {
+                if intrinsic.arity().is_some_and(|arity| arity != 1) {
                     return Err(Fault::Malformed);
                 }
-                let val = intrinsic.exec1(cx, a)?;
+                let val = intrinsic.exec1(cx, operand)?;
                 if (val != Value::FALSE) == branch_if {
                     return Ok(Control::Jump(i32::from(offset)));
                 }
             }
-            Op::BranchIntrinsic2 { a, b, intrinsic, branch_if, offset } => {
-                if intrinsic.arity().is_some_and(|n| n != 2) {
+            Op::BranchIntrinsic2 { a: left, b: right, intrinsic, branch_if, offset } => {
+                if intrinsic.arity().is_some_and(|arity| arity != 2) {
                     return Err(Fault::Malformed);
                 }
-                let val = intrinsic.exec2(cx, a, b)?;
+                let val = intrinsic.exec2(cx, left, right)?;
                 if (val != Value::FALSE) == branch_if {
                     return Ok(Control::Jump(i32::from(offset)));
                 }
@@ -360,8 +360,8 @@ impl Op {
                 }
                 for i in 0..count {
                     let index = code.checked_add(u32::from(i)).ok_or(Fault::Malformed)?;
-                    let code = cx.constants.get(mc, index).and_then(|c| c.downcast::<objects::Bytecode>(mc)).ok_or(Fault::Malformed)?;
-                    let captures = code.captures(mc).map_or(0, |c| c.len());
+                    let code = cx.constants.get(mc, index).and_then(|constant| constant.downcast::<objects::Bytecode>(mc)).ok_or(Fault::Malformed)?;
+                    let captures = code.captures(mc).map_or(0, |slice| slice.len());
                     frame.set(dst + i, Value::object(mc, objects::Closure::new(mc, Some(code), captures, Value::VOID)?));
                 }
                 if mc.step_due() {
@@ -370,15 +370,15 @@ impl Op {
                 for i in 0..count {
                     let closure = frame.get(dst + i).downcast::<objects::Closure>(mc).ok_or(Fault::Malformed)?;
                     let (code, upvalues) = (closure.code(mc).ok_or(Fault::Malformed)?, closure.items(mc));
-                    for (j, capture) in code.captures(mc).map_or(&[][..], |c| c).iter().enumerate() {
+                    for (j, capture) in code.captures(mc).map_or(&[][..], |slice| slice).iter().enumerate() {
                         let value = match *capture {
-                            Capture::Register(r) => frame.get(r),
-                            Capture::Upvalue(u) => {
-                                let u = u as usize;
-                                if u >= cx.upvalues.len() {
+                            Capture::Register(register) => frame.get(register),
+                            Capture::Upvalue(upvalue) => {
+                                let upvalue = upvalue as usize;
+                                if upvalue >= cx.upvalues.len() {
                                     return Err(Fault::Malformed);
                                 }
-                                cx.upvalues.get(u)
+                                cx.upvalues.get(upvalue)
                             }
                             Capture::Spill { spill, slot } => spilled(mc, frame, spill, slot)?.get(slot as usize),
                         };
@@ -387,7 +387,7 @@ impl Op {
                 }
             }
             Op::CallIntrinsic { base, args, intrinsic } | Op::TailCallIntrinsic { base, args, intrinsic } => {
-                if usize::from(base) + usize::from(args) > WINDOW || intrinsic.arity().is_some_and(|n| n != args) {
+                if usize::from(base) + usize::from(args) > WINDOW || intrinsic.arity().is_some_and(|arity| arity != args) {
                     return Err(Fault::Malformed);
                 }
                 cx.acc = intrinsic.exec(cx, base, args)?;
@@ -395,38 +395,38 @@ impl Op {
                     return Ok(Control::Return);
                 }
             }
-            Op::CallIntrinsic1 { dst, a, intrinsic } => {
-                if intrinsic.arity().is_some_and(|n| n != 1) {
+            Op::CallIntrinsic1 { dst, a: operand, intrinsic } => {
+                if intrinsic.arity().is_some_and(|arity| arity != 1) {
                     return Err(Fault::Malformed);
                 }
-                let val = intrinsic.exec1(cx, a)?;
+                let val = intrinsic.exec1(cx, operand)?;
                 frame.set(dst, val);
             }
-            Op::CallIntrinsic2 { dst, a, b, intrinsic } => {
-                if intrinsic.arity().is_some_and(|n| n != 2) {
+            Op::CallIntrinsic2 { dst, a: left, b: right, intrinsic } => {
+                if intrinsic.arity().is_some_and(|arity| arity != 2) {
                     return Err(Fault::Malformed);
                 }
-                let val = intrinsic.exec2(cx, a, b)?;
+                let val = intrinsic.exec2(cx, left, right)?;
                 frame.set(dst, val);
             }
-            Op::AddImm { dst, a, imm } => {
-                let (x, k) = (frame.get(a), Value::fixnum(i64::from(imm)).ok_or(Fault::Malformed)?);
-                let sum = match x.fixnum_add(k) {
+            Op::AddImm { dst, a: operand, imm } => {
+                let (left, right) = (frame.get(operand), Value::fixnum(i64::from(imm)).ok_or(Fault::Malformed)?);
+                let sum = match left.fixnum_add(right) {
                     Some(sum) => sum,
-                    None => Intrinsic::Add.run(mc, &[x, k], &mut cx.fuel)?,
+                    None => Intrinsic::Add.run(mc, &[left, right], &mut cx.fuel)?,
                 };
                 frame.set(dst, sum);
             }
-            Op::StructField { dst, a, k } => frame.set(dst, structs::field(mc, frame.get(a), usize::from(k))?),
-            Op::StructRef { dst, a, k, kind } => {
+            Op::StructField { dst, a: instance, k: index } => frame.set(dst, structs::field(mc, frame.get(instance), usize::from(index))?),
+            Op::StructRef { dst, a: instance, k: index, kind } => {
                 let kind = cx.constants.get(mc, kind).ok_or(Fault::Malformed)?;
-                frame.set(dst, structs::field_of(mc, frame.get(a), kind, usize::from(k))?);
+                frame.set(dst, structs::field_of(mc, frame.get(instance), kind, usize::from(index))?);
             }
-            Op::CallIntrinsic3 { dst, a, b, c, intrinsic } => {
-                if intrinsic.arity().is_some_and(|n| n != 3) {
+            Op::CallIntrinsic3 { dst, a: first, b: second, c: third, intrinsic } => {
+                if intrinsic.arity().is_some_and(|arity| arity != 3) {
                     return Err(Fault::Malformed);
                 }
-                let val = intrinsic.exec3(cx, a, b, c)?;
+                let val = intrinsic.exec3(cx, first, second, third)?;
                 frame.set(dst, val);
             }
             Op::CallRequest { base, args, request } | Op::TailCallRequest { base, args, request } => {
@@ -503,8 +503,8 @@ fn spilled<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, spill: u8, slot: u32)
 /// Retrieves the variable slots of the module enclosing the bytecode executing in `frame`, verifying that `slot` is within bounds.
 #[inline]
 fn variables<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, slot: u32) -> Result<Slots<'gc>, Fault> {
-    let module = frame.get(CLOSURE).downcast::<objects::Closure>(mc).and_then(|c| c.code(mc)).and_then(|code| code.module(mc));
-    module.map(|m| m.items(mc)).filter(|slots| (slot as usize) < slots.len()).ok_or(Fault::Malformed)
+    let module = frame.get(CLOSURE).downcast::<objects::Closure>(mc).and_then(|closure| closure.code(mc)).and_then(|code| code.module(mc));
+    module.map(|module| module.items(mc)).filter(|slots| (slot as usize) < slots.len()).ok_or(Fault::Malformed)
 }
 
 /// Unpacks the elements of a proper Scheme list into a `Vec<Value>`, returning [`Fault::WrongType`] if the list is improper or non-nil terminated.

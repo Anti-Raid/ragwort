@@ -224,7 +224,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         })
     }
 
-    /// Builds the declaration that `form` makes, with its names as symbols, which the compiler works out the struct's type and bindings from.
+    /// Converts the parsed `form` into the compiler's struct declaration. `whole` is the syntax of the entire form. Names become symbols with their spans.
     fn struct_item(&self, form: &Form, whole: Stx) -> structs::Form<'gc> {
         let named = |id: Stx| (self.tree.symbol(id).expect("an identifier").value(self.mc), self.tree.span(id));
         structs::Form {
@@ -240,7 +240,9 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     /// Declares what `form`, a struct form that's the module's top-level form `index`, defines,
     /// and makes its type, which the module's code has as a constant.
     ///
-    /// The compiler works out the type and the bindings from the declaration. The names are bound here, because an identifier's scopes decide what it refers to: the supertype is what its identifier resolves to, and each binding is defined for an identifier that has the scopes of the struct's name.
+    /// The compiler plans the declaration: it creates the type and lists the bindings. This method does the two steps that depend on scopes:
+    /// - It resolves the supertype's identifier.
+    /// - It defines each binding as an identifier with the scopes of the struct's name. A `struct` form written by a macro therefore keeps its bindings private to that macro.
     pub(crate) fn declare_struct(&mut self, form: Stx, index: u32) -> Result<Declared, ExpandError> {
         let parts = self.struct_form(form)?;
         let parent = match parts.parent {
@@ -250,9 +252,9 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 None => return Err(self.error(ExpandErrorKind::BadSyntax, id)),
             },
         };
-        let planned = self.struct_item(&parts, form).plan(self.mc, parent).map_err(|e| match (e, parts.parent) {
+        let planned = self.struct_item(&parts, form).plan(self.mc, parent).map_err(|error| match (error, parts.parent) {
             (ModuleError::Supertype, Some(id)) => self.error(ExpandErrorKind::BadSyntax, id),
-            _ => self.module_error(e, form),
+            _ => self.module_error(error, form),
         })?;
         let mut slots = Vec::with_capacity(planned.members.len());
         for (named, _) in &planned.members {
@@ -278,10 +280,10 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         self.quoted(kind, at)
     }
 
-    /// `(struct-copy name e [field value] ...)`: `(let ((t e)) (let ((v value)) ... (name field
+    /// `(struct-copy name expr [field value] ...)`: `(let ((t expr)) (let ((v value)) ... (name field
     /// ...)))`, a call of the struct's constructor, each field its `v` or a read of that field
     /// of `t`, which checks that `t` is of the type.
-    pub(crate) fn struct_copy(&mut self, stx: Stx, name: Stx, e: Stx, updates: &[Stx]) -> Result<Stx, ExpandError> {
+    pub(crate) fn struct_copy(&mut self, stx: Stx, name: Stx, expr: Stx, updates: &[Stx]) -> Result<Stx, ExpandError> {
         let bad = ExpandErrorKind::BadSyntax;
         let Some(info) = self.struct_info(name)? else { return Err(self.error(bad, name)) };
         if info.match_only {
@@ -296,22 +298,22 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             let &[field, value] = self.proper(update)?.as_slice() else { return Err(self.error(bad, update)) };
             let named = if self.is_id(field) { self.text(field) } else { None };
             // A subtype's field of a name is the one meant, over its supertype's.
-            let Some(k) = named.and_then(|named| info.fields.iter().rposition(|f| *f.name == *named)) else { return Err(self.error(bad, field)) };
-            if given[k].is_some() {
+            let Some(index) = named.and_then(|named| info.fields.iter().rposition(|candidate| *candidate.name == *named)) else { return Err(self.error(bad, field)) };
+            if given[index].is_some() {
                 return Err(self.error(ExpandErrorKind::Duplicate, field));
             }
             let temp = self.introduce(&format!("v{i}"), stx)?;
-            given[k] = Some(temp);
+            given[index] = Some(temp);
             binds.push((temp, value));
         }
         let all_given = given.iter().all(Option::is_some);
         let mut fields = Vec::with_capacity(given.len());
-        for (k, given) in given.into_iter().enumerate() {
+        for (index, given) in given.into_iter().enumerate() {
             fields.push(match given {
                 Some(temp) => temp,
                 None => {
-                    let k = self.value(Value::fixnum(k as i64).ok_or_else(|| self.error(OutOfMemory, stx))?, stx)?;
-                    self.list(&[get, source, kind, k], stx)?
+                    let index = self.value(Value::fixnum(index as i64).ok_or_else(|| self.error(OutOfMemory, stx))?, stx)?;
+                    self.list(&[get, source, kind, index], stx)?
                 }
             });
         }
@@ -325,6 +327,6 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         for (temp, value) in binds.into_iter().rev() {
             body = self.with_temp(stx, temp, value, body)?;
         }
-        self.with_temp(stx, source, e, body)
+        self.with_temp(stx, source, expr, body)
     }
 }

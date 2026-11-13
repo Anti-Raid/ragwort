@@ -12,11 +12,11 @@ pub fn multiply_single(mut z: RWDigits<'_>, x: Digits<'_>, y: Digit) {
     z.offset(x.len() + 1).clear();
 }
 
-/// `z = z * m + add` in place, returning the carry.
-pub fn multiply_add_in_place(mut z: RWDigits<'_>, m: Digit, add: Digit) -> Digit {
+/// `z = z * factor + add` in place, returning the carry.
+pub fn multiply_add_in_place(mut z: RWDigits<'_>, factor: Digit, add: Digit) -> Digit {
     let mut carry = add;
     for i in 0..z.len() {
-        carry = z.put(i, digit_mul_add(z.at(i), m, 0, carry));
+        carry = z.put(i, digit_mul_add(z.at(i), factor, 0, carry));
     }
     carry
 }

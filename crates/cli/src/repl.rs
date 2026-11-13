@@ -20,8 +20,8 @@ pub fn run(program: &mut Program) -> ExitCode {
         let mut line = String::new();
         let ended = match stdin.lock().read_line(&mut line) {
             Ok(read) => read == 0,
-            Err(e) => {
-                eprintln!("{e}");
+            Err(error) => {
+                eprintln!("{error}");
                 return ExitCode::FAILURE;
             }
         };

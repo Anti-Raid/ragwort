@@ -24,7 +24,7 @@ pub trait RealHost: RationalHost {
 
     fn of_rational(&self, x: Self::Rational) -> Self::Real;
 
-    fn flonum(&self, f: f64) -> Result<Self::Real, Self::Error>;
+    fn flonum(&self, value: f64) -> Result<Self::Real, Self::Error>;
 }
 
 type Res<H> = Result<<H as RealHost>::Real, <H as Host>::Error>;
@@ -43,13 +43,13 @@ fn is_zero<H: RealHost>(h: &H, x: H::Rational) -> bool {
 
 /// Exact zero, which Racket keeps exact through `*` and `/`.
 pub fn is_exact_zero<H: RealHost>(h: &H, x: H::Real) -> bool {
-    matches!(h.real_view(x), RealView::Exact(r) if is_zero(h, r))
+    matches!(h.real_view(x), RealView::Exact(fraction) if is_zero(h, fraction))
 }
 
 pub fn is_integer<H: RealHost>(h: &H, x: H::Real) -> bool {
     match h.real_view(x) {
-        RealView::Exact(r) => rational::is_integer(h, r),
-        RealView::Flonum(f) => f.is_finite() && f.fract() == 0.0,
+        RealView::Exact(fraction) => rational::is_integer(h, fraction),
+        RealView::Flonum(float) => float.is_finite() && float.fract() == 0.0,
     }
 }
 
@@ -60,15 +60,15 @@ pub fn to_f64<H: RealHost>(h: &H, x: H::Real) -> Result<f64, H::Error> {
 
 fn view_f64<H: RealHost>(h: &H, x: RealView<H::Rational>) -> Result<f64, H::Error> {
     match x {
-        RealView::Exact(r) => rational::to_f64(h, r),
-        RealView::Flonum(f) => Ok(f),
+        RealView::Exact(fraction) => rational::to_f64(h, fraction),
+        RealView::Flonum(float) => Ok(float),
     }
 }
 
 /// `exact->inexact`
 pub fn inexact<H: RealHost>(h: &H, x: H::Real) -> Res<H> {
     match h.real_view(x) {
-        RealView::Exact(r) => h.flonum(rational::to_f64(h, r)?),
+        RealView::Exact(fraction) => h.flonum(rational::to_f64(h, fraction)?),
         RealView::Flonum(_) => Ok(x),
     }
 }
@@ -77,15 +77,15 @@ pub fn inexact<H: RealHost>(h: &H, x: H::Real) -> Res<H> {
 pub fn exact<H: RealHost>(h: &H, x: H::Real) -> Res<H> {
     match h.real_view(x) {
         RealView::Exact(_) => Ok(x),
-        RealView::Flonum(f) => Ok(h.of_rational(rational::from_f64(h, f)?)),
+        RealView::Flonum(float) => Ok(h.of_rational(rational::from_f64(h, float)?)),
     }
 }
 
 /// How `x` compares to zero, or `None` for NaN. Both zeros are zero.
 pub fn sign<H: RealHost>(h: &H, x: H::Real) -> Option<Ordering> {
     match h.real_view(x) {
-        RealView::Exact(r) => Some(rational::sign(h, r)),
-        RealView::Flonum(f) => f.partial_cmp(&0.0),
+        RealView::Exact(fraction) => Some(rational::sign(h, fraction)),
+        RealView::Flonum(float) => float.partial_cmp(&0.0),
     }
 }
 
@@ -99,22 +99,22 @@ pub fn compare<H: RealHost>(h: &H, x: H::Real, y: H::Real) -> Result<Option<Orde
     })
 }
 
-/// `r` against `f`, exactly.
-fn compare_exact<H: RealHost>(h: &H, r: H::Rational, f: f64) -> Result<Option<Ordering>, H::Error> {
-    if f.is_nan() {
+/// `fraction` against `float`, exactly.
+fn compare_exact<H: RealHost>(h: &H, fraction: H::Rational, float: f64) -> Result<Option<Ordering>, H::Error> {
+    if float.is_nan() {
         return Ok(None);
     }
-    if f.is_infinite() {
-        return Ok(Some(if f > 0.0 { Ordering::Less } else { Ordering::Greater }));
+    if float.is_infinite() {
+        return Ok(Some(if float > 0.0 { Ordering::Less } else { Ordering::Greater }));
     }
     // Integers of up to 53 bits are exact as doubles.
-    if let RationalView::Integer(n) = h.rational_view(r)
+    if let RationalView::Integer(n) = h.rational_view(fraction)
         && let Some(n) = int::to_i64(h, n)
         && n.unsigned_abs() <= 1 << 53
     {
-        return Ok((n as f64).partial_cmp(&f));
+        return Ok((n as f64).partial_cmp(&float));
     }
-    Ok(Some(rational::compare(h, r, rational::from_f64(h, f)?)?))
+    Ok(Some(rational::compare(h, fraction, rational::from_f64(h, float)?)?))
 }
 
 /// `eqv?`: the same exactness and value, where `0.0` and `-0.0` differ and NaNs are all
@@ -131,22 +131,22 @@ pub fn eqv<H: RealHost>(h: &H, x: H::Real, y: H::Real) -> bool {
 /// [`rational::hash`] does.
 pub fn hash<H: RealHost, S: Hasher>(h: &H, x: H::Real, state: &mut S) {
     match h.real_view(x) {
-        RealView::Exact(r) => rational::hash(h, r, state),
-        RealView::Flonum(f) => state.write_u64(if f.is_nan() { f64::NAN.to_bits() } else { f.to_bits() }),
+        RealView::Exact(fraction) => rational::hash(h, fraction, state),
+        RealView::Flonum(float) => state.write_u64(if float.is_nan() { f64::NAN.to_bits() } else { float.to_bits() }),
     }
 }
 
 pub fn neg<H: RealHost>(h: &H, x: H::Real) -> Res<H> {
     match h.real_view(x) {
-        RealView::Exact(r) => Ok(h.of_rational(rational::neg(h, r)?)),
-        RealView::Flonum(f) => h.flonum(-f),
+        RealView::Exact(fraction) => Ok(h.of_rational(rational::neg(h, fraction)?)),
+        RealView::Flonum(float) => h.flonum(-float),
     }
 }
 
 pub fn abs<H: RealHost>(h: &H, x: H::Real) -> Res<H> {
     match h.real_view(x) {
-        RealView::Exact(r) => Ok(h.of_rational(rational::abs(h, r)?)),
-        RealView::Flonum(f) => h.flonum(f.abs()),
+        RealView::Exact(fraction) => Ok(h.of_rational(rational::abs(h, fraction)?)),
+        RealView::Flonum(float) => h.flonum(float.abs()),
     }
 }
 
@@ -197,7 +197,7 @@ pub fn min<H: RealHost>(h: &H, x: H::Real, y: H::Real) -> Res<H> {
 fn extreme<H: RealHost>(h: &H, x: H::Real, y: H::Real, want: Ordering) -> Res<H> {
     let pick = match compare(h, y, x)? {
         None => return h.flonum(f64::NAN),
-        Some(o) if o == want => y,
+        Some(order) if order == want => y,
         Some(_) => x,
     };
     if is_exact(h, x) && is_exact(h, y) { Ok(pick) } else { inexact(h, pick) }
@@ -207,12 +207,12 @@ fn extreme<H: RealHost>(h: &H, x: H::Real, y: H::Real, want: Ordering) -> Res<H>
 /// flonums, and infinities and NaN round to themselves.
 pub fn round<H: RealHost>(h: &H, x: H::Real, mode: Round) -> Res<H> {
     match h.real_view(x) {
-        RealView::Exact(r) => Ok(h.of_rational(h.of_int(rational::round(h, r, mode)?))),
-        RealView::Flonum(f) => h.flonum(match mode {
-            Round::Floor => f.floor(),
-            Round::Ceiling => f.ceil(),
-            Round::Truncate => f.trunc(),
-            Round::Nearest => f.round_ties_even(),
+        RealView::Exact(fraction) => Ok(h.of_rational(h.of_int(rational::round(h, fraction, mode)?))),
+        RealView::Flonum(float) => h.flonum(match mode {
+            Round::Floor => float.floor(),
+            Round::Ceiling => float.ceil(),
+            Round::Truncate => float.trunc(),
+            Round::Nearest => float.round_ties_even(),
         }),
     }
 }
@@ -220,11 +220,11 @@ pub fn round<H: RealHost>(h: &H, x: H::Real, mode: Round) -> Res<H> {
 /// The numerator in lowest terms, as exact as `x`.
 pub fn numerator<H: RealHost>(h: &H, x: H::Real) -> Res<H> {
     match h.real_view(x) {
-        RealView::Exact(r) => Ok(h.of_rational(h.of_int(rational::numerator(h, r)))),
-        RealView::Flonum(f) if f.fract() == 0.0 => Ok(x),
-        RealView::Flonum(f) => {
-            let n = rational::numerator(h, rational::from_f64(h, f)?);
-            h.flonum(int::to_f64(h, n))
+        RealView::Exact(fraction) => Ok(h.of_rational(h.of_int(rational::numerator(h, fraction)))),
+        RealView::Flonum(float) if float.fract() == 0.0 => Ok(x),
+        RealView::Flonum(float) => {
+            let num = rational::numerator(h, rational::from_f64(h, float)?);
+            h.flonum(int::to_f64(h, num))
         }
     }
 }
@@ -232,11 +232,11 @@ pub fn numerator<H: RealHost>(h: &H, x: H::Real) -> Res<H> {
 /// The positive denominator in lowest terms, as exact as `x`.
 pub fn denominator<H: RealHost>(h: &H, x: H::Real) -> Res<H> {
     match h.real_view(x) {
-        RealView::Exact(r) => Ok(h.of_rational(h.of_int(rational::denominator(h, r)?))),
-        RealView::Flonum(f) if f.fract() == 0.0 => h.flonum(1.0),
-        RealView::Flonum(f) => {
-            let d = rational::denominator(h, rational::from_f64(h, f)?)?;
-            h.flonum(int::to_f64(h, d))
+        RealView::Exact(fraction) => Ok(h.of_rational(h.of_int(rational::denominator(h, fraction)?))),
+        RealView::Flonum(float) if float.fract() == 0.0 => h.flonum(1.0),
+        RealView::Flonum(float) => {
+            let den = rational::denominator(h, rational::from_f64(h, float)?)?;
+            h.flonum(int::to_f64(h, den))
         }
     }
 }
@@ -270,12 +270,12 @@ fn integer_op<H: RealHost>(
     op: fn(&H, H::Int, H::Int) -> int::Res<H>,
     negative_zero: fn(f64, f64) -> bool,
 ) -> Res<H> {
-    let integer = |v: RealView<H::Rational>| match v {
-        RealView::Exact(r) => match h.rational_view(r) {
+    let integer = |view: RealView<H::Rational>| match view {
+        RealView::Exact(fraction) => match h.rational_view(fraction) {
             RationalView::Integer(n) => Ok(n),
             RationalView::Ratio { .. } => Err(NumError::NotInteger.into()),
         },
-        RealView::Flonum(f) if f.is_finite() && f.fract() == 0.0 => int::from_integral_f64(h, f),
+        RealView::Flonum(float) if float.is_finite() && float.fract() == 0.0 => int::from_integral_f64(h, float),
         RealView::Flonum(_) => Err(NumError::NotInteger.into()),
     };
     let (vx, vy) = (h.real_view(x), h.real_view(y));
@@ -283,9 +283,9 @@ fn integer_op<H: RealHost>(
     if let (RealView::Exact(_), RealView::Exact(_)) = (vx, vy) {
         return Ok(h.of_rational(h.of_int(n)));
     }
-    let f = int::to_f64(h, n);
-    let zero_sign = |v| view_f64(h, v);
-    h.flonum(if f == 0.0 && negative_zero(zero_sign(vx)?, zero_sign(vy)?) { -0.0 } else { f })
+    let float = int::to_f64(h, n);
+    let zero_sign = |view| view_f64(h, view);
+    h.flonum(if float == 0.0 && negative_zero(zero_sign(vx)?, zero_sign(vy)?) { -0.0 } else { float })
 }
 
 /// `x` in `radix`, which is 10 or a power of two, as a reader reads it back. Inexact numbers are
@@ -294,32 +294,32 @@ fn integer_op<H: RealHost>(
 pub fn to_string<H: RealHost>(h: &H, x: H::Real, radix: u32) -> Result<String, H::Error> {
     assert!(radix == 10 || radix.is_power_of_two() && (2..=32).contains(&radix), "radix 10 or a power of two");
     match h.real_view(x) {
-        RealView::Exact(r) => rational::to_string(h, r, radix),
-        RealView::Flonum(f) if f.is_nan() => Ok("+nan.0".into()),
-        RealView::Flonum(f) if f.is_infinite() => Ok(if f > 0.0 { "+inf.0" } else { "-inf.0" }.into()),
-        RealView::Flonum(f) if radix == 10 => Ok(format!("{f:?}")),
-        RealView::Flonum(f) => flonum_in_radix(h, f, radix),
+        RealView::Exact(fraction) => rational::to_string(h, fraction, radix),
+        RealView::Flonum(float) if float.is_nan() => Ok("+nan.0".into()),
+        RealView::Flonum(float) if float.is_infinite() => Ok(if float > 0.0 { "+inf.0" } else { "-inf.0" }.into()),
+        RealView::Flonum(float) if radix == 10 => Ok(format!("{float:?}")),
+        RealView::Flonum(float) => flonum_in_radix(h, float, radix),
     }
 }
 
-/// Finite `f` in `radix`, a power of two, digit for digit.
-fn flonum_in_radix<H: RealHost>(h: &H, f: f64, radix: u32) -> Result<String, H::Error> {
-    let sign = if f.is_sign_negative() { "-" } else { "" };
-    let bits = f.abs().to_bits();
+/// Finite `float` in `radix`, a power of two, digit for digit.
+fn flonum_in_radix<H: RealHost>(h: &H, float: f64, radix: u32) -> Result<String, H::Error> {
+    let sign = if float.is_sign_negative() { "-" } else { "" };
+    let bits = float.abs().to_bits();
     let (exponent, fraction) = ((bits >> 52) as i64, bits & ((1 << 52) - 1));
-    // `|f|` is `m · 2^e`.
-    let (m, e) = if exponent == 0 { (fraction, -1074) } else { (fraction | 1 << 52, exponent - 1075) };
-    if m == 0 {
+    // `|float|` is `mantissa · 2^scale`.
+    let (mantissa, scale) = if exponent == 0 { (fraction, -1074) } else { (fraction | 1 << 52, exponent - 1075) };
+    if mantissa == 0 {
         return Ok(format!("{sign}0.0"));
     }
-    if e >= 0 {
-        let n = int::arithmetic_shift(h, int::from_u64(h, m)?, e)?;
+    if scale >= 0 {
+        let n = int::arithmetic_shift(h, int::from_u64(h, mantissa)?, scale)?;
         return Ok(format!("{sign}{}.0", int::to_string(h, n, radix)?));
     }
     // With the point `places` digits from the right, each digit `log` bits.
     let log = radix.trailing_zeros() as i64;
-    let places = (-e + log - 1) / log;
-    let n = int::arithmetic_shift(h, int::from_u64(h, m)?, places * log + e)?;
+    let places = (-scale + log - 1) / log;
+    let n = int::arithmetic_shift(h, int::from_u64(h, mantissa)?, places * log + scale)?;
     let digits = int::to_string(h, n, radix)?;
     let digits = format!("{}{digits}", "0".repeat((places as usize + 1).saturating_sub(digits.len())));
     let (whole, fraction) = digits.split_at(digits.len() - places as usize);

@@ -33,7 +33,7 @@ fn sources(folder: &Path, files: &mut Vec<PathBuf>) {
             if !SKIPPED.contains(&&*name) && !name.starts_with('.') {
                 sources(&path, files);
             }
-        } else if name == "Cargo.toml" || ["rs", "rg", "rgn"].iter().any(|ext| path.extension().is_some_and(|e| e == *ext)) {
+        } else if name == "Cargo.toml" || ["rs", "rg", "rgn"].iter().any(|ext| path.extension().is_some_and(|found| found == *ext)) {
             files.push(path);
         }
     }

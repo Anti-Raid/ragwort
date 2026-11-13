@@ -61,7 +61,7 @@ impl Slot {
 }
 
 fn keyword(input: ParseStream, word: &str) -> bool {
-    input.fork().parse::<Ident>().is_ok_and(|i| i == word)
+    input.fork().parse::<Ident>().is_ok_and(|ident| ident == word)
 }
 
 impl Parse for Group {
@@ -73,9 +73,9 @@ impl Parse for Group {
         }
         input.parse::<Ident>()?;
         let name = input.parse()?;
-        let w = krate();
+        let krate = krate();
         let base = if input.peek(Token![;]) {
-            quote!(#w::FIRST_TYPE)
+            quote!(#krate::FIRST_TYPE)
         } else if keyword(input, "after") {
             input.parse::<Ident>()?;
             let group: Path = input.parse()?;
@@ -132,7 +132,7 @@ impl Parse for Object {
 impl Parse for Field {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let docs = input.call(Attribute::parse_outer)?;
-        if let Some(attr) = docs.iter().find(|a| !a.path().is_ident("doc")) {
+        if let Some(attr) = docs.iter().find(|attribute| !attribute.path().is_ident("doc")) {
             return Err(Error::new_spanned(attr, "only doc comments go on fields"));
         }
         if input.peek(Token![pub]) {
@@ -148,7 +148,7 @@ impl Parse for Field {
 }
 
 fn slot(ty: &Type) -> syn::Result<Slot> {
-    let w = krate();
+    let krate = krate();
     let err = || {
         let kinds = "Value, Member<T>, Weak<T>, Host<T>, AnyHost, Frozen<T>, Ephemeron, u64, i64, u32, f64 or bool";
         Error::new_spanned(ty, format!("expected {kinds}"))
@@ -160,40 +160,40 @@ fn slot(ty: &Type) -> syn::Result<Slot> {
     }
     let arg = match &segment.arguments {
         PathArguments::None => None,
-        PathArguments::AngleBracketed(a) => match &a.args.iter().collect::<Vec<_>>()[..] {
-            [GenericArgument::Type(t)] => Some(t),
+        PathArguments::AngleBracketed(bracketed) => match &bracketed.args.iter().collect::<Vec<_>>()[..] {
+            [GenericArgument::Type(inner)] => Some(inner),
             _ => return Err(err()),
         },
         PathArguments::Parenthesized(_) => return Err(err()),
     };
     let ident = &segment.ident;
-    let value = quote!(#w::Value<'gc>);
+    let value = quote!(#krate::Value<'gc>);
     let slot = |path, out: TokenStream, input, class| Slot { path, out, input, class };
     Ok(match (ident.to_string().as_str(), arg) {
-        ("Value", None) => slot(quote!(#w::slot::Value), value.clone(), value, Class::Value),
+        ("Value", None) => slot(quote!(#krate::slot::Value), value.clone(), value, Class::Value),
         ("u64" | "i64" | "u32" | "f64" | "bool", None) => {
-            slot(quote!(#w::slot::#ident), quote!(::core::primitive::#ident), quote!(::core::primitive::#ident), Class::Word)
+            slot(quote!(#krate::slot::#ident), quote!(::core::primitive::#ident), quote!(::core::primitive::#ident), Class::Word)
         }
-        ("Member" | "Weak", Some(t)) => {
-            let out = quote!(::core::option::Option<#w::Gc<'gc, #t>>);
-            slot(quote!(#w::slot::#ident<#t>), out.clone(), out, Class::Reference)
+        ("Member" | "Weak", Some(inner)) => {
+            let out = quote!(::core::option::Option<#krate::Gc<'gc, #inner>>);
+            slot(quote!(#krate::slot::#ident<#inner>), out.clone(), out, Class::Reference)
         }
-        ("Host", Some(t)) => {
-            let out = quote!(::core::option::Option<#w::HostRef<'gc, #t>>);
-            slot(quote!(#w::slot::Host<#t>), out.clone(), out, Class::Host)
+        ("Host", Some(inner)) => {
+            let out = quote!(::core::option::Option<#krate::HostRef<'gc, #inner>>);
+            slot(quote!(#krate::slot::Host<#inner>), out.clone(), out, Class::Host)
         }
         ("AnyHost", None) => {
-            let out = quote!(::core::option::Option<#w::AnyHostRef<'gc>>);
-            slot(quote!(#w::slot::AnyHost), out.clone(), out, Class::Host)
+            let out = quote!(::core::option::Option<#krate::AnyHostRef<'gc>>);
+            slot(quote!(#krate::slot::AnyHost), out.clone(), out, Class::Host)
         }
-        ("Frozen", Some(t)) => slot(
-            quote!(#w::slot::Frozen<#t>),
-            quote!(::core::option::Option<&'gc #t>),
-            quote!(#w::FrozenRef<'gc, #t>),
+        ("Frozen", Some(inner)) => slot(
+            quote!(#krate::slot::Frozen<#inner>),
+            quote!(::core::option::Option<&'gc #inner>),
+            quote!(#krate::FrozenRef<'gc, #inner>),
             Class::Frozen,
         ),
         ("Ephemeron", None) => slot(
-            quote!(#w::slot::Ephemeron),
+            quote!(#krate::slot::Ephemeron),
             quote!(::core::option::Option<(#value, #value)>),
             quote!((#value, #value)),
             Class::Ephemeron,
@@ -204,10 +204,10 @@ fn slot(ty: &Type) -> syn::Result<Slot> {
 
 pub(crate) fn expand(input: TokenStream) -> syn::Result<TokenStream> {
     let group: Group = syn::parse2(input)?;
-    let w = krate();
+    let krate = krate();
     let Group { attrs, vis, name: kind, base, objects } = &group;
     let count = u16::try_from(objects.len()).map_err(|_| Error::new(kind.span(), "too many types"))?;
-    let names: Vec<&Ident> = objects.iter().map(|o| &o.name).collect();
+    let names: Vec<&Ident> = objects.iter().map(|object| &object.name).collect();
     let numbers: Vec<Literal> = (0..count).map(Literal::u16_unsuffixed).collect();
     let count = Literal::u16_unsuffixed(count);
     let mut out = quote! {
@@ -215,7 +215,7 @@ pub(crate) fn expand(input: TokenStream) -> syn::Result<TokenStream> {
         #[derive(Clone, Copy, PartialEq, Debug)]
         #[allow(dead_code)]
         #vis enum #kind<'gc> {
-            #(#names(#w::Gc<'gc, #names>),)*
+            #(#names(#krate::Gc<'gc, #names>),)*
         }
 
         #[allow(dead_code)]
@@ -225,7 +225,7 @@ pub(crate) fn expand(input: TokenStream) -> syn::Result<TokenStream> {
             /// One past the group's last type number, where a group declared `after` it starts.
             pub const END: u16 = Self::BASE + #count;
             /// How the collector sees each of the group's types, in order.
-            pub const DESCS: &'static [&'static #w::Desc] = &[#(&<#names as #w::Object>::DESC),*];
+            pub const DESCS: &'static [&'static #krate::Desc] = &[#(&<#names as #krate::Object>::DESC),*];
         }
 
         #[allow(dead_code)]
@@ -233,18 +233,18 @@ pub(crate) fn expand(input: TokenStream) -> syn::Result<TokenStream> {
             /// Which of the group's types `value` refers to, from the type number it carries, or
             /// `None` for any other value.
             #[inline(always)]
-            pub fn of(value: #w::Value<'gc>) -> ::core::option::Option<Self> {
+            pub fn of(value: #krate::Value<'gc>) -> ::core::option::Option<Self> {
                 let (ty, index) = value.object_parts()?;
                 match ty.wrapping_sub(Self::BASE) {
-                    #(#numbers => ::core::option::Option::Some(Self::#names(#w::Gc::forge(index))),)*
+                    #(#numbers => ::core::option::Option::Some(Self::#names(#krate::Gc::forge(index))),)*
                     _ => ::core::option::Option::None,
                 }
             }
 
             #[inline(always)]
-            pub fn value(self, mc: &#w::Mutation<'gc>) -> #w::Value<'gc> {
+            pub fn value(self, mc: &#krate::Mutation<'gc>) -> #krate::Value<'gc> {
                 match self {
-                    #(Self::#names(gc) => #w::Value::object(mc, gc),)*
+                    #(Self::#names(gc) => #krate::Value::object(mc, gc),)*
                 }
             }
         }
@@ -256,7 +256,7 @@ pub(crate) fn expand(input: TokenStream) -> syn::Result<TokenStream> {
 }
 
 fn expand_object(object: &Object, kind: &Ident, number: &Literal) -> syn::Result<TokenStream> {
-    let w = krate();
+    let krate = krate();
     let Object { attrs, vis, name, fields, items } = object;
     let mut seen = std::collections::HashSet::new();
     for field in fields {
@@ -275,25 +275,25 @@ fn expand_object(object: &Object, kind: &Ident, number: &Literal) -> syn::Result
         at += field.slot.width();
     }
     let words = Literal::usize_unsuffixed(at);
-    let roles = fields.iter().map(|f| {
-        let path = &f.slot.path;
-        quote!(<#path as #w::slot::Slot>::ROLE)
+    let roles = fields.iter().map(|field| {
+        let path = &field.slot.path;
+        quote!(<#path as #krate::slot::Slot>::ROLE)
     });
     let items_kind = match items {
-        None => quote!(#w::Items::None),
-        Some(Slot { class: Class::Ephemeron, .. }) => quote!(#w::Items::Ephemerons),
-        Some(Slot { path, .. }) => quote!(<#path as #w::slot::Item>::ITEMS),
+        None => quote!(#krate::Items::None),
+        Some(Slot { class: Class::Ephemeron, .. }) => quote!(#krate::Items::Ephemerons),
+        Some(Slot { path, .. }) => quote!(<#path as #krate::slot::Item>::ITEMS),
     };
 
-    let field_names: Vec<&Ident> = fields.iter().map(|f| &f.name).collect();
-    let consts: Vec<Ident> = fields.iter().map(|f| format_ident!("{}", f.name.unraw().to_string().to_uppercase(), span = f.name.span())).collect();
-    let setters: Vec<Ident> = fields.iter().map(|f| format_ident!("set_{}", f.name.unraw(), span = f.name.span())).collect();
-    let paths: Vec<&TokenStream> = fields.iter().map(|f| &f.slot.path).collect();
-    let outs: Vec<&TokenStream> = fields.iter().map(|f| &f.slot.out).collect();
-    let inputs: Vec<&TokenStream> = fields.iter().map(|f| &f.slot.input).collect();
-    let docs: Vec<&Vec<Attribute>> = fields.iter().map(|f| &f.docs).collect();
-    let indices: Vec<Literal> = starts.iter().map(|&s| Literal::usize_unsuffixed(s)).collect();
-    let ends: Vec<Literal> = fields.iter().zip(&starts).map(|(f, &s)| Literal::usize_unsuffixed(s + f.slot.width())).collect();
+    let field_names: Vec<&Ident> = fields.iter().map(|field| &field.name).collect();
+    let consts: Vec<Ident> = fields.iter().map(|field| format_ident!("{}", field.name.unraw().to_string().to_uppercase(), span = field.name.span())).collect();
+    let setters: Vec<Ident> = fields.iter().map(|field| format_ident!("set_{}", field.name.unraw(), span = field.name.span())).collect();
+    let paths: Vec<&TokenStream> = fields.iter().map(|field| &field.slot.path).collect();
+    let outs: Vec<&TokenStream> = fields.iter().map(|field| &field.slot.out).collect();
+    let inputs: Vec<&TokenStream> = fields.iter().map(|field| &field.slot.input).collect();
+    let docs: Vec<&Vec<Attribute>> = fields.iter().map(|field| &field.docs).collect();
+    let indices: Vec<Literal> = starts.iter().map(|&start| Literal::usize_unsuffixed(start)).collect();
+    let ends: Vec<Literal> = fields.iter().zip(&starts).map(|(field, &start)| Literal::usize_unsuffixed(start + field.slot.width())).collect();
 
     // Without items it's `alloc_fixed`, which is small enough to inline everywhere and has to
     // be: LLVM stops inlining it into large functions otherwise.
@@ -302,18 +302,18 @@ fn expand_object(object: &Object, kind: &Ident, number: &Literal) -> syn::Result
         None => (quote!(), quote!(mc.alloc::<#name, #words>(__words)), quote!(), quote!()),
         Some(Slot { class: Class::Ephemeron, .. }) => (
             quote!(entries: usize),
-            quote!(mc.alloc_items::<#name, #words>(__words, entries.saturating_mul(2), #w::Value::BROKEN)),
+            quote!(mc.alloc_items::<#name, #words>(__words, entries.saturating_mul(2), #krate::Value::BROKEN)),
             quote!(),
             quote!(),
         ),
         Some(Slot { path, input, .. }) => (
             quote!(len: usize, fill: #input),
-            quote!(mc.alloc_items::<#name, #words>(__words, len, #w::Value::from_bits(<#path as #w::slot::Item>::store(fill)))),
-            quote!(fn items(self, mc: &#w::Mutation<'gc>) -> #w::Slots<'gc, #path>;),
+            quote!(mc.alloc_items::<#name, #words>(__words, len, #krate::Value::from_bits(<#path as #krate::slot::Item>::store(fill)))),
+            quote!(fn items(self, mc: &#krate::Mutation<'gc>) -> #krate::Slots<'gc, #path>;),
             quote! {
                 #[inline]
-                fn items(self, mc: &#w::Mutation<'gc>) -> #w::Slots<'gc, #path> {
-                    #w::raw::Raw::item_slots(self, mc)
+                fn items(self, mc: &#krate::Mutation<'gc>) -> #krate::Slots<'gc, #path> {
+                    #krate::raw::Raw::item_slots(self, mc)
                 }
             },
         ),
@@ -326,25 +326,25 @@ fn expand_object(object: &Object, kind: &Ident, number: &Literal) -> syn::Result
         #[allow(dead_code)]
         #vis struct #name;
 
-        impl #w::Object for #name {
-            const DESC: #w::Desc =
-                #w::Desc::layout::<#name>(&[#(#roles),*], #items_kind).numbered(#kind::BASE + #number);
+        impl #krate::Object for #name {
+            const DESC: #krate::Desc =
+                #krate::Desc::layout::<#name>(&[#(#roles),*], #items_kind).numbered(#kind::BASE + #number);
         }
 
         #[allow(dead_code)]
         impl #name {
-            #(#(#docs)* #vis const #consts: #w::Field<#name, #paths> = #w::Field::new(#indices);)*
+            #(#(#docs)* #vis const #consts: #krate::Field<#name, #paths> = #krate::Field::new(#indices);)*
 
             #inline
             #[allow(clippy::new_ret_no_self, clippy::too_many_arguments)]
             #vis fn new<'gc>(
-                mc: &#w::Mutation<'gc>,
+                mc: &#krate::Mutation<'gc>,
                 #(#field_names: #inputs,)*
                 #params
-            ) -> ::core::result::Result<#w::Gc<'gc, #name>, #w::OutOfMemory> {
+            ) -> ::core::result::Result<#krate::Gc<'gc, #name>, #krate::OutOfMemory> {
                 #[allow(unused_mut)]
                 let mut __words = [0u64; #words];
-                #(<#paths as #w::slot::Slot>::init(#field_names, &mut __words[#indices..#ends]);)*
+                #(<#paths as #krate::slot::Slot>::init(#field_names, &mut __words[#indices..#ends]);)*
                 #alloc
             }
         }
@@ -354,21 +354,21 @@ fn expand_object(object: &Object, kind: &Ident, number: &Literal) -> syn::Result
         #vis trait #fields_trait<'gc> {
             #(
                 #(#docs)*
-                fn #field_names(self, mc: &#w::Mutation<'gc>) -> #outs;
-                fn #setters(self, mc: &#w::Mutation<'gc>, value: #inputs);
+                fn #field_names(self, mc: &#krate::Mutation<'gc>) -> #outs;
+                fn #setters(self, mc: &#krate::Mutation<'gc>, value: #inputs);
             )*
             #items_sig
         }
 
-        impl<'gc> #fields_trait<'gc> for #w::Gc<'gc, #name> {
+        impl<'gc> #fields_trait<'gc> for #krate::Gc<'gc, #name> {
             #(
                 #[inline(always)]
-                fn #field_names(self, mc: &#w::Mutation<'gc>) -> #outs {
+                fn #field_names(self, mc: &#krate::Mutation<'gc>) -> #outs {
                     self.get(mc, #name::#consts)
                 }
 
                 #[inline(always)]
-                fn #setters(self, mc: &#w::Mutation<'gc>, value: #inputs) {
+                fn #setters(self, mc: &#krate::Mutation<'gc>, value: #inputs) {
                     self.set(mc, #name::#consts, value);
                 }
             )*

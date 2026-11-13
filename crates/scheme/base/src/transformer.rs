@@ -62,8 +62,8 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             let body = self.scoped(&body, scope)?;
             return Ok(Step::Tail(Call::Run(Box::new(move |this: &mut Self| this.body(stx, body)))));
         };
-        self.transformer(expr, stx, move |this, m| {
-            this.bind(id, Binding::Macro(m))?;
+        self.transformer(expr, stx, move |this, macro_index| {
+            this.bind(id, Binding::Macro(macro_index))?;
             this.let_macros(stx, macros, body, scope)
         })
     }
@@ -72,15 +72,15 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     /// it, and goes on with `then`.
     pub(crate) fn transformer(&mut self, expr: Stx, at: Stx, then: impl FnOnce(&mut Self, u32) -> Result<Ex<'a, 'gc>, ExpandError> + 'a) -> Result<Ex<'a, 'gc>, ExpandError> {
         Self::expr(expr, move |this, core| {
-            let m = this.made_transformer(&core, expr, at)?;
-            then(this, m)
+            let macro_index = this.made_transformer(&core, expr, at)?;
+            then(this, macro_index)
         })
     }
 
     /// Compiles and runs `core`, the expansion of `expr`, the transformer of a macro `at`
     /// defines, and keeps it.
     fn made_transformer(&mut self, core: &Core<'gc>, expr: Stx, at: Stx) -> Result<u32, ExpandError> {
-        let thunk = compile(self.mc, None, core).map_err(|e| match e {
+        let thunk = compile(self.mc, None, core).map_err(|error| match error {
             // It refers to a variable of the code around it, which isn't there yet.
             CompileError::Unbound(_) | CompileError::UnknownSlot(_) => self.error(ExpandErrorKind::Phase, expr),
             CompileError::OutOfMemory => self.error(OutOfMemory, at),
@@ -90,17 +90,17 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         if transformer.downcast::<Closure>(self.mc).is_none() {
             return Err(self.error(ExpandErrorKind::Transformer, at));
         }
-        let m = u32::try_from(self.macros.len()).map_err(|_| self.error(ExpandErrorKind::Transformer, at))?;
+        let macro_index = u32::try_from(self.macros.len()).map_err(|_| self.error(ExpandErrorKind::Transformer, at))?;
         self.macros.push(transformer);
-        Ok(m)
+        Ok(macro_index)
     }
 
-    /// The use `stx` of the macro `m`, expanded a step.
-    pub(crate) fn expand_macro(&mut self, m: u32, stx: Stx) -> Result<Stx, ExpandError> {
+    /// The use `stx` of the macro `macro_index`, expanded a step.
+    pub(crate) fn expand_macro(&mut self, macro_index: u32, stx: Stx) -> Result<Stx, ExpandError> {
         let intro = self.tree.scopes.fresh()?;
         let input = self.tree.with(stx, intro, Op::Flip)?;
         let input = self.wrap(input)?;
-        let output = self.run(self.macros[m as usize], &[input], stx)?;
+        let output = self.run(self.macros[macro_index as usize], &[input], stx)?;
         let output = self.unwrap(output, stx)?;
         Ok(self.tree.with(output, intro, Op::Flip)?)
     }
@@ -140,7 +140,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     /// innermost form is, and anything else is the transformer's failure.
     fn raised(&self, raised: Value<'gc>, at: Stx) -> ExpandError {
         let mc = self.mc;
-        let Some(condition) = raised.downcast::<Condition>(mc).filter(|c| c.failure(mc).is_some_and(|failure| failure.fault == Fault::Syntax)) else {
+        let Some(condition) = raised.downcast::<Condition>(mc).filter(|condition| condition.failure(mc).is_some_and(|failure| failure.fault == Fault::Syntax)) else {
             return self.error(ExpandErrorKind::Transformer, at);
         };
         let (mut form, mut rest) = (Value::VOID, condition.irritants(mc));
@@ -152,6 +152,6 @@ impl<'a, 'gc> Expander<'a, 'gc> {
 
     /// Where the syntax `value` came from, or `at` if it isn't syntax or has no span.
     pub(crate) fn span_of(&self, value: Value<'gc>, at: Stx) -> SyntaxSpan<'gc> {
-        Syntax::of(value).map(|s| s.span(self.mc)).filter(|span| span.source().is_some()).unwrap_or_else(|| self.tree.span(at))
+        Syntax::of(value).map(|syntax| syntax.span(self.mc)).filter(|span| span.source().is_some()).unwrap_or_else(|| self.tree.span(at))
     }
 }

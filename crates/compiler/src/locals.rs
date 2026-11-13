@@ -38,14 +38,14 @@ pub(crate) fn replace<'id, 'gc>(mc: &Mutation<'gc>, tree: &mut L2<'id, 'gc>, roo
     let (mut made, mut refs, mut assigned) = (HashMap::<Var, Made<'id, 'gc>>::default(), HashMap::<Var, usize>::default(), HashSet::default());
     for id in tree.deep(root) {
         match tree[id] {
-            Node::Ref(v) => *refs.entry(v).or_default() += 1,
-            Node::Set(v, _) => _ = assigned.insert(v),
+            Node::Ref(var) => *refs.entry(var).or_default() += 1,
+            Node::Set(var, _) => _ = assigned.insert(var),
             Node::Let(binds, _) => {
                 for &bind in &tree[binds] {
-                    if let Bind::Val(v, init) = bind
+                    if let Bind::Val(var, init) = bind
                         && let Some((kind, _)) = tree.made_struct(mc, init)
                     {
-                        made.insert(v, Made { kind, binder: id, uses: Vec::new() });
+                        made.insert(var, Made { kind, binder: id, uses: Vec::new() });
                     }
                 }
             }
@@ -55,13 +55,13 @@ pub(crate) fn replace<'id, 'gc>(mc: &Mutation<'gc>, tree: &mut L2<'id, 'gc>, roo
     if made.is_empty() {
         return;
     }
-    let found: Vec<(Var, Id<'id>, Use<'id>)> = tree.deep(root).filter_map(|id| Some((id, field_use(mc, tree, &made, id)?))).map(|(id, (v, field))| (v, id, field)).collect();
-    for (v, id, field) in found {
-        made.get_mut(&v).expect("a struct's variable").uses.push((id, field));
+    let found: Vec<(Var, Id<'id>, Use<'id>)> = tree.deep(root).filter_map(|id| Some((id, field_use(mc, tree, &made, id)?))).map(|(id, (var, field))| (var, id, field)).collect();
+    for (var, id, field) in found {
+        made.get_mut(&var).expect("a struct's variable").uses.push((id, field));
     }
-    for (v, struct_made) in made {
-        if !assigned.contains(&v) && refs.get(&v).copied().unwrap_or(0) == struct_made.uses.len() {
-            fields_for(tree, v, &struct_made, &assigned, supply);
+    for (var, struct_made) in made {
+        if !assigned.contains(&var) && refs.get(&var).copied().unwrap_or(0) == struct_made.uses.len() {
+            fields_for(tree, var, &struct_made, &assigned, supply);
         }
     }
 }
@@ -71,8 +71,8 @@ pub(crate) fn replace<'id, 'gc>(mc: &Mutation<'gc>, tree: &mut L2<'id, 'gc>, roo
 fn field_use<'id, 'gc>(mc: &Mutation<'gc>, tree: &L2<'id, 'gc>, made: &HashMap<Var, Made<'id, 'gc>>, id: Id<'id>) -> Option<(Var, Use<'id>)> {
     let Node::Intrinsic(Prim::Intrinsic(intrinsic), args) = tree[id] else { return None };
     let args = &tree[args];
-    let Node::Ref(v) = tree[*args.first()?] else { return None };
-    let made_as = made.get(&v)?.kind;
+    let Node::Ref(var) = tree[*args.first()?] else { return None };
+    let made_as = made.get(&var)?.kind;
     let constant = |at: usize| match tree[args[at]] {
         Node::Quote(value) => Some(value),
         _ => None,
@@ -82,35 +82,35 @@ fn field_use<'id, 'gc>(mc: &Mutation<'gc>, tree: &L2<'id, 'gc>, made: &HashMap<V
     // index is in range.
     let by_type = |at: usize| {
         let kind = constant(1)?.downcast::<StructType>(mc)?;
-        index(at).filter(|&k| structs::derives(mc, made_as, kind) && k < kind.fields(mc) as usize)
+        index(at).filter(|&position| structs::derives(mc, made_as, kind) && position < kind.fields(mc) as usize)
     };
     let field = match (intrinsic, args.len()) {
-        (Intrinsic::StructField | Intrinsic::StructFixedField, 2) => Use::Read(index(1).filter(|&k| k < made_as.fields(mc) as usize)?),
+        (Intrinsic::StructField | Intrinsic::StructFixedField, 2) => Use::Read(index(1).filter(|&position| position < made_as.fields(mc) as usize)?),
         (Intrinsic::StructRef, 3) => Use::Read(by_type(2)?),
-        (Intrinsic::StructSet, 4) => Use::Write(by_type(2).filter(|&k| structs::is_mutable(mc, made_as, k))?, args[3]),
+        (Intrinsic::StructSet, 4) => Use::Write(by_type(2).filter(|&position| structs::is_mutable(mc, made_as, position))?, args[3]),
         _ => return None,
     };
-    Some((v, field))
+    Some((var, field))
 }
 
-/// Replaces the struct bound to `v` with its fields. Creates variables for mutable fields and
+/// Replaces the struct bound to `var` with its fields. Creates variables for mutable fields and
 /// initializers that require evaluation; reuses other field values directly.
-fn fields_for<'id, 'gc>(tree: &mut L2<'id, 'gc>, v: Var, made: &Made<'id, 'gc>, assigned: &HashSet<Var>, supply: &mut Supply) {
+fn fields_for<'id, 'gc>(tree: &mut L2<'id, 'gc>, var: Var, made: &Made<'id, 'gc>, assigned: &HashSet<Var>, supply: &mut Supply) {
     let Node::Let(binds, body) = tree[made.binder] else { unreachable!("a struct's variable is bound by a let") };
     let mut binds = tree[binds].to_vec();
-    let at = binds.iter().position(|bind| matches!(bind, Bind::Val(bound, _) if *bound == v)).expect("the let binds the variable");
+    let at = binds.iter().position(|bind| matches!(bind, Bind::Val(bound, _) if *bound == var)).expect("the let binds the variable");
     let Bind::Val(_, init) = binds[at] else { unreachable!("found as one") };
     let Node::Intrinsic(_, args) = tree[init] else { unreachable!("a struct is made by an intrinsic") };
     let values = tree[args][1..].to_vec();
-    let set: HashSet<usize> = made.uses.iter().filter_map(|&(_, field)| if let Use::Write(k, _) = field { Some(k) } else { None }).collect();
+    let set: HashSet<usize> = made.uses.iter().filter_map(|&(_, field)| if let Use::Write(position, _) = field { Some(position) } else { None }).collect();
     let (mut bound, mut fields) = (Vec::new(), Vec::with_capacity(values.len()));
-    for (k, &value) in values.iter().enumerate() {
+    for (position, &value) in values.iter().enumerate() {
         let copyable = match tree[value] {
             Node::Quote(_) => true,
-            Node::Ref(u) => !assigned.contains(&u),
+            Node::Ref(other) => !assigned.contains(&other),
             _ => false,
         };
-        if copyable && !set.contains(&k) {
+        if copyable && !set.contains(&position) {
             fields.push(tree[value]);
         } else {
             let field = supply.fresh_var();
@@ -120,9 +120,9 @@ fn fields_for<'id, 'gc>(tree: &mut L2<'id, 'gc>, v: Var, made: &Made<'id, 'gc>, 
     }
     for &(id, field) in &made.uses {
         match field {
-            Use::Read(k) => tree.set(id, fields[k]),
-            Use::Write(k, value) => {
-                let Node::Ref(field) = fields[k] else { unreachable!("a field that's set is a variable") };
+            Use::Read(position) => tree.set(id, fields[position]),
+            Use::Write(position, value) => {
+                let Node::Ref(field) = fields[position] else { unreachable!("a field that's set is a variable") };
                 tree.set(id, Node::Set(field, value));
             }
         }

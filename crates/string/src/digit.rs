@@ -11,13 +11,13 @@ const ZEROS: [u32; 77] = [
     0x1E2F0, 0x1E4F0, 0x1E5F1, 0x1E950, 0x1FBF0,
 ];
 
-/// The value of `c` if it's a decimal digit, of any script.
-pub fn digit_value(c: char) -> Option<u32> {
-    let c = u32::from(c);
-    if c < 0x80 {
-        return (0x30..0x3A).contains(&c).then(|| c - 0x30);
+/// The value of `character` if it's a decimal digit, of any script.
+pub fn digit_value(character: char) -> Option<u32> {
+    let code = u32::from(character);
+    if code < 0x80 {
+        return (0x30..0x3A).contains(&code).then(|| code - 0x30);
     }
-    let run = ZEROS.partition_point(|&zero| zero <= c).checked_sub(1)?;
-    let value = c - ZEROS[run];
+    let run = ZEROS.partition_point(|&zero| zero <= code).checked_sub(1)?;
+    let value = code - ZEROS[run];
     (value < 10).then_some(value)
 }

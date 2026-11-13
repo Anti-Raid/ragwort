@@ -46,9 +46,9 @@ impl<'gc> Expander<'_, 'gc> {
                         continue;
                     }
                 },
-                Task::Make(stx, n, tail, kind) => {
+                Task::Make(stx, count, tail, kind) => {
                     let tail = if tail { done.pop().expect("a tail") } else { Value::NIL };
-                    let items = done.split_off(done.len() - n);
+                    let items = done.split_off(done.len() - count);
                     let datum = if kind == SyntaxKind::Vector { Vectors::new(mc).immutable_from_slice(&items)?.value(mc) } else { Pairs::new(mc).list_with_tail(items, tail)? };
                     (stx, datum, kind)
                 }
@@ -107,9 +107,9 @@ impl<'gc> Expander<'_, 'gc> {
         let (stamp, name) = match binding {
             Binding::Keyword(_) => return Ok(Some(symbol.value(mc))),
             Binding::Local(var) => (Stamp::Own(0, var.0), None),
-            Binding::Macro(m) => (Stamp::Own(1, m), None),
+            Binding::Macro(macro_index) => (Stamp::Own(1, macro_index), None),
             Binding::Pattern { var, .. } => (Stamp::Own(2, var.0), None),
-            Binding::Slot(slot) if !matches!(self.builder.binding(symbol.value(mc)), Some(module::Binding::Slot(s)) if s == slot) => (Stamp::Own(3, slot), None),
+            Binding::Slot(slot) if !matches!(self.builder.binding(symbol.value(mc)), Some(module::Binding::Slot(bound)) if bound == slot) => (Stamp::Own(3, slot), None),
             Binding::Slot(_) | Binding::Free => {
                 let module = self.builder.name();
                 (named(module, symbol.value(mc)), Some((module, symbol.value(mc))))
@@ -181,9 +181,9 @@ impl<'gc> Expander<'_, 'gc> {
         while let Some(task) = todo.pop() {
             let value = match task {
                 Task::Visit(value) => value,
-                Task::Make(span, n, tail, vector) => {
+                Task::Make(span, count, tail, vector) => {
                     let tail = if tail { done.pop() } else { None };
-                    let items = done.split_off(done.len() - n);
+                    let items = done.split_off(done.len() - count);
                     done.push(if vector { self.tree.vector(&items, span)? } else { self.tree.list(&items, tail, span)? });
                     continue;
                 }
@@ -194,7 +194,7 @@ impl<'gc> Expander<'_, 'gc> {
             }
             self.tree.scopes.charge(size_of::<Task<'gc>>())?;
             let (datum, span, kind, context) = match Syntax::of(value) {
-                Some(s) => (s.datum(mc), s.span(mc), s.kind(mc).ok_or_else(|| bad(self))?, s.context(mc)),
+                Some(syntax) => (syntax.datum(mc), syntax.span(mc), syntax.kind(mc).ok_or_else(|| bad(self))?, syntax.context(mc)),
                 None if value == Value::NIL || Pair::of(value).is_some() => (value, self.tree.span(at), SyntaxKind::List, None),
                 None if AnyVector::of(value).is_some() => (value, self.tree.span(at), SyntaxKind::Vector, None),
                 None if Symbol::of(value).is_some() => return Err(bad(self)),
@@ -213,7 +213,7 @@ impl<'gc> Expander<'_, 'gc> {
                             self.tree.scopes.charge(size_of::<Task<'gc>>())?;
                             items.push(Task::Visit(pair.head(mc)));
                             rest = pair.tail(mc);
-                        } else if let Some(list) = Syntax::of(rest).filter(|s| s.kind(mc) == Some(SyntaxKind::List)) {
+                        } else if let Some(list) = Syntax::of(rest).filter(|syntax| syntax.kind(mc) == Some(SyntaxKind::List)) {
                             // A tail that's the syntax of a list goes on with its items.
                             rest = list.datum(mc);
                         } else {

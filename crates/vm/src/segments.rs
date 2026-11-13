@@ -65,7 +65,7 @@ impl<'gc> Segments<'_, 'gc> {
     /// segment.
     pub(crate) fn overflow(&mut self, fp: usize, end: usize, need: usize) -> Result<usize, Fault> {
         let mc = self.mc;
-        let len = end.checked_sub(fp).filter(|&n| n <= WINDOW).ok_or(Fault::Malformed)?;
+        let len = end.checked_sub(fp).filter(|&size| size <= WINDOW).ok_or(Fault::Malformed)?;
         let (start, old) = (self.stack.base(), self.stack.segment(mc));
         let caller = self.frame(fp)?;
         let link = frame::link_of(mc, caller)?;
@@ -102,7 +102,7 @@ impl<'gc> Segments<'_, 'gc> {
         let segment = record.segment(mc).ok_or(Fault::Malformed)?;
         let (start, end) = (record.start(mc) as usize, record.end(mc) as usize);
         let link = Link::of(record.link(mc)).ok_or(Fault::Malformed)?;
-        let below = |at: usize, base: u8| at.checked_sub(usize::from(base)).filter(|&b| b >= start && base > 0).ok_or(Fault::Malformed);
+        let below = |at: usize, base: u8| at.checked_sub(usize::from(base)).filter(|&lower| lower >= start && base > 0).ok_or(Fault::Malformed);
         let top = below(end, link.base)?;
         task.set_attachments(mc, record.attachments(mc));
         if record.one_shot(mc) {
@@ -160,7 +160,7 @@ impl<'gc> Segments<'_, 'gc> {
     fn own_spills(&self, slots: std::ops::Range<usize>) -> Result<(), Fault> {
         let mc = self.mc;
         for i in slots {
-            let Some(spill) = self.stack.get(mc, i).and_then(|v| v.downcast::<Spill>(mc)) else { continue };
+            let Some(spill) = self.stack.get(mc, i).and_then(|value| value.downcast::<Spill>(mc)) else { continue };
             let items = spill.items(mc);
             let copy = Spill::new(mc, items.len(), Value::VOID)?;
             let copied = copy.items(mc);
@@ -350,6 +350,6 @@ pub(crate) fn restored<'gc>(mc: &Mutation<'gc>, chain: Value<'gc>) -> Value<'gc>
     }
 }
 
-fn slot(n: usize) -> Result<u32, Fault> {
-    u32::try_from(n).map_err(|_| Fault::Malformed)
+fn slot(index: usize) -> Result<u32, Fault> {
+    u32::try_from(index).map_err(|_| Fault::Malformed)
 }

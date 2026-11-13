@@ -52,8 +52,8 @@ fn task<'gc>(mc: &Mutation<'gc>, body: Value<'gc>, state: u32) -> Result<Gc<'gc,
     Task::new(mc, Value::VOID, none, Value::NIL, Value::NIL, Value::NIL, None, 0, body, none, none, none, none, None, 0, state)
 }
 
-pub(crate) fn of<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> Option<Gc<'gc, Task>> {
-    v.downcast::<Task>(mc)
+pub(crate) fn of<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Option<Gc<'gc, Task>> {
+    value.downcast::<Task>(mc)
 }
 
 /// Returns the currently active task in a machine rooted at `root` by traversing to the innermost

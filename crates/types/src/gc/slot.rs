@@ -58,7 +58,7 @@ impl Refs {
         match self {
             Self::None => None,
             Self::Values => (word & TAG == OBJECT).then_some((word >> 32) as u32),
-            Self::Members | Self::Weaks => Some(word as u32).filter(|&t| t != 0),
+            Self::Members | Self::Weaks => Some(word as u32).filter(|&target| target != 0),
         }
     }
 
@@ -160,11 +160,11 @@ macro_rules! words {
 }
 
 words! {
-    u64: |w| w, |v| v;
-    i64: |w| w as i64, |v| v as u64;
-    u32: |w| w as u32, |v| u64::from(v);
-    f64: |w| f64::from_bits(w), |v| v.to_bits();
-    bool: |w| w != 0, |v| u64::from(v);
+    u64: |word| word, |value| value;
+    i64: |word| word as i64, |value| value as u64;
+    u32: |word| word as u32, |value| u64::from(value);
+    f64: |word| f64::from_bits(word), |value| value.to_bits();
+    bool: |word| word != 0, |value| u64::from(value);
 }
 
 impl sealed::Sealed for Value {}
@@ -360,7 +360,7 @@ impl Slot for Ephemeron {
 #[inline]
 fn set_frozen<'gc, T: Object>(gc: Gc<'gc, T>, mc: &Mutation<'gc>, field: usize, word: u64) {
     gc.set_word(mc, field, word);
-    if mc.heap.has_bit(gc.to_word() as usize, |p| &p.marks) {
+    if mc.heap.has_bit(gc.to_word() as usize, |page| &page.marks) {
         mc.heap.m.frozen.mark(word);
     }
 }

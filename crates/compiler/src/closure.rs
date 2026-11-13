@@ -23,13 +23,13 @@ use crate::{Prim, Var};
 /// Lowers the L3 expression rooted at `root` in `from` into closure-converted L4 form in `tree`,
 /// returning the new root expression ID.
 pub(crate) fn closure_convert<'s, 'id, 'gc>(tree: &mut L4<'id, 'gc>, from: &L3<'s, 'gc>, root: l3::Id<'s>) -> Id<'id> {
-    let mut c = Convert { from, tree, envs: vec![Env::new(HashSet::default(), None)], vals: Vec::new(), funs: Vec::new(), binds: Vec::new(), codes: Vec::new() };
+    let mut pass = Convert { from, tree, envs: vec![Env::new(HashSet::default(), None)], vals: Vec::new(), funs: Vec::new(), binds: Vec::new(), codes: Vec::new() };
     let mut todo = vec![Task::Expr(root)];
     while let Some(task) = todo.pop() {
-        c.run(task, &mut todo);
+        pass.run(task, &mut todo);
     }
-    debug_assert!(c.envs[0].upvalues.is_empty(), "top-level expression has no free variables");
-    c.vals.pop().expect("the root's converted")
+    debug_assert!(pass.envs[0].upvalues.is_empty(), "top-level expression has no free variables");
+    pass.vals.pop().expect("the root's converted")
 }
 
 /// A deferred task in the iterative closure-conversion worklist: either an L3 expression to visit,
@@ -75,18 +75,18 @@ impl Env {
         Env { locals, upvalues: Vec::new(), self_closure }
     }
 
-    fn resolve(&mut self, v: Var) -> VarRef {
-        if self.locals.contains(&v) {
-            return VarRef::Local(v);
+    fn resolve(&mut self, var: Var) -> VarRef {
+        if self.locals.contains(&var) {
+            return VarRef::Local(var);
         }
-        if self.self_closure == Some(v) {
+        if self.self_closure == Some(var) {
             return VarRef::SelfClosure;
         }
-        if let Some(idx) = self.upvalues.iter().position(|&u| u == v) {
+        if let Some(idx) = self.upvalues.iter().position(|&upvalue| upvalue == var) {
             return VarRef::Upvalue(idx as u32);
         }
         let idx = self.upvalues.len() as u32;
-        self.upvalues.push(v);
+        self.upvalues.push(var);
         VarRef::Upvalue(idx)
     }
 }
@@ -112,9 +112,9 @@ impl<'s, 'id, 'gc> Convert<'_, 's, 'id, 'gc> {
         self.vals.pop().expect("a converted node")
     }
 
-    /// Drains the last `n` converted node IDs from `self.vals` and stores them as an L4 span.
-    fn last(&mut self, n: usize) -> l4::Span<'id, Id<'id>> {
-        let at = self.vals.len() - n;
+    /// Drains the last `count` converted node IDs from `self.vals` and stores them as an L4 span.
+    fn last(&mut self, count: usize) -> l4::Span<'id, Id<'id>> {
+        let at = self.vals.len() - count;
         self.tree.list(self.vals.drain(at..))
     }
 
@@ -136,25 +136,25 @@ impl<'s, 'id, 'gc> Convert<'_, 's, 'id, 'gc> {
                 let (second, first) = (self.pop(), self.pop());
                 self.make(Node::Seq(first, second));
             }
-            Task::Set(v) => {
+            Task::Set(var) => {
                 let value = self.pop();
-                self.make(Node::Set(v, value));
+                self.make(Node::Set(var, value));
             }
-            Task::App(n) => {
-                let args = self.last(n);
-                let f = self.pop();
-                self.make(Node::App(f, args));
+            Task::App(count) => {
+                let args = self.last(count);
+                let function = self.pop();
+                self.make(Node::App(function, args));
             }
-            Task::Jump(v, n) => {
-                let args = self.last(n);
-                self.make(Node::Jump(v, args));
+            Task::Jump(join, count) => {
+                let args = self.last(count);
+                self.make(Node::Jump(join, args));
             }
-            Task::Intrinsic(prim, n) => {
-                let args = self.last(n);
+            Task::Intrinsic(prim, count) => {
+                let args = self.last(count);
                 self.make(Node::Intrinsic(prim, args));
             }
-            Task::ApplyIntrinsic(prim, n) => {
-                let args = self.last(n);
+            Task::ApplyIntrinsic(prim, count) => {
+                let args = self.last(count);
                 self.make(Node::ApplyIntrinsic(prim, args));
             }
             Task::Lambda => {
@@ -169,32 +169,32 @@ impl<'s, 'id, 'gc> Convert<'_, 's, 'id, 'gc> {
                 let captures: Vec<UpvalSource> = env
                     .upvalues
                     .into_iter()
-                    .map(|v| match parent.resolve(v) {
+                    .map(|var| match parent.resolve(var) {
                         VarRef::Local(local) => UpvalSource::Local(local),
                         VarRef::Upvalue(idx) => UpvalSource::Upvalue(idx),
                         VarRef::SelfClosure => UpvalSource::SelfClosure,
                     })
                     .collect();
-                let f = from[fun];
-                let (captures, params) = (self.tree.list(captures), self.tree.list(from[f.params].iter().copied()));
-                let fun = self.tree.closure(l4::Closure { id: f.id, optional: f.optional, params, rest: f.rest, captures, body });
+                let closure = from[fun];
+                let (captures, params) = (self.tree.list(captures), self.tree.list(from[closure.params].iter().copied()));
+                let fun = self.tree.closure(l4::Closure { id: closure.id, optional: closure.optional, params, rest: closure.rest, captures, body });
                 self.funs.push(fun);
             }
-            Task::Val(v) => {
+            Task::Val(var) => {
                 let init = self.pop();
-                self.env().locals.insert(v);
-                self.binds.push(l4::Bind::Val(v, init));
+                self.env().locals.insert(var);
+                self.binds.push(l4::Bind::Val(var, init));
             }
-            Task::Group(group) => self.env().locals.extend(from[group].iter().map(|&(v, _)| v)),
-            Task::One(v) => {
-                self.env().locals.insert(v);
+            Task::Group(group) => self.env().locals.extend(from[group].iter().map(|&(var, _)| var)),
+            Task::One(var) => {
+                self.env().locals.insert(var);
                 let fun = self.funs.pop().expect("a converted closure");
-                let group = self.tree.list([(v, fun)]);
+                let group = self.tree.list([(var, fun)]);
                 self.binds.push(l4::Bind::Fix(group));
             }
             Task::Fix(group) => {
                 let at = self.funs.len() - from[group].len();
-                let funs = from[group].iter().map(|&(v, _)| v).zip(self.funs.drain(at..));
+                let funs = from[group].iter().map(|&(var, _)| var).zip(self.funs.drain(at..));
                 let group = self.tree.list(funs);
                 self.binds.push(l4::Bind::Fix(group));
             }
@@ -202,8 +202,8 @@ impl<'s, 'id, 'gc> Convert<'_, 's, 'id, 'gc> {
                 let body = self.pop();
                 let env = self.envs.last_mut().expect("the root's function is never left");
                 for &bind in &from[binds] {
-                    for v in from.vars(bind) {
-                        env.locals.remove(&v);
+                    for var in from.vars(bind) {
+                        env.locals.remove(&var);
                     }
                 }
                 let at = self.binds.len() - from[binds].len();
@@ -214,15 +214,15 @@ impl<'s, 'id, 'gc> Convert<'_, 's, 'id, 'gc> {
             Task::Coded(code) => {
                 let body = self.pop();
                 let env = self.envs.last_mut().expect("the root's function is never left");
-                for p in from.params(code.fun) {
-                    env.locals.remove(&p);
+                for param in from.params(code.fun) {
+                    env.locals.remove(&param);
                 }
                 let params = self.tree.list(from[from[code.fun].params].iter().copied());
                 self.codes.push(JoinCode { id: code.id, params, body });
             }
-            Task::Join(n) => {
+            Task::Join(count) => {
                 let scope = self.pop();
-                let at = self.codes.len() - n;
+                let at = self.codes.len() - count;
                 let codes = self.tree.list(self.codes.drain(at..));
                 self.make(Node::Join(scope, codes));
             }
@@ -234,31 +234,31 @@ impl<'s, 'id, 'gc> Convert<'_, 's, 'id, 'gc> {
     fn expr(&mut self, id: l3::Id<'s>, todo: &mut Vec<Task<'s>>) {
         let from = self.from;
         let at = todo.len();
-        let all = |args: l3::Span<'s, l3::Id<'s>>, todo: &mut Vec<Task<'s>>| todo.extend(from[args].iter().map(|&a| Task::Expr(a)));
+        let all = |args: l3::Span<'s, l3::Id<'s>>, todo: &mut Vec<Task<'s>>| todo.extend(from[args].iter().map(|&arg| Task::Expr(arg)));
         let site = from.site(id);
         self.tree.at(site);
         match from[id] {
-            l3::Node::Quote(v) => self.make(Node::Quote(v)),
-            l3::Node::Ref(v) => {
-                let var = self.env().resolve(v);
+            l3::Node::Quote(value) => self.make(Node::Quote(value)),
+            l3::Node::Ref(variable) => {
+                let var = self.env().resolve(variable);
                 self.make(Node::Ref(var));
             }
             l3::Node::If(test, then, other) => todo.extend([Task::Expr(test), Task::Expr(then), Task::Expr(other), Task::If]),
             l3::Node::Seq(first, second) => todo.extend([Task::Expr(first), Task::Expr(second), Task::Seq]),
-            l3::Node::Set(v, value) => {
-                let VarRef::Local(v) = self.env().resolve(v) else {
+            l3::Node::Set(var, value) => {
+                let VarRef::Local(var) = self.env().resolve(var) else {
                     unreachable!("assignment conversion boxes what closures assign")
                 };
-                todo.extend([Task::Expr(value), Task::Set(v)]);
+                todo.extend([Task::Expr(value), Task::Set(var)]);
             }
-            l3::Node::App(f, args) => {
-                todo.push(Task::Expr(f));
+            l3::Node::App(function, args) => {
+                todo.push(Task::Expr(function));
                 all(args, todo);
                 todo.extend([Task::At(site), Task::App(from[args].len())]);
             }
-            l3::Node::Jump(v, args) => {
+            l3::Node::Jump(join, args) => {
                 all(args, todo);
-                todo.extend([Task::At(site), Task::Jump(v, from[args].len())]);
+                todo.extend([Task::At(site), Task::Jump(join, from[args].len())]);
             }
             l3::Node::Intrinsic(prim, args) => {
                 all(args, todo);
@@ -272,9 +272,9 @@ impl<'s, 'id, 'gc> Convert<'_, 's, 'id, 'gc> {
             l3::Node::Let(binds, body) => {
                 for &bind in &from[binds] {
                     match bind {
-                        l3::Bind::Val(v, init) => todo.extend([Task::Expr(init), Task::Val(v)]),
+                        l3::Bind::Val(var, init) => todo.extend([Task::Expr(init), Task::Val(var)]),
                         l3::Bind::Fix(group) => match from[group] {
-                            [(v, fun)] => todo.extend([Task::Enter(fun, Some(v)), Task::Expr(from[fun].body), Task::Leave(fun), Task::One(v)]),
+                            [(var, fun)] => todo.extend([Task::Enter(fun, Some(var)), Task::Expr(from[fun].body), Task::Leave(fun), Task::One(var)]),
                             _ => {
                                 todo.push(Task::Group(group));
                                 for &(_, fun) in &from[group] {

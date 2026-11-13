@@ -30,11 +30,11 @@ pub(crate) struct Formals<'gc> {
 
 impl<'gc> Formals<'gc> {
     pub(crate) fn has_keywords(&self) -> bool {
-        self.params.iter().any(|p| p.keyword.is_some())
+        self.params.iter().any(|param| param.keyword.is_some())
     }
 
     fn params(&self) -> Vec<keyword::Param<'gc>> {
-        self.params.iter().map(|p| keyword::Param { keyword: p.keyword, optional: p.default.is_some() }).collect()
+        self.params.iter().map(|param| keyword::Param { keyword: param.keyword, optional: param.default.is_some() }).collect()
     }
 
     fn shape(&self, ex: &Expander<'_, 'gc>) -> CallShape<'gc> {
@@ -68,13 +68,13 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 View::List(parts, None) if matches!(*parts, [id, _] if self.is_id(id)) => (parts[0], Some(parts[1])),
                 _ => return Err(self.error(ExpandErrorKind::BadSyntax, at)),
             };
-            if let Some(k) = keyword
-                && params.iter().any(|p| p.keyword == Some(k))
+            if let Some(name) = keyword
+                && params.iter().any(|param| param.keyword == Some(name))
             {
                 return Err(self.error(ExpandErrorKind::Duplicate, item));
             }
             // As in Racket, a required positional parameter can't follow an optional one.
-            if keyword.is_none() && default.is_none() && params.iter().any(|p| p.keyword.is_none() && p.default.is_some()) {
+            if keyword.is_none() && default.is_none() && params.iter().any(|param| param.keyword.is_none() && param.default.is_some()) {
                 return Err(self.error(ExpandErrorKind::BadSyntax, at));
             }
             params.push(Param { keyword, id, default });
@@ -101,9 +101,9 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         Ok(formals.has_keywords().then(|| formals.shape(self)))
     }
 
-    /// Expands the lambda that `formals` and `body` make, where `scope` is the scope added to `formals`, and passes it to `then`.
+    /// Expands a lambda with optional or keyword parameters and passes the result to `then`. `formals` already has `scope` added, and `scope` is added to `body` too.
     ///
-    /// The defaults are expanded in the order written, each seeing only the parameters before it.
+    /// Defaults are expanded in written order. Each default can refer only to earlier parameters.
     pub(crate) fn optional_lambda(
         &mut self,
         stx: Stx,
@@ -112,33 +112,33 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         scope: Scope,
         then: impl FnOnce(&mut Self, OptionalLambda<'gc>) -> Result<Ex<'a, 'gc>, ExpandError> + 'a,
     ) -> Result<Ex<'a, 'gc>, ExpandError> {
-        let ids: Vec<Stx> = formals.params.iter().map(|p| p.id).chain(formals.rest).collect();
+        let ids: Vec<Stx> = formals.params.iter().map(|param| param.id).chain(formals.rest).collect();
         self.distinct(&ids)?;
         let params = Vec::with_capacity(formals.params.len());
         let lambda = Optional { stx, left: formals.params.into_iter(), rest: formals.rest, body, scope, params };
         self.defaults(lambda, Box::new(then))
     }
 
-    /// Binds the remaining parameters of an optional lambda, expanding the default of each one that has a default before binding it, then expands the body.
-    fn defaults(&mut self, mut f: Optional<'gc>, then: Made<'a, 'gc>) -> Result<Ex<'a, 'gc>, ExpandError> {
-        while let Some(param) = f.left.next() {
+    /// Binds the remaining parameters of an optional lambda, then expands the body. A default is expanded before its parameter is bound.
+    fn defaults(&mut self, mut lambda: Optional<'gc>, then: Made<'a, 'gc>) -> Result<Ex<'a, 'gc>, ExpandError> {
+        while let Some(param) = lambda.left.next() {
             let Some(default) = param.default else {
                 let var = self.local(param.id)?;
-                f.params.push(Formal { var, keyword: param.keyword, default: None });
+                lambda.params.push(Formal { var, keyword: param.keyword, default: None });
                 continue;
             };
             return Self::expr(default, move |this, default| {
                 let var = this.local(param.id)?;
-                f.params.push(Formal { var, keyword: param.keyword, default: Some(default) });
-                this.defaults(f, then)
+                lambda.params.push(Formal { var, keyword: param.keyword, default: Some(default) });
+                this.defaults(lambda, then)
             });
         }
-        let rest = f.rest.map(|id| self.local(id)).transpose()?;
-        let body = self.scoped(&f.body, f.scope)?;
-        Self::body_then(f.stx, body, move |this, body| {
-            let at = Position::of(this.mc, this.tree.span(f.stx));
+        let rest = lambda.rest.map(|id| self.local(id)).transpose()?;
+        let body = self.scoped(&lambda.body, lambda.scope)?;
+        Self::body_then(lambda.stx, body, move |this, body| {
+            let at = Position::of(this.mc, this.tree.span(lambda.stx));
             let id = this.lambda_id();
-            then(this, OptionalLambda { id, params: f.params, rest, body: Box::new(body), name: None, at })
+            then(this, OptionalLambda { id, params: lambda.params, rest, body: Box::new(body), name: None, at })
         })
     }
 
@@ -153,33 +153,33 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         args.iter().any(|&arg| self.tree.keyword(arg).is_some())
     }
 
-    /// Expands a call `stx` of `head` on `args`, some of which are passed by keyword, into a [`Core::KeywordApp`].
+    /// Expands the call `stx` of `head` with arguments `args`, some of which have keywords, into a [`Core::KeywordApp`].
     pub(crate) fn keyword_call(&mut self, stx: Stx, head: Stx, args: Vec<Stx>) -> Result<Ex<'a, 'gc>, ExpandError> {
         let (mut keywords, mut values) = (Vec::with_capacity(args.len()), Vec::with_capacity(args.len()));
         let mut items = args.iter().copied();
         while let Some(arg) = items.next() {
-            let Some(k) = self.tree.keyword(arg) else {
+            let Some(keyword) = self.tree.keyword(arg) else {
                 keywords.push(None);
                 values.push(arg);
                 continue;
             };
             let value = items.next().ok_or_else(|| self.error(ExpandErrorKind::BadSyntax, arg))?;
-            if keywords.contains(&Some(k)) {
+            if keywords.contains(&Some(keyword)) {
                 return Err(self.error(ExpandErrorKind::Duplicate, arg));
             }
-            keywords.push(Some(k));
+            keywords.push(Some(keyword));
             values.push(value);
         }
-        Self::expr(head, move |_, f| {
+        Self::expr(head, move |_, callee| {
             Self::exprs(values, move |this, values| {
                 let args = keywords.into_iter().zip(values).map(|(keyword, value)| Arg { keyword, value }).collect();
-                Ok(Step::Done(Core::KeywordApp(Box::new(f), args, this.position(stx))))
+                Ok(Step::Done(Core::KeywordApp(Box::new(callee), args, this.position(stx))))
             })
         })
     }
 }
 
-/// A lambda with optional or keyword parameters being expanded: the parameters still to bind, and those bound so far.
+/// The state of expanding a lambda with optional or keyword parameters: the parameters still to bind, and the parameters bound so far.
 struct Optional<'gc> {
     stx: Stx,
     left: std::vec::IntoIter<Param<'gc>>,
@@ -189,6 +189,6 @@ struct Optional<'gc> {
     params: Vec<Formal<'gc>>,
 }
 
-/// The continuation that receives an optional lambda once it is expanded.
+/// The continuation that receives the expanded optional lambda.
 type Made<'a, 'gc> = Box<dyn FnOnce(&mut Expander<'a, 'gc>, OptionalLambda<'gc>) -> Result<Ex<'a, 'gc>, ExpandError> + 'a>;
 

@@ -15,9 +15,9 @@ mod tests;
 use std::borrow::Cow;
 use std::fmt;
 
-fn is_space(b: u8) -> bool {
+fn is_space(byte: u8) -> bool {
     const SPACES: u64 = 1 << b' ' | 1 << b'\t' | 1 << b'\n' | 1 << b'\r' | 1 << 0x0b | 1 << 0x0c;
-    b < 64 && SPACES >> b & 1 != 0
+    byte < 64 && SPACES >> byte & 1 != 0
 }
 
 /// Whitespace and the bytes that end an identifier.
@@ -34,9 +34,9 @@ const fn byte_set(bytes: &[u8]) -> [bool; 256] {
     set
 }
 
-/// Whether `b` ends an identifier: whitespace, a bracket, a quote or `|`.
-pub fn ends_name(b: u8) -> bool {
-    ENDS_NAME[b as usize]
+/// Whether `byte` ends an identifier: whitespace, a bracket, a quote or `|`.
+pub fn ends_name(byte: u8) -> bool {
+    ENDS_NAME[byte as usize]
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -130,7 +130,7 @@ pub struct LexError {
 }
 
 impl fmt::Display for LexError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let what = match self.kind {
             ErrorKind::Unclosed => "a string or comment that's never closed",
             ErrorKind::Unsupported => "syntax that isn't supported yet",
@@ -138,7 +138,7 @@ impl fmt::Display for LexError {
             ErrorKind::BadEscape => "an unknown escape",
             ErrorKind::BadLabel => "a datum label too big to be one",
         };
-        write!(f, "{what} at bytes {}..{}", self.start, self.end)
+        write!(formatter, "{what} at bytes {}..{}", self.start, self.end)
     }
 }
 
@@ -205,18 +205,18 @@ impl<'a> Lexer<'a> {
     #[inline]
     fn name_end(&self, start: usize) -> usize {
         let rest = &self.text.as_bytes()[start..];
-        start + rest.iter().position(|&b| ENDS_NAME[b as usize]).unwrap_or(rest.len())
+        start + rest.iter().position(|&byte| ENDS_NAME[byte as usize]).unwrap_or(rest.len())
     }
 
     #[inline]
     fn skip_space(&mut self) -> Result<(), LexError> {
         let bytes = self.text.as_bytes();
-        while let Some(&b) = bytes.get(self.at) {
-            if is_space(b) {
+        while let Some(&byte) = bytes.get(self.at) {
+            if is_space(byte) {
                 self.at += 1;
-            } else if b == b';' {
-                self.at = bytes[self.at..].iter().position(|&b| b == b'\n').map_or(bytes.len(), |n| self.at + n + 1);
-            } else if b == b'#' && bytes.get(self.at + 1) == Some(&b'|') {
+            } else if byte == b';' {
+                self.at = bytes[self.at..].iter().position(|&byte| byte == b'\n').map_or(bytes.len(), |offset| self.at + offset + 1);
+            } else if byte == b'#' && bytes.get(self.at + 1) == Some(&b'|') {
                 self.block_comment()?;
             } else {
                 break;
@@ -275,7 +275,7 @@ impl<'a> Lexer<'a> {
             [b'\\', ..] => return self.character(start).map(Some),
             [b':', ..] => return self.keyword(start).map(Some),
             _ => {
-                let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+                let digits = rest.iter().take_while(|byte| byte.is_ascii_digit()).count();
                 if digits > 0 && matches!(rest.get(digits), Some(b'=' | b'#')) {
                     return self.label(start, digits).map(Some);
                 }
@@ -288,11 +288,11 @@ impl<'a> Lexer<'a> {
 
     /// `#n=` or `#n#`, with `digits` digits after the `#` at `start`.
     fn label(&mut self, start: usize, digits: usize) -> Result<Token<'a>, LexError> {
-        let n = self.text[self.at..self.at + digits].parse::<u64>();
+        let number = self.text[self.at..self.at + digits].parse::<u64>();
         let define = self.text.as_bytes()[self.at + digits] == b'=';
         self.at += digits + 1;
-        let n = n.map_err(|_| self.error(ErrorKind::BadLabel, start, self.at))?;
-        Ok(if define { Token::Label(n) } else { Token::LabelRef(n) })
+        let number = number.map_err(|_| self.error(ErrorKind::BadLabel, start, self.at))?;
+        Ok(if define { Token::Label(number) } else { Token::LabelRef(number) })
     }
 
     /// A boolean, a directive or a number after a `#` at `start`.
@@ -339,11 +339,11 @@ impl<'a> Lexer<'a> {
         }
         let folded = (self.fold && self.at - from > first.len_utf8()).then(|| self.text[from..self.at].to_lowercase());
         let name = folded.as_deref().unwrap_or(&self.text[from..self.at]);
-        let c = match name {
+        let character = match name {
             _ if name.len() == first.len_utf8() => Some(first),
             _ => named_char(name),
         };
-        c.map(Token::Char).ok_or(self.error(ErrorKind::BadChar, start, self.at))
+        character.map(Token::Char).ok_or(self.error(ErrorKind::BadChar, start, self.at))
     }
 
     /// The characters up to the `quote` that closes the one at `start`, with escapes as in
@@ -351,24 +351,24 @@ impl<'a> Lexer<'a> {
     fn quoted(&mut self, start: usize, quote: char) -> Result<Cow<'a, str>, LexError> {
         let text = self.text;
         let from = self.at;
-        let plain = text.as_bytes()[from..].iter().position(|&b| b == quote as u8 || b == b'\\');
-        if let Some(n) = plain
-            && text.as_bytes()[from + n] == quote as u8
+        let plain = text.as_bytes()[from..].iter().position(|&byte| byte == quote as u8 || byte == b'\\');
+        if let Some(length) = plain
+            && text.as_bytes()[from + length] == quote as u8
         {
-            self.at = from + n + 1;
-            return Ok(Cow::Borrowed(&text[from..from + n]));
+            self.at = from + length + 1;
+            return Ok(Cow::Borrowed(&text[from..from + length]));
         }
         let unclosed = || LexError { kind: ErrorKind::Unclosed, start, end: start + 1 };
         let mut out = String::new();
-        let mut chars = text[from..].char_indices().map(|(i, c)| (from + i, c)).peekable();
+        let mut chars = text[from..].char_indices().map(|(offset, character)| (from + offset, character)).peekable();
         let end = loop {
-            let Some((at, c)) = chars.next() else { return Err(unclosed()) };
-            match c {
-                _ if c == quote => break at + 1,
+            let Some((at, character)) = chars.next() else { return Err(unclosed()) };
+            match character {
+                _ if character == quote => break at + 1,
                 '\\' => {
                     let bad = |to: usize| LexError { kind: ErrorKind::BadEscape, start: at, end: to };
-                    let Some((next, e)) = chars.next() else { return Err(unclosed()) };
-                    match e {
+                    let Some((next, escape)) = chars.next() else { return Err(unclosed()) };
+                    match escape {
                         'a' => out.push('\x07'),
                         'b' => out.push('\x08'),
                         't' => out.push('\t'),
@@ -378,34 +378,34 @@ impl<'a> Lexer<'a> {
                         'f' => out.push('\x0c'),
                         'v' => out.push('\x0b'),
                         '0' => out.push('\0'),
-                        '"' | '\\' | '|' => out.push(e),
+                        '"' | '\\' | '|' => out.push(escape),
                         'x' => {
-                            let digits: String = std::iter::from_fn(|| chars.next_if(|&(_, c)| c.is_ascii_hexdigit()).map(|(_, c)| c)).collect();
-                            let semicolon = chars.next_if(|&(_, c)| c == ';');
-                            let to = semicolon.map_or(next + 1 + digits.len(), |(i, _)| i + 1);
-                            let c = u32::from_str_radix(&digits, 16).ok().and_then(char::from_u32).filter(|_| semicolon.is_some());
-                            out.push(c.ok_or(bad(to))?);
+                            let digits: String = std::iter::from_fn(|| chars.next_if(|&(_, character)| character.is_ascii_hexdigit()).map(|(_, character)| character)).collect();
+                            let semicolon = chars.next_if(|&(_, character)| character == ';');
+                            let to = semicolon.map_or(next + 1 + digits.len(), |(position, _)| position + 1);
+                            let character = u32::from_str_radix(&digits, 16).ok().and_then(char::from_u32).filter(|_| semicolon.is_some());
+                            out.push(character.ok_or(bad(to))?);
                         }
                         // A line ending, \n, \r\n or \r, with the spaces and tabs around it, is dropped.
                         ' ' | '\t' | '\n' | '\r' if quote == '"' => {
-                            let mut e = e;
-                            while e == ' ' || e == '\t' {
+                            let mut escape = escape;
+                            while escape == ' ' || escape == '\t' {
                                 match chars.next() {
-                                    Some((_, c)) => e = c,
+                                    Some((_, character)) => escape = character,
                                     None => return Err(unclosed()),
                                 }
                             }
-                            match e {
-                                '\r' => _ = chars.next_if(|&(_, c)| c == '\n'),
+                            match escape {
+                                '\r' => _ = chars.next_if(|&(_, character)| character == '\n'),
                                 '\n' => {}
                                 _ => return Err(bad(next + 1)),
                             }
-                            while chars.next_if(|&(_, c)| c == ' ' || c == '\t').is_some() {}
+                            while chars.next_if(|&(_, character)| character == ' ' || character == '\t').is_some() {}
                         }
-                        _ => return Err(bad(next + e.len_utf8())),
+                        _ => return Err(bad(next + escape.len_utf8())),
                     }
                 }
-                c => out.push(c),
+                character => out.push(character),
             }
         };
         self.at = end;
@@ -439,7 +439,7 @@ pub fn starts_numeric(token: &str) -> bool {
 #[inline]
 pub fn might_be_number(token: &str) -> bool {
     let after_sign = token.strip_prefix(['+', '-']).unwrap_or("");
-    let special = |s: &str| after_sign.get(..s.len()).is_some_and(|t| t.eq_ignore_ascii_case(s));
+    let special = |name: &str| after_sign.get(..name.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(name));
     after_sign.eq_ignore_ascii_case("i") || special("inf.0") || special("nan.0")
 }
 

@@ -51,24 +51,24 @@ pub(crate) fn contify<'id>(tree: &mut L3<'id, '_>, root: Id<'id>) {
         return;
     }
     let Survey { candidates, bindings, .. } = survey;
-    for v in &plan.joins {
-        for call in &candidates[v].calls {
+    for var in &plan.joins {
+        for call in &candidates[var].calls {
             let at = *call.chain.last().expect("a chain has its call");
             let Node::App(_, args) = tree[at] else { unreachable!("a call of a join") };
-            tree.set(at, Node::Jump(*v, args));
+            tree.set(at, Node::Jump(*var, args));
         }
     }
     // Maps original node IDs to their replacement IDs within the new Join node's scope.
     let mut moved = HashMap::default();
     for (at, groups) in plan.at {
-        let codes: Vec<JoinCode<'id>> = groups.iter().flatten().map(|&v| JoinCode { id: v, fun: plan.funs[&v] }).collect();
+        let codes: Vec<JoinCode<'id>> = groups.iter().flatten().map(|&var| JoinCode { id: var, fun: plan.funs[&var] }).collect();
         let (scope, codes) = (tree.add(tree[at]), tree.list(codes));
         tree.set(at, Node::Join(scope, codes));
         moved.insert(at, scope);
     }
     // Processes bindings innermost-first so that a `Let` with all bindings contified can be collapsed into its body.
     let mut done = HashSet::default();
-    for binding in bindings.iter().filter(|b| plan.joins.contains(&b.members[0])) {
+    for binding in bindings.iter().filter(|group| plan.joins.contains(&group.members[0])) {
         if !done.insert(binding.at) {
             continue;
         }
@@ -78,7 +78,7 @@ pub(crate) fn contify<'id>(tree: &mut L3<'id, '_>, root: Id<'id>) {
             .iter()
             .copied()
             .filter(|&bind| match bind {
-                Bind::Val(v, _) => !plan.joins.contains(&v),
+                Bind::Val(var, _) => !plan.joins.contains(&var),
                 // All members of a mutually recursive `Fix` group are contified together, or none are.
                 Bind::Fix(group) => !plan.joins.contains(&tree[group][0].0),
             })
@@ -183,8 +183,8 @@ impl<'id> Survey<'_, 'id, '_> {
             Task::Restore => self.base = self.bases.pop().expect("a chain was started"),
             Task::Body(fun, of) => {
                 let body = self.tree[fun].body;
-                if let Some(v) = of {
-                    self.bodies.insert(body, v);
+                if let Some(var) = of {
+                    self.bodies.insert(body, var);
                 }
                 self.frames.push(Frame { outer: self.frame, lambda: fun, of });
                 self.outer.push(std::mem::replace(&mut self.frame, self.frames.len() as u32));
@@ -204,33 +204,33 @@ impl<'id> Survey<'_, 'id, '_> {
     /// Traverses child expressions of node `id`, pushing appropriate tail or non-tail worklist tasks.
     fn node(&mut self, id: Id<'id>, todo: &mut Vec<Task<'id>>) {
         let tree = self.tree;
-        let fresh = |ids: &[Id<'id>], todo: &mut Vec<Task<'id>>| todo.extend(ids.iter().map(|&a| Task::Fresh(a)));
+        let fresh = |ids: &[Id<'id>], todo: &mut Vec<Task<'id>>| todo.extend(ids.iter().map(|&child| Task::Fresh(child)));
         match tree[id] {
             Node::Quote(_) => {}
-            Node::Ref(v) => self.unfit(v),
-            Node::Set(v, value) => {
-                self.unfit(v);
+            Node::Ref(var) => self.unfit(var),
+            Node::Set(var, value) => {
+                self.unfit(var);
                 todo.push(Task::Fresh(value));
             }
             Node::If(test, then, other) => todo.extend([Task::Fresh(test), Task::Tail(then), Task::Tail(other)]),
-            Node::Seq(a, b) => todo.extend([Task::Fresh(a), Task::Tail(b)]),
+            Node::Seq(first, second) => todo.extend([Task::Fresh(first), Task::Tail(second)]),
             Node::Let(binds, body) => {
                 self.mine.push(Vec::new());
                 todo.extend(tree[binds].iter().map(|&bind| Task::Bind(id, bind)));
                 todo.extend([Task::Tail(body), Task::Bound]);
             }
-            Node::App(f, args) => {
-                match tree[f] {
-                    Node::Ref(v) if self.candidates.contains_key(&v) => {
+            Node::App(function, args) => {
+                match tree[function] {
+                    Node::Ref(var) if self.candidates.contains_key(&var) => {
                         let chain = self.chain[self.base..].into();
-                        let c = self.candidates.get_mut(&v).expect("a candidate");
-                        if c.arity == tree[args].len() {
-                            c.calls.push(Site { chain, frame: self.frame });
+                        let candidate = self.candidates.get_mut(&var).expect("a candidate");
+                        if candidate.arity == tree[args].len() {
+                            candidate.calls.push(Site { chain, frame: self.frame });
                         } else {
-                            c.called = false;
+                            candidate.called = false;
                         }
                     }
-                    _ => todo.push(Task::Fresh(f)),
+                    _ => todo.push(Task::Fresh(function)),
                 }
                 fresh(&tree[args], todo);
             }
@@ -243,18 +243,18 @@ impl<'id> Survey<'_, 'id, '_> {
         }
     }
 
-    /// Disqualifies candidate `v` if it is passed as a value, stored, or referenced other than in a direct call.
-    fn unfit(&mut self, v: Var) {
-        if let Some(c) = self.candidates.get_mut(&v) {
-            c.called = false;
+    /// Disqualifies candidate `var` if it is passed as a value, stored, or referenced other than in a direct call.
+    fn unfit(&mut self, var: Var) {
+        if let Some(candidate) = self.candidates.get_mut(&var) {
+            candidate.called = false;
         }
     }
 
     /// Registers `var` as a contification candidate if `fun` has no rest or optional parameters and fits parameter limits.
     fn candidate(&mut self, var: Var, fun: Fun<'id>) -> bool {
-        let f = self.tree[fun];
-        let params = self.tree[f.params].len();
-        let fits = f.rest.is_none() && f.optional == 0 && params <= MAX_PARAMS;
+        let function = self.tree[fun];
+        let params = self.tree[function.params].len();
+        let fits = function.rest.is_none() && function.optional == 0 && params <= MAX_PARAMS;
         if fits {
             self.candidates.insert(var, Candidate { arity: params, called: true, calls: Vec::new() });
             self.funs.insert(var, fun);
@@ -266,25 +266,25 @@ impl<'id> Survey<'_, 'id, '_> {
         let tree = self.tree;
         let frame = self.frame;
         match bind {
-            Bind::Val(v, init) => match tree[init] {
+            Bind::Val(var, init) => match tree[init] {
                 Node::Lambda(fun) => {
-                    let fits = self.candidate(v, fun);
+                    let fits = self.candidate(var, fun);
                     if fits {
-                        self.mine.last_mut().expect("in a let").push(Binding { members: vec![v], frame, at });
+                        self.mine.last_mut().expect("in a let").push(Binding { members: vec![var], frame, at });
                     }
-                    todo.push(Task::Body(fun, fits.then_some(v)));
+                    todo.push(Task::Body(fun, fits.then_some(var)));
                 }
                 _ => todo.push(Task::Fresh(init)),
             },
             Bind::Fix(group) => {
                 let group = &tree[group];
-                let fits: Vec<bool> = group.iter().map(|&(v, fun)| self.candidate(v, fun)).collect();
+                let fits: Vec<bool> = group.iter().map(|&(var, fun)| self.candidate(var, fun)).collect();
                 // Verifies that total parameters across all group members do not exceed available registers.
                 let params: usize = group.iter().map(|&(_, fun)| tree[tree[fun].params].len()).sum();
-                if fits.iter().all(|&f| f) && params <= MAX_PARAMS {
-                    self.mine.last_mut().expect("in a let").push(Binding { members: group.iter().map(|&(v, _)| v).collect(), frame, at });
+                if fits.iter().all(|&fit| fit) && params <= MAX_PARAMS {
+                    self.mine.last_mut().expect("in a let").push(Binding { members: group.iter().map(|&(var, _)| var).collect(), frame, at });
                 }
-                todo.extend(group.iter().zip(&fits).map(|(&(v, fun), &fits)| Task::Body(fun, fits.then_some(v))));
+                todo.extend(group.iter().zip(&fits).map(|(&(var, fun), &fits)| Task::Body(fun, fits.then_some(var))));
             }
         }
     }
@@ -295,22 +295,22 @@ impl<'id> Survey<'_, 'id, '_> {
         let mut placed: HashMap<Var, Site<Vec<Id<'id>>>> = HashMap::default();
         for binding in &self.bindings {
             let members = &binding.members;
-            if !members.iter().all(|v| self.candidates[v].called) {
+            if !members.iter().all(|member| self.candidates[member].called) {
                 continue;
             }
             let mut common: Option<Site<Vec<Id<'id>>>> = None;
             let mut fits = true;
-            'calls: for v in members {
-                for call in &self.candidates[v].calls {
+            'calls: for member in members {
+                for call in &self.candidates[member].calls {
                     // If the call site is located inside another join body that was already placed, prepend its tail chain.
                     let mut chain = call.chain.to_vec();
                     let mut frame = call.frame;
-                    while let Some(join) = self.bodies.get(&chain[0]).and_then(|w| placed.get(w)) {
+                    while let Some(join) = self.bodies.get(&chain[0]).and_then(|owner| placed.get(owner)) {
                         chain = join.chain.iter().chain(&chain).copied().collect();
                         frame = join.frame;
                     }
                     // Recursive self-calls or mutual calls within group members execute locally without changing the common continuation.
-                    if self.bodies.get(&chain[0]).is_some_and(|w| members.contains(w)) {
+                    if self.bodies.get(&chain[0]).is_some_and(|owner| members.contains(owner)) {
                         continue;
                     }
                     match &mut common {
@@ -320,8 +320,8 @@ impl<'id> Survey<'_, 'id, '_> {
                                 fits = false;
                                 break 'calls;
                             }
-                            let n = shared.iter().zip(&chain).take_while(|(a, b)| a == b).count();
-                            shared.truncate(n);
+                            let length = shared.iter().zip(&chain).take_while(|(left, right)| left == right).count();
+                            shared.truncate(length);
                         }
                     }
                 }
@@ -331,9 +331,9 @@ impl<'id> Survey<'_, 'id, '_> {
             };
             plan.at.entry(*chain.last().expect("a chain has its call")).or_default().push(members.clone());
             plan.joins.extend(members);
-            for &v in members {
-                plan.funs.insert(v, self.funs[&v]);
-                placed.insert(v, Site { chain: chain.clone(), frame });
+            for &member in members {
+                plan.funs.insert(member, self.funs[&member]);
+                placed.insert(member, Site { chain: chain.clone(), frame });
             }
         }
         plan
@@ -343,21 +343,21 @@ impl<'id> Survey<'_, 'id, '_> {
     /// without increasing the number of upvalues captured by intermediate closures.
     fn moves(&self, binding: &Binding<'id>, frame: u32) -> bool {
         let (mut uses, mut bound) = (HashSet::default(), HashSet::default());
-        for v in &binding.members {
-            bound.insert(*v);
-            self.vars(self.funs[v], &mut uses, &mut bound);
+        for member in &binding.members {
+            bound.insert(*member);
+            self.vars(self.funs[member], &mut uses, &mut bound);
         }
         let uses: Vec<Var> = uses.difference(&bound).copied().collect();
         let mut at = frame;
         while at != binding.frame {
-            let Some(between) = at.checked_sub(1).and_then(|i| self.frames.get(i as usize)) else { return false };
-            if between.of.is_some_and(|v| binding.members.contains(&v)) {
+            let Some(between) = at.checked_sub(1).and_then(|index| self.frames.get(index as usize)) else { return false };
+            if between.of.is_some_and(|var| binding.members.contains(&var)) {
                 return false;
             }
             let (mut captured, mut inside) = (HashSet::default(), HashSet::default());
             self.vars(between.lambda, &mut captured, &mut inside);
-            let gone = binding.members.iter().filter(|v| captured.contains(v)).count();
-            let come = uses.iter().filter(|v| !captured.contains(v)).count();
+            let gone = binding.members.iter().filter(|member| captured.contains(member)).count();
+            let come = uses.iter().filter(|var| !captured.contains(var)).count();
             if come > gone {
                 return false;
             }
@@ -372,12 +372,12 @@ impl<'id> Survey<'_, 'id, '_> {
         bound.extend(tree.params(fun));
         for id in tree.deep(tree[fun].body) {
             match tree[id] {
-                Node::Ref(v) | Node::Set(v, _) => _ = uses.insert(v),
+                Node::Ref(var) | Node::Set(var, _) => _ = uses.insert(var),
                 Node::Let(binds, _) => {
                     for &bind in &tree[binds] {
                         bound.extend(tree.vars(bind));
                         if let Bind::Fix(group) = bind {
-                            tree[group].iter().for_each(|&(_, f)| bound.extend(tree.params(f)));
+                            tree[group].iter().for_each(|&(_, inner)| bound.extend(tree.params(inner)));
                         }
                     }
                 }
@@ -387,7 +387,7 @@ impl<'id> Survey<'_, 'id, '_> {
                         bound.extend(tree.params(code.fun));
                     }
                 }
-                Node::Lambda(f) => bound.extend(tree.params(f)),
+                Node::Lambda(inner) => bound.extend(tree.params(inner)),
                 _ => {}
             }
         }

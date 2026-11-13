@@ -40,8 +40,8 @@ fn exact_int<H: ComplexHost>(h: &H, n: i64) -> Res<H> {
     Ok(h.of_real(real::from_i64(h, n)?))
 }
 
-fn flonum<H: ComplexHost>(h: &H, f: f64) -> Res<H> {
-    Ok(h.of_real(h.flonum(f)?))
+fn flonum<H: ComplexHost>(h: &H, value: f64) -> Res<H> {
+    Ok(h.of_real(h.flonum(value)?))
 }
 
 fn from_c<H: ComplexHost>(h: &H, z: C) -> Res<H> {
@@ -89,8 +89,8 @@ fn is_exact_zero<H: ComplexHost>(h: &H, z: H::Number) -> bool {
 
 fn is_exact_one<H: ComplexHost>(h: &H, z: H::Number) -> bool {
     let ComplexView::Real(x) = h.complex_view(z) else { return false };
-    let RealView::Exact(q) = h.real_view(x) else { return false };
-    matches!(h.rational_view(q), RationalView::Integer(n) if int::to_i64(h, n) == Some(1))
+    let RealView::Exact(fraction) = h.real_view(x) else { return false };
+    matches!(h.rational_view(fraction), RationalView::Integer(integer) if int::to_i64(h, integer) == Some(1))
 }
 
 /// `make-rectangular`: inexact if either part is, except that an exact zero real part
@@ -104,11 +104,11 @@ pub fn rectangular<H: ComplexHost>(h: &H, re: H::Real, im: H::Real) -> Res<H> {
     }
 }
 
-/// `make-polar`: `m·cos(a) + m·sin(a)·i`.
-pub fn polar<H: ComplexHost>(h: &H, m: H::Real, a: H::Real) -> Res<H> {
-    let f = real::to_f64(h, a)?;
-    let sin = if real::is_exact_zero(h, a) { a } else { h.flonum(f.sin())? };
-    rectangular(h, real::mul(h, m, h.flonum(f.cos())?)?, real::mul(h, m, sin)?)
+/// `make-polar`: `modulus·cos(a) + modulus·sin(a)·i`.
+pub fn polar<H: ComplexHost>(h: &H, modulus: H::Real, a: H::Real) -> Res<H> {
+    let float = real::to_f64(h, a)?;
+    let sin = if real::is_exact_zero(h, a) { a } else { h.flonum(float.sin())? };
+    rectangular(h, real::mul(h, modulus, h.flonum(float.cos())?)?, real::mul(h, modulus, sin)?)
 }
 
 /// `=`: the same value, whatever the exactness.
@@ -117,8 +117,8 @@ pub fn equal<H: ComplexHost>(h: &H, x: H::Number, y: H::Number) -> Result<bool, 
     if let (ComplexView::Real(a), ComplexView::Real(b)) = (h.complex_view(x), h.complex_view(y)) {
         return same(a, b);
     }
-    let ((a, b), (c, d)) = (parts(h, x)?, parts(h, y)?);
-    Ok(same(a, c)? && same(b, d)?)
+    let ((a, b), (y_re, y_im)) = (parts(h, x)?, parts(h, y)?);
+    Ok(same(a, y_re)? && same(b, y_im)?)
 }
 
 /// `z` in `radix`, as [`real::to_string`] writes reals, a complex one as `a+bi`, or `bi` with
@@ -128,7 +128,7 @@ pub fn to_string<H: ComplexHost>(h: &H, z: H::Number, radix: u32) -> Result<Stri
         ComplexView::Real(x) => return real::to_string(h, x, radix),
         ComplexView::Complex { re, im } => (re, im),
     };
-    let zero = matches!(h.real_view(re), RealView::Exact(r) if rational::sign(h, r).is_eq());
+    let zero = matches!(h.real_view(re), RealView::Exact(value) if rational::sign(h, value).is_eq());
     let mut out = if zero { String::new() } else { real::to_string(h, re, radix)? };
     let im = real::to_string(h, im, radix)?;
     if !im.starts_with(['+', '-']) {
@@ -143,7 +143,7 @@ pub fn to_string<H: ComplexHost>(h: &H, z: H::Number, radix: u32) -> Result<Stri
 pub fn eqv<H: ComplexHost>(h: &H, x: H::Number, y: H::Number) -> bool {
     match (h.complex_view(x), h.complex_view(y)) {
         (ComplexView::Real(a), ComplexView::Real(b)) => real::eqv(h, a, b),
-        (ComplexView::Complex { re: a, im: b }, ComplexView::Complex { re: c, im: d }) => real::eqv(h, a, c) && real::eqv(h, b, d),
+        (ComplexView::Complex { re: a, im: b }, ComplexView::Complex { re: y_re, im: y_im }) => real::eqv(h, a, y_re) && real::eqv(h, b, y_im),
         _ => false,
     }
 }
@@ -188,8 +188,8 @@ pub fn add<H: ComplexHost>(h: &H, x: H::Number, y: H::Number) -> Res<H> {
         (ComplexView::Real(a), ComplexView::Real(b)) => Ok(h.of_real(real::add(h, a, b)?)),
         (ComplexView::Real(a), ComplexView::Complex { re, im }) => rectangular(h, real::add(h, a, re)?, im),
         (ComplexView::Complex { re, im }, ComplexView::Real(b)) => rectangular(h, real::add(h, re, b)?, im),
-        (ComplexView::Complex { re: a, im: b }, ComplexView::Complex { re: c, im: d }) => {
-            rectangular(h, real::add(h, a, c)?, real::add(h, b, d)?)
+        (ComplexView::Complex { re: a, im: b }, ComplexView::Complex { re: y_re, im: y_im }) => {
+            rectangular(h, real::add(h, a, y_re)?, real::add(h, b, y_im)?)
         }
     }
 }
@@ -199,8 +199,8 @@ pub fn sub<H: ComplexHost>(h: &H, x: H::Number, y: H::Number) -> Res<H> {
         (ComplexView::Real(a), ComplexView::Real(b)) => Ok(h.of_real(real::sub(h, a, b)?)),
         (ComplexView::Real(a), ComplexView::Complex { re, im }) => rectangular(h, real::sub(h, a, re)?, real::neg(h, im)?),
         (ComplexView::Complex { re, im }, ComplexView::Real(b)) => rectangular(h, real::sub(h, re, b)?, im),
-        (ComplexView::Complex { re: a, im: b }, ComplexView::Complex { re: c, im: d }) => {
-            rectangular(h, real::sub(h, a, c)?, real::sub(h, b, d)?)
+        (ComplexView::Complex { re: a, im: b }, ComplexView::Complex { re: y_re, im: y_im }) => {
+            rectangular(h, real::sub(h, a, y_re)?, real::sub(h, b, y_im)?)
         }
     }
 }
@@ -211,9 +211,9 @@ pub fn mul<H: ComplexHost>(h: &H, x: H::Number, y: H::Number) -> Res<H> {
         (ComplexView::Real(a), ComplexView::Complex { re, im }) | (ComplexView::Complex { re, im }, ComplexView::Real(a)) => {
             rectangular(h, real::mul(h, a, re)?, real::mul(h, a, im)?)
         }
-        (ComplexView::Complex { re: a, im: b }, ComplexView::Complex { re: c, im: d }) => {
-            let re = real::sub(h, real::mul(h, a, c)?, real::mul(h, b, d)?)?;
-            rectangular(h, re, real::add(h, real::mul(h, a, d)?, real::mul(h, b, c)?)?)
+        (ComplexView::Complex { re: a, im: b }, ComplexView::Complex { re: y_re, im: y_im }) => {
+            let re = real::sub(h, real::mul(h, a, y_re)?, real::mul(h, b, y_im)?)?;
+            rectangular(h, re, real::add(h, real::mul(h, a, y_im)?, real::mul(h, b, y_re)?)?)
         }
     }
 }
@@ -228,101 +228,101 @@ pub fn div<H: ComplexHost>(h: &H, x: H::Number, y: H::Number) -> Res<H> {
         _ if is_exact_zero(h, x) => Ok(x),
         _ if is_exact(h, x) && is_exact(h, y) => {
             // (a + bi) / (c + di) is ((ac + bd) + (bc - ad)i) / (c² + d²).
-            let ((a, b), (c, d)) = (parts(h, x)?, parts(h, y)?);
-            let den = real::add(h, real::mul(h, c, c)?, real::mul(h, d, d)?)?;
-            let re = real::add(h, real::mul(h, a, c)?, real::mul(h, b, d)?)?;
-            let im = real::sub(h, real::mul(h, b, c)?, real::mul(h, a, d)?)?;
+            let ((a, b), (y_re, y_im)) = (parts(h, x)?, parts(h, y)?);
+            let den = real::add(h, real::mul(h, y_re, y_re)?, real::mul(h, y_im, y_im)?)?;
+            let re = real::add(h, real::mul(h, a, y_re)?, real::mul(h, b, y_im)?)?;
+            let im = real::sub(h, real::mul(h, b, y_re)?, real::mul(h, a, y_im)?)?;
             rectangular(h, real::div(h, re, den)?, real::div(h, im, den)?)
         }
         _ => from_c(h, cfloat::div(to_c(h, x)?, to_c(h, y)?)),
     }
 }
 
-/// `r · 2^k`, exactly.
-fn times_power_of_two<H: RealHost>(h: &H, r: H::Rational, k: i64) -> Result<H::Rational, H::Error> {
-    let power = h.of_int(int::arithmetic_shift(h, int::from_i64(h, 1)?, k.abs())?);
-    if k >= 0 { rational::mul(h, r, power) } else { rational::div(h, r, power) }
+/// `value · 2^scale`, exactly.
+fn times_power_of_two<H: RealHost>(h: &H, value: H::Rational, scale: i64) -> Result<H::Rational, H::Error> {
+    let power = h.of_int(int::arithmetic_shift(h, int::from_i64(h, 1)?, scale.abs())?);
+    if scale >= 0 { rational::mul(h, value, power) } else { rational::div(h, value, power) }
 }
 
-/// About `log2 |r|` for a nonzero `r`, within one.
-fn exponent<H: RealHost>(h: &H, r: H::Rational) -> Result<i64, H::Error> {
-    let num = int::integer_length(h, rational::numerator(h, r)) as i64;
-    Ok(num - int::integer_length(h, rational::denominator(h, r)?) as i64)
+/// About `log2 |value|` for a nonzero `value`, within one.
+fn exponent<H: RealHost>(h: &H, value: H::Rational) -> Result<i64, H::Error> {
+    let num = int::integer_length(h, rational::numerator(h, value)) as i64;
+    Ok(num - int::integer_length(h, rational::denominator(h, value)?) as i64)
 }
 
-/// A positive `r` as `m · 2^k`, for values whose double would overflow or lose precision.
-fn split<H: RealHost>(h: &H, r: H::Rational) -> Result<(f64, i64), H::Error> {
-    let k = exponent(h, r)?;
-    Ok((rational::to_f64(h, times_power_of_two(h, r, -k)?)?, k))
+/// A positive `value` as `m · 2^scale`, for values whose double would overflow or lose precision.
+fn split<H: RealHost>(h: &H, value: H::Rational) -> Result<(f64, i64), H::Error> {
+    let scale = exponent(h, value)?;
+    Ok((rational::to_f64(h, times_power_of_two(h, value, -scale)?)?, scale))
 }
 
-/// Exact `a` and `b` as `(x, y, k)` with `a ≈ x · 2^k` and `b ≈ y · 2^k`, where `k` is even and
+/// Exact `a` and `b` as `(x, y, scale)` with `a ≈ x · 2^scale` and `b ≈ y · 2^scale`, where `scale` is even and
 /// is zero unless a double of `a` or `b` would overflow or underflow.
 fn exact_pair<H: RealHost>(h: &H, a: H::Rational, b: H::Rational) -> Result<(f64, f64, i64), H::Error> {
     let (fa, fb) = (rational::to_f64(h, a)?, rational::to_f64(h, b)?);
-    let fits = |f: f64, r| f.is_normal() || rational::sign(h, r) == Ordering::Equal;
+    let fits = |double: f64, value| double.is_normal() || rational::sign(h, value) == Ordering::Equal;
     if fits(fa, a) && fits(fb, b) {
         return Ok((fa, fb, 0));
     }
-    let mut k = i64::MIN;
-    for r in [a, b] {
-        if rational::sign(h, r) != Ordering::Equal {
-            k = k.max(exponent(h, r)?);
+    let mut scale = i64::MIN;
+    for value in [a, b] {
+        if rational::sign(h, value) != Ordering::Equal {
+            scale = scale.max(exponent(h, value)?);
         }
     }
-    let k = k + (k & 1);
-    let scaled = |r| rational::to_f64(h, times_power_of_two(h, r, -k)?);
-    Ok((scaled(a)?, scaled(b)?, k))
+    let scale = scale + (scale & 1);
+    let scaled = |value| rational::to_f64(h, times_power_of_two(h, value, -scale)?);
+    Ok((scaled(a)?, scaled(b)?, scale))
 }
 
-/// The exact square root of `r >= 0`, if it's rational.
-fn exact_sqrt<H: RealHost>(h: &H, r: H::Rational) -> Result<Option<H::Rational>, H::Error> {
-    let root = |n| {
-        let s = int::isqrt(h, n)?;
-        Ok::<_, H::Error>((int::compare(h, int::mul(h, s, s)?, n) == Ordering::Equal).then_some(s))
+/// The exact square root of `value >= 0`, if it's rational.
+fn exact_sqrt<H: RealHost>(h: &H, value: H::Rational) -> Result<Option<H::Rational>, H::Error> {
+    let root = |integer| {
+        let candidate = int::isqrt(h, integer)?;
+        Ok::<_, H::Error>((int::compare(h, int::mul(h, candidate, candidate)?, integer) == Ordering::Equal).then_some(candidate))
     };
-    let Some(num) = root(rational::numerator(h, r))? else { return Ok(None) };
-    let Some(den) = root(rational::denominator(h, r)?)? else { return Ok(None) };
+    let Some(num) = root(rational::numerator(h, value))? else { return Ok(None) };
+    let Some(den) = root(rational::denominator(h, value)?)? else { return Ok(None) };
     Ok(Some(rational::from_parts(h, num, den)?))
 }
 
 /// The square root of a real that isn't below zero: exact when it can be.
 fn sqrt_real<H: RealHost>(h: &H, x: H::Real) -> RealRes<H> {
-    let r = match h.real_view(x) {
-        RealView::Flonum(f) => return h.flonum(f.sqrt()),
-        RealView::Exact(r) => r,
+    let value = match h.real_view(x) {
+        RealView::Flonum(float) => return h.flonum(float.sqrt()),
+        RealView::Exact(value) => value,
     };
-    if let Some(s) = exact_sqrt(h, r)? {
-        return Ok(h.of_rational(s));
+    if let Some(root) = exact_sqrt(h, value)? {
+        return Ok(h.of_rational(root));
     }
-    let f = rational::to_f64(h, r)?;
-    if f.is_normal() {
-        return h.flonum(f.sqrt());
+    let float = rational::to_f64(h, value)?;
+    if float.is_normal() {
+        return h.flonum(float.sqrt());
     }
-    let (m, k) = split(h, r)?;
-    let (m, k) = if k % 2 == 0 { (m, k) } else { (m * 2.0, k - 1) };
-    h.flonum(cfloat::ldexp(m.sqrt(), k / 2))
+    let (mantissa, scale) = split(h, value)?;
+    let (mantissa, scale) = if scale % 2 == 0 { (mantissa, scale) } else { (mantissa * 2.0, scale - 1) };
+    h.flonum(cfloat::ldexp(mantissa.sqrt(), scale / 2))
 }
 
 /// The log of a real that isn't below zero: exact 0 for exact 1.
 fn log_real<H: RealHost>(h: &H, x: H::Real) -> RealRes<H> {
-    let r = match h.real_view(x) {
-        RealView::Flonum(f) => return h.flonum(f.ln()),
-        RealView::Exact(r) => r,
+    let value = match h.real_view(x) {
+        RealView::Flonum(float) => return h.flonum(float.ln()),
+        RealView::Exact(value) => value,
     };
-    if let RationalView::Integer(n) = h.rational_view(r) {
-        match int::to_i64(h, n) {
+    if let RationalView::Integer(integer) = h.rational_view(value) {
+        match int::to_i64(h, integer) {
             Some(0) => return Err(NumError::DivideByZero.into()),
             Some(1) => return real::from_i64(h, 0),
             _ => {}
         }
     }
-    let f = rational::to_f64(h, r)?;
-    if f.is_normal() {
-        return h.flonum(f.ln());
+    let float = rational::to_f64(h, value)?;
+    if float.is_normal() {
+        return h.flonum(float.ln());
     }
-    let (m, k) = split(h, r)?;
-    h.flonum(m.ln() + k as f64 * LN_2)
+    let (mantissa, scale) = split(h, value)?;
+    h.flonum(mantissa.ln() + scale as f64 * LN_2)
 }
 
 /// Exact 0 for any positive real, and an error for exact 0.
@@ -330,13 +330,13 @@ pub fn angle<H: ComplexHost>(h: &H, z: H::Number) -> RealRes<H> {
     let (re, im) = match h.complex_view(z) {
         ComplexView::Real(x) => {
             return match h.real_view(x) {
-                RealView::Exact(r) => match rational::sign(h, r) {
+                RealView::Exact(value) => match rational::sign(h, value) {
                     Ordering::Equal => Err(NumError::DivideByZero.into()),
                     Ordering::Greater => real::from_i64(h, 0),
                     Ordering::Less => h.flonum(PI),
                 },
-                RealView::Flonum(f) if f.is_nan() => Ok(x),
-                RealView::Flonum(f) if f.is_sign_negative() => h.flonum(PI),
+                RealView::Flonum(float) if float.is_nan() => Ok(x),
+                RealView::Flonum(float) if float.is_sign_negative() => h.flonum(PI),
                 RealView::Flonum(_) => real::from_i64(h, 0),
             };
         }
@@ -379,18 +379,18 @@ pub fn sqrt<H: ComplexHost>(h: &H, z: H::Number) -> Res<H> {
     if let (RealView::Exact(a), RealView::Exact(b)) = (h.real_view(re), h.real_view(im)) {
         // (p + qi)² = a + bi for p = √((|z| + a) / 2) and q = ±√((|z| - a) / 2).
         let sum = rational::add(h, rational::mul(h, a, a)?, rational::mul(h, b, b)?)?;
-        if let Some(m) = exact_sqrt(h, sum)? {
+        if let Some(modulus) = exact_sqrt(h, sum)? {
             let half = |x| rational::div(h, x, h.of_int(int::from_i64(h, 2)?));
-            let p = exact_sqrt(h, half(rational::add(h, m, a)?)?)?;
-            let q = exact_sqrt(h, half(rational::sub(h, m, a)?)?)?;
-            if let (Some(p), Some(q)) = (p, q) {
-                let q = if rational::sign(h, b) == Ordering::Less { rational::neg(h, q)? } else { q };
-                return rectangular(h, h.of_rational(p), h.of_rational(q));
+            let real_root = exact_sqrt(h, half(rational::add(h, modulus, a)?)?)?;
+            let imag_root = exact_sqrt(h, half(rational::sub(h, modulus, a)?)?)?;
+            if let (Some(real_root), Some(imag_root)) = (real_root, imag_root) {
+                let imag_root = if rational::sign(h, b) == Ordering::Less { rational::neg(h, imag_root)? } else { imag_root };
+                return rectangular(h, h.of_rational(real_root), h.of_rational(imag_root));
             }
         }
-        let (x, y, k) = exact_pair(h, a, b)?;
-        let s = cfloat::sqrt(C { re: x, im: y });
-        return from_c(h, C { re: cfloat::ldexp(s.re, k / 2), im: cfloat::ldexp(s.im, k / 2) });
+        let (x, y, scale) = exact_pair(h, a, b)?;
+        let root = cfloat::sqrt(C { re: x, im: y });
+        return from_c(h, C { re: cfloat::ldexp(root.re, scale / 2), im: cfloat::ldexp(root.im, scale / 2) });
     }
     from_c(h, cfloat::sqrt(to_c(h, z)?))
 }
@@ -462,9 +462,9 @@ pub fn acos<H: ComplexHost>(h: &H, z: H::Number) -> Res<H> {
 
 fn inverse<H: ComplexHost>(h: &H, z: H::Number, real: fn(f64) -> f64, complex: fn(C) -> C) -> Res<H> {
     if let ComplexView::Real(x) = h.complex_view(z) {
-        let f = real::to_f64(h, x)?;
-        if f.abs() <= 1.0 || f.is_nan() {
-            return flonum(h, real(f));
+        let float = real::to_f64(h, x)?;
+        if float.abs() <= 1.0 || float.is_nan() {
+            return flonum(h, real(float));
         }
     }
     from_c(h, complex(to_c(h, z)?))
@@ -508,19 +508,19 @@ pub fn atan2<H: RealHost>(h: &H, y: H::Real, x: H::Real) -> RealRes<H> {
     h.flonum(fy.atan2(fx))
 }
 
-/// `z^w` with the special cases Racket lists: exact powers of exact numbers stay exact, an
+/// `z^power` with the special cases Racket lists: exact powers of exact numbers stay exact, an
 /// exact 1/2 power is [`sqrt`], real powers follow C's `pow` except that a negative base with
-/// a non-integer power goes complex, and everything else is `exp(w · log z)`.
-pub fn expt<H: ComplexHost>(h: &H, z: H::Number, w: H::Number) -> Res<H> {
-    if is_exact_zero(h, w) || is_exact_one(h, z) {
+/// a non-integer power goes complex, and everything else is `exp(power · log z)`.
+pub fn expt<H: ComplexHost>(h: &H, z: H::Number, power: H::Number) -> Res<H> {
+    if is_exact_zero(h, power) || is_exact_one(h, z) {
         return exact_int(h, 1);
     }
     if is_exact_zero(h, z) {
-        return match h.complex_view(w) {
-            ComplexView::Real(e) => match h.real_view(e) {
+        return match h.complex_view(power) {
+            ComplexView::Real(exponent) => match h.real_view(exponent) {
                 RealView::Flonum(0.0) => flonum(h, 1.0),
-                RealView::Flonum(f) if f.is_nan() => flonum(h, f),
-                _ if real::sign(h, e) == Some(Ordering::Less) => Err(NumError::DivideByZero.into()),
+                RealView::Flonum(float) if float.is_nan() => flonum(h, float),
+                _ if real::sign(h, exponent) == Some(Ordering::Less) => Err(NumError::DivideByZero.into()),
                 _ => Ok(z),
             },
             ComplexView::Complex { re, .. } => match real::sign(h, re) {
@@ -530,11 +530,11 @@ pub fn expt<H: ComplexHost>(h: &H, z: H::Number, w: H::Number) -> Res<H> {
             },
         };
     }
-    let ComplexView::Real(e) = h.complex_view(w) else {
-        return exp(h, mul(h, w, log(h, z)?)?);
+    let ComplexView::Real(exponent) = h.complex_view(power) else {
+        return exp(h, mul(h, power, log(h, z)?)?);
     };
-    if let RealView::Exact(q) = h.real_view(e) {
-        match h.rational_view(q) {
+    if let RealView::Exact(fraction) = h.real_view(exponent) {
+        match h.rational_view(fraction) {
             RationalView::Integer(n) => return integer_power(h, z, n),
             RationalView::Ratio { num, den } if int::to_i64(h, num) == Some(1) && int::to_i64(h, den) == Some(2) => {
                 return sqrt(h, z);
@@ -543,37 +543,37 @@ pub fn expt<H: ComplexHost>(h: &H, z: H::Number, w: H::Number) -> Res<H> {
         }
     }
     if let ComplexView::Real(b) = h.complex_view(z) {
-        let (fb, fe) = (real::to_f64(h, b)?, real::to_f64(h, e)?);
-        let whole = matches!(h.real_view(e), RealView::Flonum(f) if f.is_finite() && f.fract() == 0.0);
+        let (fb, fe) = (real::to_f64(h, b)?, real::to_f64(h, exponent)?);
+        let whole = matches!(h.real_view(exponent), RealView::Flonum(float) if float.is_finite() && float.fract() == 0.0);
         if real::sign(h, b) != Some(Ordering::Less) || whole {
             return flonum(h, fb.powf(fe));
         }
     }
-    exp(h, mul(h, w, log(h, z)?)?)
+    exp(h, mul(h, power, log(h, z)?)?)
 }
 
 /// `z^n` by squaring, for an exact integer `n`.
 fn integer_power<H: ComplexHost>(h: &H, z: H::Number, n: H::Int) -> Res<H> {
     if let ComplexView::Real(b) = h.complex_view(z) {
-        let q = match h.real_view(b) {
-            RealView::Flonum(f) => return flonum(h, f.powf(int::to_f64(h, n))),
-            RealView::Exact(q) => q,
+        let fraction = match h.real_view(b) {
+            RealView::Flonum(float) => return flonum(h, float.powf(int::to_f64(h, n))),
+            RealView::Exact(fraction) => fraction,
         };
         return match int::to_i64(h, n) {
-            Some(e) => Ok(h.of_real(h.of_rational(rational::expt(h, q, e)?))),
+            Some(exponent) => Ok(h.of_real(h.of_rational(rational::expt(h, fraction, exponent)?))),
             None if real::eqv(h, b, real::from_i64(h, -1)?) => exact_int(h, if int::is_even(h, n) { 1 } else { -1 }),
             // Any other base needs more bits than memory holds.
             None => Err(int::too_big(h)),
         };
     }
-    let Some(e) = int::to_i64(h, n) else {
+    let Some(exponent) = int::to_i64(h, n) else {
         if is_exact(h, z) {
             return Err(int::too_big(h));
         }
-        let w = h.of_real(h.of_rational(h.of_int(n)));
-        return exp(h, mul(h, w, log(h, z)?)?);
+        let power = h.of_real(h.of_rational(h.of_int(n)));
+        return exp(h, mul(h, power, log(h, z)?)?);
     };
-    let (mut result, mut base, mut left) = (exact_int(h, 1)?, z, e.unsigned_abs());
+    let (mut result, mut base, mut left) = (exact_int(h, 1)?, z, exponent.unsigned_abs());
     while left != 0 {
         if left & 1 == 1 {
             result = mul(h, result, base)?;
@@ -583,5 +583,5 @@ fn integer_power<H: ComplexHost>(h: &H, z: H::Number, n: H::Int) -> Res<H> {
             base = mul(h, base, base)?;
         }
     }
-    if e < 0 { div(h, exact_int(h, 1)?, result) } else { Ok(result) }
+    if exponent < 0 { div(h, exact_int(h, 1)?, result) } else { Ok(result) }
 }

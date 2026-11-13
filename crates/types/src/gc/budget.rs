@@ -133,9 +133,9 @@ impl Budget {
         self.used.set(self.used.get().saturating_sub(bytes));
     }
 
-    pub(crate) fn optional<R>(&self, f: impl FnOnce() -> Result<R, OutOfMemory>) -> Result<R, OutOfMemory> {
+    pub(crate) fn optional<R>(&self, allocate: impl FnOnce() -> Result<R, OutOfMemory>) -> Result<R, OutOfMemory> {
         let _optional = Restore(&self.in_optional, self.in_optional.replace(true));
-        f()
+        allocate()
     }
 }
 

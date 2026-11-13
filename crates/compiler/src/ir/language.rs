@@ -54,20 +54,20 @@ macro_rules! language {
         impl<T> Copy for Span<'_, T> {}
 
         impl std::fmt::Debug for Id<'_> {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "#{}", self.0)
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "#{}", self.0)
             }
         }
 
         impl std::fmt::Debug for $fun<'_> {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "fn#{}", self.0)
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "fn#{}", self.0)
             }
         }
 
         impl<T> std::fmt::Debug for Span<'_, T> {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "{}..{}", self.start, self.start + self.len)
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "{}..{}", self.start, self.start + self.len)
             }
         }
 
@@ -105,21 +105,21 @@ macro_rules! language {
             }
         )*
 
-        /// Passes child node IDs in the current frame to `f`, in evaluation order.
+        /// Passes child node IDs in the current frame to `visit`, in evaluation order.
         pub(crate) trait Children<'id, 'gc>: Copy {
-            fn each(self, tree: &$table<'id, 'gc>, f: &mut impl FnMut(Id<'id>));
+            fn each(self, tree: &$table<'id, 'gc>, visit: &mut impl FnMut(Id<'id>));
         }
 
         impl<'id, 'gc> Children<'id, 'gc> for Id<'id> {
-            fn each(self, _: &$table<'id, 'gc>, f: &mut impl FnMut(Id<'id>)) {
-                f(self);
+            fn each(self, _: &$table<'id, 'gc>, visit: &mut impl FnMut(Id<'id>)) {
+                visit(self);
             }
         }
 
         impl<'id, 'gc, T: Item<'id, 'gc> + Children<'id, 'gc>> Children<'id, 'gc> for Span<'id, T> {
-            fn each(self, tree: &$table<'id, 'gc>, f: &mut impl FnMut(Id<'id>)) {
+            fn each(self, tree: &$table<'id, 'gc>, visit: &mut impl FnMut(Id<'id>)) {
                 for &item in &tree[self] {
-                    item.each(tree, f);
+                    item.each(tree, visit);
                 }
             }
         }
@@ -134,9 +134,9 @@ macro_rules! language {
             fn each(self, _: &$table<'id, 'gc>, _: &mut impl FnMut(Id<'id>)) {}
         }
 
-        /// Passes referenced function bodies to `f`.
+        /// Passes referenced function bodies to `visit`.
         pub(crate) trait Bodies<'id, 'gc>: Copy {
-            fn bodies(self, tree: &$table<'id, 'gc>, f: &mut impl FnMut(Id<'id>));
+            fn bodies(self, tree: &$table<'id, 'gc>, visit: &mut impl FnMut(Id<'id>));
         }
 
         impl<'id, 'gc> Bodies<'id, 'gc> for Id<'id> {
@@ -144,15 +144,15 @@ macro_rules! language {
         }
 
         impl<'id, 'gc> Bodies<'id, 'gc> for $fun<'id> {
-            fn bodies(self, tree: &$table<'id, 'gc>, f: &mut impl FnMut(Id<'id>)) {
-                f(tree[self].$body);
+            fn bodies(self, tree: &$table<'id, 'gc>, visit: &mut impl FnMut(Id<'id>)) {
+                visit(tree[self].$body);
             }
         }
 
         impl<'id, 'gc, T: Item<'id, 'gc> + Bodies<'id, 'gc>> Bodies<'id, 'gc> for Span<'id, T> {
-            fn bodies(self, tree: &$table<'id, 'gc>, f: &mut impl FnMut(Id<'id>)) {
+            fn bodies(self, tree: &$table<'id, 'gc>, visit: &mut impl FnMut(Id<'id>)) {
                 for &item in &tree[self] {
-                    item.bodies(tree, f);
+                    item.bodies(tree, visit);
                 }
             }
         }
@@ -163,13 +163,13 @@ macro_rules! language {
             }
         )*
 
-        /// Calls `f` with a new empty table and a fresh lifetime brand.
-        pub(crate) fn scope<'gc, R>(f: impl for<'id> FnOnce($table<'id, 'gc>) -> R) -> R {
-            f($table { nodes: Vec::new(), sites: Vec::new(), current: 0, $functions: Vec::new(), $($list: Vec::new(),)* })
+        /// Calls `callback` with a new empty table and a fresh lifetime brand.
+        pub(crate) fn scope<'gc, R>(callback: impl for<'id> FnOnce($table<'id, 'gc>) -> R) -> R {
+            callback($table { nodes: Vec::new(), sites: Vec::new(), current: 0, $functions: Vec::new(), $($list: Vec::new(),)* })
         }
 
-        fn count(n: usize) -> u32 {
-            u32::try_from(n).expect("fewer than 2^32 of each kind of node")
+        fn count(number: usize) -> u32 {
+            u32::try_from(number).expect("fewer than 2^32 of each kind of node")
         }
 
         impl<'id, 'gc> $table<'id, 'gc> {
@@ -225,17 +225,17 @@ macro_rules! language {
 
             /// Visits `id`'s children in evaluation order within the current function frame. Excludes nested
             /// function bodies.
-            pub(crate) fn children(&self, id: Id<'id>, mut f: impl FnMut(Id<'id>)) {
+            pub(crate) fn children(&self, id: Id<'id>, mut visit: impl FnMut(Id<'id>)) {
                 match self[id] {
-                    $( $node::$variant($($field),*) => { $( Children::each($field, self, &mut f); )* } )*
+                    $( $node::$variant($($field),*) => { $( Children::each($field, self, &mut visit); )* } )*
                 }
             }
 
             /// Visits the bodies of functions referenced by `id`, each of which belongs to a separate frame.
             #[allow(dead_code)]
-            pub(crate) fn bodies(&self, id: Id<'id>, mut f: impl FnMut(Id<'id>)) {
+            pub(crate) fn bodies(&self, id: Id<'id>, mut visit: impl FnMut(Id<'id>)) {
                 match self[id] {
-                    $( $node::$variant($($field),*) => { $( Bodies::bodies($field, self, &mut f); )* } )*
+                    $( $node::$variant($($field),*) => { $( Bodies::bodies($field, self, &mut visit); )* } )*
                 }
             }
 

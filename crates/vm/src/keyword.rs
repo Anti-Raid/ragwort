@@ -14,32 +14,32 @@ use crate::machine::{Then, condition};
 use crate::objects::{BytecodeFields, Closure, ClosureFields, KeywordProcedure, KeywordProcedureFields};
 
 /// Orders two keywords lexicographically by their string names, matching the behavior of Racket's `keyword<?`.
-pub fn order<'gc>(mc: &Mutation<'gc>, a: Keyword<'gc>, b: Keyword<'gc>) -> Ordering {
+pub fn order<'gc>(mc: &Mutation<'gc>, left: Keyword<'gc>, right: Keyword<'gc>) -> Ordering {
     let strings = Strings::new(mc);
-    string::compare(&strings, a.symbol(mc).name(mc), b.symbol(mc).name(mc)).unwrap_or(Ordering::Equal)
+    string::compare(&strings, left.symbol(mc).name(mc), right.symbol(mc).name(mc)).unwrap_or(Ordering::Equal)
 }
 
-/// Returns the signature of procedure `f` if it is a [`KeywordProcedure`]: a sorted list of accepted keywords (each paired with a boolean indicating whether it is required) and the [`Shape`] of its positional parameters.
-pub fn signature<'gc>(mc: &Mutation<'gc>, f: Value<'gc>) -> Option<(Vec<(Keyword<'gc>, bool)>, Shape)> {
-    let f = f.downcast::<KeywordProcedure>(mc)?;
+/// Returns the signature of procedure `callee` if it is a [`KeywordProcedure`]: a sorted list of accepted keywords (each paired with a boolean indicating whether it is required) and the [`Shape`] of its positional parameters.
+pub fn signature<'gc>(mc: &Mutation<'gc>, callee: Value<'gc>) -> Option<(Vec<(Keyword<'gc>, bool)>, Shape)> {
+    let callee = callee.downcast::<KeywordProcedure>(mc)?;
     let pairs = Pairs::new(mc);
-    let required: Vec<Value<'gc>> = pairs.elements(f.required(mc)).collect();
-    let keywords: Vec<_> = pairs.elements(f.keywords(mc)).map(|k| Some((Keyword::of(k)?, required.contains(&k)))).collect::<Option<_>>()?;
-    let mut shape = Shape::of(f.core(mc).downcast::<Closure>(mc)?.code(mc)?.arity(mc));
+    let required: Vec<Value<'gc>> = pairs.elements(callee.required(mc)).collect();
+    let keywords: Vec<_> = pairs.elements(callee.keywords(mc)).map(|keyword| Some((Keyword::of(keyword)?, required.contains(&keyword)))).collect::<Option<_>>()?;
+    let mut shape = Shape::of(callee.core(mc).downcast::<Closure>(mc)?.code(mc)?.arity(mc));
     shape.required = shape.required.checked_sub(keywords.len() as u64)?;
     Some((keywords, shape))
 }
 
-/// Dispatches a call to keyword procedure `f` when no keyword arguments are supplied, passing positional `args`.
-pub(crate) fn positional<'gc>(mc: &Mutation<'gc>, f: Gc<'gc, KeywordProcedure>, args: Args<'gc>) -> Result<Then<'gc>, Fault> {
-    match f.plain(mc) {
-        Value::FALSE => apply(mc, Value::object(mc, f), Value::NIL, Value::NIL, args),
+/// Dispatches a call to keyword procedure `callee` when no keyword arguments are supplied, passing positional `args`.
+pub(crate) fn positional<'gc>(mc: &Mutation<'gc>, callee: Gc<'gc, KeywordProcedure>, args: Args<'gc>) -> Result<Then<'gc>, Fault> {
+    match callee.plain(mc) {
+        Value::FALSE => apply(mc, Value::object(mc, callee), Value::NIL, Value::NIL, args),
         plain => Ok(Then::Call(plain, args)),
     }
 }
 
-/// Implements `(keyword-apply f kws vals arg ...)`: invokes `f` with keyword arguments `kws` (which must be sorted and distinct) and corresponding values `vals`, followed by positional arguments `args`. Raises a keyword fault if an unexpected keyword is supplied or if a required keyword is missing.
-pub(crate) fn apply<'gc>(mc: &Mutation<'gc>, f: Value<'gc>, kws: Value<'gc>, vals: Value<'gc>, args: Args<'gc>) -> Result<Then<'gc>, Fault> {
+/// Implements `(keyword-apply f kws vals arg ...)`: invokes `callee` with keyword arguments `kws` (which must be sorted and distinct) and corresponding values `vals`, followed by positional arguments `args`. Raises a keyword fault if an unexpected keyword is supplied or if a required keyword is missing.
+pub(crate) fn apply<'gc>(mc: &Mutation<'gc>, callee: Value<'gc>, kws: Value<'gc>, vals: Value<'gc>, args: Args<'gc>) -> Result<Then<'gc>, Fault> {
     let pairs = Pairs::new(mc);
     let mut given = Vec::new();
     for (kw, val) in pairs.elements(kws).zip(pairs.elements(vals)) {
@@ -52,18 +52,18 @@ pub(crate) fn apply<'gc>(mc: &Mutation<'gc>, f: Value<'gc>, kws: Value<'gc>, val
     if pairs.list_len(kws) != Some(given.len() as u64) || pairs.list_len(vals) != Some(given.len() as u64) {
         return Err(Fault::WrongType);
     }
-    let Some(f) = f.downcast::<KeywordProcedure>(mc) else {
+    let Some(callee) = callee.downcast::<KeywordProcedure>(mc) else {
         return match given.first() {
             Some(&(kw, _)) => raise(mc, "procedure takes no keywords", kw.value(mc)),
-            None => Ok(Then::Call(f, args)),
+            None => Ok(Then::Call(callee, args)),
         };
     };
-    let accepted: Vec<Keyword<'gc>> = pairs.elements(f.keywords(mc)).map(Keyword::of).collect::<Option<_>>().ok_or(Fault::Malformed)?;
+    let accepted: Vec<Keyword<'gc>> = pairs.elements(callee.keywords(mc)).map(Keyword::of).collect::<Option<_>>().ok_or(Fault::Malformed)?;
     // Report unknown keywords before missing required ones, as an unexpected keyword often indicates a misspelled parameter name.
     if let Some(&(kw, _)) = given.iter().find(|(kw, _)| !accepted.contains(kw)) {
         return raise(mc, "procedure doesn't take keyword", kw.value(mc));
     }
-    let required: Vec<_> = pairs.elements(f.required(mc)).collect();
+    let required: Vec<_> = pairs.elements(callee.required(mc)).collect();
     let mut given = given.into_iter().peekable();
     let mut values = Vec::with_capacity(accepted.len());
     for accepted in accepted {
@@ -74,7 +74,7 @@ pub(crate) fn apply<'gc>(mc: &Mutation<'gc>, f: Value<'gc>, kws: Value<'gc>, val
         }
     }
     let list = pairs.list_with_tail(values, args.to_list(mc)?)?;
-    Ok(Then::Call(f.core(mc), Args::list(list)))
+    Ok(Then::Call(callee.core(mc), Args::list(list)))
 }
 
 fn raise<'gc>(mc: &Mutation<'gc>, message: &str, kw: Value<'gc>) -> Result<Then<'gc>, Fault> {

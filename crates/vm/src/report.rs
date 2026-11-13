@@ -87,8 +87,8 @@ fn list<'gc>(mc: &Mutation<'gc>, values: impl DoubleEndedIterator<Item = Value<'
     Ok(list)
 }
 
-fn count<'gc>(n: u8) -> Value<'gc> {
-    Value::fixnum(i64::from(n)).unwrap_or(Value::VOID)
+fn count<'gc>(number: u8) -> Value<'gc> {
+    Value::fixnum(i64::from(number)).unwrap_or(Value::VOID)
 }
 
 /// Identifies the origin of `fault` from the instruction that raised it: the instruction before `pc` in `code`, executing in `frame`.
@@ -99,14 +99,14 @@ pub(crate) fn origin<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, code: Gc<'g
     let Some(&op) = pc.checked_sub(1).and_then(|at| code.ops(mc)?.get(at)) else { return Ok(unknown) };
     let registers = |base: u8, count: u8| (0..count).map(move |i| frame.get(base.wrapping_add(i)));
     let (operation, irritants) = match op {
-        Op::CallIntrinsic1 { a, intrinsic, .. } | Op::BranchIntrinsic1 { a, intrinsic, .. } => (Some(Operation::Intrinsic(intrinsic)), list(mc, [frame.get(a)].into_iter())?),
-        Op::CallIntrinsic2 { a, b, intrinsic, .. } | Op::BranchIntrinsic2 { a, b, intrinsic, .. } => (Some(Operation::Intrinsic(intrinsic)), list(mc, [frame.get(a), frame.get(b)].into_iter())?),
-        Op::CallIntrinsic3 { a, b, c, intrinsic, .. } => (Some(Operation::Intrinsic(intrinsic)), list(mc, [frame.get(a), frame.get(b), frame.get(c)].into_iter())?),
+        Op::CallIntrinsic1 { a: operand, intrinsic, .. } | Op::BranchIntrinsic1 { a: operand, intrinsic, .. } => (Some(Operation::Intrinsic(intrinsic)), list(mc, [frame.get(operand)].into_iter())?),
+        Op::CallIntrinsic2 { a: left, b: right, intrinsic, .. } | Op::BranchIntrinsic2 { a: left, b: right, intrinsic, .. } => (Some(Operation::Intrinsic(intrinsic)), list(mc, [frame.get(left), frame.get(right)].into_iter())?),
+        Op::CallIntrinsic3 { a: first, b: second, c: third, intrinsic, .. } => (Some(Operation::Intrinsic(intrinsic)), list(mc, [frame.get(first), frame.get(second), frame.get(third)].into_iter())?),
         Op::CallIntrinsic { base, args, intrinsic } | Op::TailCallIntrinsic { base, args, intrinsic } | Op::ApplyIntrinsic { base, args, intrinsic } => {
             (Some(Operation::Intrinsic(intrinsic)), list(mc, registers(base, args))?)
         }
-        Op::AddImm { a, imm, .. } => (Some(Operation::Intrinsic(Intrinsic::Add)), list(mc, [frame.get(a), Value::fixnum(i64::from(imm)).unwrap_or(Value::VOID)].into_iter())?),
-        Op::StructField { a, .. } | Op::StructRef { a, .. } => (None, list(mc, [frame.get(a)].into_iter())?),
+        Op::AddImm { a: operand, imm, .. } => (Some(Operation::Intrinsic(Intrinsic::Add)), list(mc, [frame.get(operand), Value::fixnum(i64::from(imm)).unwrap_or(Value::VOID)].into_iter())?),
+        Op::StructField { a: instance, .. } | Op::StructRef { a: instance, .. } => (None, list(mc, [frame.get(instance)].into_iter())?),
         Op::Call { base, args } if fault == Fault::Arity => (None, list(mc, [frame.get(base), count(args)].into_iter())?),
         // A failed tail call has already moved the callee into the frame's closure register.
         Op::TailCall { args, .. } if fault == Fault::Arity => (None, list(mc, [frame.get(CLOSURE), count(args)].into_iter())?),
@@ -282,10 +282,10 @@ fn recorded<'gc>(mc: &Mutation<'gc>, condition: Gc<'gc, Condition>) -> (Vec<Entr
     (entries, len % 2 == 1)
 }
 
-/// Returns the name of the source `source` and the one-based line of byte `offset` in it. The name is `None` for a source without one, and the line 0 when `source` is neither a source nor a string.
+/// Returns the name of `source` and the one-based line of byte `offset` in it. The name is `None` if the source has no name. The line is 0 if `source` is neither a source object nor a string.
 fn place<'gc>(mc: &Mutation<'gc>, source: Value<'gc>, offset: u32) -> (Option<String>, u32) {
     let strings = Strings::new(mc);
-    // A string names a source directly, and the offset is then the line itself: code inlined from another module records its origin this way.
+    // If `source` is a string, it is the file name and `offset` is already a line number. Code inlined from another module records its origin this way.
     if let Some(name) = strings.string(source) {
         return (Some(string::display(&strings, name).to_string()), offset);
     }

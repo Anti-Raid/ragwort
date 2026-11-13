@@ -37,18 +37,18 @@ pub struct CallShape<'gc> {
 impl<'gc> CallShape<'gc> {
     /// Computes the argument shape of `params`, including a rest parameter when `rest` is true.
     pub fn of(mc: &Mutation<'gc>, params: &[Param<'gc>], rest: bool) -> Self {
-        let mut keywords: Vec<_> = params.iter().filter_map(|p| Some((p.keyword?, !p.optional))).collect();
-        keywords.sort_by(|a, b| keyword::order(mc, a.0, b.0));
-        let positional = || params.iter().filter(|p| p.keyword.is_none());
-        CallShape { keywords, required: positional().filter(|p| !p.optional).count(), optional: positional().filter(|p| p.optional).count(), rest }
+        let mut keywords: Vec<_> = params.iter().filter_map(|param| Some((param.keyword?, !param.optional))).collect();
+        keywords.sort_by(|left, right| keyword::order(mc, left.0, right.0));
+        let positional = || params.iter().filter(|param| param.keyword.is_none());
+        CallShape { keywords, required: positional().filter(|param| !param.optional).count(), optional: positional().filter(|param| param.optional).count(), rest }
     }
 
     /// Returns the imported keyword procedure's shape and core import, if the exporting module exposes
     /// them.
     pub fn of_import(mc: &Mutation<'gc>, import: Import<'gc>) -> Option<(Import<'gc>, Self)> {
         let core = import.keyword_core()?;
-        let Ok(Core::Quote(f)) = import.reference(mc) else { return None };
-        let (keywords, shape) = keyword::signature(mc, f)?;
+        let Ok(Core::Quote(procedure)) = import.reference(mc) else { return None };
+        let (keywords, shape) = keyword::signature(mc, procedure)?;
         let (required, optional) = (usize::try_from(shape.required).ok()?, usize::try_from(shape.optional).ok()?);
         Some((core, CallShape { keywords, required, optional, rest: shape.rest }))
     }
@@ -57,8 +57,8 @@ impl<'gc> CallShape<'gc> {
     /// arguments.
     pub fn matches(&self, given: &[Keyword<'gc>], positional: usize) -> bool {
         let takes = positional >= self.required && (self.rest || positional <= self.required + self.optional);
-        let known = given.iter().all(|k| self.keywords.iter().any(|&(other, _)| other == *k));
-        let required = self.keywords.iter().filter(|&&(_, r)| r).all(|(k, _)| given.contains(k));
+        let known = given.iter().all(|keyword| self.keywords.iter().any(|&(other, _)| other == *keyword));
+        let required = self.keywords.iter().filter(|&&(_, is_required)| is_required).all(|(keyword, _)| given.contains(keyword));
         takes && known && required
     }
 
@@ -68,12 +68,12 @@ impl<'gc> CallShape<'gc> {
 /// parameters.
 pub fn order<'gc>(mc: &Mutation<'gc>, params: &[Param<'gc>]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..params.len()).filter(|&i| params[i].keyword.is_some()).collect();
-    order.sort_by(|&a, &b| keyword::order(mc, params[a].keyword.expect("a keyword"), params[b].keyword.expect("a keyword")));
+    order.sort_by(|&left, &right| keyword::order(mc, params[left].keyword.expect("a keyword"), params[right].keyword.expect("a keyword")));
     order.extend((0..params.len()).filter(|&i| params[i].keyword.is_none()));
     order
 }
 
 /// Sorts keywords into the order required by keyword procedures.
 pub fn sort<'gc>(mc: &Mutation<'gc>, keywords: &mut [Keyword<'gc>]) {
-    keywords.sort_by(|&a, &b| keyword::order(mc, a, b));
+    keywords.sort_by(|&left, &right| keyword::order(mc, left, right));
 }

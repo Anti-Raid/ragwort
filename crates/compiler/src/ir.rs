@@ -74,7 +74,7 @@ impl<'gc> Origins<'gc> {
     }
 }
 
-/// An inlined call: the procedure whose body was copied into its caller, and the site of the call it replaced.
+/// A record of one inlined call: the name of the procedure whose body was copied into the caller, and the site of the call that the body replaced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Inlined<'gc> {
     /// The procedure's name, a symbol.
@@ -115,7 +115,7 @@ impl<'gc> Sites<'gc> {
         self.sites.len() as u32
     }
 
-    /// Records that the body of the procedure named `name` was inlined in place of the call at `call`, and returns the inlined call's number.
+    /// Records that the call at site `call` was replaced by the body of the procedure named `name`. Returns the number of the new inlined call.
     pub(crate) fn inline(&mut self, name: Value<'gc>, call: u32) -> u32 {
         self.inlined.push(Inlined { name, call });
         self.inlined.len() as u32
@@ -150,9 +150,9 @@ pub(crate) struct Supply {
 
 impl Supply {
     pub(crate) fn fresh_var(&mut self) -> Var {
-        let v = Var(self.next_var);
+        let var = Var(self.next_var);
         self.next_var = self.next_var.checked_add(1).expect("fewer than 2^32 variables");
-        v
+        var
     }
 
     pub(crate) fn fresh_lambda(&mut self) -> u32 {

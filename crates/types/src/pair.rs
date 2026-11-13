@@ -14,9 +14,9 @@ pub struct Pair<'gc>(Gc<'gc, objects::Pair>);
 
 impl<'gc> Pair<'gc> {
     #[inline(always)]
-    pub fn of(v: Value<'gc>) -> Option<Self> {
-        match Data::of(v) {
-            Some(Data::Pair(p)) => Some(Self(p)),
+    pub fn of(value: Value<'gc>) -> Option<Self> {
+        match Data::of(value) {
+            Some(Data::Pair(pair)) => Some(Self(pair)),
             _ => None,
         }
     }
@@ -40,7 +40,7 @@ impl<'gc> Pair<'gc> {
     /// `()`.
     #[inline(always)]
     pub fn list_len(self, mc: &Mutation<'gc>) -> Option<u64> {
-        Some(self.0.length(mc)).filter(|&n| n != 0)
+        Some(self.0.length(mc)).filter(|&length| length != 0)
     }
 }
 
@@ -57,13 +57,13 @@ impl<'a, 'gc> Pairs<'a, 'gc> {
     }
 
     #[inline(always)]
-    pub fn pair(&self, v: Value<'gc>) -> Option<Pair<'gc>> {
-        Pair::of(v)
+    pub fn pair(&self, value: Value<'gc>) -> Option<Pair<'gc>> {
+        Pair::of(value)
     }
 
     #[inline(always)]
     pub fn cons(&self, head: Value<'gc>, tail: Value<'gc>) -> Result<Pair<'gc>, OutOfMemory> {
-        let len = self.list_len(tail).map_or(0, |n| n.saturating_add(1));
+        let len = self.list_len(tail).map_or(0, |length| length.saturating_add(1));
         Ok(Pair(objects::Pair::new(self.mc, head, tail, len)?))
     }
 
@@ -80,29 +80,29 @@ impl<'a, 'gc> Pairs<'a, 'gc> {
     {
         let mut len = self.list_len(tail);
         for head in items.into_iter().rev() {
-            len = len.map(|n| n.saturating_add(1));
+            len = len.map(|length| length.saturating_add(1));
             tail = Value::object(self.mc, objects::Pair::new(self.mc, head, tail, len.unwrap_or(0))?);
         }
         Ok(tail)
     }
 
-    /// The length of `v` if it's a list: `()` or a pair whose pairs end in `()`.
+    /// The length of `value` if it's a list: `()` or a pair whose pairs end in `()`.
     #[inline(always)]
-    pub fn list_len(&self, v: Value<'gc>) -> Option<u64> {
-        match Pair::of(v) {
-            Some(p) => p.list_len(self.mc),
-            None => (v == Value::NIL).then_some(0),
+    pub fn list_len(&self, value: Value<'gc>) -> Option<u64> {
+        match Pair::of(value) {
+            Some(pair) => pair.list_len(self.mc),
+            None => (value == Value::NIL).then_some(0),
         }
     }
 
     #[inline(always)]
-    pub fn is_list(&self, v: Value<'gc>) -> bool {
-        self.list_len(v).is_some()
+    pub fn is_list(&self, value: Value<'gc>) -> bool {
+        self.list_len(value).is_some()
     }
 
-    /// The heads of the pairs starting at `v`. [`Elements::rest`] is what follows them.
-    pub fn elements(&self, v: Value<'gc>) -> Elements<'a, 'gc> {
-        Elements { mc: self.mc, rest: v }
+    /// The heads of the pairs starting at `value`. [`Elements::rest`] is what follows them.
+    pub fn elements(&self, value: Value<'gc>) -> Elements<'a, 'gc> {
+        Elements { mc: self.mc, rest: value }
     }
 }
 
@@ -123,8 +123,8 @@ impl<'gc> Iterator for Elements<'_, 'gc> {
     type Item = Value<'gc>;
 
     fn next(&mut self) -> Option<Value<'gc>> {
-        let p = Pair::of(self.rest)?;
-        self.rest = p.tail(self.mc);
-        Some(p.head(self.mc))
+        let pair = Pair::of(self.rest)?;
+        self.rest = pair.tail(self.mc);
+        Some(pair.head(self.mc))
     }
 }

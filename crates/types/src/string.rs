@@ -38,8 +38,8 @@ const COPY_EXTERNAL: usize = 64;
 pub const INLINE_CHARS: usize = 7;
 
 #[inline]
-fn is_inline(v: Value<'_>) -> bool {
-    v.to_bits() & TAG == INLINE_STRING
+fn is_inline(value: Value<'_>) -> bool {
+    value.to_bits() & TAG == INLINE_STRING
 }
 
 #[inline]
@@ -48,8 +48,8 @@ fn inline_value<'gc>(units: Inline) -> Value<'gc> {
 }
 
 #[inline]
-fn inline_units(v: Value<'_>) -> Inline {
-    let word = v.to_bits();
+fn inline_units(value: Value<'_>) -> Inline {
+    let word = value.to_bits();
     Inline::new(word >> 8, (word >> 4 & 0xF) as usize)
 }
 
@@ -85,36 +85,36 @@ impl<'a, 'gc> Strings<'a, 'gc> {
         check_external(units)?;
         let bytes = units.len() * units.width().bytes();
         if bytes < COPY_EXTERNAL {
-            return self.flat(units.width(), units.len(), |mut u| u.copy_from(units));
+            return self.flat(units.width(), units.len(), |mut target| target.copy_from(units));
         }
         let owner: Box<dyn External> = Box::new(chars);
         let external = Extern::new(self.mc, self.mc.frozen_owning(owner, bytes)?)?;
         Ok(Str(Value::object(self.mc, external)))
     }
 
-    pub fn is_external(&self, s: Str<'gc>) -> bool {
-        matches!(Text::of(s.0), Some(Text::Extern(_)))
+    pub fn is_external(&self, string: Str<'gc>) -> bool {
+        matches!(Text::of(string.0), Some(Text::Extern(_)))
     }
 
-    /// `v` as a string, if it is one: read from the type number `v` carries.
+    /// `value` as a string, if it is one: read from the type number `value` carries.
     #[inline]
-    pub fn string(&self, v: Value<'gc>) -> Option<Str<'gc>> {
-        (is_inline(v) || Text::of(v).is_some()).then_some(Str(v))
+    pub fn string(&self, value: Value<'gc>) -> Option<Str<'gc>> {
+        (is_inline(value) || Text::of(value).is_some()).then_some(Str(value))
     }
 }
 
 impl<'gc> Strings<'_, 'gc> {
     /// Ropes and externals, kept out of line so flat strings' views inline.
     #[inline(never)]
-    fn view_rest(&self, s: Str<'gc>) -> StrView<'_, Str<'gc>> {
+    fn view_rest(&self, string: Str<'gc>) -> StrView<'_, Str<'gc>> {
         let mc = self.mc;
-        match Text::of(s.0) {
-            Some(Text::Rope(r)) => {
-                let flat = r.flat(mc);
+        match Text::of(string.0) {
+            Some(Text::Rope(rope)) => {
+                let flat = rope.flat(mc);
                 let flat = (flat != Value::FALSE).then_some(Str(flat));
-                StrView::Rope { left: Str(r.left(mc)), right: Str(r.right(mc)), info: Info::from_bits(r.info(mc)), flat }
+                StrView::Rope { left: Str(rope.left(mc)), right: Str(rope.right(mc)), info: Info::from_bits(rope.info(mc)), flat }
             }
-            Some(Text::Extern(x)) => StrView::Flat(x.owner(mc).map_or(Units::One(&[]), |o| o.units())),
+            Some(Text::Extern(external)) => StrView::Flat(external.owner(mc).map_or(Units::One(&[]), |owner| owner.units())),
             _ => panic!("strings are flat, ropes or external"),
         }
     }
@@ -125,17 +125,17 @@ impl<'gc> Host for Strings<'_, 'gc> {
     type Error = Error;
 
     #[inline(always)]
-    fn view(&self, s: Str<'gc>) -> StrView<'_, Str<'gc>> {
+    fn view(&self, string: Str<'gc>) -> StrView<'_, Str<'gc>> {
         let mc = self.mc;
-        match Text::of(s.0) {
-            Some(Text::Str8(x)) => StrView::Flat(Units::Packed(Packed::new(x.items(mc).words(), x.chars(mc) as usize, Width::One))),
-            Some(Text::Str16(x)) => StrView::Flat(Units::Packed(Packed::new(x.items(mc).words(), x.chars(mc) as usize, Width::Two))),
-            Some(Text::Str32(x)) => StrView::Flat(Units::Packed(Packed::new(x.items(mc).words(), x.chars(mc) as usize, Width::Four))),
+        match Text::of(string.0) {
+            Some(Text::Str8(flat)) => StrView::Flat(Units::Packed(Packed::new(flat.items(mc).words(), flat.chars(mc) as usize, Width::One))),
+            Some(Text::Str16(flat)) => StrView::Flat(Units::Packed(Packed::new(flat.items(mc).words(), flat.chars(mc) as usize, Width::Two))),
+            Some(Text::Str32(flat)) => StrView::Flat(Units::Packed(Packed::new(flat.items(mc).words(), flat.chars(mc) as usize, Width::Four))),
             None => {
-                debug_assert!(is_inline(s.0), "a string that's no object is inline");
-                StrView::Flat(Units::Inline(inline_units(s.0)))
+                debug_assert!(is_inline(string.0), "a string that's no object is inline");
+                StrView::Flat(Units::Inline(inline_units(string.0)))
             }
-            _ => self.view_rest(s),
+            _ => self.view_rest(string),
         }
     }
 
@@ -145,22 +145,22 @@ impl<'gc> Host for Strings<'_, 'gc> {
         }
         let mc = self.mc;
         let (chars, words) = (len as u64, len.div_ceil(width.per_word()));
-        let (v, items) = match width {
+        let (value, items) = match width {
             Width::One => {
-                let x = mc.alloc_zeroed::<Str8, 1>([chars], words)?;
-                (Value::object(mc, x), x.items(mc))
+                let object = mc.alloc_zeroed::<Str8, 1>([chars], words)?;
+                (Value::object(mc, object), object.items(mc))
             }
             Width::Two => {
-                let x = mc.alloc_zeroed::<Str16, 1>([chars], words)?;
-                (Value::object(mc, x), x.items(mc))
+                let object = mc.alloc_zeroed::<Str16, 1>([chars], words)?;
+                (Value::object(mc, object), object.items(mc))
             }
             Width::Four => {
-                let x = mc.alloc_zeroed::<Str32, 1>([chars], words)?;
-                (Value::object(mc, x), x.items(mc))
+                let object = mc.alloc_zeroed::<Str32, 1>([chars], words)?;
+                (Value::object(mc, object), object.items(mc))
             }
         };
         init(UnitsMut::Packed(PackedMut::new(items.words(), len, width)));
-        Ok(Str(v))
+        Ok(Str(value))
     }
 
     fn rope(&self, left: Str<'gc>, right: Str<'gc>, info: Info) -> Result<Str<'gc>, Error> {
@@ -169,15 +169,15 @@ impl<'gc> Host for Strings<'_, 'gc> {
     }
 
     fn flattened(&self, rope: Str<'gc>, flat: Str<'gc>) {
-        if let Some(Text::Rope(r)) = Text::of(rope.0) {
-            r.set_flat(self.mc, flat.0);
+        if let Some(Text::Rope(object)) = Text::of(rope.0) {
+            object.set_flat(self.mc, flat.0);
         }
     }
 
     fn count_read(&self, rope: Str<'gc>) -> u64 {
-        let Some(Text::Rope(r)) = Text::of(rope.0) else { return 0 };
-        let reads = r.reads(self.mc) + 1;
-        r.set_reads(self.mc, reads);
+        let Some(Text::Rope(object)) = Text::of(rope.0) else { return 0 };
+        let reads = object.reads(self.mc) + 1;
+        object.set_reads(self.mc, reads);
         reads
     }
 }

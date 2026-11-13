@@ -15,12 +15,12 @@ pub struct Chunks<'h, H: Host> {
 }
 
 impl<'h, H: Host> Chunks<'h, H> {
-    pub(crate) fn new(h: &'h H, s: H::Str, start: usize, end: usize) -> Self {
-        Self { h, stack: [s; MAX_DEPTH], top: 1, skip: start, left: end - start }
+    pub(crate) fn new(h: &'h H, string: H::Str, start: usize, end: usize) -> Self {
+        Self { h, stack: [string; MAX_DEPTH], top: 1, skip: start, left: end - start }
     }
 
-    fn push(&mut self, s: H::Str) {
-        self.stack[self.top] = s;
+    fn push(&mut self, string: H::Str) {
+        self.stack[self.top] = string;
         self.top += 1;
     }
 }
@@ -37,15 +37,15 @@ impl<'h, H: Host> Iterator for Chunks<'h, H> {
     fn next(&mut self) -> Option<Units<'h>> {
         while self.left > 0 && self.top > 0 {
             self.top -= 1;
-            let s = self.stack[self.top];
-            match self.h.view(s) {
+            let string = self.stack[self.top];
+            match self.h.view(string) {
                 StrView::Rope { info, .. } if self.skip >= info.len => self.skip -= info.len,
                 StrView::Rope { flat: Some(flat), .. } => self.push(flat),
                 StrView::Rope { left, right, .. } => {
                     self.push(right);
-                    let l = len(self.h, left);
-                    if self.skip >= l {
-                        self.skip -= l;
+                    let left_len = len(self.h, left);
+                    if self.skip >= left_len {
+                        self.skip -= left_len;
                     } else {
                         self.push(left);
                     }

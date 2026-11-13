@@ -920,7 +920,7 @@ impl Intrinsic {
     /// Evaluates a struct-related intrinsic using the arguments supplied by `arg`.
     #[inline(never)]
     fn structs<'gc>(self, mc: &Mutation<'gc>, arg: impl Fn(usize) -> Value<'gc>, args: usize, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
-        let boolean = |b: bool| if b { Value::TRUE } else { Value::FALSE };
+        let boolean = |flag: bool| if flag { Value::TRUE } else { Value::FALSE };
         Ok(match self {
             Intrinsic::MakeStructType => made(mc, fuel, Value::object(mc, structs::make_type(mc, arg(0), arg(1), arg(2), arg(3), arg(4))?)),
             Intrinsic::MakeStruct if args == 0 => return Err(Fault::Arity),
@@ -941,14 +941,14 @@ impl Intrinsic {
             Intrinsic::IsStructType => boolean(arg(0).downcast::<objects::StructType>(mc).is_some()),
             Intrinsic::IsStructFieldMutable => {
                 let kind = structs::type_of(mc, arg(0))?;
-                let k = index(arg(1))?;
-                if k >= kind.fields(mc) as usize {
+                let field = index(arg(1))?;
+                if field >= kind.fields(mc) as usize {
                     return Err(Fault::OutOfRange);
                 }
-                boolean(structs::is_mutable(mc, kind, k))
+                boolean(structs::is_mutable(mc, kind, field))
             }
             Intrinsic::StructType => {
-                let made_as = arg(0).downcast::<objects::Struct>(mc).and_then(|s| s.kind(mc)).ok_or(Fault::WrongType)?;
+                let made_as = arg(0).downcast::<objects::Struct>(mc).and_then(|instance| instance.kind(mc)).ok_or(Fault::WrongType)?;
                 Value::object(mc, made_as)
             }
             Intrinsic::StructToList => {
@@ -965,14 +965,14 @@ impl Intrinsic {
                 let fields = structs::of(mc, arg(0), kind).ok_or(Fault::WrongType)?.items(mc);
                 // An instance of this struct type is guaranteed to have allocated at least as
                 // many fields as specified by the type descriptor.
-                let k = index(arg(2))?;
-                if k >= kind.fields(mc) as usize {
+                let field = index(arg(2))?;
+                if field >= kind.fields(mc) as usize {
                     return Err(Fault::OutOfRange);
                 }
-                if !structs::is_mutable(mc, kind, k) {
+                if !structs::is_mutable(mc, kind, field) {
                     return Err(Fault::Immutable);
                 }
-                fields.set(mc, k, arg(3));
+                fields.set(mc, field, arg(3));
                 Value::VOID
             }
             _ => unreachable!("{self:?} isn't a struct procedure"),
@@ -983,19 +983,19 @@ impl Intrinsic {
     /// retrieved by `arg`.
     #[inline(never)]
     fn text<'gc>(self, mc: &Mutation<'gc>, arg: impl Fn(usize) -> Value<'gc>, args: usize, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
-        let boolean = |b: bool| if b { Value::TRUE } else { Value::FALSE };
+        let boolean = |flag: bool| if flag { Value::TRUE } else { Value::FALSE };
         let strings = Strings::new(mc);
-        let string_of = |v: Value<'gc>| strings.string(v).ok_or(Fault::WrongType);
-        let char_of = |v: Value<'gc>| v.as_char().ok_or(Fault::WrongType);
+        let string_of = |value: Value<'gc>| strings.string(value).ok_or(Fault::WrongType);
+        let char_of = |value: Value<'gc>| value.as_char().ok_or(Fault::WrongType);
         // Deducts VM fuel proportional to the string's character length for a full traversal.
-        let spend = |fuel: &mut Fuel, s| fuel.spend(string::len(&strings, s) as u64 / equal::PER_FUEL);
+        let spend = |fuel: &mut Fuel, string| fuel.spend(string::len(&strings, string) as u64 / equal::PER_FUEL);
         let made_of = match self {
             Intrinsic::IsCharAlphabetic => return Ok(boolean(char_of(arg(0))?.is_alphabetic())),
             Intrinsic::IsCharNumeric => return Ok(boolean(string::digit_value(char_of(arg(0))?).is_some())),
             Intrinsic::IsCharWhitespace => return Ok(boolean(char_of(arg(0))?.is_whitespace())),
             Intrinsic::IsCharUpperCase => return Ok(boolean(char_of(arg(0))?.is_uppercase())),
             Intrinsic::IsCharLowerCase => return Ok(boolean(char_of(arg(0))?.is_lowercase())),
-            Intrinsic::DigitValue => return Ok(string::digit_value(char_of(arg(0))?).map_or(Value::FALSE, |d| fixnum(i64::from(d)))),
+            Intrinsic::DigitValue => return Ok(string::digit_value(char_of(arg(0))?).map_or(Value::FALSE, |digit| fixnum(i64::from(digit)))),
             Intrinsic::CharUpcase => return Ok(Value::char(string::upcase_char(char_of(arg(0))?))),
             Intrinsic::CharDowncase => return Ok(Value::char(string::downcase_char(char_of(arg(0))?))),
             Intrinsic::CharFoldcase => return Ok(Value::char(string::foldcase_char(char_of(arg(0))?))),
@@ -1011,28 +1011,28 @@ impl Intrinsic {
             }
             Intrinsic::MakeString if !(1..=2).contains(&args) => return Err(Fault::Arity),
             Intrinsic::MakeString => {
-                let n = index(arg(0))?;
-                let c = if args == 2 { char_of(arg(1))? } else { ' ' };
-                fuel.spend(n as u64 / equal::PER_FUEL)?;
-                string::repeat(&strings, c, n)?.value()
+                let len = index(arg(0))?;
+                let fill = if args == 2 { char_of(arg(1))? } else { ' ' };
+                fuel.spend(len as u64 / equal::PER_FUEL)?;
+                string::repeat(&strings, fill, len)?.value()
             }
             Intrinsic::ListToString => {
                 let pairs = Pairs::new(mc);
-                let n = pairs.list_len(arg(0)).ok_or(Fault::WrongType)?;
-                fuel.spend(n / equal::PER_FUEL)?;
+                let len = pairs.list_len(arg(0)).ok_or(Fault::WrongType)?;
+                fuel.spend(len / equal::PER_FUEL)?;
                 let mut chars = ScratchVec::new(mc);
-                for x in pairs.elements(arg(0)) {
-                    chars.push(char_of(x)?)?;
+                for item in pairs.elements(arg(0)) {
+                    chars.push(char_of(item)?)?;
                 }
                 string::from_chars(&strings, chars.iter().copied())?.value()
             }
             Intrinsic::StringUpcase | Intrinsic::StringDowncase | Intrinsic::StringFoldcase => {
-                let s = string_of(arg(0))?;
-                spend(fuel, s)?;
+                let string = string_of(arg(0))?;
+                spend(fuel, string)?;
                 let mapped = match self {
-                    Intrinsic::StringUpcase => string::upcase(&strings, s)?,
-                    Intrinsic::StringDowncase => string::downcase(&strings, s)?,
-                    _ => string::foldcase(&strings, s)?,
+                    Intrinsic::StringUpcase => string::upcase(&strings, string)?,
+                    Intrinsic::StringDowncase => string::downcase(&strings, string)?,
+                    _ => string::foldcase(&strings, string)?,
                 };
                 mapped.value()
             }
@@ -1040,21 +1040,21 @@ impl Intrinsic {
                 return Err(Fault::Arity);
             }
             Intrinsic::StringToVector | Intrinsic::StringToUtf8 => {
-                let s = string_of(arg(0))?;
-                let (start, end) = range(string::len(&strings, s), &arg, args)?;
-                let part = string::substring(&strings, s, start, end)?;
+                let string = string_of(arg(0))?;
+                let (start, end) = range(string::len(&strings, string), &arg, args)?;
+                let part = string::substring(&strings, string, start, end)?;
                 spend(fuel, part)?;
                 if self == Intrinsic::StringToVector {
                     let vector = Vectors::new(mc).make(end - start, Value::VOID)?;
                     let items = vector.items(mc);
-                    string::chars(&strings, part).enumerate().for_each(|(i, c)| items.set(mc, i, Value::char(c)));
+                    string::chars(&strings, part).enumerate().for_each(|(i, character)| items.set(mc, i, Value::char(character)));
                     vector.value(mc)
                 } else {
                     let mut bytes = ScratchVec::new(mc);
                     let mut buffer = [0; 4];
-                    for c in string::chars(&strings, part) {
-                        for &b in c.encode_utf8(&mut buffer).as_bytes() {
-                            bytes.push(b)?;
+                    for character in string::chars(&strings, part) {
+                        for &byte in character.encode_utf8(&mut buffer).as_bytes() {
+                            bytes.push(byte)?;
                         }
                     }
                     Bytevectors::new(mc).from_slice(&bytes)?.value(mc)
@@ -1079,42 +1079,42 @@ impl Intrinsic {
                 string::from_str(&strings, text)?.value()
             }
             Intrinsic::IsStringPrefix | Intrinsic::IsStringSuffix | Intrinsic::IsStringContains => {
-                let (s, part) = (string_of(arg(0))?, string_of(arg(1))?);
-                spend(fuel, s)?;
+                let (string, part) = (string_of(arg(0))?, string_of(arg(1))?);
+                spend(fuel, string)?;
                 return Ok(boolean(match self {
-                    Intrinsic::IsStringPrefix => string::starts_with(&strings, s, part)?,
-                    Intrinsic::IsStringSuffix => string::ends_with(&strings, s, part)?,
-                    _ => string::find(&strings, s, part, 0)?.is_some(),
+                    Intrinsic::IsStringPrefix => string::starts_with(&strings, string, part)?,
+                    Intrinsic::IsStringSuffix => string::ends_with(&strings, string, part)?,
+                    _ => string::find(&strings, string, part, 0)?.is_some(),
                 }));
             }
             Intrinsic::StringFind | Intrinsic::StringFindLast if !(2..=3).contains(&args) => return Err(Fault::Arity),
             Intrinsic::StringFind | Intrinsic::StringFindLast => {
-                let (s, part) = (string_of(arg(0))?, string_of(arg(1))?);
-                spend(fuel, s)?;
+                let (string, part) = (string_of(arg(0))?, string_of(arg(1))?);
+                spend(fuel, string)?;
                 let found = if self == Intrinsic::StringFind {
-                    string::find(&strings, s, part, if args == 3 { index(arg(2))? } else { 0 })?
+                    string::find(&strings, string, part, if args == 3 { index(arg(2))? } else { 0 })?
                 } else {
-                    string::rfind(&strings, s, part, if args == 3 { index(arg(2))? } else { string::len(&strings, s) })?
+                    string::rfind(&strings, string, part, if args == 3 { index(arg(2))? } else { string::len(&strings, string) })?
                 };
-                return Ok(found.map_or(Value::FALSE, |i| fixnum(i as i64)));
+                return Ok(found.map_or(Value::FALSE, |position| fixnum(position as i64)));
             }
             Intrinsic::StringSplit => {
-                let s = string_of(arg(0))?;
+                let string = string_of(arg(0))?;
                 let sep = if arg(1) == Value::FALSE { None } else { Some(string_of(arg(1))?) };
-                spend(fuel, s)?;
-                string_split(mc, s, sep, arg(2) != Value::FALSE, arg(3) != Value::FALSE)?
+                spend(fuel, string)?;
+                string_split(mc, string, sep, arg(2) != Value::FALSE, arg(3) != Value::FALSE)?
             }
             Intrinsic::StringTrim => {
-                let s = string_of(arg(0))?;
+                let string = string_of(arg(0))?;
                 let sep = if arg(1) == Value::FALSE { None } else { Some(string_of(arg(1))?) };
-                spend(fuel, s)?;
+                spend(fuel, string)?;
                 let (left, right, repeat) = (arg(2) != Value::FALSE, arg(3) != Value::FALSE, arg(4) != Value::FALSE);
-                trimmed(&strings, s, sep, left, right, repeat)?.value()
+                trimmed(&strings, string, sep, left, right, repeat)?.value()
             }
             Intrinsic::StringReplace => {
-                let (s, from, to) = (string_of(arg(0))?, string_of(arg(1))?, string_of(arg(2))?);
-                spend(fuel, s)?;
-                string_replace(mc, s, from, to, arg(3) != Value::FALSE)?
+                let (string, from, to) = (string_of(arg(0))?, string_of(arg(1))?, string_of(arg(2))?);
+                spend(fuel, string)?;
+                string_replace(mc, string, from, to, arg(3) != Value::FALSE)?
             }
             _ => unreachable!("{self:?} isn't a text procedure"),
         };
@@ -1125,49 +1125,49 @@ impl Intrinsic {
     /// retrieved by `arg`.
     #[inline(never)]
     fn numeric<'gc>(self, mc: &Mutation<'gc>, arg: impl Fn(usize) -> Value<'gc>, args: usize, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
-        let h = Nums::new(mc);
-        let boolean = |b: bool| if b { Value::TRUE } else { Value::FALSE };
-        let number = |v: Value<'gc>| h.number(v).ok_or(Fault::WrongType);
-        let real = |v: Value<'gc>| h.real(v).ok_or(Fault::WrongType);
+        let nums = Nums::new(mc);
+        let boolean = |flag: bool| if flag { Value::TRUE } else { Value::FALSE };
+        let number = |value: Value<'gc>| nums.number(value).ok_or(Fault::WrongType);
+        let real = |value: Value<'gc>| nums.real(value).ok_or(Fault::WrongType);
         let made_of = match self {
-            Intrinsic::IsNumber => return Ok(boolean(h.number(arg(0)).is_some())),
-            Intrinsic::IsReal => return Ok(boolean(h.real(arg(0)).is_some())),
+            Intrinsic::IsNumber => return Ok(boolean(nums.number(arg(0)).is_some())),
+            Intrinsic::IsReal => return Ok(boolean(nums.real(arg(0)).is_some())),
             Intrinsic::IsRational => {
-                let finite = |x| !matches!(h.real_view(x), RealView::Flonum(f) if !f.is_finite());
-                return Ok(boolean(h.real(arg(0)).is_some_and(finite)));
+                let finite = |operand| !matches!(nums.real_view(operand), RealView::Flonum(float) if !float.is_finite());
+                return Ok(boolean(nums.real(arg(0)).is_some_and(finite)));
             }
-            Intrinsic::IsInteger => return Ok(boolean(h.real(arg(0)).is_some_and(|x| real::is_integer(&h, x)))),
-            Intrinsic::IsExactInteger => return Ok(boolean(h.integer(arg(0)).is_some())),
-            Intrinsic::IsExact | Intrinsic::IsInexact => return Ok(boolean(complex::is_exact(&h, number(arg(0))?) == (self == Intrinsic::IsExact))),
+            Intrinsic::IsInteger => return Ok(boolean(nums.real(arg(0)).is_some_and(|operand| real::is_integer(&nums, operand)))),
+            Intrinsic::IsExactInteger => return Ok(boolean(nums.integer(arg(0)).is_some())),
+            Intrinsic::IsExact | Intrinsic::IsInexact => return Ok(boolean(complex::is_exact(&nums, number(arg(0))?) == (self == Intrinsic::IsExact))),
             Intrinsic::IsNan | Intrinsic::IsInfinite | Intrinsic::IsFinite => {
-                let parts = match h.complex_view(number(arg(0))?) {
-                    ComplexView::Real(x) => [x, x],
+                let parts = match nums.complex_view(number(arg(0))?) {
+                    ComplexView::Real(part) => [part, part],
                     ComplexView::Complex { re, im } => [re, im],
                 };
-                let floats = parts.map(|x| match h.real_view(x) {
-                    RealView::Flonum(f) => f,
+                let floats = parts.map(|part| match nums.real_view(part) {
+                    RealView::Flonum(float) => float,
                     RealView::Exact(_) => 0.0,
                 });
                 return Ok(boolean(match self {
-                    Intrinsic::IsNan => floats.iter().any(|f| f.is_nan()),
-                    Intrinsic::IsInfinite => floats.iter().any(|f| f.is_infinite()),
-                    _ => floats.iter().all(|f| f.is_finite()),
+                    Intrinsic::IsNan => floats.iter().any(|float| float.is_nan()),
+                    Intrinsic::IsInfinite => floats.iter().any(|float| float.is_infinite()),
+                    _ => floats.iter().all(|float| float.is_finite()),
                 }));
             }
             Intrinsic::IsZero => {
-                return Ok(boolean(match h.complex_view(number(arg(0))?) {
-                    ComplexView::Real(x) => real::sign(&h, x) == Some(Ordering::Equal),
+                return Ok(boolean(match nums.complex_view(number(arg(0))?) {
+                    ComplexView::Real(operand) => real::sign(&nums, operand) == Some(Ordering::Equal),
                     ComplexView::Complex { .. } => false,
                 }));
             }
             Intrinsic::IsPositive | Intrinsic::IsNegative => {
                 let want = if self == Intrinsic::IsPositive { Ordering::Greater } else { Ordering::Less };
-                return Ok(boolean(real::sign(&h, real(arg(0))?) == Some(want)));
+                return Ok(boolean(real::sign(&nums, real(arg(0))?) == Some(want)));
             }
             Intrinsic::IsOdd | Intrinsic::IsEven => {
                 let even = match arg(0).as_fixnum() {
-                    Some(n) => n % 2 == 0,
-                    None => int::is_even(&h, integral(mc, &h, arg(0))?.0),
+                    Some(integer) => integer % 2 == 0,
+                    None => int::is_even(&nums, integral(mc, &nums, arg(0))?.0),
                 };
                 return Ok(boolean(even == (self == Intrinsic::IsEven)));
             }
@@ -1176,102 +1176,102 @@ impl Intrinsic {
                 let max = self == Intrinsic::Max;
                 let mut acc = real(arg(0))?;
                 for i in 1..args {
-                    let x = real(arg(i))?;
-                    acc = match (acc.value().as_fixnum(), x.value().as_fixnum()) {
-                        (Some(a), Some(b)) => if (b > a) == max { x } else { acc },
-                        _ if max => real::max(&h, acc, x)?,
-                        _ => real::min(&h, acc, x)?,
+                    let next = real(arg(i))?;
+                    acc = match (acc.value().as_fixnum(), next.value().as_fixnum()) {
+                        (Some(left), Some(right)) => if (right > left) == max { next } else { acc },
+                        _ if max => real::max(&nums, acc, next)?,
+                        _ => real::min(&nums, acc, next)?,
                     };
                 }
-                h.of_real(acc)
+                nums.of_real(acc)
             }
-            // Because fixnums use strictly fewer bits than an i64, `n.abs()` cannot overflow
+            // Because fixnums use strictly fewer bits than an i64, `integer.abs()` cannot overflow
             // 64-bit integer limits, although the absolute value may exceed the fixnum range and
             // require bignum promotion.
-            Intrinsic::Abs => match arg(0).as_fixnum().and_then(|n| Value::fixnum(n.abs())) {
-                Some(n) => return Ok(n),
-                None => h.of_real(real::abs(&h, real(arg(0))?)?),
+            Intrinsic::Abs => match arg(0).as_fixnum().and_then(|integer| Value::fixnum(integer.abs())) {
+                Some(value) => return Ok(value),
+                None => nums.of_real(real::abs(&nums, real(arg(0))?)?),
             },
             Intrinsic::Gcd | Intrinsic::Lcm => {
                 let gcd = self == Intrinsic::Gcd;
-                let (mut acc, mut exact) = (int::from_i64(&h, if gcd { 0 } else { 1 })?, true);
+                let (mut acc, mut exact) = (int::from_i64(&nums, if gcd { 0 } else { 1 })?, true);
                 for i in 0..args {
-                    let (n, is_exact) = integral(mc, &h, arg(i))?;
+                    let (integer, is_exact) = integral(mc, &nums, arg(i))?;
                     exact &= is_exact;
-                    let words = int::integer_length(&h, acc).max(int::integer_length(&h, n)) / 64;
+                    let words = int::integer_length(&nums, acc).max(int::integer_length(&nums, integer)) / 64;
                     fuel.spend(words.saturating_mul(words) / equal::PER_FUEL)?;
-                    acc = if gcd { int::gcd(&h, acc, n)? } else { int::lcm(&h, acc, n)? };
+                    acc = if gcd { int::gcd(&nums, acc, integer)? } else { int::lcm(&nums, acc, integer)? };
                 }
-                let acc = h.of_rational(h.of_int(acc));
-                h.of_real(if exact { acc } else { real::inexact(&h, acc)? })
+                let acc = nums.of_rational(nums.of_int(acc));
+                nums.of_real(if exact { acc } else { real::inexact(&nums, acc)? })
             }
-            Intrinsic::Numerator => h.of_real(real::numerator(&h, real(arg(0))?)?),
-            Intrinsic::Denominator => h.of_real(real::denominator(&h, real(arg(0))?)?),
+            Intrinsic::Numerator => nums.of_real(real::numerator(&nums, real(arg(0))?)?),
+            Intrinsic::Denominator => nums.of_real(real::denominator(&nums, real(arg(0))?)?),
             Intrinsic::Floor | Intrinsic::Ceiling | Intrinsic::Truncate | Intrinsic::Round => {
                 if arg(0).is_fixnum() {
                     return Ok(arg(0));
                 }
-                let x = real(arg(0))?;
-                charge_squared(&h, fuel, h.of_real(x))?;
+                let operand = real(arg(0))?;
+                charge_squared(&nums, fuel, nums.of_real(operand))?;
                 let mode = match self {
                     Intrinsic::Floor => Round::Floor,
                     Intrinsic::Ceiling => Round::Ceiling,
                     Intrinsic::Truncate => Round::Truncate,
                     _ => Round::Nearest,
                 };
-                h.of_real(real::round(&h, x, mode)?)
+                nums.of_real(real::round(&nums, operand, mode)?)
             }
             Intrinsic::IntegerSqrt => {
-                let n = h.integer(arg(0)).ok_or(Fault::WrongType)?;
-                if int::sign(&h, n) == Ordering::Less {
+                let integer = nums.integer(arg(0)).ok_or(Fault::WrongType)?;
+                if int::sign(&nums, integer) == Ordering::Less {
                     return Err(Fault::OutOfRange);
                 }
-                charge_squared(&h, fuel, number(arg(0))?)?;
-                h.of_real(h.of_rational(h.of_int(int::isqrt(&h, n)?)))
+                charge_squared(&nums, fuel, number(arg(0))?)?;
+                nums.of_real(nums.of_rational(nums.of_int(int::isqrt(&nums, integer)?)))
             }
-            Intrinsic::Exact => complex::exact(&h, number(arg(0))?)?,
-            Intrinsic::Inexact => complex::inexact(&h, number(arg(0))?)?,
+            Intrinsic::Exact => complex::exact(&nums, number(arg(0))?)?,
+            Intrinsic::Inexact => complex::inexact(&nums, number(arg(0))?)?,
             Intrinsic::StringToNumber if !(1..=2).contains(&args) => return Err(Fault::Arity),
             Intrinsic::StringToNumber => {
                 let strings = Strings::new(mc);
-                let s = strings.string(arg(0)).ok_or(Fault::WrongType)?;
+                let string = strings.string(arg(0)).ok_or(Fault::WrongType)?;
                 let radix = if args == 2 { arg(1).as_fixnum().ok_or(Fault::WrongType)? } else { 10 };
-                let radix = [2, 8, 10, 16].into_iter().find(|&r| r == radix).ok_or(Fault::OutOfRange)? as u32;
+                let radix = [2, 8, 10, 16].into_iter().find(|&allowed| allowed == radix).ok_or(Fault::OutOfRange)? as u32;
                 // Parsing a multi-precision integer has approximately quadratic computational
                 // complexity relative to its digit count (up to 4 bits per digit).
-                let len = string::len(&strings, s);
+                let len = string::len(&strings, string);
                 let words = (len as u64).saturating_mul(4) / 64;
                 fuel.spend(words.saturating_mul(words) / equal::PER_FUEL)?;
                 mc.ensure(len.saturating_mul(4))?;
-                let text: String = string::chars(&strings, s).collect();
-                match literal::parse_in(&h, &text, radix)? {
-                    Some(z) => z,
+                let text: String = string::chars(&strings, string).collect();
+                match literal::parse_in(&nums, &text, radix)? {
+                    Some(parsed) => parsed,
                     None => return Ok(Value::FALSE),
                 }
             }
-            Intrinsic::Exp => complex::exp(&h, number(arg(0))?)?,
+            Intrinsic::Exp => complex::exp(&nums, number(arg(0))?)?,
             Intrinsic::Log if !(1..=2).contains(&args) => return Err(Fault::Arity),
-            Intrinsic::Log if args == 2 => complex::log_base(&h, number(arg(0))?, number(arg(1))?)?,
-            Intrinsic::Log => complex::log(&h, number(arg(0))?)?,
-            Intrinsic::Sin => complex::sin(&h, number(arg(0))?)?,
-            Intrinsic::Cos => complex::cos(&h, number(arg(0))?)?,
-            Intrinsic::Tan => complex::tan(&h, number(arg(0))?)?,
-            Intrinsic::Asin => complex::asin(&h, number(arg(0))?)?,
-            Intrinsic::Acos => complex::acos(&h, number(arg(0))?)?,
+            Intrinsic::Log if args == 2 => complex::log_base(&nums, number(arg(0))?, number(arg(1))?)?,
+            Intrinsic::Log => complex::log(&nums, number(arg(0))?)?,
+            Intrinsic::Sin => complex::sin(&nums, number(arg(0))?)?,
+            Intrinsic::Cos => complex::cos(&nums, number(arg(0))?)?,
+            Intrinsic::Tan => complex::tan(&nums, number(arg(0))?)?,
+            Intrinsic::Asin => complex::asin(&nums, number(arg(0))?)?,
+            Intrinsic::Acos => complex::acos(&nums, number(arg(0))?)?,
             Intrinsic::Atan if !(1..=2).contains(&args) => return Err(Fault::Arity),
-            Intrinsic::Atan if args == 2 => h.of_real(complex::atan2(&h, real(arg(0))?, real(arg(1))?)?),
-            Intrinsic::Atan => complex::atan(&h, number(arg(0))?)?,
+            Intrinsic::Atan if args == 2 => nums.of_real(complex::atan2(&nums, real(arg(0))?, real(arg(1))?)?),
+            Intrinsic::Atan => complex::atan(&nums, number(arg(0))?)?,
             Intrinsic::Sqrt => {
-                let z = number(arg(0))?;
-                charge_squared(&h, fuel, z)?;
-                complex::sqrt(&h, z)?
+                let operand = number(arg(0))?;
+                charge_squared(&nums, fuel, operand)?;
+                complex::sqrt(&nums, operand)?
             }
-            Intrinsic::MakeRectangular => complex::rectangular(&h, real(arg(0))?, real(arg(1))?)?,
-            Intrinsic::MakePolar => complex::polar(&h, real(arg(0))?, real(arg(1))?)?,
-            Intrinsic::RealPart => h.of_real(complex::real_part(&h, number(arg(0))?)),
-            Intrinsic::ImagPart => h.of_real(complex::imag_part(&h, number(arg(0))?)?),
-            Intrinsic::Magnitude => h.of_real(complex::magnitude(&h, number(arg(0))?)?),
-            Intrinsic::Angle => h.of_real(complex::angle(&h, number(arg(0))?)?),
+            Intrinsic::MakeRectangular => complex::rectangular(&nums, real(arg(0))?, real(arg(1))?)?,
+            Intrinsic::MakePolar => complex::polar(&nums, real(arg(0))?, real(arg(1))?)?,
+            Intrinsic::RealPart => nums.of_real(complex::real_part(&nums, number(arg(0))?)),
+            Intrinsic::ImagPart => nums.of_real(complex::imag_part(&nums, number(arg(0))?)?),
+            Intrinsic::Magnitude => nums.of_real(complex::magnitude(&nums, number(arg(0))?)?),
+            Intrinsic::Angle => nums.of_real(complex::angle(&nums, number(arg(0))?)?),
             _ => unreachable!("{self:?} isn't numeric"),
         };
         Ok(made(mc, fuel, made_of.value()))
@@ -1293,7 +1293,7 @@ impl Intrinsic {
         if self.arity().is_some_and(|arity| usize::from(arity) != args.len()) {
             return Err(Fault::Arity);
         }
-        self.apply(mc, task, |i| args[i], args.len(), fuel)
+        self.apply(mc, task, |position| args[position], args.len(), fuel)
     }
 
     /// Executes the intrinsic within execution context `cx`, reading `args` registers starting
@@ -1303,31 +1303,31 @@ impl Intrinsic {
     #[inline(always)]
     pub(crate) fn exec<'gc>(self, cx: &mut Context<'_, 'gc>, base: u8, args: u8) -> Result<Value<'gc>, Fault> {
         let frame = cx.frame;
-        self.apply(cx.mc, Some(cx.task), |i| frame.get(base + i as u8), usize::from(args), &mut cx.fuel)
+        self.apply(cx.mc, Some(cx.task), |position| frame.get(base + position as u8), usize::from(args), &mut cx.fuel)
     }
 
-    /// Executes a unary intrinsic on operand register `a`, assuming the caller has verified
+    /// Executes a unary intrinsic on operand register `register`, assuming the caller has verified
     /// the intrinsic accepts exactly one argument.
     #[inline(always)]
-    pub(crate) fn exec1<'gc>(self, cx: &mut Context<'_, 'gc>, a: u8) -> Result<Value<'gc>, Fault> {
+    pub(crate) fn exec1<'gc>(self, cx: &mut Context<'_, 'gc>, register: u8) -> Result<Value<'gc>, Fault> {
         let frame = cx.frame;
-        self.apply(cx.mc, Some(cx.task), |_| frame.get(a), 1, &mut cx.fuel)
+        self.apply(cx.mc, Some(cx.task), |_| frame.get(register), 1, &mut cx.fuel)
     }
 
-    /// Executes a binary intrinsic on operand registers `a` and `b`, assuming the caller
+    /// Executes a binary intrinsic on operand registers `first` and `second`, assuming the caller
     /// has verified the intrinsic accepts exactly two arguments.
     #[inline(always)]
-    pub(crate) fn exec2<'gc>(self, cx: &mut Context<'_, 'gc>, a: u8, b: u8) -> Result<Value<'gc>, Fault> {
+    pub(crate) fn exec2<'gc>(self, cx: &mut Context<'_, 'gc>, first: u8, second: u8) -> Result<Value<'gc>, Fault> {
         let frame = cx.frame;
-        self.apply(cx.mc, Some(cx.task), |i| frame.get(if i == 0 { a } else { b }), 2, &mut cx.fuel)
+        self.apply(cx.mc, Some(cx.task), |position| frame.get(if position == 0 { first } else { second }), 2, &mut cx.fuel)
     }
 
-    /// Executes a ternary intrinsic on operand registers `a`, `b`, and `c`, assuming the
+    /// Executes a ternary intrinsic on operand registers `first`, `second`, and `third`, assuming the
     /// caller has verified the intrinsic accepts exactly three arguments.
     #[inline(always)]
-    pub(crate) fn exec3<'gc>(self, cx: &mut Context<'_, 'gc>, a: u8, b: u8, c: u8) -> Result<Value<'gc>, Fault> {
+    pub(crate) fn exec3<'gc>(self, cx: &mut Context<'_, 'gc>, first: u8, second: u8, third: u8) -> Result<Value<'gc>, Fault> {
         let frame = cx.frame;
-        self.apply(cx.mc, Some(cx.task), |i| frame.get([a, b, c][i]), 3, &mut cx.fuel)
+        self.apply(cx.mc, Some(cx.task), |position| frame.get([first, second, third][position]), 3, &mut cx.fuel)
     }
 
     /// Evaluates less common dynamic intrinsics that inspect or mutate the running `task`'s
@@ -1350,23 +1350,23 @@ impl Intrinsic {
     /// optional running `task` context if present.
     #[inline(always)]
     fn apply<'gc>(self, mc: &Mutation<'gc>, task: Option<Gc<'gc, Task>>, arg: impl Fn(usize) -> Value<'gc>, args: usize, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
-        let boolean = |b: bool| if b { Value::TRUE } else { Value::FALSE };
+        let boolean = |flag: bool| if flag { Value::TRUE } else { Value::FALSE };
         Ok(match self {
             Intrinsic::MarkValue => prompts::mark(mc, task.ok_or(Fault::Malformed)?, arg(0), arg(1))?,
             Intrinsic::FrameMark => prompts::frame_mark(mc, task.ok_or(Fault::Malformed)?, arg(0), arg(1))?,
             Intrinsic::Running => Value::object(mc, task.ok_or(Fault::Malformed)?),
             Intrinsic::Winders => task.ok_or(Fault::Malformed)?.winders(mc),
             Intrinsic::FrameMarks | Intrinsic::SetWinders => self.dynamic(mc, task.ok_or(Fault::Malformed)?, arg, fuel)?,
-            Intrinsic::Add => arith(mc, fuel, fixnum(0), (0..args).map(&arg), Value::fixnum_add, |h, a, b| complex::add(h, a, b))?,
-            Intrinsic::Mul => arith(mc, fuel, fixnum(1), (0..args).map(&arg), Value::fixnum_mul, |h, a, b| complex::mul(h, a, b))?,
+            Intrinsic::Add => arith(mc, fuel, fixnum(0), (0..args).map(&arg), Value::fixnum_add, |nums, left, right| complex::add(nums, left, right))?,
+            Intrinsic::Mul => arith(mc, fuel, fixnum(1), (0..args).map(&arg), Value::fixnum_mul, |nums, left, right| complex::mul(nums, left, right))?,
             Intrinsic::Sub | Intrinsic::Div if args == 0 => return Err(Fault::Arity),
             Intrinsic::Sub => {
                 let (first, rest) = if args == 1 { (fixnum(0), 0) } else { (arg(0), 1) };
-                arith(mc, fuel, first, (rest..args).map(&arg), Value::fixnum_sub, |h, a, b| complex::sub(h, a, b))?
+                arith(mc, fuel, first, (rest..args).map(&arg), Value::fixnum_sub, |nums, left, right| complex::sub(nums, left, right))?
             }
             Intrinsic::Div => {
                 let (first, rest) = if args == 1 { (fixnum(1), 0) } else { (arg(0), 1) };
-                arith(mc, fuel, first, (rest..args).map(&arg), fixnum_div, |h, a, b| complex::div(h, a, b))?
+                arith(mc, fuel, first, (rest..args).map(&arg), fixnum_div, |nums, left, right| complex::div(nums, left, right))?
             }
             Intrinsic::NumEq | Intrinsic::Lt | Intrinsic::Gt | Intrinsic::Le | Intrinsic::Ge if args == 0 => return Err(Fault::Arity),
             Intrinsic::NumEq | Intrinsic::Lt | Intrinsic::Gt | Intrinsic::Le | Intrinsic::Ge => boolean(compare(mc, self, (0..args).map(&arg))?),
@@ -1442,17 +1442,17 @@ impl Intrinsic {
             }
             Intrinsic::Substring | Intrinsic::StringToList => {
                 let strings = Strings::new(mc);
-                let s = strings.string(arg(0)).ok_or(Fault::WrongType)?;
+                let string = strings.string(arg(0)).ok_or(Fault::WrongType)?;
                 let start = if args > 1 { index(arg(1))? } else { 0 };
-                let end = if args > 2 { index(arg(2))? } else { string::len(&strings, s) };
-                let part = if (start, end) == (0, string::len(&strings, s)) { s } else { string::substring(&strings, s, start, end)? };
+                let end = if args > 2 { index(arg(2))? } else { string::len(&strings, string) };
+                let part = if (start, end) == (0, string::len(&strings, string)) { string } else { string::substring(&strings, string, start, end)? };
                 if self == Intrinsic::Substring {
                     made(mc, fuel, part.value())
                 } else {
                     fuel.spend((end - start) as u64 / equal::PER_FUEL)?;
                     let mut chars = ScratchVec::new(mc);
-                    for c in string::chars(&strings, part) {
-                        chars.push(Value::char(c))?;
+                    for character in string::chars(&strings, part) {
+                        chars.push(Value::char(character))?;
                     }
                     made(mc, fuel, Pairs::new(mc).list(&chars)?)
                 }
@@ -1472,8 +1472,8 @@ impl Intrinsic {
             Intrinsic::IsChar => boolean(arg(0).as_char().is_some()),
             Intrinsic::CharToInteger => fixnum(i64::from(u32::from(arg(0).as_char().ok_or(Fault::WrongType)?))),
             Intrinsic::IntegerToChar => {
-                let n = arg(0).as_fixnum().ok_or_else(|| not_fixnum(mc, arg(0)))?;
-                Value::char(u32::try_from(n).ok().and_then(char::from_u32).ok_or(Fault::OutOfRange)?)
+                let code = arg(0).as_fixnum().ok_or_else(|| not_fixnum(mc, arg(0)))?;
+                Value::char(u32::try_from(code).ok().and_then(char::from_u32).ok_or(Fault::OutOfRange)?)
             }
             Intrinsic::CharEq | Intrinsic::CharLt | Intrinsic::CharGt | Intrinsic::CharLe | Intrinsic::CharGe if args == 0 => {
                 return Err(Fault::Arity);
@@ -1483,18 +1483,18 @@ impl Intrinsic {
             }
             Intrinsic::NumberToString if !(1..=2).contains(&args) => return Err(Fault::Arity),
             Intrinsic::NumberToString => {
-                let h = Nums::new(mc);
-                let z = h.number(arg(0)).ok_or(Fault::WrongType)?;
+                let nums = Nums::new(mc);
+                let number = nums.number(arg(0)).ok_or(Fault::WrongType)?;
                 let radix = if args == 2 { arg(1).as_fixnum().ok_or(Fault::WrongType)? } else { 10 };
-                let radix = [2, 8, 10, 16].into_iter().find(|&r| r == radix).ok_or(Fault::OutOfRange)? as u32;
-                if let Some(n) = arg(0).as_fixnum() {
-                    return Ok(made(mc, fuel, fixnum_to_string(mc, n, radix)?));
+                let radix = [2, 8, 10, 16].into_iter().find(|&allowed| allowed == radix).ok_or(Fault::OutOfRange)? as u32;
+                if let Some(integer) = arg(0).as_fixnum() {
+                    return Ok(made(mc, fuel, fixnum_to_string(mc, integer, radix)?));
                 }
                 // Formatting a multi-precision integer as text has approximately quadratic
                 // computational complexity relative to its digit count.
-                let words = exact_bits(&h, z) / 64;
+                let words = exact_bits(&nums, number) / 64;
                 fuel.spend(words.saturating_mul(words) / equal::PER_FUEL)?;
-                let text = complex::to_string(&h, z, radix)?;
+                let text = complex::to_string(&nums, number, radix)?;
                 made(mc, fuel, string::from_str(&Strings::new(mc), &text)?.value())
             }
             Intrinsic::Quotient | Intrinsic::Remainder | Intrinsic::Modulo | Intrinsic::FloorQuotient => divide(mc, fuel, self, arg(0), arg(1))?,
@@ -1593,59 +1593,59 @@ impl Intrinsic {
             | Intrinsic::StringSplit
             | Intrinsic::StringTrim
             | Intrinsic::StringReplace => self.text(mc, arg, args, fuel)?,
-            Intrinsic::BitwiseAnd => bitwise(mc, fuel, -1, (0..args).map(&arg), |a, b| a & b, |h, a, b| int::bitwise_and(h, a, b))?,
-            Intrinsic::BitwiseIor => bitwise(mc, fuel, 0, (0..args).map(&arg), |a, b| a | b, |h, a, b| int::bitwise_or(h, a, b))?,
-            Intrinsic::BitwiseXor => bitwise(mc, fuel, 0, (0..args).map(&arg), |a, b| a ^ b, |h, a, b| int::bitwise_xor(h, a, b))?,
+            Intrinsic::BitwiseAnd => bitwise(mc, fuel, -1, (0..args).map(&arg), |left, right| left & right, |nums, left, right| int::bitwise_and(nums, left, right))?,
+            Intrinsic::BitwiseIor => bitwise(mc, fuel, 0, (0..args).map(&arg), |left, right| left | right, |nums, left, right| int::bitwise_or(nums, left, right))?,
+            Intrinsic::BitwiseXor => bitwise(mc, fuel, 0, (0..args).map(&arg), |left, right| left ^ right, |nums, left, right| int::bitwise_xor(nums, left, right))?,
             Intrinsic::BitwiseNot | Intrinsic::ArithmeticShift | Intrinsic::BitField | Intrinsic::BitFieldReplace => {
-                let h = Nums::new(mc);
-                let n = h.integer(arg(0)).ok_or(Fault::WrongType)?;
-                let (len, negative) = (int::integer_length(&h, n), int::sign(&h, n) == Ordering::Less);
+                let nums = Nums::new(mc);
+                let integer = nums.integer(arg(0)).ok_or(Fault::WrongType)?;
+                let (len, negative) = (int::integer_length(&nums, integer), int::sign(&nums, integer) == Ordering::Less);
                 let made_of = match self {
-                    Intrinsic::BitwiseNot => int::bitwise_not(&h, n)?,
+                    Intrinsic::BitwiseNot => int::bitwise_not(&nums, integer)?,
                     Intrinsic::ArithmeticShift => {
                         let count = arg(1).as_fixnum().ok_or(Fault::WrongType)?;
                         // Shifting zero produces zero without allocating additional bits, whereas
                         // left-shifting negative one increases its two's complement bit width.
-                        if n.value() != fixnum(0) {
+                        if integer.value() != fixnum(0) {
                             charge_bits(mc, fuel, len.saturating_add(count.max(0) as u64))?;
                         }
-                        int::arithmetic_shift(&h, n, count)?
+                        int::arithmetic_shift(&nums, integer, count)?
                     }
                     Intrinsic::BitField => {
                         let (start, end) = bit_range(arg(1), arg(2))?;
                         charge_bits(mc, fuel, if negative { end - start } else { len.saturating_sub(start).min(end - start) })?;
-                        int::bit_field(&h, n, start, end)?
+                        int::bit_field(&nums, integer, start, end)?
                     }
                     _ => {
-                        let (source, (start, end)) = (h.integer(arg(1)).ok_or(Fault::WrongType)?, bit_range(arg(2), arg(3))?);
-                        let field = if int::sign(&h, source) == Ordering::Less { end - start } else { int::integer_length(&h, source).min(end - start) };
+                        let (source, (start, end)) = (nums.integer(arg(1)).ok_or(Fault::WrongType)?, bit_range(arg(2), arg(3))?);
+                        let field = if int::sign(&nums, source) == Ordering::Less { end - start } else { int::integer_length(&nums, source).min(end - start) };
                         let bits = if negative { end } else if field == 0 { len } else { len.max(start + field) };
                         charge_bits(mc, fuel, bits)?;
-                        int::bit_field_replace(&h, n, source, start, end)?
+                        int::bit_field_replace(&nums, integer, source, start, end)?
                     }
                 };
                 made(mc, fuel, made_of.value())
             }
             Intrinsic::IntegerLength | Intrinsic::BitCount => {
-                let h = Nums::new(mc);
-                let n = h.integer(arg(0)).ok_or(Fault::WrongType)?;
+                let nums = Nums::new(mc);
+                let integer = nums.integer(arg(0)).ok_or(Fault::WrongType)?;
                 let bits = if self == Intrinsic::IntegerLength {
-                    int::integer_length(&h, n)
+                    int::integer_length(&nums, integer)
                 } else {
-                    fuel.spend(int::integer_length(&h, n) / 64 / equal::PER_FUEL)?;
-                    int::bit_count(&h, n)?
+                    fuel.spend(int::integer_length(&nums, integer) / 64 / equal::PER_FUEL)?;
+                    int::bit_count(&nums, integer)?
                 };
                 fixnum(i64::try_from(bits).map_err(|_| Fault::OutOfRange)?)
             }
             Intrinsic::IsBitSet => {
-                let h = Nums::new(mc);
-                let n = h.integer(arg(1)).ok_or(Fault::WrongType)?;
+                let nums = Nums::new(mc);
+                let integer = nums.integer(arg(1)).ok_or(Fault::WrongType)?;
                 // Testing bit flags on a negative multi-precision integer may require scanning
                 // past its least significant set bit, traversing multiple words.
-                if int::sign(&h, n) == Ordering::Less {
-                    fuel.spend(int::integer_length(&h, n) / 64 / equal::PER_FUEL)?;
+                if int::sign(&nums, integer) == Ordering::Less {
+                    fuel.spend(int::integer_length(&nums, integer) / 64 / equal::PER_FUEL)?;
                 }
-                boolean(int::bit_set(&h, n, index(arg(0))? as u64))
+                boolean(int::bit_set(&nums, integer, index(arg(0))? as u64))
             }
             Intrinsic::SymbolToString => Symbol::of(arg(0)).ok_or(Fault::WrongType)?.name(mc).value(),
             Intrinsic::StringToSymbol => {
@@ -1654,10 +1654,10 @@ impl Intrinsic {
                 made(mc, fuel, Symbols::of_arena(mc)?.intern(&strings, name)?.value(mc))
             }
             Intrinsic::Expt => {
-                let h = Nums::new(mc);
-                let (z, w) = (h.number(arg(0)).ok_or(Fault::WrongType)?, h.number(arg(1)).ok_or(Fault::WrongType)?);
-                charge_power(mc, &h, fuel, z, w)?;
-                made(mc, fuel, complex::expt(&h, z, w)?.value())
+                let nums = Nums::new(mc);
+                let (base, exponent) = (nums.number(arg(0)).ok_or(Fault::WrongType)?, nums.number(arg(1)).ok_or(Fault::WrongType)?);
+                charge_power(mc, &nums, fuel, base, exponent)?;
+                made(mc, fuel, complex::expt(&nums, base, exponent)?.value())
             }
             Intrinsic::KeywordToString => Keyword::of(arg(0)).ok_or(Fault::WrongType)?.symbol(mc).name(mc).value(),
             Intrinsic::StringToKeyword => {
@@ -1684,38 +1684,38 @@ impl Intrinsic {
             Intrinsic::BytevectorRef => {
                 let bytes = AnyBytevector::of(arg(0)).ok_or(Fault::WrongType)?;
                 let (big, (size, signed)) = (big_endian(arg(2))?, int_kind(arg(3))?);
-                let n = bytes.get_uint(mc, index(arg(1))?, size).ok_or(Fault::OutOfRange)?;
+                let number = bytes.get_uint(mc, index(arg(1))?, size).ok_or(Fault::OutOfRange)?;
                 let unused = 64 - size as u32 * 8;
-                let n = if big { n.swap_bytes() >> unused } else { n };
-                let h = Nums::new(mc);
+                let number = if big { number.swap_bytes() >> unused } else { number };
+                let nums = Nums::new(mc);
                 if signed {
-                    let n = ((n << unused) as i64) >> unused;
-                    match Value::fixnum(n) {
-                        Some(n) => n,
-                        None => made(mc, fuel, int::from_i64(&h, n)?.value()),
+                    let number = ((number << unused) as i64) >> unused;
+                    match Value::fixnum(number) {
+                        Some(value) => value,
+                        None => made(mc, fuel, int::from_i64(&nums, number)?.value()),
                     }
                 } else {
-                    match i64::try_from(n).ok().and_then(Value::fixnum) {
-                        Some(n) => n,
-                        None => made(mc, fuel, int::from_u64(&h, n)?.value()),
+                    match i64::try_from(number).ok().and_then(Value::fixnum) {
+                        Some(value) => value,
+                        None => made(mc, fuel, int::from_u64(&nums, number)?.value()),
                     }
                 }
             }
             Intrinsic::BytevectorSet => {
                 let bytes = AnyBytevector::of(arg(0)).ok_or(Fault::WrongType)?;
-                let h = Nums::new(mc);
-                let n = h.integer(arg(2)).ok_or(Fault::WrongType)?;
+                let nums = Nums::new(mc);
+                let integer = nums.integer(arg(2)).ok_or(Fault::WrongType)?;
                 let (big, (size, signed)) = (big_endian(arg(3))?, int_kind(arg(4))?);
                 let unused = 64 - size as u32 * 8;
-                let n = if signed {
-                    int::to_i64(&h, n).filter(|&n| (n << unused) >> unused == n).map(|n| n as u64)
+                let number = if signed {
+                    int::to_i64(&nums, integer).filter(|&number| (number << unused) >> unused == number).map(|number| number as u64)
                 } else {
-                    int::to_u64(&h, n).filter(|&n| n <= u64::MAX >> unused)
+                    int::to_u64(&nums, integer).filter(|&number| number <= u64::MAX >> unused)
                 };
-                let n = n.ok_or(Fault::OutOfRange)?;
+                let number = number.ok_or(Fault::OutOfRange)?;
                 let AnyBytevector::Mutable(bytes) = bytes else { return Err(Fault::Immutable) };
-                let n = if big { (n << unused).swap_bytes() } else { n };
-                if !bytes.set_uint(mc, index(arg(1))?, size, n) {
+                let number = if big { (number << unused).swap_bytes() } else { number };
+                if !bytes.set_uint(mc, index(arg(1))?, size, number) {
                     return Err(Fault::OutOfRange);
                 }
                 Value::VOID
@@ -1744,11 +1744,11 @@ impl Intrinsic {
             Intrinsic::VectorRef => AnyVector::of(arg(0)).ok_or(Fault::WrongType)?.get(mc, index(arg(1))?).ok_or(Fault::OutOfRange)?,
             Intrinsic::VectorSet => {
                 let AnyVector::Mutable(vector) = AnyVector::of(arg(0)).ok_or(Fault::WrongType)? else { return Err(Fault::Immutable) };
-                let (items, k) = (vector.items(mc), index(arg(1))?);
-                if k >= items.len() {
+                let (items, position) = (vector.items(mc), index(arg(1))?);
+                if position >= items.len() {
                     return Err(Fault::OutOfRange);
                 }
-                items.set(mc, k, arg(2));
+                items.set(mc, position, arg(2));
                 Value::VOID
             }
             Intrinsic::VectorToList => {
@@ -1768,7 +1768,7 @@ impl Intrinsic {
                 fuel.spend(len / equal::PER_FUEL)?;
                 let vector = Vectors::new(mc).make(usize::try_from(len).map_err(|_| Fault::OutOfMemory)?, Value::VOID)?;
                 let items = vector.items(mc);
-                pairs.elements(arg(0)).enumerate().for_each(|(i, x)| items.set(mc, i, x));
+                pairs.elements(arg(0)).enumerate().for_each(|(i, item)| items.set(mc, i, item));
                 made(mc, fuel, vector.value(mc))
             }
             Intrinsic::MakeBox => made(mc, fuel, Value::object(mc, objects::Box::new(mc, arg(0))?)),
@@ -1792,16 +1792,16 @@ impl Intrinsic {
             }
             Intrinsic::ValuesRef => {
                 let items = arg(0).downcast::<MultiValue>(mc).ok_or(Fault::WrongType)?.items(mc);
-                let k = index(arg(1))?;
-                if k >= items.len() {
+                let position = index(arg(1))?;
+                if position >= items.len() {
                     return Err(Fault::OutOfRange);
                 }
-                items.get(k)
+                items.get(position)
             }
             Intrinsic::ModuleRef => {
                 let items = arg(0).downcast::<objects::Module>(mc).ok_or(Fault::WrongType)?.items(mc);
-                let k = arg(1).as_fixnum().ok_or(Fault::WrongType)?;
-                let value = usize::try_from(k).ok().filter(|&k| k < items.len()).map(|k| items.get(k)).ok_or(Fault::OutOfRange)?;
+                let slot = arg(1).as_fixnum().ok_or(Fault::WrongType)?;
+                let value = usize::try_from(slot).ok().filter(|&slot| slot < items.len()).map(|slot| items.get(slot)).ok_or(Fault::OutOfRange)?;
                 if value == Value::UNDEFINED {
                     return Err(Fault::Unbound);
                 }
@@ -1827,12 +1827,12 @@ impl Intrinsic {
                 made(mc, fuel, Value::object(mc, objects::KeywordProcedure::new(mc, plain, core, arg(2), arg(3))?))
             }
             Intrinsic::ProcedureKeywords => {
-                let f = arg(0);
-                if !is_procedure(mc, f) {
+                let procedure = arg(0);
+                if !is_procedure(mc, procedure) {
                     return Err(Fault::WrongType);
                 }
-                let (required, keywords) = match f.downcast::<objects::KeywordProcedure>(mc) {
-                    Some(k) => (k.required(mc), k.keywords(mc)),
+                let (required, keywords) = match procedure.downcast::<objects::KeywordProcedure>(mc) {
+                    Some(keyed) => (keyed.required(mc), keyed.keywords(mc)),
                     None => (Value::NIL, Value::NIL),
                 };
                 values(mc, [required, keywords].into_iter())?
@@ -1876,10 +1876,10 @@ impl Intrinsic {
                 made(mc, fuel, temporaries)
             }
             Intrinsic::ErrorObjectMessage => {
-                let c = arg(0).downcast::<Condition>(mc).ok_or(Fault::WrongType)?;
-                match c.message(mc) {
+                let condition = arg(0).downcast::<Condition>(mc).ok_or(Fault::WrongType)?;
+                match condition.message(mc) {
                     Value::VOID => {
-                        let words = c.failure(mc).ok_or(Fault::Malformed)?.fault.message();
+                        let words = condition.failure(mc).ok_or(Fault::Malformed)?.fault.message();
                         made(mc, fuel, string::from_str(&Strings::new(mc), words)?.value())
                     }
                     message => message,
@@ -1887,16 +1887,16 @@ impl Intrinsic {
             }
             Intrinsic::ErrorObjectIrritants => arg(0).downcast::<Condition>(mc).ok_or(Fault::WrongType)?.irritants(mc),
             Intrinsic::ErrorObjectWho => {
-                let c = arg(0).downcast::<Condition>(mc).ok_or(Fault::WrongType)?;
-                made(mc, fuel, crate::report::who(mc, c)?)
+                let condition = arg(0).downcast::<Condition>(mc).ok_or(Fault::WrongType)?;
+                made(mc, fuel, crate::report::who(mc, condition)?)
             }
             Intrinsic::ErrorObjectTraceback => {
-                let c = arg(0).downcast::<Condition>(mc).ok_or(Fault::WrongType)?;
-                made(mc, fuel, crate::report::traceback(mc, c)?)
+                let condition = arg(0).downcast::<Condition>(mc).ok_or(Fault::WrongType)?;
+                made(mc, fuel, crate::report::traceback(mc, condition)?)
             }
             Intrinsic::ErrorObjectKind => {
-                let c = arg(0).downcast::<Condition>(mc).ok_or(Fault::WrongType)?;
-                let name = Fault::KINDS[c.failure(mc).ok_or(Fault::Malformed)?.fault.kind()];
+                let condition = arg(0).downcast::<Condition>(mc).ok_or(Fault::WrongType)?;
+                let name = Fault::KINDS[condition.failure(mc).ok_or(Fault::Malformed)?.fault.kind()];
                 made(mc, fuel, Symbols::of_arena(mc)?.intern_str(&Strings::new(mc), name)?.value(mc))
             }
         })
@@ -1904,24 +1904,24 @@ impl Intrinsic {
 }
 
 #[inline(always)]
-fn car<'gc>(mc: &Mutation<'gc>, x: Value<'gc>) -> Result<Value<'gc>, Fault> {
-    Ok(Pair::of(x).ok_or(Fault::WrongType)?.head(mc))
+fn car<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Result<Value<'gc>, Fault> {
+    Ok(Pair::of(value).ok_or(Fault::WrongType)?.head(mc))
 }
 
 #[inline(always)]
-fn cdr<'gc>(mc: &Mutation<'gc>, x: Value<'gc>) -> Result<Value<'gc>, Fault> {
-    Ok(Pair::of(x).ok_or(Fault::WrongType)?.tail(mc))
+fn cdr<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Result<Value<'gc>, Fault> {
+    Ok(Pair::of(value).ok_or(Fault::WrongType)?.tail(mc))
 }
 
-fn fixnum<'gc>(n: i64) -> Value<'gc> {
-    Value::fixnum(n).expect("a small fixnum")
+fn fixnum<'gc>(integer: i64) -> Value<'gc> {
+    Value::fixnum(integer).expect("a small fixnum")
 }
 
-/// Returns `Some(a / b)` if both `a` and `b` are fixnums, division by zero does not occur, and
+/// Returns `Some(dividend / divisor)` if both `dividend` and `divisor` are fixnums, division by zero does not occur, and
 /// the quotient is exactly representable as a fixnum; otherwise returns `None`.
-fn fixnum_div<'gc>(a: Value<'gc>, b: Value<'gc>) -> Option<Value<'gc>> {
-    let (a, b) = (a.as_fixnum()?, b.as_fixnum()?);
-    (b != 0 && a % b == 0).then(|| a / b).and_then(Value::fixnum)
+fn fixnum_div<'gc>(dividend: Value<'gc>, divisor: Value<'gc>) -> Option<Value<'gc>> {
+    let (dividend, divisor) = (dividend.as_fixnum()?, divisor.as_fixnum()?);
+    (divisor != 0 && dividend % divisor == 0).then(|| dividend / divisor).and_then(Value::fixnum)
 }
 
 /// Folds `first` across elements of `rest`, using the optimized `fast` closure while operands
@@ -1938,13 +1938,13 @@ fn arith<'gc>(
     generic: impl Fn(&Nums<'_, 'gc>, Number<'gc>, Number<'gc>) -> Result<Number<'gc>, Error>,
 ) -> Result<Value<'gc>, Fault> {
     let mut acc = first;
-    for x in rest {
-        acc = match fast(acc, x) {
+    for operand in rest {
+        acc = match fast(acc, operand) {
             Some(acc) => acc,
             None => {
-                let h = Nums::new(mc);
-                let (a, b) = (h.number(acc).ok_or(Fault::WrongType)?, h.number(x).ok_or(Fault::WrongType)?);
-                made(mc, fuel, generic(&h, a, b)?.value())
+                let nums = Nums::new(mc);
+                let (left, right) = (nums.number(acc).ok_or(Fault::WrongType)?, nums.number(operand).ok_or(Fault::WrongType)?);
+                made(mc, fuel, generic(&nums, left, right)?.value())
             }
         };
     }
@@ -1962,16 +1962,16 @@ fn bitwise<'gc>(
     fast: fn(i64, i64) -> i64,
     generic: impl Fn(&Nums<'_, 'gc>, Integer<'gc>, Integer<'gc>) -> Result<Integer<'gc>, Error>,
 ) -> Result<Value<'gc>, Fault> {
-    let h = Nums::new(mc);
+    let nums = Nums::new(mc);
     let mut acc = fixnum(first);
-    for x in rest {
-        acc = match (acc.as_fixnum(), x.as_fixnum()) {
+    for operand in rest {
+        acc = match (acc.as_fixnum(), operand.as_fixnum()) {
             // Bitwise operations on two fixnum values are guaranteed to produce a result that
             // fits within a fixnum.
-            (Some(a), Some(b)) => fixnum(fast(a, b)),
+            (Some(left), Some(right)) => fixnum(fast(left, right)),
             _ => {
-                let (a, b) = (h.integer(acc).ok_or(Fault::WrongType)?, h.integer(x).ok_or(Fault::WrongType)?);
-                made(mc, fuel, generic(&h, a, b)?.value())
+                let (left, right) = (nums.integer(acc).ok_or(Fault::WrongType)?, nums.integer(operand).ok_or(Fault::WrongType)?);
+                made(mc, fuel, generic(&nums, left, right)?.value())
             }
         };
     }
@@ -2002,14 +2002,14 @@ fn bit_range(start: Value<'_>, end: Value<'_>) -> Result<(u64, u64), Fault> {
 
 /// Parses a bytevector endianness indicator value into a boolean (`true` for big-endian `#t`,
 /// `false` for little-endian `#f`).
-fn big_endian(v: Value<'_>) -> Result<bool, Fault> {
-    if v == Value::TRUE || v == Value::FALSE { Ok(v == Value::TRUE) } else { Err(Fault::WrongType) }
+fn big_endian(value: Value<'_>) -> Result<bool, Fault> {
+    if value == Value::TRUE || value == Value::FALSE { Ok(value == Value::TRUE) } else { Err(Fault::WrongType) }
 }
 
 /// Parses a bytevector integer size and signedness descriptor, returning the byte width (1 to
 /// 8) and a boolean indicating whether the integer is signed.
-fn int_kind(v: Value<'_>) -> Result<(usize, bool), Fault> {
-    let kind = v.as_fixnum().ok_or(Fault::WrongType)?;
+fn int_kind(value: Value<'_>) -> Result<(usize, bool), Fault> {
+    let kind = value.as_fixnum().ok_or(Fault::WrongType)?;
     let size = kind.unsigned_abs() as usize;
     if !(1..=8).contains(&size) {
         return Err(Fault::OutOfRange);
@@ -2017,49 +2017,49 @@ fn int_kind(v: Value<'_>) -> Result<(usize, bool), Fault> {
     Ok((size, kind < 0))
 }
 
-/// Computes `quotient`, `remainder`, `modulo`, or `floor-quotient` for `n` and `m`, using fast
+/// Computes `quotient`, `remainder`, `modulo`, or `floor-quotient` for `dividend` and `divisor`, using fast
 /// in-place fixnum arithmetic when both operands are fixnums and non-zero, and falling back to
 /// arbitrary-precision arithmetic otherwise.
-fn divide<'gc>(mc: &Mutation<'gc>, fuel: &mut Fuel, op: Intrinsic, n: Value<'gc>, m: Value<'gc>) -> Result<Value<'gc>, Fault> {
-    if let (Some(a), Some(b)) = (n.as_fixnum(), m.as_fixnum())
-        && b != 0
+fn divide<'gc>(mc: &Mutation<'gc>, fuel: &mut Fuel, op: Intrinsic, dividend: Value<'gc>, divisor: Value<'gc>) -> Result<Value<'gc>, Fault> {
+    if let (Some(left), Some(right)) = (dividend.as_fixnum(), divisor.as_fixnum())
+        && right != 0
     {
         // Because fixnums use strictly fewer bits than an i64, operations cannot trigger 64-bit
         // signed integer overflow (such as `i64::MIN / -1`).
         let fast = match op {
-            Intrinsic::Quotient => a / b,
-            Intrinsic::Remainder => a % b,
+            Intrinsic::Quotient => left / right,
+            Intrinsic::Remainder => left % right,
             Intrinsic::FloorQuotient => {
-                let q = a / b;
-                if a % b != 0 && (a < 0) != (b < 0) { q - 1 } else { q }
+                let quotient = left / right;
+                if left % right != 0 && (left < 0) != (right < 0) { quotient - 1 } else { quotient }
             }
             _ => {
-                let r = a % b;
-                if r != 0 && (r < 0) != (b < 0) { r + b } else { r }
+                let remainder = left % right;
+                if remainder != 0 && (remainder < 0) != (right < 0) { remainder + right } else { remainder }
             }
         };
-        if let Some(v) = Value::fixnum(fast) {
-            return Ok(v);
+        if let Some(value) = Value::fixnum(fast) {
+            return Ok(value);
         }
     }
-    let h = Nums::new(mc);
-    let (x, y) = (h.real(n).ok_or(Fault::WrongType)?, h.real(m).ok_or(Fault::WrongType)?);
+    let nums = Nums::new(mc);
+    let (left, right) = (nums.real(dividend).ok_or(Fault::WrongType)?, nums.real(divisor).ok_or(Fault::WrongType)?);
     let generic = match op {
-        Intrinsic::Quotient => real::quotient(&h, x, y),
-        Intrinsic::Remainder => real::remainder(&h, x, y),
-        Intrinsic::FloorQuotient => real::floor_quotient(&h, x, y),
-        _ => real::modulo(&h, x, y),
+        Intrinsic::Quotient => real::quotient(&nums, left, right),
+        Intrinsic::Remainder => real::remainder(&nums, left, right),
+        Intrinsic::FloorQuotient => real::floor_quotient(&nums, left, right),
+        _ => real::modulo(&nums, left, right),
     };
     Ok(made(mc, fuel, generic?.value()))
 }
 
-/// Formats fixnum `n` in the given `radix` (2, 8, 10, or 16) by writing characters into a
+/// Formats fixnum `integer` in the given `radix` (2, 8, 10, or 16) by writing characters into a
 /// stack-allocated buffer and constructing a Scheme string.
-fn fixnum_to_string<'gc>(mc: &Mutation<'gc>, n: i64, radix: u32) -> Result<Value<'gc>, Fault> {
+fn fixnum_to_string<'gc>(mc: &Mutation<'gc>, integer: i64, radix: u32) -> Result<Value<'gc>, Fault> {
     // Buffer size of 65 bytes accommodates the worst-case representation: 64 base-2 digits
     // plus an optional minus sign.
     let mut digits = [0u8; 65];
-    let (mut at, mut left) = (digits.len(), n.unsigned_abs());
+    let (mut at, mut left) = (digits.len(), integer.unsigned_abs());
     loop {
         at -= 1;
         digits[at] = b"0123456789abcdef"[(left % radix as u64) as usize];
@@ -2068,7 +2068,7 @@ fn fixnum_to_string<'gc>(mc: &Mutation<'gc>, n: i64, radix: u32) -> Result<Value
             break;
         }
     }
-    if n < 0 {
+    if integer < 0 {
         at -= 1;
         digits[at] = b'-';
     }
@@ -2076,48 +2076,48 @@ fn fixnum_to_string<'gc>(mc: &Mutation<'gc>, n: i64, radix: u32) -> Result<Value
     Ok(string::from_str(&Strings::new(mc), text)?.value())
 }
 
-/// Returns whether value `v` is callable as a procedure (a closure, a continuation, or a
+/// Returns whether value `value` is callable as a procedure (a closure, a continuation, or a
 /// keyword procedure).
-fn is_procedure<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> bool {
-    v.downcast::<objects::Closure>(mc).is_some()
-        || v.downcast::<objects::Continuation>(mc).is_some()
-        || v.downcast::<objects::KeywordProcedure>(mc).is_some()
+fn is_procedure<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> bool {
+    value.downcast::<objects::Closure>(mc).is_some()
+        || value.downcast::<objects::Continuation>(mc).is_some()
+        || value.downcast::<objects::KeywordProcedure>(mc).is_some()
 }
 
-/// Returns the total significant bit count of exact parts in number `z` beyond the initial
+/// Returns the total significant bit count of exact parts in number `number` beyond the initial
 /// bit, such that 0, 1, and -1 yield zero bits.
-fn exact_bits<'gc>(h: &Nums<'_, 'gc>, z: Number<'gc>) -> u64 {
-    let bits = |n| int::integer_length(h, n).saturating_sub(1);
-    let real = |r| match h.real_view(r) {
+fn exact_bits<'gc>(nums: &Nums<'_, 'gc>, number: Number<'gc>) -> u64 {
+    let bits = |integer| int::integer_length(nums, integer).saturating_sub(1);
+    let real = |part| match nums.real_view(part) {
         RealView::Flonum(_) => 0,
-        RealView::Exact(q) => match h.rational_view(q) {
-            RationalView::Integer(n) => bits(n),
+        RealView::Exact(rational) => match nums.rational_view(rational) {
+            RationalView::Integer(integer) => bits(integer),
             RationalView::Ratio { num, den } => bits(num) + bits(den),
         },
     };
-    match h.complex_view(z) {
-        ComplexView::Real(r) => real(r),
+    match nums.complex_view(number) {
+        ComplexView::Real(part) => real(part),
         ComplexView::Complex { re, im } => real(re) + real(im),
     }
 }
 
-/// Deducts VM fuel proportional to the square of the bit-length of the exact components of `z`,
+/// Deducts VM fuel proportional to the square of the bit-length of the exact components of `number`,
 /// modeling the quadratic complexity of multi-precision division and multiplication.
-fn charge_squared<'gc>(h: &Nums<'_, 'gc>, fuel: &mut Fuel, z: Number<'gc>) -> Result<(), Fault> {
-    let words = exact_bits(h, z) / 64;
+fn charge_squared<'gc>(nums: &Nums<'_, 'gc>, fuel: &mut Fuel, number: Number<'gc>) -> Result<(), Fault> {
+    let words = exact_bits(nums, number) / 64;
     fuel.spend(words.saturating_mul(words) / equal::PER_FUEL)
 }
 
-/// Extracts `v` as an exact integer and returns a tuple containing the integer and a boolean
-/// flag that is `true` if `v` was already an exact integer, or `false` if it was an inexact
+/// Extracts `value` as an exact integer and returns a tuple containing the integer and a boolean
+/// flag that is `true` if `value` was already an exact integer, or `false` if it was an inexact
 /// floating-point number with an integral value.
-fn integral<'gc>(mc: &Mutation<'gc>, h: &Nums<'_, 'gc>, v: Value<'gc>) -> Result<(Integer<'gc>, bool), Fault> {
-    if let Some(n) = h.integer(v) {
-        return Ok((n, true));
+fn integral<'gc>(mc: &Mutation<'gc>, nums: &Nums<'_, 'gc>, value: Value<'gc>) -> Result<(Integer<'gc>, bool), Fault> {
+    if let Some(integer) = nums.integer(value) {
+        return Ok((integer, true));
     }
-    match v.as_flonum(mc) {
-        Some(f) if f.is_finite() && f.fract() == 0.0 => Ok((int::from_integral_f64(h, f)?, false)),
-        _ if h.number(v).is_some() => Err(Fault::Num(NumError::NotInteger)),
+    match value.as_flonum(mc) {
+        Some(float) if float.is_finite() && float.fract() == 0.0 => Ok((int::from_integral_f64(nums, float)?, false)),
+        _ if nums.number(value).is_some() => Err(Fault::Num(NumError::NotInteger)),
         _ => Err(Fault::WrongType),
     }
 }
@@ -2126,23 +2126,23 @@ fn integral<'gc>(mc: &Mutation<'gc>, h: &Nums<'_, 'gc>, v: Value<'gc>) -> Result
 /// `op` holds pairwise across consecutive character elements.
 fn compare_chars<'gc>(op: Intrinsic, xs: impl Iterator<Item = Value<'gc>>) -> Result<bool, Fault> {
     let (mut before, mut so_far) = (None, true);
-    for x in xs {
-        let x = x.as_char().ok_or(Fault::WrongType)?;
-        let x = if matches!(op, Intrinsic::CharCiEq | Intrinsic::CharCiLt | Intrinsic::CharCiGt | Intrinsic::CharCiLe | Intrinsic::CharCiGe) {
-            string::foldcase_char(x)
+    for value in xs {
+        let character = value.as_char().ok_or(Fault::WrongType)?;
+        let character = if matches!(op, Intrinsic::CharCiEq | Intrinsic::CharCiLt | Intrinsic::CharCiGt | Intrinsic::CharCiLe | Intrinsic::CharCiGe) {
+            string::foldcase_char(character)
         } else {
-            x
+            character
         };
-        if let Some(b) = before {
+        if let Some(previous) = before {
             so_far &= match op {
-                Intrinsic::CharEq | Intrinsic::CharCiEq => b == x,
-                Intrinsic::CharLt | Intrinsic::CharCiLt => b < x,
-                Intrinsic::CharGt | Intrinsic::CharCiGt => b > x,
-                Intrinsic::CharLe | Intrinsic::CharCiLe => b <= x,
-                _ => b >= x,
+                Intrinsic::CharEq | Intrinsic::CharCiEq => previous == character,
+                Intrinsic::CharLt | Intrinsic::CharCiLt => previous < character,
+                Intrinsic::CharGt | Intrinsic::CharCiGt => previous > character,
+                Intrinsic::CharLe | Intrinsic::CharCiLe => previous <= character,
+                _ => previous >= character,
             };
         }
-        before = Some(x);
+        before = Some(character);
     }
     Ok(so_far)
 }
@@ -2160,47 +2160,47 @@ fn range<'gc>(len: usize, arg: &impl Fn(usize) -> Value<'gc>, args: usize) -> Re
 }
 
 /// Strips occurrences of `sep` (or whitespace if `sep` is `None`) from the start (`left`) and/or
-/// end (`right`) of string `s`, removing either a single instance or repeated contiguous
+/// end (`right`) of string `string`, removing either a single instance or repeated contiguous
 /// instances if `repeat` is true.
-fn trimmed<'gc>(strings: &Strings<'_, 'gc>, s: Str<'gc>, sep: Option<Str<'gc>>, left: bool, right: bool, repeat: bool) -> Result<Str<'gc>, Fault> {
+fn trimmed<'gc>(strings: &Strings<'_, 'gc>, string: Str<'gc>, sep: Option<Str<'gc>>, left: bool, right: bool, repeat: bool) -> Result<Str<'gc>, Fault> {
     let Some(sep) = sep else {
         return Ok(match (left, right) {
-            (true, true) => string::trim(strings, s)?,
-            (true, false) => string::trim_start(strings, s)?,
-            (false, true) => string::trim_end(strings, s)?,
-            (false, false) => s,
+            (true, true) => string::trim(strings, string)?,
+            (true, false) => string::trim_start(strings, string)?,
+            (false, true) => string::trim_end(strings, string)?,
+            (false, false) => string,
         });
     };
-    let (n, m) = (string::len(strings, s), string::len(strings, sep));
-    if m == 0 {
-        return Ok(s);
+    let (len, width) = (string::len(strings, string), string::len(strings, sep));
+    if width == 0 {
+        return Ok(string);
     }
-    let at = |i: usize| -> Result<bool, Fault> { Ok(string::equal(strings, string::substring(strings, s, i, i + m)?, sep)?) };
-    let (mut start, mut end) = (0, n);
-    while left && start + m <= end && at(start)? {
-        start += m;
+    let at = |offset: usize| -> Result<bool, Fault> { Ok(string::equal(strings, string::substring(strings, string, offset, offset + width)?, sep)?) };
+    let (mut start, mut end) = (0, len);
+    while left && start + width <= end && at(start)? {
+        start += width;
         if !repeat {
             break;
         }
     }
-    while right && end >= start + m && at(end - m)? {
-        end -= m;
+    while right && end >= start + width && at(end - width)? {
+        end -= width;
         if !repeat {
             break;
         }
     }
-    Ok(if (start, end) == (0, n) { s } else { string::substring(strings, s, start, end)? })
+    Ok(if (start, end) == (0, len) { string } else { string::substring(strings, string, start, end)? })
 }
 
-/// Implements Racket-compatible `(string-split s [sep] #:trim? trim #:repeat? repeat)`, splitting
-/// `s` by `sep` (or runs of whitespace if `sep` is `None`), with optional boundary trimming and
+/// Implements Racket-compatible `(string-split string [sep] #:trim? trim #:repeat? repeat)`, splitting
+/// `string` by `sep` (or runs of whitespace if `sep` is `None`), with optional boundary trimming and
 /// collapsing of consecutive delimiters.
-fn string_split<'gc>(mc: &Mutation<'gc>, s: Str<'gc>, sep: Option<Str<'gc>>, trim: bool, repeat: bool) -> Result<Value<'gc>, Fault> {
+fn string_split<'gc>(mc: &Mutation<'gc>, string: Str<'gc>, sep: Option<Str<'gc>>, trim: bool, repeat: bool) -> Result<Value<'gc>, Fault> {
     let strings = Strings::new(mc);
     let mut pieces = ScratchVec::new(mc);
     match sep {
         None if trim => {
-            for piece in string::split_whitespace(&strings, s) {
+            for piece in string::split_whitespace(&strings, string) {
                 pieces.push(piece?.value())?;
             }
         }
@@ -2208,23 +2208,23 @@ fn string_split<'gc>(mc: &Mutation<'gc>, s: Str<'gc>, sep: Option<Str<'gc>>, tri
         // the beginning or end of the output.
         None => {
             let (mut start, mut space) = (0, false);
-            for (i, c) in string::chars(&strings, s).enumerate() {
-                if c.is_whitespace() && !space {
-                    pieces.push(string::substring(&strings, s, start, i)?.value())?;
-                } else if !c.is_whitespace() && space {
+            for (i, character) in string::chars(&strings, string).enumerate() {
+                if character.is_whitespace() && !space {
+                    pieces.push(string::substring(&strings, string, start, i)?.value())?;
+                } else if !character.is_whitespace() && space {
                     start = i;
                 }
-                space = c.is_whitespace();
+                space = character.is_whitespace();
             }
-            let n = string::len(&strings, s);
-            pieces.push(string::substring(&strings, s, if space { n } else { start }, n)?.value())?;
+            let len = string::len(&strings, string);
+            pieces.push(string::substring(&strings, string, if space { len } else { start }, len)?.value())?;
         }
         Some(sep) => {
-            let s = if trim { trimmed(&strings, s, Some(sep), true, true, repeat)? } else { s };
-            if trim && string::len(&strings, s) == 0 {
+            let string = if trim { trimmed(&strings, string, Some(sep), true, true, repeat)? } else { string };
+            if trim && string::len(&strings, string) == 0 {
                 return Ok(Value::NIL);
             }
-            let all = string::split(&strings, s, sep).collect::<Result<Vec<_>, _>>()?;
+            let all = string::split(&strings, string, sep).collect::<Result<Vec<_>, _>>()?;
             let last = all.len().saturating_sub(1);
             // Consecutive delimiter occurrences are treated as a single boundary when
             // collapsing is enabled, suppressing intermediate empty strings.
@@ -2238,37 +2238,37 @@ fn string_split<'gc>(mc: &Mutation<'gc>, s: Str<'gc>, sep: Option<Str<'gc>>, tri
     Ok(Pairs::new(mc).list(&pieces)?)
 }
 
-/// Returns string `s` with occurrences of `from` replaced by `to` (replacing all matches if
+/// Returns string `string` with occurrences of `from` replaced by `to` (replacing all matches if
 /// `all` is true, or only the first match otherwise). An empty `from` pattern matches before each
 /// character and after the final character.
-fn string_replace<'gc>(mc: &Mutation<'gc>, s: Str<'gc>, from: Str<'gc>, to: Str<'gc>, all: bool) -> Result<Value<'gc>, Fault> {
+fn string_replace<'gc>(mc: &Mutation<'gc>, string: Str<'gc>, from: Str<'gc>, to: Str<'gc>, all: bool) -> Result<Value<'gc>, Fault> {
     let strings = Strings::new(mc);
-    let (n, m) = (string::len(&strings, s), string::len(&strings, from));
+    let (len, width) = (string::len(&strings, string), string::len(&strings, from));
     let mut parts = ScratchVec::new(mc);
-    if m == 0 {
+    if width == 0 {
         parts.push(to)?;
         if !all {
-            parts.push(s)?;
+            parts.push(string)?;
         } else {
-            for i in 0..n {
-                parts.push(string::substring(&strings, s, i, i + 1)?)?;
+            for i in 0..len {
+                parts.push(string::substring(&strings, string, i, i + 1)?)?;
                 parts.push(to)?;
             }
         }
     } else {
         let mut at = 0;
-        while let Some(i) = string::find(&strings, s, from, at)? {
-            parts.push(string::substring(&strings, s, at, i)?)?;
+        while let Some(found) = string::find(&strings, string, from, at)? {
+            parts.push(string::substring(&strings, string, at, found)?)?;
             parts.push(to)?;
-            at = i + m;
+            at = found + width;
             if !all {
                 break;
             }
         }
         if parts.is_empty() {
-            return Ok(s.value());
+            return Ok(string.value());
         }
-        parts.push(string::substring(&strings, s, at, n)?)?;
+        parts.push(string::substring(&strings, string, at, len)?)?;
     }
     Ok(string::concat_all(&strings, &parts)?.value())
 }
@@ -2278,29 +2278,29 @@ fn string_replace<'gc>(mc: &Mutation<'gc>, s: Str<'gc>, from: Str<'gc>, to: Str<
 fn string_join<'gc>(mc: &Mutation<'gc>, strs: Value<'gc>, sep: Option<Value<'gc>>, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
     let (strings, pairs) = (Strings::new(mc), Pairs::new(mc));
     let sep = match sep {
-        Some(v) => strings.string(v).ok_or(Fault::WrongType)?,
+        Some(value) => strings.string(value).ok_or(Fault::WrongType)?,
         None => string::from_str(&strings, " ")?,
     };
-    let n = pairs.list_len(strs).ok_or(Fault::WrongType)?;
-    if n == 0 {
+    let count = pairs.list_len(strs).ok_or(Fault::WrongType)?;
+    if count == 0 {
         return Ok(string::empty(&strings)?.value());
     }
-    fuel.spend(n / equal::PER_FUEL)?;
-    let mut items = pairs.elements(strs).map(|v| strings.string(v).ok_or(Fault::WrongType));
+    fuel.spend(count / equal::PER_FUEL)?;
+    let mut items = pairs.elements(strs).map(|value| strings.string(value).ok_or(Fault::WrongType));
     // Small joins consisting of up to four strings use a stack-allocated buffer to avoid
     // heap allocation overhead.
-    let joined = if n <= 4 {
+    let joined = if count <= 4 {
         let mut parts = [sep; 7];
-        for (i, s) in items.enumerate() {
-            parts[2 * i] = s?;
+        for (i, item) in items.enumerate() {
+            parts[2 * i] = item?;
         }
-        string::concat_all(&strings, &parts[..2 * n as usize - 1])?
+        string::concat_all(&strings, &parts[..2 * count as usize - 1])?
     } else {
         let mut parts = ScratchVec::new(mc);
         parts.push(items.next().ok_or(Fault::WrongType)??)?;
-        for s in items {
+        for item in items {
             parts.push(sep)?;
-            parts.push(s?)?;
+            parts.push(item?)?;
         }
         string::concat_all(&strings, &parts)?
     };
@@ -2313,41 +2313,41 @@ fn string_join<'gc>(mc: &Mutation<'gc>, strs: Value<'gc>, sep: Option<Value<'gc>
 fn compare_strings<'gc>(mc: &Mutation<'gc>, op: Intrinsic, xs: impl Iterator<Item = Value<'gc>>, fuel: &mut Fuel) -> Result<bool, Fault> {
     let strings = Strings::new(mc);
     let (mut before, mut so_far) = (None, true);
-    for x in xs {
-        let x = strings.string(x).ok_or(Fault::WrongType)?;
-        if let Some(b) = before
+    for value in xs {
+        let string = strings.string(value).ok_or(Fault::WrongType)?;
+        if let Some(previous) = before
             && so_far
         {
-            fuel.spend(string::len(&strings, b).min(string::len(&strings, x)) as u64 / equal::PER_FUEL)?;
+            fuel.spend(string::len(&strings, previous).min(string::len(&strings, string)) as u64 / equal::PER_FUEL)?;
             so_far = match op {
-                Intrinsic::StringEq => string::equal(&strings, b, x)?,
-                Intrinsic::StringCiEq => string::compare_ci(&strings, b, x)?.is_eq(),
-                Intrinsic::StringCiLt => string::compare_ci(&strings, b, x)?.is_lt(),
-                Intrinsic::StringCiGt => string::compare_ci(&strings, b, x)?.is_gt(),
-                Intrinsic::StringCiLe => string::compare_ci(&strings, b, x)?.is_le(),
-                Intrinsic::StringCiGe => string::compare_ci(&strings, b, x)?.is_ge(),
-                Intrinsic::StringLt => string::compare(&strings, b, x)?.is_lt(),
-                Intrinsic::StringGt => string::compare(&strings, b, x)?.is_gt(),
-                Intrinsic::StringLe => string::compare(&strings, b, x)?.is_le(),
-                _ => string::compare(&strings, b, x)?.is_ge(),
+                Intrinsic::StringEq => string::equal(&strings, previous, string)?,
+                Intrinsic::StringCiEq => string::compare_ci(&strings, previous, string)?.is_eq(),
+                Intrinsic::StringCiLt => string::compare_ci(&strings, previous, string)?.is_lt(),
+                Intrinsic::StringCiGt => string::compare_ci(&strings, previous, string)?.is_gt(),
+                Intrinsic::StringCiLe => string::compare_ci(&strings, previous, string)?.is_le(),
+                Intrinsic::StringCiGe => string::compare_ci(&strings, previous, string)?.is_ge(),
+                Intrinsic::StringLt => string::compare(&strings, previous, string)?.is_lt(),
+                Intrinsic::StringGt => string::compare(&strings, previous, string)?.is_gt(),
+                Intrinsic::StringLe => string::compare(&strings, previous, string)?.is_le(),
+                _ => string::compare(&strings, previous, string)?.is_ge(),
             };
         }
-        before = Some(x);
+        before = Some(string);
     }
     Ok(so_far)
 }
 
-/// Deducts VM fuel and reserves heap memory before calculating exact exponentiation `z^w`,
+/// Deducts VM fuel and reserves heap memory before calculating exact exponentiation `base^exponent`,
 /// accounting for both the memory footprint of the digits and the quadratic work required by
 /// exponentiation-by-squaring.
-fn charge_power<'gc>(mc: &Mutation<'gc>, h: &Nums<'_, 'gc>, fuel: &mut Fuel, z: Number<'gc>, w: Number<'gc>) -> Result<(), Fault> {
-    let ComplexView::Real(e) = h.complex_view(w) else { return Ok(()) };
-    let RealView::Exact(e) = h.real_view(e) else { return Ok(()) };
-    let RationalView::Integer(e) = h.rational_view(e) else { return Ok(()) };
+fn charge_power<'gc>(mc: &Mutation<'gc>, nums: &Nums<'_, 'gc>, fuel: &mut Fuel, base: Number<'gc>, exponent: Number<'gc>) -> Result<(), Fault> {
+    let ComplexView::Real(power) = nums.complex_view(exponent) else { return Ok(()) };
+    let RealView::Exact(power) = nums.real_view(power) else { return Ok(()) };
+    let RationalView::Integer(power) = nums.rational_view(power) else { return Ok(()) };
     // An exact integer exponent that exceeds 64 bits would exhaust available memory for any
     // base other than 0, 1, or -1 (which are handled as special cases by `expt`).
-    let Some(e) = int::to_i64(h, e) else { return Ok(()) };
-    let words = exact_bits(h, z).saturating_mul(e.unsigned_abs()) / 64;
+    let Some(power) = int::to_i64(nums, power) else { return Ok(()) };
+    let words = exact_bits(nums, base).saturating_mul(power.unsigned_abs()) / 64;
     mc.ensure(usize::try_from(words.saturating_mul(8)).unwrap_or(usize::MAX))?;
     fuel.spend(words.saturating_mul(words) / equal::PER_FUEL)
 }
@@ -2364,28 +2364,28 @@ fn compare<'gc>(mc: &Mutation<'gc>, op: Intrinsic, mut xs: impl Iterator<Item = 
         Intrinsic::Ge => order.is_ge(),
         _ => order.is_eq(),
     };
-    let h = Nums::new(mc);
-    let number = |x: Value<'gc>| h.number(x).ok_or(Fault::WrongType);
-    let real = |x: Value<'gc>| h.real(x).ok_or(Fault::WrongType);
-    let check = |x: Value<'gc>| if op == Intrinsic::NumEq { number(x).map(drop) } else { real(x).map(drop) };
+    let nums = Nums::new(mc);
+    let number = |value: Value<'gc>| nums.number(value).ok_or(Fault::WrongType);
+    let real = |value: Value<'gc>| nums.real(value).ok_or(Fault::WrongType);
+    let check = |value: Value<'gc>| if op == Intrinsic::NumEq { number(value).map(drop) } else { real(value).map(drop) };
     let mut before = xs.next().ok_or(Fault::Arity)?;
     let mut so_far = true;
     if before.as_fixnum().is_none() {
         check(before)?;
     }
-    for x in xs {
-        let fixnums = before.as_fixnum().zip(x.as_fixnum());
+    for next in xs {
+        let fixnums = before.as_fixnum().zip(next.as_fixnum());
         if fixnums.is_none() {
-            check(x)?;
+            check(next)?;
         }
         if so_far {
             so_far = match fixnums {
-                Some((a, b)) => holds(a.cmp(&b)),
-                None if op == Intrinsic::NumEq => complex::equal(&h, number(before)?, number(x)?)?,
-                None => real::compare(&h, real(before)?, real(x)?)?.is_some_and(holds),
+                Some((left, right)) => holds(left.cmp(&right)),
+                None if op == Intrinsic::NumEq => complex::equal(&nums, number(before)?, number(next)?)?,
+                None => real::compare(&nums, real(before)?, real(next)?)?.is_some_and(holds),
             };
         }
-        before = x;
+        before = next;
     }
     Ok(so_far)
 }
@@ -2408,7 +2408,7 @@ fn reverse<'gc>(mc: &Mutation<'gc>, xs: Value<'gc>, fuel: &mut Fuel) -> Result<V
 
 /// Implements list searching intrinsics `memq`, `memv`, `member`, `assq`, `assv`, and `assoc`
 /// using the equality semantics appropriate for each variant.
-fn find<'gc>(mc: &Mutation<'gc>, kind: Intrinsic, x: Value<'gc>, mut xs: Value<'gc>, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
+fn find<'gc>(mc: &Mutation<'gc>, kind: Intrinsic, target: Value<'gc>, mut xs: Value<'gc>, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
     let assoc = matches!(kind, Intrinsic::Assq | Intrinsic::Assv | Intrinsic::Assoc);
     let mut steps = 0u64;
     while xs != Value::NIL {
@@ -2419,11 +2419,11 @@ fn find<'gc>(mc: &Mutation<'gc>, kind: Intrinsic, x: Value<'gc>, mut xs: Value<'
         let matched = match kind {
             Intrinsic::Memq | Intrinsic::Assq => {
                 steps += 1;
-                x == candidate
+                target == candidate
             }
             Intrinsic::Memv | Intrinsic::Assv => {
                 steps += 1;
-                equal::eqv(mc, x, candidate)
+                equal::eqv(mc, target, candidate)
             }
             _ => {
                 let most = fuel
@@ -2432,7 +2432,7 @@ fn find<'gc>(mc: &Mutation<'gc>, kind: Intrinsic, x: Value<'gc>, mut xs: Value<'
                     .saturating_mul(equal::PER_FUEL)
                     .saturating_sub(steps % equal::PER_FUEL)
                     .saturating_sub(1);
-                let (same, compared) = equal::equal(mc, x, candidate, most)?;
+                let (same, compared) = equal::equal(mc, target, candidate, most)?;
                 steps = steps.saturating_add(compared);
                 same
             }
@@ -2448,23 +2448,23 @@ fn find<'gc>(mc: &Mutation<'gc>, kind: Intrinsic, x: Value<'gc>, mut xs: Value<'
 
 fn string_append<'gc>(mc: &Mutation<'gc>, args: impl ExactSizeIterator<Item = Value<'gc>>, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
     let strings = Strings::new(mc);
-    let n = args.len();
-    fuel.spend(n as u64 / equal::PER_FUEL)?;
-    let mut args = args.map(|v| strings.string(v).ok_or(Fault::WrongType));
+    let count = args.len();
+    fuel.spend(count as u64 / equal::PER_FUEL)?;
+    let mut args = args.map(|value| strings.string(value).ok_or(Fault::WrongType));
     let Some(first) = args.next().transpose()? else { return Ok(string::empty(&strings)?.value()) };
     // Common string concatenations with up to eight arguments use a stack-allocated array
     // to avoid heap allocation overhead.
-    let joined = if n <= 8 {
+    let joined = if count <= 8 {
         let mut parts = [first; 8];
-        for (part, s) in parts[1..].iter_mut().zip(args) {
-            *part = s?;
+        for (part, arg) in parts[1..].iter_mut().zip(args) {
+            *part = arg?;
         }
-        string::concat_all(&strings, &parts[..n])?
+        string::concat_all(&strings, &parts[..count])?
     } else {
         let mut parts = ScratchVec::new(mc);
         parts.push(first)?;
-        for s in args {
-            parts.push(s?)?;
+        for arg in args {
+            parts.push(arg?)?;
         }
         string::concat_all(&strings, &parts)?
     };
@@ -2478,11 +2478,11 @@ fn append<'gc>(mc: &Mutation<'gc>, args: impl ExactSizeIterator<Item = Value<'gc
     let pairs = Pairs::new(mc);
     let mut lists = ScratchVec::new(mc);
     let len = args.len();
-    for (i, v) in args.enumerate() {
-        if i + 1 < len && !pairs.is_list(v) {
+    for (i, arg) in args.enumerate() {
+        if i + 1 < len && !pairs.is_list(arg) {
             return Err(Fault::WrongType);
         }
-        lists.push(v)?;
+        lists.push(arg)?;
     }
     let Some(mut last) = len.checked_sub(1) else { return Ok(Value::NIL) };
     while last > 0 && lists[last] == Value::NIL {
@@ -2503,17 +2503,17 @@ fn append<'gc>(mc: &Mutation<'gc>, args: impl ExactSizeIterator<Item = Value<'gc
     Ok(made(mc, fuel, pairs.list_with_tail(items.iter().copied(), tail)?))
 }
 
-/// Traverses `k` pair links starting from `xs` and returns the resulting sublist tail, faulting
+/// Traverses `count` pair links starting from `xs` and returns the resulting sublist tail, faulting
 /// if `xs` is too short or if `need_pair` is true and the resulting tail is not a pair.
-fn list_tail<'gc>(mc: &Mutation<'gc>, mut xs: Value<'gc>, k: usize, need_pair: bool, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
+fn list_tail<'gc>(mc: &Mutation<'gc>, mut xs: Value<'gc>, count: usize, need_pair: bool, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
     if let Some(len) = Pairs::new(mc).list_len(xs) {
         let max = if need_pair { len } else { len.saturating_add(1) };
-        if k as u64 >= max {
+        if count as u64 >= max {
             return Err(Fault::OutOfRange);
         }
     }
-    fuel.spend(k as u64 / equal::PER_FUEL)?;
-    for _ in 0..k {
+    fuel.spend(count as u64 / equal::PER_FUEL)?;
+    for _ in 0..count {
         let pair = Pair::of(xs).ok_or(if xs == Value::NIL { Fault::OutOfRange } else { Fault::WrongType })?;
         xs = pair.tail(mc);
     }
@@ -2523,25 +2523,25 @@ fn list_tail<'gc>(mc: &Mutation<'gc>, mut xs: Value<'gc>, k: usize, need_pair: b
     Ok(xs)
 }
 
-/// Validates that `v` is a fixnum in the range `0..=255`, returning `u8` on success,
+/// Validates that `value` is a fixnum in the range `0..=255`, returning `u8` on success,
 /// [`Fault::OutOfRange`] for any other exact integer, or [`Fault::WrongType`].
-fn byte<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> Result<u8, Fault> {
-    let b = v.as_fixnum().ok_or_else(|| not_fixnum(mc, v))?;
-    u8::try_from(b).map_err(|_| Fault::OutOfRange)
+fn byte<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Result<u8, Fault> {
+    let number = value.as_fixnum().ok_or_else(|| not_fixnum(mc, value))?;
+    u8::try_from(number).map_err(|_| Fault::OutOfRange)
 }
 
-/// Returns the fault for `v`, which is not a fixnum, as an argument that must be an integer in a
-/// range that fixnums cover: [`Fault::OutOfRange`] for an exact integer too large to be a fixnum,
-/// and [`Fault::WrongType`] for anything else.
-fn not_fixnum<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> Fault {
-    if Nums::new(mc).integer(v).is_some() { Fault::OutOfRange } else { Fault::WrongType }
+/// Returns the fault for an argument `value` that must be a small integer but is not a fixnum:
+/// [`Fault::OutOfRange`] if `value` is an exact integer too large to be a fixnum,
+/// and [`Fault::WrongType`] otherwise.
+fn not_fixnum<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Fault {
+    if Nums::new(mc).integer(value).is_some() { Fault::OutOfRange } else { Fault::WrongType }
 }
 
-/// Validates that `v` is a non-negative fixnum, returning `usize` on success, or
+/// Validates that `value` is a non-negative fixnum, returning `usize` on success, or
 /// [`Fault::WrongType`] if not a fixnum or [`Fault::OutOfRange`] if negative.
-fn index(v: Value<'_>) -> Result<usize, Fault> {
-    let k = v.as_fixnum().ok_or(Fault::WrongType)?;
-    usize::try_from(k).map_err(|_| Fault::OutOfRange)
+fn index(value: Value<'_>) -> Result<usize, Fault> {
+    let number = value.as_fixnum().ok_or(Fault::WrongType)?;
+    usize::try_from(number).map_err(|_| Fault::OutOfRange)
 }
 
 /// Returns newly allocated `value`, pausing the VM fuel budget if GC step thresholds have

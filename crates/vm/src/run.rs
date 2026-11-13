@@ -285,7 +285,7 @@ impl<'s, 'gc> Run<'s, 'gc> {
         let mc = self.cx.mc;
         let hosts = match self.hosts {
             Some(hosts) => hosts,
-            None => *self.hosts.insert(self.code.module(mc).and_then(|m| m.hosts(mc)).map_or(&[][..], |h| &h[..])),
+            None => *self.hosts.insert(self.code.module(mc).and_then(|module| module.hosts(mc)).map_or(&[][..], |defs| &defs[..])),
         };
         let def = *hosts.get(host as usize).ok_or(Fault::Malformed)?;
         if !def.takes(usize::from(args)) {
@@ -332,9 +332,9 @@ impl<'s, 'gc> Run<'s, 'gc> {
                 Call { base, argc: args - 2, rest }
             }
             Request::ApplyValues if !spread => {
-                let v = frame.get(base + 1);
-                if v.downcast::<MultiValue>(self.cx.mc).is_some() {
-                    Call { base, argc: 0, rest: v }
+                let value = frame.get(base + 1);
+                if value.downcast::<MultiValue>(self.cx.mc).is_some() {
+                    Call { base, argc: 0, rest: value }
                 } else {
                     Call { base, argc: 1, rest: Value::NIL }
                 }
@@ -359,7 +359,7 @@ impl<'s, 'gc> Run<'s, 'gc> {
         };
         let call = Call { base: base + SAVED_MARKS, argc, rest: Value::NIL };
         fits(call)?;
-        let takes = procedure.downcast::<Closure>(mc).and_then(|c| c.code(mc)).is_some_and(|code| code.arity(mc) == i64::from(argc));
+        let takes = procedure.downcast::<Closure>(mc).and_then(|closure| closure.code(mc)).is_some_and(|code| code.arity(mc) == i64::from(argc));
         if !takes || self.fp + usize::from(call.base) > self.limit {
             return Err(Exit::Request { base, args, request, spread: false, tail: false });
         }
@@ -458,7 +458,7 @@ fn bind_slow<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, mut arg
             () => Ok(()),
         };
     }
-    // What is left of the caller's list becomes the tail of the rest parameter, so it must be a proper list. A pair knows whether it starts one, so the check does not walk the list.
+    // The remaining arguments become the tail of the rest parameter, so they must form a proper list. A pair stores whether it starts a proper list, so this check does not walk the list.
     let pairs = Pairs::new(mc);
     if !pairs.is_list(rest) {
         return Err(Fault::WrongType);
@@ -475,7 +475,7 @@ fn bind_slow<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, mut arg
 fn counts(shape: Shape) -> Result<(u8, u8), Fault> {
     let fixed = u8::try_from(shape.required + shape.optional)
         .ok()
-        .filter(|&n| usize::from(n) + usize::from(shape.rest) <= MAX_ARGS)
+        .filter(|&count| usize::from(count) + usize::from(shape.rest) <= MAX_ARGS)
         .ok_or(Fault::Malformed)?;
     Ok((shape.required as u8, fixed))
 }

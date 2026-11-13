@@ -40,10 +40,10 @@ enum Kept<'gc> {
     Outside(Gc<'gc, objects::ExternMutBytevector>),
 }
 
-/// The bytes of `v`'s buffer, for one read or write: as many as it had when `v` was made.
-fn outside<'gc>(mc: &Mutation<'gc>, v: Gc<'gc, objects::ExternMutBytevector>) -> Option<RefMut<'gc, [u8]>> {
-    let len = v.bytes(mc) as usize;
-    Some(RefMut::map(v.buffer(mc)?.borrow_mut(), |buffer| {
+/// The bytes of `bytevector`'s buffer, for one read or write: as many as it had when `bytevector` was made.
+fn outside<'gc>(mc: &Mutation<'gc>, bytevector: Gc<'gc, objects::ExternMutBytevector>) -> Option<RefMut<'gc, [u8]>> {
+    let len = bytevector.bytes(mc) as usize;
+    Some(RefMut::map(bytevector.buffer(mc)?.borrow_mut(), |buffer| {
         let bytes = (**buffer).as_mut();
         let len = len.min(bytes.len());
         &mut bytes[..len]
@@ -53,8 +53,8 @@ fn outside<'gc>(mc: &Mutation<'gc>, v: Gc<'gc, objects::ExternMutBytevector>) ->
 /// The word of the eight bytes from `index * 8` that `byte` reads, zeros past the last.
 fn word_of(len: usize, index: usize, byte: impl Fn(usize) -> u8) -> u64 {
     let mut word = [0; 8];
-    for (i, b) in word.iter_mut().enumerate().take(len.saturating_sub(index * 8)) {
-        *b = byte(index * 8 + i);
+    for (i, out) in word.iter_mut().enumerate().take(len.saturating_sub(index * 8)) {
+        *out = byte(index * 8 + i);
     }
     u64::from_le_bytes(word)
 }
@@ -62,21 +62,21 @@ fn word_of(len: usize, index: usize, byte: impl Fn(usize) -> u8) -> u64 {
 impl<'gc> Bytevector<'gc> {
     pub fn value(self, mc: &Mutation<'gc>) -> Value<'gc> {
         match self.0 {
-            Kept::Inside(v) => Value::object(mc, v),
-            Kept::Outside(v) => Value::object(mc, v),
+            Kept::Inside(bytevector) => Value::object(mc, bytevector),
+            Kept::Outside(bytevector) => Value::object(mc, bytevector),
         }
     }
 
     /// Sets the byte at `index`, or returns `false` if there's none.
     pub fn set(self, mc: &Mutation<'gc>, index: usize, byte: u8) -> bool {
-        let v = match self.0 {
-            Kept::Inside(v) => v,
-            Kept::Outside(v) => return outside(mc, v).and_then(|mut bytes| bytes.get_mut(index).map(|b| *b = byte)).is_some(),
+        let bytevector = match self.0 {
+            Kept::Inside(bytevector) => bytevector,
+            Kept::Outside(bytevector) => return outside(mc, bytevector).and_then(|mut bytes| bytes.get_mut(index).map(|out| *out = byte)).is_some(),
         };
-        if index as u64 >= v.bytes(mc) {
+        if index as u64 >= bytevector.bytes(mc) {
             return false;
         }
-        let items = v.items(mc);
+        let items = bytevector.items(mc);
         let shift = index % 8 * 8;
         let word = items.get(index / 8) & !(0xff << shift) | u64::from(byte) << shift;
         items.set(mc, index / 8, word);
@@ -86,19 +86,19 @@ impl<'gc> Bytevector<'gc> {
     /// Sets the `size` bytes from `index`, 1 to 8, to `value`'s low ones, least significant
     /// first, or returns `false` if they're not all there.
     pub fn set_uint(self, mc: &Mutation<'gc>, index: usize, size: usize, value: u64) -> bool {
-        let v = match self.0 {
-            Kept::Inside(v) => v,
-            Kept::Outside(v) => {
-                let Some(mut bytes) = outside(mc, v) else { return false };
+        let bytevector = match self.0 {
+            Kept::Inside(bytevector) => bytevector,
+            Kept::Outside(bytevector) => {
+                let Some(mut bytes) = outside(mc, bytevector) else { return false };
                 let Some(to) = index.checked_add(size).and_then(|end| bytes.get_mut(index..end)) else { return false };
                 to.copy_from_slice(&value.to_le_bytes()[..size]);
                 return true;
             }
         };
-        if index.checked_add(size).is_none_or(|end| end as u64 > v.bytes(mc)) {
+        if index.checked_add(size).is_none_or(|end| end as u64 > bytevector.bytes(mc)) {
             return false;
         }
-        let (items, at, shift, mask) = (v.items(mc), index / 8, index % 8 * 8, low_bytes(size));
+        let (items, at, shift, mask) = (bytevector.items(mc), index / 8, index % 8 * 8, low_bytes(size));
         let value = value & mask;
         items.set(mc, at, items.get(at) & !(mask << shift) | value << shift);
         if shift + size * 8 > 64 {
@@ -181,21 +181,21 @@ pub enum AnyBytevector<'gc> {
 
 impl<'gc> AnyBytevector<'gc> {
     #[inline]
-    pub fn of(v: Value<'gc>) -> Option<Self> {
-        match Data::of(v) {
-            Some(Data::Bytevector(v)) => Some(Self::Mutable(Bytevector(Kept::Inside(v)))),
-            Some(Data::ExternMutBytevector(v)) => Some(Self::Mutable(Bytevector(Kept::Outside(v)))),
-            Some(Data::ImmutableBytevector(v)) => Some(Self::Immutable(ImmutableBytevector(v))),
-            Some(Data::ExternBytevector(v)) => Some(Self::External(ExternalBytevector(v))),
+    pub fn of(value: Value<'gc>) -> Option<Self> {
+        match Data::of(value) {
+            Some(Data::Bytevector(bytevector)) => Some(Self::Mutable(Bytevector(Kept::Inside(bytevector)))),
+            Some(Data::ExternMutBytevector(bytevector)) => Some(Self::Mutable(Bytevector(Kept::Outside(bytevector)))),
+            Some(Data::ImmutableBytevector(bytevector)) => Some(Self::Immutable(ImmutableBytevector(bytevector))),
+            Some(Data::ExternBytevector(bytevector)) => Some(Self::External(ExternalBytevector(bytevector))),
             _ => None,
         }
     }
 
     pub fn value(self, mc: &Mutation<'gc>) -> Value<'gc> {
         match self {
-            Self::Mutable(v) => v.value(mc),
-            Self::Immutable(v) => Value::object(mc, v.0),
-            Self::External(v) => Value::object(mc, v.0),
+            Self::Mutable(bytevector) => bytevector.value(mc),
+            Self::Immutable(bytevector) => Value::object(mc, bytevector.0),
+            Self::External(bytevector) => Value::object(mc, bytevector.0),
         }
     }
 
@@ -210,10 +210,10 @@ impl<'gc> AnyBytevector<'gc> {
 
     pub fn len(self, mc: &Mutation<'gc>) -> usize {
         match self {
-            Self::Mutable(Bytevector(Kept::Inside(v))) => v.bytes(mc) as usize,
-            Self::Mutable(Bytevector(Kept::Outside(v))) => v.bytes(mc) as usize,
-            Self::Immutable(v) => v.0.bytes(mc) as usize,
-            Self::External(v) => v.0.bytes(mc) as usize,
+            Self::Mutable(Bytevector(Kept::Inside(bytevector))) => bytevector.bytes(mc) as usize,
+            Self::Mutable(Bytevector(Kept::Outside(bytevector))) => bytevector.bytes(mc) as usize,
+            Self::Immutable(bytevector) => bytevector.0.bytes(mc) as usize,
+            Self::External(bytevector) => bytevector.0.bytes(mc) as usize,
         }
     }
 
@@ -223,11 +223,11 @@ impl<'gc> AnyBytevector<'gc> {
 
     fn word(self, mc: &Mutation<'gc>, index: usize) -> u64 {
         match self {
-            Self::Mutable(Bytevector(Kept::Inside(v))) => v.items(mc).get(index),
-            Self::Mutable(Bytevector(Kept::Outside(v))) => outside(mc, v).map_or(0, |bytes| word_of(bytes.len(), index, |i| bytes[i])),
-            Self::Immutable(v) => v.0.items(mc).get(index),
-            Self::External(v) => {
-                let bytes = v.bytes(mc);
+            Self::Mutable(Bytevector(Kept::Inside(bytevector))) => bytevector.items(mc).get(index),
+            Self::Mutable(Bytevector(Kept::Outside(bytevector))) => outside(mc, bytevector).map_or(0, |bytes| word_of(bytes.len(), index, |i| bytes[i])),
+            Self::Immutable(bytevector) => bytevector.0.items(mc).get(index),
+            Self::External(bytevector) => {
+                let bytes = bytevector.bytes(mc);
                 word_of(bytes.len(), index, |i| bytes[i])
             }
         }
@@ -237,23 +237,23 @@ impl<'gc> AnyBytevector<'gc> {
     #[inline(always)]
     fn inside(self, mc: &Mutation<'gc>) -> Option<(usize, Slots<'gc, slot::u64>)> {
         match self {
-            Self::Mutable(Bytevector(Kept::Inside(v))) => Some((v.bytes(mc) as usize, v.items(mc))),
-            Self::Immutable(v) => Some((v.0.bytes(mc) as usize, v.0.items(mc))),
+            Self::Mutable(Bytevector(Kept::Inside(bytevector))) => Some((bytevector.bytes(mc) as usize, bytevector.items(mc))),
+            Self::Immutable(bytevector) => Some((bytevector.0.bytes(mc) as usize, bytevector.0.items(mc))),
             _ => None,
         }
     }
 
-    /// What `f` makes of the bytes, which are kept outside the arena. It's out of line so that
+    /// What `read` makes of the bytes, which are kept outside the arena. It's out of line so that
     /// reading the ones in the arena stays short.
     #[inline(never)]
-    fn outside<R>(self, mc: &Mutation<'gc>, f: impl FnOnce(&[u8]) -> R) -> R {
+    fn outside<R>(self, mc: &Mutation<'gc>, read: impl FnOnce(&[u8]) -> R) -> R {
         match self {
-            Self::External(v) => f(v.bytes(mc)),
-            Self::Mutable(Bytevector(Kept::Outside(v))) => match outside(mc, v) {
-                Some(bytes) => f(&bytes),
-                None => f(&[]),
+            Self::External(bytevector) => read(bytevector.bytes(mc)),
+            Self::Mutable(Bytevector(Kept::Outside(bytevector))) => match outside(mc, bytevector) {
+                Some(bytes) => read(&bytes),
+                None => read(&[]),
             },
-            _ => f(&[]),
+            _ => read(&[]),
         }
     }
 
@@ -295,8 +295,8 @@ impl<'gc> AnyBytevector<'gc> {
     /// the others' copied out.
     pub fn bytes(self, mc: &Mutation<'gc>, start: usize, end: usize) -> Cow<'gc, [u8]> {
         match self {
-            Self::External(v) => return Cow::Borrowed(&v.bytes(mc)[start..end]),
-            Self::Mutable(Bytevector(Kept::Outside(v))) => return Cow::Owned(outside(mc, v).map_or(Vec::new(), |bytes| bytes[start..end].to_vec())),
+            Self::External(bytevector) => return Cow::Borrowed(&bytevector.bytes(mc)[start..end]),
+            Self::Mutable(Bytevector(Kept::Outside(bytevector))) => return Cow::Owned(outside(mc, bytevector).map_or(Vec::new(), |bytes| bytes[start..end].to_vec())),
             _ => {}
         }
         let mut bytes: Vec<u8> = (start / 8..words(end)).flat_map(|i| self.word(mc, i).to_le_bytes()).collect();
@@ -323,14 +323,14 @@ impl<'a, 'gc> Bytevectors<'a, 'gc> {
         Self { mc }
     }
 
-    pub fn bytevector(&self, v: Value<'gc>) -> Option<AnyBytevector<'gc>> {
-        AnyBytevector::of(v)
+    pub fn bytevector(&self, value: Value<'gc>) -> Option<AnyBytevector<'gc>> {
+        AnyBytevector::of(value)
     }
 
-    /// `v` if it's a bytevector that can be written to.
-    pub fn mutable(&self, v: Value<'gc>) -> Option<Bytevector<'gc>> {
-        match AnyBytevector::of(v) {
-            Some(AnyBytevector::Mutable(v)) => Some(v),
+    /// `value` if it's a bytevector that can be written to.
+    pub fn mutable(&self, value: Value<'gc>) -> Option<Bytevector<'gc>> {
+        match AnyBytevector::of(value) {
+            Some(AnyBytevector::Mutable(bytevector)) => Some(bytevector),
             _ => None,
         }
     }
@@ -338,21 +338,21 @@ impl<'a, 'gc> Bytevectors<'a, 'gc> {
     /// A bytevector of `len` copies of `fill`.
     pub fn make(&self, len: usize, fill: u8) -> Result<Bytevector<'gc>, OutOfMemory> {
         let word = u64::from_le_bytes([fill; 8]);
-        let v = objects::Bytevector::new(self.mc, len as u64, words(len), word)?;
-        clear_slack(self.mc, v.items(self.mc), len, word);
-        Ok(Bytevector(Kept::Inside(v)))
+        let bytevector = objects::Bytevector::new(self.mc, len as u64, words(len), word)?;
+        clear_slack(self.mc, bytevector.items(self.mc), len, word);
+        Ok(Bytevector(Kept::Inside(bytevector)))
     }
 
     pub fn from_slice(&self, bytes: &[u8]) -> Result<Bytevector<'gc>, OutOfMemory> {
-        let v = objects::Bytevector::new(self.mc, bytes.len() as u64, words(bytes.len()), 0)?;
-        pack(self.mc, v.items(self.mc), bytes);
-        Ok(Bytevector(Kept::Inside(v)))
+        let bytevector = objects::Bytevector::new(self.mc, bytes.len() as u64, words(bytes.len()), 0)?;
+        pack(self.mc, bytevector.items(self.mc), bytes);
+        Ok(Bytevector(Kept::Inside(bytevector)))
     }
 
     pub fn immutable_from_slice(&self, bytes: &[u8]) -> Result<AnyBytevector<'gc>, OutOfMemory> {
-        let v = objects::ImmutableBytevector::new(self.mc, bytes.len() as u64, words(bytes.len()), 0)?;
-        pack(self.mc, v.items(self.mc), bytes);
-        Ok(AnyBytevector::Immutable(ImmutableBytevector(v)))
+        let bytevector = objects::ImmutableBytevector::new(self.mc, bytes.len() as u64, words(bytes.len()), 0)?;
+        pack(self.mc, bytevector.items(self.mc), bytes);
+        Ok(AnyBytevector::Immutable(ImmutableBytevector(bytevector)))
     }
 
     /// Makes a read-only bytevector whose bytes stay in `bytes`, outside the arena.
@@ -367,8 +367,8 @@ impl<'a, 'gc> Bytevectors<'a, 'gc> {
             return self.immutable_from_slice(bytes.as_ref());
         }
         let owner: Box<dyn ExternalBuffer> = Box::new(bytes);
-        let v = objects::ExternBytevector::new(self.mc, len as u64, self.mc.frozen_owning(owner, len)?)?;
-        Ok(AnyBytevector::External(ExternalBytevector(v)))
+        let bytevector = objects::ExternBytevector::new(self.mc, len as u64, self.mc.frozen_owning(owner, len)?)?;
+        Ok(AnyBytevector::External(ExternalBytevector(bytevector)))
     }
 
     /// Makes a writable bytevector over `buffer`, which the arena takes ownership of.
@@ -380,8 +380,8 @@ impl<'a, 'gc> Bytevectors<'a, 'gc> {
     pub fn external_mutable(&self, mut buffer: impl ExternalBufferMut) -> Result<Bytevector<'gc>, OutOfMemory> {
         let len = buffer.as_mut().len();
         let buffer: RefCell<Box<dyn ExternalBufferMut>> = RefCell::new(Box::new(buffer));
-        let v = objects::ExternMutBytevector::new(self.mc, len as u64, self.mc.frozen_owning(buffer, len)?)?;
-        Ok(Bytevector(Kept::Outside(v)))
+        let bytevector = objects::ExternMutBytevector::new(self.mc, len as u64, self.mc.frozen_owning(buffer, len)?)?;
+        Ok(Bytevector(Kept::Outside(bytevector)))
     }
 }
 

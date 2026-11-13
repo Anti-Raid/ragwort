@@ -27,25 +27,25 @@ pub trait Table<H: Host> {
     ) -> Result<Self::Entry, H::Error>;
 }
 
-/// The symbol named by the characters of `s`, made if there's none.
+/// The symbol named by the characters of `name`, made if there's none.
 #[inline]
-pub fn intern<H: Host, T: Table<H>>(h: &H, table: &T, s: H::Str) -> Result<T::Entry, H::Error> {
-    let hash = hash(h, s, table.seed())?;
-    table.find_or_insert(h, probe_hash(hash), |entry| equal(h, table.name(h, entry), s), || table.make(h, flatten(h, s)?, hash))
+pub fn intern<H: Host, T: Table<H>>(h: &H, table: &T, name: H::Str) -> Result<T::Entry, H::Error> {
+    let hash = hash(h, name, table.seed())?;
+    table.find_or_insert(h, probe_hash(hash), |entry| equal(h, table.name(h, entry), name), || table.make(h, flatten(h, name)?, hash))
 }
 
-/// The symbol named `s`, made without making a string first unless the name is new.
+/// The symbol named `name`, made without making a string first unless the name is new.
 #[inline]
-pub fn intern_str<H: Host, T: Table<H>>(h: &H, table: &T, s: &str) -> Result<T::Entry, H::Error> {
-    let hash = hash_str(s, table.seed());
-    table.find_or_insert(h, probe_hash(hash), |entry| named(h, table, entry, s), || table.make(h, from_str(h, s)?, hash))
+pub fn intern_str<H: Host, T: Table<H>>(h: &H, table: &T, name: &str) -> Result<T::Entry, H::Error> {
+    let hash = hash_str(name, table.seed());
+    table.find_or_insert(h, probe_hash(hash), |entry| named(h, table, entry, name), || table.make(h, from_str(h, name)?, hash))
 }
 
-/// Whether `entry` is named `s`. Kept out of the probe: inlined, its setup for `s` would run on
+/// Whether `entry` is named `name`. Kept out of the probe: inlined, its setup for `name` would run on
 /// every call, before any entry is compared.
 #[inline(never)]
-fn named<H: Host, T: Table<H>>(h: &H, table: &T, entry: T::Entry, s: &str) -> Result<bool, H::Error> {
-    equal_str(h, table.name(h, entry), s)
+fn named<H: Host, T: Table<H>>(h: &H, table: &T, entry: T::Entry, name: &str) -> Result<bool, H::Error> {
+    equal_str(h, table.name(h, entry), name)
 }
 
 fn probe_hash(hash: u64) -> u64 {

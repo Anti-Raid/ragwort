@@ -14,9 +14,9 @@ pub struct Vector<'gc>(Gc<'gc, objects::Vector>);
 
 impl<'gc> Vector<'gc> {
     #[inline]
-    pub fn of(v: Value<'gc>) -> Option<Self> {
-        match Data::of(v) {
-            Some(Data::Vector(v)) => Some(Self(v)),
+    pub fn of(value: Value<'gc>) -> Option<Self> {
+        match Data::of(value) {
+            Some(Data::Vector(vector)) => Some(Self(vector)),
             _ => None,
         }
     }
@@ -36,9 +36,9 @@ pub struct ImmutableVector<'gc>(Gc<'gc, objects::ImmutableVector>);
 
 impl<'gc> ImmutableVector<'gc> {
     #[inline]
-    pub fn of(v: Value<'gc>) -> Option<Self> {
-        match Data::of(v) {
-            Some(Data::ImmutableVector(v)) => Some(Self(v)),
+    pub fn of(value: Value<'gc>) -> Option<Self> {
+        match Data::of(value) {
+            Some(Data::ImmutableVector(vector)) => Some(Self(vector)),
             _ => None,
         }
     }
@@ -71,18 +71,18 @@ pub enum AnyVector<'gc> {
 
 impl<'gc> AnyVector<'gc> {
     #[inline]
-    pub fn of(v: Value<'gc>) -> Option<Self> {
-        match Data::of(v) {
-            Some(Data::Vector(v)) => Some(Self::Mutable(Vector(v))),
-            Some(Data::ImmutableVector(v)) => Some(Self::Immutable(ImmutableVector(v))),
+    pub fn of(value: Value<'gc>) -> Option<Self> {
+        match Data::of(value) {
+            Some(Data::Vector(vector)) => Some(Self::Mutable(Vector(vector))),
+            Some(Data::ImmutableVector(vector)) => Some(Self::Immutable(ImmutableVector(vector))),
             _ => None,
         }
     }
 
     fn items(self, mc: &Mutation<'gc>) -> Slots<'gc> {
         match self {
-            Self::Mutable(v) => v.0.items(mc),
-            Self::Immutable(v) => v.0.items(mc),
+            Self::Mutable(vector) => vector.0.items(mc),
+            Self::Immutable(vector) => vector.0.items(mc),
         }
     }
 
@@ -106,8 +106,8 @@ impl<'gc> AnyVector<'gc> {
 
     pub fn value(self, mc: &Mutation<'gc>) -> Value<'gc> {
         match self {
-            Self::Mutable(v) => v.value(mc),
-            Self::Immutable(v) => v.value(mc),
+            Self::Mutable(vector) => vector.value(mc),
+            Self::Immutable(vector) => vector.value(mc),
         }
     }
 }
@@ -123,13 +123,13 @@ impl<'a, 'gc> Vectors<'a, 'gc> {
         Self { mc }
     }
 
-    pub fn vector(&self, v: Value<'gc>) -> Option<AnyVector<'gc>> {
-        AnyVector::of(v)
+    pub fn vector(&self, value: Value<'gc>) -> Option<AnyVector<'gc>> {
+        AnyVector::of(value)
     }
 
-    /// `v` if it's a vector that can be written to.
-    pub fn mutable(&self, v: Value<'gc>) -> Option<Vector<'gc>> {
-        Vector::of(v)
+    /// `value` if it's a vector that can be written to.
+    pub fn mutable(&self, value: Value<'gc>) -> Option<Vector<'gc>> {
+        Vector::of(value)
     }
 
     /// A vector of `len` copies of `fill`.
@@ -138,9 +138,9 @@ impl<'a, 'gc> Vectors<'a, 'gc> {
     }
 
     pub fn from_slice(&self, items: &[Value<'gc>]) -> Result<Vector<'gc>, OutOfMemory> {
-        let v = self.make(items.len(), Value::NIL)?;
-        fill(self.mc, v.items(self.mc), items.iter().copied());
-        Ok(v)
+        let vector = self.make(items.len(), Value::NIL)?;
+        fill(self.mc, vector.items(self.mc), items.iter().copied());
+        Ok(vector)
     }
 
     pub fn immutable_from_slice(&self, items: &[Value<'gc>]) -> Result<ImmutableVector<'gc>, OutOfMemory> {
@@ -148,18 +148,18 @@ impl<'a, 'gc> Vectors<'a, 'gc> {
     }
 
     pub fn immutable_with(&self, len: usize, fill: impl FnMut(usize) -> Value<'gc>) -> Result<ImmutableVector<'gc>, OutOfMemory> {
-        let v = objects::ImmutableVector::new(self.mc, len, Value::NIL)?;
-        self::fill(self.mc, v.items(self.mc), (0..len).map(fill));
-        Ok(ImmutableVector(v))
+        let vector = objects::ImmutableVector::new(self.mc, len, Value::NIL)?;
+        self::fill(self.mc, vector.items(self.mc), (0..len).map(fill));
+        Ok(ImmutableVector(vector))
     }
 
-    /// `v`'s elements as they are now, in a vector that can't change: `v` itself if it's
+    /// `vector`'s elements as they are now, in a vector that can't change: `vector` itself if it's
     /// already immutable, otherwise a copy.
-    pub fn freeze(&self, v: AnyVector<'gc>) -> Result<ImmutableVector<'gc>, OutOfMemory> {
-        match v {
-            AnyVector::Immutable(v) => Ok(v),
-            AnyVector::Mutable(v) => {
-                let items = v.items(self.mc);
+    pub fn freeze(&self, vector: AnyVector<'gc>) -> Result<ImmutableVector<'gc>, OutOfMemory> {
+        match vector {
+            AnyVector::Immutable(immutable) => Ok(immutable),
+            AnyVector::Mutable(mutable) => {
+                let items = mutable.items(self.mc);
                 let frozen = objects::ImmutableVector::new(self.mc, items.len(), Value::NIL)?;
                 frozen.items(self.mc).copy_from(self.mc, items);
                 Ok(ImmutableVector(frozen))

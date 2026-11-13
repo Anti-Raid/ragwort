@@ -25,26 +25,26 @@ const SLOW: u64 = 20;
 /// Memory allocation cost (in bytes) debited from the GC arena budget for each tracked compound value in [`Classes`].
 const CLASS_COST: usize = size_of::<(u64, usize, usize, u32)>() + 16;
 
-/// Implements Scheme `eqv?`: returns `true` if `a` and `b` are identical values/objects, or numbers with equal value and identical exactness.
+/// Implements Scheme `eqv?`: returns `true` if `left` and `right` are identical values/objects, or numbers with equal value and identical exactness.
 #[inline]
-pub(crate) fn eqv<'gc>(mc: &Mutation<'gc>, a: Value<'gc>, b: Value<'gc>) -> bool {
-    if a == b {
+pub(crate) fn eqv<'gc>(mc: &Mutation<'gc>, left: Value<'gc>, right: Value<'gc>) -> bool {
+    if left == right {
         return true;
     }
     // Two distinct fixnum bit patterns represent distinct integers and cannot be `eqv?`.
-    if a.as_fixnum().is_some() && b.as_fixnum().is_some() {
+    if left.as_fixnum().is_some() && right.as_fixnum().is_some() {
         return false;
     }
     let nums = Nums::new(mc);
-    match (nums.number(a), nums.number(b)) {
-        (Some(x), Some(y)) => complex::eqv(&nums, x, y),
+    match (nums.number(left), nums.number(right)) {
+        (Some(first), Some(second)) => complex::eqv(&nums, first, second),
         _ => false,
     }
 }
 
 /// Implements Scheme `equal?` structural comparison with cycle detection and bounded fuel consumption.
 ///
-/// Returns `Ok((true, compared_count))` if `a` and `b` are:
+/// Returns `Ok((true, compared_count))` if `left` and `right` are:
 /// - Equivalent under [`eqv?`](eqv);
 /// - Strings with identical character sequences;
 /// - Bytevectors with identical byte sequences;
@@ -53,37 +53,37 @@ pub(crate) fn eqv<'gc>(mc: &Mutation<'gc>, a: Value<'gc>, b: Value<'gc>) -> bool
 ///
 /// Tracks fuel consumption (counting strings/bytevectors as 1 plus 1 per 8 characters or bytes)
 /// and raises [`Fault::OutOfFuel`] if comparison steps exceed `most`.
-pub(crate) fn equal<'gc>(mc: &Mutation<'gc>, a: Value<'gc>, b: Value<'gc>, most: u64) -> Result<(bool, u64), Fault> {
+pub(crate) fn equal<'gc>(mc: &Mutation<'gc>, left: Value<'gc>, right: Value<'gc>, most: u64) -> Result<(bool, u64), Fault> {
     let (strings, vectors) = (Strings::new(mc), Vectors::new(mc));
-    let (mut next, mut todo, mut phases) = (Some((a, b)), ScratchVec::new(mc), Phases::new(mc));
+    let (mut next, mut todo, mut phases) = (Some((left, right)), ScratchVec::new(mc), Phases::new(mc));
     let mut compared = 0;
     loop {
-        let (a, b) = match next.take().map(|(a, b)| Work::Values(a, b)).or_else(|| todo.pop()) {
+        let (left, right) = match next.take().map(|(left, right)| Work::Values(left, right)).or_else(|| todo.pop()) {
             None => return Ok((true, compared)),
-            Some(Work::Values(a, b)) => (a, b),
-            Some(Work::Items(x, y, i)) => {
-                if i + 1 < x.len(mc) {
-                    todo.push(Work::Items(x, y, i + 1))?;
+            Some(Work::Values(left, right)) => (left, right),
+            Some(Work::Items(first, second, index)) => {
+                if index + 1 < first.len(mc) {
+                    todo.push(Work::Items(first, second, index + 1))?;
                 }
-                (x.get(mc, i).ok_or(Fault::Malformed)?, y.get(mc, i).ok_or(Fault::Malformed)?)
+                (first.get(mc, index).ok_or(Fault::Malformed)?, second.get(mc, index).ok_or(Fault::Malformed)?)
             }
-            Some(Work::Fields(x, y, i)) => {
-                let (xs, ys) = (x.items(mc), y.items(mc));
-                if i + 1 < xs.len() {
-                    todo.push(Work::Fields(x, y, i + 1))?;
+            Some(Work::Fields(first, second, index)) => {
+                let (xs, ys) = (first.items(mc), second.items(mc));
+                if index + 1 < xs.len() {
+                    todo.push(Work::Fields(first, second, index + 1))?;
                 }
-                (xs.get(i), ys.get(i))
+                (xs.get(index), ys.get(index))
             }
         };
         compared += 1;
         if compared > most {
             return Err(Fault::OutOfFuel);
         }
-        if eqv(mc, a, b) {
+        if eqv(mc, left, right) {
             continue;
         }
-        if let (Some(s), Some(t)) = (strings.string(a), strings.string(b)) {
-            let (na, nb) = (string::len(&strings, s), string::len(&strings, t));
+        if let (Some(first), Some(second)) = (strings.string(left), strings.string(right)) {
+            let (na, nb) = (string::len(&strings, first), string::len(&strings, second));
             if na != nb {
                 return Ok((false, compared));
             }
@@ -91,13 +91,13 @@ pub(crate) fn equal<'gc>(mc: &Mutation<'gc>, a: Value<'gc>, b: Value<'gc>, most:
             if compared > most {
                 return Err(Fault::OutOfFuel);
             }
-            if !string::equal(&strings, s, t)? {
+            if !string::equal(&strings, first, second)? {
                 return Ok((false, compared));
             }
             continue;
         }
-        if let (Some(x), Some(y)) = (AnyBytevector::of(a), AnyBytevector::of(b)) {
-            let (na, nb) = (x.len(mc), y.len(mc));
+        if let (Some(first), Some(second)) = (AnyBytevector::of(left), AnyBytevector::of(right)) {
+            let (na, nb) = (first.len(mc), second.len(mc));
             if na != nb {
                 return Ok((false, compared));
             }
@@ -105,32 +105,32 @@ pub(crate) fn equal<'gc>(mc: &Mutation<'gc>, a: Value<'gc>, b: Value<'gc>, most:
             if compared > most {
                 return Err(Fault::OutOfFuel);
             }
-            if !x.same_bytes(mc, y) {
+            if !first.same_bytes(mc, second) {
                 return Ok((false, compared));
             }
             continue;
         }
-        let (Some(x), Some(y)) = (Compound::of(mc, &vectors, a), Compound::of(mc, &vectors, b)) else { return Ok((false, compared)) };
-        let same_shape = match (x, y) {
-            (Compound::Vector(x), Compound::Vector(y)) => x.len(mc) == y.len(mc),
+        let (Some(first), Some(second)) = (Compound::of(mc, &vectors, left), Compound::of(mc, &vectors, right)) else { return Ok((false, compared)) };
+        let same_shape = match (first, second) {
+            (Compound::Vector(first), Compound::Vector(second)) => first.len(mc) == second.len(mc),
             (Compound::Pair(_), Compound::Pair(_)) | (Compound::Box(_), Compound::Box(_)) => true,
-            (Compound::Struct(x), Compound::Struct(y)) => x.kind(mc) == y.kind(mc),
+            (Compound::Struct(first), Compound::Struct(second)) => first.kind(mc) == second.kind(mc),
             _ => false,
         };
         if !same_shape {
             return Ok((false, compared));
         }
-        if phases.seen(a, b)? {
+        if phases.seen(left, right)? {
             continue;
         }
-        match (x, y) {
-            (Compound::Pair(x), Compound::Pair(y)) => {
-                todo.push(Work::Values(x.tail(mc), y.tail(mc)))?;
-                next = Some((x.head(mc), y.head(mc)));
+        match (first, second) {
+            (Compound::Pair(first), Compound::Pair(second)) => {
+                todo.push(Work::Values(first.tail(mc), second.tail(mc)))?;
+                next = Some((first.head(mc), second.head(mc)));
             }
-            (Compound::Vector(x), Compound::Vector(y)) if !x.is_empty(mc) => todo.push(Work::Items(x, y, 0))?,
-            (Compound::Box(x), Compound::Box(y)) => next = Some((x.value(mc), y.value(mc))),
-            (Compound::Struct(x), Compound::Struct(y)) if !x.items(mc).is_empty() => todo.push(Work::Fields(x, y, 0))?,
+            (Compound::Vector(first), Compound::Vector(second)) if !first.is_empty(mc) => todo.push(Work::Items(first, second, 0))?,
+            (Compound::Box(first), Compound::Box(second)) => next = Some((first.value(mc), second.value(mc))),
+            (Compound::Struct(first), Compound::Struct(second)) if !first.items(mc).is_empty() => todo.push(Work::Fields(first, second, 0))?,
             _ => {}
         }
     }
@@ -154,18 +154,18 @@ enum Compound<'gc> {
 }
 
 impl<'gc> Compound<'gc> {
-    fn of(mc: &Mutation<'gc>, vectors: &Vectors<'_, 'gc>, v: Value<'gc>) -> Option<Self> {
-        if let Some(pair) = Pair::of(v) {
+    fn of(mc: &Mutation<'gc>, vectors: &Vectors<'_, 'gc>, value: Value<'gc>) -> Option<Self> {
+        if let Some(pair) = Pair::of(value) {
             return Some(Compound::Pair(pair));
         }
-        if let Some(vector) = vectors.vector(v) {
+        if let Some(vector) = vectors.vector(value) {
             return Some(Compound::Vector(vector));
         }
         // Struct instances belonging to an identity type compare `equal?` strictly by pointer identity (`eq?`).
-        if let Some(made) = v.downcast::<objects::Struct>(mc) {
+        if let Some(made) = value.downcast::<objects::Struct>(mc) {
             return made.kind(mc).is_some_and(|kind| !structs::type_flags(mc, kind).contains(TypeFlags::IDENTITY)).then_some(Compound::Struct(made));
         }
-        v.downcast::<objects::Box>(mc).map(Compound::Box)
+        value.downcast::<objects::Box>(mc).map(Compound::Box)
     }
 }
 
@@ -189,9 +189,9 @@ impl<'gc> Phases<'gc> {
         }
     }
 
-    /// Checks whether compound values `a` and `b` have already been unified into the same equivalence class
+    /// Checks whether compound values `left` and `right` have already been unified into the same equivalence class
     /// during cycle detection, returning `true` to avoid re-comparing cycles.
-    fn seen(&mut self, a: Value<'_>, b: Value<'_>) -> Result<bool, OutOfMemory> {
+    fn seen(&mut self, left: Value<'_>, right: Value<'_>) -> Result<bool, OutOfMemory> {
         if self.k == -(SLOW as i64) {
             self.k = (self.next_random() % (2 * PRECHECK)) as i64;
         }
@@ -199,7 +199,7 @@ impl<'gc> Phases<'gc> {
         if self.k >= 0 {
             return Ok(false);
         }
-        if self.classes.union(a, b)? {
+        if self.classes.union(left, right)? {
             self.k = 0;
             return Ok(true);
         }
@@ -212,12 +212,12 @@ impl<'gc> Phases<'gc> {
         if self.random == 0 {
             self.random = RandomState::new().hash_one(self.classes.parent.len()) | 1;
         }
-        let mut x = self.random;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.random = x;
-        x
+        let mut state = self.random;
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        self.random = state;
+        state
     }
 }
 
@@ -231,35 +231,35 @@ struct Classes<'gc> {
 }
 
 impl Classes<'_> {
-    /// Merges the equivalence classes of values `a` and `b`. Returns `true` if they were already in the same equivalence class.
-    fn union(&mut self, a: Value<'_>, b: Value<'_>) -> Result<bool, OutOfMemory> {
-        let (x, y) = (self.find(a)?, self.find(b)?);
-        if x == y {
+    /// Merges the equivalence classes of values `left` and `right`. Returns `true` if they were already in the same equivalence class.
+    fn union(&mut self, left: Value<'_>, right: Value<'_>) -> Result<bool, OutOfMemory> {
+        let (first, second) = (self.find(left)?, self.find(right)?);
+        if first == second {
             return Ok(true);
         }
-        let (small, large) = if self.size[x] < self.size[y] { (x, y) } else { (y, x) };
+        let (small, large) = if self.size[first] < self.size[second] { (first, second) } else { (second, first) };
         self.parent[small] = large;
         self.size[large] += self.size[small];
         Ok(false)
     }
 
-    fn find(&mut self, v: Value<'_>) -> Result<usize, OutOfMemory> {
-        let mut i = match self.index.get(&v.to_bits()) {
-            Some(&i) => i,
+    fn find(&mut self, value: Value<'_>) -> Result<usize, OutOfMemory> {
+        let mut node = match self.index.get(&value.to_bits()) {
+            Some(&node) => node,
             None => {
                 self.charge.grow(CLASS_COST)?;
                 let fresh = self.parent.len();
-                self.index.insert(v.to_bits(), fresh);
+                self.index.insert(value.to_bits(), fresh);
                 self.parent.push(fresh);
                 self.size.push(1);
                 fresh
             }
         };
-        while self.parent[i] != i {
-            self.parent[i] = self.parent[self.parent[i]];
-            i = self.parent[i];
+        while self.parent[node] != node {
+            self.parent[node] = self.parent[self.parent[node]];
+            node = self.parent[node];
         }
-        Ok(i)
+        Ok(node)
     }
 }
 
@@ -271,12 +271,12 @@ struct WordHasher(u64);
 
 impl Hasher for WordHasher {
     fn write(&mut self, bytes: &[u8]) {
-        bytes.iter().for_each(|&b| self.write_u64(u64::from(b)));
+        bytes.iter().for_each(|&byte| self.write_u64(u64::from(byte)));
     }
 
-    fn write_u64(&mut self, n: u64) {
-        let m = u128::from(self.0 ^ n) * 0x9E37_79B9_7F4A_7C15;
-        self.0 = (m >> 64) as u64 ^ m as u64;
+    fn write_u64(&mut self, word: u64) {
+        let product = u128::from(self.0 ^ word) * 0x9E37_79B9_7F4A_7C15;
+        self.0 = (product >> 64) as u64 ^ product as u64;
     }
 
     fn finish(&self) -> u64 {

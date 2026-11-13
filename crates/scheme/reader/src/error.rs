@@ -45,9 +45,9 @@ pub enum ErrorKind {
 }
 
 impl From<ragwort_parser_scheme::ErrorKind> for ErrorKind {
-    fn from(e: ragwort_parser_scheme::ErrorKind) -> Self {
+    fn from(kind: ragwort_parser_scheme::ErrorKind) -> Self {
         use ragwort_parser_scheme::ErrorKind as Lex;
-        match e {
+        match kind {
             Lex::Unclosed => Self::Unclosed,
             Lex::Unsupported => Self::Unsupported,
             Lex::BadChar => Self::BadChar,
@@ -58,14 +58,14 @@ impl From<ragwort_parser_scheme::ErrorKind> for ErrorKind {
 }
 
 impl From<OutOfMemory> for ErrorKind {
-    fn from(e: OutOfMemory) -> Self {
-        Self::Arena(e.into())
+    fn from(error: OutOfMemory) -> Self {
+        Self::Arena(error.into())
     }
 }
 
 impl From<Error> for ErrorKind {
-    fn from(e: Error) -> Self {
-        Self::Arena(e)
+    fn from(error: Error) -> Self {
+        Self::Arena(error)
     }
 }
 
@@ -89,8 +89,8 @@ impl ReadError {
 }
 
 impl fmt::Display for ErrorKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
             ErrorKind::UnexpectedClose => "a closing bracket with no list open",
             ErrorKind::Mismatched { .. } => "a list closed with the wrong bracket",
             ErrorKind::Unclosed => "a list, string or comment that's never closed",
@@ -114,8 +114,8 @@ impl fmt::Display for ErrorKind {
 }
 
 impl fmt::Display for ReadError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} at bytes {}..{}", self.kind, self.start, self.end)
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} at bytes {}..{}", self.kind, self.start, self.end)
     }
 }
 

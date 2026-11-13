@@ -112,12 +112,12 @@ impl Request {
     /// Executes the request with `args`, which must satisfy [takes](Request::takes).
     pub(crate) fn run<'gc>(self, outer: &mut Outer<'_, 'gc>, args: Args<'gc>) -> Result<Then<'gc>, Fault> {
         let (mc, task) = (outer.mc(), outer.task());
-        let arg = |i| args.get(mc, i);
+        let arg = |index| args.get(mc, index);
         Ok(match self {
             Request::Apply => Then::Call(arg(0)?, args.tail(mc, 1)?.spread_last(mc)?),
             Request::ApplyValues => {
-                let v = arg(1)?;
-                Then::Call(arg(0)?, if v.downcast::<MultiValue>(mc).is_some() { Args::list(v) } else { Args::one(v) })
+                let value = arg(1)?;
+                Then::Call(arg(0)?, if value.downcast::<MultiValue>(mc).is_some() { Args::list(value) } else { Args::one(value) })
             }
             Request::WithMark => {
                 outer.segments.set_mark(arg(0)?, arg(1)?)?;
@@ -129,12 +129,12 @@ impl Request {
             }
             Request::Abort => outer.abort(tag_of(mc, arg(0)?)?, args.tail(mc, 1)?)?,
             Request::Capture => {
-                let k = prompts::capture(mc, task, tag_of(mc, arg(0)?)?, false)?;
-                Then::Call(arg(1)?, Args::one(k))
+                let continuation = prompts::capture(mc, task, tag_of(mc, arg(0)?)?, false)?;
+                Then::Call(arg(1)?, Args::one(continuation))
             }
             Request::CallCc => {
-                let k = prompts::capture(mc, task, prompts::default_tag(), true)?;
-                Then::Call(arg(0)?, Args::one(k))
+                let continuation = prompts::capture(mc, task, prompts::default_tag(), true)?;
+                Then::Call(arg(0)?, Args::one(continuation))
             }
             Request::Compose => {
                 prompts::compose(mc, task, arg(0)?.downcast::<Continuation>(mc).ok_or(Fault::WrongType)?)?;

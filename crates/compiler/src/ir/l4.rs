@@ -48,17 +48,17 @@ pub(crate) enum Bind<'id> {
 }
 
 impl<'id, 'gc> Children<'id, 'gc> for Bind<'id> {
-    fn each(self, _: &L4<'id, 'gc>, f: &mut impl FnMut(Id<'id>)) {
+    fn each(self, _: &L4<'id, 'gc>, visit: &mut impl FnMut(Id<'id>)) {
         if let Bind::Val(_, init) = self {
-            f(init);
+            visit(init);
         }
     }
 }
 
 impl<'id, 'gc> Bodies<'id, 'gc> for Bind<'id> {
-    fn bodies(self, tree: &L4<'id, 'gc>, f: &mut impl FnMut(Id<'id>)) {
+    fn bodies(self, tree: &L4<'id, 'gc>, visit: &mut impl FnMut(Id<'id>)) {
         if let Bind::Fix(group) = self {
-            tree[group].iter().for_each(|&(_, fun)| f(tree[fun].body));
+            tree[group].iter().for_each(|&(_, fun)| visit(tree[fun].body));
         }
     }
 }
@@ -72,8 +72,8 @@ pub(crate) struct JoinCode<'id> {
 }
 
 impl<'id, 'gc> Children<'id, 'gc> for JoinCode<'id> {
-    fn each(self, _: &L4<'id, 'gc>, f: &mut impl FnMut(Id<'id>)) {
-        f(self.body);
+    fn each(self, _: &L4<'id, 'gc>, visit: &mut impl FnMut(Id<'id>)) {
+        visit(self.body);
     }
 }
 
@@ -96,17 +96,17 @@ impl<'id, 'gc> L4<'id, 'gc> {
     /// Returns the variables introduced by `bind`.
     pub(crate) fn vars(&self, bind: Bind<'id>) -> impl Iterator<Item = Var> + '_ {
         let (one, group) = match bind {
-            Bind::Val(v, _) => (Some(v), &[][..]),
+            Bind::Val(var, _) => (Some(var), &[][..]),
             Bind::Fix(group) => (None, &self[group]),
         };
-        one.into_iter().chain(group.iter().map(|&(v, _)| v))
+        one.into_iter().chain(group.iter().map(|&(var, _)| var))
     }
 
     /// Panics if the tree rooted at `root` is malformed. Used by debug-build checks.
     #[cfg(debug_assertions)]
     pub(crate) fn check(&self, root: Id<'id>) {
-        if let Err(e) = self.verify(root) {
-            panic!("malformed L4: {e}");
+        if let Err(error) = self.verify(root) {
+            panic!("malformed L4: {error}");
         }
     }
 
@@ -144,13 +144,13 @@ impl<'id, 'gc> L4<'id, 'gc> {
         while let Some(task) = todo.pop() {
             let scope = scopes.last_mut().expect("the code's scope is never left");
             match task {
-                Task::Bind(v) => {
-                    if !bound.insert(v) {
-                        return Err(format!("{v:?} is bound twice"));
+                Task::Bind(var) => {
+                    if !bound.insert(var) {
+                        return Err(format!("{var:?} is bound twice"));
                     }
-                    scope.locals.insert(v);
+                    scope.locals.insert(var);
                 }
-                Task::Unbind(v) => _ = scope.locals.remove(&v),
+                Task::Unbind(var) => _ = scope.locals.remove(&var),
                 Task::Joins(codes) => {
                     for code in &self[codes] {
                         if scope.joins.insert(code.id, self[code.params].len()).is_some() {
@@ -167,8 +167,8 @@ impl<'id, 'gc> L4<'id, 'gc> {
                     let clos = self[fun];
                     for &src in &self[clos.captures] {
                         let ok = match src {
-                            UpvalSource::Local(v) => scope.locals.contains(&v),
-                            UpvalSource::Upvalue(u) => u < scope.upvalues,
+                            UpvalSource::Local(var) => scope.locals.contains(&var),
+                            UpvalSource::Upvalue(index) => index < scope.upvalues,
                             UpvalSource::SelfClosure => scope.closure,
                         };
                         if !ok {
@@ -180,11 +180,11 @@ impl<'id, 'gc> L4<'id, 'gc> {
                         return Err(format!("{fun:?} has more optional parameters than parameters"));
                     }
                     let mut inner = Scope { upvalues: count(self[clos.captures].len()), closure: true, ..Scope::default() };
-                    for &v in params.iter().chain(&clos.rest) {
-                        if !bound.insert(v) {
-                            return Err(format!("{v:?} is bound twice"));
+                    for &var in params.iter().chain(&clos.rest) {
+                        if !bound.insert(var) {
+                            return Err(format!("{var:?} is bound twice"));
                         }
-                        inner.locals.insert(v);
+                        inner.locals.insert(var);
                     }
                     scopes.push(inner);
                     todo.extend([Task::Leave, Task::Expr(clos.body)]);
@@ -194,8 +194,8 @@ impl<'id, 'gc> L4<'id, 'gc> {
                         return Err(format!("{id:?} has two parents"));
                     }
                     let in_scope = match self[id] {
-                        Node::Ref(VarRef::Local(v)) | Node::Set(v, _) => scope.locals.contains(&v),
-                        Node::Ref(VarRef::Upvalue(u)) => u < scope.upvalues,
+                        Node::Ref(VarRef::Local(var)) | Node::Set(var, _) => scope.locals.contains(&var),
+                        Node::Ref(VarRef::Upvalue(index)) => index < scope.upvalues,
                         Node::Ref(VarRef::SelfClosure) => scope.closure,
                         Node::Jump(join, args) => scope.joins.get(&join) == Some(&self[args].len()),
                         _ => true,
@@ -207,9 +207,9 @@ impl<'id, 'gc> L4<'id, 'gc> {
                         Node::Let(binds, body) => {
                             for &bind in &self[binds] {
                                 match bind {
-                                    Bind::Val(v, init) => then.extend([Task::Expr(init), Task::Bind(v)]),
+                                    Bind::Val(var, init) => then.extend([Task::Expr(init), Task::Bind(var)]),
                                     Bind::Fix(group) => {
-                                        then.extend(self[group].iter().map(|&(v, _)| Task::Bind(v)));
+                                        then.extend(self[group].iter().map(|&(var, _)| Task::Bind(var)));
                                         then.extend(self[group].iter().map(|&(_, fun)| Task::Closure(fun)));
                                     }
                                 }
@@ -222,9 +222,9 @@ impl<'id, 'gc> L4<'id, 'gc> {
                         Node::Join(body, codes) => {
                             then.extend([Task::Joins(codes), Task::Expr(body)]);
                             for code in &self[codes] {
-                                then.extend(self[code.params].iter().map(|&v| Task::Bind(v)));
+                                then.extend(self[code.params].iter().map(|&var| Task::Bind(var)));
                                 then.push(Task::Expr(code.body));
-                                then.extend(self[code.params].iter().map(|&v| Task::Unbind(v)));
+                                then.extend(self[code.params].iter().map(|&var| Task::Unbind(var)));
                             }
                             then.push(Task::Unjoin(codes));
                         }

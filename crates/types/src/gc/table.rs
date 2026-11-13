@@ -53,15 +53,15 @@ pub trait Kind: sealed::Sealed + 'static {
     #[doc(hidden)]
     fn alloc<'gc>(mc: &Mutation<'gc>, slots: usize) -> Result<Gc<'gc, Self::Buf>, OutOfMemory>;
 
-    /// The entry in slot `i`, unless it's dead.
+    /// The entry in slot `index`, unless it's dead.
     #[doc(hidden)]
-    fn entry<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, Self::Buf>, i: usize) -> Option<Self::Entry<'gc>>;
+    fn entry<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, Self::Buf>, index: usize) -> Option<Self::Entry<'gc>>;
 
     #[doc(hidden)]
-    fn set<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, Self::Buf>, i: usize, entry: Self::Entry<'gc>);
+    fn set<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, Self::Buf>, index: usize, entry: Self::Entry<'gc>);
 
     #[doc(hidden)]
-    fn kill<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, Self::Buf>, i: usize);
+    fn kill<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, Self::Buf>, index: usize);
 
     /// What an identity table hashes the entry by.
     #[doc(hidden)]
@@ -96,21 +96,21 @@ impl Kind for Strong {
     }
 
     #[inline]
-    fn entry<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, Pairs>, i: usize) -> Option<Self::Entry<'gc>> {
+    fn entry<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, Pairs>, index: usize) -> Option<Self::Entry<'gc>> {
         let items = buf.items(mc);
-        let key = items.get(2 * i);
-        (key != Value::BROKEN).then(|| (key, items.get(2 * i + 1)))
+        let key = items.get(2 * index);
+        (key != Value::BROKEN).then(|| (key, items.get(2 * index + 1)))
     }
 
     #[inline]
-    fn set<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, Pairs>, i: usize, (key, value): Self::Entry<'gc>) {
+    fn set<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, Pairs>, index: usize, (key, value): Self::Entry<'gc>) {
         let items = buf.items(mc);
-        items.set(mc, 2 * i, key);
-        items.set(mc, 2 * i + 1, value);
+        items.set(mc, 2 * index, key);
+        items.set(mc, 2 * index + 1, value);
     }
 
-    fn kill<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, Pairs>, i: usize) {
-        Self::set(mc, buf, i, (Value::BROKEN, Value::BROKEN));
+    fn kill<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, Pairs>, index: usize) {
+        Self::set(mc, buf, index, (Value::BROKEN, Value::BROKEN));
     }
 
     fn identity<'gc>(_: &Mutation<'gc>, (key, _): Self::Entry<'gc>) -> Value<'gc> {
@@ -129,17 +129,17 @@ impl Kind for Ephemerons {
     }
 
     #[inline]
-    fn entry<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, EphemeronPairs>, i: usize) -> Option<Self::Entry<'gc>> {
-        buf.entry(mc, i)
+    fn entry<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, EphemeronPairs>, index: usize) -> Option<Self::Entry<'gc>> {
+        buf.entry(mc, index)
     }
 
     #[inline]
-    fn set<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, EphemeronPairs>, i: usize, (key, value): Self::Entry<'gc>) {
-        buf.set_entry(mc, i, key, value);
+    fn set<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, EphemeronPairs>, index: usize, (key, value): Self::Entry<'gc>) {
+        buf.set_entry(mc, index, key, value);
     }
 
-    fn kill<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, EphemeronPairs>, i: usize) {
-        buf.set_entry(mc, i, Value::BROKEN, Value::BROKEN);
+    fn kill<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, EphemeronPairs>, index: usize) {
+        buf.set_entry(mc, index, Value::BROKEN, Value::BROKEN);
     }
 
     fn identity<'gc>(_: &Mutation<'gc>, (key, _): Self::Entry<'gc>) -> Value<'gc> {
@@ -158,17 +158,17 @@ impl<U: Object> Kind for WeakObjects<U> {
     }
 
     #[inline]
-    fn entry<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, WeakSlots<U>>, i: usize) -> Option<Gc<'gc, U>> {
-        buf.item_slots::<slot::Weak<U>>(mc).get(i)
+    fn entry<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, WeakSlots<U>>, index: usize) -> Option<Gc<'gc, U>> {
+        buf.item_slots::<slot::Weak<U>>(mc).get(index)
     }
 
     #[inline]
-    fn set<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, WeakSlots<U>>, i: usize, entry: Gc<'gc, U>) {
-        buf.item_slots::<slot::Weak<U>>(mc).set(mc, i, Some(entry));
+    fn set<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, WeakSlots<U>>, index: usize, entry: Gc<'gc, U>) {
+        buf.item_slots::<slot::Weak<U>>(mc).set(mc, index, Some(entry));
     }
 
-    fn kill<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, WeakSlots<U>>, i: usize) {
-        buf.item_slots::<slot::Weak<U>>(mc).set(mc, i, None);
+    fn kill<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, WeakSlots<U>>, index: usize) {
+        buf.item_slots::<slot::Weak<U>>(mc).set(mc, index, None);
     }
 
     fn identity<'gc>(mc: &Mutation<'gc>, entry: Gc<'gc, U>) -> Value<'gc> {
@@ -180,8 +180,8 @@ impl<U: Object> Kind for WeakObjects<U> {
 /// the same if they're the same word.
 #[inline]
 pub fn eq_hash(value: Value<'_>) -> u64 {
-    let x = value.to_bits().wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    x ^ x >> 29
+    let product = value.to_bits().wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    product ^ product >> 29
 }
 
 /// Where a probe for a key ended.
@@ -292,9 +292,9 @@ impl<'gc, K: Kind> Table<'gc, K> {
         same: impl FnMut(K::Entry<'gc>) -> Result<bool, E>,
     ) -> Result<Option<K::Entry<'gc>>, E> {
         match self.probe(mc, key_of(hash), same)? {
-            Probe::Found(i, entry) => {
+            Probe::Found(index, entry) => {
                 if let Some((_, buf)) = self.parts(mc) {
-                    K::kill(mc, buf, i);
+                    K::kill(mc, buf, index);
                 }
                 Ok(Some(entry))
             }
@@ -313,20 +313,20 @@ impl<'gc, K: Kind> Table<'gc, K> {
     ) -> Result<Probe<K::Entry<'gc>>, E> {
         let Some((keys, buf)) = self.parts(mc) else { return Ok(Probe::Missing(None)) };
         let mask = keys.len().wrapping_sub(1);
-        let mut i = home(key, mask);
+        let mut index = home(key, mask);
         let mut free = None;
         for _ in 0..keys.len() {
-            match keys.get(i) {
-                0 => return Ok(Probe::Missing(free.or(Some(i)))),
-                k if k == key => match K::entry(mc, buf, i) {
-                    Some(entry) if same(entry)? => return Ok(Probe::Found(i, entry)),
+            match keys.get(index) {
+                0 => return Ok(Probe::Missing(free.or(Some(index)))),
+                stored if stored == key => match K::entry(mc, buf, index) {
+                    Some(entry) if same(entry)? => return Ok(Probe::Found(index, entry)),
                     Some(_) => {}
-                    None => free = free.or(Some(i)),
+                    None => free = free.or(Some(index)),
                 },
-                _ if free.is_none() && K::entry(mc, buf, i).is_none() => free = Some(i),
+                _ if free.is_none() && K::entry(mc, buf, index).is_none() => free = Some(index),
                 _ => {}
             }
-            i = (i + 1) & mask;
+            index = (index + 1) & mask;
         }
         Ok(Probe::Missing(free))
     }
@@ -336,12 +336,12 @@ impl<'gc, K: Kind> Table<'gc, K> {
     fn put(self, mc: &Mutation<'gc>, key: u64, free: Option<usize>, entry: K::Entry<'gc>) -> Result<(), OutOfMemory> {
         let used = self.head.used(mc) as usize;
         let capacity = self.capacity(mc);
-        let reused = free.zip(self.parts(mc)).is_some_and(|(i, (keys, _))| keys.get(i) != 0);
-        let i = match free {
-            Some(i) if reused => i,
-            Some(i) if (used + 1) * 4 <= capacity * 3 => {
+        let reused = free.zip(self.parts(mc)).is_some_and(|(index, (keys, _))| keys.get(index) != 0);
+        let index = match free {
+            Some(index) if reused => index,
+            Some(index) if (used + 1) * 4 <= capacity * 3 => {
                 self.head.set_used(mc, used as u64 + 1);
-                i
+                index
             }
             _ => {
                 self.rebuild(mc, false)?;
@@ -350,8 +350,8 @@ impl<'gc, K: Kind> Table<'gc, K> {
             }
         };
         if let Some((keys, buf)) = self.parts(mc) {
-            keys.set(mc, i, key);
-            K::set(mc, buf, i, entry);
+            keys.set(mc, index, key);
+            K::set(mc, buf, index, entry);
         }
         Ok(())
     }
@@ -359,12 +359,12 @@ impl<'gc, K: Kind> Table<'gc, K> {
     fn unused_slot(self, mc: &Mutation<'gc>, key: u64) -> Option<usize> {
         let (keys, _) = self.parts(mc)?;
         let mask = keys.len().wrapping_sub(1);
-        let mut i = home(key, mask);
+        let mut index = home(key, mask);
         for _ in 0..keys.len() {
-            if keys.get(i) == 0 {
-                return Some(i);
+            if keys.get(index) == 0 {
+                return Some(index);
             }
-            i = (i + 1) & mask;
+            index = (index + 1) & mask;
         }
         None
     }
@@ -384,9 +384,9 @@ impl<'gc, K: Kind> Table<'gc, K> {
         for j in 0..old_keys.len() {
             let Some(entry) = (old_keys.get(j) != 0).then(|| K::entry(mc, old_buf, j)).flatten() else { continue };
             let key = if rehash { key_of(eq_hash(K::identity(mc, entry))) } else { old_keys.get(j) };
-            if let Some(i) = self.unused_slot(mc, key) {
-                keys.items(mc).set(mc, i, key);
-                K::set(mc, buf, i, entry);
+            if let Some(index) = self.unused_slot(mc, key) {
+                keys.items(mc).set(mc, index, key);
+                K::set(mc, buf, index, entry);
             }
         }
         Ok(())
@@ -416,7 +416,7 @@ impl<'gc, K: for<'a> Kind<Entry<'a> = (Value<'a>, Value<'a>)>> Table<'gc, K> {
         hash: u64,
         mut same: impl FnMut(Value<'gc>) -> Result<bool, E>,
     ) -> Result<Option<Value<'gc>>, E> {
-        Ok(self.find(mc, hash, |(k, _)| same(k))?.map(|(_, v)| v))
+        Ok(self.find(mc, hash, |(key, _)| same(key))?.map(|(_, value)| value))
     }
 
     /// Sets the value of the live entry with this hash whose key `same` accepts, or adds an
@@ -429,16 +429,16 @@ impl<'gc, K: for<'a> Kind<Entry<'a> = (Value<'a>, Value<'a>)>> Table<'gc, K> {
         key: Value<'gc>,
         value: Value<'gc>,
     ) -> Result<Option<Value<'gc>>, E> {
-        let k = key_of(hash);
-        match self.probe(mc, k, |(old, _)| same(old))? {
-            Probe::Found(i, (old_key, old)) => {
+        let key_word = key_of(hash);
+        match self.probe(mc, key_word, |(old, _)| same(old))? {
+            Probe::Found(index, (old_key, old)) => {
                 if let Some((_, buf)) = self.parts(mc) {
-                    K::set(mc, buf, i, (old_key, value));
+                    K::set(mc, buf, index, (old_key, value));
                 }
                 Ok(Some(old))
             }
             Probe::Missing(free) => {
-                self.put(mc, k, free, (key, value))?;
+                self.put(mc, key_word, free, (key, value))?;
                 Ok(None)
             }
         }
@@ -447,19 +447,19 @@ impl<'gc, K: for<'a> Kind<Entry<'a> = (Value<'a>, Value<'a>)>> Table<'gc, K> {
     /// In an identity table, the value for `key`.
     pub fn get_eq(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<Value<'gc>>, OutOfMemory> {
         self.rehashed(mc)?;
-        self.get(mc, eq_hash(key), |k| Ok(k == key))
+        self.get(mc, eq_hash(key), |candidate| Ok(candidate == key))
     }
 
     /// In an identity table, sets `key`'s value and returns the one it replaced.
     pub fn insert_eq(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) -> Result<Option<Value<'gc>>, OutOfMemory> {
         self.rehashed(mc)?;
-        self.insert(mc, eq_hash(key), |k| Ok(k == key), key, value)
+        self.insert(mc, eq_hash(key), |candidate| Ok(candidate == key), key, value)
     }
 
     /// In an identity table, removes `key`'s entry and returns its value.
     pub fn remove_eq(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<Value<'gc>>, OutOfMemory> {
         self.rehashed(mc)?;
-        Ok(self.remove(mc, eq_hash(key), |(k, _)| Ok::<_, OutOfMemory>(k == key))?.map(|(_, v)| v))
+        Ok(self.remove(mc, eq_hash(key), |(candidate, _)| Ok::<_, OutOfMemory>(candidate == key))?.map(|(_, value)| value))
     }
 }
 
@@ -468,14 +468,14 @@ impl<'gc, U: Object> Table<'gc, WeakObjects<U>> {
     pub fn insert_eq(self, mc: &Mutation<'gc>, object: Gc<'gc, U>) -> Result<(), OutOfMemory> {
         self.rehashed(mc)?;
         let hash = eq_hash(Value::object(mc, object));
-        self.find_or_insert(mc, hash, |o| Ok(o == object), || Ok(object)).map(drop)
+        self.find_or_insert(mc, hash, |candidate| Ok(candidate == object), || Ok(object)).map(drop)
     }
 
     /// In an identity table, whether `object` is there.
     pub fn contains_eq(self, mc: &Mutation<'gc>, object: Gc<'gc, U>) -> Result<bool, OutOfMemory> {
         self.rehashed(mc)?;
         let hash = eq_hash(Value::object(mc, object));
-        Ok(self.find(mc, hash, |o| Ok::<_, OutOfMemory>(o == object))?.is_some())
+        Ok(self.find(mc, hash, |candidate| Ok::<_, OutOfMemory>(candidate == object))?.is_some())
     }
 }
 

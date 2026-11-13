@@ -287,8 +287,8 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         for &module in std::iter::once(&prelude).chain(implicit) {
             builder.require_implicitly(mc, symbols, module).map_err(|_| OutOfMemory)?;
         }
-        let keywords = KEYWORDS.iter().map(|&(name, k)| Ok((key(intern(name)?, mc), k))).collect::<Result<_, ragwort_types::Error>>()?;
-        let abbreviations = Abbreviation::ALL.iter().map(|a| intern(a.name())).collect::<Result<_, _>>()?;
+        let keywords = KEYWORDS.iter().map(|&(name, keyword)| Ok((key(intern(name)?, mc), keyword))).collect::<Result<_, ragwort_types::Error>>()?;
+        let abbreviations = Abbreviation::ALL.iter().map(|abbreviation| intern(abbreviation.name())).collect::<Result<_, _>>()?;
         let mut tree = Tree::new(mc, abbreviations);
         let top = tree.scopes.set(vec![TOP])?;
         let base = tree.scopes.set(vec![BASE])?;
@@ -340,7 +340,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     /// What the reader read, in the top-level scope.
     fn read(&mut self, node: Syntax<'gc>) -> Result<Stx, ExpandError> {
         let span = node.span(self.mc);
-        let stx = self.tree.read(node).map_err(|e| ExpandError { kind: e.into(), start: span.start(), end: span.end() })?;
+        let stx = self.tree.read(node).map_err(|error| ExpandError { kind: error.into(), start: span.start(), end: span.end() })?;
         Ok(self.tree.with(stx, TOP, Op::Add)?)
     }
 
@@ -352,12 +352,12 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             match self.head(form)? {
                 Head::Define(form) => {
                     let (id, value) = self.definition(form)?;
-                    let index = u32::try_from(out.len()).ok().and_then(|n| first.checked_add(n)).ok_or_else(|| self.error(OutOfMemory, form))?;
+                    let index = u32::try_from(out.len()).ok().and_then(|count| first.checked_add(count)).ok_or_else(|| self.error(OutOfMemory, form))?;
                     let slot = self.define_top(id, index)?;
                     match self.keyword_lambda(value)? {
                         Some(shape) => {
                             let name = self.tree.symbol(id).expect("definitions bind identifiers").value(self.mc);
-                            let core = self.builder.define_private(name, index).map_err(|e| self.module_error(e, id))?;
+                            let core = self.builder.define_private(name, index).map_err(|error| self.module_error(error, id))?;
                             self.builder.keyword_core(slot, core, shape);
                             out.push(Top(TopForm::DefineKeyword { procedure: slot, lambda: value }));
                         }
@@ -365,26 +365,26 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                     }
                 }
                 Head::DefineSyntax(form) => {
-                    let (id, m) = self.define_syntax_now(form)?;
-                    self.bind(id, Binding::Macro(m))?;
+                    let (id, macro_index) = self.define_syntax_now(form)?;
+                    self.bind(id, Binding::Macro(macro_index))?;
                 }
                 Head::Require(form) => {
                     for spec in self.proper(form)?.into_iter().skip(1) {
-                        let imports = self.spec(spec)?.imports(self.mc, resolver, self.builder.name()).map_err(|e| match e {
+                        let imports = self.spec(spec)?.imports(self.mc, resolver, self.builder.name()).map_err(|error| match error {
                             SpecError::Resolve(at) => self.error(ExpandErrorKind::Resolve, at),
                             SpecError::NotProvided(at) => self.error(ExpandErrorKind::NotProvided, at),
                         })?;
-                        self.builder.require(self.mc, self.symbols, imports).map_err(|e| self.module_error(e, spec))?;
+                        self.builder.require(self.mc, self.symbols, imports).map_err(|error| self.module_error(error, spec))?;
                     }
                 }
                 Head::Provide(form) => self.provides.push(form),
                 Head::Begin(forms) => queue.extend(forms.into_iter().rev()),
                 Head::Struct(form) => {
-                    let index = u32::try_from(out.len()).ok().and_then(|n| first.checked_add(n)).ok_or_else(|| self.error(OutOfMemory, form))?;
+                    let index = u32::try_from(out.len()).ok().and_then(|count| first.checked_add(count)).ok_or_else(|| self.error(OutOfMemory, form))?;
                     let declared = self.declare_struct(form, index)?;
                     out.push(Top(TopForm::Struct(declared)));
                 }
-                Head::Expr(e) => out.push(Top(TopForm::Expr(e))),
+                Head::Expr(expr) => out.push(Top(TopForm::Expr(expr))),
             }
         }
         Ok(())
@@ -397,14 +397,14 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 if self.is_id(spec) {
                     let symbol = self.tree.symbol(spec).expect("an identifier");
                     let name = self.text(spec).expect("an identifier");
-                    self.builder.provide(&name, symbol.value(self.mc)).map_err(|e| self.module_error(e, spec))?;
+                    self.builder.provide(&name, symbol.value(self.mc)).map_err(|error| self.module_error(error, spec))?;
                     continue;
                 }
                 let items = self.proper(spec)?;
                 let Some((&head, args)) = items.split_first() else { return Err(self.error(ExpandErrorKind::BadSyntax, spec)) };
                 let word = if self.is_id(head) { self.text(head) } else { None };
                 match (word.as_deref(), args) {
-                    (Some("all-defined-out"), []) => self.builder.provide_all(self.mc).map_err(|e| self.module_error(e, spec))?,
+                    (Some("all-defined-out"), []) => self.builder.provide_all(self.mc).map_err(|error| self.module_error(error, spec))?,
                     (Some("struct-out"), &[name, ref options @ ..]) if self.is_id(name) => {
                         let constructors = match options {
                             [] => true,
@@ -412,13 +412,13 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                             _ => return Err(self.error(ExpandErrorKind::BadSyntax, spec)),
                         };
                         let Binding::Slot(constructor) = self.resolve(name)? else { return Err(self.error(ExpandErrorKind::NotDefined, name)) };
-                        self.builder.provide_struct(self.mc, constructor, constructors).map_err(|e| self.module_error(e, name))?;
+                        self.builder.provide_struct(self.mc, constructor, constructors).map_err(|error| self.module_error(error, name))?;
                     }
                     (Some("rename-out"), renames) => {
                         for &rename in renames {
                             let (inner, external) = self.pair_of_names(rename)?;
                             let symbol = self.tree.symbol(inner).expect("an identifier");
-                            self.builder.provide(&external, symbol.value(self.mc)).map_err(|e| self.module_error(e, rename))?;
+                            self.builder.provide(&external, symbol.value(self.mc)).map_err(|error| self.module_error(error, rename))?;
                         }
                     }
                     _ => return Err(self.error(ExpandErrorKind::BadSyntax, spec)),
@@ -480,27 +480,27 @@ impl<'a, 'gc> Expander<'a, 'gc> {
 
     /// The text of `stx`, if it's an identifier or a string.
     pub(crate) fn text(&mut self, stx: Stx) -> Option<String> {
-        let s = match self.tree.symbol(stx) {
+        let string = match self.tree.symbol(stx) {
             Some(symbol) => symbol.name(self.mc),
             None => match self.tree.view(stx).ok()? {
                 View::Datum(value) => self.strings.string(value)?,
                 _ => return None,
             },
         };
-        Some(chars(&self.strings, s).collect())
+        Some(chars(&self.strings, string).collect())
     }
 
     /// The error of using the import `stx` as a value, which it doesn't have.
-    pub(crate) fn import_error(&self, e: Unusable, stx: Stx) -> ExpandError {
-        let kind = match e {
+    pub(crate) fn import_error(&self, error: Unusable, stx: Stx) -> ExpandError {
+        let kind = match error {
             Unusable::Uninitialized => ExpandErrorKind::Unbound,
             Unusable::MatchOnly => ExpandErrorKind::NoConstructor,
         };
         self.error(kind, stx)
     }
 
-    pub(crate) fn module_error(&self, e: ModuleError, stx: Stx) -> ExpandError {
-        let kind = match e {
+    pub(crate) fn module_error(&self, error: ModuleError, stx: Stx) -> ExpandError {
+        let kind = match error {
             ModuleError::Duplicate => ExpandErrorKind::Duplicate,
             ModuleError::Conflict => ExpandErrorKind::Conflict,
             ModuleError::NotDefined => ExpandErrorKind::NotDefined,
@@ -533,7 +533,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 Ok(module::Form::Define(procedure, value?))
             }
             TopForm::Struct(declared) => Ok(module::Form::Expr(self.lower_struct(declared))),
-            TopForm::Expr(e) => self.expand_now(e).map(module::Form::Expr),
+            TopForm::Expr(expr) => self.expand_now(expr).map(module::Form::Expr),
         }
     }
 
@@ -542,15 +542,15 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         self.builder.finish(self.mc)
     }
 
-    /// `e`, or if it says nowhere, as running out of room does, `e` where `stx` is.
-    fn placed(&self, e: ExpandError, stx: Stx) -> ExpandError {
-        if e.start == e.end { self.error(e.kind, stx) } else { e }
+    /// `error`, or if it says nowhere, as running out of room does, `error` where `stx` is.
+    fn placed(&self, error: ExpandError, stx: Stx) -> ExpandError {
+        if error.start == error.end { self.error(error.kind, stx) } else { error }
     }
 
     /// Whether `form` is a definition, of a variable or a macro, a `begin`, or some other
     /// expression, once the macro uses it is are expanded.
     fn head(&mut self, form: Stx) -> Result<Head, ExpandError> {
-        self.head_of(form).map_err(|e| self.placed(e, form))
+        self.head_of(form).map_err(|error| self.placed(error, form))
     }
 
     fn head_of(&mut self, mut form: Stx) -> Result<Head, ExpandError> {
@@ -561,9 +561,9 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 _ => return Ok(Head::Expr(form)),
             };
             form = match self.resolve(head)? {
-                Binding::Macro(m) => self.expand_macro(m, form)?,
+                Binding::Macro(macro_index) => self.expand_macro(macro_index, form)?,
                 _ if alone => return Ok(Head::Expr(form)),
-                Binding::Keyword(Keyword::Macro(m)) => self.transform(m, form)?,
+                Binding::Keyword(Keyword::Macro(kind)) => self.transform(kind, form)?,
                 Binding::Keyword(Keyword::Form(Form::Define)) => return Ok(Head::Define(form)),
                 Binding::Keyword(Keyword::Form(Form::DefineSyntax)) => return Ok(Head::DefineSyntax(form)),
                 Binding::Keyword(Keyword::Form(Form::Require)) => return Ok(Head::Require(form)),
@@ -608,9 +608,9 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     pub(crate) fn define_top(&mut self, id: Stx, form: u32) -> Result<u32, ExpandError> {
         let name = self.tree.symbol(id).expect("definitions bind identifiers").value(self.mc);
         if self.tree.scopes_of(id)? == self.top {
-            return self.builder.define(name, form).map_err(|e| self.module_error(e, id));
+            return self.builder.define(name, form).map_err(|error| self.module_error(error, id));
         }
-        let slot = self.builder.define_private(name, form).map_err(|e| self.module_error(e, id))?;
+        let slot = self.builder.define_private(name, form).map_err(|error| self.module_error(error, id))?;
         self.bind(id, Binding::Slot(slot))?;
         Ok(slot)
     }
@@ -624,26 +624,26 @@ impl<'a, 'gc> Expander<'a, 'gc> {
 
     /// What an identifier named `symbol` with the scopes `set` refers to.
     pub(crate) fn resolve_name(&self, symbol: Symbol<'gc>, set: Set) -> Result<Binding<'gc>, Ambiguous> {
-        let k = key(symbol, self.mc);
+        let name_key = key(symbol, self.mc);
         let scopes = &self.tree.scopes;
         // A binding visible to `id` is under one of `id`'s scopes, so look up whichever list
         // is shorter: `id`'s scopes, or those the name is bound under that are among them.
-        let bound_in = self.bound_in.get(&k).map_or(&[][..], Vec::as_slice);
+        let bound_in = self.bound_in.get(&name_key).map_or(&[][..], Vec::as_slice);
         let own = scopes.scopes(set);
         let (bound_in, own) = if bound_in.len() < own.len() { (bound_in, &[][..]) } else { (&[][..], own) };
         let candidates = || {
             let under = bound_in.iter().filter(|&&scope| scopes.contains(set, scope)).chain(own);
-            let lists = under.filter_map(|&scope| self.bindings.get(&(scope, k)));
-            lists.flatten().filter(|&&(s, _)| scopes.subset(s, set))
+            let lists = under.filter_map(|&scope| self.bindings.get(&(scope, name_key)));
+            lists.flatten().filter(|&&(bound, _)| scopes.subset(bound, set))
         };
         let mut best: Option<(Set, Binding<'gc>)> = None;
-        for &(s, binding) in candidates() {
-            if best.is_none_or(|(b, _)| scopes.subset(b, s)) {
-                best = Some((s, binding));
+        for &(bound, binding) in candidates() {
+            if best.is_none_or(|(best_set, _)| scopes.subset(best_set, bound)) {
+                best = Some((bound, binding));
             }
         }
         if let Some((best, binding)) = best {
-            if candidates().any(|&(s, _)| !scopes.subset(s, best)) {
+            if candidates().any(|&(bound, _)| !scopes.subset(bound, best)) {
                 return Err(Ambiguous);
             }
             return Ok(binding);
@@ -656,10 +656,10 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 module::Binding::Import(import) => Binding::Import(import),
             });
         }
-        if let Some(&keyword) = self.keywords.get(&k) {
+        if let Some(&keyword) = self.keywords.get(&name_key) {
             return Ok(Binding::Keyword(keyword));
         }
-        if base && let Some(&import) = self.base_cells.get(&k) {
+        if base && let Some(&import) = self.base_cells.get(&name_key) {
             return Ok(Binding::Import(import));
         }
         Ok(Binding::Free)
@@ -670,17 +670,17 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let set = self.tree.scopes_of(id)?;
         self.tree.scopes.charge(size_of::<(Set, Binding)>())?;
         let newest = self.tree.scopes.scopes(set).last().copied().unwrap_or(TOP);
-        let k = key(symbol, self.mc);
-        let under = self.bindings.entry((newest, k)).or_default();
+        let name_key = key(symbol, self.mc);
+        let under = self.bindings.entry((newest, name_key)).or_default();
         if under.is_empty() {
             self.tree.scopes.charge(size_of::<Scope>())?;
-            self.bound_in.entry(k).or_default().push(newest);
+            self.bound_in.entry(name_key).or_default().push(newest);
         }
         under.push((set, binding));
         Ok(())
     }
 
-    /// Makes a local variable for the identifier `id` and binds `id` to it. A lambda bound to the variable is reported under the identifier's name.
+    /// Allocates a local variable for the identifier `id` and binds `id` to it. If the variable is later bound to a lambda, error reports show the lambda under this name.
     pub(crate) fn local(&mut self, id: Stx) -> Result<Var, ExpandError> {
         let var = match self.tree.symbol(id) {
             Some(name) => self.builder.locals().named(name.value(self.mc)),
@@ -706,12 +706,12 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         Ok(())
     }
 
-    /// Applies the macro `m` to its use `stx`, flipping a fresh scope on what it's given and
+    /// Applies the macro `kind` to its use `stx`, flipping a fresh scope on what it's given and
     /// what it makes.
-    pub(crate) fn transform(&mut self, m: Macro, stx: Stx) -> Result<Stx, ExpandError> {
+    pub(crate) fn transform(&mut self, kind: Macro, stx: Stx) -> Result<Stx, ExpandError> {
         let intro = self.tree.scopes.fresh()?;
         let input = self.tree.with(stx, intro, Op::Flip)?;
-        let output = self.derived(m, input)?;
+        let output = self.derived(kind, input)?;
         Ok(self.tree.with(output, intro, Op::Flip)?)
     }
 
@@ -725,8 +725,8 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     /// the expression being expanded is.
     fn step(&mut self, call: Call<'a, 'gc>) -> Result<Ex<'a, 'gc>, ExpandError> {
         match call {
-            Call::Expr(stx) => self.expand(stx).map_err(|e| self.placed(e, stx)),
-            Call::Run(f) => f(self),
+            Call::Expr(stx) => self.expand(stx).map_err(|error| self.placed(error, stx)),
+            Call::Run(run) => run(self),
         }
     }
 
@@ -762,12 +762,12 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         if self.is_id(head) {
             match self.resolve(head)? {
                 Binding::Keyword(Keyword::Form(form)) => return self.form(form, stx, items, tail),
-                Binding::Keyword(Keyword::Macro(m)) => return Ok(Step::Tail(Call::Expr(self.transform(m, stx)?))),
+                Binding::Keyword(Keyword::Macro(kind)) => return Ok(Step::Tail(Call::Expr(self.transform(kind, stx)?))),
                 Binding::Keyword(Keyword::Aux(_)) => return Err(self.error(ExpandErrorKind::BadSyntax, head)),
-                Binding::Macro(m) => return Ok(Step::Tail(Call::Expr(self.expand_macro(m, stx)?))),
+                Binding::Macro(macro_index) => return Ok(Step::Tail(Call::Expr(self.expand_macro(macro_index, stx)?))),
                 Binding::Import(import) if tail.is_none() && !self.has_keyword_args(&items[1..]) => {
                     return Self::exprs(items[1..].to_vec(), move |this, args| {
-                        import.callable(this.mc, args.len()).map_err(|e| this.import_error(e, head))?;
+                        import.callable(this.mc, args.len()).map_err(|error| this.import_error(error, head))?;
                         Ok(Step::Done(Core::App(Box::new(Core::Import(import)), args, this.position(stx))))
                     });
                 }
@@ -780,10 +780,10 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         if self.has_keyword_args(&items[1..]) {
             return self.keyword_call(stx, head, items[1..].to_vec());
         }
-        Self::expr(head, move |_, f| Self::exprs(items[1..].to_vec(), move |this, args| Ok(Step::Done(Core::App(Box::new(f), args, this.position(stx))))))
+        Self::expr(head, move |_, callee| Self::exprs(items[1..].to_vec(), move |this, args| Ok(Step::Done(Core::App(Box::new(callee), args, this.position(stx))))))
     }
 
-    /// Returns the source position of the form `stx`, which a call or operation expanded from it reports in an error.
+    /// Returns the source position of the form `stx`. Error reports use it for a call or operation expanded from the form.
     pub(crate) fn position(&self, stx: Stx) -> Option<Position<'gc>> {
         Position::of(self.mc, self.tree.span(stx))
     }
@@ -815,7 +815,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             (Form::Syntax, &[template]) => Ok(Step::Done(self.syntax(template)?)),
             (Form::QuoteSyntax, &[datum]) => Ok(Step::Done(Core::Quote(self.wrap(datum)?))),
             (Form::Unsupported, _) => Err(self.error(ExpandErrorKind::Unsupported, stx)),
-            (Form::StructRef, &[s, kind, k]) => Self::exprs(vec![s, kind, k], move |this, parts| Ok(Step::Done(Core::Intrinsic(Prim::Intrinsic(Intrinsic::StructRef), parts, this.position(stx))))),
+            (Form::StructRef, &[instance, kind, index]) => Self::exprs(vec![instance, kind, index], move |this, parts| Ok(Step::Done(Core::Intrinsic(Prim::Intrinsic(Intrinsic::StructRef), parts, this.position(stx))))),
             _ => bad(self),
         }
     }
@@ -828,11 +828,11 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 None => self.builder.place(slot, self.form, self.defining),
             },
             Binding::Import(import) => {
-                import.usable(self.mc).map_err(|e| self.import_error(e, id))?;
+                import.usable(self.mc).map_err(|error| self.import_error(error, id))?;
                 return Ok(Step::Done(Core::Import(import)));
             }
             Binding::Free => return Err(self.error(ExpandErrorKind::Unbound, id)),
-            Binding::Macro(m) => return Ok(Step::Tail(Call::Expr(self.expand_macro(m, id)?))),
+            Binding::Macro(macro_index) => return Ok(Step::Tail(Call::Expr(self.expand_macro(macro_index, id)?))),
             Binding::Keyword(_) | Binding::Pattern { .. } => return Err(self.error(ExpandErrorKind::BadSyntax, id)),
         };
         Ok(Step::Done(Core::Ref(place)))
@@ -842,7 +842,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let place = match self.resolve(id)? {
             Binding::Local(var) => Place::Local(var),
             Binding::Slot(slot) => {
-                self.builder.assign(slot).map_err(|e| self.module_error(e, id))?;
+                self.builder.assign(slot).map_err(|error| self.module_error(error, id))?;
                 self.builder.place(slot, self.form, self.defining)
             }
             Binding::Import(_) => return Err(self.error(ExpandErrorKind::Immutable, id)),
@@ -944,37 +944,37 @@ impl<'a, 'gc> Expander<'a, 'gc> {
 
     /// Goes on looking at a body's forms till they're all found, each macro one defines made
     /// before those after it are looked at, then expands what they define and do.
-    fn scan(&mut self, mut s: Scan) -> Result<Ex<'a, 'gc>, ExpandError> {
-        while let Some(form) = s.queue.pop() {
+    fn scan(&mut self, mut scan: Scan) -> Result<Ex<'a, 'gc>, ExpandError> {
+        while let Some(form) = scan.queue.pop() {
             match self.head(form)? {
                 Head::Define(form) => {
                     let (id, value) = self.definition(form)?;
-                    s.defined.push(id);
-                    s.names.push(id);
-                    s.items.push(Item::Define(self.local(id)?, value));
+                    scan.defined.push(id);
+                    scan.names.push(id);
+                    scan.items.push(Item::Define(self.local(id)?, value));
                 }
                 Head::DefineSyntax(form) => {
                     let (id, expr) = self.syntax_definition(form)?;
-                    return self.transformer(expr, form, move |this, m| {
-                        s.names.push(id);
-                        this.bind(id, Binding::Macro(m))?;
-                        this.scan(s)
+                    return self.transformer(expr, form, move |this, macro_index| {
+                        scan.names.push(id);
+                        this.bind(id, Binding::Macro(macro_index))?;
+                        this.scan(scan)
                     });
                 }
                 Head::Require(form) | Head::Provide(form) | Head::Struct(form) => return Err(self.error(ExpandErrorKind::Definition, form)),
-                Head::Begin(forms) => s.queue.extend(forms.into_iter().rev()),
-                Head::Expr(e) => s.items.push(Item::Expr(e)),
+                Head::Begin(forms) => scan.queue.extend(forms.into_iter().rev()),
+                Head::Expr(expr) => scan.items.push(Item::Expr(expr)),
             }
         }
-        self.distinct(&s.names)?;
-        let Some(Item::Expr(last)) = s.items.pop() else { return Err(self.error(ExpandErrorKind::NoExpression, s.stx)) };
-        if s.defined.is_empty() {
-            let mut stxs: Vec<Stx> = s.items.into_iter().filter_map(|item| if let Item::Expr(e) = item { Some(e) } else { None }).collect();
+        self.distinct(&scan.names)?;
+        let Some(Item::Expr(last)) = scan.items.pop() else { return Err(self.error(ExpandErrorKind::NoExpression, scan.stx)) };
+        if scan.defined.is_empty() {
+            let mut stxs: Vec<Stx> = scan.items.into_iter().filter_map(|item| if let Item::Expr(expr) = item { Some(expr) } else { None }).collect();
             stxs.push(last);
             return self.sequence(stxs);
         }
-        let n = s.items.len();
-        self.defines(s.items.into_iter(), Vec::with_capacity(n), last)
+        let count = scan.items.len();
+        self.defines(scan.items.into_iter(), Vec::with_capacity(count), last)
     }
 
     /// The rest of a body's definitions and expressions, `items`, bound after `binds`, then its
@@ -983,7 +983,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let (var, value) = match items.next() {
             None => return Self::expr(last, move |_, last| Ok(Step::Done(Core::Letrec(binds, Box::new(last))))),
             Some(Item::Define(var, value)) => (var, value),
-            Some(Item::Expr(e)) => (self.fresh(), e),
+            Some(Item::Expr(expr)) => (self.fresh(), expr),
         };
         Self::expr(value, move |this, value| {
             binds.push((var, value));
@@ -997,7 +997,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     }
 
     pub(crate) fn strip(&mut self, stx: Stx) -> Result<Value<'gc>, ExpandError> {
-        self.tree.strip(stx).map_err(|e| self.error(e, stx))
+        self.tree.strip(stx).map_err(|error| self.error(error, stx))
     }
 
     pub(crate) fn is_id(&self, stx: Stx) -> bool {
@@ -1006,7 +1006,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
 
     /// Whether `stx` is an identifier that means `aux`.
     pub(crate) fn is_aux(&mut self, stx: Stx, aux: Aux) -> Result<bool, ExpandError> {
-        Ok(self.is_id(stx) && matches!(self.resolve(stx)?, Binding::Keyword(Keyword::Aux(a)) if a == aux))
+        Ok(self.is_id(stx) && matches!(self.resolve(stx)?, Binding::Keyword(Keyword::Aux(found)) if found == aux))
     }
 
     /// The items of `stx`, a proper list.

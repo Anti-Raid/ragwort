@@ -57,7 +57,7 @@ pub(crate) fn expand(input: TokenStream) -> Result<TokenStream, Error> {
             }
         }
     };
-    if !item.variants.iter().all(|v| matches!(v.fields, Fields::Unit)) {
+    if !item.variants.iter().all(|variant| matches!(variant.fields, Fields::Unit)) {
         if let Some(data_type) = data_type {
             return Err(Error::new_spanned(data_type, "only an enum whose variants have no fields has data"));
         }

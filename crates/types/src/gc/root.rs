@@ -36,8 +36,8 @@ impl<T> Clone for Root<T> {
 pub struct ForeignRoot;
 
 impl fmt::Display for ForeignRoot {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("root belongs to a different arena")
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("root belongs to a different arena")
     }
 }
 
@@ -45,12 +45,12 @@ impl std::error::Error for ForeignRoot {}
 
 impl<T: Object> Root<T> {
     pub fn new<'gc>(mc: &Mutation<'gc>, object: Gc<'gc, T>) -> Result<Self, OutOfMemory> {
-        let m = mc.heap.m;
-        m.budget.count_allocation()?;
-        m.budget.charge(ROOT_COST)?;
+        let meta = mc.heap.m;
+        meta.budget.count_allocation()?;
+        meta.budget.charge(ROOT_COST)?;
         let record = Rc::new(RootRecord { word: Cell::new(Value::object(mc, object).to_bits()) });
-        m.handles.borrow_mut().push(record.clone());
-        Ok(Self { arena: m.id, record, _marker: PhantomData })
+        meta.handles.borrow_mut().push(record.clone());
+        Ok(Self { arena: meta.id, record, _marker: PhantomData })
     }
 
     pub fn get<'gc>(&self, mc: &Mutation<'gc>) -> Result<Gc<'gc, T>, ForeignRoot> {
@@ -78,15 +78,15 @@ enum Held {
 
 impl ValueRoot {
     pub fn new<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Result<Self, OutOfMemory> {
-        let (m, word) = (mc.heap.m, value.to_bits());
+        let (meta, word) = (mc.heap.m, value.to_bits());
         if word & TAG != OBJECT {
-            return Ok(Self { arena: m.id, held: Held::Word(word) });
+            return Ok(Self { arena: meta.id, held: Held::Word(word) });
         }
-        m.budget.count_allocation()?;
-        m.budget.charge(ROOT_COST)?;
+        meta.budget.count_allocation()?;
+        meta.budget.charge(ROOT_COST)?;
         let record = Rc::new(RootRecord { word: Cell::new(word) });
-        m.handles.borrow_mut().push(record.clone());
-        Ok(Self { arena: m.id, held: Held::Record(record) })
+        meta.handles.borrow_mut().push(record.clone());
+        Ok(Self { arena: meta.id, held: Held::Record(record) })
     }
 
     pub fn get<'gc>(&self, mc: &Mutation<'gc>) -> Result<Value<'gc>, ForeignRoot> {

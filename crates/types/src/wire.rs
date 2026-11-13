@@ -49,20 +49,20 @@ impl Writer {
         Self::default()
     }
 
-    pub fn u8(&mut self, n: u8) {
-        self.bytes.push(n);
+    pub fn u8(&mut self, value: u8) {
+        self.bytes.push(value);
     }
 
-    pub fn u16(&mut self, n: u16) {
-        self.bytes.extend(n.to_le_bytes());
+    pub fn u16(&mut self, value: u16) {
+        self.bytes.extend(value.to_le_bytes());
     }
 
-    pub fn u32(&mut self, n: u32) {
-        self.bytes.extend(n.to_le_bytes());
+    pub fn u32(&mut self, value: u32) {
+        self.bytes.extend(value.to_le_bytes());
     }
 
-    pub fn u64(&mut self, n: u64) {
-        self.bytes.extend(n.to_le_bytes());
+    pub fn u64(&mut self, value: u64) {
+        self.bytes.extend(value.to_le_bytes());
     }
 
     /// `bytes`, after how many there are.
@@ -179,8 +179,8 @@ pub const fn shape_of(text: &str) -> u64 {
 }
 
 /// One number of two, different if either is.
-pub const fn mix(a: u64, b: u64) -> u64 {
-    (a.rotate_left(23) ^ b).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+pub const fn mix(left: u64, right: u64) -> u64 {
+    (left.rotate_left(23) ^ right).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 /// A value with a binary form.

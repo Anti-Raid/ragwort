@@ -33,52 +33,52 @@ pub enum Error {
 }
 
 impl From<ReadError> for Error {
-    fn from(e: ReadError) -> Self {
-        Error::Read(e)
+    fn from(error: ReadError) -> Self {
+        Error::Read(error)
     }
 }
 
 impl From<ExpandError> for Error {
-    fn from(e: ExpandError) -> Self {
-        Error::Expand(e)
+    fn from(error: ExpandError) -> Self {
+        Error::Expand(error)
     }
 }
 
 impl From<LowerError> for Error {
-    fn from(e: LowerError) -> Self {
-        Error::Lower(e)
+    fn from(error: LowerError) -> Self {
+        Error::Lower(error)
     }
 }
 
 impl From<CompileError> for Error {
-    fn from(e: CompileError) -> Self {
+    fn from(error: CompileError) -> Self {
         // The compiler resolves the top-level names of native forms, and reports a misused one as the lowerer would.
-        match LowerError::located(e) {
+        match LowerError::located(error) {
             Some(lower) => Error::Lower(lower),
-            None => Error::Compile(e),
+            None => Error::Compile(error),
         }
     }
 }
 
 impl From<OutOfMemory> for Error {
-    fn from(e: OutOfMemory) -> Self {
-        Error::Expand(e.into())
+    fn from(error: OutOfMemory) -> Self {
+        Error::Expand(error.into())
     }
 }
 
 impl From<ragwort_native::Error> for Error {
-    fn from(e: ragwort_native::Error) -> Self {
-        match e {
-            ragwort_native::Error::Read(e) => Error::Read(e),
-            ragwort_native::Error::Lower(e) => Error::Lower(e),
-            ragwort_native::Error::Compile(e) => Error::Compile(e),
+    fn from(error: ragwort_native::Error) -> Self {
+        match error {
+            ragwort_native::Error::Read(error) => Error::Read(error),
+            ragwort_native::Error::Lower(error) => Error::Lower(error),
+            ragwort_native::Error::Compile(error) => Error::Compile(error),
         }
     }
 }
 
 /// Builds the [`PRELUDE`]'s module, whose forms are to run before any Scheme is loaded.
 pub fn prelude<'gc>(mc: &Mutation<'gc>, symbols: Symbols<'gc>) -> Result<Loaded<'gc>, Error> {
-    let session = SyntaxSession::named(mc, "prelude", PRELUDE).map_err(|e| LowerError::from(ragwort_types::Error::from(e)))?;
+    let session = SyntaxSession::named(mc, "prelude", PRELUDE).map_err(|error| LowerError::from(ragwort_types::Error::from(error)))?;
     Ok(ragwort_native::load(mc, symbols, PRELUDE_NAME, &[], &[&session], &mut NoModules)?)
 }
 
@@ -167,15 +167,15 @@ fn load_from<'gc>(
     let mut lowerer = None;
     let mut forms = Vec::new();
     let mut tops = Vec::new();
-    for (k, file) in source.files.iter().enumerate() {
-        *at = Some(k);
+    for (file_index, file) in source.files.iter().enumerate() {
+        *at = Some(file_index);
         for node in Reader::new(mc, symbols, file.session)? {
             let node = node?;
             let first = u32::try_from(forms.len()).map_err(|_| OutOfMemory)?;
             match file.language {
                 Language::Scheme => {
                     expander.declare(node, first, &mut tops, resolver)?;
-                    forms.extend(tops.drain(..).map(|top| (k, Form::Scheme(top))));
+                    forms.extend(tops.drain(..).map(|top| (file_index, Form::Scheme(top))));
                 }
                 Language::Native => {
                     let lowerer = match &mut lowerer {
@@ -183,19 +183,19 @@ fn load_from<'gc>(
                         None => lowerer.insert(Lowerer::new(mc, symbols, source.hosts, source.internals).map_err(LowerError::from)?),
                     };
                     let item = lowerer.item(expander.builder().locals(), node)?;
-                    expander.builder().declare(mc, resolver, first, &item).map_err(|(e, span)| LowerError::declared(e, span))?;
-                    forms.push((k, Form::Native(item)));
+                    expander.builder().declare(mc, resolver, first, &item).map_err(|(error, span)| LowerError::declared(error, span))?;
+                    forms.push((file_index, Form::Native(item)));
                 }
             }
         }
     }
     *at = None;
     expander.provide()?;
-    expander.builder().provide_items(mc).map_err(|(e, span)| LowerError::declared(e, span))?;
+    expander.builder().provide_items(mc).map_err(|(error, span)| LowerError::declared(error, span))?;
     expander.builder().start(mc)?;
     let mut thunks = Vec::with_capacity(forms.len());
-    for (i, (k, form)) in forms.into_iter().enumerate() {
-        *at = Some(k);
+    for (i, (file_index, form)) in forms.into_iter().enumerate() {
+        *at = Some(file_index);
         let i = u32::try_from(i).map_err(|_| OutOfMemory)?;
         match form {
             Form::Scheme(top) => {

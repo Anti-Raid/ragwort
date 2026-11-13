@@ -68,11 +68,11 @@ pub fn cells(x: &[Digit]) -> Vec<Cell<Digit>> {
 
 pub fn hex(x: Digits<'_>) -> String {
     let x = x.normalize();
-    let mut s = format!("{:x}", x.msd());
+    let mut text = format!("{:x}", x.msd());
     for i in (0..x.len().saturating_sub(1)).rev() {
-        write!(s, "{:016x}", x.at(i)).unwrap();
+        write!(text, "{:016x}", x.at(i)).unwrap();
     }
-    s
+    text
 }
 
 pub fn signed(x: Digits<'_>, negative: bool) -> String {
@@ -130,8 +130,8 @@ pub enum TestError {
 }
 
 impl From<NumError> for TestError {
-    fn from(e: NumError) -> Self {
-        Self::Num(e)
+    fn from(error: NumError) -> Self {
+        Self::Num(error)
     }
 }
 
@@ -209,9 +209,9 @@ impl TestHost {
             assert!(!digits.is_empty() && digits.last().unwrap().get() != 0, "big zero or high zero digits");
             let all = self.bigs[at].get().expect("made by this host");
             assert!(all.len() <= 2 * digits.len(), "{} digits kept of {}", digits.len(), all.len());
-            assert!(all[digits.len()..].iter().all(|d| d.get() == 0), "digits left past those kept");
+            assert!(all[digits.len()..].iter().all(|digit| digit.get() == 0), "digits left past those kept");
             let value = (digits.len() == 1).then(|| if negative { (digits[0].get() as i64).wrapping_neg() } else { digits[0].get() as i64 });
-            let small = value.filter(|&v| (v < 0) == negative && v != 0).and_then(|v| self.small(v));
+            let small = value.filter(|&number| (number < 0) == negative && number != 0).and_then(|number| self.small(number));
             assert!(small.is_none(), "{x:?} should be small");
         }
         to_string(self, x, 16).unwrap()
@@ -255,8 +255,8 @@ impl crate::RationalHost for TestHost {
     fn ratio(&self, num: TestInt, den: TestInt) -> Result<TestRational, TestError> {
         let one = from_i64(self, 1).unwrap();
         assert_eq!(compare(self, den, one), std::cmp::Ordering::Greater, "denominator {}", self.show(den));
-        let g = gcd(self, num, den).unwrap();
-        assert_eq!(compare(self, g, one), std::cmp::Ordering::Equal, "{}/{} isn't reduced", self.show(num), self.show(den));
+        let divisor = gcd(self, num, den).unwrap();
+        assert_eq!(compare(self, divisor, one), std::cmp::Ordering::Equal, "{}/{} isn't reduced", self.show(num), self.show(den));
         Ok(TestRational::Ratio(num, den))
     }
 }
@@ -302,8 +302,8 @@ impl crate::RealHost for TestHost {
 
     fn real_view(&self, x: TestReal) -> crate::RealView<TestRational> {
         match x {
-            TestReal::Exact(r) => crate::RealView::Exact(r),
-            TestReal::Flonum(f) => crate::RealView::Flonum(f),
+            TestReal::Exact(fraction) => crate::RealView::Exact(fraction),
+            TestReal::Flonum(float) => crate::RealView::Flonum(float),
         }
     }
 
@@ -311,8 +311,8 @@ impl crate::RealHost for TestHost {
         TestReal::Exact(x)
     }
 
-    fn flonum(&self, f: f64) -> Result<TestReal, TestError> {
-        Ok(TestReal::Flonum(f))
+    fn flonum(&self, value: f64) -> Result<TestReal, TestError> {
+        Ok(TestReal::Flonum(value))
     }
 }
 
@@ -321,7 +321,7 @@ impl crate::ComplexHost for TestHost {
 
     fn complex_view(&self, x: TestNumber) -> crate::ComplexView<TestReal> {
         match x {
-            TestNumber::Real(r) => crate::ComplexView::Real(r),
+            TestNumber::Real(real) => crate::ComplexView::Real(real),
             TestNumber::Complex(re, im) => crate::ComplexView::Complex { re, im },
         }
     }
@@ -369,16 +369,16 @@ const FLONUM_EDGES: [f64; 22] = [
 impl TestHost {
     pub fn show_real(&self, x: TestReal) -> String {
         match x {
-            TestReal::Exact(r) => self.show_rational(r),
+            TestReal::Exact(fraction) => self.show_rational(fraction),
             // A NaN's sign and payload depend on the CPU (x86 makes 0/0 negative), and ragwort
             // treats every NaN as the same number.
-            TestReal::Flonum(f) => format!("fl{:x}", if f.is_nan() { f64::NAN } else { f }.to_bits()),
+            TestReal::Flonum(float) => format!("fl{:x}", if float.is_nan() { f64::NAN } else { float }.to_bits()),
         }
     }
 
     pub fn show_number(&self, x: TestNumber) -> String {
         match x {
-            TestNumber::Real(r) => self.show_real(r),
+            TestNumber::Real(real) => self.show_real(real),
             TestNumber::Complex(re, im) => format!("cx{}|{}", self.show_real(re), self.show_real(im)),
         }
     }
@@ -398,8 +398,8 @@ impl TestHost {
             0 => TestReal::Flonum(self.random_flonum(rng)),
             // The double nearest an exact number, so the two compare closely.
             1 if rng.bool() => {
-                let r = self.random_rational(rng, max_len);
-                TestReal::Flonum(crate::rational::to_f64(self, r).unwrap())
+                let fraction = self.random_rational(rng, max_len);
+                TestReal::Flonum(crate::rational::to_f64(self, fraction).unwrap())
             }
             _ => TestReal::Exact(self.random_rational(rng, max_len)),
         }
@@ -420,8 +420,8 @@ impl TestHost {
 }
 
 /// An error as the oracle names it.
-pub fn error_token(e: TestError) -> String {
-    match e {
+pub fn error_token(error: TestError) -> String {
+    match error {
         TestError::Num(NumError::DivideByZero) => "div0",
         TestError::Num(NumError::NoExactValue) => "noexact",
         TestError::Num(NumError::NotInteger) => "notint",

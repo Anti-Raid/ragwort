@@ -65,7 +65,7 @@ fn l5_of(build: impl for<'gc> FnOnce(&Mutation<'gc>) -> Core<'gc>) -> String {
     let mut arena = Arena::new(1 << 24, 0);
     arena.mutate(|mc| {
         let trees = ragwort_alloc::Arena::new();
-        let f = to_l5(mc, &trees, &build(mc), &mut crate::ir::Origins::default(), &|_| None, None, &mut None).unwrap();
+        let f = to_l5(mc, &trees, &build(mc), &mut crate::ir::Origins::default(), None, None, &mut None).unwrap();
         verify(&f).unwrap_or_else(|e| panic!("{e}\n{f}"));
         f.to_string()
     })

@@ -38,9 +38,9 @@ fn is_zero<H: Host>(h: &H, x: H::Int) -> bool {
     int::sign(h, x) == Ordering::Equal
 }
 
-/// `x / g` for a `g` known to divide it.
-fn exact_div<H: Host>(h: &H, x: H::Int, g: H::Int) -> IntRes<H> {
-    if is_one(h, g) { Ok(x) } else { int::quotient(h, x, g) }
+/// `x / divisor` for a `divisor` known to divide it.
+fn exact_div<H: Host>(h: &H, x: H::Int, divisor: H::Int) -> IntRes<H> {
+    if is_one(h, divisor) { Ok(x) } else { int::quotient(h, x, divisor) }
 }
 
 /// From a numerator and positive denominator with no common factor.
@@ -55,8 +55,8 @@ pub fn from_parts<H: RationalHost>(h: &H, num: H::Int, den: H::Int) -> Res<H> {
         Ordering::Less => (int::neg(h, num)?, int::neg(h, den)?),
         Ordering::Greater => (num, den),
     };
-    let g = int::gcd(h, num, den)?;
-    reduced(h, exact_div(h, num, g)?, exact_div(h, den, g)?)
+    let divisor = int::gcd(h, num, den)?;
+    reduced(h, exact_div(h, num, divisor)?, exact_div(h, den, divisor)?)
 }
 
 /// Numerator and denominator, with 1 for integers.
@@ -98,8 +98,8 @@ pub fn compare<H: RationalHost>(h: &H, x: H::Rational, y: H::Rational) -> Result
         return Ok(sx.cmp(&sy));
     }
     // Same sign: a/b against c/d is ad against cb, as denominators are positive.
-    let ((a, b), (c, d)) = (parts(h, x)?, parts(h, y)?);
-    Ok(int::compare(h, int::mul(h, a, d)?, int::mul(h, c, b)?))
+    let ((a, b), (other_num, other_den)) = (parts(h, x)?, parts(h, y)?);
+    Ok(int::compare(h, int::mul(h, a, other_den)?, int::mul(h, other_num, b)?))
 }
 
 /// Whether `x` and `y` are the same rational. Lowest terms make that a comparison of parts.
@@ -107,7 +107,7 @@ pub fn eqv<H: RationalHost>(h: &H, x: H::Rational, y: H::Rational) -> bool {
     let same = |a, b| int::compare(h, a, b) == Ordering::Equal;
     match (h.rational_view(x), h.rational_view(y)) {
         (RationalView::Integer(a), RationalView::Integer(b)) => same(a, b),
-        (RationalView::Ratio { num: a, den: b }, RationalView::Ratio { num: c, den: d }) => same(a, c) && same(b, d),
+        (RationalView::Ratio { num: a, den: b }, RationalView::Ratio { num: other_num, den: other_den }) => same(a, other_num) && same(b, other_den),
         _ => false,
     }
 }
@@ -138,66 +138,66 @@ pub fn add<H: RationalHost>(h: &H, x: H::Rational, y: H::Rational) -> Res<H> {
     if let (RationalView::Integer(a), RationalView::Integer(b)) = (h.rational_view(x), h.rational_view(y)) {
         return Ok(h.of_int(int::add(h, a, b)?));
     }
-    let ((a, b), (c, d)) = (parts(h, x)?, parts(h, y)?);
-    add_parts(h, a, b, c, d)
+    let ((a, b), (other_num, other_den)) = (parts(h, x)?, parts(h, y)?);
+    add_parts(h, a, b, other_num, other_den)
 }
 
 pub fn sub<H: RationalHost>(h: &H, x: H::Rational, y: H::Rational) -> Res<H> {
     if let (RationalView::Integer(a), RationalView::Integer(b)) = (h.rational_view(x), h.rational_view(y)) {
         return Ok(h.of_int(int::sub(h, a, b)?));
     }
-    let ((a, b), (c, d)) = (parts(h, x)?, parts(h, y)?);
-    add_parts(h, a, b, int::neg(h, c)?, d)
+    let ((a, b), (other_num, other_den)) = (parts(h, x)?, parts(h, y)?);
+    add_parts(h, a, b, int::neg(h, other_num)?, other_den)
 }
 
-/// `a/b + c/d` for reduced fractions, dividing out what the denominators share before
+/// `a/b + other_num/other_den` for reduced fractions, dividing out what the denominators share before
 /// multiplying, as in Knuth 4.5.1.
-fn add_parts<H: RationalHost>(h: &H, a: H::Int, b: H::Int, c: H::Int, d: H::Int) -> Res<H> {
-    let g = int::gcd(h, b, d)?;
-    if is_one(h, g) {
+fn add_parts<H: RationalHost>(h: &H, a: H::Int, b: H::Int, other_num: H::Int, other_den: H::Int) -> Res<H> {
+    let common = int::gcd(h, b, other_den)?;
+    if is_one(h, common) {
         // Nothing shared, so (ad + cb) / bd is already in lowest terms.
-        let num = int::add(h, int::mul(h, a, d)?, int::mul(h, c, b)?)?;
-        return reduced(h, num, int::mul(h, b, d)?);
+        let num = int::add(h, int::mul(h, a, other_den)?, int::mul(h, other_num, b)?)?;
+        return reduced(h, num, int::mul(h, b, other_den)?);
     }
-    let (b1, d1) = (int::quotient(h, b, g)?, int::quotient(h, d, g)?);
-    let t = int::add(h, int::mul(h, a, d1)?, int::mul(h, c, b1)?)?;
+    let (b1, d1) = (int::quotient(h, b, common)?, int::quotient(h, other_den, common)?);
+    let sum = int::add(h, int::mul(h, a, d1)?, int::mul(h, other_num, b1)?)?;
     // Only factors of g can be left in common between t and b1 * d.
-    let g2 = int::gcd(h, t, g)?;
-    reduced(h, exact_div(h, t, g2)?, int::mul(h, b1, exact_div(h, d, g2)?)?)
+    let g2 = int::gcd(h, sum, common)?;
+    reduced(h, exact_div(h, sum, g2)?, int::mul(h, b1, exact_div(h, other_den, g2)?)?)
 }
 
 pub fn mul<H: RationalHost>(h: &H, x: H::Rational, y: H::Rational) -> Res<H> {
     if let (RationalView::Integer(a), RationalView::Integer(b)) = (h.rational_view(x), h.rational_view(y)) {
         return Ok(h.of_int(int::mul(h, a, b)?));
     }
-    let ((a, b), (c, d)) = (parts(h, x)?, parts(h, y)?);
-    mul_parts(h, a, b, c, d)
+    let ((a, b), (other_num, other_den)) = (parts(h, x)?, parts(h, y)?);
+    mul_parts(h, a, b, other_num, other_den)
 }
 
 pub fn div<H: RationalHost>(h: &H, x: H::Rational, y: H::Rational) -> Res<H> {
-    let ((a, b), (c, d)) = (parts(h, x)?, parts(h, y)?);
+    let ((a, b), (other_num, other_den)) = (parts(h, x)?, parts(h, y)?);
     // a/b ÷ c/d is a/b × d/c, with the sign of c moved to the top.
-    match int::sign(h, c) {
+    match int::sign(h, other_num) {
         Ordering::Equal => Err(NumError::DivideByZero.into()),
-        Ordering::Less => mul_parts(h, a, b, int::neg(h, d)?, int::neg(h, c)?),
-        Ordering::Greater => mul_parts(h, a, b, d, c),
+        Ordering::Less => mul_parts(h, a, b, int::neg(h, other_den)?, int::neg(h, other_num)?),
+        Ordering::Greater => mul_parts(h, a, b, other_den, other_num),
     }
 }
 
-/// `a/b × c/d` for reduced fractions, cancelling across before multiplying.
-fn mul_parts<H: RationalHost>(h: &H, a: H::Int, b: H::Int, c: H::Int, d: H::Int) -> Res<H> {
-    let (g1, g2) = (int::gcd(h, a, d)?, int::gcd(h, c, b)?);
-    let num = int::mul(h, exact_div(h, a, g1)?, exact_div(h, c, g2)?)?;
-    let den = int::mul(h, exact_div(h, b, g2)?, exact_div(h, d, g1)?)?;
+/// `a/b × other_num/other_den` for reduced fractions, cancelling across before multiplying.
+fn mul_parts<H: RationalHost>(h: &H, a: H::Int, b: H::Int, other_num: H::Int, other_den: H::Int) -> Res<H> {
+    let (g1, g2) = (int::gcd(h, a, other_den)?, int::gcd(h, other_num, b)?);
+    let num = int::mul(h, exact_div(h, a, g1)?, exact_div(h, other_num, g2)?)?;
+    let den = int::mul(h, exact_div(h, b, g2)?, exact_div(h, other_den, g1)?)?;
     reduced(h, num, den)
 }
 
-/// `x^e`. Negative powers of zero divide by zero.
-pub fn expt<H: RationalHost>(h: &H, x: H::Rational, e: i64) -> Res<H> {
+/// `x^exponent`. Negative powers of zero divide by zero.
+pub fn expt<H: RationalHost>(h: &H, x: H::Rational, exponent: i64) -> Res<H> {
     let (num, den) = parts(h, x)?;
-    let n = e.unsigned_abs();
+    let n = exponent.unsigned_abs();
     let (num, den) = (int::expt(h, num, n)?, int::expt(h, den, n)?);
-    if e >= 0 {
+    if exponent >= 0 {
         return reduced(h, num, den);
     }
     match int::sign(h, num) {
@@ -219,16 +219,16 @@ pub fn round<H: RationalHost>(h: &H, x: H::Rational, mode: Round) -> IntRes<H> {
         Round::Ceiling => int::neg(h, int::floor_quotient(h, int::neg(h, num)?, den)?),
         Round::Truncate => int::quotient(h, num, den),
         Round::Nearest => {
-            let (q, r) = int::divide(h, num, den, Rounding::Floor, true, true)?;
-            let (q, r) = (q.expect("asked for the quotient"), r.expect("asked for the remainder"));
+            let (quotient, remainder) = int::divide(h, num, den, Rounding::Floor, true, true)?;
+            let (quotient, remainder) = (quotient.expect("asked for the quotient"), remainder.expect("asked for the remainder"));
             // 0 <= r < den, and the fraction left over is r / den.
-            let twice = int::arithmetic_shift(h, r, 1)?;
+            let twice = int::arithmetic_shift(h, remainder, 1)?;
             let up = match int::compare(h, twice, den) {
                 Ordering::Less => false,
                 Ordering::Greater => true,
-                Ordering::Equal => !int::is_even(h, q),
+                Ordering::Equal => !int::is_even(h, quotient),
             };
-            if up { int::add(h, q, int::from_i64(h, 1)?) } else { Ok(q) }
+            if up { int::add(h, quotient, int::from_i64(h, 1)?) } else { Ok(quotient) }
         }
     }
 }
@@ -249,84 +249,84 @@ pub fn to_f64<H: RationalHost>(h: &H, x: H::Rational) -> Result<f64, H::Error> {
         RationalView::Ratio { num, den } => (num, den),
     };
     // Both exact as doubles, so one division rounds once.
-    if let (Some(n), Some(d)) = (int::to_i64(h, num), int::to_i64(h, den))
-        && n.unsigned_abs() <= 1 << 53
-        && d <= 1 << 53
+    if let (Some(small_num), Some(small_den)) = (int::to_i64(h, num), int::to_i64(h, den))
+        && small_num.unsigned_abs() <= 1 << 53
+        && small_den <= 1 << 53
     {
-        return Ok(n as f64 / d as f64);
+        return Ok(small_num as f64 / small_den as f64);
     }
     let negative = int::sign(h, num) == Ordering::Less;
     let num = int::abs(h, num)?;
-    let f = ratio_to_f64(h, num, den)?;
-    Ok(if negative { -f } else { f })
+    let value = ratio_to_f64(h, num, den)?;
+    Ok(if negative { -value } else { value })
 }
 
-/// `n / d` for positive `n` and `d`.
-fn ratio_to_f64<H: Host>(h: &H, n: H::Int, d: H::Int) -> Result<f64, H::Error> {
+/// `num / den` for positive `num` and `den`.
+fn ratio_to_f64<H: Host>(h: &H, num: H::Int, den: H::Int) -> Result<f64, H::Error> {
     // n / d is in [2^(bn - bd - 1), 2^(bn - bd + 1)), so scaling by 2^shift puts the quotient
     // in [2^54, 2^56): enough bits for 53, a rounding bit and one to spare.
-    let (bn, bd) = (int::integer_length(h, n) as i64, int::integer_length(h, d) as i64);
+    let (bn, bd) = (int::integer_length(h, num) as i64, int::integer_length(h, den) as i64);
     let shift = 55 - (bn - bd);
     // Bits shifted or divided away only matter as one sticky bit below the rounding bit.
-    let (q, r, lost) = if shift >= 0 {
-        let (q, r) = int::quotient_remainder(h, int::arithmetic_shift(h, n, shift)?, d)?;
-        (q, r, false)
+    let (quotient, remainder, lost) = if shift >= 0 {
+        let (quotient, remainder) = int::quotient_remainder(h, int::arithmetic_shift(h, num, shift)?, den)?;
+        (quotient, remainder, false)
     } else {
-        let m = int::arithmetic_shift(h, n, shift)?;
-        let lost = int::compare(h, int::arithmetic_shift(h, m, -shift)?, n) != Ordering::Equal;
-        let (q, r) = int::quotient_remainder(h, m, d)?;
-        (q, r, lost)
+        let shifted = int::arithmetic_shift(h, num, shift)?;
+        let lost = int::compare(h, int::arithmetic_shift(h, shifted, -shift)?, num) != Ordering::Equal;
+        let (quotient, remainder) = int::quotient_remainder(h, shifted, den)?;
+        (quotient, remainder, lost)
     };
-    let sticky = lost || !is_zero(h, r);
-    let q = int::to_i64(h, q).expect("the quotient has at most 56 bits") as u64;
-    let len = 64 - q.leading_zeros() as i64;
+    let sticky = lost || !is_zero(h, remainder);
+    let quotient = int::to_i64(h, quotient).expect("the quotient has at most 56 bits") as u64;
+    let len = 64 - quotient.leading_zeros() as i64;
     // The value is in [2^e, 2^(e + 1)).
-    let e = len - 1 - shift;
-    if e > 1023 {
+    let exponent = len - 1 - shift;
+    if exponent > 1023 {
         return Ok(f64::INFINITY);
     }
     // Below the normal range, fewer bits are left for the significand.
-    let precision = if e >= -1022 { 53 } else { e + 1075 };
+    let precision = if exponent >= -1022 { 53 } else { exponent + 1075 };
     let drop = len - precision;
     if drop > len {
         return Ok(0.0);
     }
-    let kept = q >> drop;
-    let half = (q >> (drop - 1)) & 1 == 1;
-    let below = q & ((1 << (drop - 1)) - 1) != 0 || sticky;
+    let kept = quotient >> drop;
+    let half = (quotient >> (drop - 1)) & 1 == 1;
+    let below = quotient & ((1 << (drop - 1)) - 1) != 0 || sticky;
     let kept = kept + (half && (below || kept & 1 == 1)) as u64;
-    Ok(scale(kept as f64, e + 1 - precision))
+    Ok(scale(kept as f64, exponent + 1 - precision))
 }
 
-/// `x * 2^k` for a result that's representable, or overflows to infinity.
-fn scale(mut x: f64, mut k: i64) -> f64 {
-    if k < -1022 {
+/// `x * 2^exponent` for a result that's representable, or overflows to infinity.
+fn scale(mut x: f64, mut exponent: i64) -> f64 {
+    if exponent < -1022 {
         x *= f64::from_bits(1 << 52);
-        k += 1022;
+        exponent += 1022;
     }
-    x * f64::from_bits(((k + 1023) as u64) << 52)
+    x * f64::from_bits(((exponent + 1023) as u64) << 52)
 }
 
 /// A finite double's exact value.
-pub fn from_f64<H: RationalHost>(h: &H, f: f64) -> Res<H> {
-    if !f.is_finite() {
+pub fn from_f64<H: RationalHost>(h: &H, value: f64) -> Res<H> {
+    if !value.is_finite() {
         return Err(NumError::NoExactValue.into());
     }
-    if f.fract() == 0.0 {
-        return Ok(h.of_int(int::from_integral_f64(h, f)?));
+    if value.fract() == 0.0 {
+        return Ok(h.of_int(int::from_integral_f64(h, value)?));
     }
-    let bits = f.to_bits();
+    let bits = value.to_bits();
     let (exponent, fraction) = ((bits >> 52) & 0x7ff, bits & ((1 << 52) - 1));
-    let (mut m, mut e) = match exponent {
+    let (mut significand, mut shift) = match exponent {
         0 => (fraction, -1074),
         _ => (fraction | 1 << 52, exponent as i64 - 1075),
     };
     // Not an integer, so e < 0 and the denominator is a power of two above one.
-    let tz = (m.trailing_zeros() as i64).min(-e);
-    m >>= tz;
-    e += tz;
-    let num = int::from_i64(h, if f < 0.0 { -(m as i64) } else { m as i64 })?;
-    let den = int::arithmetic_shift(h, int::from_i64(h, 1)?, -e)?;
+    let tz = (significand.trailing_zeros() as i64).min(-shift);
+    significand >>= tz;
+    shift += tz;
+    let num = int::from_i64(h, if value < 0.0 { -(significand as i64) } else { significand as i64 })?;
+    let den = int::arithmetic_shift(h, int::from_i64(h, 1)?, -shift)?;
     h.ratio(num, den)
 }
 

@@ -62,8 +62,8 @@ enum Grow<'gc> {
 }
 
 impl From<OutOfMemory> for Grow<'_> {
-    fn from(e: OutOfMemory) -> Self {
-        Grow::Arena(e.into())
+    fn from(error: OutOfMemory) -> Self {
+        Grow::Arena(error.into())
     }
 }
 
@@ -108,13 +108,13 @@ impl<'a, 'gc> Reader<'a, 'gc> {
         let foreign = |_| ReadError::new(ErrorKind::ForeignSession, 0, 0);
         let source = session.source(mc).map_err(foreign)?;
         let bytes = session.text(mc).map_err(foreign)?.bytes(mc);
-        let text = std::str::from_utf8(bytes).map_err(|e| {
-            let at = e.valid_up_to();
-            ReadError::new(ErrorKind::InvalidUtf8, at, e.error_len().map_or(bytes.len(), |n| at + n))
+        let text = std::str::from_utf8(bytes).map_err(|error| {
+            let at = error.valid_up_to();
+            ReadError::new(ErrorKind::InvalidUtf8, at, error.error_len().map_or(bytes.len(), |length| at + length))
         })?;
-        let oom = |e| ReadError::new(e, 0, 0);
+        let oom = |error| ReadError::new(error, 0, 0);
         let meta = |kind| SyntaxMeta::new(mc, kind, None, None).map_err(oom);
-        let abbreviation = |a| meta(SyntaxKind::Abbreviation(a));
+        let abbreviation = |kind| meta(SyntaxKind::Abbreviation(kind));
         Ok(Self {
             mc,
             strings: Strings::new(mc),
@@ -128,7 +128,7 @@ impl<'a, 'gc> Reader<'a, 'gc> {
             literal: meta(SyntaxKind::Literal)?,
             list: meta(SyntaxKind::List)?,
             vector: meta(SyntaxKind::Vector)?,
-            abbreviations: Abbreviation::ALL.iter().map(|&a| abbreviation(a)).collect::<Result<_, _>>()?,
+            abbreviations: Abbreviation::ALL.iter().map(|&kind| abbreviation(kind)).collect::<Result<_, _>>()?,
             open: ScratchVec::new(mc),
             items: ScratchVec::new(mc),
             labels: HashMap::new(),
@@ -153,7 +153,7 @@ impl<'a, 'gc> Reader<'a, 'gc> {
 
     fn read_datum(&mut self) -> Result<Option<Syntax<'gc>>, ReadError> {
         loop {
-            let lexeme = self.lexer.next_token().map_err(|e| ReadError::new(e.kind, e.start, e.end))?;
+            let lexeme = self.lexer.next_token().map_err(|error| ReadError::new(error.kind, error.start, error.end))?;
             let Some(lexeme) = lexeme else { return self.end() };
             let start = lexeme.start;
             self.at = lexeme.end;
@@ -180,15 +180,15 @@ impl<'a, 'gc> Reader<'a, 'gc> {
                     self.push(Open::Skip { start, end: self.at }, start)?;
                     continue;
                 }
-                Token::Label(n) => {
-                    if self.labels.contains_key(&n) {
+                Token::Label(label) => {
+                    if self.labels.contains_key(&label) {
                         return Err(ReadError::new(ErrorKind::DuplicateLabel, start, self.at));
                     }
-                    self.labels.insert(n, None);
-                    self.push(Open::Label { start, end: self.at, n }, start)?;
+                    self.labels.insert(label, None);
+                    self.push(Open::Label { start, end: self.at, n: label }, start)?;
                     continue;
                 }
-                Token::LabelRef(n) => match self.labels.get(&n) {
+                Token::LabelRef(label) => match self.labels.get(&label) {
                     Some(&Some(node)) => node,
                     Some(None) => return Err(ReadError::new(ErrorKind::CyclicLabel, start, self.at)),
                     None => return Err(ReadError::new(ErrorKind::UnknownLabel, start, self.at)),
@@ -197,17 +197,17 @@ impl<'a, 'gc> Reader<'a, 'gc> {
                     self.dot(start)?;
                     continue;
                 }
-                Token::Boolean(b) => self.node(if b { Value::TRUE } else { Value::FALSE }, self.literal, start)?,
-                Token::Char(c) => self.node(Value::char(c), self.literal, start)?,
+                Token::Boolean(boolean) => self.node(if boolean { Value::TRUE } else { Value::FALSE }, self.literal, start)?,
+                Token::Char(character) => self.node(Value::char(character), self.literal, start)?,
                 Token::String(text) => {
-                    let s = string::from_str(&self.strings, &text).map_err(|e| ReadError::new(e, start, self.at))?;
-                    self.node(s.value(), self.literal, start)?
+                    let string = string::from_str(&self.strings, &text).map_err(|error| ReadError::new(error, start, self.at))?;
+                    self.node(string.value(), self.literal, start)?
                 }
                 Token::Identifier(name) => self.identifier(&name, start)?,
                 Token::Keyword(name) => {
-                    let failed = |e| ReadError::new(e, start, self.at);
+                    let failed = |error| ReadError::new(error, start, self.at);
                     let symbol = self.symbols.intern_str(&self.strings, &name).map_err(failed)?;
-                    let keyword = self.symbols.keyword(self.mc, symbol).map_err(|e| failed(e.into()))?;
+                    let keyword = self.symbols.keyword(self.mc, symbol).map_err(|error| failed(error.into()))?;
                     self.node(keyword.value(self.mc), self.literal, start)?
                 }
                 Token::Number(text) => {
@@ -230,16 +230,16 @@ impl<'a, 'gc> Reader<'a, 'gc> {
     }
 
     fn push(&mut self, open: Open<'gc>, start: usize) -> Result<(), ReadError> {
-        self.open.push(open).map_err(|e| ReadError::new(e, start, self.at))
+        self.open.push(open).map_err(|error| ReadError::new(error, start, self.at))
     }
 
     fn number(&self, text: &str, start: usize) -> Result<Option<Value<'gc>>, ReadError> {
-        let number = number::parse(&self.nums, text).map_err(|e| ReadError::new(e, start, self.at))?;
-        Ok(number.map(|z| z.value()))
+        let number = number::parse(&self.nums, text).map_err(|error| ReadError::new(error, start, self.at))?;
+        Ok(number.map(|parsed| parsed.value()))
     }
 
     fn identifier(&self, name: &str, start: usize) -> Result<Syntax<'gc>, ReadError> {
-        let symbol = self.symbols.intern_str(&self.strings, name).map_err(|e| ReadError::new(e, start, self.at))?;
+        let symbol = self.symbols.intern_str(&self.strings, name).map_err(|error| ReadError::new(error, start, self.at))?;
         self.node(symbol.value(self.mc), self.identifier, start)
     }
 
@@ -266,12 +266,12 @@ impl<'a, 'gc> Reader<'a, 'gc> {
                 let items = &self.items[first..];
                 let (datum, meta) = match shape {
                     Shape::List => (self.pairs.list_with_tail(items.iter().copied(), tail).map_err(Grow::from), self.list),
-                    Shape::Vector => (Vectors::new(self.mc).immutable_from_slice(items).map(|v| v.value(self.mc)).map_err(Grow::from), self.vector),
-                    Shape::Bytevector => (self.bytes(items).and_then(|b| Ok(Bytevectors::new(self.mc).immutable_from_slice(&b)?.value(self.mc))), self.literal),
+                    Shape::Vector => (Vectors::new(self.mc).immutable_from_slice(items).map(|vector| vector.value(self.mc)).map_err(Grow::from), self.vector),
+                    Shape::Bytevector => (self.bytes(items).and_then(|bytes| Ok(Bytevectors::new(self.mc).immutable_from_slice(&bytes)?.value(self.mc))), self.literal),
                 };
-                let datum = datum.map_err(|e| match e {
+                let datum = datum.map_err(|error| match error {
                     Grow::Item(node) => ReadError::new(ErrorKind::BadByte, node.span(self.mc).start() as usize, node.span(self.mc).end() as usize),
-                    Grow::Arena(e) => ReadError::new(e, open, self.at),
+                    Grow::Arena(error) => ReadError::new(error, open, self.at),
                 })?;
                 self.items.truncate(first);
                 self.node(datum, meta, open)
@@ -298,16 +298,16 @@ impl<'a, 'gc> Reader<'a, 'gc> {
                     self.open.pop();
                     return Ok(None);
                 }
-                Some(&mut Open::Label { n, .. }) => {
+                Some(&mut Open::Label { n: label, .. }) => {
                     self.open.pop();
-                    self.labels.insert(n, Some(node));
+                    self.labels.insert(label, Some(node));
                 }
                 Some(Open::List { tail, .. }) => {
                     let value = node.value(self.mc);
                     let span = node.span(self.mc);
                     let at = |kind: ErrorKind| ReadError::new(kind, span.start() as usize, span.end() as usize);
                     match *tail {
-                        Tail::None => self.items.push(value).map_err(|e| at(e.into()))?,
+                        Tail::None => self.items.push(value).map_err(|error| at(error.into()))?,
                         Tail::Dot(_) => *tail = Tail::Datum(value),
                         Tail::Datum(_) => return Err(at(ErrorKind::BadDot)),
                     }
@@ -337,9 +337,9 @@ impl<'a, 'gc> Reader<'a, 'gc> {
     fn bytes(&self, items: &[Value<'gc>]) -> Result<Vec<u8>, Grow<'gc>> {
         items
             .iter()
-            .map(|&v| {
-                let node = Syntax::of(v).expect("list items are syntax");
-                let byte = node.datum(self.mc).as_fixnum().and_then(|n| u8::try_from(n).ok());
+            .map(|&item| {
+                let node = Syntax::of(item).expect("list items are syntax");
+                let byte = node.datum(self.mc).as_fixnum().and_then(|number| u8::try_from(number).ok());
                 byte.filter(|_| node.kind(self.mc) == Some(SyntaxKind::Literal)).ok_or(Grow::Item(node))
             })
             .collect()
@@ -348,7 +348,7 @@ impl<'a, 'gc> Reader<'a, 'gc> {
     /// A node for `datum`, from `start` to the reader's position.
     fn node(&self, datum: Value<'gc>, meta: SyntaxMeta<'gc>, start: usize) -> Result<Syntax<'gc>, ReadError> {
         let span = SyntaxSpan::new(self.mc, self.source, start as u32, self.at as u32).expect("spans lie in the text");
-        Syntax::new(self.mc, datum, span, Some(meta)).map_err(|e| ReadError::new(e, start, self.at))
+        Syntax::new(self.mc, datum, span, Some(meta)).map_err(|error| ReadError::new(error, start, self.at))
     }
 }
 

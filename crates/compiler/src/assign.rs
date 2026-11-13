@@ -35,9 +35,9 @@ pub(crate) fn lower<'s, 'id, 'gc>(tree: &mut l3::L3<'id, 'gc>, from: &L2<'s, 'gc
     let mut todo = vec![Task::Expr(root)];
     let mut then = std::vec::Vec::new();
     let function = |tree: &mut l3::L3<'id, 'gc>, fun: l2::Fun<'s>, body: Id<'id>| {
-        let f = from[fun];
-        let params = tree.list(from[f.params].iter().copied());
-        tree.function(l3::Function { id: f.id, optional: f.optional, params, rest: f.rest, body })
+        let original = from[fun];
+        let params = tree.list(from[original.params].iter().copied());
+        tree.function(l3::Function { id: original.id, optional: original.optional, params, rest: original.rest, body })
     };
     while let Some(task) = todo.pop() {
         let id = match task {
@@ -54,9 +54,9 @@ pub(crate) fn lower<'s, 'id, 'gc>(tree: &mut l3::L3<'id, 'gc>, from: &L2<'s, 'gc
                         let (second, first) = (pop(), pop());
                         Node::Seq(first, second)
                     }
-                    l2::Node::Set(v, _) => {
-                        assigned.insert(v);
-                        Node::Set(v, pop())
+                    l2::Node::Set(var, _) => {
+                        assigned.insert(var);
+                        Node::Set(var, pop())
                     }
                     l2::Node::Lambda(fun) => {
                         let body = pop();
@@ -73,11 +73,11 @@ pub(crate) fn lower<'s, 'id, 'gc>(tree: &mut l3::L3<'id, 'gc>, from: &L2<'s, 'gc
                         let mut lowered = std::vec::Vec::with_capacity(from[binds].len());
                         for &bind in from[binds].iter().rev() {
                             lowered.push(match bind {
-                                l2::Bind::Val(v, _) => l3::Bind::Val(v, vals.pop().expect("a lowered init")),
+                                l2::Bind::Val(var, _) => l3::Bind::Val(var, vals.pop().expect("a lowered init")),
                                 l2::Bind::Fix(group) => {
                                     let bodies = vals.drain(vals.len() - from[group].len()..).collect::<std::vec::Vec<_>>();
                                     let group: std::vec::Vec<(Var, Fun<'id>)> =
-                                        from[group].iter().zip(bodies).map(|(&(v, fun), body)| (v, function(tree, fun, body))).collect();
+                                        from[group].iter().zip(bodies).map(|(&(var, fun), body)| (var, function(tree, fun, body))).collect();
                                     l3::Bind::Fix(tree.list(group))
                                 }
                             });
@@ -92,8 +92,8 @@ pub(crate) fn lower<'s, 'id, 'gc>(tree: &mut l3::L3<'id, 'gc>, from: &L2<'s, 'gc
             }
         };
         match from[id] {
-            l2::Node::Quote(v) => vals.push(tree.add(Node::Quote(v))),
-            l2::Node::Ref(v) => vals.push(tree.add(Node::Ref(v))),
+            l2::Node::Quote(value) => vals.push(tree.add(Node::Quote(value))),
+            l2::Node::Ref(var) => vals.push(tree.add(Node::Ref(var))),
             l2::Node::Lambda(fun) => then.extend([Task::Expr(from[fun].body), Task::Make(id)]),
             l2::Node::Let(binds, body) => {
                 for &bind in &from[binds] {
@@ -188,17 +188,17 @@ struct Bound {
 }
 
 impl<'id> Survey<'_, '_, 'id, '_> {
-    fn bind(&mut self, v: Var) {
-        if self.assigned.contains(&v) {
-            self.bound.insert(v, Bound { frame: self.frame, captures: self.captures });
+    fn bind(&mut self, var: Var) {
+        if self.assigned.contains(&var) {
+            self.bound.insert(var, Bound { frame: self.frame, captures: self.captures });
         }
     }
 
-    fn uses(&mut self, v: Var) {
-        if let Some(bound) = self.bound.get(&v)
+    fn uses(&mut self, var: Var) {
+        if let Some(bound) = self.bound.get(&var)
             && bound.frame != self.frame
         {
-            self.boxed.insert(v);
+            self.boxed.insert(var);
         }
     }
 
@@ -210,15 +210,15 @@ impl<'id> Survey<'_, '_, 'id, '_> {
         let tree = self.tree;
         match step {
             Step::Expr(id, tail) => self.expr(id, tail, todo),
-            Step::Set(v) => {
-                self.uses(v);
-                if let Some(bound) = self.bound.get(&v)
+            Step::Set(var) => {
+                self.uses(var);
+                if let Some(bound) = self.bound.get(&var)
                     && self.captures > bound.captures
                 {
-                    self.boxed.insert(v);
+                    self.boxed.insert(var);
                 }
             }
-            Step::Bind(v) => self.bind(v),
+            Step::Bind(var) => self.bind(var),
             Step::Capture => self.captures += 1,
             Step::Mark => self.saved.push(self.captures),
             Step::Branch => {
@@ -233,7 +233,7 @@ impl<'id> Survey<'_, '_, 'id, '_> {
             Step::Enter(fun) => {
                 self.frames += 1;
                 self.outer.push((std::mem::replace(&mut self.frame, self.frames), std::mem::replace(&mut self.captures, 0)));
-                tree.params(fun).for_each(|p| self.bind(p));
+                tree.params(fun).for_each(|param| self.bind(param));
             }
             Step::Leave => (self.frame, self.captures) = self.outer.pop().expect("entered"),
             // Join points can be entered via jumps, and loops can repeat; therefore, if any join body
@@ -246,7 +246,7 @@ impl<'id> Survey<'_, '_, 'id, '_> {
             }
             Step::Code(fun) => {
                 self.captures = self.saved[self.saved.len() - 2];
-                tree.params(fun).for_each(|p| self.bind(p));
+                tree.params(fun).for_each(|param| self.bind(param));
             }
             Step::Coded => {
                 let end = self.saved.last_mut().expect("noted at the join");
@@ -263,19 +263,19 @@ impl<'id> Survey<'_, '_, 'id, '_> {
     fn expr(&mut self, id: Id<'id>, tail: bool, todo: &mut std::vec::Vec<Step<'id>>) {
         let tree = self.tree;
         let at = todo.len();
-        let exprs = |ids: &[Id<'id>], todo: &mut std::vec::Vec<Step<'id>>| todo.extend(ids.iter().map(|&a| Step::Expr(a, false)));
+        let exprs = |ids: &[Id<'id>], todo: &mut std::vec::Vec<Step<'id>>| todo.extend(ids.iter().map(|&child| Step::Expr(child, false)));
         match tree[id] {
             Node::Quote(_) => {}
-            Node::Ref(v) => self.uses(v),
-            Node::Set(v, value) => todo.extend([Step::Expr(value, false), Step::Set(v)]),
+            Node::Ref(var) => self.uses(var),
+            Node::Set(var, value) => todo.extend([Step::Expr(value, false), Step::Set(var)]),
             Node::If(test, then, other) => {
                 todo.extend([Step::Expr(test, false), Step::Mark, Step::Expr(then, tail), Step::Branch, Step::Expr(other, tail), Step::Merge]);
             }
-            Node::Seq(a, b) => todo.extend([Step::Expr(a, false), Step::Expr(b, tail)]),
+            Node::Seq(first, second) => todo.extend([Step::Expr(first, false), Step::Expr(second, tail)]),
             Node::Let(binds, body) => {
                 for &bind in &tree[binds] {
                     match bind {
-                        l3::Bind::Val(v, init) => todo.extend([Step::Expr(init, false), Step::Bind(v)]),
+                        l3::Bind::Val(var, init) => todo.extend([Step::Expr(init, false), Step::Bind(var)]),
                         l3::Bind::Fix(group) => {
                             for &(_, fun) in &tree[group] {
                                 todo.extend([Step::Enter(fun), Step::Expr(tree[fun].body, true), Step::Leave]);
@@ -286,8 +286,8 @@ impl<'id> Survey<'_, '_, 'id, '_> {
                 todo.push(Step::Expr(body, tail));
             }
             Node::Lambda(fun) => todo.extend([Step::Enter(fun), Step::Expr(tree[fun].body, true), Step::Leave]),
-            Node::App(f, args) => {
-                let all: std::vec::Vec<Id<'id>> = std::iter::once(f).chain(tree[args].iter().copied()).collect();
+            Node::App(function, args) => {
+                let all: std::vec::Vec<Id<'id>> = std::iter::once(function).chain(tree[args].iter().copied()).collect();
                 exprs(&all, todo);
                 if !tail {
                     todo.push(Step::Capture);
@@ -319,7 +319,7 @@ trait VarSet: Clone + Default {
     fn new(words: usize) -> Self;
     fn insert(&mut self, idx: usize);
     fn union_with(&mut self, other: &Self);
-    fn for_each_intersection(&self, other: &Self, f: impl FnMut(usize));
+    fn for_each_intersection(&self, other: &Self, callback: impl FnMut(usize));
 }
 
 impl VarSet for u64 {
@@ -335,11 +335,11 @@ impl VarSet for u64 {
         *self |= *other;
     }
 
-    fn for_each_intersection(&self, other: &Self, mut f: impl FnMut(usize)) {
+    fn for_each_intersection(&self, other: &Self, mut callback: impl FnMut(usize)) {
         let mut both = *self & *other;
         while both != 0 {
             let tz = both.trailing_zeros() as usize;
-            f(tz);
+            callback(tz);
             both &= both - 1;
         }
     }
@@ -358,17 +358,17 @@ impl VarSet for LargeSet {
     }
 
     fn union_with(&mut self, other: &Self) {
-        for (a, &b) in self.0.iter_mut().zip(&other.0) {
-            *a |= b;
+        for (left, &right) in self.0.iter_mut().zip(&other.0) {
+            *left |= right;
         }
     }
 
-    fn for_each_intersection(&self, other: &Self, mut f: impl FnMut(usize)) {
-        for (i, (&a, &b)) in self.0.iter().zip(&other.0).enumerate() {
-            let mut both = a & b;
+    fn for_each_intersection(&self, other: &Self, mut callback: impl FnMut(usize)) {
+        for (i, (&left, &right)) in self.0.iter().zip(&other.0).enumerate() {
+            let mut both = left & right;
             while both != 0 {
                 let tz = both.trailing_zeros() as usize;
-                f(i * 64 + tz);
+                callback(i * 64 + tz);
                 both &= both - 1;
             }
         }
@@ -394,7 +394,7 @@ fn order_hazards<'id, 'gc>(
     boxed: &mut HashSet<Var>,
 ) {
     let var_list: Vec<Var> = assigned.iter().copied().collect();
-    let var_map: HashMap<Var, usize> = var_list.iter().copied().enumerate().map(|(i, v)| (v, i)).collect();
+    let var_map: HashMap<Var, usize> = var_list.iter().copied().enumerate().map(|(i, var)| (var, i)).collect();
     if assigned.len() <= 64 {
         survey_order::<u64>(tree, root, 1, &var_map, &var_list, boxed);
     } else {
@@ -427,13 +427,13 @@ fn survey_order<'id, 'gc, S: VarSet>(
                     let mut reads = S::new(words);
                     let mut writes = S::new(words);
                     match tree[id] {
-                        Node::Ref(v) => {
-                            if let Some(&idx) = var_map.get(&v) {
+                        Node::Ref(var) => {
+                            if let Some(&idx) = var_map.get(&var) {
                                 reads.insert(idx);
                             }
                         }
-                        Node::Set(v, _) => {
-                            if let Some(&idx) = var_map.get(&v) {
+                        Node::Set(var, _) => {
+                            if let Some(&idx) = var_map.get(&var) {
                                 writes.insert(idx);
                             }
                         }
@@ -468,13 +468,13 @@ fn survey_order<'id, 'gc, S: VarSet>(
                     node_writes.union_with(&child.writes);
                 }
                 match tree[id] {
-                    Node::Ref(v) => {
-                        if let Some(&idx) = var_map.get(&v) {
+                    Node::Ref(var) => {
+                        if let Some(&idx) = var_map.get(&var) {
                             node_reads.insert(idx);
                         }
                     }
-                    Node::Set(v, _) => {
-                        if let Some(&idx) = var_map.get(&v) {
+                    Node::Set(var, _) => {
+                        if let Some(&idx) = var_map.get(&var) {
                             node_writes.insert(idx);
                         }
                     }
@@ -486,35 +486,35 @@ fn survey_order<'id, 'gc, S: VarSet>(
     }
 }
 
-/// Checks whether expression `e` contains any non-tail calls or operations that could capture a continuation,
-/// taking into account whether `e` itself is in tail position.
-fn captures<'id>(tree: &l3::L3<'id, '_>, e: Id<'id>, tail: bool) -> bool {
-    let mut todo = vec![(e, tail)];
+/// Checks whether expression `expr` contains any non-tail calls or operations that could capture a continuation,
+/// taking into account whether `expr` itself is in tail position.
+fn captures<'id>(tree: &l3::L3<'id, '_>, expr: Id<'id>, tail: bool) -> bool {
+    let mut todo = vec![(expr, tail)];
     while let Some((id, tail)) = todo.pop() {
-        let args = |ids: &[Id<'id>], todo: &mut std::vec::Vec<(Id<'id>, bool)>| todo.extend(ids.iter().map(|&a| (a, false)));
+        let args = |ids: &[Id<'id>], todo: &mut std::vec::Vec<(Id<'id>, bool)>| todo.extend(ids.iter().map(|&arg| (arg, false)));
         match tree[id] {
             Node::Quote(_) | Node::Ref(_) | Node::Lambda(_) => {}
             Node::Set(_, value) => todo.push((value, false)),
             Node::If(test, then, other) => todo.extend([(test, false), (then, tail), (other, tail)]),
-            Node::Seq(a, b) => todo.extend([(a, false), (b, tail)]),
+            Node::Seq(first, second) => todo.extend([(first, false), (second, tail)]),
             Node::Let(binds, body) => {
-                todo.extend(tree[binds].iter().filter_map(|b| if let l3::Bind::Val(_, init) = *b { Some((init, false)) } else { None }));
+                todo.extend(tree[binds].iter().filter_map(|bind| if let l3::Bind::Val(_, init) = *bind { Some((init, false)) } else { None }));
                 todo.push((body, tail));
             }
-            Node::App(f, a) => {
+            Node::App(function, operands) => {
                 if !tail {
                     return true;
                 }
-                todo.push((f, false));
-                args(&tree[a], &mut todo);
+                todo.push((function, false));
+                args(&tree[operands], &mut todo);
             }
-            Node::Intrinsic(prim, a) | Node::ApplyIntrinsic(prim, a) => {
+            Node::Intrinsic(prim, operands) | Node::ApplyIntrinsic(prim, operands) => {
                 if !tail && !matches!(prim, Prim::Intrinsic(_) | Prim::Slot(..)) {
                     return true;
                 }
-                args(&tree[a], &mut todo);
+                args(&tree[operands], &mut todo);
             }
-            Node::Jump(_, a) => args(&tree[a], &mut todo),
+            Node::Jump(_, operands) => args(&tree[operands], &mut todo),
             Node::Join(scope, codes) => {
                 todo.push((scope, tail));
                 todo.extend(tree[codes].iter().map(|code| (tree[code.fun].body, tail)));
@@ -545,44 +545,44 @@ fn rewrite<'id, 'gc>(tree: &mut l3::L3<'id, 'gc>, root: Id<'id>, boxed: &HashSet
             Redo::Node(id) => id,
             Redo::Function(fun) => {
                 let mut binds = std::vec::Vec::new();
-                let mut fresh = |p: Var, tree: &mut l3::L3<'id, 'gc>| {
-                    if !boxed.contains(&p) {
-                        return p;
+                let mut fresh = |param: Var, tree: &mut l3::L3<'id, 'gc>| {
+                    if !boxed.contains(&param) {
+                        return param;
                     }
                     let raw = supply.fresh_var();
-                    let r = tree.add(Node::Ref(raw));
-                    let init = boxing(tree, Intrinsic::MakeBox, &[r]);
-                    binds.push(l3::Bind::Val(p, tree.add(init)));
+                    let reference = tree.add(Node::Ref(raw));
+                    let init = boxing(tree, Intrinsic::MakeBox, &[reference]);
+                    binds.push(l3::Bind::Val(param, tree.add(init)));
                     raw
                 };
-                let f = tree[fun];
-                let params: std::vec::Vec<Var> = (0..tree[f.params].len()).map(|i| fresh(tree[f.params][i], tree)).collect();
-                let rest = f.rest.map(|p| fresh(p, tree));
+                let function = tree[fun];
+                let params: std::vec::Vec<Var> = (0..tree[function.params].len()).map(|i| fresh(tree[function.params][i], tree)).collect();
+                let rest = function.rest.map(|param| fresh(param, tree));
                 if !binds.is_empty() {
                     let (params, binds) = (tree.list(params), tree.list(binds));
-                    let body = tree.add(Node::Let(binds, f.body));
-                    tree[fun] = l3::Function { params, rest, body, ..f };
+                    let body = tree.add(Node::Let(binds, function.body));
+                    tree[fun] = l3::Function { params, rest, body, ..function };
                 }
                 continue;
             }
         };
         let body = |fun: Fun<'id>, tree: &l3::L3<'id, 'gc>| [Redo::Node(tree[fun].body), Redo::Function(fun)];
         match tree[id] {
-            Node::Ref(v) if boxed.contains(&v) => {
-                let r = tree.add(Node::Ref(v));
-                let node = boxing(tree, Intrinsic::Unbox, &[r]);
+            Node::Ref(var) if boxed.contains(&var) => {
+                let reference = tree.add(Node::Ref(var));
+                let node = boxing(tree, Intrinsic::Unbox, &[reference]);
                 tree.set(id, node);
             }
-            Node::Set(v, value) if boxed.contains(&v) => {
-                let r = tree.add(Node::Ref(v));
-                let node = boxing(tree, Intrinsic::SetBox, &[r, value]);
+            Node::Set(var, value) if boxed.contains(&var) => {
+                let reference = tree.add(Node::Ref(var));
+                let node = boxing(tree, Intrinsic::SetBox, &[reference, value]);
                 tree.set(id, node);
                 then.push(Redo::Node(value));
             }
             Node::Let(binds, body_id) => {
                 for i in 0..tree[binds].len() {
                     match tree[binds][i] {
-                        l3::Bind::Val(v, init) if boxed.contains(&v) => {
+                        l3::Bind::Val(var, init) if boxed.contains(&var) => {
                             let value = tree.add(tree[init]);
                             let node = boxing(tree, Intrinsic::MakeBox, &[value]);
                             tree.set(init, node);

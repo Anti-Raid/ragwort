@@ -156,13 +156,13 @@ impl<'a, 'gc> Tree<'a, 'gc> {
             Make(Syntax<'gc>, usize, bool),
         }
         let mc = self.mc;
-        let part = |v: Value<'gc>| Task::Visit(Syntax::of(v).expect("the reader wraps every part"));
+        let part = |value: Value<'gc>| Task::Visit(Syntax::of(value).expect("the reader wraps every part"));
         let (mut todo, mut done) = (vec![Task::Visit(root)], Vec::new());
         while let Some(task) = todo.pop() {
             let node = match task {
                 Task::Visit(node) => node,
-                Task::Make(node, n, dotted) => {
-                    let items = done.split_off(done.len() - n);
+                Task::Make(node, count, dotted) => {
+                    let items = done.split_off(done.len() - count);
                     let (first, len) = self.parts(items)?;
                     let shape = match node.kind(mc) {
                         Some(SyntaxKind::Vector) => Shape::Vector { first, len },
@@ -193,8 +193,8 @@ impl<'a, 'gc> Tree<'a, 'gc> {
                     todo.extend((0..vector.len(mc)).filter_map(|i| vector.get(mc, i)).map(part));
                     todo.push(Task::Make(node, todo.len() - at, false));
                 }
-                Some(SyntaxKind::Abbreviation(a)) => {
-                    let name = self.abbreviations[a as usize];
+                Some(SyntaxKind::Abbreviation(abbreviation)) => {
+                    let name = self.abbreviations[abbreviation as usize];
                     done.push(self.id(name, Set::EMPTY, node.span(mc))?);
                     // A list of the abbreviation's name, made already, and what it abbreviates.
                     todo.extend([part(node.datum(mc)), Task::Make(node, 2, false)]);

@@ -30,12 +30,12 @@ const OPTIONAL: i64 = 1 << 48;
 impl Shape {
     /// Encodes this parameter shape as an `i64` arity representation stored in [`crate::objects::Bytecode`]. Without optional parameters, it follows Chez Scheme encoding: `n >= 0` for exactly `n` arguments, and `-(n + 1)` for at least `n` arguments with a rest list. With optional parameters, required and optional counts (16 bits each) and the rest flag are tagged with the high `OPTIONAL` bit, ensuring calls take the general arity-checking path. Returns `None` if counts exceed 16 bits.
     pub fn encode(self) -> Option<i64> {
-        let n = i64::try_from(self.required).ok()?;
+        let required = i64::try_from(self.required).ok()?;
         Some(match (self.optional, self.rest) {
-            (0, false) => n,
-            (0, true) => -n - 1,
+            (0, false) => required,
+            (0, true) => -required - 1,
             (optional, rest) if self.required <= 0xFFFF && optional <= 0xFFFF => {
-                OPTIONAL | n | (optional as i64) << 16 | i64::from(rest) << 32
+                OPTIONAL | required | (optional as i64) << 16 | i64::from(rest) << 32
             }
             _ => return None,
         })
@@ -56,9 +56,9 @@ impl Shape {
         self.required + self.optional + u64::from(self.rest)
     }
 
-    /// Returns `true` if this parameter shape accepts `n` positional arguments.
-    pub fn takes(self, n: u64) -> bool {
-        n >= self.required && (self.rest || n <= self.required + self.optional)
+    /// Returns `true` if this parameter shape accepts `count` positional arguments.
+    pub fn takes(self, count: u64) -> bool {
+        count >= self.required && (self.rest || count <= self.required + self.optional)
     }
 }
 
@@ -107,8 +107,8 @@ impl Link {
     }
 
     pub fn of(value: Value<'_>) -> Option<Link> {
-        let n = u64::try_from(value.as_fixnum()?).ok()?;
-        Some(Link { pc: usize::try_from(n >> 9).ok()?, base: n as u8, marks: n & 256 != 0 })
+        let bits = u64::try_from(value.as_fixnum()?).ok()?;
+        Some(Link { pc: usize::try_from(bits >> 9).ok()?, base: bits as u8, marks: bits & 256 != 0 })
     }
 }
 

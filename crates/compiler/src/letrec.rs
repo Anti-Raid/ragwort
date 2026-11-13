@@ -17,7 +17,7 @@ use crate::ir::l1::{self, L1};
 use crate::ir::l2::{self, Bind, Fun, Id, L2, Node};
 use crate::ir::Supply;
 
-/// Maximum number of mutually recursive closures allowed in a single `Fix` group: the emitter stages a group's closures in its `STAGE` scratch registers, one each.
+/// Maximum number of mutually recursive closures in a single `Fix` group. The emitter stages each closure of a group in one of its `STAGE` scratch registers, so a group cannot be larger than that.
 const MAX_FIX_GROUP: usize = crate::emit::STAGE;
 
 /// Lowers `root` from `from` into `tree` with all `letrec` bindings fixed, returning the new root node ID and updated `Supply`.
@@ -43,19 +43,19 @@ pub(crate) fn fix_letrec<'s, 'id, 'gc>(mc: &Mutation<'gc>, from: &L1<'s, 'gc>, r
         match task {
             Task::Open => usages.push(Usage::default()),
             Task::Keep => {
-                let u = usages.pop().expect("opened");
-                inits.push((vals.pop().expect("a fixed init"), u));
+                let init_usage = usages.pop().expect("opened");
+                inits.push((vals.pop().expect("a fixed init"), init_usage));
             }
             Task::Expr(id) => {
                 cx.tree.at(from.site(id));
                 match from[id] {
-                l1::Node::Quote(v) => vals.push(cx.tree.add(Node::Quote(v))),
-                l1::Node::Ref(v) => {
-                    usage.used.insert(v);
-                    vals.push(cx.tree.add(Node::Ref(v)));
+                l1::Node::Quote(value) => vals.push(cx.tree.add(Node::Quote(value))),
+                l1::Node::Ref(var) => {
+                    usage.used.insert(var);
+                    vals.push(cx.tree.add(Node::Ref(var)));
                 }
-                l1::Node::Set(v, value) => {
-                    usage.assigned.insert(v);
+                l1::Node::Set(var, value) => {
+                    usage.assigned.insert(var);
                     then.extend([Task::Expr(value), Task::Make(id)]);
                 }
                 l1::Node::Lambda(fun) => then.extend([Task::Open, Task::Expr(from[fun].body), Task::Make(id)]),
@@ -73,13 +73,13 @@ pub(crate) fn fix_letrec<'s, 'id, 'gc>(mc: &Mutation<'gc>, from: &L1<'s, 'gc>, r
             }
             Task::Make(id) => {
                 cx.tree.at(from.site(id));
-                let mut last = |n: usize| vals.split_off(vals.len() - n);
+                let mut last = |count: usize| vals.split_off(vals.len() - count);
                 let node = match from[id] {
                     l1::Node::If(..) => {
-                        let [test, t, other] = last(3)[..] else { unreachable!() };
-                        Node::If(test, t, other)
+                        let [test, consequent, other] = last(3)[..] else { unreachable!() };
+                        Node::If(test, consequent, other)
                     }
-                    l1::Node::Set(v, _) => Node::Set(v, last(1)[0]),
+                    l1::Node::Set(var, _) => Node::Set(var, last(1)[0]),
                     l1::Node::App(_, args) => {
                         let mut all = last(from[args].len() + 1);
                         let args = all.split_off(1);
@@ -90,19 +90,19 @@ pub(crate) fn fix_letrec<'s, 'id, 'gc>(mc: &Mutation<'gc>, from: &L1<'s, 'gc>, r
                     l1::Node::Lambda(fun) => {
                         let body = last(1)[0];
                         let inner = usages.pop().expect("opened");
-                        let f = from[fun];
-                        let params = &from[f.params];
-                        usages.last_mut().expect("the root's usage is never closed").absorb(inner.bind(params.iter().copied().chain(f.rest)));
+                        let function = from[fun];
+                        let params = &from[function.params];
+                        usages.last_mut().expect("the root's usage is never closed").absorb(inner.bind(params.iter().copied().chain(function.rest)));
                         let params = cx.tree.list(params.iter().copied());
-                        Node::Lambda(cx.tree.function(l2::Function { id: f.id, optional: f.optional, params, rest: f.rest, body }))
+                        Node::Lambda(cx.tree.function(l2::Function { id: function.id, optional: function.optional, params, rest: function.rest, body }))
                     }
                     l1::Node::Let(binds, _) | l1::Node::Letrec(binds, _) => {
                         let body = last(1)[0];
                         let body_usage = usages.pop().expect("opened");
                         let fixed = inits.split_off(inits.len() - from[binds].len());
-                        let binds: Vec<(Var, Id<'id>, Usage)> = from[binds].iter().zip(fixed).map(|(&(v, _), (e, u))| (v, e, u)).collect();
-                        let (expr, u) = if matches!(from[id], l1::Node::Letrec(..)) { cx.fix_block(binds, body, body_usage) } else { cx.simplify_let_with(binds, body, body_usage) };
-                        usages.last_mut().expect("the root's usage is never closed").absorb(u);
+                        let binds: Vec<(Var, Id<'id>, Usage)> = from[binds].iter().zip(fixed).map(|(&(var, _), (init, init_usage))| (var, init, init_usage)).collect();
+                        let (expr, combined) = if matches!(from[id], l1::Node::Letrec(..)) { cx.fix_block(binds, body, body_usage) } else { cx.simplify_let_with(binds, body, body_usage) };
+                        usages.last_mut().expect("the root's usage is never closed").absorb(combined);
                         vals.push(expr);
                         continue;
                     }
@@ -143,30 +143,30 @@ impl Usage {
         self.assigned.extend(other.assigned);
     }
 
-    fn mentions(&self, v: Var) -> bool {
-        self.used.contains(&v) || self.assigned.contains(&v)
+    fn mentions(&self, var: Var) -> bool {
+        self.used.contains(&var) || self.assigned.contains(&var)
     }
 
     /// Returns the remaining free variable usage after removing the variables bound by `vars`.
     fn bind(mut self, vars: impl IntoIterator<Item = Var>) -> Self {
-        for v in vars {
-            self.forget(v);
+        for var in vars {
+            self.forget(var);
         }
         self
     }
 
-    fn forget(&mut self, v: Var) {
-        self.used.remove(&v);
-        self.assigned.remove(&v);
+    fn forget(&mut self, var: Var) {
+        self.used.remove(&var);
+        self.assigned.remove(&var);
     }
 
     /// Computes the intersection of `self`'s used and assigned variables with `vars`, returning `(used_in_vars, assigned_in_vars)`.
     fn among(&self, vars: &HashSet<Var>) -> (HashSet<Var>, HashSet<Var>) {
         let among = |set: &HashSet<Var>| -> HashSet<Var> {
             if set.len() < vars.len() {
-                set.iter().copied().filter(|v| vars.contains(v)).collect()
+                set.iter().copied().filter(|var| vars.contains(var)).collect()
             } else {
-                vars.iter().copied().filter(|v| set.contains(v)).collect()
+                vars.iter().copied().filter(|var| set.contains(var)).collect()
             }
         };
         (among(&self.used), among(&self.assigned))
@@ -184,7 +184,7 @@ pub(crate) fn prune<'id, 'gc>(mc: &Mutation<'gc>, tree: &mut l2::L2<'id, 'gc>, r
         Open,
         /// Finalizes traversal of a function body, removes its formal parameters from the tracked usage, and merges remaining free variables into the outer scope.
         Function(l2::Fun<'id>),
-        /// Evaluates `let` binding `i` after all subsequent bindings and the body have been processed: retains the binding if it is impure or referenced downstream.
+        /// Evaluates `let` binding `index` after all subsequent bindings and the body have been processed: retains the binding if it is impure or referenced downstream.
         Bind(l2::Id<'id>, usize),
         /// Removes all variables bound by a mutually recursive `Fix` group from the active usage set after analyzing its member functions.
         Forget(l2::Span<'id, (Var, l2::Fun<'id>)>),
@@ -204,19 +204,19 @@ pub(crate) fn prune<'id, 'gc>(mc: &Mutation<'gc>, tree: &mut l2::L2<'id, 'gc>, r
                 let outer = usages.last_mut().expect("the root's usage is never closed");
                 outer.absorb(inner.bind(tree.params(fun)));
             }
-            Task::Forget(group) => tree[group].iter().for_each(|&(v, _)| usage.forget(v)),
-            Task::Bind(at, i) => {
+            Task::Forget(group) => tree[group].iter().for_each(|&(var, _)| usage.forget(var)),
+            Task::Bind(at, index) => {
                 let l2::Node::Let(binds, _) = tree[at] else { unreachable!("a let's binding") };
-                match tree[binds][i] {
-                    l2::Bind::Val(v, e) => {
-                        if usage.mentions(v) || !tree.is_pure(mc, e) {
-                            usage.forget(v);
-                            kept.last_mut().expect("in a let").push(l2::Bind::Val(v, e));
-                            then.push(Task::Expr(e));
+                match tree[binds][index] {
+                    l2::Bind::Val(var, init) => {
+                        if usage.mentions(var) || !tree.is_pure(mc, init) {
+                            usage.forget(var);
+                            kept.last_mut().expect("in a let").push(l2::Bind::Val(var, init));
+                            then.push(Task::Expr(init));
                         }
                     }
                     l2::Bind::Fix(group) => {
-                        if tree[group].iter().any(|&(v, _)| usage.mentions(v)) {
+                        if tree[group].iter().any(|&(var, _)| usage.mentions(var)) {
                             for &(_, fun) in &tree[group] {
                                 then.extend([Task::Open, Task::Expr(tree[fun].body), Task::Function(fun)]);
                             }
@@ -225,8 +225,8 @@ pub(crate) fn prune<'id, 'gc>(mc: &Mutation<'gc>, tree: &mut l2::L2<'id, 'gc>, r
                         }
                     }
                 }
-                if i > 0 {
-                    then.push(Task::Bind(at, i - 1));
+                if index > 0 {
+                    then.push(Task::Bind(at, index - 1));
                 }
             }
             Task::Let(at) => {
@@ -239,9 +239,9 @@ pub(crate) fn prune<'id, 'gc>(mc: &Mutation<'gc>, tree: &mut l2::L2<'id, 'gc>, r
                 tree.set(at, node);
             }
             Task::Expr(id) => match tree[id] {
-                l2::Node::Ref(v) => _ = usage.used.insert(v),
-                l2::Node::Set(v, value) => {
-                    usage.assigned.insert(v);
+                l2::Node::Ref(var) => _ = usage.used.insert(var),
+                l2::Node::Set(var, value) => {
+                    usage.assigned.insert(var);
                     then.push(Task::Expr(value));
                 }
                 l2::Node::Lambda(fun) => then.extend([Task::Open, Task::Expr(tree[fun].body), Task::Function(fun)]),
@@ -269,11 +269,11 @@ impl<'id> Cx<'_, '_, 'id, '_> {
     fn simplify_let_with(&mut self, binds: Vec<(Var, Id<'id>, Usage)>, body: Id<'id>, body_usage: Usage) -> (Id<'id>, Usage) {
         let mut usage = body_usage;
         let mut kept = Vec::with_capacity(binds.len());
-        for (v, init, init_usage) in binds.into_iter().rev() {
-            if usage.mentions(v) || !self.tree.is_pure(self.mc, init) {
-                usage.forget(v);
+        for (var, init, init_usage) in binds.into_iter().rev() {
+            if usage.mentions(var) || !self.tree.is_pure(self.mc, init) {
+                usage.forget(var);
                 usage.absorb(init_usage);
-                kept.push(Bind::Val(v, init));
+                kept.push(Bind::Val(var, init));
             }
         }
         kept.reverse();
@@ -298,16 +298,16 @@ impl<'id> Cx<'_, '_, 'id, '_> {
         if binds.is_empty() {
             return (body, body_usage);
         }
-        let letrec_vars: HashSet<Var> = binds.iter().map(|&(v, _, _)| v).collect();
+        let letrec_vars: HashSet<Var> = binds.iter().map(|&(var, _, _)| var).collect();
         let mut used = HashSet::default();
         let mut assigned = HashSet::default();
         let mut fv: HashMap<Var, HashSet<Var>> = HashMap::with_capacity_and_hasher(binds.len(), Default::default());
 
-        for (v, _, usage) in &binds {
+        for (var, _, usage) in &binds {
             let (init_used, init_assigned) = usage.among(&letrec_vars);
             used.extend(init_used.iter().copied());
             assigned.extend(init_assigned.iter().copied());
-            fv.insert(*v, init_used.into_iter().chain(init_assigned).collect());
+            fv.insert(*var, init_used.into_iter().chain(init_assigned).collect());
         }
         let (body_used, body_assigned) = body_usage.among(&letrec_vars);
         used.extend(body_used);
@@ -316,10 +316,10 @@ impl<'id> Cx<'_, '_, 'id, '_> {
         // Discard completely unreferenced pure bindings; remaining bindings represent all active dependencies of the block.
         let mut usage = body_usage;
         let mut indexed: Vec<Pending<'id>> = Vec::with_capacity(binds.len());
-        for (i, (v, init, u)) in binds.into_iter().enumerate() {
-            if used.contains(&v) || !self.tree.is_pure(self.mc, init) {
-                usage.absorb(u);
-                indexed.push((i, v, init));
+        for (i, (var, init, init_usage)) in binds.into_iter().enumerate() {
+            if used.contains(&var) || !self.tree.is_pure(self.mc, init) {
+                usage.absorb(init_usage);
+                indexed.push((i, var, init));
             }
         }
         let usage = usage.bind(letrec_vars.iter().copied());
@@ -329,26 +329,26 @@ impl<'id> Cx<'_, '_, 'id, '_> {
         let mut out = Vec::with_capacity(indexed.len());
         let mut iter = indexed.into_iter().peekable();
 
-        while let Some((idx, v, init)) = iter.next() {
-            if !assigned.contains(&v) && used.contains(&v) && matches!(self.tree[init], Node::Lambda(_)) {
-                pending_fix.push((idx, v, init));
+        while let Some((idx, var, init)) = iter.next() {
+            if !assigned.contains(&var) && used.contains(&var) && matches!(self.tree[init], Node::Lambda(_)) {
+                pending_fix.push((idx, var, init));
                 continue;
             }
 
             self.flush_ready_fix(&mut pending_fix, &mut bound, &fv, &mut out);
 
-            if fv[&v].is_subset(&bound) {
-                if used.contains(&v) {
-                    bound.insert(v);
+            if fv[&var].is_subset(&bound) {
+                if used.contains(&var) {
+                    bound.insert(var);
                 }
-                out.push(Bind::Val(v, init));
+                out.push(Bind::Val(var, init));
             } else {
                 // Detected forward reference to an uninitialized variable: desugar remaining bindings into `#<void>` initialization followed by `Set` assignments in original source order.
                 let mut rest: Vec<Pending<'id>> = std::mem::take(&mut pending_fix);
-                rest.push((idx, v, init));
+                rest.push((idx, var, init));
                 rest.extend(iter);
-                rest.sort_by_key(|&(i, _, _)| i);
-                self.fallback(rest.into_iter().map(|(_, v, init)| (v, init)), &used, &mut out);
+                rest.sort_by_key(|&(original, _, _)| original);
+                self.fallback(rest.into_iter().map(|(_, var, init)| (var, init)), &used, &mut out);
                 break;
             }
         }
@@ -357,8 +357,8 @@ impl<'id> Cx<'_, '_, 'id, '_> {
             self.flush_ready_fix(&mut pending_fix, &mut bound, &fv, &mut out);
             if !pending_fix.is_empty() {
                 let mut rest = std::mem::take(&mut pending_fix);
-                rest.sort_by_key(|&(i, _, _)| i);
-                self.fallback(rest.into_iter().map(|(_, v, init)| (v, init)), &used, &mut out);
+                rest.sort_by_key(|&(original, _, _)| original);
+                self.fallback(rest.into_iter().map(|(_, var, init)| (var, init)), &used, &mut out);
             }
         }
 
@@ -368,15 +368,15 @@ impl<'id> Cx<'_, '_, 'id, '_> {
     /// Desugars `rest` using the general fallback strategy: binds referenced variables to `#<void>`, then sequentially assigns each initializer or evaluates impure unused initializers for their side effects.
     fn fallback(&mut self, rest: impl IntoIterator<Item = (Var, Id<'id>)>, used: &HashSet<Var>, out: &mut Vec<Bind<'id>>) {
         let rest: Vec<(Var, Id<'id>)> = rest.into_iter().collect();
-        for &(v, _) in rest.iter().filter(|(v, _)| used.contains(v)) {
-            out.push(Bind::Val(v, self.tree.add(Node::Quote(Value::VOID))));
+        for &(var, _) in rest.iter().filter(|(var, _)| used.contains(var)) {
+            out.push(Bind::Val(var, self.tree.add(Node::Quote(Value::VOID))));
         }
-        for (v, init) in rest {
-            if used.contains(&v) {
-                let set = self.tree.add(Node::Set(v, init));
+        for (var, init) in rest {
+            if used.contains(&var) {
+                let set = self.tree.add(Node::Set(var, init));
                 out.push(Bind::Val(self.supply.fresh_var(), set));
             } else if !self.tree.is_pure(self.mc, init) {
-                out.push(Bind::Val(v, init));
+                out.push(Bind::Val(var, init));
             }
         }
     }
@@ -386,9 +386,9 @@ impl<'id> Cx<'_, '_, 'id, '_> {
         if pending_fix.is_empty() {
             return;
         }
-        let mut cand: HashSet<Var> = pending_fix.iter().map(|&(_, v, _)| v).collect();
+        let mut cand: HashSet<Var> = pending_fix.iter().map(|&(_, var, _)| var).collect();
         loop {
-            let next: HashSet<Var> = cand.iter().copied().filter(|v| fv[v].iter().all(|dep| bound.contains(dep) || cand.contains(dep))).collect();
+            let next: HashSet<Var> = cand.iter().copied().filter(|var| fv[var].iter().all(|dep| bound.contains(dep) || cand.contains(dep))).collect();
             if next.len() == cand.len() {
                 break;
             }
@@ -411,24 +411,24 @@ impl<'id> Cx<'_, '_, 'id, '_> {
 
         // Decompose the dependency graph of `ready` functions into strongly connected components in topological order using Tarjan's algorithm.
         for scc in tarjan_sccs(ready, fv) {
-            for &(v, _) in &scc {
-                bound.insert(v);
+            for &(var, _) in &scc {
+                bound.insert(var);
             }
             if scc.len() == 1 {
-                let (v, lambda) = scc[0];
-                if fv[&v].contains(&v) {
-                    let group = self.tree.list([(v, self.fun(lambda))]);
+                let (var, lambda) = scc[0];
+                if fv[&var].contains(&var) {
+                    let group = self.tree.list([(var, self.fun(lambda))]);
                     out.push(Bind::Fix(group));
                 } else {
-                    out.push(Bind::Val(v, lambda));
+                    out.push(Bind::Val(var, lambda));
                 }
             } else if scc.len() <= MAX_FIX_GROUP {
-                let group: Vec<(Var, Fun<'id>)> = scc.iter().map(|&(v, lambda)| (v, self.fun(lambda))).collect();
+                let group: Vec<(Var, Fun<'id>)> = scc.iter().map(|&(var, lambda)| (var, self.fun(lambda))).collect();
                 let group = self.tree.list(group);
                 out.push(Bind::Fix(group));
             } else {
                 // Fall back to desugared assignment for mutually recursive SCCs exceeding MAX_FIX_GROUP, which exceed available staging registers.
-                let members: HashSet<Var> = scc.iter().map(|&(v, _)| v).collect();
+                let members: HashSet<Var> = scc.iter().map(|&(var, _)| var).collect();
                 self.fallback(scc, &members, out);
             }
         }
@@ -437,12 +437,12 @@ impl<'id> Cx<'_, '_, 'id, '_> {
 
 /// Computes the strongly connected components of `nodes` in topological dependency order (callees preceding callers) via Tarjan's algorithm.
 fn tarjan_sccs<T: Copy>(nodes: Vec<(Var, T)>, fv: &HashMap<Var, HashSet<Var>>) -> Vec<Vec<(Var, T)>> {
-    let n = nodes.len();
-    let index_of: HashMap<Var, usize> = nodes.iter().enumerate().map(|(i, &(v, _))| (v, i)).collect();
+    let count = nodes.len();
+    let index_of: HashMap<Var, usize> = nodes.iter().enumerate().map(|(i, &(var, _))| (var, i)).collect();
     let edges: Vec<Vec<usize>> = nodes
         .iter()
-        .map(|&(v, _)| {
-            let mut deps: Vec<usize> = fv[&v].iter().filter_map(|dep| index_of.get(dep).copied()).collect();
+        .map(|&(var, _)| {
+            let mut deps: Vec<usize> = fv[&var].iter().filter_map(|dep| index_of.get(dep).copied()).collect();
             deps.sort_unstable();
             deps
         })
@@ -463,29 +463,29 @@ fn tarjan_sccs<T: Copy>(nodes: Vec<(Var, T)>, fv: &HashMap<Var, HashSet<Var>>) -
         fn visit(&mut self, root: usize) {
             let mut calls = vec![(root, 0)];
             self.enter(root);
-            while let Some(&mut (v, ref mut next)) = calls.last_mut() {
-                if let Some(&w) = self.edges[v].get(*next) {
+            while let Some(&mut (node, ref mut next)) = calls.last_mut() {
+                if let Some(&successor) = self.edges[node].get(*next) {
                     *next += 1;
-                    match self.indices[w] {
-                        Some(w_idx) if self.on_stack[w] => self.lowlink[v] = self.lowlink[v].min(w_idx),
+                    match self.indices[successor] {
+                        Some(w_idx) if self.on_stack[successor] => self.lowlink[node] = self.lowlink[node].min(w_idx),
                         Some(_) => {}
                         None => {
-                            self.enter(w);
-                            calls.push((w, 0));
+                            self.enter(successor);
+                            calls.push((successor, 0));
                         }
                     }
                     continue;
                 }
                 calls.pop();
                 if let Some(&(parent, _)) = calls.last() {
-                    self.lowlink[parent] = self.lowlink[parent].min(self.lowlink[v]);
+                    self.lowlink[parent] = self.lowlink[parent].min(self.lowlink[node]);
                 }
-                if Some(self.lowlink[v]) == self.indices[v] {
+                if Some(self.lowlink[node]) == self.indices[node] {
                     let mut scc = Vec::new();
-                    while let Some(w) = self.stack.pop() {
-                        self.on_stack[w] = false;
-                        scc.push(w);
-                        if w == v {
+                    while let Some(member) = self.stack.pop() {
+                        self.on_stack[member] = false;
+                        scc.push(member);
+                        if member == node {
                             break;
                         }
                     }
@@ -495,26 +495,26 @@ fn tarjan_sccs<T: Copy>(nodes: Vec<(Var, T)>, fv: &HashMap<Var, HashSet<Var>>) -
             }
         }
 
-        fn enter(&mut self, v: usize) {
+        fn enter(&mut self, node: usize) {
             let idx = self.index;
             self.index += 1;
-            self.indices[v] = Some(idx);
-            self.lowlink[v] = idx;
-            self.stack.push(v);
-            self.on_stack[v] = true;
+            self.indices[node] = Some(idx);
+            self.lowlink[node] = idx;
+            self.stack.push(node);
+            self.on_stack[node] = true;
         }
     }
 
     let mut state = Tarjan {
         edges: &edges,
         index: 0,
-        indices: vec![None; n],
-        lowlink: vec![0; n],
-        on_stack: vec![false; n],
-        stack: Vec::with_capacity(n),
+        indices: vec![None; count],
+        lowlink: vec![0; count],
+        on_stack: vec![false; count],
+        stack: Vec::with_capacity(count),
         sccs: Vec::new(),
     };
-    for i in 0..n {
+    for i in 0..count {
         if state.indices[i].is_none() {
             state.visit(i);
         }

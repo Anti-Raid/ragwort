@@ -36,13 +36,13 @@ pub(crate) fn emit<'gc>(mc: &Mutation<'gc>, owner: Option<Gc<'gc, objects::Modul
         module.index.insert(value.to_bits(), slot);
     }
     let table = Vectors::new(mc).immutable_from_slice(&module.constants)?.value(mc);
-    for &c in &module.codes {
-        c.set_constants(mc, table);
+    for &bytecode in &module.codes {
+        bytecode.set_constants(mc, table);
     }
     if !module.lines.is_empty() {
         let sites = module.sites()?;
-        for &c in &module.codes {
-            c.set_sites(mc, sites);
+        for &bytecode in &module.codes {
+            bytecode.set_sites(mc, sites);
         }
     }
     Ok(Value::object(mc, Closure::new(mc, Some(code), 0, Value::VOID)?))
@@ -56,36 +56,36 @@ enum Loc {
     Slot(u32),
 }
 
-fn has(set: &[u64], v: Val) -> bool {
-    set[v.0 as usize / 64] & (1 << (v.0 % 64)) != 0
+fn has(set: &[u64], value: Val) -> bool {
+    set[value.0 as usize / 64] & (1 << (value.0 % 64)) != 0
 }
 
-/// Inserts value `v` into bitset `set`, returning `true` if `v` was not previously present.
-fn add(set: &mut [u64], v: Val) -> bool {
-    let (word, bit) = (&mut set[v.0 as usize / 64], 1 << (v.0 % 64));
+/// Inserts value `value` into bitset `set`, returning `true` if `value` was not previously present.
+fn add(set: &mut [u64], value: Val) -> bool {
+    let (word, bit) = (&mut set[value.0 as usize / 64], 1 << (value.0 % 64));
     let new = *word & bit == 0;
     *word |= bit;
     new
 }
 
-fn remove(set: &mut [u64], v: Val) {
-    set[v.0 as usize / 64] &= !(1 << (v.0 % 64));
+fn remove(set: &mut [u64], value: Val) {
+    set[value.0 as usize / 64] &= !(1 << (value.0 % 64));
 }
 
 /// A bitset representing a set of physical registers within the register window (`WINDOW`).
 type Regs = [u64; WINDOW / 64];
 
-fn has_reg(regs: &Regs, r: u8) -> bool {
-    regs[usize::from(r) / 64] & (1 << (r % 64)) != 0
+fn has_reg(regs: &Regs, register: u8) -> bool {
+    regs[usize::from(register) / 64] & (1 << (register % 64)) != 0
 }
 
-fn set_reg(regs: &mut Regs, r: u8, to: bool) {
-    let (word, bit) = (&mut regs[usize::from(r) / 64], 1 << (r % 64));
+fn set_reg(regs: &mut Regs, register: u8, to: bool) {
+    let (word, bit) = (&mut regs[usize::from(register) / 64], 1 << (register % 64));
     *word = if to { *word | bit } else { *word & !bit };
 }
 
 fn highest(regs: &Regs) -> Option<u8> {
-    let i = regs.iter().rposition(|&w| w != 0)?;
+    let i = regs.iter().rposition(|&word| word != 0)?;
     Some((i * 64 + 63 - regs[i].leading_zeros() as usize) as u8)
 }
 
@@ -113,18 +113,18 @@ enum Imm<'gc> {
 /// Precomputes embedded immediate constants for each SSA instruction that supports immediate operands.
 type Imms<'t, 'gc> = AVec<'t, Option<Imm<'gc>>>;
 
-fn imms<'t, 'gc>(arena: &'t Arena, f: &Function<'_, 'gc>) -> Imms<'t, 'gc> {
-    let mut constants: AVec<'t, Option<Value<'gc>>> = arena.vec_of(None, f.values as usize);
-    let mut imms = arena.vec_of(None, f.values as usize);
-    for inst in f.blocks.iter().flat_map(|block| &block.insts) {
+fn imms<'t, 'gc>(arena: &'t Arena, function: &Function<'_, 'gc>) -> Imms<'t, 'gc> {
+    let mut constants: AVec<'t, Option<Value<'gc>>> = arena.vec_of(None, function.values as usize);
+    let mut imms = arena.vec_of(None, function.values as usize);
+    for inst in function.blocks.iter().flat_map(|block| &block.insts) {
         match inst {
             Inst::Const(dst, value) => constants[dst.0 as usize] = Some(*value),
             Inst::Prim { dst, prim: Prim::Intrinsic(intrinsic), args, spread: false } => {
-                let fixnum = |v: &Val| constants[v.0 as usize].and_then(|k| k.as_fixnum());
+                let fixnum = |value: &Val| constants[value.0 as usize].and_then(|constant| constant.as_fixnum());
                 imms[dst.0 as usize] = match (intrinsic, args.as_slice()) {
-                    (Intrinsic::Add, [_, k]) => fixnum(k).and_then(|k| i16::try_from(k).ok()).map(Imm::Add),
-                    (Intrinsic::StructField | Intrinsic::StructFixedField, [_, k]) => fixnum(k).and_then(|k| u16::try_from(k).ok()).map(Imm::Field),
-                    (Intrinsic::StructRef, [_, kind, k]) => constants[kind.0 as usize].zip(fixnum(k).and_then(|k| u8::try_from(k).ok())).map(|(kind, k)| Imm::FieldOf(kind, k)),
+                    (Intrinsic::Add, [_, addend]) => fixnum(addend).and_then(|number| i16::try_from(number).ok()).map(Imm::Add),
+                    (Intrinsic::StructField | Intrinsic::StructFixedField, [_, field]) => fixnum(field).and_then(|number| u16::try_from(number).ok()).map(Imm::Field),
+                    (Intrinsic::StructRef, [_, kind, field]) => constants[kind.0 as usize].zip(fixnum(field).and_then(|number| u8::try_from(number).ok())).map(|(kind, field)| Imm::FieldOf(kind, field)),
                     _ => None,
                 };
             }
@@ -136,15 +136,15 @@ fn imms<'t, 'gc>(arena: &'t Arena, f: &Function<'_, 'gc>) -> Imms<'t, 'gc> {
 
 /// Iterates over every SSA value read by `inst` before its destination is assigned. Mutual closures
 /// capture each other once instantiated, and instructions with immediate constants read only their first argument.
-fn each_read(inst: &Inst<'_, '_>, imms: &Imms<'_, '_>, mut f: impl FnMut(Val)) {
+fn each_read(inst: &Inst<'_, '_>, imms: &Imms<'_, '_>, mut visit: impl FnMut(Val)) {
     match inst {
-        Inst::Prim { dst, args, .. } if imms[dst.0 as usize].is_some() => f(args[0]),
-        Inst::Closures { dsts, .. } => inst.each_use(|v| {
-            if !dsts.contains(&v) {
-                f(v);
+        Inst::Prim { dst, args, .. } if imms[dst.0 as usize].is_some() => visit(args[0]),
+        Inst::Closures { dsts, .. } => inst.each_use(|value| {
+            if !dsts.contains(&value) {
+                visit(value);
             }
         }),
-        _ => inst.each_use(f),
+        _ => inst.each_use(visit),
     }
 }
 
@@ -160,8 +160,8 @@ struct Live<'t> {
 }
 
 impl Live<'_> {
-    fn outs(&self, b: usize) -> &[Val] {
-        &self.outs[self.starts[b]..self.starts[b + 1]]
+    fn outs(&self, block: usize) -> &[Val] {
+        &self.outs[self.starts[block]..self.starts[block + 1]]
     }
 }
 
@@ -170,25 +170,25 @@ const NOWHERE: u32 = u32::MAX;
 
 /// Computes live-out value sets for each basic block by traversing backwards from each use site
 /// to its definition block. This sparse backward traversal avoids the memory overhead of a full dense block-by-value matrix.
-fn liveness<'t>(arena: &'t Arena, f: &Function<'_, '_>, imms: &Imms<'_, '_>) -> Live<'t> {
-    let (n, values) = (f.blocks.len(), f.values as usize);
-    let mut preds = arena.vec_of(arena.vec(), n);
-    for (b, block) in f.blocks.iter().enumerate() {
+fn liveness<'t>(arena: &'t Arena, function: &Function<'_, '_>, imms: &Imms<'_, '_>) -> Live<'t> {
+    let (count, values) = (function.blocks.len(), function.values as usize);
+    let mut preds = arena.vec_of(arena.vec(), count);
+    for (index, block) in function.blocks.iter().enumerate() {
         for to in block.end.successors() {
-            preds[to.0 as usize].push(b);
+            preds[to.0 as usize].push(index);
         }
     }
     let mut home = arena.vec_of(NOWHERE, values);
-    for (b, block) in f.blocks.iter().enumerate() {
-        block.params.iter().for_each(|p| home[p.0 as usize] = b as u32);
-        block.insts.iter().flat_map(|inst| inst.defs()).for_each(|d| home[d.0 as usize] = b as u32);
+    for (index, block) in function.blocks.iter().enumerate() {
+        block.params.iter().for_each(|param| home[param.0 as usize] = index as u32);
+        block.insts.iter().flat_map(|inst| inst.defs()).for_each(|def| home[def.0 as usize] = index as u32);
     }
     // Identifies upwards-exposed values: values used in a block before being defined in that block.
     let mut exposed = arena.vec();
-    for (b, block) in f.blocks.iter().enumerate() {
-        let mut note = |u: Val| {
-            if home[u.0 as usize] != b as u32 {
-                exposed.push((u.0, b as u32));
+    for (index, block) in function.blocks.iter().enumerate() {
+        let mut note = |value: Val| {
+            if home[value.0 as usize] != index as u32 {
+                exposed.push((value.0, index as u32));
             }
         };
         block.insts.iter().for_each(|inst| each_read(inst, imms, &mut note));
@@ -196,36 +196,36 @@ fn liveness<'t>(arena: &'t Arena, f: &Function<'_, '_>, imms: &Imms<'_, '_>) -> 
     }
     exposed.sort_unstable();
     // Tracks the most recent SSA value processed for each block's live-in and live-out sets to avoid redundant visits.
-    let (mut into, mut out) = (arena.vec_of(NOWHERE, n), arena.vec_of(NOWHERE, n));
+    let (mut into, mut out) = (arena.vec_of(NOWHERE, count), arena.vec_of(NOWHERE, count));
     let (mut found, mut stack) = (arena.vec(), arena.vec());
-    for &(v, b) in exposed.iter() {
-        if into[b as usize] == v {
+    for &(value, block) in exposed.iter() {
+        if into[block as usize] == value {
             continue;
         }
-        into[b as usize] = v;
-        stack.push(b as usize);
-        while let Some(b) = stack.pop() {
-            for &p in &preds[b] {
-                if out[p] != v {
-                    out[p] = v;
-                    found.push((p, Val(v)));
+        into[block as usize] = value;
+        stack.push(block as usize);
+        while let Some(current) = stack.pop() {
+            for &pred in &preds[current] {
+                if out[pred] != value {
+                    out[pred] = value;
+                    found.push((pred, Val(value)));
                 }
-                if home[v as usize] != p as u32 && into[p] != v {
-                    into[p] = v;
-                    stack.push(p);
+                if home[value as usize] != pred as u32 && into[pred] != value {
+                    into[pred] = value;
+                    stack.push(pred);
                 }
             }
         }
     }
     // Groups live-out values by basic block, sorted by SSA value index to build compact contiguous slices.
-    let mut starts = arena.vec_of(0, n + 1);
-    found.iter().for_each(|&(b, _)| starts[b + 1] += 1);
-    (0..n).for_each(|b| starts[b + 1] += starts[b]);
+    let mut starts = arena.vec_of(0, count + 1);
+    found.iter().for_each(|&(block, _)| starts[block + 1] += 1);
+    (0..count).for_each(|block| starts[block + 1] += starts[block]);
     let mut next = starts.clone();
     let mut outs = arena.vec_of(Val(0), found.len());
-    for &(b, v) in found.iter() {
-        outs[next[b]] = v;
-        next[b] += 1;
+    for &(block, value) in found.iter() {
+        outs[next[block]] = value;
+        next[block] += 1;
     }
     Live { preds, starts, outs, words: values.div_ceil(64).max(1) }
 }
@@ -240,39 +240,39 @@ struct Colours<'t> {
 /// at function entry first.
 fn colour<'t>(
     arena: &'t Arena,
-    f: &Function<'_, '_>,
+    function: &Function<'_, '_>,
     live: &Live<'_>,
     imms: &Imms<'_, '_>,
     pinned: &[bool],
     uses: &[u32],
     defined: &[Val],
 ) -> Colours<'t> {
-    let n = f.blocks.len();
-    let mut children = arena.vec_of(arena.vec(), n);
-    if n > 1 {
-        let idom = l5::dominators(&f.blocks, &live.preds).expect("lowering reaches every block");
-        for b in 1..n {
-            children[idom[b]].push(b);
+    let count = function.blocks.len();
+    let mut children = arena.vec_of(arena.vec(), count);
+    if count > 1 {
+        let idom = l5::dominators(&function.blocks, &live.preds).expect("lowering reaches every block");
+        for block in 1..count {
+            children[idom[block]].push(block);
         }
     }
-    let colours = Colours { of: arena.vec_of(None, f.values as usize), count: 0 };
-    let mut c = Colouring { colours, taken: arena.vec(), pinned, uses };
+    let colours = Colours { of: arena.vec_of(None, function.values as usize), count: 0 };
+    let mut colouring = Colouring { colours, taken: arena.vec(), pinned, uses };
     // Bitset of values currently live during backward block scanning, accompanied by an undo log of visited values.
     let (mut at, mut seen) = (arena.vec_of(0, live.words), arena.vec());
     // Records values whose live ranges terminate at instruction `i`, indexed via `dying[spans[i].0..spans[i].1]`.
     let (mut dying, mut spans) = (arena.vec(), arena.vec());
     let mut stack = ragwort_alloc::vec_in![arena; 0];
-    while let Some(b) = stack.pop() {
-        stack.extend(children[b].iter().rev().copied());
-        let block = &f.blocks[b];
+    while let Some(index) = stack.pop() {
+        stack.extend(children[index].iter().rev().copied());
+        let block = &function.blocks[index];
         seen.clear();
-        for &v in live.outs(b) {
-            add(&mut at, v);
-            seen.push(v);
+        for &value in live.outs(index) {
+            add(&mut at, value);
+            seen.push(value);
         }
-        block.end.each_use(|u| {
-            if add(&mut at, u) {
-                seen.push(u);
+        block.end.each_use(|value| {
+            if add(&mut at, value) {
+                seen.push(value);
             }
         });
         dying.clear();
@@ -280,48 +280,48 @@ fn colour<'t>(
         spans.resize(block.insts.len(), (0, 0));
         for (i, inst) in block.insts.iter().enumerate().rev() {
             let start = dying.len();
-            each_read(inst, imms, |u| {
-                if !has(&at, u) && !dying[start..].contains(&u) {
-                    dying.push(u);
+            each_read(inst, imms, |value| {
+                if !has(&at, value) && !dying[start..].contains(&value) {
+                    dying.push(value);
                 }
             });
             spans[i] = (start, dying.len());
-            for &d in inst.defs() {
-                remove(&mut at, d);
+            for &def in inst.defs() {
+                remove(&mut at, def);
             }
-            each_read(inst, imms, |u| {
-                if add(&mut at, u) {
-                    seen.push(u);
+            each_read(inst, imms, |value| {
+                if add(&mut at, value) {
+                    seen.push(value);
                 }
             });
         }
         // Reclaims colors for values that are live-in to the block, then assigns colors to uncolored block parameters.
-        c.taken.clear();
-        c.taken.resize(c.colours.count as usize, false);
-        for &v in seen.iter() {
-            if has(&at, v)
-                && let Some(colour) = c.colours.of[v.0 as usize]
+        colouring.taken.clear();
+        colouring.taken.resize(colouring.colours.count as usize, false);
+        for &value in seen.iter() {
+            if has(&at, value)
+                && let Some(colour) = colouring.colours.of[value.0 as usize]
             {
-                c.taken[colour as usize] = true;
+                colouring.taken[colour as usize] = true;
             }
-            remove(&mut at, v);
+            remove(&mut at, value);
         }
-        if b == 0 {
-            defined.iter().for_each(|&v| c.take(v));
+        if index == 0 {
+            defined.iter().for_each(|&value| colouring.take(value));
         }
-        block.params.iter().for_each(|&p| c.take(p));
+        block.params.iter().for_each(|&param| colouring.take(param));
         for (inst, &(start, end)) in block.insts.iter().zip(&spans) {
             // The closure object's destination register is defined prior to capturing environment values.
             if let Inst::Closures { .. } = inst {
-                inst.defs().iter().for_each(|&d| c.take(d));
-                dying[start..end].iter().for_each(|&u| c.free(u));
+                inst.defs().iter().for_each(|&def| colouring.take(def));
+                dying[start..end].iter().for_each(|&value| colouring.free(value));
             } else {
-                dying[start..end].iter().for_each(|&u| c.free(u));
-                inst.defs().iter().for_each(|&d| c.take(d));
+                dying[start..end].iter().for_each(|&value| colouring.free(value));
+                inst.defs().iter().for_each(|&def| colouring.take(def));
             }
         }
     }
-    c.colours
+    colouring.colours
 }
 
 /// State for greedy register coloring: maintains assigned colors and tracks which colors are currently occupied.
@@ -333,23 +333,23 @@ struct Colouring<'t, 'f> {
 }
 
 impl Colouring<'_, '_> {
-    /// Assigns the lowest available register color to value `v`, provided `v` is used and not pinned to a fixed register.
-    fn take(&mut self, v: Val) {
-        if self.pinned[v.0 as usize] || self.uses[v.0 as usize] == 0 {
+    /// Assigns the lowest available register color to value `value`, provided `value` is used and not pinned to a fixed register.
+    fn take(&mut self, value: Val) {
+        if self.pinned[value.0 as usize] || self.uses[value.0 as usize] == 0 {
             return;
         }
-        let c = self.taken.iter().position(|&t| !t).unwrap_or(self.taken.len());
-        if c == self.taken.len() {
+        let colour = self.taken.iter().position(|&taken| !taken).unwrap_or(self.taken.len());
+        if colour == self.taken.len() {
             self.taken.push(false);
         }
-        self.taken[c] = true;
-        self.colours.of[v.0 as usize] = Some(c as u32);
-        self.colours.count = self.colours.count.max(c as u32 + 1);
+        self.taken[colour] = true;
+        self.colours.of[value.0 as usize] = Some(colour as u32);
+        self.colours.count = self.colours.count.max(colour as u32 + 1);
     }
 
-    fn free(&mut self, v: Val) {
-        if let Some(c) = self.colours.of[v.0 as usize] {
-            self.taken[c as usize] = false;
+    fn free(&mut self, value: Val) {
+        if let Some(colour) = self.colours.of[value.0 as usize] {
+            self.taken[colour as usize] = false;
         }
     }
 }
@@ -393,8 +393,8 @@ impl<'a, 'gc> Module<'a, 'gc> {
 
     /// Returns the index of host function `def` in the module's host table, registering it if not yet present.
     fn host(&self, def: &'static HostDef) -> Result<u32, CompileError> {
-        let hosts = self.owner.and_then(|m| m.hosts(self.mc)).map_or(&[][..], |h| &h[..]);
-        let i = hosts.iter().position(|&h| h == def).ok_or(CompileError::UnknownHost(def))?;
+        let hosts = self.owner.and_then(|module| module.hosts(self.mc)).map_or(&[][..], |table| &table[..]);
+        let i = hosts.iter().position(|&host| host == def).ok_or(CompileError::UnknownHost(def))?;
         u32::try_from(i).map_err(|_| CompileError::TooManyConstants)
     }
 
@@ -407,7 +407,7 @@ impl<'a, 'gc> Module<'a, 'gc> {
         Ok(slot)
     }
 
-    /// Emits bytecode for function `f`, fusing 1- and 2-argument intrinsic tests into conditional branches
+    /// Emits bytecode for function `function`, fusing 1- and 2-argument intrinsic tests into conditional branches
     /// unless jump targets exceed the 16-bit signed branch offset limit.
     /// Returns the index of `value` among the items of the position table, adding it if it is new.
     fn item(&mut self, value: Value<'gc>) -> u32 {
@@ -445,9 +445,9 @@ impl<'a, 'gc> Module<'a, 'gc> {
         Ok(Value::object(mc, sites))
     }
 
-    fn function(&mut self, f: &Function<'_, 'gc>, captures: &[Capture]) -> Result<Gc<'gc, Bytecode>, CompileError> {
+    fn function(&mut self, function: &Function<'_, 'gc>, captures: &[Capture]) -> Result<Gc<'gc, Bytecode>, CompileError> {
         let (constants, codes, pending) = (self.constants.len(), self.codes.len(), self.pending.len());
-        if let Some(code) = self.attempt(f, captures, true)? {
+        if let Some(code) = self.attempt(function, captures, true)? {
             return Ok(code);
         }
         for constant in self.constants.drain(constants..) {
@@ -458,45 +458,45 @@ impl<'a, 'gc> Module<'a, 'gc> {
         }
         self.codes.truncate(codes);
         self.pending.truncate(pending);
-        Ok(self.attempt(f, captures, false)?.expect("without fused branches every jump has an i32 offset"))
+        Ok(self.attempt(function, captures, false)?.expect("without fused branches every jump has an i32 offset"))
     }
 
-    fn attempt(&mut self, f: &Function<'_, 'gc>, captures: &[Capture], near: bool) -> Result<Option<Gc<'gc, Bytecode>>, CompileError> {
-        let (n, optional) = (f.params.len() as u64, u64::from(f.optional));
-        let shape = Shape { required: n - optional, optional, rest: f.rest.is_some() };
+    fn attempt(&mut self, function: &Function<'_, 'gc>, captures: &[Capture], near: bool) -> Result<Option<Gc<'gc, Bytecode>>, CompileError> {
+        let (count, optional) = (function.params.len() as u64, u64::from(function.optional));
+        let shape = Shape { required: count - optional, optional, rest: function.rest.is_some() };
         // Optional parameters must reside in frame registers; reject parameter shapes exceeding `MAX_PARAMS`.
         if optional > 0 && shape.slots() > u64::from(MAX_PARAMS) {
             return Err(CompileError::TooManyRegisters);
         }
         let arity = shape.encode().ok_or(CompileError::TooManyRegisters)?;
         let link = frame::link_slot(arity);
-        let values = f.values as usize;
+        let values = function.values as usize;
         // Scratch arena for intra-function compiler data structures, deallocated immediately after function emission.
         let scratch = Arena::new();
         let arena = &scratch;
         let mut fixed = arena.vec_of(None, values);
-        fixed[f.this.0 as usize] = Some(CLOSURE);
-        let all: AVec<'_, Val> = f.params.iter().chain(&f.rest).copied().collect_in(arena);
+        fixed[function.this.0 as usize] = Some(CLOSURE);
+        let all: AVec<'_, Val> = function.params.iter().chain(&function.rest).copied().collect_in(arena);
         let list = ARGS + MAX_PARAMS - 1;
         // When parameter count exceeds available frame registers, the final register stores overflow arguments as a list.
         let unpacked = if all.len() <= usize::from(MAX_PARAMS) {
-            all.iter().zip(ARGS..).for_each(|(v, r)| fixed[v.0 as usize] = Some(r));
+            all.iter().zip(ARGS..).for_each(|(param, register)| fixed[param.0 as usize] = Some(register));
             &[][..]
         } else {
             let keep = usize::from(MAX_PARAMS - 1);
-            f.params[..keep].iter().zip(ARGS..).for_each(|(v, r)| fixed[v.0 as usize] = Some(r));
-            f.rest.iter().for_each(|v| fixed[v.0 as usize] = Some(list));
-            &f.params[keep..]
+            function.params[..keep].iter().zip(ARGS..).for_each(|(param, register)| fixed[param.0 as usize] = Some(register));
+            function.rest.iter().for_each(|rest| fixed[rest.0 as usize] = Some(list));
+            &function.params[keep..]
         };
-        let imms = imms(arena, f);
+        let imms = imms(arena, function);
         let mut uses = arena.vec_of(0u32, values);
-        for block in &f.blocks {
-            block.insts.iter().for_each(|inst| each_read(inst, &imms, |u| uses[u.0 as usize] += 1));
-            block.end.each_use(|u| uses[u.0 as usize] += 1);
+        for block in &function.blocks {
+            block.insts.iter().for_each(|inst| each_read(inst, &imms, |value| uses[value.0 as usize] += 1));
+            block.end.each_use(|value| uses[value.0 as usize] += 1);
         }
-        let live = liveness(arena, f, &imms);
+        let live = liveness(arena, function, &imms);
         let pinned: AVec<'_, bool> = fixed.iter().map(Option::is_some).collect_in(arena);
-        let colours = colour(arena, f, &live, &imms, &pinned, &uses, unpacked);
+        let colours = colour(arena, function, &live, &imms, &pinned, &uses, unpacked);
 
         let own = LIMIT.saturating_sub(link + 1);
         let (spill, first) = if colours.count > u32::from(own) { (Some(link + 1), link + 2) } else { (None, link + 1) };
@@ -504,17 +504,17 @@ impl<'a, 'gc> Module<'a, 'gc> {
         let locs = fixed
             .iter()
             .zip(&colours.of)
-            .map(|(&r, &c)| match (r, c) {
-                (Some(r), _) => Some(Loc::Reg(r)),
-                (None, Some(c)) if c < own => Some(Loc::Reg(first + c as u8)),
-                (None, Some(c)) => Some(Loc::Slot(c - own)),
+            .map(|(&register, &colour)| match (register, colour) {
+                (Some(register), _) => Some(Loc::Reg(register)),
+                (None, Some(colour)) if colour < own => Some(Loc::Reg(first + colour as u8)),
+                (None, Some(colour)) => Some(Loc::Slot(colour - own)),
                 (None, None) => None,
             })
             .collect_in(arena);
-        let to = forwards(arena, f);
-        let fusable: AVec<'_, bool> = f.blocks.iter().map(|block| near && fused_test(block, &uses, &imms).is_some()).collect_in(arena);
-        let (order, inverted) = layout(arena, f, &to, &fusable);
-        let mut e = Emitter {
+        let to = forwards(arena, function);
+        let fusable: AVec<'_, bool> = function.blocks.iter().map(|block| near && fused_test(block, &uses, &imms).is_some()).collect_in(arena);
+        let (order, inverted) = layout(arena, function, &to, &fusable);
+        let mut emitter = Emitter {
             module: self,
             arena,
             ops: Vec::new(),
@@ -533,23 +533,23 @@ impl<'a, 'gc> Module<'a, 'gc> {
             inverted,
             spill,
             first,
-            starts: arena.vec_of(0, f.blocks.len()),
+            starts: arena.vec_of(0, function.blocks.len()),
             jumps: arena.vec(),
             sited: Vec::new(),
         };
         if let Some(dst) = spill {
-            e.ops.push(Op::NewSpill { dst, count: colours.count - own });
+            emitter.ops.push(Op::NewSpill { dst, count: colours.count - own });
         }
-        for &v in unpacked {
-            if e.used(v) {
-                e.write(v, |dst| Op::CallIntrinsic1 { dst, a: list, intrinsic: Intrinsic::Car });
+        for &param in unpacked {
+            if emitter.used(param) {
+                emitter.write(param, |dst| Op::CallIntrinsic1 { dst, a: list, intrinsic: Intrinsic::Car });
             }
-            e.ops.push(Op::CallIntrinsic1 { dst: list, a: list, intrinsic: Intrinsic::Cdr });
+            emitter.ops.push(Op::CallIntrinsic1 { dst: list, a: list, intrinsic: Intrinsic::Cdr });
         }
-        for (i, &b) in order.iter().enumerate() {
-            e.block(f, b, &live, order.get(i + 1).copied())?;
+        for (i, &block) in order.iter().enumerate() {
+            emitter.block(function, block, &live, order.get(i + 1).copied())?;
         }
-        let Emitter { mut ops, mut starts, mut jumps, mut sited, .. } = e;
+        let Emitter { mut ops, mut starts, mut jumps, mut sited, .. } = emitter;
         // Eliminates redundant jumps to the immediately following instruction (e.g. blocks where parallel moves collapsed to no-ops).
         loop {
             let gone: AVec<'_, usize> = jumps
@@ -569,16 +569,16 @@ impl<'a, 'gc> Module<'a, 'gc> {
                 }
             }
             ops = ops.into_iter().enumerate().filter(|(i, _)| !gone.contains(i)).map(|(_, op)| op).collect();
-            starts.iter_mut().for_each(|s| *s = moved[*s]);
+            starts.iter_mut().for_each(|start| *start = moved[*start]);
             sited.iter_mut().for_each(|(pc, _)| *pc = moved[*pc]);
             jumps = jumps.into_iter().filter(|(at, _)| !gone.contains(at)).map(|(at, to)| (moved[at], to)).collect_in(arena);
         }
         for (at, to) in jumps {
             let offset = i32::try_from(starts[to.0 as usize] as isize - (at as isize + 1)).expect("functions are shorter than 2^31 ops");
             match &mut ops[at] {
-                Op::Jump { offset: o } | Op::JumpIfFalse { offset: o, .. } => *o = offset,
-                Op::BranchIntrinsic1 { offset: o, .. } | Op::BranchIntrinsic2 { offset: o, .. } => match i16::try_from(offset) {
-                    Ok(offset) => *o = offset,
+                Op::Jump { offset: jump } | Op::JumpIfFalse { offset: jump, .. } => *jump = offset,
+                Op::BranchIntrinsic1 { offset: jump, .. } | Op::BranchIntrinsic2 { offset: jump, .. } => match i16::try_from(offset) {
+                    Ok(offset) => *jump = offset,
                     Err(_) => return Ok(None),
                 },
                 _ => unreachable!("only jumps go to blocks"),
@@ -586,8 +586,8 @@ impl<'a, 'gc> Module<'a, 'gc> {
         }
         let mc = self.mc;
         // A function without a lambda ID is the code of a top-level form, which the trace of an error tells apart from a procedure.
-        let described = f.id.map(|id| self.names.get(id)).unwrap_or_default();
-        let name = match f.id {
+        let described = function.id.map(|id| self.names.get(id)).unwrap_or_default();
+        let name = match function.id {
             Some(_) => described.name.unwrap_or(Value::FALSE),
             None => Value::VOID,
         };
@@ -617,23 +617,23 @@ fn fused_test<'b>(block: &'b l5::BlockData<'_, '_>, uses: &[u32], imms: &Imms<'_
 
 /// Computes basic block layout order via depth-first traversal, arranging fall-through jumps along hot edges
 /// and inverting loop condition branches so that loop bodies fall through while loop exits branch away.
-fn layout<'t>(arena: &'t Arena, f: &Function<'_, '_>, to: &[usize], fusable: &[bool]) -> (AVec<'t, usize>, AVec<'t, bool>) {
-    let n = f.blocks.len();
-    let (mut order, mut placed, mut inverted) = (AVec::with_capacity_in(n, arena), arena.vec_of(false, n), arena.vec_of(false, n));
+fn layout<'t>(arena: &'t Arena, function: &Function<'_, '_>, to: &[usize], fusable: &[bool]) -> (AVec<'t, usize>, AVec<'t, bool>) {
+    let count = function.blocks.len();
+    let (mut order, mut placed, mut inverted) = (AVec::with_capacity_in(count, arena), arena.vec_of(false, count), arena.vec_of(false, count));
     let mut stack = ragwort_alloc::vec_in![arena; 0];
-    while let Some(b) = stack.pop() {
-        let b = to[b];
-        if placed[b] {
+    while let Some(block) = stack.pop() {
+        let block = to[block];
+        if placed[block] {
             continue;
         }
-        placed[b] = true;
-        order.push(b);
-        match &f.blocks[b].end {
+        placed[block] = true;
+        order.push(block);
+        match &function.blocks[block].end {
             End::Jump(next, _) => stack.push(next.0 as usize),
             End::Branch { then, other, .. } => {
                 let (then, other) = (to[then.0 as usize], to[other.0 as usize]);
-                let invert = fusable[b] && recurs(arena, f, to, &placed, other) && !recurs(arena, f, to, &placed, then);
-                inverted[b] = invert;
+                let invert = fusable[block] && recurs(arena, function, to, &placed, other) && !recurs(arena, function, to, &placed, then);
+                inverted[block] = invert;
                 stack.extend(if invert { [then, other] } else { [other, then] });
             }
             End::Return(_) | End::TailCall { .. } | End::TailPrim { .. } => {}
@@ -642,21 +642,21 @@ fn layout<'t>(arena: &'t Arena, f: &Function<'_, '_>, to: &[usize], fusable: &[b
     (order, inverted)
 }
 
-/// Heuristically checks (up to a small bounded depth) whether all outgoing paths from block `b` lead to
+/// Heuristically checks (up to a small bounded depth) whether all outgoing paths from block `start` lead to
 /// an already placed block, indicating a backward loop edge.
-fn recurs(arena: &Arena, f: &Function<'_, '_>, to: &[usize], placed: &[bool], b: usize) -> bool {
-    let mut ways = ragwort_alloc::vec_in![arena; b];
+fn recurs(arena: &Arena, function: &Function<'_, '_>, to: &[usize], placed: &[bool], start: usize) -> bool {
+    let mut ways = ragwort_alloc::vec_in![arena; start];
     let mut seen = 0;
-    while let Some(b) = ways.pop() {
-        let b = to[b];
-        if placed[b] {
+    while let Some(block) = ways.pop() {
+        let block = to[block];
+        if placed[block] {
             continue;
         }
         seen += 1;
         if seen > 64 {
             return false;
         }
-        match &f.blocks[b].end {
+        match &function.blocks[block].end {
             End::Jump(next, _) => ways.push(next.0 as usize),
             End::Branch { then, other, .. } => ways.extend([then.0 as usize, other.0 as usize]),
             End::Return(_) | End::TailCall { .. } | End::TailPrim { .. } => return false,
@@ -666,23 +666,23 @@ fn recurs(arena: &Arena, f: &Function<'_, '_>, to: &[usize], placed: &[bool], b:
 }
 
 /// Computes the effective jump target for each basic block, bypassing intermediate blocks that contain only an unconditional jump.
-fn forwards<'t>(arena: &'t Arena, f: &Function<'_, '_>) -> AVec<'t, usize> {
-    let on = |b: usize| match &f.blocks[b] {
-        block if b > 0 && block.params.is_empty() && block.insts.is_empty() => match &block.end {
+fn forwards<'t>(arena: &'t Arena, function: &Function<'_, '_>) -> AVec<'t, usize> {
+    let on = |index: usize| match &function.blocks[index] {
+        block if index > 0 && block.params.is_empty() && block.insts.is_empty() => match &block.end {
             End::Jump(to, args) if args.is_empty() => Some(to.0 as usize),
             _ => None,
         },
         _ => None,
     };
-    (0..f.blocks.len())
-        .map(|b| {
-            if on(b).is_none() {
-                return b;
+    (0..function.blocks.len())
+        .map(|index| {
+            if on(index).is_none() {
+                return index;
             }
-            let (mut at, mut seen) = (b, ragwort_alloc::vec_in![arena; b]);
+            let (mut at, mut seen) = (index, ragwort_alloc::vec_in![arena; index]);
             while let Some(to) = on(at) {
                 if seen.contains(&to) {
-                    return b;
+                    return index;
                 }
                 seen.push(to);
                 at = to;
@@ -734,11 +734,11 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         }
     }
 
-    fn block(&mut self, f: &Function<'_, 'gc>, b: usize, live: &Live<'_>, next: Option<usize>) -> Result<(), CompileError> {
-        self.starts[b] = self.ops.len();
+    fn block(&mut self, function: &Function<'_, 'gc>, index: usize, live: &Live<'_>, next: Option<usize>) -> Result<(), CompileError> {
+        self.starts[index] = self.ops.len();
         self.fence = self.ops.len();
-        let block = &f.blocks[b];
-        let n = block.insts.len();
+        let block = &function.blocks[index];
+        let count = block.insts.len();
         let tail = self.tail(block);
         // Computes the set of active registers following each instruction, identifying the highest live register
         // to establish the frame base for nested calls.
@@ -751,64 +751,64 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
             std::mem::replace(&mut self.after, arena.vec()),
         );
         seen.clear();
-        for &v in live.outs(b) {
-            add(&mut at, v);
-            seen.push(v);
-            self.mark(&mut taken, v, true);
+        for &value in live.outs(index) {
+            add(&mut at, value);
+            seen.push(value);
+            self.mark(&mut taken, value, true);
         }
-        block.end.each_use(|u| {
-            if add(&mut at, u) {
-                seen.push(u);
-                self.mark(&mut taken, u, true);
+        block.end.each_use(|value| {
+            if add(&mut at, value) {
+                seen.push(value);
+                self.mark(&mut taken, value, true);
             }
         });
-        self.aim_end(f, b);
+        self.aim_end(function, index);
         highs.clear();
-        highs.resize(n, None);
+        highs.resize(count, None);
         after.clear();
-        after.resize(n, taken);
+        after.resize(count, taken);
         for (i, inst) in block.insts.iter().enumerate().rev() {
             after[i] = taken;
-            for &d in inst.defs() {
-                remove(&mut at, d);
-                self.mark(&mut taken, d, false);
+            for &def in inst.defs() {
+                remove(&mut at, def);
+                self.mark(&mut taken, def, false);
             }
             highs[i] = highest(&taken);
-            self.aim_args(b, i, inst, tail.is_some() && i + 1 == n);
-            each_read(inst, &self.imms, |u| {
-                if add(&mut at, u) {
-                    seen.push(u);
-                    self.mark(&mut taken, u, true);
+            self.aim_args(index, i, inst, tail.is_some() && i + 1 == count);
+            each_read(inst, &self.imms, |value| {
+                if add(&mut at, value) {
+                    seen.push(value);
+                    self.mark(&mut taken, value, true);
                 }
             });
         }
-        seen.iter().for_each(|&v| remove(&mut at, v));
-        let test = if self.fusable[b] { fused_test(block, &self.uses, &self.imms) } else { None };
-        let insts = &block.insts[..n - usize::from(tail.is_some() || test.is_some())];
+        seen.iter().for_each(|&value| remove(&mut at, value));
+        let test = if self.fusable[index] { fused_test(block, &self.uses, &self.imms) } else { None };
+        let insts = &block.insts[..count - usize::from(tail.is_some() || test.is_some())];
         for (j, inst) in insts.iter().enumerate() {
-            if let &[d] = inst.defs()
+            if let &[def] = inst.defs()
                 && !matches!(inst, Inst::Closures { .. })
             {
-                self.aim(b, j, d, &mut highs, &mut after);
+                self.aim(index, j, def, &mut highs, &mut after);
             }
-            let base = highs[j].map_or(self.first, |h| self.first.max(h + 1));
+            let base = highs[j].map_or(self.first, |high| self.first.max(high + 1));
             self.site(block.sites[j]);
             self.inst(inst, base)?;
         }
         (self.at, self.seen, self.highs, self.after) = (at, seen, highs, after);
         // An instruction fused into the end of the block is emitted there, and keeps its own site.
         let fused = tail.is_some() || test.is_some();
-        self.site(if fused { block.sites[n - 1] } else { block.end_site });
+        self.site(if fused { block.sites[count - 1] } else { block.end_site });
         match (tail, test, &block.end) {
             (Some((prim, args)), _, _) => self.tail_prim(prim, args),
             (None, Some((intrinsic, args)), End::Branch { then, other, .. }) => {
-                let branch_if = self.inverted[b];
+                let branch_if = self.inverted[index];
                 let (target, fall) = if branch_if { (*then, *other) } else { (*other, *then) };
                 let op = match *args {
                     [a0] => Op::BranchIntrinsic1 { a: self.read(a0, 0), intrinsic, branch_if, offset: 0 },
                     [a0, a1] => {
-                        let (a, b) = (self.read(a0, 0), self.read(a1, 1));
-                        Op::BranchIntrinsic2 { a, b, intrinsic, branch_if, offset: 0 }
+                        let (left, right) = (self.read(a0, 0), self.read(a1, 1));
+                        Op::BranchIntrinsic2 { a: left, b: right, intrinsic, branch_if, offset: 0 }
                     }
                     _ => unreachable!("a fused test takes 1 or 2 arguments"),
                 };
@@ -816,22 +816,22 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
                 self.go(fall, next);
                 Ok(())
             }
-            _ => self.end(f, &block.end, next),
+            _ => self.end(function, &block.end, next),
         }
     }
 
     /// If `block` ends by returning the result of an intrinsic instruction, returns the intrinsic and its arguments
     /// so it can be emitted using a specialized tail-return opcode.
     fn tail<'b>(&self, block: &'b l5::BlockData<'_, 'gc>) -> Option<(Prim, &'b [Val])> {
-        let (Some(Inst::Prim { dst, prim, args, spread: false }), End::Return(v)) = (block.insts.last(), &block.end) else { return None };
+        let (Some(Inst::Prim { dst, prim, args, spread: false }), End::Return(returned)) = (block.insts.last(), &block.end) else { return None };
         let tail = matches!(prim, Prim::Intrinsic(_)) && self.imms[dst.0 as usize].is_none();
-        (tail && dst == v && self.uses[dst.0 as usize] == 1).then_some((*prim, args.as_slice()))
+        (tail && dst == returned && self.uses[dst.0 as usize] == 1).then_some((*prim, args.as_slice()))
     }
 
     fn tail_prim(&mut self, prim: Prim, args: &[Val]) -> Result<(), CompileError> {
-        let n = args.len() as u8;
+        let count = args.len() as u8;
         match (prim, self.stage(self.first, None, args, true)) {
-            (Prim::Intrinsic(intrinsic), Some(base)) => self.ops.push(Op::TailCallIntrinsic { base, args: n, intrinsic }),
+            (Prim::Intrinsic(intrinsic), Some(base)) => self.ops.push(Op::TailCallIntrinsic { base, args: count, intrinsic }),
             (Prim::Intrinsic(intrinsic), None) => {
                 let base = self.list(args, None);
                 self.ops.extend([Op::ApplyIntrinsic { base, args: 1, intrinsic }, Op::LoadAcc { dst: SCRATCH }, Op::Return { src: SCRATCH }]);
@@ -841,81 +841,81 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         Ok(())
     }
 
-    fn mark(&self, taken: &mut Regs, v: Val, to: bool) {
-        if let Some(Loc::Reg(r)) = self.locs[v.0 as usize] {
-            set_reg(taken, r, to);
+    fn mark(&self, taken: &mut Regs, value: Val, to: bool) {
+        if let Some(Loc::Reg(register)) = self.locs[value.0 as usize] {
+            set_reg(taken, register, to);
         }
     }
 
-    /// Registers target preferences for argument values staged by `inst` at instruction `at` in block `b`.
-    fn aim_args(&mut self, b: usize, at: usize, inst: &Inst<'_, 'gc>, tail: bool) {
+    /// Registers target preferences for argument values staged by `inst` at instruction `at` in block `block`.
+    fn aim_args(&mut self, block: usize, at: usize, inst: &Inst<'_, 'gc>, tail: bool) {
         let (head, args) = match inst {
-            Inst::Call { f, args, .. } => (Some(*f), args),
+            Inst::Call { f: callee, args, .. } => (Some(*callee), args),
             Inst::Prim { dst, prim, args, spread } if tail || self.stages(*dst, *prim, args.len(), *spread) => (None, args),
             _ => return,
         };
-        for (p, &v) in head.iter().chain(args).enumerate() {
-            let p = u8::try_from(p).unwrap_or(u8::MAX);
-            self.wants(v, b, at, if tail { Aim::First(p) } else { Aim::Base(p) });
+        for (position, &value) in head.iter().chain(args).enumerate() {
+            let position = u8::try_from(position).unwrap_or(u8::MAX);
+            self.wants(value, block, at, if tail { Aim::First(position) } else { Aim::Base(position) });
         }
     }
 
-    /// Registers target preferences for values passed as block arguments by block `b`'s terminator.
-    fn aim_end(&mut self, f: &Function<'_, 'gc>, b: usize) {
-        let block = &f.blocks[b];
+    /// Registers target preferences for values passed as block arguments by block `index`'s terminator.
+    fn aim_end(&mut self, function: &Function<'_, 'gc>, index: usize) {
+        let block = &function.blocks[index];
         let at = block.insts.len();
         match &block.end {
             End::Jump(to, args) => {
-                for (p, &a) in f.blocks[to.0 as usize].params.iter().zip(args) {
-                    if let Some(Loc::Reg(r)) = self.locs[p.0 as usize] {
-                        self.wants(a, b, at, Aim::Reg(r));
+                for (param, &arg) in function.blocks[to.0 as usize].params.iter().zip(args) {
+                    if let Some(Loc::Reg(register)) = self.locs[param.0 as usize] {
+                        self.wants(arg, index, at, Aim::Reg(register));
                     }
                 }
             }
-            End::TailCall { f, args } => {
-                for (p, &v) in std::iter::once(f).chain(args).enumerate() {
-                    self.wants(v, b, at, Aim::First(u8::try_from(p).unwrap_or(u8::MAX)));
+            End::TailCall { f: callee, args } => {
+                for (position, &value) in std::iter::once(callee).chain(args).enumerate() {
+                    self.wants(value, index, at, Aim::First(u8::try_from(position).unwrap_or(u8::MAX)));
                 }
             }
             End::TailPrim { args, .. } => {
-                for (p, &v) in args.iter().enumerate() {
-                    self.wants(v, b, at, Aim::First(u8::try_from(p).unwrap_or(u8::MAX)));
+                for (position, &value) in args.iter().enumerate() {
+                    self.wants(value, index, at, Aim::First(u8::try_from(position).unwrap_or(u8::MAX)));
                 }
             }
             End::Return(_) | End::Branch { .. } => {}
         }
     }
 
-    fn wants(&mut self, v: Val, b: usize, at: usize, aim: Aim) {
-        if self.uses[v.0 as usize] == 1 {
-            self.aims[v.0 as usize] = Some((b as u32, at as u32, aim));
+    fn wants(&mut self, value: Val, block: usize, at: usize, aim: Aim) {
+        if self.uses[value.0 as usize] == 1 {
+            self.aims[value.0 as usize] = Some((block as u32, at as u32, aim));
         }
     }
 
-    /// Pre-assigns `v` (defined at instruction `j` in block `b`) directly to its preferred destination register,
+    /// Pre-assigns `value` (defined at instruction `j` in block `index`) directly to its preferred destination register,
     /// provided that register remains unallocated throughout the intervening range.
-    fn aim(&mut self, b: usize, j: usize, v: Val, highs: &mut [Option<u8>], after: &mut [Regs]) {
-        let Some((block, k, aim)) = self.aims[v.0 as usize] else { return };
-        let k = k as usize;
-        if block as usize != b || k <= j {
+    fn aim(&mut self, index: usize, j: usize, value: Val, highs: &mut [Option<u8>], after: &mut [Regs]) {
+        let Some((block, at, aim)) = self.aims[value.0 as usize] else { return };
+        let at = at as usize;
+        if block as usize != index || at <= j {
             return;
         }
         let first = usize::from(self.first);
-        let t = match aim {
-            Aim::Reg(r) => usize::from(r),
-            Aim::First(p) => first + usize::from(p),
-            Aim::Base(p) => highs[k].map_or(first, |h| first.max(usize::from(h) + 1)) + usize::from(p),
+        let target = match aim {
+            Aim::Reg(register) => usize::from(register),
+            Aim::First(position) => first + usize::from(position),
+            Aim::Base(position) => highs[at].map_or(first, |high| first.max(usize::from(high) + 1)) + usize::from(position),
         };
-        if t < first || t >= usize::from(LIMIT) {
+        if target < first || target >= usize::from(LIMIT) {
             return;
         }
-        let t = t as u8;
-        if self.locs[v.0 as usize] == Some(Loc::Reg(t)) || after[j..k].iter().any(|regs| has_reg(regs, t)) {
+        let target = target as u8;
+        if self.locs[value.0 as usize] == Some(Loc::Reg(target)) || after[j..at].iter().any(|regs| has_reg(regs, target)) {
             return;
         }
-        self.locs[v.0 as usize] = Some(Loc::Reg(t));
-        after[j..k].iter_mut().for_each(|regs| set_reg(regs, t, true));
-        highs[j + 1..k].iter_mut().for_each(|h| *h = Some(h.map_or(t, |h| h.max(t))));
+        self.locs[value.0 as usize] = Some(Loc::Reg(target));
+        after[j..at].iter_mut().for_each(|regs| set_reg(regs, target, true));
+        highs[j + 1..at].iter_mut().for_each(|high| *high = Some(high.map_or(target, |current| current.max(target))));
     }
 
     /// Determines whether the primitive producing `dst` requires its arguments to be staged in a contiguous sequence of registers.
@@ -943,12 +943,12 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
                 }
             }
             Inst::Prim { dst, prim, args, spread } => self.prim(*dst, *prim, args, *spread, base)?,
-            Inst::Call { dst, f, args } => {
-                if let Some(base) = self.stage(base, Some(*f), args, false) {
+            Inst::Call { dst, f: callee, args } => {
+                if let Some(base) = self.stage(base, Some(*callee), args, false) {
                     self.ops.push(Op::Call { base, args: args.len() as u8 });
                 } else {
                     self.list(args, None);
-                    self.mov(Loc::Reg(SCRATCH), self.loc(*f));
+                    self.mov(Loc::Reg(SCRATCH), self.loc(*callee));
                     self.ops.push(Op::CallRequest { base: SCRATCH, args: 2, request: Request::Apply });
                 }
                 self.take(*dst);
@@ -967,45 +967,45 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
                 Imm::FieldOf(kind, _) => self.module.constant(kind)?,
                 Imm::Add(_) | Imm::Field(_) => 0,
             };
-            let a = self.read(args[0], 0);
+            let operand = self.read(args[0], 0);
             self.write(dst, |dst| match imm {
-                Imm::Add(imm) => Op::AddImm { dst, a, imm },
-                Imm::Field(k) => Op::StructField { dst, a, k },
-                Imm::FieldOf(_, k) => Op::StructRef { dst, a, k, kind },
+                Imm::Add(imm) => Op::AddImm { dst, a: operand, imm },
+                Imm::Field(field) => Op::StructField { dst, a: operand, k: field },
+                Imm::FieldOf(_, field) => Op::StructRef { dst, a: operand, k: field, kind },
             });
             return Ok(());
         }
         if !spread {
             match (prim, args) {
                 (Prim::Intrinsic(intrinsic), &[a0]) => {
-                    let a = self.read(a0, 0);
-                    self.write(dst, |dst| Op::CallIntrinsic1 { dst, a, intrinsic });
+                    let operand = self.read(a0, 0);
+                    self.write(dst, |dst| Op::CallIntrinsic1 { dst, a: operand, intrinsic });
                     return Ok(());
                 }
                 (Prim::Intrinsic(intrinsic), &[a0, a1]) => {
-                    let (a, b) = (self.read(a0, 0), self.read(a1, 1));
-                    self.write(dst, |dst| Op::CallIntrinsic2 { dst, a, b, intrinsic });
+                    let (left, right) = (self.read(a0, 0), self.read(a1, 1));
+                    self.write(dst, |dst| Op::CallIntrinsic2 { dst, a: left, b: right, intrinsic });
                     return Ok(());
                 }
                 (Prim::Intrinsic(intrinsic), &[a0, a1, a2]) => {
-                    let (a, b, c) = (self.read(a0, 0), self.read(a1, 1), self.read(a2, 2));
-                    self.write(dst, |dst| Op::CallIntrinsic3 { dst, a, b, c, intrinsic });
+                    let (first, second, third) = (self.read(a0, 0), self.read(a1, 1), self.read(a2, 2));
+                    self.write(dst, |dst| Op::CallIntrinsic3 { dst, a: first, b: second, c: third, intrinsic });
                     return Ok(());
                 }
                 _ => {}
             }
         }
         let host = if let Prim::Host(def) = prim { Some(self.module.host(def)?) } else { None };
-        let n = args.len() as u8;
+        let count = args.len() as u8;
         let staged = self.stage(base, None, args, matches!(prim, Prim::Intrinsic(_)));
         let op = match (prim, spread, staged) {
-            (Prim::Intrinsic(intrinsic), false, Some(base)) => Op::CallIntrinsic { base, args: n, intrinsic },
-            (Prim::Intrinsic(intrinsic), true, Some(base)) => Op::ApplyIntrinsic { base, args: n, intrinsic },
+            (Prim::Intrinsic(intrinsic), false, Some(base)) => Op::CallIntrinsic { base, args: count, intrinsic },
+            (Prim::Intrinsic(intrinsic), true, Some(base)) => Op::ApplyIntrinsic { base, args: count, intrinsic },
             (Prim::Intrinsic(intrinsic), _, None) => Op::ApplyIntrinsic { base: self.spread(args, spread), args: 1, intrinsic },
-            (Prim::Request(request), false, Some(base)) => Op::CallRequest { base, args: n, request },
-            (Prim::Request(request), true, Some(base)) => Op::ApplyRequest { base, args: n, request },
+            (Prim::Request(request), false, Some(base)) => Op::CallRequest { base, args: count, request },
+            (Prim::Request(request), true, Some(base)) => Op::ApplyRequest { base, args: count, request },
             (Prim::Request(request), _, None) => Op::ApplyRequest { base: self.spread(args, spread), args: 1, request },
-            (Prim::Host(_), false, Some(base)) => Op::CallHost { base, args: n, host: host.expect("looked up") },
+            (Prim::Host(_), false, Some(base)) => Op::CallHost { base, args: count, host: host.expect("looked up") },
             (Prim::Host(_), false, None) => return Err(CompileError::TooManyArguments),
             (Prim::Host(_) | Prim::Slot(..), true, _) | (Prim::Slot(..), false, _) => {
                 unreachable!("lowering spreads no host function or slot access")
@@ -1018,7 +1018,7 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
 
     /// Emits a load or store operation for module variable `slot`. For stores, the value to write is provided in `args`.
     fn slot(&mut self, dst: Val, op: SlotOp, slot: u32, args: &[Val]) -> Result<(), CompileError> {
-        let len = self.module.owner.map_or(0, |m| m.items(self.module.mc).len());
+        let len = self.module.owner.map_or(0, |module| module.items(self.module.mc).len());
         if slot as usize >= len {
             return Err(CompileError::UnknownSlot(slot));
         }
@@ -1073,21 +1073,21 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         }
         let code = first.expect("a group has closures");
         self.ops.push(Op::NewClosure { dst: SCRATCH, count: codes.len() as u8, code });
-        for (dst, r) in peers {
+        for (dst, register) in peers {
             if self.used(dst) {
-                self.mov(self.loc(dst), Loc::Reg(r));
+                self.mov(self.loc(dst), Loc::Reg(register));
             }
         }
         Ok(())
     }
 
     fn captures(&self, captured: &[Captured], peers: &[(Val, u8)]) -> Vec<Capture> {
-        let capture = |&c: &Captured| match c {
-            Captured::Upvalue(u) => Capture::Upvalue(u),
-            Captured::Val(v) => match peers.iter().find(|&&(peer, _)| peer == v) {
-                Some(&(_, r)) => Capture::Register(r),
-                None => match self.loc(v) {
-                    Loc::Reg(r) => Capture::Register(r),
+        let capture = |&source: &Captured| match source {
+            Captured::Upvalue(index) => Capture::Upvalue(index),
+            Captured::Val(value) => match peers.iter().find(|&&(peer, _)| peer == value) {
+                Some(&(_, register)) => Capture::Register(register),
+                None => match self.loc(value) {
+                    Loc::Reg(register) => Capture::Register(register),
                     Loc::Slot(slot) => Capture::Spill { spill: self.spill_reg(), slot },
                 },
             },
@@ -1096,17 +1096,17 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
     }
 
     /// Emits bytecode for block terminator `end`. If the target block matches `next`, redundant jumps can fall through.
-    fn end(&mut self, f: &Function<'_, 'gc>, end: &End<'_>, next: Option<usize>) -> Result<(), CompileError> {
+    fn end(&mut self, function: &Function<'_, 'gc>, end: &End<'_>, next: Option<usize>) -> Result<(), CompileError> {
         match end {
-            End::Return(v) => {
-                let src = self.read(*v, 0);
+            End::Return(value) => {
+                let src = self.read(*value, 0);
                 self.ops.push(Op::Return { src });
             }
             End::Jump(to, args) => {
-                let params = &f.blocks[to.0 as usize].params;
+                let params = &function.blocks[to.0 as usize].params;
                 let mut moves = std::mem::replace(&mut self.moves, self.arena.vec());
                 moves.clear();
-                moves.extend(params.iter().zip(args).filter_map(|(p, &a)| Some((self.locs[p.0 as usize]?, self.loc(a)))));
+                moves.extend(params.iter().zip(args).filter_map(|(param, &arg)| Some((self.locs[param.0 as usize]?, self.loc(arg)))));
                 self.parallel(moves);
                 self.go(*to, next);
             }
@@ -1115,28 +1115,28 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
                 self.jump(Op::JumpIfFalse { test, offset: 0 }, *other);
                 self.go(*then, next);
             }
-            End::TailCall { f, args } => {
-                if let Some(base) = self.stage(self.first, Some(*f), args, false) {
+            End::TailCall { f: callee, args } => {
+                if let Some(base) = self.stage(self.first, Some(*callee), args, false) {
                     self.ops.push(Op::TailCall { base, args: args.len() as u8 });
                 } else {
                     self.list(args, None);
-                    self.mov(Loc::Reg(SCRATCH), self.loc(*f));
+                    self.mov(Loc::Reg(SCRATCH), self.loc(*callee));
                     self.ops.push(Op::TailCallRequest { base: SCRATCH, args: 2, request: Request::Apply });
                 }
             }
             End::TailPrim { prim: Prim::Request(request), args, spread } => {
-                let n = args.len() as u8;
+                let count = args.len() as u8;
                 let request = *request;
                 match (self.stage(self.first, None, args, false), spread) {
                     // A guard continuation retains its caller frame; invoking it from that frame allows the VM
                     // to reuse the existing handler in place without creating a new prompt.
                     (Some(base), false) if matches!(request, Request::Guard | Request::GuardQuiet) => self.ops.extend([
-                        Op::CallRequest { base, args: n, request },
+                        Op::CallRequest { base, args: count, request },
                         Op::LoadAcc { dst: SCRATCH },
                         Op::Return { src: SCRATCH },
                     ]),
-                    (Some(base), false) => self.ops.push(Op::TailCallRequest { base, args: n, request }),
-                    (Some(base), true) => self.ops.push(Op::TailApplyRequest { base, args: n, request }),
+                    (Some(base), false) => self.ops.push(Op::TailCallRequest { base, args: count, request }),
+                    (Some(base), true) => self.ops.push(Op::TailApplyRequest { base, args: count, request }),
                     (None, _) => {
                         let base = self.spread(args, *spread);
                         self.ops.push(Op::TailApplyRequest { base, args: 1, request });
@@ -1170,37 +1170,37 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
     /// Returns the starting register index, or `None` if argument count exceeds available scratch registers.
     /// Values already arranged consecutively in eligible registers remain in place.
     fn stage(&mut self, base: u8, head: Option<Val>, vals: &[Val], free: bool) -> Option<u8> {
-        let n = usize::from(head.is_some()) + vals.len();
-        if let Some(r) = self.row(head.iter().chain(vals))
-            && (r >= base || free && r >= ARGS)
+        let count = usize::from(head.is_some()) + vals.len();
+        if let Some(start) = self.row(head.iter().chain(vals))
+            && (start >= base || free && start >= ARGS)
         {
-            return Some(r);
+            return Some(start);
         }
-        let base = if usize::from(base) + n <= usize::from(LIMIT) {
+        let base = if usize::from(base) + count <= usize::from(LIMIT) {
             base
-        } else if n <= STAGE {
+        } else if count <= STAGE {
             SCRATCH
         } else {
             return None;
         };
         let mut moves = std::mem::replace(&mut self.moves, self.arena.vec());
         moves.clear();
-        moves.extend(head.iter().chain(vals).zip(base..).map(|(&v, r)| (Loc::Reg(r), self.loc(v))));
+        moves.extend(head.iter().chain(vals).zip(base..).map(|(&value, register)| (Loc::Reg(register), self.loc(value))));
         self.parallel(moves);
         Some(base)
     }
 
     /// Returns the starting register index if `vals` already occupy a contiguous sequence of hardware registers, or `None` otherwise.
     fn row<'v>(&self, mut vals: impl Iterator<Item = &'v Val>) -> Option<u8> {
-        let Loc::Reg(r) = self.loc(*vals.next()?) else { return None };
-        let mut next = r;
-        for &v in vals {
+        let Loc::Reg(start) = self.loc(*vals.next()?) else { return None };
+        let mut next = start;
+        for &value in vals {
             next = next.checked_add(1)?;
-            if self.loc(v) != Loc::Reg(next) {
+            if self.loc(value) != Loc::Reg(next) {
                 return None;
             }
         }
-        Some(r)
+        Some(start)
     }
 
     /// Builds a Scheme list from `args` into a scratch register and returns that register. If `spread` is true,
@@ -1223,8 +1223,8 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
                 self.ops.push(Op::LoadConst { dst: list, index });
             }
         }
-        for &v in vals.iter().rev() {
-            self.mov(Loc::Reg(SCRATCH), self.loc(v));
+        for &value in vals.iter().rev() {
+            self.mov(Loc::Reg(SCRATCH), self.loc(value));
             self.ops.push(Op::CallIntrinsic2 { dst: list, a: SCRATCH, b: list, intrinsic: Intrinsic::Cons });
         }
         list
@@ -1242,9 +1242,9 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
                 // Breaks a cyclic dependency permutation by buffering one source location through a scratch register.
                 let from = moves[0].1;
                 self.mov(Loc::Reg(SCRATCH), from);
-                for m in &mut moves {
-                    if m.1 == from {
-                        m.1 = Loc::Reg(SCRATCH);
+                for entry in &mut moves {
+                    if entry.1 == from {
+                        entry.1 = Loc::Reg(SCRATCH);
                     }
                 }
             }
@@ -1270,12 +1270,12 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         }
     }
 
-    fn used(&self, v: Val) -> bool {
-        self.uses[v.0 as usize] > 0
+    fn used(&self, value: Val) -> bool {
+        self.uses[value.0 as usize] > 0
     }
 
-    fn loc(&self, v: Val) -> Loc {
-        self.locs[v.0 as usize].expect("a value used has a place")
+    fn loc(&self, value: Val) -> Loc {
+        self.locs[value.0 as usize].expect("a value used has a place")
     }
 
     fn spill_reg(&self) -> u8 {
@@ -1289,22 +1289,22 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         }
     }
 
-    /// Resolves the physical register holding operand value `v` for instruction input `k`, loading spilled values into scratch if necessary.
-    fn read(&mut self, v: Val, k: u8) -> u8 {
-        match self.loc(v) {
-            Loc::Reg(r) => r,
+    /// Resolves the physical register holding operand value `value` for instruction input `input`, loading spilled values into scratch if necessary.
+    fn read(&mut self, value: Val, input: u8) -> u8 {
+        match self.loc(value) {
+            Loc::Reg(register) => register,
             Loc::Slot(slot) => {
-                let dst = SCRATCH + k;
+                let dst = SCRATCH + input;
                 self.ops.push(Op::LoadSpill { dst, spill: self.spill_reg(), slot });
                 dst
             }
         }
     }
 
-    /// Emits `op` targeting the physical register assigned to `v`, or redirects to a scratch register if `v` is unused.
-    fn write(&mut self, v: Val, op: impl FnOnce(u8) -> Op) {
-        match self.locs[v.0 as usize].filter(|_| self.used(v)) {
-            Some(Loc::Reg(r)) => self.ops.push(op(r)),
+    /// Emits `op` targeting the physical register assigned to `value`, or redirects to a scratch register if `value` is unused.
+    fn write(&mut self, value: Val, op: impl FnOnce(u8) -> Op) {
+        match self.locs[value.0 as usize].filter(|_| self.used(value)) {
+            Some(Loc::Reg(register)) => self.ops.push(op(register)),
             Some(Loc::Slot(slot)) => {
                 let spill = self.spill_reg();
                 self.ops.extend([op(SCRATCH), Op::StoreSpill { src: SCRATCH, spill, slot }]);

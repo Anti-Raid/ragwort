@@ -146,7 +146,7 @@ impl FrozenTable {
 
     pub(crate) fn clear_marks(&self) {
         for chunk in self.chunks.iter().filter_map(OnceCell::get) {
-            chunk.iter().for_each(|s| s.marked.set(false));
+            chunk.iter().for_each(|slot| slot.marked.set(false));
         }
     }
 
@@ -173,7 +173,7 @@ impl FrozenTable {
         let mut dead = self.dead.borrow_mut();
         dead.clear();
         let mut live = 0;
-        for (c, chunk) in self.chunks.iter().enumerate() {
+        for (chunk_index, chunk) in self.chunks.iter().enumerate() {
             let Some(chunk) = chunk.get() else { continue };
             for (i, slot) in chunk.iter().enumerate() {
                 if slot.value.get().is_none() {
@@ -182,7 +182,7 @@ impl FrozenTable {
                 if slot.marked.get() {
                     live += slot.cost.get();
                 } else {
-                    dead.push((c * CHUNK + i) as u32);
+                    dead.push((chunk_index * CHUNK + i) as u32);
                 }
             }
         }
@@ -197,7 +197,7 @@ impl FrozenTable {
         let (free, dead) = (self.free.get_mut(), self.dead.get_mut());
         let keep = dead.len().saturating_sub(max);
         for id in dead.drain(keep..) {
-            let slot = self.chunks.get_mut(id as usize / CHUNK).and_then(OnceCell::get_mut).and_then(|c| c.get_mut(id as usize % CHUNK));
+            let slot = self.chunks.get_mut(id as usize / CHUNK).and_then(OnceCell::get_mut).and_then(|chunk| chunk.get_mut(id as usize % CHUNK));
             if let Some(slot) = slot
                 && slot.value.take().is_some()
             {
@@ -210,7 +210,7 @@ impl FrozenTable {
     /// What the values not yet freed were charged.
     #[cfg(test)]
     pub(crate) fn charged(&self) -> usize {
-        self.chunks.iter().filter_map(OnceCell::get).flat_map(|c| c.iter()).map(|s| s.cost.get()).sum()
+        self.chunks.iter().filter_map(OnceCell::get).flat_map(|chunk| chunk.iter()).map(|slot| slot.cost.get()).sum()
     }
 
     pub(crate) fn live(&self) -> usize {

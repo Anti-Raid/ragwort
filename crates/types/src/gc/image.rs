@@ -164,8 +164,8 @@ impl From<OutOfMemory> for LoadError {
 }
 
 impl From<crate::Error> for LoadError {
-    fn from(e: crate::Error) -> Self {
-        match e {
+    fn from(error: crate::Error) -> Self {
+        match error {
             crate::Error::OutOfMemory => Self::OutOfMemory,
             // A string or a number that can't be made comes from bytes that no build wrote.
             crate::Error::Num(_) | crate::Error::Str(_) => Self::Malformed,

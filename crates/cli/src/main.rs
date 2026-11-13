@@ -32,7 +32,7 @@ fn finish(result: Result<(), Vec<String>>) -> ExitCode {
 fn program(from: Source) -> Result<Program, Vec<String>> {
     let heap = from.heap.unwrap_or(program::HEAP);
     let Some(image) = from.image else { return Program::new(heap, from.modules) };
-    let bytes = std::fs::read(&image).map_err(|e| vec![format!("{}: {e}", image.display())])?;
+    let bytes = std::fs::read(&image).map_err(|error| vec![format!("{}: {error}", image.display())])?;
     Program::from_image(heap, from.modules, &bytes).map_err(|errors| errors.iter().map(|error| format!("{}: {error}", image.display())).collect())
 }
 
@@ -52,7 +52,7 @@ fn compile(mut program: Program, entry: Option<PathBuf>) -> ExitCode {
 /// Compiles the modules of `program`, and saves it to the file at `to`.
 fn save(mut program: Program, to: &Path) -> ExitCode {
     let saved = program.load_all().and_then(|()| program.save_image());
-    finish(saved.and_then(|bytes| std::fs::write(to, bytes).map_err(|e| vec![format!("{}: {e}", to.display())])))
+    finish(saved.and_then(|bytes| std::fs::write(to, bytes).map_err(|error| vec![format!("{}: {error}", to.display())])))
 }
 
 fn main() -> ExitCode {

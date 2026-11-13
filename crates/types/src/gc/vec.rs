@@ -51,9 +51,9 @@ impl<'gc, S: Item> GcVec<'gc, S> {
     }
 
     pub fn with_capacity(mc: &Mutation<'gc>, capacity: usize) -> Result<Self, OutOfMemory> {
-        let v = Self::new(mc)?;
-        v.reserve(mc, capacity)?;
-        Ok(v)
+        let vector = Self::new(mc)?;
+        vector.reserve(mc, capacity)?;
+        Ok(vector)
     }
 
     /// The vector `head` is the handle of.
@@ -92,16 +92,16 @@ impl<'gc, S: Item> GcVec<'gc, S> {
     }
 
     #[inline]
-    pub fn get(self, mc: &Mutation<'gc>, i: usize) -> Option<S::Out<'gc>> {
+    pub fn get(self, mc: &Mutation<'gc>, index: usize) -> Option<S::Out<'gc>> {
         let (slots, len) = self.parts(mc)?;
-        (i < len).then(|| slots.get(i))
+        (index < len).then(|| slots.get(index))
     }
 
-    /// Whether `i` is in bounds, and so was set.
+    /// Whether `index` is in bounds, and so was set.
     #[inline]
-    pub fn set(self, mc: &Mutation<'gc>, i: usize, value: S::In<'gc>) -> bool {
-        let Some((slots, _)) = self.parts(mc).filter(|&(_, len)| i < len) else { return false };
-        slots.set(mc, i, value);
+    pub fn set(self, mc: &Mutation<'gc>, index: usize, value: S::In<'gc>) -> bool {
+        let Some((slots, _)) = self.parts(mc).filter(|&(_, len)| index < len) else { return false };
+        slots.set(mc, index, value);
         true
     }
 
@@ -115,14 +115,14 @@ impl<'gc, S: Item> GcVec<'gc, S> {
         if needed <= capacity {
             return Ok(());
         }
-        let alloc = |n| mc.alloc_items::<VecSlots<S>, 0>([], n, Value::from_bits(0));
+        let alloc = |count| mc.alloc_items::<VecSlots<S>, 0>([], count, Value::from_bits(0));
         let doubled = (capacity * 2).max(4);
         let slots = if doubled > needed { mc.optional(|| alloc(doubled)).ok() } else { None };
         let slots = match slots {
             Some(slots) => slots,
             None => alloc(needed)?,
         };
-        if let (Some(old), Some(new)) = (old.and_then(|o| o.slice(0..len)), slots.item_slots::<S>(mc).slice(0..len)) {
+        if let (Some(old), Some(new)) = (old.and_then(|previous| previous.slice(0..len)), slots.item_slots::<S>(mc).slice(0..len)) {
             new.copy_from(mc, old);
         }
         self.head.set(mc, VecHead::SLOTS, Some(slots));
@@ -150,7 +150,7 @@ impl<'gc, S: Item> GcVec<'gc, S> {
         let Some((_, old)) = self.parts(mc) else { return };
         let len = len.min(old);
         // Zero words, whatever `S` is, so the slots keep nothing alive.
-        if let Some(gone) = self.head.get(mc, VecHead::SLOTS).and_then(|s| s.item_slots::<slot::u64>(mc).slice(len..old)) {
+        if let Some(gone) = self.head.get(mc, VecHead::SLOTS).and_then(|slots| slots.item_slots::<slot::u64>(mc).slice(len..old)) {
             gone.fill(mc, 0);
         }
         self.head.set(mc, VecHead::LEN, len as u64);

@@ -55,9 +55,9 @@ pub fn subtract_and_return_borrow(mut z: RWDigits<'_>, x: Digits<'_>) -> Digit {
     borrow
 }
 
-/// `z += d` in place, returning the carry.
-pub fn add_digit(z: RWDigits<'_>, d: Digit) -> Digit {
-    add_and_return_carry(z, Digits::of_mut(&mut [d]))
+/// `z += digit` in place, returning the carry.
+pub fn add_digit(z: RWDigits<'_>, digit: Digit) -> Digit {
+    add_and_return_carry(z, Digits::of_mut(&mut [digit]))
 }
 
 /// `z = x + 1`. `z` needs `x + 1` digits.
@@ -138,7 +138,7 @@ pub fn right_shift(mut z: RWDigits<'_>, x: Digits<'_>, shift: usize) {
 /// Whether `x >> shift` drops any one bits, which makes a negative shift round down.
 pub fn shifts_out_ones(x: Digits<'_>, shift: usize) -> bool {
     let (digits, bits) = (shift / DIGIT_BITS, shift % DIGIT_BITS);
-    x.slice(0, digits).iter().any(|d| d != 0) || (bits != 0 && x.get(digits) << (DIGIT_BITS - bits) != 0)
+    x.slice(0, digits).iter().any(|digit| digit != 0) || (bits != 0 && x.get(digits) << (DIGIT_BITS - bits) != 0)
 }
 
 /// The magnitude as the nearest double, ties to even.
@@ -151,10 +151,10 @@ pub fn to_f64(x: Digits<'_>) -> f64 {
     // The top digit's worth of bits, with any lower one bit folded into the lowest bit, so
     // the conversion rounds ties correctly.
     let shift = bits - DIGIT_BITS;
-    let (digit, s) = (shift / DIGIT_BITS, shift % DIGIT_BITS);
-    let mut top = x.at(digit) >> s;
-    if s != 0 {
-        top |= x.at(digit + 1) << (DIGIT_BITS - s);
+    let (digit, bit_shift) = (shift / DIGIT_BITS, shift % DIGIT_BITS);
+    let mut top = x.at(digit) >> bit_shift;
+    if bit_shift != 0 {
+        top |= x.at(digit + 1) << (DIGIT_BITS - bit_shift);
     }
     let sticky = shifts_out_ones(x, shift);
     if shift > 1023 {

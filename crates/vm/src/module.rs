@@ -49,10 +49,10 @@ impl HostDef {
         TypeId::of::<F>()
     }
 
-    /// Returns `true` if this host function accepts `n` arguments.
+    /// Returns `true` if this host function accepts `count` arguments.
     #[inline]
-    pub fn takes(&self, n: usize) -> bool {
-        takes(self.arity, n)
+    pub fn takes(&self, count: usize) -> bool {
+        takes(self.arity, count)
     }
 }
 
@@ -138,9 +138,9 @@ impl<'s, 'gc> HostArgs<'s, 'gc> {
     }
 
     #[inline]
-    pub fn get(self, i: usize) -> Option<Value<'gc>> {
-        let i = u8::try_from(i).ok().filter(|&i| i < self.len)?;
-        Some(self.frame.get(self.base + i))
+    pub fn get(self, index: usize) -> Option<Value<'gc>> {
+        let index = u8::try_from(index).ok().filter(|&index| index < self.len)?;
+        Some(self.frame.get(self.base + index))
     }
 
     #[inline]
@@ -150,8 +150,8 @@ impl<'s, 'gc> HostArgs<'s, 'gc> {
 }
 
 impl fmt::Debug for HostArgs<'_, '_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(self.iter()).finish()
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_list().entries(self.iter()).finish()
     }
 }
 
@@ -169,8 +169,8 @@ impl Deferred {
 }
 
 impl fmt::Debug for Deferred {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Deferred")
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Deferred")
     }
 }
 
@@ -214,15 +214,15 @@ pub fn external_data<'gc, T: Any>(mc: &Mutation<'gc>, external: Value<'gc>) -> O
     external.downcast::<ExternalRef>(mc)?.data(mc)?.downcast_ref()
 }
 
-/// Returns `true` if an encoded arity integer (formatted as in [`Bytecode`](crate::objects::Bytecode)) accepts `n` arguments.
+/// Returns `true` if an encoded arity integer (formatted as in [`Bytecode`](crate::objects::Bytecode)) accepts `count` arguments.
 #[inline]
-pub(crate) fn takes(arity: i64, n: usize) -> bool {
-    let n = n as i64;
-    if arity == n {
+pub(crate) fn takes(arity: i64, count: usize) -> bool {
+    let count = count as i64;
+    if arity == count {
         true
     } else if arity < 0 {
-        n >= -(arity + 1)
+        count >= -(arity + 1)
     } else {
-        crate::frame::Shape::of(arity).takes(n as u64)
+        crate::frame::Shape::of(arity).takes(count as u64)
     }
 }

@@ -13,33 +13,33 @@ impl Hasher for Mix {
     }
 
     fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.write_u64(u64::from(b));
+        for &byte in bytes {
+            self.write_u64(u64::from(byte));
         }
     }
 
-    fn write_u8(&mut self, n: u8) {
-        self.write_u64(u64::from(n));
+    fn write_u8(&mut self, number: u8) {
+        self.write_u64(u64::from(number));
     }
 
-    fn write_u16(&mut self, n: u16) {
-        self.write_u64(u64::from(n));
+    fn write_u16(&mut self, number: u16) {
+        self.write_u64(u64::from(number));
     }
 
-    fn write_u32(&mut self, n: u32) {
-        self.write_u64(u64::from(n));
+    fn write_u32(&mut self, number: u32) {
+        self.write_u64(u64::from(number));
     }
 
-    fn write_usize(&mut self, n: usize) {
-        self.write_u64(n as u64);
+    fn write_usize(&mut self, number: usize) {
+        self.write_u64(number as u64);
     }
 
-    fn write_isize(&mut self, n: isize) {
-        self.write_u64(n as u64);
+    fn write_isize(&mut self, number: isize) {
+        self.write_u64(number as u64);
     }
 
-    fn write_u64(&mut self, n: u64) {
-        self.0 = (self.0 ^ n).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(26);
+    fn write_u64(&mut self, number: u64) {
+        self.0 = (self.0 ^ number).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(26);
     }
 }
 

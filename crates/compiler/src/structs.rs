@@ -41,10 +41,10 @@ fn members(name: &str, fields: &[Field], inherited: usize) -> Option<Vec<(String
     let mut members = vec![(format!("struct:{name}"), Member::Type), (name.to_string(), Member::Make), (format!("{name}?"), Member::Is)];
     let mut mutators = Vec::new();
     for (i, field) in fields.iter().enumerate() {
-        let k = u32::try_from(inherited + i).ok()?;
-        members.push((format!("{name}-{}", field.name), Member::Ref(k)));
+        let position = u32::try_from(inherited + i).ok()?;
+        members.push((format!("{name}-{}", field.name), Member::Ref(position)));
         if field.mutable {
-            mutators.push((format!("set-{name}-{}!", field.name), Member::Set(k)));
+            mutators.push((format!("set-{name}-{}!", field.name), Member::Set(position)));
         }
     }
     members.extend(mutators);
@@ -81,8 +81,8 @@ fn make_type<'gc>(mc: &Mutation<'gc>, name: Value<'gc>, parent: Value<'gc>, fiel
     structs::make_type(mc, name, parent, names, field_flags, bits(flags)).map(|kind| Value::object(mc, kind))
 }
 
-fn index<'gc>(k: u32) -> Core<'gc> {
-    Core::Quote(Value::fixnum(i64::from(k)).expect("an index is a fixnum"))
+fn index<'gc>(position: u32) -> Core<'gc> {
+    Core::Quote(Value::fixnum(i64::from(position)).expect("an index is a fixnum"))
 }
 
 /// Describes the direct-call operation for `member` of a type with `fields` fields, stored in
@@ -93,8 +93,8 @@ pub fn inline(member: Member, kind: u32, fields: u32) -> Option<Inline> {
         Member::Type => return None,
         Member::Make => Inline::of_call(Intrinsic::MakeStruct, fields, &std::iter::once(kind).chain((0..fields).map(Operand::Param)).collect::<Vec<_>>()),
         Member::Is => Inline::of_call(Intrinsic::IsStructDerivedFrom, 1, &[Operand::Param(0), kind]),
-        Member::Ref(k) => Inline::of_call(Intrinsic::StructRef, 1, &[Operand::Param(0), kind, Operand::Index(k)]),
-        Member::Set(k) => Inline::of_call(Intrinsic::StructSet, 2, &[Operand::Param(0), kind, Operand::Index(k), Operand::Param(1)]),
+        Member::Ref(position) => Inline::of_call(Intrinsic::StructRef, 1, &[Operand::Param(0), kind, Operand::Index(position)]),
+        Member::Set(position) => Inline::of_call(Intrinsic::StructSet, 2, &[Operand::Param(0), kind, Operand::Index(position), Operand::Param(1)]),
     })
 }
 
@@ -110,23 +110,23 @@ pub fn value<'gc>(member: Member, kind: Core<'gc>, fields: u32, fresh: &mut Loca
             (params, Intrinsic::MakeStruct, args)
         }
         Member::Is => {
-            let v = fresh.fresh();
-            (vec![v], Intrinsic::IsStructDerivedFrom, vec![local(&v), kind])
+            let operand = fresh.fresh();
+            (vec![operand], Intrinsic::IsStructDerivedFrom, vec![local(&operand), kind])
         }
-        Member::Ref(k) => {
-            let s = fresh.fresh();
-            (vec![s], Intrinsic::StructRef, vec![local(&s), kind, index(k)])
+        Member::Ref(position) => {
+            let instance = fresh.fresh();
+            (vec![instance], Intrinsic::StructRef, vec![local(&instance), kind, index(position)])
         }
-        Member::Set(k) => {
-            let (s, v) = (fresh.fresh(), fresh.fresh());
-            (vec![s, v], Intrinsic::StructSet, vec![local(&s), kind, index(k), local(&v)])
+        Member::Set(position) => {
+            let (instance, operand) = (fresh.fresh(), fresh.fresh());
+            (vec![instance, operand], Intrinsic::StructSet, vec![local(&instance), kind, index(position), local(&operand)])
         }
     };
     let body = Box::new(Core::Intrinsic(Prim::Intrinsic(prim), args, None));
     Core::Lambda(Lambda { id: fresh.lambda(), optional: 0, params, rest: None, body, name: None, at: None })
 }
 
-/// A direct expansion of a call of a generated struct procedure.
+/// The inline expansion of a call of a generated struct procedure.
 pub(crate) struct Call<'gc> {
     inline: Inline,
     kind: Value<'gc>,
@@ -134,72 +134,76 @@ pub(crate) struct Call<'gc> {
 }
 
 impl<'gc> Call<'gc> {
-    /// Creates the expansion of the template `inline` for the struct whose type object is `kind`. If `check` names the procedure's variable, which may be undefined when the call runs, the expansion reads it first, so that the call fails as an ordinary call would.
+    /// Creates the expansion of template `inline` for the struct with type object `kind`.
+    ///
+    /// `check` is the procedure's variable if that variable may be undefined when the call runs. The expansion then reads the variable first, so the call fails the same way an ordinary call would.
     pub(crate) fn new(inline: Inline, kind: Value<'gc>, check: Option<Place>) -> Self {
         Self { inline, kind, check }
     }
 
-    /// Checks whether the procedure accepts `n` arguments. A call with any other number of arguments stays an ordinary call.
-    pub(crate) fn takes(&self, n: usize) -> bool {
-        self.inline.inlines(n)
+    /// Returns whether the procedure accepts `count` arguments. A call with a different number of arguments is not expanded and stays an ordinary call.
+    pub(crate) fn takes(&self, count: usize) -> bool {
+        self.inline.inlines(count)
     }
 
-    /// Returns the procedure's template, the struct's type object, and the module variable to read first if it may be undefined.
+    /// Returns the three parts of the expansion: the procedure's template, the struct's type object, and the variable to read first (see [`Call::new`]).
     pub(crate) fn parts(self) -> (Inline, Value<'gc>, Option<Place>) {
         (self.inline, self.kind, self.check)
     }
 }
 
-/// A struct declaration whose names the compiler resolves, as an [`Item::Struct`](crate::module::Item::Struct) holds it.
+/// A struct declaration that refers to its supertype by name. An [`Item::Struct`](crate::module::Item::Struct) holds one, and the compiler resolves the names.
 ///
-/// `(struct point3 point (z) #:sealed)` is the form whose `name` is `point3`, whose `parent` is `point`, and whose `fields` hold `z`. Declaring it defines `struct:point3`, `point3`, `point3?` and `point3-z` as variables of the module.
+/// For `(struct point3 point (z) #:sealed)`, `name` is `point3`, `parent` is `point`, and `fields` holds `z`. Declaring it defines the module variables `struct:point3`, `point3`, `point3?` and `point3-z`.
 pub struct Form<'gc> {
-    /// The struct's name, a symbol, with the span of the name in the source.
+    /// The struct's name (a symbol) and the span of the name in the source.
     pub name: (Value<'gc>, SyntaxSpan<'gc>),
     /// The span of the whole declaration.
     pub span: SyntaxSpan<'gc>,
-    /// The name that the supertype's constructor is bound to in the module, if the struct has a supertype.
+    /// The supertype, if the struct has one. A supertype is named by its constructor. The span covers the name in the source.
     pub parent: Option<(Value<'gc>, SyntaxSpan<'gc>)>,
-    /// The fields the declaration adds to those of the supertype.
+    /// The fields that this declaration adds. The supertype's fields are not included.
     pub fields: Vec<Declaration<'gc>>,
     pub flags: TypeFlags,
-    /// The names of the constructors that the declaration defines besides the one that has the struct's name.
+    /// Extra constructor names, with their spans. The constructor named after the struct is always defined and is not listed here.
     pub constructors: Vec<(Value<'gc>, SyntaxSpan<'gc>)>,
 }
 
-/// The supertype of a struct declaration, once a front end or the module builder has found what the declaration's supertype name refers to.
+/// A resolved supertype. The front end or the module builder looks up the supertype's name and passes the result to [`Form::plan`].
 pub struct Supertype<'gc> {
     /// The supertype's type object.
     pub kind: Value<'gc>,
-    /// All of the supertype's fields, those of its own supertype first.
+    /// All fields of the supertype, including inherited ones. Inherited fields come first.
     pub fields: Vec<Field>,
     pub sealed: bool,
 }
 
-/// How a binding that a struct declaration defines is named.
+/// The name of one binding that a struct declaration defines.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Named {
-    /// The struct's own name, which the constructor has.
+    /// The struct's own name. The main constructor has this name.
     Own,
-    /// The name of another constructor, by its index in [`Form::constructors`].
+    /// An extra constructor name, given by its index in [`Form::constructors`].
     Constructor(usize),
-    /// A name made from the struct's name, such as `point-x` or `struct:point`.
+    /// A name derived from the struct's name, such as `point-x` or `struct:point`.
     Derived(String),
 }
 
-/// What a struct declaration makes, before the names of its bindings are bound: [`Form::plan`] works it out, and [`Planned::declare`] registers it once each binding has a variable of the module.
+/// The result of [`Form::plan`]: the struct's type and the list of bindings to define. No module variable exists for the bindings yet.
 ///
-/// A front end that resolves names itself binds each of `members` its own way. The module builder binds them by name for an [`Item::Struct`](crate::module::Item::Struct).
+/// The caller creates a module variable for each entry of `members`, then calls [`Planned::declare`]:
+/// - The module builder defines each binding by name. It does this for an [`Item::Struct`](crate::module::Item::Struct).
+/// - A front end that resolves names itself, such as Scheme, defines each binding in its own way.
 pub struct Planned<'gc> {
     kind: Value<'gc>,
     fields: Vec<Field>,
     sealed: bool,
-    /// The bindings the declaration defines, in the order their variables are defined: the type, the constructor that has the struct's name, the other constructors, the predicate, the accessors and the mutators.
+    /// The bindings to define, in this order: the type, the main constructor, the extra constructors, the predicate, the accessors, and the mutators.
     pub members: Vec<(Named, Member)>,
 }
 
 impl<'gc> Planned<'gc> {
-    /// Registers the declaration with `builder`. `slots` holds the module variable of each of [`Planned::members`], in order.
+    /// Registers the declaration with `builder`. `slots` holds the slot of each entry of [`Planned::members`], in the same order.
     pub fn declare(self, builder: &mut ModuleBuilder<'gc>, slots: Vec<u32>) -> Declared {
         let members = slots.into_iter().zip(self.members).map(|(slot, (_, member))| (slot, member)).collect();
         Declared::new(builder, self.kind, self.fields, self.sealed, members)
@@ -207,7 +211,9 @@ impl<'gc> Planned<'gc> {
 }
 
 impl<'gc> Form<'gc> {
-    /// Works out what the declaration makes, given the supertype that [`Form::parent`] names, if it names one: checks that the supertype can be extended, makes the struct's type, and lists the bindings to define.
+    /// Plans the declaration: checks the supertype, creates the struct's type, and lists the bindings to define.
+    ///
+    /// `parent` is the resolved supertype, or `None` if the struct has no supertype. Returns [`ModuleError::Supertype`] if the supertype is sealed.
     pub fn plan(&self, mc: &Mutation<'gc>, parent: Option<Supertype<'gc>>) -> Result<Planned<'gc>, ModuleError> {
         let strings = Strings::new(mc);
         let text = |symbol: Value<'gc>| Symbol::of(symbol).map(|symbol| chars(&strings, symbol.name(mc)).collect::<String>());
@@ -229,7 +235,7 @@ impl<'gc> Form<'gc> {
         let mut members = Vec::with_capacity(named.len() + self.constructors.len());
         for (text, member) in named {
             members.push((if member == Member::Make { Named::Own } else { Named::Derived(text) }, member));
-            // The constructors of other names go after the one that has the struct's name.
+            // Extra constructors come right after the main constructor.
             if member == Member::Make {
                 members.extend((0..self.constructors.len()).map(|i| (Named::Constructor(i), Member::Make)));
             }
@@ -265,9 +271,11 @@ impl Declared {
         Self { constructor, members, fields: count }
     }
 
-    /// Declares `form`, the top-level form of the module with index `top`: finds the supertype by name, makes the struct's type, and defines a variable of the module for the type and for each generated procedure. An error comes with the span of the name at fault.
+    /// Declares `form`, which is top-level form number `top`. This looks up the supertype by name, creates the struct's type, and defines a module variable for the type and for each generated procedure.
+    ///
+    /// An error is returned with the span of the name at fault.
     pub(crate) fn of_form<'gc>(mc: &Mutation<'gc>, builder: &mut ModuleBuilder<'gc>, top: u32, form: &Form<'gc>) -> Result<Self, (ModuleError, SyntaxSpan<'gc>)> {
-        // The supertype is a struct type that the module defines or requires, named by its constructor.
+        // The supertype must be a struct type that the module defines or requires. It is named by its constructor.
         let parent = match form.parent {
             None => None,
             Some((name, span)) => {
@@ -280,20 +288,20 @@ impl Declared {
                 Some(Supertype { kind, fields: def.fields.into_vec(), sealed: def.sealed })
             }
         };
-        let planned = form.plan(mc, parent).map_err(|e| match (e, form.parent) {
-            (ModuleError::Supertype, Some((_, span))) => (e, span),
-            _ => (e, form.span),
+        let planned = form.plan(mc, parent).map_err(|error| match (error, form.parent) {
+            (ModuleError::Supertype, Some((_, span))) => (error, span),
+            _ => (error, form.span),
         })?;
-        let symbols = Symbols::of_arena(mc).map_err(|e| (e.into(), form.span))?;
+        let symbols = Symbols::of_arena(mc).map_err(|error| (error.into(), form.span))?;
         let strings = Strings::new(mc);
         let mut slots = Vec::with_capacity(planned.members.len());
         for (named, _) in &planned.members {
             let (name, span) = match named {
                 Named::Own => form.name,
-                Named::Constructor(i) => form.constructors[*i],
+                Named::Constructor(extra) => form.constructors[*extra],
                 Named::Derived(text) => (symbols.intern_str(&strings, text).map_err(|_| (ModuleError::OutOfMemory, form.span))?.value(mc), form.name.1),
             };
-            slots.push(builder.define(name, top).map_err(|e| (e, span))?);
+            slots.push(builder.define(name, top).map_err(|error| (error, span))?);
         }
         Ok(planned.declare(builder, slots))
     }

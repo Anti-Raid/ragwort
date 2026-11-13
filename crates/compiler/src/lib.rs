@@ -109,34 +109,34 @@ impl SlotOp {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Formal<'gc> {
     pub var: Var,
-    /// The keyword a call passes the argument by, or `None` for a positional parameter.
+    /// The keyword of a keyword parameter, or `None` for a positional parameter.
     pub keyword: Option<Keyword<'gc>>,
-    /// The expression whose value the parameter takes when a call omits the argument, or `None` for a required parameter. It is evaluated inside the procedure, and may refer to the parameters written before this one.
+    /// The default value expression, or `None` if the parameter is required. The default is evaluated inside the procedure when a call omits the argument. It may refer to the parameters written before this one.
     pub default: Option<Core<'gc>>,
 }
 
 /// A lambda with optional or keyword parameters, as Racket's `lambda` takes them.
 ///
-/// For `(lambda (a [b 2] #:k [k 3] . rest) body)`, `params` holds `a`, `b` and `k` in the order written:
+/// For `(lambda (a [b 2] #:k [k 3] . rest) body)`, `params` holds `a`, `b` and `k` in written order:
 ///
 /// - `a` has no default, so it is required.
-/// - `b` is an optional positional parameter. A required positional parameter may not follow one.
-/// - `k` is passed by the keyword `#:k`.
+/// - `b` has a default, so it is an optional positional parameter. A required positional parameter must not follow an optional one.
+/// - `k` is a keyword parameter. A call passes it as `#:k value`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OptionalLambda<'gc> {
-    /// A unique identifier, as [`Lambda::id`] is, for the plain lambda this one becomes.
+    /// A unique identifier, like [`Lambda::id`]. The plain lambda that the compiler builds from this one uses it.
     pub id: u32,
     pub params: Vec<Formal<'gc>>,
     /// An optional rest parameter that receives any excess positional arguments as a list.
     pub rest: Option<Var>,
     pub body: Box<Core<'gc>>,
-    /// As [`Lambda::name`].
+    /// The procedure's name, as in [`Lambda::name`].
     pub name: Option<Value<'gc>>,
-    /// As [`Lambda::at`].
+    /// The position of the definition, as in [`Lambda::at`].
     pub at: Option<Position<'gc>>,
 }
 
-/// An argument of a [`Core::KeywordApp`]: its value, and the keyword it is passed by if it is not positional.
+/// One argument of a [`Core::KeywordApp`]. `keyword` is `None` for a positional argument.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Arg<'gc> {
     pub keyword: Option<Keyword<'gc>>,
@@ -158,7 +158,7 @@ impl<'gc> Position<'gc> {
 }
 
 impl<'gc> Core<'gc> {
-    /// Returns the source position this expression carries, if it is a call or a built-in operation that has one.
+    /// Returns the source position of this expression, if it is a call or a built-in operation that has one.
     pub fn position(&self) -> Option<Position<'gc>> {
         match self {
             Core::App(_, _, at) | Core::Intrinsic(_, _, at) | Core::ApplyIntrinsic(_, _, at) | Core::KeywordApp(_, _, at) => *at,
@@ -197,22 +197,26 @@ pub enum Core<'gc> {
     Letrec(Vec<(Var, Core<'gc>)>, Box<Core<'gc>>),
     /// Mutates a local variable or module slot; evaluates to `#<void>`.
     Set(Place, Box<Core<'gc>>),
-    /// Calls a procedure with arguments. The last field is the source position of the call, which an error raised by the call reports; it is `None` for a call that a front end or the compiler made up.
+    /// Calls a procedure with arguments. The last field is the source position of the call, which error reports use. It is `None` for a call that a front end or the compiler generated.
     App(Box<Core<'gc>>, Vec<Core<'gc>>, Option<Position<'gc>>),
     Lambda(Lambda<'gc>),
     /// Applies a built-in operation to arguments. The last field is the source position, as for `App`.
     Intrinsic(Prim, Vec<Core<'gc>>, Option<Position<'gc>>),
     /// Invokes an intrinsic whose final argument is a list that is spread into remaining arguments, analogous to `apply`. The last field is the source position, as for `App`.
     ApplyIntrinsic(Prim, Vec<Core<'gc>>, Option<Position<'gc>>),
-    /// A lambda with optional or keyword parameters. The compiler turns it into a plain lambda that evaluates the defaults, and into a keyword procedure around that lambda if any parameter has a keyword.
+    /// A lambda with optional or keyword parameters. The compiler turns it into a plain lambda that evaluates the defaults. If any parameter has a keyword, the compiler also wraps that lambda in a keyword procedure.
     OptionalLambda(OptionalLambda<'gc>),
-    /// A call with keyword arguments, written in the order the call evaluates them. The compiler passes the arguments straight to the core of a keyword procedure it knows, and otherwise leaves the matching of keywords to the call at run time. The last field is the source position, as for `App`.
+    /// A call with keyword arguments. The arguments are in written order, which is also their evaluation order. The last field is the source position, as for `App`.
+    ///
+    /// If the compiler knows that the callee is a keyword procedure that accepts the arguments, the call goes directly to its core procedure. Otherwise the keywords are matched when the call runs.
     KeywordApp(Box<Core<'gc>>, Vec<Arg<'gc>>, Option<Position<'gc>>),
-    /// A reference to the binding that the symbol names at the top level of the module being built: one of its variables, or an import. The compiler resolves the name, so a front end only tells local variables from every other name. The span locates the name in the source, for the error of a name that the module does not bind.
+    /// A reference to a module-level binding by name. The symbol names a variable of the module being built, or an import. The span covers the name in the source and locates the error if the name is unbound.
+    ///
+    /// The compiler resolves the name. A front end therefore only has to tell local variables apart from all other names.
     Global(Value<'gc>, SyntaxSpan<'gc>),
-    /// An assignment of the module variable that the symbol names, with the span of the name.
+    /// An assignment to a module variable by name. The fields are the variable's name (a symbol), the new value, and the span of the name.
     SetGlobal(Value<'gc>, Box<Core<'gc>>, SyntaxSpan<'gc>),
-    /// A reference to a binding imported from another module. The compiler reads the binding's value from the module, and expands a call of an imported procedure from the procedure's inline template when it has one.
+    /// A reference to a binding imported from another module. The compiler reads the value from that module. A call of an imported procedure is inlined if the procedure has an inline template.
     Import(module::Import<'gc>),
 }
 
@@ -230,24 +234,24 @@ impl Core<'_> {
         };
         match self {
             Core::Quote(_) | Core::Ref(_) | Core::Import(_) | Core::Global(..) => {}
-            Core::If(a, b, c) => [a, b, c].into_iter().for_each(|part| take(part)),
+            Core::If(test, consequent, other) => [test, consequent, other].into_iter().for_each(|part| take(part)),
             Core::Let(binds, body) | Core::Letrec(binds, body) => {
                 binds.iter_mut().for_each(|(_, init)| take(init));
                 take(body);
             }
             Core::Set(_, value) => take(value),
-            Core::App(f, args, _) => {
-                take(f);
+            Core::App(function, args, _) => {
+                take(function);
                 args.iter_mut().for_each(take);
             }
             Core::SetGlobal(_, value, _) => take(value),
-            Core::Lambda(f) => take(&mut f.body),
-            Core::OptionalLambda(f) => {
-                f.params.iter_mut().filter_map(|formal| formal.default.as_mut()).for_each(&mut take);
-                take(&mut f.body);
+            Core::Lambda(lambda) => take(&mut lambda.body),
+            Core::OptionalLambda(lambda) => {
+                lambda.params.iter_mut().filter_map(|formal| formal.default.as_mut()).for_each(&mut take);
+                take(&mut lambda.body);
             }
-            Core::KeywordApp(f, args, _) => {
-                take(f);
+            Core::KeywordApp(function, args, _) => {
+                take(function);
                 args.iter_mut().for_each(|arg| take(&mut arg.value));
             }
             Core::Intrinsic(_, args, _) | Core::ApplyIntrinsic(_, args, _) => args.iter_mut().for_each(take),
@@ -295,17 +299,17 @@ pub enum CompileError {
     TooManyArguments,
     /// A reference to an import that cannot be used as a value where it appears.
     Import(module::Unusable),
-    /// A misuse of the top-level name at bytes `start..end` of its source.
+    /// A module-level name is used incorrectly. The name is at bytes `start..end` of its source.
     Global { kind: GlobalError, start: u32, end: u32 },
     OutOfMemory,
 }
 
-/// What is wrong with a use of a top-level name, a [`Core::Global`] or [`Core::SetGlobal`].
+/// The kind of error in a [`Core::Global`] or [`Core::SetGlobal`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GlobalError {
     /// The module neither defines nor imports the name.
     Unbound,
-    /// The name is assigned, but it is an import, a struct's binding or a keyword procedure, which cannot change.
+    /// The name is assigned, but it is immutable: an import, a binding of a struct declaration, or a keyword procedure.
     Immutable,
     /// The name is an import that cannot be used as a value.
     Import(module::Unusable),
@@ -324,29 +328,29 @@ impl From<ragwort_types::Error> for CompileError {
 }
 
 impl fmt::Display for CompileError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Import(module::Unusable::Uninitialized) => write!(f, "an import whose module hasn't defined it yet"),
-            Self::Import(module::Unusable::MatchOnly) => write!(f, "a struct whose constructor its module doesn't provide"),
-            Self::Global { kind: GlobalError::Unbound, .. } => write!(f, "a name nothing defines"),
-            Self::Global { kind: GlobalError::Immutable, .. } => write!(f, "an assignment of a name that can't change"),
-            Self::Global { kind: GlobalError::Import(unusable), .. } => Self::Import(*unusable).fmt(f),
-            Self::Unbound(v) => write!(f, "unbound variable {}", v.0),
-            Self::Rebound(v) => write!(f, "variable {} bound more than once", v.0),
-            Self::SameLambda(id) => write!(f, "lambda {id} appears more than once"),
-            Self::TooManyOptional(id) => write!(f, "lambda {id} has more optional parameters than parameters"),
-            Self::Formals(id) => write!(f, "lambda {id} repeats a keyword, or has a required parameter after an optional one"),
-            Self::SameKeyword => write!(f, "a call passes the same keyword twice"),
-            Self::Arity(Prim::Intrinsic(i)) => write!(f, "wrong number of arguments to {}", i.name()),
-            Self::Arity(Prim::Request(r)) => write!(f, "wrong number of arguments to {}", r.name()),
-            Self::Arity(Prim::Host(h)) => write!(f, "wrong number of arguments to host function {}", h.name),
-            Self::Arity(Prim::Slot(_, slot)) => write!(f, "wrong number of arguments to an access of module variable {slot}"),
-            Self::TooManyConstants => write!(f, "more than 2^32 constants"),
-            Self::UnknownHost(h) => write!(f, "host function {} isn't one of the module's", h.name),
-            Self::UnknownSlot(slot) => write!(f, "variable {slot} isn't one of the module's"),
-            Self::TooManyRegisters => write!(f, "more than 2^32 locals"),
-            Self::TooManyArguments => write!(f, "a host call with more arguments than fit a frame"),
-            Self::OutOfMemory => write!(f, "out of memory"),
+            Self::Import(module::Unusable::Uninitialized) => write!(formatter, "an import whose module hasn't defined it yet"),
+            Self::Import(module::Unusable::MatchOnly) => write!(formatter, "a struct whose constructor its module doesn't provide"),
+            Self::Global { kind: GlobalError::Unbound, .. } => write!(formatter, "a name nothing defines"),
+            Self::Global { kind: GlobalError::Immutable, .. } => write!(formatter, "an assignment of a name that can't change"),
+            Self::Global { kind: GlobalError::Import(unusable), .. } => Self::Import(*unusable).fmt(formatter),
+            Self::Unbound(var) => write!(formatter, "unbound variable {}", var.0),
+            Self::Rebound(var) => write!(formatter, "variable {} bound more than once", var.0),
+            Self::SameLambda(id) => write!(formatter, "lambda {id} appears more than once"),
+            Self::TooManyOptional(id) => write!(formatter, "lambda {id} has more optional parameters than parameters"),
+            Self::Formals(id) => write!(formatter, "lambda {id} repeats a keyword, or has a required parameter after an optional one"),
+            Self::SameKeyword => write!(formatter, "a call passes the same keyword twice"),
+            Self::Arity(Prim::Intrinsic(intrinsic)) => write!(formatter, "wrong number of arguments to {}", intrinsic.name()),
+            Self::Arity(Prim::Request(request)) => write!(formatter, "wrong number of arguments to {}", request.name()),
+            Self::Arity(Prim::Host(host)) => write!(formatter, "wrong number of arguments to host function {}", host.name),
+            Self::Arity(Prim::Slot(_, slot)) => write!(formatter, "wrong number of arguments to an access of module variable {slot}"),
+            Self::TooManyConstants => write!(formatter, "more than 2^32 constants"),
+            Self::UnknownHost(host) => write!(formatter, "host function {} isn't one of the module's", host.name),
+            Self::UnknownSlot(slot) => write!(formatter, "variable {slot} isn't one of the module's"),
+            Self::TooManyRegisters => write!(formatter, "more than 2^32 locals"),
+            Self::TooManyArguments => write!(formatter, "a host call with more arguments than fit a frame"),
+            Self::OutOfMemory => write!(formatter, "out of memory"),
         }
     }
 }
@@ -359,7 +363,9 @@ pub fn compile<'gc>(mc: &Mutation<'gc>, module: Option<Gc<'gc, Module>>, core: &
     compile_in(mc, module, core, None).map(|(thunk, _)| thunk)
 }
 
-/// Compiles `core` as [`compile`] does. With a `unit`, calls of the struct procedures and keyword procedures that the module being built defines are resolved from its declarations, and the inline template of the procedure that the form defines is returned with the thunk, if the procedure has one.
+/// Compiles `core` like [`compile`], with an optional module context `unit`.
+///
+/// With a `unit`, the compiler resolves module-level names, and calls of the module's struct and keyword procedures. If the form defines a procedure that has an inline template, the template is returned with the thunk.
 pub(crate) fn compile_in<'gc>(
     mc: &Mutation<'gc>,
     module: Option<Gc<'gc, Module>>,
@@ -370,7 +376,7 @@ pub(crate) fn compile_in<'gc>(
     let mut inline = None;
     let mut names = ir::Origins::default();
     let slots = module.and_then(|module| AnyVector::of(module.names(mc)));
-    let mut l5 = to_l5(mc, &arena, core, &mut names, &|slot| slots?.get(mc, slot as usize), unit, &mut inline)?;
+    let mut l5 = to_l5(mc, &arena, core, &mut names, slots, unit, &mut inline)?;
     merge::merge(mc, &mut l5);
     #[cfg(debug_assertions)]
     l5::check(&l5);
@@ -383,13 +389,13 @@ fn to_l5<'a, 'gc>(
     arena: &'a Arena,
     core: &Core<'gc>,
     names: &mut ir::Origins<'gc>,
-    slot_name: &dyn Fn(u32) -> Option<Value<'gc>>,
+    slot_names: Option<AnyVector<'gc>>,
     unit: Option<&module::Unit<'_, 'gc>>,
     inline: &mut Option<module::Inline>,
 ) -> Result<l5::Program<'a, 'gc>, CompileError> {
     // Each intermediate IR table is deallocated as soon as the subsequent pass completes.
     ir::l1::scope(|mut l1| {
-        let (root, supply) = lower::lower(mc, &mut l1, core, names, slot_name, unit)?;
+        let (root, supply) = lower::lower(mc, &mut l1, core, names, slot_names, unit)?;
         if let Some(fun) = unit.and_then(|unit| unit.defining()).and_then(|slot| lower::defined(&l1, root, slot)) {
             *inline = module::Inline::of_function(mc, &l1, &names.sites, fun, names.get(l1[fun].id).at);
         }

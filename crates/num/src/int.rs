@@ -202,8 +202,8 @@ pub fn from_i128<H: Host>(h: &H, n: i128) -> Res<H> {
     {
         return Ok(x);
     }
-    let m = n.unsigned_abs();
-    from_digits(h, n < 0, Digits::of_mut(&mut [m as Digit, (m >> DIGIT_BITS) as Digit]))
+    let magnitude = n.unsigned_abs();
+    from_digits(h, n < 0, Digits::of_mut(&mut [magnitude as Digit, (magnitude >> DIGIT_BITS) as Digit]))
 }
 
 pub fn to_u64<H: Host>(h: &H, x: H::Int) -> Option<u64> {
@@ -221,15 +221,15 @@ pub fn to_i64<H: Host>(h: &H, x: H::Int) -> Option<i64> {
 }
 
 /// An integral, finite double, exactly.
-pub fn from_integral_f64<H: Host>(h: &H, f: f64) -> Res<H> {
-    debug_assert!(f.is_finite() && f.fract() == 0.0, "{f} isn't an integer");
-    if f.abs() < -(i64::MIN as f64) {
-        return from_i64(h, f as i64);
+pub fn from_integral_f64<H: Host>(h: &H, value: f64) -> Res<H> {
+    debug_assert!(value.is_finite() && value.fract() == 0.0, "{value} isn't an integer");
+    if value.abs() < -(i64::MIN as f64) {
+        return from_i64(h, value as i64);
     }
-    let bits = f.to_bits();
+    let bits = value.to_bits();
     let mantissa = bits & ((1 << 52) - 1) | 1 << 52;
     let shift = ((bits >> 52) & 0x7ff) as usize - 1075;
-    make_long(h, f < 0.0, shift / DIGIT_BITS + 2, |z| bigint::left_shift(z, Digits::of_mut(&mut [mantissa]), shift))
+    make_long(h, value < 0.0, shift / DIGIT_BITS + 2, |z| bigint::left_shift(z, Digits::of_mut(&mut [mantissa]), shift))
 }
 
 /// The nearest double, ties to even.
@@ -237,8 +237,8 @@ pub fn to_f64<H: Host>(h: &H, x: H::Int) -> f64 {
     match h.view(x) {
         IntView::Small(n) => n as f64,
         IntView::Big { negative, digits } => {
-            let f = bigint::to_f64(digits);
-            if negative { -f } else { f }
+            let value = bigint::to_f64(digits);
+            if negative { -value } else { value }
         }
     }
 }
@@ -400,52 +400,52 @@ pub fn divide<H: Host>(
         (_, IntView::Small(0)) => return Err(NumError::DivideByZero.into()),
         (IntView::Small(a), IntView::Small(b)) => {
             let (a, b) = (a as i128, b as i128);
-            let (mut q, mut r) = (a / b, a % b);
-            if floor && r != 0 && (r < 0) != (b < 0) {
-                q -= 1;
-                r += b;
+            let (mut quotient, mut remainder) = (a / b, a % b);
+            if floor && remainder != 0 && (remainder < 0) != (b < 0) {
+                quotient -= 1;
+                remainder += b;
             }
-            let q = want_q.then(|| from_i128(h, q)).transpose()?;
-            return Ok((q, want_r.then(|| from_i128(h, r)).transpose()?));
+            let quotient = want_q.then(|| from_i128(h, quotient)).transpose()?;
+            return Ok((quotient, want_r.then(|| from_i128(h, remainder)).transpose()?));
         }
         (xv, yv) => (Signed::new(xv, &mut bx), Signed::new(yv, &mut by)),
     };
     let (xd, yd) = (xs.digits, ys.digits);
     let q_negative = xs.negative != ys.negative;
     // Flooring with a nonzero remainder and differing signs takes one off the truncated
-    // quotient and turns the remainder into `y - r`.
+    // quotient and turns the remainder into `y - remainder`.
     let adjust = floor && q_negative;
     h.charge((xd.len().saturating_sub(yd.len()) as u64 + 1) * yd.len() as u64)?;
 
     if bigint::compare(xd, yd) == Ordering::Less {
-        let (q, r) = if !adjust || xd.is_zero() {
+        let (quotient, remainder) = if !adjust || xd.is_zero() {
             (from_i64(h, 0)?, x)
         } else {
             (from_i64(h, -1)?, make(h, ys.negative, yd.len(), |z| bigint::subtract(z, yd, xd))?)
         };
-        return Ok((want_q.then_some(q), want_r.then_some(r)));
+        return Ok((want_q.then_some(quotient), want_r.then_some(remainder)));
     }
 
     if yd.len() == 1 {
-        let d = yd.at(0);
+        let divisor = yd.at(0);
         let mut rem = 0;
-        let q = if want_q {
+        let quotient = if want_q {
             Some(make(h, q_negative, xd.len(), |mut z| {
-                rem = bigint::divide_single(Some(z.reborrow()), xd, d);
+                rem = bigint::divide_single(Some(z.reborrow()), xd, divisor);
                 if adjust && rem != 0 {
                     bigint::add_digit(z, 1);
                 }
             })?)
         } else {
-            rem = bigint::divide_single(None, xd, d);
+            rem = bigint::divide_single(None, xd, divisor);
             None
         };
-        let r = match (want_r, adjust && rem != 0) {
+        let remainder = match (want_r, adjust && rem != 0) {
             (false, _) => None,
-            (true, true) => Some(from_digits(h, ys.negative, Digits::of_mut(&mut [d - rem]))?),
+            (true, true) => Some(from_digits(h, ys.negative, Digits::of_mut(&mut [divisor - rem]))?),
             (true, false) => Some(from_digits(h, xs.negative, Digits::of_mut(&mut [rem]))?),
         };
-        return Ok((q, r));
+        return Ok((quotient, remainder));
     }
 
     // One more quotient digit than division needs, for the carry of adjusting it.
@@ -453,25 +453,25 @@ pub fn divide<H: Host>(
     let len = q_len + r_len + bigint::divide_scratch(xd, yd);
     h.scratch(len)?;
     let mut buf = vec![0; len];
-    let (q, rest) = buf.split_at_mut(q_len);
-    let (r, scratch) = rest.split_at_mut(r_len);
-    let q_out = want_q.then(|| RWDigits::new(&mut q[..q_len - 1]));
-    bigint::divide(q_out, Some(RWDigits::new(r)), xd, yd, RWDigits::new(scratch));
-    let adjust = adjust && !Digits::of_mut(r).is_zero();
-    let q = if want_q {
+    let (quotient_digits, rest) = buf.split_at_mut(q_len);
+    let (remainder_digits, scratch) = rest.split_at_mut(r_len);
+    let q_out = want_q.then(|| RWDigits::new(&mut quotient_digits[..q_len - 1]));
+    bigint::divide(q_out, Some(RWDigits::new(remainder_digits)), xd, yd, RWDigits::new(scratch));
+    let adjust = adjust && !Digits::of_mut(remainder_digits).is_zero();
+    let quotient = if want_q {
         if adjust {
-            bigint::add_digit(RWDigits::new(q), 1);
+            bigint::add_digit(RWDigits::new(quotient_digits), 1);
         }
-        Some(from_digits(h, q_negative, Digits::of_mut(q))?)
+        Some(from_digits(h, q_negative, Digits::of_mut(quotient_digits))?)
     } else {
         None
     };
-    let r = match (want_r, adjust) {
+    let remainder = match (want_r, adjust) {
         (false, _) => None,
-        (true, true) => Some(make(h, ys.negative, r_len, |z| bigint::subtract(z, yd, Digits::of_mut(r)))?),
-        (true, false) => Some(from_digits(h, xs.negative, Digits::of_mut(r))?),
+        (true, true) => Some(make(h, ys.negative, r_len, |z| bigint::subtract(z, yd, Digits::of_mut(remainder_digits)))?),
+        (true, false) => Some(from_digits(h, xs.negative, Digits::of_mut(remainder_digits))?),
     };
-    Ok((q, r))
+    Ok((quotient, remainder))
 }
 
 pub fn quotient<H: Host>(h: &H, x: H::Int, y: H::Int) -> Res<H> {
@@ -487,8 +487,8 @@ pub fn modulo<H: Host>(h: &H, x: H::Int, y: H::Int) -> Res<H> {
 }
 
 pub fn quotient_remainder<H: Host>(h: &H, x: H::Int, y: H::Int) -> Result<(H::Int, H::Int), H::Error> {
-    let (q, r) = divide(h, x, y, Rounding::Truncate, true, true)?;
-    Ok((q.expect("asked for the quotient"), r.expect("asked for the remainder")))
+    let (quotient, remainder) = divide(h, x, y, Rounding::Truncate, true, true)?;
+    Ok((quotient.expect("asked for the quotient"), remainder.expect("asked for the remainder")))
 }
 
 pub fn floor_quotient<H: Host>(h: &H, x: H::Int, y: H::Int) -> Res<H> {
@@ -527,7 +527,7 @@ pub fn gcd<H: Host>(h: &H, x: H::Int, y: H::Int) -> Res<H> {
     // Euclid's algorithm, rotating three buffers: a, b, then a mod b.
     let len = x.len() + 1;
     h.scratch(3 * len + bigint::divide_scratch(x, y))?;
-    let (mut a, mut b, mut r) = (x.iter().collect::<Vec<_>>(), y.iter().collect::<Vec<_>>(), vec![0; len]);
+    let (mut a, mut b, mut remainder) = (x.iter().collect::<Vec<_>>(), y.iter().collect::<Vec<_>>(), vec![0; len]);
     let mut scratch = vec![0; bigint::divide_scratch(x, y)];
     loop {
         let (ad, bd) = (Digits::of_mut(&mut a).normalize(), Digits::of_mut(&mut b).normalize());
@@ -539,10 +539,10 @@ pub fn gcd<H: Host>(h: &H, x: H::Int, y: H::Int) -> Res<H> {
         }
         h.charge(bigint::divide_cost(ad, bd))?;
         let bn = bd.len();
-        bigint::divide(None, Some(RWDigits::new(&mut r[..bn])), ad, bd, RWDigits::new(&mut scratch));
-        r[bn..].fill(0);
+        bigint::divide(None, Some(RWDigits::new(&mut remainder[..bn])), ad, bd, RWDigits::new(&mut scratch));
+        remainder[bn..].fill(0);
         std::mem::swap(&mut a, &mut b);
-        std::mem::swap(&mut b, &mut r);
+        std::mem::swap(&mut b, &mut remainder);
     }
 }
 
@@ -551,8 +551,8 @@ pub fn lcm<H: Host>(h: &H, x: H::Int, y: H::Int) -> Res<H> {
     if sign(h, x) == Ordering::Equal || sign(h, y) == Ordering::Equal {
         return from_i64(h, 0);
     }
-    let g = gcd(h, x, y)?;
-    let x = quotient(h, x, g)?;
+    let divisor = gcd(h, x, y)?;
+    let x = quotient(h, x, divisor)?;
     abs(h, mul(h, x, y)?)
 }
 
@@ -594,7 +594,7 @@ fn bitwise<H: Host>(h: &H, x: H::Int, y: H::Int, op: Bitwise) -> Res<H> {
     h.charge(xd.len().max(yd.len()) as u64)?;
     type Op = fn(RWDigits<'_>, Digits<'_>, Digits<'_>);
     type Len = fn(Digits<'_>, Digits<'_>) -> usize;
-    let (f, len, negative): (Op, Len, bool) = match (op, x.negative, y.negative) {
+    let (function, len, negative): (Op, Len, bool) = match (op, x.negative, y.negative) {
         (Bitwise::And, false, false) => (bigint::and_pos_pos, bigint::and_pos_pos_len, false),
         (Bitwise::And, false, true) => (bigint::and_pos_neg, bigint::and_pos_neg_len, false),
         (Bitwise::And, _, _) => (bigint::and_neg_neg, bigint::and_neg_neg_len, true),
@@ -605,7 +605,7 @@ fn bitwise<H: Host>(h: &H, x: H::Int, y: H::Int, op: Bitwise) -> Res<H> {
         (Bitwise::Xor, false, true) => (bigint::xor_pos_neg, bigint::xor_pos_neg_len, true),
         (Bitwise::Xor, _, _) => (bigint::xor_neg_neg, bigint::xor_neg_neg_len, false),
     };
-    make(h, negative, len(xd, yd), |z| f(z, xd, yd))
+    make(h, negative, len(xd, yd), |z| function(z, xd, yd))
 }
 
 /// `-x - 1`
@@ -665,7 +665,7 @@ pub fn integer_length<H: Host>(h: &H, x: H::Int) -> u64 {
 
 /// The bits set in `x` if it isn't negative, or else those clear.
 pub fn bit_count<H: Host>(h: &H, x: H::Int) -> Result<u64, H::Error> {
-    let ones = |d: Digits<'_>| d.iter().map(|d| u64::from(d.count_ones())).sum::<u64>();
+    let ones = |digits: Digits<'_>| digits.iter().map(|digit| u64::from(digit.count_ones())).sum::<u64>();
     Ok(match h.view(x) {
         IntView::Small(n) => u64::from(if n < 0 { !n } else { n }.count_ones()),
         IntView::Big { negative, digits } => {
@@ -717,11 +717,11 @@ pub fn bit_field<H: Host>(h: &H, x: H::Int, start: u64, end: u64) -> Res<H> {
 /// `dest` with bits `start..end` replaced by the low bits of `source`. `start` is at most `end`.
 pub fn bit_field_replace<H: Host>(h: &H, dest: H::Int, source: H::Int, start: u64, end: u64) -> Res<H> {
     let width = end - start;
-    if let (IntView::Small(d), IntView::Small(s)) = (h.view(dest), h.view(source))
+    if let (IntView::Small(small_dest), IntView::Small(small_source)) = (h.view(dest), h.view(source))
         && end < 63
     {
         let low = (1 << width) - 1;
-        return from_i64(h, d & !(low << start) | (s & low) << start);
+        return from_i64(h, small_dest & !(low << start) | (small_source & low) << start);
     }
     // Made of the bits under `start` and over `end`, it takes no mask wider than the result.
     let low = bit_field(h, dest, 0, start)?;
@@ -743,28 +743,28 @@ fn shift_count(bits: u64) -> i64 {
 
 /// The zeros under the lowest one of a magnitude that isn't zero.
 fn trailing_zeros(digits: Digits<'_>) -> u64 {
-    let zeros = digits.iter().take_while(|&d| d == 0).count();
+    let zeros = digits.iter().take_while(|&digit| digit == 0).count();
     (zeros * DIGIT_BITS) as u64 + u64::from(digits.get(zeros).trailing_zeros())
 }
 
 /// The host's error for an integer larger than any memory holds.
 pub(crate) fn too_big<H: Host>(h: &H) -> H::Error {
     match h.big(false, usize::MAX, |_| 0) {
-        Err(e) => e,
+        Err(error) => error,
         Ok(_) => panic!("the host made an integer of usize::MAX digits"),
     }
 }
 
-/// `x^e`, by squaring.
-pub fn expt<H: Host>(h: &H, x: H::Int, mut e: u64) -> Res<H> {
+/// `x^exponent`, by squaring.
+pub fn expt<H: Host>(h: &H, x: H::Int, mut exponent: u64) -> Res<H> {
     let mut result = from_i64(h, 1)?;
     let mut base = x;
-    while e != 0 {
-        if e & 1 == 1 {
+    while exponent != 0 {
+        if exponent & 1 == 1 {
             result = mul(h, result, base)?;
         }
-        e >>= 1;
-        if e != 0 {
+        exponent >>= 1;
+        if exponent != 0 {
             base = mul(h, base, base)?;
         }
     }
@@ -777,26 +777,26 @@ pub fn isqrt<H: Host>(h: &H, x: H::Int) -> Res<H> {
     if let Some(n) = to_i64(h, x) {
         let n = n as u64;
         // The double's root can be off by one either way.
-        let mut s = (n as f64).sqrt() as u64;
-        while s * s > n {
-            s -= 1;
+        let mut root = (n as f64).sqrt() as u64;
+        while root * root > n {
+            root -= 1;
         }
-        while (s + 1) * (s + 1) <= n {
-            s += 1;
+        while (root + 1) * (root + 1) <= n {
+            root += 1;
         }
-        return from_u64(h, s);
+        return from_u64(h, root);
     }
     // Newton's method from above falls to the root and then stops falling. It starts a little
     // above the root of the top hundred-odd bits, which the double gets to within 2^-50.
     let shift = (integer_length(h, x).saturating_sub(100) / 2) as i64;
     let top = to_f64(h, arithmetic_shift(h, x, -2 * shift)?);
-    let mut s = arithmetic_shift(h, from_u64(h, top.sqrt() as u64 + 2)?, shift)?;
+    let mut root = arithmetic_shift(h, from_u64(h, top.sqrt() as u64 + 2)?, shift)?;
     loop {
-        let t = arithmetic_shift(h, add(h, s, quotient(h, x, s)?)?, -1)?;
-        if compare(h, t, s) != Ordering::Less {
-            return Ok(s);
+        let next = arithmetic_shift(h, add(h, root, quotient(h, x, root)?)?, -1)?;
+        if compare(h, next, root) != Ordering::Less {
+            return Ok(root);
         }
-        s = t;
+        root = next;
     }
 }
 
@@ -804,7 +804,7 @@ pub fn isqrt<H: Host>(h: &H, x: H::Int) -> Res<H> {
 /// that isn't a digit in the radix.
 pub fn parse<H: Host>(h: &H, text: &[u8], radix: u32, negative: bool) -> Result<Option<H::Int>, H::Error> {
     assert!((2..=36).contains(&radix), "radix out of range");
-    if text.is_empty() || !text.iter().all(|&c| (c as char).is_digit(radix)) {
+    if text.is_empty() || !text.iter().all(|&byte| (byte as char).is_digit(radix)) {
         return Ok(None);
     }
     let len = bigint::from_string_len(text.len(), radix);

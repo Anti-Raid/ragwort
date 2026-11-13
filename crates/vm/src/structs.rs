@@ -75,14 +75,14 @@ pub fn type_flags<'gc>(mc: &Mutation<'gc>, kind: Gc<'gc, StructType>) -> TypeFla
     TypeFlags::from_bits_truncate(kind.flags(mc))
 }
 
-/// Returns the [`FieldFlags`] for field index `k` of `kind`, or empty flags if index `k` is out of bounds.
-pub fn field_flags<'gc>(mc: &Mutation<'gc>, kind: Gc<'gc, StructType>, k: usize) -> FieldFlags {
-    flags_at(mc, kind.field_flags(mc), k)
+/// Returns the [`FieldFlags`] for field index `index` of `kind`, or empty flags if index `index` is out of bounds.
+pub fn field_flags<'gc>(mc: &Mutation<'gc>, kind: Gc<'gc, StructType>, index: usize) -> FieldFlags {
+    flags_at(mc, kind.field_flags(mc), index)
 }
 
-/// Returns the [`FieldFlags`] at byte index `k` within a type's field flags bytevector.
-fn flags_at<'gc>(mc: &Mutation<'gc>, bytes: Value<'gc>, k: usize) -> FieldFlags {
-    FieldFlags::from_bits_truncate(AnyBytevector::of(bytes).and_then(|flags| flags.get(mc, k)).unwrap_or(0))
+/// Returns the [`FieldFlags`] at byte index `index` within a type's field flags bytevector.
+fn flags_at<'gc>(mc: &Mutation<'gc>, bytes: Value<'gc>, index: usize) -> FieldFlags {
+    FieldFlags::from_bits_truncate(AnyBytevector::of(bytes).and_then(|flags| flags.get(mc, index)).unwrap_or(0))
 }
 
 /// Builds the complete field layout for a struct type, returning a tuple containing an immutable vector
@@ -147,37 +147,37 @@ pub fn make_type<'gc>(
     Ok(kind)
 }
 
-/// Returns `true` if field index `k` of struct type `kind` is mutable.
-pub fn is_mutable<'gc>(mc: &Mutation<'gc>, kind: Gc<'gc, StructType>, k: usize) -> bool {
-    field_flags(mc, kind, k).contains(FieldFlags::MUTABLE)
+/// Returns `true` if field index `index` of struct type `kind` is mutable.
+pub fn is_mutable<'gc>(mc: &Mutation<'gc>, kind: Gc<'gc, StructType>, index: usize) -> bool {
+    field_flags(mc, kind, index).contains(FieldFlags::MUTABLE)
 }
 
-/// Reads field index `k` from struct instance `s`, validating that `s` is an instance of `kind`
-/// and that `k` is a valid field index for `kind` (implements runtime `struct-ref`).
+/// Reads field index `index` from struct instance `value`, validating that `value` is an instance of `kind`
+/// and that `index` is a valid field index for `kind` (implements runtime `struct-ref`).
 #[inline]
-pub fn field_of<'gc>(mc: &Mutation<'gc>, s: Value<'gc>, kind: Value<'gc>, k: usize) -> Result<Value<'gc>, Fault> {
+pub fn field_of<'gc>(mc: &Mutation<'gc>, value: Value<'gc>, kind: Value<'gc>, index: usize) -> Result<Value<'gc>, Fault> {
     let kind = type_of(mc, kind)?;
-    let fields = of(mc, s, kind).ok_or(Fault::WrongType)?.items(mc);
+    let fields = of(mc, value, kind).ok_or(Fault::WrongType)?.items(mc);
     // Any valid instance of `kind` has at least as many fields as defined by `kind`.
-    if k >= kind.fields(mc) as usize {
+    if index >= kind.fields(mc) as usize {
         return Err(Fault::OutOfRange);
     }
-    Ok(fields.get(k))
+    Ok(fields.get(index))
 }
 
-/// Accesses field index `k` from struct instance `s` without checking its struct type (implements runtime `struct-field`).
+/// Accesses field index `index` from struct instance `value` without checking its struct type (implements runtime `struct-field`).
 #[inline]
-pub fn field<'gc>(mc: &Mutation<'gc>, s: Value<'gc>, k: usize) -> Result<Value<'gc>, Fault> {
-    let fields = s.downcast::<Struct>(mc).ok_or(Fault::WrongType)?.items(mc);
-    if k >= fields.len() {
+pub fn field<'gc>(mc: &Mutation<'gc>, value: Value<'gc>, index: usize) -> Result<Value<'gc>, Fault> {
+    let fields = value.downcast::<Struct>(mc).ok_or(Fault::WrongType)?.items(mc);
+    if index >= fields.len() {
         return Err(Fault::OutOfRange);
     }
-    Ok(fields.get(k))
+    Ok(fields.get(index))
 }
 
-/// Downcasts `v` to a struct type descriptor (`Gc<StructType>`), returning `Fault::WrongType` if `v` is not one.
-pub fn type_of<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> Result<Gc<'gc, StructType>, Fault> {
-    v.downcast::<StructType>(mc).ok_or(Fault::WrongType)
+/// Downcasts `value` to a struct type descriptor (`Gc<StructType>`), returning `Fault::WrongType` if `value` is not one.
+pub fn type_of<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Result<Gc<'gc, StructType>, Fault> {
+    value.downcast::<StructType>(mc).ok_or(Fault::WrongType)
 }
 
 /// Instantiates a struct instance of type `kind`, initializing its fields from the `fields` iterator.
@@ -203,9 +203,9 @@ pub fn derives<'gc>(mc: &Mutation<'gc>, kind: Gc<'gc, StructType>, from: Gc<'gc,
     depth < supertypes.len() && supertypes.get(depth) == Value::object(mc, from)
 }
 
-/// Downcasts `v` to a struct instance (`Gc<Struct>`) if `v` is an instance of `kind` or any of its subtypes; otherwise returns `None`.
+/// Downcasts `value` to a struct instance (`Gc<Struct>`) if `value` is an instance of `kind` or any of its subtypes; otherwise returns `None`.
 #[inline]
-pub fn of<'gc>(mc: &Mutation<'gc>, v: Value<'gc>, kind: Gc<'gc, StructType>) -> Option<Gc<'gc, Struct>> {
-    let made = v.downcast::<Struct>(mc)?;
+pub fn of<'gc>(mc: &Mutation<'gc>, value: Value<'gc>, kind: Gc<'gc, StructType>) -> Option<Gc<'gc, Struct>> {
+    let made = value.downcast::<Struct>(mc)?;
     derives(mc, made.kind(mc)?, kind).then_some(made)
 }

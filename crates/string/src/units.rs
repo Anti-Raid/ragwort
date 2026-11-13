@@ -19,8 +19,8 @@ pub enum Width {
 }
 
 impl Width {
-    pub const fn of(c: char) -> Self {
-        Self::of_code(c as u32)
+    pub const fn of(character: char) -> Self {
+        Self::of_code(character as u32)
     }
 
     const fn of_code(code: u32) -> Self {
@@ -158,15 +158,15 @@ impl<'a> Packed<'a> {
         Self { words, len: range.len(), skip: (start & ((1 << log) - 1)) as u8, width: self.width }
     }
 
-    /// Calls `f` with each unit's code, in order.
+    /// Calls `visit` with each unit's code, in order.
     #[inline]
-    fn each_code(self, mut f: impl FnMut(u32)) {
+    fn each_code(self, mut visit: impl FnMut(u32)) {
         let (log, bits, mask) = (self.width.per_word_log(), self.width.bits(), self.width.mask());
         let (mut i, end) = (self.skip as usize, self.skip as usize + self.len);
-        for w in &self.words[..end.div_ceil(1 << log)] {
-            let (w, stop) = (w.get(), end.min((i | ((1 << log) - 1)) + 1));
+        for cell in &self.words[..end.div_ceil(1 << log)] {
+            let (word, stop) = (cell.get(), end.min((i | ((1 << log) - 1)) + 1));
             while i < stop {
-                f(((w >> ((i & ((1 << log) - 1)) as u32 * bits)) & mask) as u32);
+                visit(((word >> ((i & ((1 << log) - 1)) as u32 * bits)) & mask) as u32);
                 i += 1;
             }
         }
@@ -182,35 +182,35 @@ impl<'a> Packed<'a> {
     pub(crate) fn copy_bytes(self, from: usize, out: &mut [u8]) {
         let at = self.byte_start() + from * self.width.bytes();
         let (whole, tail) = out.as_chunks_mut::<8>();
-        for (k, chunk) in whole.iter_mut().enumerate() {
-            *chunk = read_bytes(self.words, at + 8 * k, 8).to_le_bytes();
+        for (index, chunk) in whole.iter_mut().enumerate() {
+            *chunk = read_bytes(self.words, at + 8 * index, 8).to_le_bytes();
         }
         if !tail.is_empty() {
-            let v = read_bytes(self.words, at + 8 * whole.len(), tail.len());
-            for (i, b) in tail.iter_mut().enumerate() {
-                *b = (v >> (8 * i)) as u8;
+            let value = read_bytes(self.words, at + 8 * whole.len(), tail.len());
+            for (i, byte) in tail.iter_mut().enumerate() {
+                *byte = (value >> (8 * i)) as u8;
             }
         }
     }
 
     /// Whether these are one-byte units, all of them ASCII.
     pub(crate) fn is_ascii(self) -> bool {
-        self.width == Width::One && self.byte_words().fold(0, |seen, w| seen | w) & HIGH == 0
+        self.width == Width::One && self.byte_words().fold(0, |seen, word| seen | word) & HIGH == 0
     }
 
     /// The units' bytes, eight to a word, the last word holding what's left.
     #[inline]
     pub(crate) fn byte_words(self) -> impl Iterator<Item = u64> + Clone + 'a {
         let n = self.len * self.width.bytes();
-        (0..n.div_ceil(8)).map(move |k| self.word_at(k, (n - 8 * k).min(8)))
+        (0..n.div_ceil(8)).map(move |index| self.word_at(index, (n - 8 * index).min(8)))
     }
 
-    /// The `k`th 8 bytes of the units' bytes, or the `n` there are if fewer.
+    /// The `index`th 8 bytes of the units' bytes, or the `n` there are if fewer.
     #[inline]
-    pub(crate) fn word_at(self, k: usize, n: usize) -> u64 {
+    pub(crate) fn word_at(self, index: usize, n: usize) -> u64 {
         match self.skip {
-            0 if n == 8 => self.words[k].get(),
-            _ => read_bytes(self.words, self.byte_start() + 8 * k, n),
+            0 if n == 8 => self.words[index].get(),
+            _ => read_bytes(self.words, self.byte_start() + 8 * index, n),
         }
     }
 
@@ -245,8 +245,8 @@ impl<'a> Packed<'a> {
         }
         let (a, b) = (self.byte_start(), other.byte_start());
         (0..bytes).step_by(8).all(|at| {
-            let k = (bytes - at).min(8);
-            read_bytes(self.words, a + at, k) == read_bytes(other.words, b + at, k)
+            let count = (bytes - at).min(8);
+            read_bytes(self.words, a + at, count) == read_bytes(other.words, b + at, count)
         })
     }
 
@@ -263,18 +263,18 @@ impl<'a> Packed<'a> {
         let Some(words) = self.words.get(..chunks.len() + !tail.is_empty() as usize) else { return false };
         // Differences and high bits gather, so there's one branch whatever the length.
         let (mut diff, mut seen) = (0, 0);
-        for (w, c) in words.iter().zip(chunks) {
-            let c = u64::from_le_bytes(*c);
-            diff |= w.get() ^ c;
-            seen |= c;
+        for (cell, chunk) in words.iter().zip(chunks) {
+            let chunk = u64::from_le_bytes(*chunk);
+            diff |= cell.get() ^ chunk;
+            seen |= chunk;
         }
         if let Some(last) = words.get(chunks.len()) {
-            let c = match bytes.last_chunk::<8>() {
+            let tail_word = match bytes.last_chunk::<8>() {
                 Some(end) => u64::from_le_bytes(*end) >> (64 - 8 * tail.len()),
                 None => u8::pack(tail),
             };
-            diff |= (last.get() ^ c) & low_bytes(tail.len());
-            seen |= c;
+            diff |= (last.get() ^ tail_word) & low_bytes(tail.len());
+            seen |= tail_word;
         }
         diff | seen & HIGH == 0
     }
@@ -284,7 +284,7 @@ impl<'a> Packed<'a> {
         let at = self.byte_start();
         self.width == Width::One
             && self.len == bytes.len()
-            && bytes.chunks(8).enumerate().all(|(k, b)| read_bytes(self.words, at + 8 * k, b.len()) == u8::pack(b))
+            && bytes.chunks(8).enumerate().all(|(index, chunk)| read_bytes(self.words, at + 8 * index, chunk.len()) == u8::pack(chunk))
     }
 }
 
@@ -338,8 +338,8 @@ impl Inline {
     #[inline]
     pub(crate) fn equal_ascii(self, bytes: &[u8]) -> bool {
         self.len() == bytes.len() && {
-            let w = u8::pack(bytes);
-            w == self.word && w & HIGH == 0
+            let word = u8::pack(bytes);
+            word == self.word && word & HIGH == 0
         }
     }
 
@@ -362,8 +362,8 @@ impl<'a> PackedMut<'a> {
         assert!(i < self.len, "unit {i} past the end");
         let log = self.width.per_word_log();
         let shift = (i & ((1 << log) - 1)) as u32 * self.width.bits();
-        let w = &self.words[i >> log];
-        w.set(w.get() & !(self.width.mask() << shift) | (code as u64 & self.width.mask()) << shift);
+        let cell = &self.words[i >> log];
+        cell.set(cell.get() & !(self.width.mask() << shift) | (code as u64 & self.width.mask()) << shift);
     }
 
     /// Writes `src` from `at`, each character converted to this width, which must hold them.
@@ -371,17 +371,17 @@ impl<'a> PackedMut<'a> {
         assert!(at + src.len() <= self.len, "writing past the end");
         let wb = self.width.bytes();
         match src {
-            Units::Packed(s) if s.width == self.width => {
-                let from = s.byte_start();
-                self.copy(at * wb, s.len() * wb, |i, k| read_bytes(s.words, from + i, k));
+            Units::Packed(packed) if packed.width == self.width => {
+                let from = packed.byte_start();
+                self.copy(at * wb, packed.len() * wb, |i, count| read_bytes(packed.words, from + i, count));
             }
-            Units::One(s) if self.width == Width::One => self.copy(at, s.len(), |i, k| u8::pack(&s[i..i + k])),
-            Units::One(s) => self.widen(at, s.len(), |i| s[i] as u32),
-            Units::Two(s) => self.widen(at, s.len(), |i| s[i] as u32),
-            Units::Four(s) => self.widen(at, s.len(), |i| s[i]),
-            Units::Packed(s) => self.widen(at, s.len, |i| s.code(i)),
-            Units::Inline(s) if self.width == Width::One => self.copy(at, s.len(), |i, k| s.word >> (8 * i) & low_bytes(k)),
-            Units::Inline(s) => self.widen(at, s.len(), |i| s.code(i)),
+            Units::One(bytes) if self.width == Width::One => self.copy(at, bytes.len(), |i, count| u8::pack(&bytes[i..i + count])),
+            Units::One(bytes) => self.widen(at, bytes.len(), |i| bytes[i] as u32),
+            Units::Two(slice) => self.widen(at, slice.len(), |i| slice[i] as u32),
+            Units::Four(slice) => self.widen(at, slice.len(), |i| slice[i]),
+            Units::Packed(packed) => self.widen(at, packed.len, |i| packed.code(i)),
+            Units::Inline(inline) if self.width == Width::One => self.copy(at, inline.len(), |i, count| inline.word >> (8 * i) & low_bytes(count)),
+            Units::Inline(inline) => self.widen(at, inline.len(), |i| inline.code(i)),
         }
     }
 
@@ -389,29 +389,29 @@ impl<'a> PackedMut<'a> {
     #[inline]
     fn widen(&self, at: usize, n: usize, unit: impl Fn(usize) -> u32) {
         let (log, bits, mask) = (self.width.per_word_log(), self.width.bits(), self.width.mask());
-        let (end, mut d, mut i) = (at + n, at, 0);
-        while d < end {
-            let first = d & ((1 << log) - 1);
-            let k = ((1 << log) - first).min(end - d);
+        let (end, mut position, mut i) = (at + n, at, 0);
+        while position < end {
+            let first = position & ((1 << log) - 1);
+            let count = ((1 << log) - first).min(end - position);
             let mut word = 0;
-            for u in 0..k {
-                word |= (unit(i + u) as u64 & mask) << ((first + u) as u32 * bits);
+            for offset in 0..count {
+                word |= (unit(i + offset) as u64 & mask) << ((first + offset) as u32 * bits);
             }
-            let used = if k == 1 << log { u64::MAX } else { ((1u64 << (k as u32 * bits)) - 1) << (first as u32 * bits) };
-            let w = &self.words[d >> log];
-            w.set(w.get() & !used | word);
-            (d, i) = (d + k, i + k);
+            let used = if count == 1 << log { u64::MAX } else { ((1u64 << (count as u32 * bits)) - 1) << (first as u32 * bits) };
+            let cell = &self.words[position >> log];
+            cell.set(cell.get() & !used | word);
+            (position, i) = (position + count, i + count);
         }
     }
 
-    /// Writes `n` bytes from byte `to`, which `read(i, k)` gives `k` at a time from the `i`th.
+    /// Writes `n` bytes from byte `to`, which `read(i, count)` gives `count` at a time from the `i`th.
     #[inline]
     fn copy(&self, to: usize, n: usize, read: impl Fn(usize, usize) -> u64) {
         let mut i = 0;
         while i < n {
-            let k = (8 - (to + i) % 8).min(n - i);
-            write_bytes(self.words, to + i, k, read(i, k));
-            i += k;
+            let count = (8 - (to + i) % 8).min(n - i);
+            write_bytes(self.words, to + i, count, read(i, count));
+            i += count;
         }
     }
 }
@@ -449,7 +449,7 @@ pub(crate) trait Unit: Copy + Ord {
     /// Up to `64 / BITS` units, the first lowest.
     #[inline]
     fn pack(units: &[Self]) -> u64 {
-        units.iter().rev().fold(0, |w, u| w << Self::BITS | u.code() as u64)
+        units.iter().rev().fold(0, |word, unit| word << Self::BITS | unit.code() as u64)
     }
 }
 
@@ -502,25 +502,25 @@ fn to_char(code: u32) -> char {
 }
 
 fn widest<U: Unit>(units: &[U]) -> u32 {
-    units.iter().fold(0, |m, u| m.max(u.code()))
+    units.iter().fold(0, |most, unit| most.max(unit.code()))
 }
 
 impl<'a> Units<'a> {
-    /// The `k`th eight of these one-byte units in a little-endian word, or the ones left.
+    /// The `index`th eight of these one-byte units in a little-endian word, or the ones left.
     #[inline]
-    pub(crate) fn byte_chunk(self, k: usize) -> u64 {
-        let n = (self.len() - 8 * k).min(8);
+    pub(crate) fn byte_chunk(self, index: usize) -> u64 {
+        let n = (self.len() - 8 * index).min(8);
         match self {
-            Units::Inline(s) => s.word,
-            Units::Packed(p) if p.width == Width::One => p.word_at(k, n),
-            Units::One(b) => u8::pack(&b[8 * k..8 * k + n]),
+            Units::Inline(inline) => inline.word,
+            Units::Packed(packed) if packed.width == Width::One => packed.word_at(index, n),
+            Units::One(bytes) => u8::pack(&bytes[8 * index..8 * index + n]),
             _ => panic!("reading bytes of wider units"),
         }
     }
 
     #[inline]
     pub fn len(self) -> usize {
-        each!(self, s => s.len(), p => p.len())
+        each!(self, slice => slice.len(), packed => packed.len())
     }
 
     #[inline]
@@ -534,7 +534,7 @@ impl<'a> Units<'a> {
             Self::One(_) => Width::One,
             Self::Two(_) => Width::Two,
             Self::Four(_) => Width::Four,
-            Self::Packed(p) => p.width,
+            Self::Packed(packed) => packed.width,
             Self::Inline(_) => Width::One,
         }
     }
@@ -542,11 +542,11 @@ impl<'a> Units<'a> {
     #[inline]
     pub fn get(self, i: usize) -> Option<char> {
         match self {
-            Self::One(s) => s.get(i).map(|&b| char::from(b)),
-            Self::Two(s) => s.get(i).map(|&u| to_char(u as u32)),
-            Self::Four(s) => s.get(i).map(|&u| to_char(u)),
-            Self::Packed(p) => (i < p.len()).then(|| to_char(p.code(i))),
-            Self::Inline(p) => (i < p.len()).then(|| char::from(p.byte(i))),
+            Self::One(bytes) => bytes.get(i).map(|&byte| char::from(byte)),
+            Self::Two(slice) => slice.get(i).map(|&unit| to_char(unit as u32)),
+            Self::Four(slice) => slice.get(i).map(|&unit| to_char(unit)),
+            Self::Packed(packed) => (i < packed.len()).then(|| to_char(packed.code(i))),
+            Self::Inline(inline) => (i < inline.len()).then(|| char::from(inline.byte(i))),
         }
     }
 
@@ -555,11 +555,11 @@ impl<'a> Units<'a> {
     #[inline(always)]
     pub fn slice(self, range: Range<usize>) -> Self {
         match self {
-            Self::One(s) => Self::One(&s[range]),
-            Self::Two(s) => Self::Two(&s[range]),
-            Self::Four(s) => Self::Four(&s[range]),
-            Self::Packed(p) => Self::Packed(p.slice(range)),
-            Self::Inline(p) => Self::Inline(p.slice(range)),
+            Self::One(slice) => Self::One(&slice[range]),
+            Self::Two(slice) => Self::Two(&slice[range]),
+            Self::Four(slice) => Self::Four(&slice[range]),
+            Self::Packed(packed) => Self::Packed(packed.slice(range)),
+            Self::Inline(inline) => Self::Inline(inline.slice(range)),
         }
     }
 
@@ -571,9 +571,9 @@ impl<'a> Units<'a> {
         'a: 'b,
     {
         match self {
-            Self::Inline(p) => {
-                cell.set(p.word);
-                Units::Packed(Packed::new(std::slice::from_ref(cell), p.len(), Width::One))
+            Self::Inline(inline) => {
+                cell.set(inline.word);
+                Units::Packed(Packed::new(std::slice::from_ref(cell), inline.len(), Width::One))
             }
             units => units,
         }
@@ -585,11 +585,11 @@ impl<'a> Units<'a> {
 
     /// The characters, read a word at a time if they're packed.
     #[inline]
-    pub(crate) fn each_char(self, mut f: impl FnMut(char)) {
+    pub(crate) fn each_char(self, mut visit: impl FnMut(char)) {
         match self {
-            Self::Packed(p) => p.each_code(|c| f(to_char(c))),
-            Self::Inline(p) => (0..p.len()).for_each(|i| f(char::from(p.byte(i)))),
-            _ => self.chars().for_each(f),
+            Self::Packed(packed) => packed.each_code(|code| visit(to_char(code))),
+            Self::Inline(inline) => (0..inline.len()).for_each(|i| visit(char::from(inline.byte(i)))),
+            _ => self.chars().for_each(visit),
         }
     }
 
@@ -597,26 +597,26 @@ impl<'a> Units<'a> {
     pub(crate) fn narrowest(self) -> Width {
         match self.width() {
             Width::One => Width::One,
-            _ => Width::of_code(each!(self, s => widest(s), p => (0..p.len()).map(|i| p.code(i)).max().unwrap_or(0))),
+            _ => Width::of_code(each!(self, slice => widest(slice), packed => (0..packed.len()).map(|i| packed.code(i)).max().unwrap_or(0))),
         }
     }
 
     #[inline]
     pub(crate) fn code(self, i: usize) -> u32 {
-        each!(self, s => s[i].code(), p => p.code(i))
+        each!(self, slice => slice[i].code(), packed => packed.code(i))
     }
 
     /// Orders two runs of the same length by code point.
     pub(crate) fn compare(self, other: Units<'_>) -> Ordering {
         debug_assert_eq!(self.len(), other.len());
-        let (x, y) = (Cell::new(0), Cell::new(0));
-        let (this, other) = (self.anchored(&x), other.anchored(&y));
+        let (this_cell, other_cell) = (Cell::new(0), Cell::new(0));
+        let (this, other) = (self.anchored(&this_cell), other.anchored(&other_cell));
         match (this, other) {
             (Units::One(a), Units::One(b)) => a.cmp(b),
             (Units::Two(a), Units::Two(b)) => a.cmp(b),
             (Units::Four(a), Units::Four(b)) => a.cmp(b),
-            (Units::Packed(a), Units::Packed(b)) if a.width == b.width => a.compare_by(b, |w| w),
-            _ => (0..this.len()).map(|i| this.code(i).cmp(&other.code(i))).find(|o| o.is_ne()).unwrap_or(Ordering::Equal),
+            (Units::Packed(a), Units::Packed(b)) if a.width == b.width => a.compare_by(b, |word| word),
+            _ => (0..this.len()).map(|i| this.code(i).cmp(&other.code(i))).find(|order| order.is_ne()).unwrap_or(Ordering::Equal),
         }
     }
 
@@ -626,8 +626,8 @@ impl<'a> Units<'a> {
         if let (Self::Inline(a), Units::Inline(b)) = (self, other) {
             return a == b;
         }
-        let (x, y) = (Cell::new(0), Cell::new(0));
-        match (self.anchored(&x), other.anchored(&y)) {
+        let (this_cell, other_cell) = (Cell::new(0), Cell::new(0));
+        match (self.anchored(&this_cell), other.anchored(&other_cell)) {
             (Units::One(a), Units::One(b)) if a.len() <= SHORT => {
                 a.len() == b.len() && fingerprint(a) == fingerprint(b)
             }
@@ -645,9 +645,9 @@ impl<'a> Units<'a> {
     /// UTF-8 bytes these characters take.
     pub(crate) fn utf8_len(self) -> usize {
         match self {
-            Self::One(s) => s.len() + s.iter().filter(|&&b| b >= 0x80).count(),
-            Self::Packed(p) if p.width == Width::One => p.len() + p.byte_words().map(|w| (w & HIGH).count_ones() as usize).sum::<usize>(),
-            Self::Inline(p) => p.len() + (p.word & HIGH).count_ones() as usize,
+            Self::One(bytes) => bytes.len() + bytes.iter().filter(|&&byte| byte >= 0x80).count(),
+            Self::Packed(packed) if packed.width == Width::One => packed.len() + packed.byte_words().map(|word| (word & HIGH).count_ones() as usize).sum::<usize>(),
+            Self::Inline(inline) => inline.len() + (inline.word & HIGH).count_ones() as usize,
             _ => self.chars().map(char::len_utf8).sum(),
         }
     }
@@ -671,24 +671,24 @@ impl<'o, 'a> RunWriter<'o, 'a> {
     #[inline]
     pub(crate) fn push(&mut self, run: Units<'_>) {
         let n = run.len();
-        let UnitsMut::Packed(p) = &*self.out else {
+        let UnitsMut::Packed(packed) = &*self.out else {
             self.out.write(self.at, run);
             self.at += n;
             return;
         };
-        if p.width != Width::One {
-            p.write(self.at, run);
+        if packed.width != Width::One {
+            packed.write(self.at, run);
             self.at += n;
             return;
         }
-        for k in 0..n.div_ceil(8) {
-            let (chunk, bits) = (run.byte_chunk(k), 8 * (n - 8 * k).min(8) as u32);
+        for index in 0..n.div_ceil(8) {
+            let (chunk, bits) = (run.byte_chunk(index), 8 * (n - 8 * index).min(8) as u32);
             self.word |= chunk << self.filled;
             if self.filled + bits < 64 {
                 self.filled += bits;
                 continue;
             }
-            p.words[self.at / 8].set(self.word);
+            packed.words[self.at / 8].set(self.word);
             self.at += 8;
             self.word = chunk.checked_shr(64 - self.filled).unwrap_or(0);
             self.filled = self.filled + bits - 64;
@@ -696,18 +696,18 @@ impl<'o, 'a> RunWriter<'o, 'a> {
     }
 
     pub(crate) fn finish(self) {
-        if let UnitsMut::Packed(p) = &*self.out
-            && p.width == Width::One
+        if let UnitsMut::Packed(packed) = &*self.out
+            && packed.width == Width::One
             && self.filled > 0
         {
-            p.words[self.at / 8].set(self.word);
+            packed.words[self.at / 8].set(self.word);
         }
     }
 }
 
 impl UnitsMut<'_> {
     pub fn len(&self) -> usize {
-        each_mut!(self, s => s.len(), p => p.len)
+        each_mut!(self, slice => slice.len(), packed => packed.len)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -718,8 +718,8 @@ impl UnitsMut<'_> {
     /// bytes dropped.
     pub(crate) fn write_words(&mut self, words: impl Iterator<Item = u64>) {
         match self {
-            UnitsMut::Packed(p) if p.width == Width::One => p.words.iter().zip(words).for_each(|(w, v)| w.set(v)),
-            UnitsMut::One(s) => s.chunks_mut(8).zip(words).for_each(|(chunk, v)| chunk.copy_from_slice(&v.to_le_bytes()[..chunk.len()])),
+            UnitsMut::Packed(packed) if packed.width == Width::One => packed.words.iter().zip(words).for_each(|(cell, word)| cell.set(word)),
+            UnitsMut::One(bytes) => bytes.chunks_mut(8).zip(words).for_each(|(chunk, word)| chunk.copy_from_slice(&word.to_le_bytes()[..chunk.len()])),
             _ => panic!("writing bytes to wider units"),
         }
     }
@@ -735,7 +735,7 @@ impl UnitsMut<'_> {
             UnitsMut::One(_) => Width::One,
             UnitsMut::Two(_) => Width::Two,
             UnitsMut::Four(_) => Width::Four,
-            UnitsMut::Packed(p) => p.width,
+            UnitsMut::Packed(packed) => packed.width,
         }
     }
 
@@ -743,19 +743,19 @@ impl UnitsMut<'_> {
     pub(crate) fn write(&mut self, at: usize, src: Units<'_>) {
         let end = at + src.len();
         match (self, src) {
-            (UnitsMut::One(d), Units::One(s)) => d[at..end].copy_from_slice(s),
-            (UnitsMut::Two(d), Units::Two(s)) => d[at..end].copy_from_slice(s),
-            (UnitsMut::Four(d), Units::Four(s)) => d[at..end].copy_from_slice(s),
-            (UnitsMut::Packed(d), s) => d.write(at, s),
-            (d, s) => (0..s.len()).for_each(|i| d.put(at + i, s.code(i))),
+            (UnitsMut::One(dest), Units::One(source)) => dest[at..end].copy_from_slice(source),
+            (UnitsMut::Two(dest), Units::Two(source)) => dest[at..end].copy_from_slice(source),
+            (UnitsMut::Four(dest), Units::Four(source)) => dest[at..end].copy_from_slice(source),
+            (UnitsMut::Packed(dest), source) => dest.write(at, source),
+            (dest, source) => (0..source.len()).for_each(|i| dest.put(at + i, source.code(i))),
         }
     }
 
     fn put(&mut self, i: usize, code: u32) {
-        each_mut!(self, s => s[i] = Unit::of(code), p => p.put(i, code));
+        each_mut!(self, slice => slice[i] = Unit::of(code), packed => packed.put(i, code));
     }
 
-    pub(crate) fn set(&mut self, i: usize, c: char) {
-        self.put(i, c as u32);
+    pub(crate) fn set(&mut self, i: usize, character: char) {
+        self.put(i, character as u32);
     }
 }

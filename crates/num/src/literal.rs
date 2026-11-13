@@ -41,15 +41,15 @@ pub fn parse_in<H: ComplexHost>(nums: &H, token: &str, radix: u32) -> Result<Opt
 fn complex_number<H: ComplexHost>(nums: &H, text: &str, radix: u32, exact: Option<bool>) -> Result<Option<H::Number>, H::Error> {
     let real = |text: &str| number(nums, text, radix, exact);
     if let Some((magnitude, angle)) = text.split_once('@') {
-        let (Some(m), Some(a)) = (real(magnitude)?, real(angle)?) else { return Ok(None) };
-        return Ok(Some(complex::polar(nums, m, a)?));
+        let (Some(modulus), Some(a)) = (real(magnitude)?, real(angle)?) else { return Ok(None) };
+        return Ok(Some(complex::polar(nums, modulus, a)?));
     }
     let Some(body) = text.strip_suffix(['i', 'I']) else { return Ok(real(text)?.map(|x| nums.of_real(x))) };
     // The imaginary part starts at the last sign that isn't an exponent's.
     let bytes = body.as_bytes();
-    let split = (1..bytes.len()).rev().find(|&k| matches!(bytes[k], b'+' | b'-') && !(radix == 10 && matches!(bytes[k - 1], b'e' | b'E')));
+    let split = (1..bytes.len()).rev().find(|&index| matches!(bytes[index], b'+' | b'-') && !(radix == 10 && matches!(bytes[index - 1], b'e' | b'E')));
     let (re, im) = match split {
-        Some(k) => (Some(&body[..k]), &body[k..]),
+        Some(index) => (Some(&body[..index]), &body[index..]),
         None => (None, body),
     };
     if !im.starts_with(['+', '-']) {
@@ -96,8 +96,8 @@ fn number<H: ComplexHost>(nums: &H, text: &str, radix: u32, exact: Option<bool>)
         }
         return Ok(Some(nums.of_rational(rational::from_parts(nums, num, den)?)));
     }
-    if let Some(n) = int::parse(nums, body.as_bytes(), radix, negative)? {
-        return Ok(Some(nums.of_rational(nums.of_int(n))));
+    if let Some(integer) = int::parse(nums, body.as_bytes(), radix, negative)? {
+        return Ok(Some(nums.of_rational(nums.of_int(integer))));
     }
     if radix == 10 { decimal(nums, negative, body, exact) } else { Ok(None) }
 }
@@ -109,14 +109,14 @@ fn decimal<H: ComplexHost>(nums: &H, negative: bool, body: &str, exact: Option<b
         None => (body, None),
     };
     let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    let digits = |text: &str| text.bytes().all(|byte| byte.is_ascii_digit());
     if whole.len() + fraction.len() == 0 || !digits(whole) || !digits(fraction) {
         return Ok(None);
     }
     let exponent = match exponent {
         None => 0,
-        Some(e) if !e.is_empty() && digits(e.strip_prefix(['+', '-']).unwrap_or(e)) => match e.parse::<i64>() {
-            Ok(e) => e,
+        Some(text) if !text.is_empty() && digits(text.strip_prefix(['+', '-']).unwrap_or(text)) => match text.parse::<i64>() {
+            Ok(value) => value,
             Err(_) => return Ok(None),
         },
         Some(_) => return Ok(None),
@@ -126,11 +126,11 @@ fn decimal<H: ComplexHost>(nums: &H, negative: bool, body: &str, exact: Option<b
         if scale.unsigned_abs() > MAX_EXACT_SCALE {
             return Ok(None);
         }
-        let n = int::parse(nums, format!("{whole}{fraction}").as_bytes(), 10, negative)?.expect("checked digits");
+        let significand = int::parse(nums, format!("{whole}{fraction}").as_bytes(), 10, negative)?.expect("checked digits");
         let power = int::parse(nums, format!("1{}", "0".repeat(scale.unsigned_abs() as usize)).as_bytes(), 10, false)?.expect("digits");
-        let x = if scale >= 0 { nums.of_int(int::mul(nums, n, power)?) } else { rational::from_parts(nums, n, power)? };
+        let x = if scale >= 0 { nums.of_int(int::mul(nums, significand, power)?) } else { rational::from_parts(nums, significand, power)? };
         return Ok(Some(nums.of_rational(x)));
     }
-    let Ok(f) = body.parse::<f64>() else { return Ok(None) };
-    Ok(Some(nums.flonum(if negative { -f } else { f })?))
+    let Ok(value) = body.parse::<f64>() else { return Ok(None) };
+    Ok(Some(nums.flonum(if negative { -value } else { value })?))
 }

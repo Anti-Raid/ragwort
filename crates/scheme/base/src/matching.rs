@@ -112,8 +112,8 @@ impl Step {
     /// Whether this step is `other`, and has no effects, so clauses can share it.
     fn shares(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Is(shape, x), Self::Is(other, y)) => shape == other && x.n == y.n,
-            (Self::Get(x, ..), Self::Get(y, ..)) => x.n == y.n,
+            (Self::Is(shape, temp), Self::Is(other, other_temp)) => shape == other && temp.n == other_temp.n,
+            (Self::Get(temp, ..), Self::Get(other_temp, ..)) => temp.n == other_temp.n,
             _ => false,
         }
     }
@@ -232,30 +232,30 @@ struct Alternatives<'s> {
 }
 
 impl<'gc> Expander<'_, 'gc> {
-    /// `(let ((x e)) (let ((none (lambda () (error ...)))) clauses))`, the clauses as
+    /// `(let ((x expr)) (let ((none (lambda () (error ...)))) clauses))`, the clauses as
     /// [`Matching::tries`] makes them.
-    pub(crate) fn match_form(&mut self, stx: Stx, e: Stx, clauses: &[Stx]) -> Result<Stx, ExpandError> {
-        let m = Matcher { at: stx, temps: 0, parts: HashMap::new(), seen: Vec::new(), structs: Vec::new() };
-        Matching { ex: self, m, out: Vec::new() }.form(stx, e, clauses)
+    pub(crate) fn match_form(&mut self, stx: Stx, expr: Stx, clauses: &[Stx]) -> Result<Stx, ExpandError> {
+        let matcher = Matcher { at: stx, temps: 0, parts: HashMap::new(), seen: Vec::new(), structs: Vec::new() };
+        Matching { ex: self, m: matcher, out: Vec::new() }.form(stx, expr, clauses)
     }
 }
 
 impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
-    fn form(&mut self, stx: Stx, e: Stx, clauses: &[Stx]) -> Result<Stx, ExpandError> {
-        let x = self.temp()?;
+    fn form(&mut self, stx: Stx, expr: Stx, clauses: &[Stx]) -> Result<Stx, ExpandError> {
+        let target = self.temp()?;
         let none = self.temp()?.stx;
         let mut parsed = Vec::with_capacity(clauses.len());
         for &clause in clauses {
             self.m.seen.clear();
-            parsed.push(self.clause(x, clause)?);
+            parsed.push(self.clause(target, clause)?);
         }
         let parsed: Vec<_> = parsed.iter().map(|(steps, body)| (steps.as_slice(), body)).collect();
         let code = steps::run(self, Code::Tries(parsed, none), Self::code)?;
         let message = string::from_str(&Strings::new(self.ex.mc), "match: no matching clause for")?.value();
         let message = self.ex.value(message, stx)?;
-        let error = self.ex.build(stx, "error", &[&[message, x.stx]])?;
+        let error = self.ex.build(stx, "error", &[&[message, target.stx]])?;
         let code = self.let_thunk(stx, none, error, code)?;
-        self.ex.with_temp(stx, x.stx, e, code)
+        self.ex.with_temp(stx, target.stx, expr, code)
     }
 
     /// `(let ((name (lambda () body))) code)`.
@@ -270,13 +270,13 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         Ok(Temp { n: self.m.temps, stx: self.ex.introduce(&format!("x{}", self.m.temps), self.m.at)? })
     }
 
-    /// The temporary for `part` of `x`: the same one each time.
-    fn part(&mut self, x: Temp, part: Part) -> Result<Temp, ExpandError> {
-        if let Some(&temp) = self.m.parts.get(&(x.n, part)) {
+    /// The temporary for `part` of `target`: the same one each time.
+    fn part(&mut self, target: Temp, part: Part) -> Result<Temp, ExpandError> {
+        if let Some(&temp) = self.m.parts.get(&(target.n, part)) {
             return Ok(temp);
         }
         let temp = self.temp()?;
-        self.m.parts.insert((x.n, part), temp);
+        self.m.parts.insert((target.n, part), temp);
         Ok(temp)
     }
 
@@ -301,11 +301,11 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         let mut runs = Vec::new();
         let mut rest = clauses.as_slice();
         while let Some(((steps, _), others)) = rest.split_first() {
-            let n = match steps.first() {
-                Some(first) => 1 + others.iter().take_while(|(other, _)| other.first().is_some_and(|o| first.shares(o))).count(),
+            let count = match steps.first() {
+                Some(first) => 1 + others.iter().take_while(|(other, _)| other.first().is_some_and(|step| first.shares(step))).count(),
                 None => 1,
             };
-            let (run, after) = rest.split_at(n);
+            let (run, after) = rest.split_at(count);
             runs.push(run.to_vec());
             rest = after;
         }
@@ -323,52 +323,52 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         let run = runs.pop().expect("a run left");
         // The first run is tried where the match is.
         if runs.is_empty() {
-            return Ok(Next::then(Code::Run(run, next), move |s: &mut Self, mut code| {
+            return Ok(Next::then(Code::Run(run, next), move |this: &mut Self, mut code| {
                 for (name, body) in later.into_iter().rev() {
-                    code = s.let_thunk(at, name, body, code)?;
+                    code = this.let_thunk(at, name, body, code)?;
                 }
                 Ok(Next::Done(code))
             }));
         }
         let tries = self.temp()?.stx;
-        let Some(&Step::Is(shape, x)) = run[0].0.first() else {
-            return Ok(Next::then(Code::Run(run, next), move |s: &mut Self, this| {
+        let Some(&Step::Is(shape, temp)) = run[0].0.first() else {
+            return Ok(Next::then(Code::Run(run, next), move |matching: &mut Self, this| {
                 later.push((tries, this));
-                s.runs(runs, later, tries)
+                matching.runs(runs, later, tries)
             }));
         };
         // A run that starts with a test is the test, which picks a procedure, and the rest.
         let matched = self.temp()?.stx;
-        let test = self.shape_test(shape, x)?;
+        let test = self.shape_test(shape, temp)?;
         let (to_matched, to_next) = (self.ex.list(&[matched], at)?, self.ex.list(&[next], at)?);
         let pick = self.ex.build(at, "if", &[&[test, to_matched, to_next]])?;
         let rest = match *run.as_slice() {
             [(steps, body)] => Code::Emit(&steps[1..], self.match_body(body, next)?, to_next),
             _ => Code::Tries(run.iter().map(|&(steps, body)| (&steps[1..], body)).collect(), next),
         };
-        Ok(Next::then(rest, move |s: &mut Self, rest| {
+        Ok(Next::then(rest, move |this: &mut Self, rest| {
             later.extend([(matched, rest), (tries, pick)]);
-            s.runs(runs, later, tries)
+            this.runs(runs, later, tries)
         }))
     }
 
-    /// The test of whether `x` has `shape`.
-    fn shape_test(&mut self, shape: Shape, x: Temp) -> Result<Stx, ExpandError> {
+    /// The test of whether `target` has `shape`.
+    fn shape_test(&mut self, shape: Shape, target: Temp) -> Result<Stx, ExpandError> {
         let at = self.m.at;
         Ok(match shape {
-            Shape::Pair => self.ex.build(at, "pair?", &[&[x.stx]])?,
-            Shape::Null => self.ex.build(at, "null?", &[&[x.stx]])?,
-            Shape::List => self.ex.build(at, "list?", &[&[x.stx]])?,
-            Shape::Vector => self.ex.build(at, "vector?", &[&[x.stx]])?,
-            Shape::Length(n) => {
-                let n = Value::fixnum(n as i64).ok_or_else(|| self.ex.error(ExpandErrorKind::BadSyntax, at))?;
-                let n = self.ex.value(n, at)?;
-                let len = self.ex.build(at, "vector-length", &[&[x.stx]])?;
-                self.ex.build(at, "eqv?", &[&[len, n]])?
+            Shape::Pair => self.ex.build(at, "pair?", &[&[target.stx]])?,
+            Shape::Null => self.ex.build(at, "null?", &[&[target.stx]])?,
+            Shape::List => self.ex.build(at, "list?", &[&[target.stx]])?,
+            Shape::Vector => self.ex.build(at, "vector?", &[&[target.stx]])?,
+            Shape::Length(count) => {
+                let count = Value::fixnum(count as i64).ok_or_else(|| self.ex.error(ExpandErrorKind::BadSyntax, at))?;
+                let count = self.ex.value(count, at)?;
+                let len = self.ex.build(at, "vector-length", &[&[target.stx]])?;
+                self.ex.build(at, "eqv?", &[&[len, count]])?
             }
             Shape::Struct(of) => {
                 let kind = self.m.structs[of].kind;
-                self.ex.build(at, "struct-derived-from?", &[&[x.stx, kind]])?
+                self.ex.build(at, "struct-derived-from?", &[&[target.stx, kind]])?
             }
         })
     }
@@ -385,13 +385,13 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         Ok(Next::then(Code::Tries(rest, fail), move |_, done| Ok(Next::Tail(Code::Emit(&shared[..1], done, failed)))))
     }
 
-    /// A clause's steps for matching `x` and its body.
-    fn clause(&mut self, x: Temp, clause: Stx) -> Result<(Vec<Step>, Body), ExpandError> {
+    /// A clause's steps for matching `target` and its body.
+    fn clause(&mut self, target: Temp, clause: Stx) -> Result<(Vec<Step>, Body), ExpandError> {
         let parts = self.ex.proper(clause)?;
         let Some((&pattern, rest)) = parts.split_first() else { return Err(self.ex.error(ExpandErrorKind::BadSyntax, clause)) };
-        let steps = self.match_pattern(x, pattern)?;
+        let steps = self.match_pattern(target, pattern)?;
         let when_ = self.ex.symbol("when")?;
-        let when = rest.first().is_some_and(|&first| self.ex.tree.keyword(first).is_some_and(|k| k.symbol(self.ex.mc) == when_));
+        let when = rest.first().is_some_and(|&first| self.ex.tree.keyword(first).is_some_and(|keyword| keyword.symbol(self.ex.mc) == when_));
         let escape = match rest.first() {
             Some(&first) => self.escape(first)?,
             None => None,
@@ -429,24 +429,24 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         })
     }
 
-    /// The steps of matching `p` against `x`, binding its variables last.
-    fn match_pattern(&mut self, x: Temp, p: Stx) -> Result<Vec<Step>, ExpandError> {
+    /// The steps of matching `pattern` against `target`, binding its variables last.
+    fn match_pattern(&mut self, target: Temp, pattern: Stx) -> Result<Vec<Step>, ExpandError> {
         self.out.push(Vec::new());
-        steps::run(self, (x, p), Self::pattern)?;
+        steps::run(self, (target, pattern), Self::pattern)?;
         let steps = self.out.pop().expect("a pattern's steps");
         let (mut steps, vars): (Vec<_>, Vec<_>) = steps.into_iter().partition(|step| !matches!(step, Step::Var(..)));
         steps.extend(vars);
         Ok(steps)
     }
 
-    /// The steps of matching `p` against `x` within another pattern, which binds none of its
+    /// The steps of matching `pattern` against `target` within another pattern, which binds none of its
     /// variables, to `then`: what they're bound to is in `m.seen`.
-    fn inner_pattern(&mut self, x: Temp, p: Stx, then: impl FnOnce(&mut Self, Vec<Step>) -> Result<Pat<'e, 'a, 'gc>, ExpandError> + 'e) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
+    fn inner_pattern(&mut self, target: Temp, pattern: Stx, then: impl FnOnce(&mut Self, Vec<Step>) -> Result<Pat<'e, 'a, 'gc>, ExpandError> + 'e) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
         self.out.push(Vec::new());
-        Ok(Next::then((x, p), move |s: &mut Self, ()| {
-            let mut steps = s.out.pop().expect("an inner pattern's steps");
+        Ok(Next::then((target, pattern), move |this: &mut Self, ()| {
+            let mut steps = this.out.pop().expect("an inner pattern's steps");
             steps.retain(|step| !matches!(step, Step::Var(..)));
-            then(s, steps)
+            then(this, steps)
         }))
     }
 
@@ -464,102 +464,102 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         }
     }
 
-    /// Adds what matching `p` against `x` does to the steps being made.
-    fn pattern(&mut self, (x, p): (Temp, Stx)) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
+    /// Adds what matching `pattern` against `target` does to the steps being made.
+    fn pattern(&mut self, (target, pattern): (Temp, Stx)) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
         let bad = |this: &Self, at| Err(this.ex.error(ExpandErrorKind::BadSyntax, at));
-        let (items, tail) = match self.ex.tree.view(p)? {
-            View::Id if self.ex.is_aux(p, Aux::Underscore)? => return Ok(Next::Done(())),
-            View::Id if self.ex.is_aux(p, Aux::Ellipsis)? => return bad(self, p),
+        let (items, tail) = match self.ex.tree.view(pattern)? {
+            View::Id if self.ex.is_aux(pattern, Aux::Underscore)? => return Ok(Next::Done(())),
+            View::Id if self.ex.is_aux(pattern, Aux::Ellipsis)? => return bad(self, pattern),
             View::Id => {
-                self.variable(x, p)?;
+                self.variable(target, pattern)?;
                 return Ok(Next::Done(()));
             }
             View::Datum(value) => {
                 let same = if value.immediate().is_some() { "eqv?" } else { "equal?" };
-                let quoted = self.ex.quoted(p, p)?;
-                let test = self.ex.build(p, same, &[&[x.stx, quoted]])?;
+                let quoted = self.ex.quoted(pattern, pattern)?;
+                let test = self.ex.build(pattern, same, &[&[target.stx, quoted]])?;
                 self.push(Step::Test(test));
                 return Ok(Next::Done(()));
             }
             View::Vector(_) => {
-                let quoted = self.ex.quoted(p, p)?;
-                let test = self.ex.build(p, "equal?", &[&[x.stx, quoted]])?;
+                let quoted = self.ex.quoted(pattern, pattern)?;
+                let test = self.ex.build(pattern, "equal?", &[&[target.stx, quoted]])?;
                 self.push(Step::Test(test));
                 return Ok(Next::Done(()));
             }
             View::List(items, None) if items.is_empty() => {
-                self.push(Step::Is(Shape::Null, x));
+                self.push(Step::Is(Shape::Null, target));
                 return Ok(Next::Done(()));
             }
             View::List(items, tail) => (items, tail),
         };
         let name = match self.ex.tree.symbol(items[0]) {
             Some(symbol) if tail.is_none() => string::chars(&Strings::new(self.ex.mc), symbol.name(self.ex.mc)).collect::<String>(),
-            _ => return bad(self, p),
+            _ => return bad(self, pattern),
         };
         let args = &items[1..];
         let step = match (name.as_str(), args) {
-            ("quote", [_]) => Step::Test(self.ex.build(p, "equal?", &[&[x.stx, p]])?),
-            ("quasiquote", _) => return Err(self.ex.error(ExpandErrorKind::Unsupported, p)),
-            ("list", _) => return self.list_pattern(x, args.to_vec(), 0, None),
-            ("list-rest", &[ref init @ .., rest]) => return self.list_pattern(x, init.to_vec(), 0, Some(rest)),
-            ("cons", &[head, rest]) => return self.list_pattern(x, vec![head], 0, Some(rest)),
+            ("quote", [_]) => Step::Test(self.ex.build(pattern, "equal?", &[&[target.stx, pattern]])?),
+            ("quasiquote", _) => return Err(self.ex.error(ExpandErrorKind::Unsupported, pattern)),
+            ("list", _) => return self.list_pattern(target, args.to_vec(), 0, None),
+            ("list-rest", &[ref init @ .., rest]) => return self.list_pattern(target, init.to_vec(), 0, Some(rest)),
+            ("cons", &[head, rest]) => return self.list_pattern(target, vec![head], 0, Some(rest)),
             ("vector", _) => {
-                self.push(Step::Is(Shape::Vector, x));
-                self.push(Step::Is(Shape::Length(args.len()), x));
-                return self.vector_pattern(x, args.to_vec(), 0);
+                self.push(Step::Is(Shape::Vector, target));
+                self.push(Step::Is(Shape::Length(args.len()), target));
+                return self.vector_pattern(target, args.to_vec(), 0);
             }
             ("?", &[pred, ref pats @ ..]) => {
-                let test = self.ex.list(&[pred, x.stx], p)?;
+                let test = self.ex.list(&[pred, target.stx], pattern)?;
                 self.push(Step::Test(test));
-                return self.each_pattern(x, pats.to_vec(), 0);
+                return self.each_pattern(target, pats.to_vec(), 0);
             }
-            ("and", pats) => return self.each_pattern(x, pats.to_vec(), 0),
-            ("or", []) => Step::Test(self.ex.value(Value::FALSE, p)?),
+            ("and", pats) => return self.each_pattern(target, pats.to_vec(), 0),
+            ("or", []) => Step::Test(self.ex.value(Value::FALSE, pattern)?),
             ("or", alts) => {
                 let before = self.m.seen.clone();
-                return self.or_pattern(Or { x, alts: alts.to_vec(), before, steps: Vec::with_capacity(alts.len()), bound: Vec::with_capacity(alts.len()) });
+                return self.or_pattern(Or { x: target, alts: alts.to_vec(), before, steps: Vec::with_capacity(alts.len()), bound: Vec::with_capacity(alts.len()) });
             }
-            ("not", pats) => return self.not_pattern(x, pats.to_vec(), 0),
-            ("app", &[f, pat]) => {
+            ("not", pats) => return self.not_pattern(target, pats.to_vec(), 0),
+            ("app", &[function, pat]) => {
                 let result = self.temp()?;
-                let value = self.ex.list(&[f, x.stx], p)?;
+                let value = self.ex.list(&[function, target.stx], pattern)?;
                 self.push(Step::Bind(result, value));
                 return Ok(Next::Tail((result, pat)));
             }
-            ("==", &[v]) => Step::Test(self.ex.build(p, "equal?", &[&[v, x.stx]])?),
-            ("==", &[v, same]) => Step::Test(self.ex.list(&[same, v, x.stx], p)?),
+            ("==", &[expected]) => Step::Test(self.ex.build(pattern, "equal?", &[&[expected, target.stx]])?),
+            ("==", &[expected, same]) => Step::Test(self.ex.list(&[same, expected, target.stx], pattern)?),
             _ => {
-                let Some(info) = self.ex.struct_info(items[0])? else { return bad(self, p) };
-                let pats = self.field_pats(p, args, info.fields.len())?;
+                let Some(info) = self.ex.struct_info(items[0])? else { return bad(self, pattern) };
+                let pats = self.field_pats(pattern, args, info.fields.len())?;
                 let key = info.kind;
                 let known = self.m.structs.iter().position(|named| named.key == key);
                 let of = match known {
                     Some(of) => of,
                     None => {
-                        let kind = self.ex.struct_type(&info, p)?;
+                        let kind = self.ex.struct_type(&info, pattern)?;
                         self.m.structs.push(Named { kind, key });
                         self.m.structs.len() - 1
                     }
                 };
-                self.push(Step::Is(Shape::Struct(of), x));
-                return self.field_pattern(x, of, pats, 0);
+                self.push(Step::Is(Shape::Struct(of), target));
+                return self.field_pattern(target, of, pats, 0);
             }
         };
         self.push(step);
         Ok(Next::Done(()))
     }
 
-    /// Matches each of `pats` from `i` on against `x`.
-    fn each_pattern(&mut self, x: Temp, pats: Vec<Stx>, i: usize) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
+    /// Matches each of `pats` from `i` on against `target`.
+    fn each_pattern(&mut self, target: Temp, pats: Vec<Stx>, i: usize) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
         let Some(&pat) = pats.get(i) else { return Ok(Next::Done(())) };
-        Ok(Next::then((x, pat), move |s: &mut Self, ()| s.each_pattern(x, pats, i + 1)))
+        Ok(Next::then((target, pat), move |this: &mut Self, ()| this.each_pattern(target, pats, i + 1)))
     }
 
-    /// The fields each of `pats`, the patterns of the struct pattern `p`, is matched against,
+    /// The fields each of `pats`, the patterns of the struct pattern `pattern`, is matched against,
     /// the struct having `fields` of them. Only one pattern can repeat, and there's a field
     /// for each one that doesn't.
-    fn field_pats(&mut self, p: Stx, pats: &[Stx], fields: usize) -> Result<Vec<FieldPat>, ExpandError> {
+    fn field_pats(&mut self, pattern: Stx, pats: &[Stx], fields: usize) -> Result<Vec<FieldPat>, ExpandError> {
         let bad = ExpandErrorKind::BadSyntax;
         let mut dots = None;
         for (i, &pat) in pats.iter().enumerate() {
@@ -573,7 +573,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         let single = pats.len() - if dots.is_some() { 2 } else { 0 };
         let spare = match fields.checked_sub(single) {
             Some(spare) if spare == 0 || dots.is_some() => spare,
-            _ => return Err(self.ex.error(bad, p)),
+            _ => return Err(self.ex.error(bad, pattern)),
         };
         let mut out = Vec::with_capacity(pats.len());
         let mut first = 0;
@@ -589,28 +589,28 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         Ok(out)
     }
 
-    /// A temporary for field `k` of `x`, a struct of the matcher's type `of`, read by then.
-    fn field(&mut self, x: Temp, of: usize, k: usize) -> Result<Temp, ExpandError> {
-        let field = self.part(x, Part::Field(of, k))?;
-        self.push(Step::Get(field, Part::Field(of, k), x));
+    /// A temporary for field `index` of `target`, a struct of the matcher's type `of`, read by then.
+    fn field(&mut self, target: Temp, of: usize, index: usize) -> Result<Temp, ExpandError> {
+        let field = self.part(target, Part::Field(of, index))?;
+        self.push(Step::Get(field, Part::Field(of, index), target));
         Ok(field)
     }
 
-    /// Matches the fields of `x`, a struct of the matcher's type `of`, against `pats` from `i`
+    /// Matches the fields of `target`, a struct of the matcher's type `of`, against `pats` from `i`
     /// on. A pattern that repeats is matched against the list of its fields, as a list's last
     /// pattern is against the rest of the list, and `_ ...` reads none.
-    fn field_pattern(&mut self, x: Temp, of: usize, pats: Vec<FieldPat>, i: usize) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
+    fn field_pattern(&mut self, target: Temp, of: usize, pats: Vec<FieldPat>, i: usize) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
         let Some(&FieldPat { pat, first, count, repeats }) = pats.get(i) else { return Ok(Next::Done(())) };
         if !repeats {
-            let field = self.field(x, of, first)?;
-            return Ok(Next::then((field, pat), move |s: &mut Self, ()| s.field_pattern(x, of, pats, i + 1)));
+            let field = self.field(target, of, first)?;
+            return Ok(Next::then((field, pat), move |this: &mut Self, ()| this.field_pattern(target, of, pats, i + 1)));
         }
         if self.ex.is_aux(pat, Aux::Underscore)? {
-            return self.field_pattern(x, of, pats, i + 1);
+            return self.field_pattern(target, of, pats, i + 1);
         }
         let mut values = Vec::with_capacity(count);
-        for k in first..first + count {
-            values.push(self.field(x, of, k)?.stx);
+        for index in first..first + count {
+            values.push(self.field(target, of, index)?.stx);
         }
         let all = self.temp()?;
         let list = self.ex.build(pat, "list", &[&values])?;
@@ -618,9 +618,9 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         if self.ex.is_id(pat) {
             self.not_bound(pat)?;
             self.variable(all, pat)?;
-            return self.field_pattern(x, of, pats, i + 1);
+            return self.field_pattern(target, of, pats, i + 1);
         }
-        self.repeat_pattern(all, pat, move |s| s.field_pattern(x, of, pats, i + 1))
+        self.repeat_pattern(all, pat, move |this| this.field_pattern(target, of, pats, i + 1))
     }
 
     /// An error if the pattern so far binds the variable `id`: one that's bound to a list of
@@ -638,83 +638,83 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
     fn repeat_pattern(&mut self, list: Temp, item: Stx, then: impl FnOnce(&mut Self) -> Result<Pat<'e, 'a, 'gc>, ExpandError> + 'e) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
         let element = self.temp()?;
         let before = std::mem::take(&mut self.m.seen);
-        self.inner_pattern(element, item, move |s, steps| {
-            let inner = std::mem::replace(&mut s.m.seen, before);
-            if let Some(seen) = inner.iter().find(|seen| s.m.seen.iter().any(|other| other.key() == seen.key())) {
-                return Err(s.ex.error(ExpandErrorKind::Duplicate, seen.id));
+        self.inner_pattern(element, item, move |this, steps| {
+            let inner = std::mem::replace(&mut this.m.seen, before);
+            if let Some(seen) = inner.iter().find(|seen| this.m.seen.iter().any(|other| other.key() == seen.key())) {
+                return Err(this.ex.error(ExpandErrorKind::Duplicate, seen.id));
             }
-            let values = inner.iter().map(|v| v.value).collect();
-            let results = inner.iter().map(|_| Ok(s.temp()?.stx)).collect::<Result<Vec<_>, ExpandError>>()?;
-            let first = s.m.seen.len();
-            s.m.seen.extend(inner);
-            s.push(Step::Each { list, item: element, steps, values, results: results.clone() });
-            s.bind_results(first, &results);
-            then(s)
+            let values = inner.iter().map(|seen| seen.value).collect();
+            let results = inner.iter().map(|_| Ok(this.temp()?.stx)).collect::<Result<Vec<_>, ExpandError>>()?;
+            let first = this.m.seen.len();
+            this.m.seen.extend(inner);
+            this.push(Step::Each { list, item: element, steps, values, results: results.clone() });
+            this.bind_results(first, &results);
+            then(this)
         })
     }
 
-    /// Matches the items of the vector `x` from `i` on against `pats`.
-    fn vector_pattern(&mut self, x: Temp, pats: Vec<Stx>, i: usize) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
+    /// Matches the items of the vector `target` from `i` on against `pats`.
+    fn vector_pattern(&mut self, target: Temp, pats: Vec<Stx>, i: usize) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
         let Some(&pat) = pats.get(i) else { return Ok(Next::Done(())) };
         if self.ex.is_aux(pat, Aux::Ellipsis)? {
             return Err(self.ex.error(ExpandErrorKind::Unsupported, pat));
         }
-        let item = self.part(x, Part::Item(i))?;
-        self.push(Step::Get(item, Part::Item(i), x));
-        Ok(Next::then((item, pat), move |s: &mut Self, ()| s.vector_pattern(x, pats, i + 1)))
+        let item = self.part(target, Part::Item(i))?;
+        self.push(Step::Get(item, Part::Item(i), target));
+        Ok(Next::then((item, pat), move |this: &mut Self, ()| this.vector_pattern(target, pats, i + 1)))
     }
 
     /// Matches the alternatives of `or` from the next on, each binding the same variables.
     fn or_pattern(&mut self, mut or: Or<'gc>) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
         if let Some(&alt) = or.alts.get(or.steps.len()) {
             self.m.seen.clone_from(&or.before);
-            return self.inner_pattern(or.x, alt, move |s, steps| {
+            return self.inner_pattern(or.x, alt, move |this, steps| {
                 or.steps.push(steps);
-                let vars = s.m.seen[or.before.len()..].to_vec();
+                let vars = this.m.seen[or.before.len()..].to_vec();
                 // Each alternative binds the same variables, in any order.
                 if let Some(first) = or.bound.first()
-                    && (first.len() != vars.len() || !vars.iter().all(|v| first.iter().any(|f| f.key() == v.key())))
+                    && (first.len() != vars.len() || !vars.iter().all(|var| first.iter().any(|other| other.key() == var.key())))
                 {
-                    return Err(s.ex.error(ExpandErrorKind::BadSyntax, alt));
+                    return Err(this.ex.error(ExpandErrorKind::BadSyntax, alt));
                 }
                 or.bound.push(vars);
-                s.or_pattern(or)
+                this.or_pattern(or)
             });
         }
         let Or { before, steps, bound, .. } = or;
         let results = (before.len()..self.m.seen.len()).map(|_| Ok(self.temp()?.stx)).collect::<Result<Vec<_>, ExpandError>>()?;
         let values = bound
             .iter()
-            .map(|vars| self.m.seen[before.len()..].iter().map(|v| vars.iter().find(|w| w.key() == v.key()).expect("checked").value).collect())
+            .map(|vars| self.m.seen[before.len()..].iter().map(|seen| vars.iter().find(|var| var.key() == seen.key()).expect("checked").value).collect())
             .collect();
         self.push(Step::Or { alts: steps, values, results: results.clone() });
         self.bind_results(before.len(), &results);
         Ok(Next::Done(()))
     }
 
-    /// Matches `x` against none of `pats` from `i` on, binding nothing.
-    fn not_pattern(&mut self, x: Temp, pats: Vec<Stx>, i: usize) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
+    /// Matches `target` against none of `pats` from `i` on, binding nothing.
+    fn not_pattern(&mut self, target: Temp, pats: Vec<Stx>, i: usize) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
         let Some(&pat) = pats.get(i) else { return Ok(Next::Done(())) };
         let before = self.m.seen.clone();
-        self.inner_pattern(x, pat, move |s, steps| {
-            s.m.seen = before;
-            s.push(Step::Not(steps));
-            s.not_pattern(x, pats, i + 1)
+        self.inner_pattern(target, pat, move |this, steps| {
+            this.m.seen = before;
+            this.push(Step::Not(steps));
+            this.not_pattern(target, pats, i + 1)
         })
     }
 
     /// Matches anything, bound to `id`, or if `id` is already bound in the pattern, what's
     /// `equal?` to it.
-    fn variable(&mut self, x: Temp, id: Stx) -> Result<(), ExpandError> {
-        let seen = Seen { id, symbol: self.ex.tree.symbol(id).expect("an identifier"), set: self.ex.tree.scopes_of(id)?, value: x.stx };
+    fn variable(&mut self, target: Temp, id: Stx) -> Result<(), ExpandError> {
+        let seen = Seen { id, symbol: self.ex.tree.symbol(id).expect("an identifier"), set: self.ex.tree.scopes_of(id)?, value: target.stx };
         match self.m.seen.iter().find(|other| other.key() == seen.key()) {
             Some(first) => {
-                let test = self.ex.build(id, "equal?", &[&[first.value, x.stx]])?;
+                let test = self.ex.build(id, "equal?", &[&[first.value, target.stx]])?;
                 self.push(Step::Test(test));
             }
             None => {
                 self.m.seen.push(seen);
-                self.push(Step::Var(id, x.stx));
+                self.push(Step::Var(id, target.stx));
             }
         }
         Ok(())
@@ -758,7 +758,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         self.push(Step::Get(head, Part::Car, at));
         let tail = self.part(at, Part::Cdr)?;
         self.push(Step::Get(tail, Part::Cdr, at));
-        Ok(Next::then((head, item), move |s: &mut Self, ()| s.list_pattern(tail, items, i + 1, rest)))
+        Ok(Next::then((head, item), move |this: &mut Self, ()| this.list_pattern(tail, items, i + 1, rest)))
     }
 
     /// The code of `steps`: `done` if they match, `fail` if they don't.
@@ -766,46 +766,46 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         let Some((step, rest)) = steps.split_first() else { return Ok(Next::Done(done)) };
         let at = self.m.at;
         let rest = Code::Emit(rest, done, fail);
-        let fixnum = |this: &Self, n: usize| Value::fixnum(n as i64).ok_or_else(|| this.ex.error(ExpandErrorKind::BadSyntax, at));
+        let fixnum = |this: &Self, index: usize| Value::fixnum(index as i64).ok_or_else(|| this.ex.error(ExpandErrorKind::BadSyntax, at));
         Ok(match *step {
-            Step::Is(shape, x) => {
-                let test = self.shape_test(shape, x)?;
-                Next::then(rest, move |s: &mut Self, rest| Ok(Next::Done(s.ex.build(at, "if", &[&[test, rest, fail]])?)))
+            Step::Is(shape, target) => {
+                let test = self.shape_test(shape, target)?;
+                Next::then(rest, move |this: &mut Self, rest| Ok(Next::Done(this.ex.build(at, "if", &[&[test, rest, fail]])?)))
             }
-            Step::Get(temp, part, x) => {
+            Step::Get(temp, part, target) => {
                 let value = match part {
-                    Part::Car => self.ex.build(at, "car", &[&[x.stx]])?,
-                    Part::Cdr => self.ex.build(at, "cdr", &[&[x.stx]])?,
-                    Part::Item(i) => {
-                        let k = self.ex.value(fixnum(self, i)?, at)?;
-                        self.ex.build(at, "vector-ref", &[&[x.stx, k]])?
+                    Part::Car => self.ex.build(at, "car", &[&[target.stx]])?,
+                    Part::Cdr => self.ex.build(at, "cdr", &[&[target.stx]])?,
+                    Part::Item(index) => {
+                        let index = self.ex.value(fixnum(self, index)?, at)?;
+                        self.ex.build(at, "vector-ref", &[&[target.stx, index]])?
                     }
-                    Part::Field(of, i) => {
+                    Part::Field(of, index) => {
                         let kind = self.m.structs[of].kind;
-                        let k = self.ex.value(fixnum(self, i)?, at)?;
+                        let index = self.ex.value(fixnum(self, index)?, at)?;
                         let get = self.ex.internal("struct-ref", at)?;
-                        self.ex.list(&[get, x.stx, kind, k], at)?
+                        self.ex.list(&[get, target.stx, kind, index], at)?
                     }
                 };
-                Next::then(rest, move |s: &mut Self, rest| Ok(Next::Done(s.ex.with_temp(at, temp.stx, value, rest)?)))
+                Next::then(rest, move |this: &mut Self, rest| Ok(Next::Done(this.ex.with_temp(at, temp.stx, value, rest)?)))
             }
-            Step::Test(test) => Next::then(rest, move |s: &mut Self, rest| Ok(Next::Done(s.ex.build(at, "if", &[&[test, rest, fail]])?))),
-            Step::Bind(temp, value) => Next::then(rest, move |s: &mut Self, rest| Ok(Next::Done(s.ex.with_temp(at, temp.stx, value, rest)?))),
-            Step::Var(var, value) => Next::then(rest, move |s: &mut Self, rest| Ok(Next::Done(s.ex.with_temp(at, var, value, rest)?))),
+            Step::Test(test) => Next::then(rest, move |this: &mut Self, rest| Ok(Next::Done(this.ex.build(at, "if", &[&[test, rest, fail]])?))),
+            Step::Bind(temp, value) => Next::then(rest, move |this: &mut Self, rest| Ok(Next::Done(this.ex.with_temp(at, temp.stx, value, rest)?))),
+            Step::Var(var, value) => Next::then(rest, move |this: &mut Self, rest| Ok(Next::Done(this.ex.with_temp(at, var, value, rest)?))),
             Step::Not(ref steps) => {
                 let (yes, no) = (self.ex.value(Value::TRUE, at)?, self.ex.value(Value::FALSE, at)?);
                 Next::then(Code::Emit(steps, yes, no), move |_, test| {
-                    Ok(Next::then(rest, move |s: &mut Self, rest| Ok(Next::Done(s.ex.build(at, "if", &[&[test, fail, rest]])?))))
+                    Ok(Next::then(rest, move |this: &mut Self, rest| Ok(Next::Done(this.ex.build(at, "if", &[&[test, fail, rest]])?))))
                 })
             }
             // `(let ((k (lambda (result ...) rest))) alt)`, each alt calling `k` with its values,
             // and each but the last trying the next if it fails.
             Step::Or { ref alts, ref values, ref results } => {
-                let k = self.temp()?.stx;
+                let join = self.temp()?.stx;
                 let formals = self.ex.list(results, at)?;
-                Next::then(rest, move |s: &mut Self, rest| {
-                    let lambda = s.ex.build(at, "lambda", &[&[formals, rest]])?;
-                    s.alternatives(Alternatives { alts, values, left: alts.len(), next: None, k, lambda, fail })
+                Next::then(rest, move |this: &mut Self, rest| {
+                    let lambda = this.ex.build(at, "lambda", &[&[formals, rest]])?;
+                    this.alternatives(Alternatives { alts, values, left: alts.len(), next: None, k: join, lambda, fail })
                 })
             }
             // `(let loop ((xs list) (acc '()) ...) (if (null? xs) (let ((result (reverse acc)) ...)
@@ -814,31 +814,31 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
             Step::Each { list, item, ref steps, ref values, ref results } => {
                 let (again, xs) = (self.temp()?.stx, self.temp()?.stx);
                 let accs = values.iter().map(|_| Ok(self.temp()?.stx)).collect::<Result<Vec<_>, ExpandError>>()?;
-                Next::then(rest, move |s: &mut Self, mut finished| {
+                Next::then(rest, move |this: &mut Self, mut finished| {
                     for (&result, &acc) in results.iter().zip(&accs).rev() {
-                        let reversed = s.ex.build(at, "reverse", &[&[acc]])?;
-                        finished = s.ex.with_temp(at, result, reversed, finished)?;
+                        let reversed = this.ex.build(at, "reverse", &[&[acc]])?;
+                        finished = this.ex.with_temp(at, result, reversed, finished)?;
                     }
-                    let mut next = vec![again, s.ex.build(at, "cdr", &[&[xs]])?];
+                    let mut next = vec![again, this.ex.build(at, "cdr", &[&[xs]])?];
                     for (&value, &acc) in values.iter().zip(&accs) {
-                        next.push(s.ex.build(at, "cons", &[&[value, acc]])?);
+                        next.push(this.ex.build(at, "cons", &[&[value, acc]])?);
                     }
-                    let next = s.ex.list(&next, at)?;
-                    Ok(Next::then(Code::Emit(steps, next, fail), move |s: &mut Self, each| {
-                        let first = s.ex.build(at, "car", &[&[xs]])?;
-                        let each = s.ex.with_temp(at, item.stx, first, each)?;
-                        let is_pair = s.ex.build(at, "pair?", &[&[xs]])?;
-                        let more = s.ex.build(at, "if", &[&[is_pair, each, fail]])?;
-                        let is_null = s.ex.build(at, "null?", &[&[xs]])?;
-                        let body = s.ex.build(at, "if", &[&[is_null, finished, more]])?;
-                        let mut binds = vec![s.ex.list(&[xs, list.stx], at)?];
+                    let next = this.ex.list(&next, at)?;
+                    Ok(Next::then(Code::Emit(steps, next, fail), move |this: &mut Self, each| {
+                        let first = this.ex.build(at, "car", &[&[xs]])?;
+                        let each = this.ex.with_temp(at, item.stx, first, each)?;
+                        let is_pair = this.ex.build(at, "pair?", &[&[xs]])?;
+                        let more = this.ex.build(at, "if", &[&[is_pair, each, fail]])?;
+                        let is_null = this.ex.build(at, "null?", &[&[xs]])?;
+                        let body = this.ex.build(at, "if", &[&[is_null, finished, more]])?;
+                        let mut binds = vec![this.ex.list(&[xs, list.stx], at)?];
                         for &acc in &accs {
-                            let empty = s.ex.value(Value::NIL, at)?;
-                            let empty = s.ex.quoted(empty, at)?;
-                            binds.push(s.ex.list(&[acc, empty], at)?);
+                            let empty = this.ex.value(Value::NIL, at)?;
+                            let empty = this.ex.quoted(empty, at)?;
+                            binds.push(this.ex.list(&[acc, empty], at)?);
                         }
-                        let binds = s.ex.list(&binds, at)?;
-                        Ok(Next::Done(s.ex.build(at, "let", &[&[again, binds, body]])?))
+                        let binds = this.ex.list(&binds, at)?;
+                        Ok(Next::Done(this.ex.build(at, "let", &[&[again, binds, body]])?))
                     }))
                 })
             }
@@ -846,28 +846,28 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
     }
 
     /// The code of an `or` step's alternatives left, each calling its `k` with its values.
-    fn alternatives<'s>(&mut self, mut a: Alternatives<'s>) -> Result<Em<'s, 'e, 'a, 'gc>, ExpandError> {
+    fn alternatives<'s>(&mut self, mut alternatives: Alternatives<'s>) -> Result<Em<'s, 'e, 'a, 'gc>, ExpandError> {
         let at = self.m.at;
-        let Some(left) = a.left.checked_sub(1) else {
-            let alts = a.next.expect("an `or` of no patterns is a test");
-            return Ok(Next::Done(self.ex.with_temp(at, a.k, a.lambda, alts)?));
+        let Some(left) = alternatives.left.checked_sub(1) else {
+            let alts = alternatives.next.expect("an `or` of no patterns is a test");
+            return Ok(Next::Done(self.ex.with_temp(at, alternatives.k, alternatives.lambda, alts)?));
         };
-        a.left = left;
-        let (alts, values) = (a.alts, a.values);
-        let matched = self.ex.list(&[&[a.k], values[left].as_slice()].concat(), at)?;
-        Ok(match a.next {
-            None => Next::then(Code::Emit(&alts[left], matched, a.fail), move |s: &mut Self, code| {
-                a.next = Some(code);
-                s.alternatives(a)
+        alternatives.left = left;
+        let (alts, values) = (alternatives.alts, alternatives.values);
+        let matched = self.ex.list(&[&[alternatives.k], values[left].as_slice()].concat(), at)?;
+        Ok(match alternatives.next {
+            None => Next::then(Code::Emit(&alts[left], matched, alternatives.fail), move |this: &mut Self, code| {
+                alternatives.next = Some(code);
+                this.alternatives(alternatives)
             }),
             Some(next) => {
                 let other = self.temp()?.stx;
                 let tried = self.ex.list(&[other], at)?;
-                Next::then(Code::Emit(&alts[left], matched, tried), move |s: &mut Self, code| {
-                    let none = s.ex.list(&[], at)?;
-                    let thunk = s.ex.build(at, "lambda", &[&[none, next]])?;
-                    a.next = Some(s.ex.with_temp(at, other, thunk, code)?);
-                    s.alternatives(a)
+                Next::then(Code::Emit(&alts[left], matched, tried), move |this: &mut Self, code| {
+                    let none = this.ex.list(&[], at)?;
+                    let thunk = this.ex.build(at, "lambda", &[&[none, next]])?;
+                    alternatives.next = Some(this.ex.with_temp(at, other, thunk, code)?);
+                    this.alternatives(alternatives)
                 })
             }
         })

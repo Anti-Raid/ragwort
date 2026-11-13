@@ -25,8 +25,8 @@ language! {
 }
 
 impl<'id, 'gc> Children<'id, 'gc> for (Var, Id<'id>) {
-    fn each(self, _: &L1<'id, 'gc>, f: &mut impl FnMut(Id<'id>)) {
-        f(self.1);
+    fn each(self, _: &L1<'id, 'gc>, visit: &mut impl FnMut(Id<'id>)) {
+        visit(self.1);
     }
 }
 

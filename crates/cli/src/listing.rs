@@ -78,7 +78,7 @@ fn function<'gc>(mc: &Mutation<'gc>, number: usize, code: Gc<'gc, Bytecode>, fun
         let text = match *op {
             Op::LoadConst { dst, index } => format!("LoadConst {{ dst: {dst}, value: {} }}", constant(index)),
             Op::NewClosure { dst, count, code } => {
-                let codes: Vec<String> = (0..u32::from(count)).map(|k| constant(code + k)).collect();
+                let codes: Vec<String> = (0..u32::from(count)).map(|offset| constant(code + offset)).collect();
                 format!("NewClosure {{ dst: {dst}, codes: [{}] }}", codes.join(", "))
             }
             ref op => format!("{op:?}"),

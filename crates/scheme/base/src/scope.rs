@@ -92,21 +92,21 @@ impl Hasher for Folded {
         }
     }
 
-    fn write_u8(&mut self, n: u8) {
-        self.write_u64(u64::from(n));
+    fn write_u8(&mut self, value: u8) {
+        self.write_u64(u64::from(value));
     }
 
-    fn write_u32(&mut self, n: u32) {
-        self.write_u64(u64::from(n));
+    fn write_u32(&mut self, value: u32) {
+        self.write_u64(u64::from(value));
     }
 
-    fn write_usize(&mut self, n: usize) {
-        self.write_u64(n as u64);
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(value as u64);
     }
 
-    fn write_u64(&mut self, n: u64) {
-        let m = u128::from(self.0 ^ n) * 0x9E37_79B9_7F4A_7C15;
-        self.0 = (m >> 64) as u64 ^ m as u64;
+    fn write_u64(&mut self, value: u64) {
+        let product = u128::from(self.0 ^ value) * 0x9E37_79B9_7F4A_7C15;
+        self.0 = (product >> 64) as u64 ^ product as u64;
     }
 
     fn finish(&self) -> u64 {
@@ -202,11 +202,11 @@ impl<'gc> Scopes<'gc> {
         self.scopes(set).binary_search(&scope).is_ok()
     }
 
-    /// Whether every scope of `a` is in `b`.
-    pub(crate) fn subset(&self, a: Set, b: Set) -> bool {
-        let (a, b) = (self.scopes(a), self.scopes(b));
-        let mut b = b.iter();
-        a.len() <= b.len() && a.iter().all(|x| b.by_ref().any(|y| y == x))
+    /// Whether every scope of `part` is in `whole`.
+    pub(crate) fn subset(&self, part: Set, whole: Set) -> bool {
+        let (part, whole) = (self.scopes(part), self.scopes(whole));
+        let mut whole = whole.iter();
+        part.len() <= whole.len() && part.iter().all(|scope| whole.by_ref().any(|other| other == scope))
     }
 
     pub(crate) fn op(&mut self, scope: Scope, op: Op) -> Result<Ops, OutOfMemory> {
@@ -221,25 +221,25 @@ impl<'gc> Scopes<'gc> {
         if let Some(&ops) = self.composed.get(&(first, then)) {
             return Ok(ops);
         }
-        let (a, b) = (self.ops.get(first.0), self.ops.get(then.0));
+        let (left, right) = (self.ops.get(first.0), self.ops.get(then.0));
         let mut merged = std::mem::take(&mut self.scratch_ops);
         merged.clear();
         let (mut i, mut j) = (0, 0);
-        while i < a.len() && j < b.len() {
-            let ((x, earlier), (y, later)) = (a[i], b[j]);
-            if x < y {
-                merged.push(a[i]);
+        while i < left.len() && j < right.len() {
+            let ((left_scope, earlier), (right_scope, later)) = (left[i], right[j]);
+            if left_scope < right_scope {
+                merged.push(left[i]);
                 i += 1;
-            } else if y < x {
-                merged.push(b[j]);
+            } else if right_scope < left_scope {
+                merged.push(right[j]);
                 j += 1;
             } else {
-                merged.extend(later.after(Some(earlier)).map(|op| (x, op)));
+                merged.extend(later.after(Some(earlier)).map(|op| (left_scope, op)));
                 (i, j) = (i + 1, j + 1);
             }
         }
-        merged.extend_from_slice(&a[i..]);
-        merged.extend_from_slice(&b[j..]);
+        merged.extend_from_slice(&left[i..]);
+        merged.extend_from_slice(&right[j..]);
         let ops = self.ops.intern(&mut self.charge, &merged).map(Ops);
         self.scratch_ops = merged;
         let ops = ops?;
@@ -263,24 +263,24 @@ impl<'gc> Scopes<'gc> {
         // A scope the set has stays unless removed or flipped; one it lacks comes in if added or
         // flipped.
         while i < have.len() && j < changes.len() {
-            let (x, (y, op)) = (have[i], changes[j]);
-            if x < y {
-                scopes.push(x);
+            let (scope, (changed, op)) = (have[i], changes[j]);
+            if scope < changed {
+                scopes.push(scope);
                 i += 1;
-            } else if y < x {
+            } else if changed < scope {
                 if op != Op::Remove {
-                    scopes.push(y);
+                    scopes.push(changed);
                 }
                 j += 1;
             } else {
                 if op == Op::Add {
-                    scopes.push(x);
+                    scopes.push(scope);
                 }
                 (i, j) = (i + 1, j + 1);
             }
         }
         scopes.extend_from_slice(&have[i..]);
-        scopes.extend(changes[j..].iter().filter(|&&(_, op)| op != Op::Remove).map(|&(y, _)| y));
+        scopes.extend(changes[j..].iter().filter(|&&(_, op)| op != Op::Remove).map(|&(changed, _)| changed));
         let applied = self.sets.intern(&mut self.charge, &scopes).map(Set);
         self.scratch_set = scopes;
         let applied = applied?;

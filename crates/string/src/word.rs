@@ -17,18 +17,18 @@ pub(crate) fn low_bytes(n: usize) -> u64 {
     u64::MAX.checked_shr(64 - 8 * n as u32).unwrap_or(0)
 }
 
-/// Two words that together hold every byte of `b`, at most [`SHORT`] of them, from
+/// Two words that together hold every byte of `bytes`, at most [`SHORT`] of them, from
 /// overlapping reads. They aren't the bytes in place, but with the length they tell any two
 /// inputs apart.
 #[inline]
-pub(crate) fn fingerprint(b: &[u8]) -> (u64, u64) {
-    let n = b.len();
+pub(crate) fn fingerprint(bytes: &[u8]) -> (u64, u64) {
+    let n = bytes.len();
     if n >= 4 {
-        let r4 = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().expect("four bytes")) as u64;
-        let q = (n >> 3) << 2;
-        (r4(0) << 32 | r4(q), r4(n - 4) << 32 | r4(n - 4 - q))
+        let r4 = |i: usize| u32::from_le_bytes(bytes[i..i + 4].try_into().expect("four bytes")) as u64;
+        let offset = (n >> 3) << 2;
+        (r4(0) << 32 | r4(offset), r4(n - 4) << 32 | r4(n - 4 - offset))
     } else if n > 0 {
-        ((b[0] as u64) << 16 | (b[n >> 1] as u64) << 8 | b[n - 1] as u64, 0)
+        ((bytes[0] as u64) << 16 | (bytes[n >> 1] as u64) << 8 | bytes[n - 1] as u64, 0)
     } else {
         (0, 0)
     }
@@ -38,8 +38,8 @@ pub(crate) fn fingerprint(b: &[u8]) -> (u64, u64) {
 #[inline]
 pub(crate) fn equal_ascii(a: &[u8], b: &[u8]) -> bool {
     if b.len() <= SHORT {
-        let w = fingerprint(b);
-        return a.len() == b.len() && fingerprint(a) == w && (w.0 | w.1) & HIGH == 0;
+        let words = fingerprint(b);
+        return a.len() == b.len() && fingerprint(a) == words && (words.0 | words.1) & HIGH == 0;
     }
     a == b && b.is_ascii()
 }
@@ -48,18 +48,18 @@ pub(crate) fn equal_ascii(a: &[u8], b: &[u8]) -> bool {
 #[inline]
 pub(crate) fn read_bytes(words: &[Cell<u64>], at: usize, n: usize) -> u64 {
     let (i, shift) = (at / 8, (at % 8) as u32 * 8);
-    let mut v = words[i].get() >> shift;
+    let mut value = words[i].get() >> shift;
     if shift != 0 && shift + 8 * n as u32 > 64 {
-        v |= words[i + 1].get() << (64 - shift);
+        value |= words[i + 1].get() << (64 - shift);
     }
-    v & low_bytes(n)
+    value & low_bytes(n)
 }
 
-/// Writes the low `n` bytes of `v` from byte `at`, all in one word.
+/// Writes the low `n` bytes of `value` from byte `at`, all in one word.
 #[inline]
-pub(crate) fn write_bytes(words: &[Cell<u64>], at: usize, n: usize, v: u64) {
+pub(crate) fn write_bytes(words: &[Cell<u64>], at: usize, n: usize, value: u64) {
     let shift = (at % 8) as u32 * 8;
     let mask = low_bytes(n) << shift;
-    let w = &words[at / 8];
-    w.set(w.get() & !mask | (v << shift) & mask);
+    let word = &words[at / 8];
+    word.set(word.get() & !mask | (value << shift) & mask);
 }

@@ -162,13 +162,13 @@ fn place(text: &str, offset: u32) -> (usize, usize) {
 /// What's wrong with the module `name`, whose files are `files`, as `file:line:column: what`.
 fn describe(name: &str, files: &[SourceFile], failed: &Located) -> String {
     let (what, start) = match failed.error {
-        Error::Read(e) => (e.kind.to_string(), Some(e.start)),
-        Error::Expand(e) => (e.kind.to_string(), Some(e.start)),
-        Error::Lower(e) => (e.kind.to_string(), Some(e.start)),
-        Error::Compile(e) => (e.to_string(), None),
+        Error::Read(error) => (error.kind.to_string(), Some(error.start)),
+        Error::Expand(error) => (error.kind.to_string(), Some(error.start)),
+        Error::Lower(error) => (error.kind.to_string(), Some(error.start)),
+        Error::Compile(error) => (error.to_string(), None),
     };
     let file = match failed.file {
-        Some(k) => files.get(k),
+        Some(index) => files.get(index),
         None => files.first().filter(|_| files.len() == 1),
     };
     match (file, start) {
@@ -203,13 +203,13 @@ fn ran<'gc>(mc: &Mutation<'gc>, outcome: Result<Outcome<'gc>, Fault>) -> Ran<'gc
         Ok(Outcome::Raised(raised)) => Ran::Failed(render(mc, &Report::of(mc, raised), SHOWN)),
         Ok(Outcome::Yielded(_)) => Ran::Failed("error: a yield with nothing to resume it".to_string()),
         Ok(Outcome::Deferred(_)) => Ran::Failed("error: a host call that's never answered".to_string()),
-        Err(e) => Ran::Failed(fault(e)),
+        Err(error) => Ran::Failed(fault(error)),
     }
 }
 
 /// The source files in `folder`, in the order of their names.
 fn read_folder(folder: &Path) -> Result<Vec<SourceFile>, String> {
-    let wrong = |e: std::io::Error| format!("{}: {e}", folder.display());
+    let wrong = |error: std::io::Error| format!("{}: {error}", folder.display());
     let mut paths = Vec::new();
     for entry in std::fs::read_dir(folder).map_err(wrong)? {
         let path = entry.map_err(wrong)?.path();
@@ -226,7 +226,7 @@ fn read_folder(folder: &Path) -> Result<Vec<SourceFile>, String> {
 
 fn read_file(path: &Path) -> Result<SourceFile, String> {
     let language = language(path).ok_or_else(|| format!("{}: not a .rg or .rgn file", path.display()))?;
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let text = std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
     Ok(SourceFile { path: path.to_path_buf(), text, language })
 }
 
@@ -306,7 +306,7 @@ impl<'gc> Resolver<'gc> for Finder<'_> {
 fn start<'gc>(mc: &Mutation<'gc>) -> Result<(ValueRoot, Built), String> {
     let oom = |_| OUT_OF_MEMORY.to_string();
     let symbols = Symbols::with_seed(mc, RandomState::new().build_hasher().finish()).map_err(oom)?;
-    let loaded = prelude(mc, symbols).map_err(|e| format!("the prelude: {e:?}"))?;
+    let loaded = prelude(mc, symbols).map_err(|error| format!("the prelude: {error:?}"))?;
     let built = rooted(mc, &loaded).ok_or_else(|| OUT_OF_MEMORY.to_string())?;
     Ok((ValueRoot::new(mc, symbols.value(mc)).map_err(oom)?, built))
 }
@@ -315,7 +315,7 @@ fn start<'gc>(mc: &Mutation<'gc>) -> Result<(ValueRoot, Built), String> {
 /// module with its name. A module the command line gives a folder too is an error.
 fn restore<'gc>(mc: &Mutation<'gc>, bytes: &[u8], modules: &mut Modules) -> Result<(ValueRoot, Root<Module>), String> {
     let oom = |_| OUT_OF_MEMORY.to_string();
-    let roots = image::load(mc, bytes, hosts::HOSTS.iter()).map_err(|e| match e {
+    let roots = image::load(mc, bytes, hosts::HOSTS.iter()).map_err(|error| match error {
         ImageError::Host(name) => format!("the image calls the host function `{name}`, which this ragwort doesn't have"),
         ImageError::SameHost(path) => format!("two host functions are both `{path}`"),
         ImageError::Load(LoadError::Stamp) => "the image was made by another build of ragwort".to_string(),
@@ -549,8 +549,8 @@ impl Program {
             let Ok(session) = SyntaxSession::new(mc, text) else { return false };
             let Ok(reader) = Reader::new(mc, symbols, &session) else { return false };
             for node in reader {
-                if let Err(e) = node {
-                    return e.kind == ErrorKind::Unclosed;
+                if let Err(error) = node {
+                    return error.kind == ErrorKind::Unclosed;
                 }
             }
             false

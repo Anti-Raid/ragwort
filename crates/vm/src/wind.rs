@@ -60,17 +60,17 @@ impl Kind {
         Kind::Catch,
     ];
 
-    fn of(n: u32) -> Result<Kind, Fault> {
-        Kind::ALL.get(n as usize).copied().ok_or(Fault::Malformed)
+    fn of(index: u32) -> Result<Kind, Fault> {
+        Kind::ALL.get(index as usize).copied().ok_or(Fault::Malformed)
     }
 }
 
 impl<'gc> Outer<'_, 'gc> {
     /// Pushes a [`Native`] record of type `kind` onto the continuation chain as the return destination for
     /// the subsequent call.
-    pub(crate) fn push(&self, kind: Kind, a: Value<'gc>, b: Value<'gc>) -> Result<(), Fault> {
+    pub(crate) fn push(&self, kind: Kind, first: Value<'gc>, second: Value<'gc>) -> Result<(), Fault> {
         let (mc, task) = (self.mc(), self.task());
-        let record = Native::new(mc, kind as u32, a, b, task.attachments(mc), task.chain(mc))?;
+        let record = Native::new(mc, kind as u32, first, second, task.attachments(mc), task.chain(mc))?;
         task.set_chain(mc, Value::object(mc, record));
         Ok(())
     }
@@ -81,34 +81,34 @@ impl<'gc> Outer<'_, 'gc> {
         self.step(Kind::of(native.kind(self.mc()))?, native.a(self.mc()), native.b(self.mc()))
     }
 
-    fn step(&mut self, kind: Kind, a: Value<'gc>, b: Value<'gc>) -> Result<Then<'gc>, Fault> {
+    fn step(&mut self, kind: Kind, first: Value<'gc>, second: Value<'gc>) -> Result<Then<'gc>, Fault> {
         let (mc, task) = (self.mc(), self.task());
         Ok(match kind {
             Kind::Handled => {
                 let message = string::from_str(&Strings::new(mc), "exception handler returned")?.value();
-                Then::Raise(condition(mc, Fault::Error, message, Pairs::new(mc).cons(a, Value::NIL)?.value(mc))?, false)
+                Then::Raise(condition(mc, Fault::Error, message, Pairs::new(mc).cons(first, Value::NIL)?.value(mc))?, false)
             }
-            Kind::Guarded if b == Value::FALSE => Then::Return(self.regs.acc),
+            Kind::Guarded if second == Value::FALSE => Then::Return(self.regs.acc),
             Kind::Guarded => {
                 let acc = self.regs.acc;
                 let all = if acc.downcast::<MultiValue>(mc).is_some() { Args::before(Value::TRUE, acc) } else { Args::two(Value::TRUE, acc) };
                 Then::Return(all.values(mc)?)
             }
-            Kind::Winds => match Pair::of(a) {
+            Kind::Winds => match Pair::of(first) {
                 Some(cell) => {
                     let wind = Pair::of(cell.head(mc)).ok_or(Fault::Malformed)?;
-                    self.push(Kind::Winds, cell.tail(mc), b)?;
+                    self.push(Kind::Winds, cell.tail(mc), second)?;
                     task.set_winders(mc, wind.tail(mc));
                     Then::Call(wind.head(mc), Args::none())
                 }
-                None => self.native(b.downcast::<Native>(mc).ok_or(Fault::Malformed)?)?,
+                None => self.native(second.downcast::<Native>(mc).ok_or(Fault::Malformed)?)?,
             },
-            Kind::Abort => self.abort_now(a, Args::list(b))?,
-            Kind::Escape | Kind::Compose => self.go_now(a, kind == Kind::Escape, Args::list(b))?,
-            Kind::Uncaught => Then::Uncaught(a, true),
+            Kind::Abort => self.abort_now(first, Args::list(second))?,
+            Kind::Escape | Kind::Compose => self.go_now(first, kind == Kind::Escape, Args::list(second))?,
+            Kind::Uncaught => Then::Uncaught(first, true),
             Kind::Catch => {
-                let guard = a.downcast::<Guard>(mc).ok_or(Fault::Malformed)?;
-                let (part, Cut { chain, marks, free }, under) = self.back_to(a)?;
+                let guard = first.downcast::<Guard>(mc).ok_or(Fault::Malformed)?;
+                let (part, Cut { chain, marks, free }, under) = self.back_to(first)?;
                 let stack = &mut self.segments.stack;
                 if let Some((segment, at)) = free
                     && part == 0
@@ -122,21 +122,21 @@ impl<'gc> Outer<'_, 'gc> {
                 task.set_attachments(mc, marks);
                 task.set_winders(mc, guard.winders(mc));
                 match guard.handler(mc) {
-                    Value::FALSE => Then::Return(values(mc, [Value::FALSE, b].into_iter())?),
-                    handler => Then::Call(handler, Args::one(b)),
+                    Value::FALSE => Then::Return(values(mc, [Value::FALSE, second].into_iter())?),
+                    handler => Then::Call(handler, Args::one(second)),
                 }
             }
         })
     }
 
     /// Executes each `(thunk . winders)` entry in `todo`, then proceeds with action `kind` parameterized by
-    /// `a` and `b`.
-    fn unwind(&mut self, todo: Value<'gc>, kind: Kind, a: Value<'gc>, b: Value<'gc>) -> Result<Then<'gc>, Fault> {
+    /// `first` and `second`.
+    fn unwind(&mut self, todo: Value<'gc>, kind: Kind, first: Value<'gc>, second: Value<'gc>) -> Result<Then<'gc>, Fault> {
         if todo == Value::NIL {
-            return self.step(kind, a, b);
+            return self.step(kind, first, second);
         }
         let mc = self.mc();
-        let then = Native::new(mc, kind as u32, a, b, Value::NIL, Value::FALSE)?;
+        let then = Native::new(mc, kind as u32, first, second, Value::NIL, Value::FALSE)?;
         self.step(Kind::Winds, todo, Value::object(mc, then))
     }
 
@@ -231,33 +231,33 @@ impl<'gc> Outer<'_, 'gc> {
         })
     }
 
-    /// Reinstates continuation `k` with `args` after executing necessary `before` and `after` winders:
+    /// Reinstates continuation `continuation` with `args` after executing necessary `before` and `after` winders:
     /// escape continuations unwind winders exited up to the common ancestor and rewind newly entered
     /// winders, while composable continuations rewind all of their own winders.
-    pub(crate) fn go_to(&mut self, k: Gc<'gc, Continuation>, args: Args<'gc>) -> Result<Then<'gc>, Fault> {
+    pub(crate) fn go_to(&mut self, continuation: Gc<'gc, Continuation>, args: Args<'gc>) -> Result<Then<'gc>, Fault> {
         let mc = self.mc();
-        let to = prompts::winds_of(mc, k)?;
-        let (todo, kind) = if k.escape(mc) {
+        let to = prompts::winds_of(mc, continuation)?;
+        let (todo, kind) = if continuation.escape(mc) {
             let from = prompts::winds(mc, self.task(), Some(default_tag()))?;
-            let same = from.iter().rev().zip(to.iter().rev()).take_while(|(f, t)| f.0 == t.0).count();
+            let same = from.iter().rev().zip(to.iter().rev()).take_while(|(left, right)| left.0 == right.0).count();
             (winds_todo(mc, &from[..from.len() - same], &to[..to.len() - same])?, Kind::Escape)
         } else {
             (winds_todo(mc, &[], &to)?, Kind::Compose)
         };
         if todo == Value::NIL {
-            return self.go_now(Value::object(mc, k), kind == Kind::Escape, args);
+            return self.go_now(Value::object(mc, continuation), kind == Kind::Escape, args);
         }
-        self.unwind(todo, kind, Value::object(mc, k), args.to_list(mc)?)
+        self.unwind(todo, kind, Value::object(mc, continuation), args.to_list(mc)?)
     }
 
-    /// Directly resumes continuation `k` with `args`, dispatching as either an escape continuation or a
+    /// Directly resumes continuation `continuation` with `args`, dispatching as either an escape continuation or a
     /// composable continuation.
-    fn go_now(&mut self, k: Value<'gc>, escape: bool, args: Args<'gc>) -> Result<Then<'gc>, Fault> {
+    fn go_now(&mut self, continuation: Value<'gc>, escape: bool, args: Args<'gc>) -> Result<Then<'gc>, Fault> {
         let (mc, task) = (self.mc(), self.task());
         if escape {
             prompts::clear_to_default(mc, task)?;
         }
-        prompts::compose(mc, task, k.downcast::<Continuation>(mc).ok_or(Fault::Malformed)?)?;
+        prompts::compose(mc, task, continuation.downcast::<Continuation>(mc).ok_or(Fault::Malformed)?)?;
         Ok(Then::Return(args.values(mc)?))
     }
 }

@@ -85,7 +85,7 @@ pub trait Host {
     type Str: Copy + Eq;
     type Error: From<StrError>;
 
-    fn view(&self, s: Self::Str) -> StrView<'_, Self::Str>;
+    fn view(&self, string: Self::Str) -> StrView<'_, Self::Str>;
 
     /// A flat string of `len` characters at `width`, zeroed for `init` to fill in. Views of
     /// other strings stay valid while it runs.
@@ -117,9 +117,9 @@ pub trait Host {
 
 pub type Res<H> = Result<<H as Host>::Str, <H as Host>::Error>;
 
-pub(crate) fn info<H: Host>(h: &H, s: H::Str) -> Info {
-    match h.view(s) {
-        StrView::Flat(u) => Info { len: u.len(), width: u.width(), depth: 0 },
+pub(crate) fn info<H: Host>(h: &H, string: H::Str) -> Info {
+    match h.view(string) {
+        StrView::Flat(units) => Info { len: units.len(), width: units.width(), depth: 0 },
         StrView::Rope { info, .. } => info,
     }
 }
@@ -128,94 +128,94 @@ pub fn empty<H: Host>(h: &H) -> Res<H> {
     h.flat(Width::One, 0, |_| {})
 }
 
-pub fn from_str<H: Host>(h: &H, s: &str) -> Res<H> {
-    if s.is_ascii() {
-        h.charge(s.len() as u64)?;
-        return h.flat(Width::One, s.len(), |mut u| u.write(0, Units::One(s.as_bytes())));
+pub fn from_str<H: Host>(h: &H, string: &str) -> Res<H> {
+    if string.is_ascii() {
+        h.charge(string.len() as u64)?;
+        return h.flat(Width::One, string.len(), |mut out| out.write(0, Units::One(string.as_bytes())));
     }
-    from_chars(h, s.chars())
+    from_chars(h, string.chars())
 }
 
 /// A string of the characters `chars` yields, which it must yield the same each time.
 pub fn from_chars<H: Host>(h: &H, chars: impl Iterator<Item = char> + Clone) -> Res<H> {
-    let (len, width) = chars.clone().fold((0, Width::One), |(n, w), c| (n + 1, w.max(Width::of(c))));
+    let (len, width) = chars.clone().fold((0, Width::One), |(n, widest), character| (n + 1, widest.max(Width::of(character))));
     if len > MAX_LEN {
         return Err(StrError::TooLong.into());
     }
     h.charge(len as u64)?;
-    h.flat(width, len, |mut u| {
-        for (i, c) in chars.take(len).enumerate() {
-            u.set(i, c);
+    h.flat(width, len, |mut out| {
+        for (i, character) in chars.take(len).enumerate() {
+            out.set(i, character);
         }
     })
 }
 
-/// `n` copies of `c`.
-pub fn repeat<H: Host>(h: &H, c: char, n: usize) -> Res<H> {
+/// `n` copies of `character`.
+pub fn repeat<H: Host>(h: &H, character: char, n: usize) -> Res<H> {
     if n > MAX_LEN {
         return Err(StrError::TooLong.into());
     }
     h.charge(n as u64)?;
-    h.flat(Width::of(c), n, |mut u| {
+    h.flat(Width::of(character), n, |mut out| {
         for i in 0..n {
-            u.set(i, c);
+            out.set(i, character);
         }
     })
 }
 
-pub fn len<H: Host>(h: &H, s: H::Str) -> usize {
-    info(h, s).len
+pub fn len<H: Host>(h: &H, string: H::Str) -> usize {
+    info(h, string).len
 }
 
-pub fn width<H: Host>(h: &H, s: H::Str) -> Width {
-    info(h, s).width
+pub fn width<H: Host>(h: &H, string: H::Str) -> Width {
+    info(h, string).width
 }
 
-pub fn is_flat<H: Host>(h: &H, s: H::Str) -> bool {
-    matches!(h.view(s), StrView::Flat(_))
+pub fn is_flat<H: Host>(h: &H, string: H::Str) -> bool {
+    matches!(h.view(string), StrView::Flat(_))
 }
 
 /// The character at `i`, in time proportional to the rope's depth. A rope read this way often
 /// enough is flattened, after which reads take constant time.
 #[inline]
-pub fn char_at<H: Host>(h: &H, s: H::Str, i: usize) -> Result<char, H::Error> {
-    match flat(h, s) {
-        Some(u) => u.get(i).ok_or_else(|| StrError::OutOfRange.into()),
-        None => rope_char_at(h, s, i),
+pub fn char_at<H: Host>(h: &H, string: H::Str, i: usize) -> Result<char, H::Error> {
+    match flat(h, string) {
+        Some(units) => units.get(i).ok_or_else(|| StrError::OutOfRange.into()),
+        None => rope_char_at(h, string, i),
     }
 }
 
 /// Kept out of line, as are the other rope cases, so the flat ones inline small.
 #[inline(never)]
-fn rope_char_at<H: Host>(h: &H, mut s: H::Str, mut i: usize) -> Result<char, H::Error> {
-    match h.view(s) {
-        StrView::Rope { flat: Some(flat), .. } => s = flat,
-        StrView::Rope { info, .. } if h.count_read(s).saturating_mul(rope::CHARS_PER_READ) >= info.len as u64 => {
-            s = flatten(h, s)?;
+fn rope_char_at<H: Host>(h: &H, mut string: H::Str, mut i: usize) -> Result<char, H::Error> {
+    match h.view(string) {
+        StrView::Rope { flat: Some(flat), .. } => string = flat,
+        StrView::Rope { info, .. } if h.count_read(string).saturating_mul(rope::CHARS_PER_READ) >= info.len as u64 => {
+            string = flatten(h, string)?;
         }
         _ => {}
     }
     loop {
-        match h.view(s) {
-            StrView::Flat(u) => return u.get(i).ok_or_else(|| StrError::OutOfRange.into()),
-            StrView::Rope { flat: Some(flat), .. } => s = flat,
+        match h.view(string) {
+            StrView::Flat(units) => return units.get(i).ok_or_else(|| StrError::OutOfRange.into()),
+            StrView::Rope { flat: Some(flat), .. } => string = flat,
             StrView::Rope { left, right, info, .. } => {
                 if i >= info.len {
                     return Err(StrError::OutOfRange.into());
                 }
-                let l = len(h, left);
-                (s, i) = if i < l { (left, i) } else { (right, i - l) };
+                let left_len = len(h, left);
+                (string, i) = if i < left_len { (left, i) } else { (right, i - left_len) };
             }
         }
     }
 }
 
-pub fn chunks<H: Host>(h: &H, s: H::Str) -> Chunks<'_, H> {
-    Chunks::new(h, s, 0, len(h, s))
+pub fn chunks<H: Host>(h: &H, string: H::Str) -> Chunks<'_, H> {
+    Chunks::new(h, string, 0, len(h, string))
 }
 
-pub fn chars<H: Host>(h: &H, s: H::Str) -> Chars<'_, H> {
-    Chars::new(chunks(h, s))
+pub fn chars<H: Host>(h: &H, string: H::Str) -> Chars<'_, H> {
+    Chars::new(chunks(h, string))
 }
 
 /// Orders by code point, then by length.
@@ -224,10 +224,10 @@ pub fn compare<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<Ordering, H::Erro
     if a == b {
         return Ok(Ordering::Equal);
     }
-    if let (Some(x), Some(y)) = (flat(h, a), flat(h, b)) {
-        let n = x.len().min(y.len());
+    if let (Some(units_a), Some(units_b)) = (flat(h, a), flat(h, b)) {
+        let n = units_a.len().min(units_b.len());
         h.charge(n as u64)?;
-        return Ok(x.slice(0..n).compare(y.slice(0..n)).then(x.len().cmp(&y.len())));
+        return Ok(units_a.slice(0..n).compare(units_b.slice(0..n)).then(units_a.len().cmp(&units_b.len())));
     }
     rope_compare(h, a, b)
 }
@@ -237,8 +237,8 @@ fn rope_compare<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<Ordering, H::Err
     let ((ia, fa), (ib, fb)) = (summary(h, a), summary(h, b));
     let n = ia.len.min(ib.len);
     h.charge(n as u64)?;
-    if let (Some(x), Some(y)) = (fa, fb) {
-        return Ok(x.slice(0..n).compare(y.slice(0..n)).then(ia.len.cmp(&ib.len)));
+    if let (Some(units_a), Some(units_b)) = (fa, fb) {
+        return Ok(units_a.slice(0..n).compare(units_b.slice(0..n)).then(ia.len.cmp(&ib.len)));
     }
     compare_chunks(h, a, b)
 }
@@ -250,19 +250,19 @@ fn compare_chunks<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<Ordering, H::E
 
 /// Orders the characters of two runs of chunks by code point, as far as the shorter goes.
 pub(crate) fn compare_runs<'a>(mut ca: impl Iterator<Item = Units<'a>>, mut cb: impl Iterator<Item = Units<'a>>) -> Ordering {
-    let (mut x, mut y) = (Units::One(&[]), Units::One(&[]));
+    let (mut run_a, mut run_b) = (Units::One(&[]), Units::One(&[]));
     loop {
-        while x.is_empty() {
+        while run_a.is_empty() {
             let Some(next) = ca.next() else { return Ordering::Equal };
-            x = next;
+            run_a = next;
         }
-        while y.is_empty() {
+        while run_b.is_empty() {
             let Some(next) = cb.next() else { return Ordering::Equal };
-            y = next;
+            run_b = next;
         }
-        let n = x.len().min(y.len());
-        match x.slice(0..n).compare(y.slice(0..n)) {
-            Ordering::Equal => (x, y) = (x.slice(n..x.len()), y.slice(n..y.len())),
+        let n = run_a.len().min(run_b.len());
+        match run_a.slice(0..n).compare(run_b.slice(0..n)) {
+            Ordering::Equal => (run_a, run_b) = (run_a.slice(n..run_a.len()), run_b.slice(n..run_b.len())),
             order => return order,
         }
     }
@@ -273,12 +273,12 @@ pub fn equal<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<bool, H::Error> {
     if a == b {
         return Ok(true);
     }
-    if let (Some(x), Some(y)) = (flat(h, a), flat(h, b)) {
-        if x.len() != y.len() || x.width() != y.width() {
+    if let (Some(units_a), Some(units_b)) = (flat(h, a), flat(h, b)) {
+        if units_a.len() != units_b.len() || units_a.width() != units_b.width() {
             return Ok(false);
         }
-        h.charge(x.len() as u64)?;
-        return Ok(x.equal(y));
+        h.charge(units_a.len() as u64)?;
+        return Ok(units_a.equal(units_b));
     }
     rope_equal(h, a, b)
 }
@@ -291,98 +291,98 @@ fn rope_equal<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<bool, H::Error> {
         return Ok(false);
     }
     h.charge(ia.len as u64)?;
-    if let (Some(x), Some(y)) = (fa, fb) {
-        return Ok(x.equal(y));
+    if let (Some(units_a), Some(units_b)) = (fa, fb) {
+        return Ok(units_a.equal(units_b));
     }
     Ok(compare_chunks(h, a, b)? == Ordering::Equal)
 }
 
-/// Whether `s` holds the characters of `t`.
+/// Whether `string` holds the characters of `text`.
 #[inline]
-pub fn equal_str<H: Host>(h: &H, s: H::Str, t: &str) -> Result<bool, H::Error> {
-    match flat(h, s) {
-        Some(units) => units_equal_str(h, units, t),
-        None => rope_equal_str(h, s, t),
+pub fn equal_str<H: Host>(h: &H, string: H::Str, text: &str) -> Result<bool, H::Error> {
+    match flat(h, string) {
+        Some(units) => units_equal_str(h, units, text),
+        None => rope_equal_str(h, string, text),
     }
 }
 
 #[inline(never)]
-fn rope_equal_str<H: Host>(h: &H, s: H::Str, t: &str) -> Result<bool, H::Error> {
-    let (info, flat) = summary(h, s);
+fn rope_equal_str<H: Host>(h: &H, string: H::Str, text: &str) -> Result<bool, H::Error> {
+    let (info, flat) = summary(h, string);
     if let Some(units) = flat {
-        return units_equal_str(h, units, t);
+        return units_equal_str(h, units, text);
     }
-    if info.len > t.len() || info.len < t.len().div_ceil(4) {
+    if info.len > text.len() || info.len < text.len().div_ceil(4) {
         return Ok(false);
     }
     h.charge(info.len as u64)?;
-    Ok(chars(h, s).eq(t.chars()))
+    Ok(chars(h, string).eq(text.chars()))
 }
 
 #[inline]
-fn units_equal_str<H: Host>(h: &H, units: Units<'_>, t: &str) -> Result<bool, H::Error> {
-    // As many characters as `t` has bytes match only if `t` is ASCII: Latin-1 isn't UTF-8 past
+fn units_equal_str<H: Host>(h: &H, units: Units<'_>, text: &str) -> Result<bool, H::Error> {
+    // As many characters as `text` has bytes match only if `text` is ASCII: Latin-1 isn't UTF-8 past
     // it. A test for each kind rather than a match: names mix kinds, and a jump table guesses
     // worse.
-    if let Units::Inline(p) = units
-        && p.len() == t.len()
+    if let Units::Inline(inline) = units
+        && inline.len() == text.len()
     {
-        h.charge(t.len() as u64)?;
-        return Ok(p.equal_ascii(t.as_bytes()));
+        h.charge(text.len() as u64)?;
+        return Ok(inline.equal_ascii(text.as_bytes()));
     }
     if let Units::One(bytes) = units
-        && bytes.len() == t.len()
+        && bytes.len() == text.len()
     {
-        h.charge(t.len() as u64)?;
-        return Ok(word::equal_ascii(bytes, t.as_bytes()));
+        h.charge(text.len() as u64)?;
+        return Ok(word::equal_ascii(bytes, text.as_bytes()));
     }
-    if let Units::Packed(p) = units
-        && p.len() == t.len()
+    if let Units::Packed(packed) = units
+        && packed.len() == text.len()
     {
-        h.charge(t.len() as u64)?;
-        return Ok(p.equal_ascii(t.as_bytes()));
+        h.charge(text.len() as u64)?;
+        return Ok(packed.equal_ascii(text.as_bytes()));
     }
-    if units.len() > t.len() || units.len() < t.len().div_ceil(4) {
+    if units.len() > text.len() || units.len() < text.len().div_ceil(4) {
         return Ok(false);
     }
     h.charge(units.len() as u64)?;
-    Ok(units.chars().eq(t.chars()))
+    Ok(units.chars().eq(text.chars()))
 }
 
-/// The characters of `s`, if it's flat.
+/// The characters of `string`, if it's flat.
 #[inline]
-fn flat<H: Host>(h: &H, s: H::Str) -> Option<Units<'_>> {
-    match h.view(s) {
-        StrView::Flat(u) => Some(u),
+fn flat<H: Host>(h: &H, string: H::Str) -> Option<Units<'_>> {
+    match h.view(string) {
+        StrView::Flat(units) => Some(units),
         StrView::Rope { .. } => None,
     }
 }
 
-/// What [`info`] says of `s`, and the characters of a flat string or of a rope's flat copy,
+/// What [`info`] says of `string`, and the characters of a flat string or of a rope's flat copy,
 /// from one view.
-fn summary<H: Host>(h: &H, s: H::Str) -> (Info, Option<Units<'_>>) {
-    match h.view(s) {
-        StrView::Flat(u) => (Info { len: u.len(), width: u.width(), depth: 0 }, Some(u)),
+fn summary<H: Host>(h: &H, string: H::Str) -> (Info, Option<Units<'_>>) {
+    match h.view(string) {
+        StrView::Flat(units) => (Info { len: units.len(), width: units.width(), depth: 0 }, Some(units)),
         StrView::Rope { info, flat: Some(flat), .. } => match h.view(flat) {
-            StrView::Flat(u) => (info, Some(u)),
+            StrView::Flat(units) => (info, Some(units)),
             StrView::Rope { .. } => (info, None),
         },
         StrView::Rope { info, .. } => (info, None),
     }
 }
 
-pub fn utf8_len<H: Host>(h: &H, s: H::Str) -> Result<usize, H::Error> {
-    if let Some(units) = flat(h, s) {
+pub fn utf8_len<H: Host>(h: &H, string: H::Str) -> Result<usize, H::Error> {
+    if let Some(units) = flat(h, string) {
         h.charge(units.len() as u64)?;
         return Ok(units.utf8_len());
     }
-    h.charge(len(h, s) as u64)?;
-    Ok(chunks(h, s).map(Units::utf8_len).sum())
+    h.charge(len(h, string) as u64)?;
+    Ok(chunks(h, string).map(Units::utf8_len).sum())
 }
 
-/// Writes `s` as UTF-8, with `write!` or `to_string`.
-pub fn display<H: Host>(h: &H, s: H::Str) -> Display<'_, H> {
-    Display { h, s }
+/// Writes `string` as UTF-8, with `write!` or `to_string`.
+pub fn display<H: Host>(h: &H, string: H::Str) -> Display<'_, H> {
+    Display { h, s: string }
 }
 
 pub struct Display<'h, H: Host> {
@@ -391,8 +391,8 @@ pub struct Display<'h, H: Host> {
 }
 
 impl<H: Host> fmt::Display for Display<'_, H> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut out = Utf8 { f, buf: [0; 256], n: 0 };
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut out = Utf8 { f: formatter, buf: [0; 256], n: 0 };
         match flat(self.h, self.s) {
             Some(units) => out.units(units)?,
             None => {
@@ -421,12 +421,12 @@ impl Utf8<'_, '_> {
     /// Latin-1 bytes encoded into the buffer, which has room for them.
     #[inline]
     fn latin1(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            if b < 0x80 {
-                self.buf[self.n] = b;
+        for &byte in bytes {
+            if byte < 0x80 {
+                self.buf[self.n] = byte;
                 self.n += 1;
             } else {
-                self.buf[self.n..self.n + 2].copy_from_slice(&[0xC0 | b >> 6, 0x80 | b & 0x3F]);
+                self.buf[self.n..self.n + 2].copy_from_slice(&[0xC0 | byte >> 6, 0x80 | byte & 0x3F]);
                 self.n += 2;
             }
         }
@@ -439,38 +439,38 @@ impl Utf8<'_, '_> {
                 self.f.write_str(std::str::from_utf8(bytes).expect("ASCII"))
             }
             // A block at a time: ASCII straight into the buffer, the rest encoded.
-            Units::Packed(p) if p.width() == Width::One => {
-                let ascii = p.is_ascii();
-                for from in (0..p.len()).step_by(64) {
-                    let k = (p.len() - from).min(64);
-                    if self.n + 2 * k > self.buf.len() {
+            Units::Packed(packed) if packed.width() == Width::One => {
+                let ascii = packed.is_ascii();
+                for from in (0..packed.len()).step_by(64) {
+                    let count = (packed.len() - from).min(64);
+                    if self.n + 2 * count > self.buf.len() {
                         self.flush()?;
                     }
                     if ascii {
-                        p.copy_bytes(from, &mut self.buf[self.n..self.n + k]);
-                        self.n += k;
+                        packed.copy_bytes(from, &mut self.buf[self.n..self.n + count]);
+                        self.n += count;
                         continue;
                     }
                     let mut block = [0; 64];
-                    p.copy_bytes(from, &mut block[..k]);
-                    self.latin1(&block[..k]);
+                    packed.copy_bytes(from, &mut block[..count]);
+                    self.latin1(&block[..count]);
                 }
                 Ok(())
             }
-            Units::Inline(p) => {
-                if self.n + 2 * p.len() > self.buf.len() {
+            Units::Inline(inline) => {
+                if self.n + 2 * inline.len() > self.buf.len() {
                     self.flush()?;
                 }
-                self.latin1(&p.bytes()[..p.len()]);
+                self.latin1(&inline.bytes()[..inline.len()]);
                 Ok(())
             }
             _ => {
                 let mut written = Ok(());
-                units.each_char(|c| {
+                units.each_char(|character| {
                     if self.n + 4 > self.buf.len() {
                         written = written.and(self.flush());
                     }
-                    self.n += c.encode_utf8(&mut self.buf[self.n..]).len();
+                    self.n += character.encode_utf8(&mut self.buf[self.n..]).len();
                 });
                 written
             }

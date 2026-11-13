@@ -15,58 +15,58 @@ use crate::Fault;
 use crate::equal::PER_FUEL;
 use crate::op::Fuel;
 
-pub(crate) fn is_identifier<'gc>(mc: &Mutation<'gc>, x: Value<'gc>) -> bool {
-    Syntax::of(x).is_some_and(|s| s.kind(mc) == Some(SyntaxKind::Identifier))
+pub(crate) fn is_identifier<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> bool {
+    Syntax::of(value).is_some_and(|syntax| syntax.kind(mc) == Some(SyntaxKind::Identifier))
 }
 
-/// Returns the immediate datum wrapped by syntax object `x` (a symbol, list or vector of syntax objects, or literal datum), or `Fault::WrongType` if `x` is not syntax (implements `syntax-e`).
-pub(crate) fn unwrap<'gc>(mc: &Mutation<'gc>, x: Value<'gc>) -> Result<Value<'gc>, Fault> {
-    Ok(Syntax::of(x).ok_or(Fault::WrongType)?.datum(mc))
+/// Returns the immediate datum wrapped by syntax object `value` (a symbol, list or vector of syntax objects, or literal datum), or `Fault::WrongType` if `value` is not syntax (implements `syntax-e`).
+pub(crate) fn unwrap<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Result<Value<'gc>, Fault> {
+    Ok(Syntax::of(value).ok_or(Fault::WrongType)?.datum(mc))
 }
 
-/// Recursively unwraps all syntax objects in `x` to construct a raw Scheme datum (implements `syntax->datum`).
-pub(crate) fn to_datum<'gc>(mc: &Mutation<'gc>, x: Value<'gc>, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
+/// Recursively unwraps all syntax objects in `value` to construct a raw Scheme datum (implements `syntax->datum`).
+pub(crate) fn to_datum<'gc>(mc: &Mutation<'gc>, value: Value<'gc>, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
     let mut walk = Walk::new(mc, *fuel);
-    let mut todo = vec![Step::Visit(x)];
+    let mut todo = vec![Step::Visit(value)];
     while let Some(step) = todo.pop() {
-        let x = match step {
-            Step::Visit(x) => x,
-            Step::List(n, tail) => {
-                walk.list(mc, n, tail, None)?;
+        let node = match step {
+            Step::Visit(node) => node,
+            Step::List(count, tail) => {
+                walk.list(mc, count, tail, None)?;
                 continue;
             }
-            Step::Vector(n) => {
-                walk.vector(mc, n, None)?;
+            Step::Vector(count) => {
+                walk.vector(mc, count, None)?;
                 continue;
             }
         };
         walk.charge(1)?;
-        let x = Syntax::of(x).map_or(x, |s| s.datum(mc));
-        if Pair::of(x).is_some() {
+        let node = Syntax::of(node).map_or(node, |syntax| syntax.datum(mc));
+        if Pair::of(node).is_some() {
             let at = todo.len();
-            let mut rest = x;
-            let mut n = 0;
+            let mut rest = node;
+            let mut count = 0;
             while let Some(pair) = Pair::of(rest) {
                 walk.charge(1)?;
                 todo.push(Step::Visit(pair.head(mc)));
-                rest = Syntax::of(pair.tail(mc)).map_or(pair.tail(mc), |s| s.datum(mc));
-                n += 1;
+                rest = Syntax::of(pair.tail(mc)).map_or(pair.tail(mc), |syntax| syntax.datum(mc));
+                count += 1;
             }
             let tail = rest != Value::NIL;
             if tail {
                 todo.push(Step::Visit(rest));
             }
-            todo.push(Step::List(n, tail));
+            todo.push(Step::List(count, tail));
             todo[at..].reverse();
             walk.fit(todo.len())?;
-        } else if let Some(vector) = AnyVector::of(x) {
+        } else if let Some(vector) = AnyVector::of(node) {
             let at = todo.len();
             todo.extend((0..vector.len(mc)).filter_map(|i| vector.get(mc, i)).map(Step::Visit));
             todo.push(Step::Vector(todo.len() - at));
             todo[at..].reverse();
             walk.fit(todo.len())?;
         } else {
-            walk.done.push(x);
+            walk.done.push(node);
         }
     }
     walk.finish(fuel)
@@ -106,22 +106,22 @@ impl<'gc> Walk<'gc> {
         Ok(())
     }
 
-    fn charge(&mut self, n: u64) -> Result<(), Fault> {
-        self.count = self.count.saturating_add(n);
+    fn charge(&mut self, amount: u64) -> Result<(), Fault> {
+        self.count = self.count.saturating_add(amount);
         if self.count > self.most { Err(Fault::OutOfFuel) } else { Ok(()) }
     }
 
-    /// Constructs a Scheme list (or improper list if `tail` is true) from the top `n` values on the stack,
+    /// Constructs a Scheme list (or improper list if `tail` is true) from the top `count` values on the stack,
     /// optionally wrapping the result in a syntax object with metadata `meta`.
-    fn list(&mut self, mc: &Mutation<'gc>, n: usize, tail: bool, meta: Option<(SyntaxSpan<'gc>, SyntaxMeta<'gc>)>) -> Result<(), Fault> {
+    fn list(&mut self, mc: &Mutation<'gc>, count: usize, tail: bool, meta: Option<(SyntaxSpan<'gc>, SyntaxMeta<'gc>)>) -> Result<(), Fault> {
         let tail = if tail { self.done.pop().expect("a tail") } else { Value::NIL };
-        let items = self.done.split_off(self.done.len() - n);
+        let items = self.done.split_off(self.done.len() - count);
         let list = Pairs::new(mc).list_with_tail(items, tail)?;
         self.made(mc, list, meta)
     }
 
-    fn vector(&mut self, mc: &Mutation<'gc>, n: usize, meta: Option<(SyntaxSpan<'gc>, SyntaxMeta<'gc>)>) -> Result<(), Fault> {
-        let items = self.done.split_off(self.done.len() - n);
+    fn vector(&mut self, mc: &Mutation<'gc>, count: usize, meta: Option<(SyntaxSpan<'gc>, SyntaxMeta<'gc>)>) -> Result<(), Fault> {
+        let items = self.done.split_off(self.done.len() - count);
         let vector = Vectors::new(mc).immutable_from_slice(&items)?.value(mc);
         self.made(mc, vector, meta)
     }
@@ -147,102 +147,102 @@ impl<'gc> Walk<'gc> {
 /// and existing syntax objects are preserved without re-wrapping.
 pub(crate) fn to_syntax<'gc>(mc: &Mutation<'gc>, context: Value<'gc>, datum: Value<'gc>, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
     let (scopes, span) = match Syntax::of(context) {
-        Some(s) => (s.context(mc), s.span(mc)),
+        Some(syntax) => (syntax.context(mc), syntax.span(mc)),
         None if context == Value::FALSE => (None, SyntaxSpan::default()),
         None => return Err(Fault::WrongType),
     };
     let meta = |kind| SyntaxMeta::new(mc, kind, scopes, None);
-    let named = Syntax::of(context).filter(|_| is_identifier(mc, context)).and_then(|s| Some((s.datum(mc), s.binding(mc)?)));
+    let named = Syntax::of(context).filter(|_| is_identifier(mc, context)).and_then(|syntax| Some((syntax.datum(mc), syntax.binding(mc)?)));
     let (id, list, vector) = (meta(SyntaxKind::Identifier)?, meta(SyntaxKind::List)?, meta(SyntaxKind::Vector)?);
     let mut walk = Walk::new(mc, *fuel);
     let mut todo = vec![Step::Visit(datum)];
     while let Some(step) = todo.pop() {
-        let x = match step {
-            Step::Visit(x) => x,
-            Step::List(n, tail) => {
-                walk.list(mc, n, tail, Some((span, list)))?;
+        let node = match step {
+            Step::Visit(node) => node,
+            Step::List(count, tail) => {
+                walk.list(mc, count, tail, Some((span, list)))?;
                 continue;
             }
-            Step::Vector(n) => {
-                walk.vector(mc, n, Some((span, vector)))?;
+            Step::Vector(count) => {
+                walk.vector(mc, count, Some((span, vector)))?;
                 continue;
             }
         };
         walk.charge(1)?;
-        if Syntax::of(x).is_some() {
-            walk.done.push(x);
-        } else if Symbol::of(x).is_some() {
-            let binding = named.filter(|&(name, _)| name == x).map(|(_, binding)| binding);
-            walk.done.push(Syntax::bound(mc, x, span, Some(id), binding)?.value(mc));
-        } else if Pair::of(x).is_some() {
+        if Syntax::of(node).is_some() {
+            walk.done.push(node);
+        } else if Symbol::of(node).is_some() {
+            let binding = named.filter(|&(name, _)| name == node).map(|(_, binding)| binding);
+            walk.done.push(Syntax::bound(mc, node, span, Some(id), binding)?.value(mc));
+        } else if Pair::of(node).is_some() {
             let at = todo.len();
-            let (mut rest, mut n) = (x, 0);
+            let (mut rest, mut count) = (node, 0);
             while let Some(pair) = Pair::of(rest) {
                 walk.charge(1)?;
                 todo.push(Step::Visit(pair.head(mc)));
                 rest = pair.tail(mc);
-                n += 1;
+                count += 1;
             }
             let tail = rest != Value::NIL;
             if tail {
                 todo.push(Step::Visit(rest));
             }
-            todo.push(Step::List(n, tail));
+            todo.push(Step::List(count, tail));
             todo[at..].reverse();
             walk.fit(todo.len())?;
-        } else if let Some(v) = AnyVector::of(x) {
+        } else if let Some(items) = AnyVector::of(node) {
             let at = todo.len();
-            todo.extend((0..v.len(mc)).filter_map(|i| v.get(mc, i)).map(Step::Visit));
+            todo.extend((0..items.len(mc)).filter_map(|i| items.get(mc, i)).map(Step::Visit));
             todo.push(Step::Vector(todo.len() - at));
             todo[at..].reverse();
             walk.fit(todo.len())?;
         } else {
-            walk.done.push(Syntax::new(mc, x, span, None)?.value(mc));
+            walk.done.push(Syntax::new(mc, node, span, None)?.value(mc));
         }
     }
     walk.finish(fuel)
 }
 
-/// Returns `true` if identifiers `a` and `b` have identical symbolic names and equivalent lexical scope sets,
+/// Returns `true` if identifiers `left` and `right` have identical symbolic names and equivalent lexical scope sets,
 /// meaning a binding for one would capture or bind the other (implements `bound-identifier=?`).
-pub(crate) fn same_identifier<'gc>(mc: &Mutation<'gc>, a: Value<'gc>, b: Value<'gc>, fuel: &mut Fuel) -> Result<bool, Fault> {
-    if !is_identifier(mc, a) || !is_identifier(mc, b) {
+pub(crate) fn same_identifier<'gc>(mc: &Mutation<'gc>, left: Value<'gc>, right: Value<'gc>, fuel: &mut Fuel) -> Result<bool, Fault> {
+    if !is_identifier(mc, left) || !is_identifier(mc, right) {
         return Err(Fault::WrongType);
     }
-    let (a, b) = (Syntax::of(a).ok_or(Fault::WrongType)?, Syntax::of(b).ok_or(Fault::WrongType)?);
-    if a.datum(mc) != b.datum(mc) {
+    let (left, right) = (Syntax::of(left).ok_or(Fault::WrongType)?, Syntax::of(right).ok_or(Fault::WrongType)?);
+    if left.datum(mc) != right.datum(mc) {
         return Ok(false);
     }
-    let scopes = |c: Option<SyntaxContext<'gc>>| c.map(|c| c.scopes(mc).collect::<Vec<_>>()).unwrap_or_default();
-    let (x, y) = (a.context(mc), b.context(mc));
-    if x == y {
+    let scopes = |context: Option<SyntaxContext<'gc>>| context.map(|context| context.scopes(mc).collect::<Vec<_>>()).unwrap_or_default();
+    let (left_context, right_context) = (left.context(mc), right.context(mc));
+    if left_context == right_context {
         return Ok(true);
     }
-    let (x, y) = (scopes(x), scopes(y));
+    let (left_scopes, right_scopes) = (scopes(left_context), scopes(right_context));
     // Syntax contexts created independently may contain the same set of scopes stored in different orders.
-    if x.len() != y.len() || x == y {
-        return Ok(x == y);
+    if left_scopes.len() != right_scopes.len() || left_scopes == right_scopes {
+        return Ok(left_scopes == right_scopes);
     }
-    let compared = (x.len() as u64).saturating_mul(y.len() as u64);
+    let compared = (left_scopes.len() as u64).saturating_mul(right_scopes.len() as u64);
     fuel.spend(compared / PER_FUEL)?;
-    Ok(x.iter().all(|scope| y.contains(scope)))
+    Ok(left_scopes.iter().all(|scope| right_scopes.contains(scope)))
 }
 
-/// Returns `true` if identifiers `a` and `b` refer to the same lexical or module binding (implements `free-identifier=?`).
+/// Returns `true` if identifiers `left` and `right` refer to the same lexical or module binding (implements `free-identifier=?`).
 ///
 /// Compares expander-assigned binding values: matching local binding objects, keyword symbols,
 /// module-import `(module_name . export_name)` pairs, or falling back to symbolic datum equality for unbound identifiers.
-pub(crate) fn same_binding<'gc>(mc: &Mutation<'gc>, a: Value<'gc>, b: Value<'gc>) -> Result<bool, Fault> {
-    if !is_identifier(mc, a) || !is_identifier(mc, b) {
+pub(crate) fn same_binding<'gc>(mc: &Mutation<'gc>, left: Value<'gc>, right: Value<'gc>) -> Result<bool, Fault> {
+    if !is_identifier(mc, left) || !is_identifier(mc, right) {
         return Err(Fault::WrongType);
     }
-    let (a, b) = (Syntax::of(a).ok_or(Fault::WrongType)?, Syntax::of(b).ok_or(Fault::WrongType)?);
-    Ok(match (a.binding(mc), b.binding(mc)) {
-        (Some(x), Some(y)) => match (Pair::of(x), Pair::of(y)) {
-            (Some(x), Some(y)) => x.head(mc) == y.head(mc) && x.tail(mc) == y.tail(mc),
-            _ => x == y,
+    let (left, right) = (Syntax::of(left).ok_or(Fault::WrongType)?, Syntax::of(right).ok_or(Fault::WrongType)?);
+    Ok(match (left.binding(mc), right.binding(mc)) {
+        (Some(left_binding), Some(right_binding)) => match (Pair::of(left_binding), Pair::of(right_binding)) {
+            (Some(left_pair), Some(right_pair)) => left_pair.head(mc) == right_pair.head(mc) && left_pair.tail(mc) == right_pair.tail(mc),
+            _ => left_binding == right_binding,
         },
-        (None, None) => a.datum(mc) == b.datum(mc),
+        (None, None) => left.datum(mc) == right.datum(mc),
         _ => false,
     })
 }
@@ -260,13 +260,13 @@ pub(crate) fn temporaries<'gc>(mc: &Mutation<'gc>, list: Value<'gc>, name: Value
         if let Some(pair) = Pair::of(at) {
             let item = pair.head(mc);
             let syntax = Syntax::of(item);
-            let named = if is_identifier(mc, item) { syntax.map_or(name, |s| s.datum(mc)) } else { name };
+            let named = if is_identifier(mc, item) { syntax.map_or(name, |source| source.datum(mc)) } else { name };
             let context = SyntaxContext::new(mc, &[SyntaxScope::new(mc)?])?;
             let meta = SyntaxMeta::new(mc, SyntaxKind::Identifier, Some(context), None)?;
-            let span = syntax.map(|s| s.span(mc)).unwrap_or_default();
+            let span = syntax.map(|source| source.span(mc)).unwrap_or_default();
             temporaries.push(Syntax::new(mc, named, span, Some(meta))?.value(mc));
             at = pair.tail(mc);
-        } else if let Some(rest) = Syntax::of(at).filter(|s| s.kind(mc) == Some(SyntaxKind::List)) {
+        } else if let Some(rest) = Syntax::of(at).filter(|syntax| syntax.kind(mc) == Some(SyntaxKind::List)) {
             at = rest.datum(mc);
         } else if at == Value::NIL {
             break;

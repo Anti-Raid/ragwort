@@ -132,35 +132,35 @@ impl Inst<'_, '_> {
     #[cfg(any(debug_assertions, test))]
     pub(crate) fn uses(&self) -> std::vec::Vec<Val> {
         let mut uses = std::vec::Vec::new();
-        self.each_use(|v| uses.push(v));
+        self.each_use(|value| uses.push(value));
         uses
     }
 
-    pub(crate) fn each_use(&self, mut f: impl FnMut(Val)) {
+    pub(crate) fn each_use(&self, mut visit: impl FnMut(Val)) {
         match self {
             Inst::Const(..) | Inst::Upvalue(..) => {}
-            Inst::Prim { args, .. } => args.iter().for_each(|&v| f(v)),
-            Inst::Call { f: callee, args, .. } => iter::once(callee).chain(args).for_each(|&v| f(v)),
+            Inst::Prim { args, .. } => args.iter().for_each(|&value| visit(value)),
+            Inst::Call { f: callee, args, .. } => iter::once(callee).chain(args).for_each(|&value| visit(value)),
             Inst::Closures { codes, .. } => {
-                for c in codes.iter().flat_map(|code| &code.captures) {
-                    if let Captured::Val(v) = c {
-                        f(*v);
+                for captured in codes.iter().flat_map(|code| &code.captures) {
+                    if let Captured::Val(value) = captured {
+                        visit(*value);
                     }
                 }
             }
         }
     }
 
-    /// Invokes `f` with a mutable reference to each SSA value read (used) by this instruction.
-    pub(crate) fn each_use_mut(&mut self, mut f: impl FnMut(&mut Val)) {
+    /// Invokes `visit` with a mutable reference to each SSA value read (used) by this instruction.
+    pub(crate) fn each_use_mut(&mut self, mut visit: impl FnMut(&mut Val)) {
         match self {
             Inst::Const(..) | Inst::Upvalue(..) => {}
-            Inst::Prim { args, .. } => args.iter_mut().for_each(f),
-            Inst::Call { f: callee, args, .. } => iter::once(callee).chain(args).for_each(f),
+            Inst::Prim { args, .. } => args.iter_mut().for_each(visit),
+            Inst::Call { f: callee, args, .. } => iter::once(callee).chain(args).for_each(visit),
             Inst::Closures { codes, .. } => {
-                for c in codes.iter_mut().flat_map(|code| &mut code.captures) {
-                    if let Captured::Val(v) = c {
-                        f(v);
+                for captured in codes.iter_mut().flat_map(|code| &mut code.captures) {
+                    if let Captured::Val(value) = captured {
+                        visit(value);
                     }
                 }
             }
@@ -181,24 +181,24 @@ impl End<'_> {
     #[cfg(any(debug_assertions, test))]
     pub(crate) fn uses(&self) -> std::vec::Vec<Val> {
         let mut uses = std::vec::Vec::new();
-        self.each_use(|v| uses.push(v));
+        self.each_use(|value| uses.push(value));
         uses
     }
 
-    pub(crate) fn each_use(&self, mut f: impl FnMut(Val)) {
+    pub(crate) fn each_use(&self, mut visit: impl FnMut(Val)) {
         match self {
-            End::Jump(_, args) | End::TailPrim { args, .. } => args.iter().for_each(|&v| f(v)),
-            End::Branch { test, .. } | End::Return(test) => f(*test),
-            End::TailCall { f: callee, args } => iter::once(callee).chain(args).for_each(|&v| f(v)),
+            End::Jump(_, args) | End::TailPrim { args, .. } => args.iter().for_each(|&value| visit(value)),
+            End::Branch { test, .. } | End::Return(test) => visit(*test),
+            End::TailCall { f: callee, args } => iter::once(callee).chain(args).for_each(|&value| visit(value)),
         }
     }
 
-    /// Invokes `f` with a mutable reference to each SSA value read (used) by this terminator.
-    pub(crate) fn each_use_mut(&mut self, mut f: impl FnMut(&mut Val)) {
+    /// Invokes `visit` with a mutable reference to each SSA value read (used) by this terminator.
+    pub(crate) fn each_use_mut(&mut self, mut visit: impl FnMut(&mut Val)) {
         match self {
-            End::Jump(_, args) | End::TailPrim { args, .. } => args.iter_mut().for_each(f),
-            End::Branch { test, .. } | End::Return(test) => f(test),
-            End::TailCall { f: callee, args } => iter::once(callee).chain(args).for_each(f),
+            End::Jump(_, args) | End::TailPrim { args, .. } => args.iter_mut().for_each(visit),
+            End::Branch { test, .. } | End::Return(test) => visit(test),
+            End::TailCall { f: callee, args } => iter::once(callee).chain(args).for_each(visit),
         }
     }
 }
@@ -231,8 +231,8 @@ pub(crate) fn lower<'a, 'id, 'gc>(arena: &'a Arena, tree: &L4<'id, 'gc>, root: I
 /// Validates that `program` is well-formed, panicking on verification failure in debug builds.
 #[cfg(debug_assertions)]
 pub(crate) fn check(program: &Program<'_, '_>) {
-    if let Err(e) = verify(program) {
-        panic!("malformed L5: {e}\n{program}");
+    if let Err(error) = verify(program) {
+        panic!("malformed L5: {error}\n{program}");
     }
 }
 
@@ -245,7 +245,7 @@ struct Formals<'a> {
 
 /// Collects all local variables mutated (via `set!`) within the frame rooted at `root` into `sets`.
 fn sets_in<'id>(tree: &L4<'id, '_>, root: Id<'id>, sets: &mut HashSet<Var>) {
-    sets.extend(tree.frame(root).filter_map(|id| if let Node::Set(v, _) = tree[id] { Some(v) } else { None }));
+    sets.extend(tree.frame(root).filter_map(|id| if let Node::Set(var, _) = tree[id] { Some(var) } else { None }));
 }
 
 struct Building<'a, 'gc> {
@@ -365,15 +365,15 @@ enum Use {
 
 impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
     fn fresh(&mut self) -> Val {
-        let v = Val(self.next);
+        let value = Val(self.next);
         self.next = self.next.checked_add(1).expect("fewer than 2^32 values");
-        v
+        value
     }
 
     fn block(&mut self, params: Vec<'a, Val>) -> Block {
-        let b = Block(u32::try_from(self.blocks.len()).expect("fewer than 2^32 blocks"));
+        let block = Block(u32::try_from(self.blocks.len()).expect("fewer than 2^32 blocks"));
         self.blocks.push(Building { params, insts: self.arena.vec(), sites: std::vec::Vec::new(), end: None, end_site: 0 });
-        b
+        block
     }
 
     fn building(&mut self) -> &mut Building<'a, 'gc> {
@@ -401,41 +401,41 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
         block.end_site = site;
     }
 
-    fn bind(&mut self, v: Var) -> Val {
+    fn bind(&mut self, var: Var) -> Val {
         let val = self.fresh();
-        self.bind_to(v, val);
+        self.bind_to(var, val);
         val
     }
 
-    fn bind_to(&mut self, v: Var, val: Val) {
-        self.env.insert(v, val);
-        if self.sets.contains(&v) {
-            self.assigned.push(v);
+    fn bind_to(&mut self, var: Var, val: Val) {
+        self.env.insert(var, val);
+        if self.sets.contains(&var) {
+            self.assigned.push(var);
         }
     }
 
-    fn lookup(&mut self, v: Var) -> Result<Val, CompileError> {
-        if self.voids.contains(&v) {
+    fn lookup(&mut self, var: Var) -> Result<Val, CompileError> {
+        if self.voids.contains(&var) {
             return Ok(self.def(|dst| Inst::Const(dst, Value::VOID)));
         }
-        self.env.get(&v).copied().ok_or(CompileError::Unbound(v))
+        self.env.get(&var).copied().ok_or(CompileError::Unbound(var))
     }
 
-    /// Captures a snapshot of the current SSA values of the first `n` mutated local variables in `assigned`.
-    fn snapshot(&self, n: usize) -> std::vec::Vec<Val> {
-        self.assigned[..n].iter().map(|v| self.env[v]).collect()
+    /// Captures a snapshot of the current SSA values of the first `count` mutated local variables in `assigned`.
+    fn snapshot(&self, count: usize) -> std::vec::Vec<Val> {
+        self.assigned[..count].iter().map(|var| self.env[var]).collect()
     }
 
     fn restore(&mut self, vars: &[Var], vals: &[Val]) {
-        for (&v, &val) in vars.iter().zip(vals) {
-            self.env.insert(v, val);
+        for (&var, &val) in vars.iter().zip(vals) {
+            self.env.insert(var, val);
         }
     }
 
     fn new(arena: &'a Arena, tree: &'t L4<'id, 'gc>, id: Option<u32>, formals: Formals<'_>, upvalues: u32, body: Id<'id>) -> Self {
         let mut sets = HashSet::default();
         sets_in(tree, body, &mut sets);
-        let mut b = Builder {
+        let mut builder = Builder {
             arena,
             tree,
             id,
@@ -457,10 +457,10 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
             todo: vec![Task::Expr(body, Ctx::Tail)],
             ret: None,
         };
-        b.this = b.fresh();
-        b.params = formals.params.iter().map(|&v| b.bind(v)).collect_in(arena);
-        b.rest = formals.rest.map(|v| b.bind(v));
-        b
+        builder.this = builder.fresh();
+        builder.params = formals.params.iter().map(|&param| builder.bind(param)).collect_in(arena);
+        builder.rest = formals.rest.map(|rest| builder.bind(rest));
+        builder
     }
 
     fn finish(self) -> Function<'a, 'gc> {
@@ -487,42 +487,42 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
                 }
                 Task::Test { then, other, ctx } => {
                     let Some(test) = self.ret else { continue };
-                    let (a, b) = (self.block(arena.vec()), self.block(arena.vec()));
-                    self.end(End::Branch { test, then: a, other: b });
+                    let (then_block, other_block) = (self.block(arena.vec()), self.block(arena.vec()));
+                    self.end(End::Branch { test, then: then_block, other: other_block });
                     let vars = self.assigned.clone();
                     let before = self.snapshot(vars.len());
-                    self.cur = a;
-                    self.todo.push(Task::Then { other, ctx, b, vars, before });
+                    self.cur = then_block;
+                    self.todo.push(Task::Then { other, ctx, b: other_block, vars, before });
                     self.todo.push(Task::Expr(then, ctx));
                 }
-                Task::Then { other, ctx, b, vars, before } => {
-                    let (x, end_a, env_a) = (self.ret, self.cur, self.snapshot(vars.len()));
+                Task::Then { other, ctx, b: other_block, vars, before } => {
+                    let (value_a, end_a, env_a) = (self.ret, self.cur, self.snapshot(vars.len()));
                     self.restore(&vars, &before);
-                    self.cur = b;
-                    self.todo.push(Task::Else { x, end_a, env_a, vars });
+                    self.cur = other_block;
+                    self.todo.push(Task::Else { x: value_a, end_a, env_a, vars });
                     self.todo.push(Task::Expr(other, ctx));
                 }
-                Task::Else { x, end_a, env_a, vars } => self.meet(x, end_a, &env_a, &vars),
-                Task::Seq(b, ctx) => {
+                Task::Else { x: value_a, end_a, env_a, vars } => self.meet(value_a, end_a, &env_a, &vars),
+                Task::Seq(trailing, ctx) => {
                     if self.ret.is_some() {
-                        self.todo.push(Task::Expr(b, ctx));
+                        self.todo.push(Task::Expr(trailing, ctx));
                     }
                 }
                 Task::Bind(rest) => self.bind_next(rest),
-                Task::Bound { v, void, next } => {
+                Task::Bound { v: var, void, next } => {
                     let Some(val) = self.ret else { continue };
                     if void {
-                        self.voids.insert(v);
+                        self.voids.insert(var);
                     } else {
-                        self.bind_to(v, val);
+                        self.bind_to(var, val);
                     }
                     self.todo.push(Task::Bind(next));
                 }
                 Task::Unbind { binds, assigned } => self.unbind(tree[binds].iter().flat_map(|&bind| tree.vars(bind)), assigned),
-                Task::Assign(v) => {
+                Task::Assign(var) => {
                     let Some(val) = self.ret else { continue };
-                    self.lookup(v)?;
-                    self.env.insert(v, val);
+                    self.lookup(var)?;
+                    self.env.insert(var, val);
                 }
                 Task::Void => {
                     if self.ret.is_some() {
@@ -530,15 +530,15 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
                     }
                 }
                 Task::Return => {
-                    if let Some(v) = self.ret.take() {
-                        self.end(End::Return(v));
+                    if let Some(value) = self.ret.take() {
+                        self.end(End::Return(value));
                     }
                 }
                 Task::Join { codes, carried, rest, lowered, ctx, code } => self.join_next(codes, carried, rest, lowered, ctx, code),
                 Task::Callee { args, tail, site } => {
-                    let Some(f) = self.ret else { continue };
+                    let Some(callee) = self.ret else { continue };
                     self.site = site;
-                    self.args(args, None, if tail { Use::TailCall(f) } else { Use::Call(f) });
+                    self.args(args, None, if tail { Use::TailCall(callee) } else { Use::Call(callee) });
                 }
                 Task::Args { args, order, at, mut vals, then, site } => {
                     if at > 0 {
@@ -569,8 +569,8 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
                     let mut captures = Vec::with_capacity_in(tree[clos.captures].len(), arena);
                     for &src in &tree[clos.captures] {
                         captures.push(match src {
-                            UpvalSource::Local(v) => Captured::Val(self.lookup(v)?),
-                            UpvalSource::Upvalue(u) => Captured::Upvalue(u),
+                            UpvalSource::Local(var) => Captured::Val(self.lookup(var)?),
+                            UpvalSource::Upvalue(index) => Captured::Upvalue(index),
                             UpvalSource::SelfClosure => Captured::Val(self.this),
                         });
                     }
@@ -600,9 +600,9 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
                 self.todo.push(Task::Test { then, other, ctx });
                 self.todo.push(Task::Expr(test, Ctx::Value));
             }
-            (Node::Seq(a, b), _) => {
-                self.todo.push(Task::Seq(b, ctx));
-                self.effect(a);
+            (Node::Seq(first, second), _) => {
+                self.todo.push(Task::Seq(second, ctx));
+                self.effect(first);
             }
             (Node::Let(binds, body), _) => {
                 self.todo.push(Task::Unbind { binds, assigned: self.assigned.len() });
@@ -610,9 +610,9 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
             }
             (Node::Join(scope, codes), _) => self.join(codes, scope, ctx),
             (Node::Jump(id, args), _) => self.jump(id, args)?,
-            (Node::App(f, args), _) => {
+            (Node::App(callee, args), _) => {
                 self.todo.push(Task::Callee { args, tail: ctx == Ctx::Tail, site: self.site });
-                self.todo.push(Task::Expr(f, Ctx::Value));
+                self.todo.push(Task::Expr(callee, Ctx::Value));
             }
             (Node::Intrinsic(prim @ (Prim::Request(_) | Prim::Host(_)), args), Ctx::Tail) => self.args(args, None, Use::TailPrim(prim, false)),
             (Node::ApplyIntrinsic(prim @ Prim::Request(_), args), Ctx::Tail) => self.args(args, None, Use::TailPrim(prim, true)),
@@ -621,12 +621,12 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
                 self.todo.push(Task::Expr(expr, Ctx::Value));
             }
             (Node::Quote(value), Ctx::Value) => self.ret = Some(self.def(|dst| Inst::Const(dst, value))),
-            (Node::Ref(VarRef::Local(v)), Ctx::Value) => self.ret = Some(self.lookup(v)?),
+            (Node::Ref(VarRef::Local(var)), Ctx::Value) => self.ret = Some(self.lookup(var)?),
             (Node::Ref(VarRef::Upvalue(index)), Ctx::Value) => self.ret = Some(self.def(|dst| Inst::Upvalue(dst, index))),
             (Node::Ref(VarRef::SelfClosure), Ctx::Value) => self.ret = Some(self.this),
-            (Node::Set(v, value), Ctx::Value) => {
+            (Node::Set(var, value), Ctx::Value) => {
                 self.todo.push(Task::Void);
-                self.todo.push(Task::Assign(v));
+                self.todo.push(Task::Assign(var));
                 self.todo.push(Task::Expr(value, Ctx::Value));
             }
             (Node::Lambda(fun), Ctx::Value) => self.closures(vec![fun], &[]),
@@ -638,8 +638,8 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
 
     /// Lowers `expr` strictly for its side effects, discarding its value before continuing with the next task.
     fn effect(&mut self, expr: Id<'id>) {
-        if let Node::Set(v, value) = self.tree[expr] {
-            self.todo.push(Task::Assign(v));
+        if let Node::Set(var, value) = self.tree[expr] {
+            self.todo.push(Task::Assign(var));
             self.todo.push(Task::Expr(value, Ctx::Value));
         } else {
             self.todo.push(Task::Expr(expr, Ctx::Value));
@@ -656,47 +656,47 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
         };
         let next = Rest { i: rest.i + 1, ..rest };
         match bind {
-            Bind::Val(v, init) => match tree[init] {
+            Bind::Val(var, init) => match tree[init] {
                 // Non-terminal statements in a sequence evaluate for side effects. For assignments
                 // that mutate an unmonitored variable, record them as void without generating redundant bindings.
-                Node::Set(target, value) if !self.sets.contains(&v) => {
-                    self.todo.push(Task::Bound { v, void: true, next });
+                Node::Set(target, value) if !self.sets.contains(&var) => {
+                    self.todo.push(Task::Bound { v: var, void: true, next });
                     self.todo.push(Task::Assign(target));
                     self.todo.push(Task::Expr(value, Ctx::Value));
                 }
                 _ => {
-                    self.todo.push(Task::Bound { v, void: false, next });
+                    self.todo.push(Task::Bound { v: var, void: false, next });
                     self.todo.push(Task::Expr(init, Ctx::Value));
                 }
             },
             Bind::Fix(group) => {
                 self.todo.push(Task::Bind(next));
-                let vars: std::vec::Vec<Var> = tree[group].iter().map(|&(v, _)| v).collect();
+                let vars: std::vec::Vec<Var> = tree[group].iter().map(|&(var, _)| var).collect();
                 self.closures(tree[group].iter().map(|&(_, fun)| fun).collect(), &vars);
             }
         }
     }
 
     fn unbind(&mut self, vars: impl IntoIterator<Item = Var>, assigned: usize) {
-        for v in vars {
-            self.env.remove(&v);
-            self.voids.remove(&v);
+        for var in vars {
+            self.env.remove(&var);
+            self.voids.remove(&var);
         }
         self.assigned.truncate(assigned);
     }
 
     /// Initiates lowering for arguments in `args`, following permutation `order` if provided, to feed into `then`.
     fn args(&mut self, args: Span<'id, Id<'id>>, order: Option<Vec<'a, usize>>, then: Use) {
-        let n = self.tree[args].len();
-        let vals = if order.is_some() { self.arena.vec_of(self.this, n) } else { Vec::with_capacity_in(n, self.arena) };
+        let count = self.tree[args].len();
+        let vals = if order.is_some() { self.arena.vec_of(self.this, count) } else { Vec::with_capacity_in(count, self.arena) };
         self.todo.push(Task::Args { args, order, at: 0, vals, then, site: self.site });
     }
 
     fn finish_args(&mut self, then: Use, args: Vec<'a, Val>) -> Result<(), CompileError> {
         self.ret = match then {
-            Use::Call(f) => Some(self.def(|dst| Inst::Call { dst, f, args })),
-            Use::TailCall(f) => {
-                self.end(End::TailCall { f, args });
+            Use::Call(callee) => Some(self.def(|dst| Inst::Call { dst, f: callee, args })),
+            Use::TailCall(callee) => {
+                self.end(End::TailCall { f: callee, args });
                 None
             }
             Use::Prim(prim, spread) => Some(self.def(|dst| Inst::Prim { dst, prim, args, spread })),
@@ -713,37 +713,37 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
     }
 
     /// Emits a join block where both branches of an `if` converge: `end_a` is the exit block of the `then` branch
-    /// (with result `x` and environment `env_a`), and the current block is the exit of the `else` branch.
-    fn meet(&mut self, x: Option<Val>, end_a: Block, env_a: &[Val], vars: &[Var]) {
-        let y = self.ret;
+    /// (with result `value_a` and environment `env_a`), and the current block is the exit of the `else` branch.
+    fn meet(&mut self, value_a: Option<Val>, end_a: Block, env_a: &[Val], vars: &[Var]) {
+        let value_b = self.ret;
         let (end_b, env_b) = (self.cur, self.snapshot(vars.len()));
-        let (x, y) = match (x, y) {
+        let (value_a, value_b) = match (value_a, value_b) {
             (None, None) => return,
-            (Some(x), None) => {
+            (Some(value_a), None) => {
                 self.cur = end_a;
                 self.restore(vars, env_a);
-                self.ret = Some(x);
+                self.ret = Some(value_a);
                 return;
             }
             (None, Some(_)) => return,
-            (Some(x), Some(y)) => (x, y),
+            (Some(value_a), Some(value_b)) => (value_a, value_b),
         };
         let mut params = self.arena.vec();
         let (mut from_a, mut from_b) = (self.arena.vec(), self.arena.vec());
-        let result = if x == y { x } else { self.fresh() };
-        if x != y {
+        let result = if value_a == value_b { value_a } else { self.fresh() };
+        if value_a != value_b {
             params.push(result);
-            from_a.push(x);
-            from_b.push(y);
+            from_a.push(value_a);
+            from_b.push(value_b);
         }
         let mut merged = std::vec::Vec::new();
         for (i, (&va, &vb)) in env_a.iter().zip(&env_b).enumerate() {
             if va != vb {
-                let p = self.fresh();
-                params.push(p);
+                let param = self.fresh();
+                params.push(param);
                 from_a.push(va);
                 from_b.push(vb);
-                merged.push((vars[i], p));
+                merged.push((vars[i], param));
             }
         }
         let join = self.block(params);
@@ -752,8 +752,8 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
         self.cur = end_b;
         self.end(End::Jump(join, from_b));
         self.cur = join;
-        for (v, p) in merged {
-            self.env.insert(v, p);
+        for (var, param) in merged {
+            self.env.insert(var, param);
         }
         self.ret = Some(result);
     }
@@ -770,7 +770,7 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
             let mut sets = HashSet::default();
             sets_in(tree, scope, &mut sets);
             group.iter().for_each(|code| sets_in(tree, code.body, &mut sets));
-            self.assigned.iter().copied().filter(|v| sets.contains(v)).collect()
+            self.assigned.iter().copied().filter(|var| sets.contains(var)).collect()
         };
         let index = self.groups.len();
         self.groups.push(carried.clone());
@@ -788,8 +788,8 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
     fn join_next(&mut self, codes: Span<'id, JoinCode<'id>>, carried: std::vec::Vec<Var>, mut rest: Option<Block>, mut lowered: std::vec::Vec<bool>, ctx: Ctx, code: Option<(usize, usize)>) {
         let tree = self.tree;
         let group = &tree[codes];
-        if let Some((i, n)) = code {
-            self.unbind(tree[group[i].params].iter().copied(), n);
+        if let Some((i, count)) = code {
+            self.unbind(tree[group[i].params].iter().copied(), count);
         }
         self.go_on(self.ret, &carried, &mut rest);
         if let Some(i) = (0..group.len()).find(|&i| !lowered[i] && self.joins[&group[i].id].block.is_some()) {
@@ -799,12 +799,12 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
             self.cur = block;
             let params = self.blocks[block.0 as usize].params.to_vec();
             let (declared, assigned) = params.split_at(tree[code.params].len());
-            let n = self.assigned.len();
+            let count = self.assigned.len();
             self.restore(&carried, assigned);
-            for (&v, &p) in tree[code.params].iter().zip(declared) {
-                self.bind_to(v, p);
+            for (&var, &param) in tree[code.params].iter().zip(declared) {
+                self.bind_to(var, param);
             }
-            self.todo.push(Task::Join { codes, carried, rest, lowered, ctx, code: Some((i, n)) });
+            self.todo.push(Task::Join { codes, carried, rest, lowered, ctx, code: Some((i, count)) });
             self.todo.push(Task::Expr(code.body, ctx));
             return;
         }
@@ -833,7 +833,7 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
                 to
             }
         };
-        let args = iter::once(out).chain(carried.iter().map(|v| self.env[v])).collect_in(self.arena);
+        let args = iter::once(out).chain(carried.iter().map(|var| self.env[var])).collect_in(self.arena);
         self.end(End::Jump(to, args));
     }
 
@@ -850,7 +850,7 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
         let join = self.joins.get(&id).ok_or(CompileError::Unbound(id))?;
         let (block, params, group) = (join.block, join.params.len(), join.group);
         let carried = &self.groups[group];
-        vals.extend(carried.iter().map(|v| self.env[v]));
+        vals.extend(carried.iter().map(|var| self.env[var]));
         let to = match block {
             Some(to) => to,
             None => {
@@ -870,8 +870,8 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
     fn closures(&mut self, funs: std::vec::Vec<Fun<'id>>, vars: &[Var]) {
         let arena = self.arena;
         let dsts: Vec<'a, Val> = funs.iter().map(|_| self.fresh()).collect_in(arena);
-        for (&v, &dst) in vars.iter().zip(&dsts) {
-            self.bind_to(v, dst);
+        for (&var, &dst) in vars.iter().zip(&dsts) {
+            self.bind_to(var, dst);
         }
         let codes = Vec::with_capacity_in(funs.len(), arena);
         self.todo.push(Task::Closures { funs, dsts, codes, captures: None });
@@ -881,15 +881,15 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
 /// Determines a safe evaluation ordering for arguments passed in a jump to prevent an argument expression
 /// from overwriting a parameter register while that register's previous value is still required by a subsequent argument.
 fn order<'a, 'id>(arena: &'a Arena, tree: &L4<'id, '_>, args: &[Id<'id>], params: &[Var]) -> Option<Vec<'a, usize>> {
-    let n = args.len();
-    if !(2..=16).contains(&n) || n != params.len() || !args.iter().all(|&arg| reorderable(tree, arg)) {
+    let count = args.len();
+    if !(2..=16).contains(&count) || count != params.len() || !args.iter().all(|&arg| reorderable(tree, arg)) {
         return None;
     }
-    let mut done = arena.vec_of(false, n);
-    let mut order = Vec::with_capacity_in(n, arena);
-    while order.len() < n {
-        let ready = |i: usize| !done[i] && !(0..n).any(|j| j != i && !done[j] && reads_local(tree, args[j], params[i]));
-        let i = (0..n).find(|&i| ready(i)).or_else(|| (0..n).find(|&i| !done[i])).expect("one is left");
+    let mut done = arena.vec_of(false, count);
+    let mut order = Vec::with_capacity_in(count, arena);
+    while order.len() < count {
+        let ready = |i: usize| !done[i] && !(0..count).any(|j| j != i && !done[j] && reads_local(tree, args[j], params[i]));
+        let i = (0..count).find(|&i| ready(i)).or_else(|| (0..count).find(|&i| !done[i])).expect("one is left");
         done[i] = true;
         order.push(i);
     }
@@ -902,9 +902,9 @@ pub(crate) fn reorderable<'id>(tree: &L4<'id, '_>, expr: Id<'id>) -> bool {
     tree.frame(expr).all(|id| match tree[id] {
         Node::Quote(_) | Node::Ref(_) | Node::Lambda(_) | Node::If(..) | Node::Seq(..) => true,
         Node::Let(binds, _) => tree[binds].iter().all(|bind| matches!(bind, Bind::Val(..))),
-        Node::Intrinsic(Prim::Host(h), _) => h.purity.is_reorderable(),
+        Node::Intrinsic(Prim::Host(host), _) => host.purity.is_reorderable(),
         Node::Intrinsic(Prim::Slot(SlotOp::Load | SlotOp::LoadChecked, _), _) => true,
-        Node::Intrinsic(Prim::Intrinsic(i), _) => i.is_reorderable(),
+        Node::Intrinsic(Prim::Intrinsic(intrinsic), _) => intrinsic.is_reorderable(),
         _ => false,
     })
 }
@@ -913,7 +913,7 @@ pub(crate) fn reorderable<'id>(tree: &L4<'id, '_>, expr: Id<'id>) -> bool {
 pub(crate) fn reads_local<'id>(tree: &L4<'id, '_>, expr: Id<'id>, target: Var) -> bool {
     let captures = |fun: Fun<'id>| tree[tree[fun].captures].contains(&UpvalSource::Local(target));
     tree.frame(expr).any(|id| match tree[id] {
-        Node::Ref(VarRef::Local(v)) | Node::Set(v, _) => v == target,
+        Node::Ref(VarRef::Local(var)) | Node::Set(var, _) => var == target,
         Node::Lambda(fun) => captures(fun),
         Node::Let(binds, _) => tree[binds].iter().any(|&bind| matches!(bind, Bind::Fix(group) if tree[group].iter().any(|&(_, fun)| captures(fun)))),
         _ => false,
@@ -938,22 +938,22 @@ struct Defs {
 
 #[cfg(any(debug_assertions, test))]
 impl Defs {
-    fn define(&mut self, v: Val, def: Def) -> Result<(), String> {
-        if v.0 >= self.values {
-            return Err(format!("{v} is past the function's values"));
+    fn define(&mut self, value: Val, def: Def) -> Result<(), String> {
+        if value.0 >= self.values {
+            return Err(format!("{value} is past the function's values"));
         }
-        if self.at.insert(v, def).is_some() {
-            return Err(format!("{v} is defined twice"));
+        if self.at.insert(value, def).is_some() {
+            return Err(format!("{value} is defined twice"));
         }
         Ok(())
     }
 
-    /// Verifies that value `v` dominates position `at` in block `b`, ensuring it is defined on all paths
+    /// Verifies that value `value` dominates position `at` in block `block`, ensuring it is defined on all paths
     /// reaching this point using the immediate dominator tree `idom`.
-    fn check(&self, idom: &[usize], v: Val, b: usize, at: usize) -> Result<(), String> {
-        let def = self.at.get(&v).ok_or_else(|| format!("{v}, used in b{b}, isn't defined"))?;
-        let ok = if def.block == b { def.after < at } else { dominates(idom, def.block, b) };
-        if ok { Ok(()) } else { Err(format!("{v}, used in b{b}, isn't defined on every way there")) }
+    fn check(&self, idom: &[usize], value: Val, block: usize, at: usize) -> Result<(), String> {
+        let def = self.at.get(&value).ok_or_else(|| format!("{value}, used in b{block}, isn't defined"))?;
+        let ok = if def.block == block { def.after < at } else { dominates(idom, def.block, block) };
+        if ok { Ok(()) } else { Err(format!("{value}, used in b{block}, isn't defined on every way there")) }
     }
 }
 
@@ -966,9 +966,9 @@ pub(crate) fn verify(program: &Program<'_, '_>) -> Result<(), String> {
         return Err("no functions".into());
     }
     let mut made = vec![0usize; functions.len()];
-    for (i, f) in functions.iter().enumerate() {
-        verify_function(f, &functions[..i]).map_err(|e| format!("function {i}: {e}"))?;
-        for block in &f.blocks {
+    for (i, function) in functions.iter().enumerate() {
+        verify_function(function, &functions[..i]).map_err(|error| format!("function {i}: {error}"))?;
+        for block in &function.blocks {
             for inst in &block.insts {
                 if let Inst::Closures { codes, .. } = inst {
                     codes.iter().for_each(|code| made[code.function as usize] += 1);
@@ -977,91 +977,91 @@ pub(crate) fn verify(program: &Program<'_, '_>) -> Result<(), String> {
         }
     }
     let last = functions.len() - 1;
-    match made.iter().enumerate().find(|&(i, &n)| n != usize::from(i < last)) {
-        Some((i, n)) => Err(format!("function {i} is the code of closures {n} functions make")),
+    match made.iter().enumerate().find(|&(i, &count)| count != usize::from(i < last)) {
+        Some((i, count)) => Err(format!("function {i} is the code of closures {count} functions make")),
         None => Ok(()),
     }
 }
 
-/// Verifies that function `f` is well-formed and that any closures it instantiates reference functions
+/// Verifies that function `checked` is well-formed and that any closures it instantiates reference functions
 /// located within the preceding slice `before`.
 #[cfg(any(debug_assertions, test))]
-pub(crate) fn verify_function(f: &Function<'_, '_>, before: &[Function<'_, '_>]) -> Result<(), String> {
-    let n = f.blocks.len();
-    if n == 0 {
+pub(crate) fn verify_function(checked: &Function<'_, '_>, before: &[Function<'_, '_>]) -> Result<(), String> {
+    let count = checked.blocks.len();
+    if count == 0 {
         return Err("no blocks".into());
     }
-    if !f.blocks[0].params.is_empty() {
+    if !checked.blocks[0].params.is_empty() {
         return Err("the entry takes parameters".into());
     }
-    let mut defs = Defs { values: f.values, at: HashMap::default() };
-    for &v in iter::once(&f.this).chain(&f.params).chain(&f.rest) {
-        defs.define(v, Def { block: 0, after: 0 })?;
+    let mut defs = Defs { values: checked.values, at: HashMap::default() };
+    for &value in iter::once(&checked.this).chain(&checked.params).chain(&checked.rest) {
+        defs.define(value, Def { block: 0, after: 0 })?;
     }
-    for (b, block) in f.blocks.iter().enumerate() {
-        for &p in &block.params {
-            defs.define(p, Def { block: b, after: 0 })?;
+    for (block_index, block) in checked.blocks.iter().enumerate() {
+        for &param in &block.params {
+            defs.define(param, Def { block: block_index, after: 0 })?;
         }
         for (i, inst) in block.insts.iter().enumerate() {
-            for &d in inst.defs() {
-                defs.define(d, Def { block: b, after: i + 1 })?;
+            for &def in inst.defs() {
+                defs.define(def, Def { block: block_index, after: i + 1 })?;
             }
         }
     }
-    let mut preds = vec![std::vec::Vec::new(); n];
-    for (b, block) in f.blocks.iter().enumerate() {
+    let mut preds = vec![std::vec::Vec::new(); count];
+    for (block_index, block) in checked.blocks.iter().enumerate() {
         for to in block.end.successors() {
-            let target = f.blocks.get(to.0 as usize).ok_or_else(|| format!("b{b} goes to {to}, which isn't a block"))?;
+            let target = checked.blocks.get(to.0 as usize).ok_or_else(|| format!("b{block_index} goes to {to}, which isn't a block"))?;
             if to.0 == 0 {
-                return Err(format!("b{b} goes to the entry"));
+                return Err(format!("b{block_index} goes to the entry"));
             }
-            preds[to.0 as usize].push(b);
+            preds[to.0 as usize].push(block_index);
             match &block.end {
                 End::Jump(_, args) if args.len() != target.params.len() => {
-                    return Err(format!("b{b} jumps to {to} with {} values, not {}", args.len(), target.params.len()));
+                    return Err(format!("b{block_index} jumps to {to} with {} values, not {}", args.len(), target.params.len()));
                 }
-                End::Branch { .. } if !target.params.is_empty() => return Err(format!("b{b} branches to {to}, which takes parameters")),
+                End::Branch { .. } if !target.params.is_empty() => return Err(format!("b{block_index} branches to {to}, which takes parameters")),
                 _ => {}
             }
         }
     }
-    let idom = dominators(&f.blocks, &preds)?;
+    let idom = dominators(&checked.blocks, &preds)?;
     // The register allocator processes blocks in topological/dominator order; every block must appear
     // after its immediate dominator (`idom[b] < b`).
-    if let Some(b) = (1..n).find(|&b| idom[b] >= b) {
-        return Err(format!("b{b} comes before b{}, which it's only reached through", idom[b]));
+    if let Some(block) = (1..count).find(|&block| idom[block] >= block) {
+        return Err(format!("b{block} comes before b{}, which it's only reached through", idom[block]));
     }
-    let check = |v: Val, b: usize, at: usize| defs.check(&idom, v, b, at);
-    for (b, block) in f.blocks.iter().enumerate() {
+    let check = |value: Val, block: usize, at: usize| defs.check(&idom, value, block, at);
+    for (block_index, block) in checked.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             // Closures within a mutually recursive group may capture each other's allocated instances.
             let at = if let Inst::Closures { .. } = inst { i + 2 } else { i + 1 };
-            for v in inst.uses() {
-                check(v, b, at)?;
+            for value in inst.uses() {
+                check(value, block_index, at)?;
             }
             match inst {
-                Inst::Upvalue(_, index) if *index >= f.upvalues => return Err(format!("b{b} loads upvalue {index} of {}", f.upvalues)),
+                Inst::Upvalue(_, index) if *index >= checked.upvalues => return Err(format!("b{block_index} loads upvalue {index} of {}", checked.upvalues)),
                 Inst::Closures { dsts, codes } => {
                     if dsts.len() != codes.len() {
-                        return Err(format!("b{b} makes {} closures into {} values", codes.len(), dsts.len()));
+                        return Err(format!("b{block_index} makes {} closures into {} values", codes.len(), dsts.len()));
                     }
                     for code in codes {
-                        if let Some(&Captured::Upvalue(u)) = code.captures.iter().find(|c| matches!(c, Captured::Upvalue(u) if *u >= f.upvalues)) {
-                            return Err(format!("b{b} captures upvalue {u} of {}", f.upvalues));
+                        if let Some(&Captured::Upvalue(upvalue)) = code.captures.iter().find(|captured| matches!(captured, Captured::Upvalue(upvalue) if *upvalue >= checked.upvalues)) {
+                            return Err(format!("b{block_index} captures upvalue {upvalue} of {}", checked.upvalues));
                         }
                         let Some(function) = before.get(code.function as usize) else {
-                            return Err(format!("a closure in b{b} has the code of function {}, which isn't before it", code.function));
+                            return Err(format!("a closure in b{block_index} has the code of function {}, which isn't before it", code.function));
                         };
                         if function.upvalues as usize != code.captures.len() {
-                            return Err(format!("a closure in b{b} captures {} values for {} upvalues", code.captures.len(), function.upvalues));
+                            return Err(format!("a closure in b{block_index} captures {} values for {} upvalues", code.captures.len(), function.upvalues));
                         }
                     }
                 }
                 _ => {}
             }
         }
-        for v in block.end.uses() {
-            check(v, b, block.insts.len() + 1)?;
+        for value in block.end.uses() {
+            check(value, block_index, block.insts.len() + 1)?;
         }
     }
     Ok(())
@@ -1070,13 +1070,13 @@ pub(crate) fn verify_function(f: &Function<'_, '_>, before: &[Function<'_, '_>])
 /// Computes the immediate dominator of each basic block using the iterative algorithm of Cooper, Harvey,
 /// and Kennedy. Returns an error if any block is unreachable from the entry block.
 pub(crate) fn dominators(blocks: &[BlockData<'_, '_>], preds: &[impl AsRef<[usize]>]) -> Result<std::vec::Vec<usize>, String> {
-    let n = blocks.len();
-    let mut order = std::vec::Vec::with_capacity(n);
-    let mut seen = vec![false; n];
+    let count = blocks.len();
+    let mut order = std::vec::Vec::with_capacity(count);
+    let mut seen = vec![false; count];
     let mut stack = vec![(0, 0)];
     seen[0] = true;
-    while let Some(&mut (b, ref mut next)) = stack.last_mut() {
-        if let Some(to) = blocks[b].end.successors().nth(*next) {
+    while let Some(&mut (block, ref mut next)) = stack.last_mut() {
+        if let Some(to) = blocks[block].end.successors().nth(*next) {
             *next += 1;
             let to = to.0 as usize;
             if !seen[to] {
@@ -1084,85 +1084,85 @@ pub(crate) fn dominators(blocks: &[BlockData<'_, '_>], preds: &[impl AsRef<[usiz
                 stack.push((to, 0));
             }
         } else {
-            order.push(b);
+            order.push(block);
             stack.pop();
         }
     }
-    if let Some(b) = seen.iter().position(|&s| !s) {
-        return Err(format!("b{b} can't be reached"));
+    if let Some(block) = seen.iter().position(|&reached| !reached) {
+        return Err(format!("b{block} can't be reached"));
     }
     order.reverse();
-    let mut number = vec![0; n];
-    for (i, &b) in order.iter().enumerate() {
-        number[b] = i;
+    let mut number = vec![0; count];
+    for (i, &block) in order.iter().enumerate() {
+        number[block] = i;
     }
-    let mut idom: std::vec::Vec<Option<usize>> = vec![None; n];
+    let mut idom: std::vec::Vec<Option<usize>> = vec![None; count];
     idom[0] = Some(0);
     let mut changed = true;
     while changed {
         changed = false;
-        for &b in &order[1..] {
+        for &block in &order[1..] {
             let mut new = None;
-            for &p in preds[b].as_ref() {
-                if idom[p].is_none() {
+            for &pred in preds[block].as_ref() {
+                if idom[pred].is_none() {
                     continue;
                 }
                 new = Some(match new {
-                    None => p,
-                    Some(mut q) => {
-                        let mut p = p;
-                        while p != q {
-                            while number[p] > number[q] {
-                                p = idom[p].expect("processed");
+                    None => pred,
+                    Some(mut current) => {
+                        let mut pred = pred;
+                        while pred != current {
+                            while number[pred] > number[current] {
+                                pred = idom[pred].expect("processed");
                             }
-                            while number[q] > number[p] {
-                                q = idom[q].expect("processed");
+                            while number[current] > number[pred] {
+                                current = idom[current].expect("processed");
                             }
                         }
-                        p
+                        pred
                     }
                 });
             }
-            if new.is_some() && idom[b] != new {
-                idom[b] = new;
+            if new.is_some() && idom[block] != new {
+                idom[block] = new;
                 changed = true;
             }
         }
     }
-    Ok(idom.into_iter().map(|d| d.expect("every block reached")).collect())
+    Ok(idom.into_iter().map(|dominator| dominator.expect("every block reached")).collect())
 }
 
 #[cfg(any(debug_assertions, test))]
-fn dominates(idom: &[usize], a: usize, mut b: usize) -> bool {
+fn dominates(idom: &[usize], dominator: usize, mut block: usize) -> bool {
     loop {
-        if a == b {
+        if dominator == block {
             return true;
         }
-        if b == 0 {
+        if block == 0 {
             return false;
         }
-        b = idom[b];
+        block = idom[block];
     }
 }
 
 impl fmt::Display for Val {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "v{}", self.0)
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "v{}", self.0)
     }
 }
 
 impl fmt::Display for Block {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "b{}", self.0)
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "b{}", self.0)
     }
 }
 
 struct Vals<'a>(&'a [Val]);
 
 impl fmt::Display for Vals<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, v) in self.0.iter().enumerate() {
-            write!(f, "{}{v}", if i == 0 { "" } else { " " })?;
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, value) in self.0.iter().enumerate() {
+            write!(formatter, "{}{value}", if i == 0 { "" } else { " " })?;
         }
         Ok(())
     }
@@ -1171,10 +1171,10 @@ impl fmt::Display for Vals<'_> {
 struct Constant<'a, 'gc>(&'a Value<'gc>);
 
 impl fmt::Display for Constant<'_, '_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let v = *self.0;
-        if let Some(n) = v.as_fixnum() {
-            return write!(f, "{n}");
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = *self.0;
+        if let Some(number) = value.as_fixnum() {
+            return write!(formatter, "{number}");
         }
         let name = [
             (Value::TRUE, "#t"),
@@ -1184,18 +1184,18 @@ impl fmt::Display for Constant<'_, '_> {
             (Value::UNDEFINED, "#<undefined>"),
             (Value::UNSUPPLIED, "#<unsupplied>"),
         ];
-        f.write_str(name.iter().find(|(c, _)| *c == v).map_or("#<object>", |(_, name)| name))
+        formatter.write_str(name.iter().find(|(constant, _)| *constant == value).map_or("#<object>", |(_, name)| name))
     }
 }
 
 struct PrimName(Prim);
 
 impl fmt::Display for PrimName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
-            Prim::Intrinsic(i) => f.write_str(i.name()),
-            Prim::Request(r) => f.write_str(r.name()),
-            Prim::Host(h) => write!(f, "host {}", h.name),
+            Prim::Intrinsic(intrinsic) => formatter.write_str(intrinsic.name()),
+            Prim::Request(request) => formatter.write_str(request.name()),
+            Prim::Host(host) => write!(formatter, "host {}", host.name),
             Prim::Slot(op, slot) => {
                 let name = match op {
                     SlotOp::Load => "load-slot",
@@ -1203,7 +1203,7 @@ impl fmt::Display for PrimName {
                     SlotOp::Store => "store-slot",
                     SlotOp::StoreChecked => "store-slot-checked",
                 };
-                write!(f, "{name} {slot}")
+                write!(formatter, "{name} {slot}")
             }
         }
     }
@@ -1220,11 +1220,11 @@ fn args(args: &[Val]) -> String {
 /// Formats the program for display by printing the top-level function followed by each nested closure
 /// function in hierarchical order.
 impl fmt::Display for Program<'_, '_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut todo = vec![self.root()];
         while let Some(function) = todo.pop() {
             let at = todo.len();
-            function.print(f, &self.functions, &mut todo)?;
+            function.print(formatter, &self.functions, &mut todo)?;
             todo[at..].reverse();
         }
         Ok(())
@@ -1234,56 +1234,56 @@ impl fmt::Display for Program<'_, '_> {
 impl<'a, 'gc> Function<'a, 'gc> {
     /// Formats the function as human-readable SSA text and appends references to its nested closure functions
     /// to `nested` for subsequent printing.
-    fn print<'p>(&self, f: &mut fmt::Formatter<'_>, functions: &'p [Function<'a, 'gc>], nested: &mut std::vec::Vec<&'p Function<'a, 'gc>>) -> fmt::Result {
+    fn print<'p>(&self, formatter: &mut fmt::Formatter<'_>, functions: &'p [Function<'a, 'gc>], nested: &mut std::vec::Vec<&'p Function<'a, 'gc>>) -> fmt::Result {
         match self.id {
-            Some(id) => write!(f, "function {id}")?,
-            None => write!(f, "function")?,
+            Some(id) => write!(formatter, "function {id}")?,
+            None => write!(formatter, "function")?,
         }
         let required = self.params.len() - self.optional as usize;
-        write!(f, " ({}", Vals(&self.params[..required]))?;
-        for p in &self.params[required..] {
-            write!(f, " [{p}]")?;
+        write!(formatter, " ({}", Vals(&self.params[..required]))?;
+        for param in &self.params[required..] {
+            write!(formatter, " [{param}]")?;
         }
         if let Some(rest) = self.rest {
-            write!(f, " . {rest}")?;
+            write!(formatter, " . {rest}")?;
         }
-        writeln!(f, ") closure {}:", self.this)?;
-        for (b, block) in self.blocks.iter().enumerate() {
+        writeln!(formatter, ") closure {}:", self.this)?;
+        for (block_index, block) in self.blocks.iter().enumerate() {
             if block.params.is_empty() {
-                writeln!(f, "b{b}:")?;
+                writeln!(formatter, "b{block_index}:")?;
             } else {
-                writeln!(f, "b{b}({}):", Vals(&block.params))?;
+                writeln!(formatter, "b{block_index}({}):", Vals(&block.params))?;
             }
             for inst in &block.insts {
                 match inst {
-                    Inst::Const(dst, value) => writeln!(f, "  {dst} = {}", Constant(value))?,
-                    Inst::Upvalue(dst, index) => writeln!(f, "  {dst} = upvalue {index}")?,
-                    Inst::Prim { dst, prim, args: a, spread: s } => writeln!(f, "  {dst} = {}{}{}", spread(*s), PrimName(*prim), args(a))?,
-                    Inst::Call { dst, f: callee, args: a } => writeln!(f, "  {dst} = call {callee}{}", args(a))?,
+                    Inst::Const(dst, value) => writeln!(formatter, "  {dst} = {}", Constant(value))?,
+                    Inst::Upvalue(dst, index) => writeln!(formatter, "  {dst} = upvalue {index}")?,
+                    Inst::Prim { dst, prim, args: operands, spread: applied } => writeln!(formatter, "  {dst} = {}{}{}", spread(*applied), PrimName(*prim), args(operands))?,
+                    Inst::Call { dst, f: callee, args: operands } => writeln!(formatter, "  {dst} = call {callee}{}", args(operands))?,
                     Inst::Closures { dsts, codes } => {
-                        write!(f, "  {} = closures", Vals(dsts))?;
+                        write!(formatter, "  {} = closures", Vals(dsts))?;
                         for code in codes {
                             let function = &functions[code.function as usize];
-                            write!(f, " [{}", function.id.unwrap_or(0))?;
-                            for c in &code.captures {
-                                match c {
-                                    Captured::Val(v) => write!(f, " {v}")?,
-                                    Captured::Upvalue(u) => write!(f, " upvalue {u}")?,
+                            write!(formatter, " [{}", function.id.unwrap_or(0))?;
+                            for captured in &code.captures {
+                                match captured {
+                                    Captured::Val(value) => write!(formatter, " {value}")?,
+                                    Captured::Upvalue(upvalue) => write!(formatter, " upvalue {upvalue}")?,
                                 }
                             }
-                            write!(f, "]")?;
+                            write!(formatter, "]")?;
                             nested.push(function);
                         }
-                        writeln!(f)?;
+                        writeln!(formatter)?;
                     }
                 }
             }
             match &block.end {
-                End::Jump(to, a) => writeln!(f, "  jump {to}({})", Vals(a))?,
-                End::Branch { test, then, other } => writeln!(f, "  branch {test} {then} {other}")?,
-                End::Return(v) => writeln!(f, "  return {v}")?,
-                End::TailCall { f: callee, args: a } => writeln!(f, "  tail-call {callee}{}", args(a))?,
-                End::TailPrim { prim, args: a, spread: s } => writeln!(f, "  tail {}{}{}", spread(*s), PrimName(*prim), args(a))?,
+                End::Jump(to, operands) => writeln!(formatter, "  jump {to}({})", Vals(operands))?,
+                End::Branch { test, then, other } => writeln!(formatter, "  branch {test} {then} {other}")?,
+                End::Return(value) => writeln!(formatter, "  return {value}")?,
+                End::TailCall { f: callee, args: operands } => writeln!(formatter, "  tail-call {callee}{}", args(operands))?,
+                End::TailPrim { prim, args: operands, spread: applied } => writeln!(formatter, "  tail {}{}{}", spread(*applied), PrimName(*prim), args(operands))?,
             }
         }
         Ok(())

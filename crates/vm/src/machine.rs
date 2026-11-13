@@ -218,8 +218,8 @@ impl Machine {
 fn args_of<'gc>(mc: &Mutation<'gc>, args: &[Value<'gc>]) -> Result<Args<'gc>, Fault> {
     Ok(match *args {
         [] => Args::none(),
-        [a] => Args::one(a),
-        [a, b] => Args::two(a, b),
+        [value] => Args::one(value),
+        [first, second] => Args::two(first, second),
         _ => Args::list(Pairs::new(mc).list(args)?),
     })
 }
@@ -397,13 +397,13 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         self.then(Then::Call(slots.get(0), args))
     }
 
-    /// Returns a slice of `n` registers starting at offset `base` within the current frame window.
-    fn registers(&self, base: u8, n: u8) -> Result<Slots<'gc>, Fault> {
+    /// Returns a slice of `count` registers starting at offset `base` within the current frame window.
+    fn registers(&self, base: u8, count: u8) -> Result<Slots<'gc>, Fault> {
         let (mc, at) = (self.mc(), self.regs.fp + usize::from(base));
-        if usize::from(base) + usize::from(n) > WINDOW {
+        if usize::from(base) + usize::from(count) > WINDOW {
             return Err(Fault::Malformed);
         }
-        self.segments.stack.segment(mc).slots(mc).slice(at..at + usize::from(n)).ok_or(Fault::Malformed)
+        self.segments.stack.segment(mc).slots(mc).slice(at..at + usize::from(count)).ok_or(Fault::Malformed)
     }
 
     pub(crate) fn then(&mut self, then: Then<'gc>) -> Step<'gc> {
@@ -423,12 +423,12 @@ impl<'a, 'gc> Outer<'a, 'gc> {
     /// Applies `procedure` to `args`. For a closure, establishes a new bottom frame; for a continuation,
     /// unwinds and rewinds intervening winders before resuming with the provided arguments.
     fn apply(&mut self, procedure: Value<'gc>, args: Args<'gc>) -> Step<'gc> {
-        if let Some(k) = procedure.downcast::<Continuation>(self.mc()) {
-            let then = self.go_to(k, args)?;
+        if let Some(continuation) = procedure.downcast::<Continuation>(self.mc()) {
+            let then = self.go_to(continuation, args)?;
             return self.then(then);
         }
-        if let Some(f) = procedure.downcast::<KeywordProcedure>(self.mc()) {
-            let then = keyword::positional(self.mc(), f, args)?;
+        if let Some(callee) = procedure.downcast::<KeywordProcedure>(self.mc()) {
+            let then = keyword::positional(self.mc(), callee, args)?;
             return self.then(then);
         }
         self.start(procedure, args)?;

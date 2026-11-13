@@ -55,12 +55,12 @@ pub fn to_string(x: Digits<'_>, radix: u32, mut scratch: RWDigits<'_>, out: &mut
     at
 }
 
-fn divide_in_place(mut z: RWDigits<'_>, d: Digit) -> Digit {
+fn divide_in_place(mut z: RWDigits<'_>, divisor: Digit) -> Digit {
     let mut rem: Digit = 0;
     for i in (0..z.len()).rev() {
-        let t = (rem as TwoDigits) << DIGIT_BITS | z.at(i) as TwoDigits;
-        z.set(i, (t / d as TwoDigits) as Digit);
-        rem = (t % d as TwoDigits) as Digit;
+        let num = (rem as TwoDigits) << DIGIT_BITS | z.at(i) as TwoDigits;
+        z.set(i, (num / divisor as TwoDigits) as Digit);
+        rem = (num % divisor as TwoDigits) as Digit;
     }
     rem
 }
@@ -71,11 +71,11 @@ pub fn from_string_len(chars: usize, radix: u32) -> usize {
     (chars * bits_per_char).div_ceil(DIGIT_BITS).max(1)
 }
 
-fn char_value(c: u8) -> Option<u32> {
-    match c {
-        b'0'..=b'9' => Some((c - b'0') as u32),
-        b'a'..=b'z' => Some((c - b'a') as u32 + 10),
-        b'A'..=b'Z' => Some((c - b'A') as u32 + 10),
+fn char_value(character: u8) -> Option<u32> {
+    match character {
+        b'0'..=b'9' => Some((character - b'0') as u32),
+        b'a'..=b'z' => Some((character - b'a') as u32 + 10),
+        b'A'..=b'Z' => Some((character - b'A') as u32 + 10),
         _ => None,
     }
 }
@@ -89,9 +89,9 @@ pub fn from_string(mut z: RWDigits<'_>, text: &[u8], radix: u32) -> Option<()> {
     let mut len = 0;
     for part in text.chunks(chars) {
         let (mut value, mut scale) = (0 as Digit, 1 as Digit);
-        for &c in part {
-            let d = char_value(c).filter(|&d| d < radix)?;
-            value = value * radix as Digit + d as Digit;
+        for &character in part {
+            let digit = char_value(character).filter(|&digit| digit < radix)?;
+            value = value * radix as Digit + digit as Digit;
             scale *= radix as Digit;
         }
         let carry = multiply_add_in_place(z.slice(0, len), scale, value);

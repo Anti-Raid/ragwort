@@ -42,8 +42,8 @@ pub fn digit_sub(a: Digit, b: Digit, borrow: Digit) -> (Digit, Digit) {
 /// `a * b + add + carry`, low digit and high digit.
 #[inline]
 pub fn digit_mul_add(a: Digit, b: Digit, add: Digit, carry: Digit) -> (Digit, Digit) {
-    let t = a as TwoDigits * b as TwoDigits + add as TwoDigits + carry as TwoDigits;
-    (t as Digit, (t >> DIGIT_BITS) as Digit)
+    let total = a as TwoDigits * b as TwoDigits + add as TwoDigits + carry as TwoDigits;
+    (total as Digit, (total >> DIGIT_BITS) as Digit)
 }
 
 /// A read-only view of digits, in cells so a host can lend the words it keeps them in.
@@ -77,13 +77,13 @@ impl<'a> Digits<'a> {
     /// Without high zero digits.
     #[inline]
     pub fn normalize(self) -> Self {
-        let len = self.digits.iter().rposition(|d| d.get() != 0).map_or(0, |i| i + 1);
+        let len = self.digits.iter().rposition(|digit| digit.get() != 0).map_or(0, |i| i + 1);
         Self { digits: &self.digits[..len] }
     }
 
     #[inline]
     pub fn is_zero(self) -> bool {
-        self.digits.iter().all(|d| d.get() == 0)
+        self.digits.iter().all(|digit| digit.get() == 0)
     }
 
     /// The most significant digit, or 0 if there are none.
@@ -159,15 +159,15 @@ impl<'a> RWDigits<'a> {
     }
 
     #[inline]
-    pub fn set(&mut self, i: usize, d: Digit) {
-        self.digits[i].set(d);
+    pub fn set(&mut self, i: usize, digit: Digit) {
+        self.digits[i].set(digit);
     }
 
     /// Sets digit `i` to the first of `pair`, and returns the second: what a digit operation
     /// carries or borrows.
     #[inline]
-    pub fn put(&mut self, i: usize, (d, carry): (Digit, Digit)) -> Digit {
-        self.digits[i].set(d);
+    pub fn put(&mut self, i: usize, (digit, carry): (Digit, Digit)) -> Digit {
+        self.digits[i].set(digit);
         carry
     }
 
@@ -205,19 +205,19 @@ impl<'a> RWDigits<'a> {
     /// Splits into the first `mid` digits and the rest.
     #[inline]
     pub fn split(self, mid: usize) -> (RWDigits<'a>, RWDigits<'a>) {
-        let (a, b) = self.digits.split_at(mid.min(self.digits.len()));
-        (RWDigits { digits: a }, RWDigits { digits: b })
+        let (first, rest) = self.digits.split_at(mid.min(self.digits.len()));
+        (RWDigits { digits: first }, RWDigits { digits: rest })
     }
 
     #[inline]
     pub fn clear(&mut self) {
-        self.digits.iter().for_each(|d| d.set(0));
+        self.digits.iter().for_each(|digit| digit.set(0));
     }
 
     #[inline]
     pub fn copy_from(&mut self, x: Digits<'_>) {
         let n = x.len().min(self.len());
-        self.digits[..n].iter().zip(x.iter()).for_each(|(d, x)| d.set(x));
-        self.digits[n..].iter().for_each(|d| d.set(0));
+        self.digits[..n].iter().zip(x.iter()).for_each(|(digit, x)| digit.set(x));
+        self.digits[n..].iter().for_each(|digit| digit.set(0));
     }
 }

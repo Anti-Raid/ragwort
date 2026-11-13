@@ -21,19 +21,19 @@ const LOG_LARGE: f64 = 708.3964185322641;
 const SQRT_LARGE: f64 = 6.703903964971299e153;
 const SQRT_MIN: f64 = 1.4916681462400413e-154;
 
-/// `x * 2^k`, with one rounding unless the result is far below the normal range.
-pub(crate) fn ldexp(mut x: f64, k: i64) -> f64 {
-    let mut k = k.clamp(-2200, 2200);
-    let power = |k: i64| f64::from_bits(((k + 1023) as u64) << 52);
-    while k > 1023 {
+/// `x * 2^exponent`, with one rounding unless the result is far below the normal range.
+pub(crate) fn ldexp(mut x: f64, exponent: i64) -> f64 {
+    let mut exponent = exponent.clamp(-2200, 2200);
+    let power = |exponent: i64| f64::from_bits(((exponent + 1023) as u64) << 52);
+    while exponent > 1023 {
         x *= power(1023);
-        k -= 1023;
+        exponent -= 1023;
     }
-    while k < -1022 {
+    while exponent < -1022 {
         x *= power(-1022);
-        k += 1022;
+        exponent += 1022;
     }
-    x * power(k)
+    x * power(exponent)
 }
 
 /// Smith's division, as CPython does it.
@@ -73,7 +73,7 @@ pub(crate) fn sqrt(z: C) -> C {
         return c(0.0, z.im);
     }
     let (ax, ay) = (z.re.abs(), z.im.abs());
-    let s = if ax < f64::MIN_POSITIVE && ay < f64::MIN_POSITIVE {
+    let root = if ax < f64::MIN_POSITIVE && ay < f64::MIN_POSITIVE {
         // hypot(ax, ay) would be subnormal, so scale up first.
         let ax = ldexp(ax, 53);
         ldexp((ax + ax.hypot(ldexp(ay, 53))).sqrt(), -27)
@@ -81,19 +81,19 @@ pub(crate) fn sqrt(z: C) -> C {
         let ax = ax / 8.0;
         2.0 * (ax + ax.hypot(ay / 8.0)).sqrt()
     };
-    let d = ay / (2.0 * s);
-    if z.re >= 0.0 { c(s, d.copysign(z.im)) } else { c(d, s.copysign(z.im)) }
+    let quotient = ay / (2.0 * root);
+    if z.re >= 0.0 { c(root, quotient.copysign(z.im)) } else { c(quotient, root.copysign(z.im)) }
 }
 
-/// `t · e^x`, which overflows only when the product does, and stays zero for a zero `t`.
-fn times_exp(t: f64, x: f64) -> f64 {
-    if t == 0.0 {
-        t
+/// `factor · e^x`, which overflows only when the product does, and stays zero for a zero `factor`.
+fn times_exp(factor: f64, x: f64) -> f64 {
+    if factor == 0.0 {
+        factor
     } else if x <= LOG_LARGE {
-        t * x.exp()
+        factor * x.exp()
     } else {
-        let h = (x / 2.0).exp();
-        t * h * h
+        let half = (x / 2.0).exp();
+        factor * half * half
     }
 }
 
@@ -121,12 +121,12 @@ pub(crate) fn log(z: C) -> C {
             ldexp(ax, 53).hypot(ldexp(ay, 53)).ln() - 53.0 * LN_2
         }
     } else {
-        let m = ax.hypot(ay);
-        if (0.71..=1.73).contains(&m) {
+        let magnitude = ax.hypot(ay);
+        if (0.71..=1.73).contains(&magnitude) {
             let (big, small) = (ax.max(ay), ax.min(ay));
             ((big - 1.0) * (big + 1.0) + small * small).ln_1p() / 2.0
         } else {
-            m.ln()
+            magnitude.ln()
         }
     };
     c(re, z.im.atan2(z.re))
@@ -134,8 +134,8 @@ pub(crate) fn log(z: C) -> C {
 
 /// `-i·sinh(iz)`.
 pub(crate) fn sin(z: C) -> C {
-    let s = sinh(c(-z.im, z.re));
-    c(s.im, -s.re)
+    let rotated = sinh(c(-z.im, z.re));
+    c(rotated.im, -rotated.re)
 }
 
 /// `cosh(iz)`.
@@ -145,14 +145,14 @@ pub(crate) fn cos(z: C) -> C {
 
 /// `-i·tanh(iz)`.
 pub(crate) fn tan(z: C) -> C {
-    let t = tanh(c(-z.im, z.re));
-    c(t.im, -t.re)
+    let rotated = tanh(c(-z.im, z.re));
+    c(rotated.im, -rotated.re)
 }
 
-/// `sinh x` or `cosh x` times `t`, for `|x|` past where they overflow on their own.
-fn times_half_exp(t: f64, x: f64, odd: bool) -> f64 {
-    let r = times_exp(t / 2.0, x.abs());
-    if odd && x < 0.0 { -r } else { r }
+/// `sinh x` or `cosh x` times `factor`, for `|x|` past where they overflow on their own.
+fn times_half_exp(factor: f64, x: f64, odd: bool) -> f64 {
+    let result = times_exp(factor / 2.0, x.abs());
+    if odd && x < 0.0 { -result } else { result }
 }
 
 fn sinh(z: C) -> C {
@@ -217,8 +217,8 @@ fn tanh(z: C) -> C {
 }
 
 pub(crate) fn asin(z: C) -> C {
-    let s = asinh(c(-z.im, z.re));
-    c(s.im, -s.re)
+    let rotated = asinh(c(-z.im, z.re));
+    c(rotated.im, -rotated.re)
 }
 
 pub(crate) fn acos(z: C) -> C {
@@ -235,8 +235,8 @@ pub(crate) fn acos(z: C) -> C {
     }
     if z.re.abs() > LARGE || z.im.abs() > LARGE {
         let re = z.im.abs().atan2(z.re);
-        let l = (z.re / 2.0).hypot(z.im / 2.0).ln() + LN_2 * 2.0;
-        let im = if z.re < 0.0 { -l.copysign(z.im) } else { l.copysign(-z.im) };
+        let log_magnitude = (z.re / 2.0).hypot(z.im / 2.0).ln() + LN_2 * 2.0;
+        let im = if z.re < 0.0 { -log_magnitude.copysign(z.im) } else { log_magnitude.copysign(-z.im) };
         return c(re, im);
     }
     let s1 = sqrt(c(1.0 - z.re, -z.im));
@@ -245,8 +245,8 @@ pub(crate) fn acos(z: C) -> C {
 }
 
 pub(crate) fn atan(z: C) -> C {
-    let s = atanh(c(-z.im, z.re));
-    c(s.im, -s.re)
+    let rotated = atanh(c(-z.im, z.re));
+    c(rotated.im, -rotated.re)
 }
 
 fn asinh(z: C) -> C {
@@ -262,8 +262,8 @@ fn asinh(z: C) -> C {
         };
     }
     if z.re.abs() > LARGE || z.im.abs() > LARGE {
-        let l = (z.re / 2.0).hypot(z.im / 2.0).ln() + LN_2 * 2.0;
-        let re = if z.im >= 0.0 { l.copysign(z.re) } else { -l.copysign(-z.re) };
+        let log_magnitude = (z.re / 2.0).hypot(z.im / 2.0).ln() + LN_2 * 2.0;
+        let re = if z.im >= 0.0 { log_magnitude.copysign(z.re) } else { -log_magnitude.copysign(-z.re) };
         return c(re, z.im.atan2(z.re.abs()));
     }
     let s1 = sqrt(c(1.0 + z.im, -z.re));
@@ -284,13 +284,13 @@ fn atanh(z: C) -> C {
         };
     }
     if z.re < 0.0 {
-        let s = atanh(c(-z.re, -z.im));
-        return c(-s.re, -s.im);
+        let negated = atanh(c(-z.re, -z.im));
+        return c(-negated.re, -negated.im);
     }
     let ay = z.im.abs();
     if z.re > SQRT_LARGE || ay > SQRT_LARGE {
-        let h = (z.re / 2.0).hypot(z.im / 2.0);
-        let re = if h.is_infinite() { 0.0f64.copysign(z.re) } else { z.re / 4.0 / h / h };
+        let half_magnitude = (z.re / 2.0).hypot(z.im / 2.0);
+        let re = if half_magnitude.is_infinite() { 0.0f64.copysign(z.re) } else { z.re / 4.0 / half_magnitude / half_magnitude };
         return c(re, -FRAC_PI_2.copysign(-z.im));
     }
     if z.re == 1.0 && ay < SQRT_MIN {

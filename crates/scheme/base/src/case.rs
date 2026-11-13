@@ -60,10 +60,10 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         self.distinct(&ids)?;
         let matched = self.fresh();
         let mut binds = Vec::with_capacity(ids.len());
-        for (k, (&id, &(_, depth))) in ids.iter().zip(&vars).enumerate() {
+        for (slot, (&id, &(_, depth))) in ids.iter().zip(&vars).enumerate() {
             let var = self.fresh();
             self.bind(id, Binding::Pattern { var, depth })?;
-            let at = Core::Quote(Value::fixnum(k as i64).expect("a fixnum"));
+            let at = Core::Quote(Value::fixnum(slot as i64).expect("a fixnum"));
             binds.push((var, Core::Intrinsic(Prim::Intrinsic(Intrinsic::VectorRef), vec![local(matched), at], None)));
         }
         let output = self.tree.with(output, scope, Op::Add)?;
@@ -76,14 +76,14 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                     return Ok(Step::Done(Core::Let(vec![(matched, asked)], Box::new(Core::If(Box::new(local(matched)), Box::new(body), Box::new(next))))));
                 };
                 // The rest are tried if the fender fails or the pattern doesn't match.
-                let k = this.fresh();
+                let retry = this.fresh();
                 let thunk = Core::Lambda(Lambda { id: this.lambda_id(), params: Vec::new(), optional: 0, rest: None, body: Box::new(next), name: None, at: None });
                 Self::expr(fender, move |_, fender| {
-                    let again = || Core::App(Box::new(local(k)), Vec::new(), None);
+                    let again = || Core::App(Box::new(local(retry)), Vec::new(), None);
                     let body = Core::If(Box::new(fender), Box::new(output), Box::new(again()));
                     let body = Core::Let(binds, Box::new(body));
                     let tried = Core::If(Box::new(local(matched)), Box::new(body), Box::new(again()));
-                    Ok(Step::Done(Core::Let(vec![(k, thunk)], Box::new(Core::Let(vec![(matched, asked)], Box::new(tried))))))
+                    Ok(Step::Done(Core::Let(vec![(retry, thunk)], Box::new(Core::Let(vec![(matched, asked)], Box::new(tried))))))
                 })
             })
         }))
@@ -105,8 +105,8 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let (mut done, mut starts, mut repeats) = (Vec::new(), Vec::new(), Vec::new());
         let mut todo = vec![Task::Visit(root, 0)];
         while let Some(task) = todo.pop() {
-            let (p, depth) = match task {
-                Task::Visit(p, depth) => (p, depth),
+            let (pattern, depth) = match task {
+                Task::Visit(pattern, depth) => (pattern, depth),
                 Task::Repeat => {
                     starts.push(slot(vars));
                     continue;
@@ -126,20 +126,20 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                     continue;
                 }
             };
-            let (items, tail, vector) = match self.tree.view(p)? {
-                View::Id if self.is_aux(p, Aux::Underscore)? => {
+            let (items, tail, vector) = match self.tree.view(pattern)? {
+                View::Id if self.is_aux(pattern, Aux::Underscore)? => {
                     done.push(shape.add(Pattern::Any));
                     continue;
                 }
-                View::Id if self.is_aux(p, Aux::Ellipsis)? => return Err(self.error(ExpandErrorKind::BadSyntax, p)),
-                View::Id if self.is_literal(p, literals)? => {
+                View::Id if self.is_aux(pattern, Aux::Ellipsis)? => return Err(self.error(ExpandErrorKind::BadSyntax, pattern)),
+                View::Id if self.is_literal(pattern, literals)? => {
                     let at = index(parts);
-                    parts.push(self.wrap(p)?);
+                    parts.push(self.wrap(pattern)?);
                     done.push(shape.add(Pattern::Literal(at)));
                     continue;
                 }
                 View::Id => {
-                    vars.push((p, depth));
+                    vars.push((pattern, depth));
                     done.push(shape.add(Pattern::Var(slot(vars) - 1)));
                     continue;
                 }
@@ -172,7 +172,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                     todo.extend(items[i + 1..].iter().map(|&item| Task::Visit(item, depth)));
                     Task::Seq { before: i - 1, repeat: true, after: items.len() - i - 1, tail: tail.is_some(), vector }
                 }
-                _ => return Err(self.error(ExpandErrorKind::BadSyntax, p)),
+                _ => return Err(self.error(ExpandErrorKind::BadSyntax, pattern)),
             };
             todo.extend(tail.map(|tail| Task::Visit(tail, depth)));
             todo.push(seq);
@@ -235,8 +235,8 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let mut done: Vec<Made> = Vec::new();
         let mut todo = vec![Task::Visit(root, 0, false)];
         while let Some(task) = todo.pop() {
-            let (t, nesting, escaped) = match task {
-                Task::Visit(t, nesting, escaped) => (t, nesting, escaped),
+            let (template, nesting, escaped) = match task {
+                Task::Visit(template, nesting, escaped) => (template, nesting, escaped),
                 Task::Escaped => {
                     done.last_mut().expect("an escaped template").escapes = true;
                     continue;
@@ -248,7 +248,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                     }
                     continue;
                 }
-                Task::Seq { t, ellipses, tail, vector, start: (parts_at, nodes, items, slots) } => {
+                Task::Seq { t: template, ellipses, tail, vector, start: (parts_at, nodes, items, slots) } => {
                     let tail = if tail { done.pop() } else { None };
                     let built = done.split_off(done.len() - ellipses.len());
                     let inner = built.iter().chain(&tail).any(|made| made.escapes);
@@ -257,7 +257,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                     if built.iter().chain(&tail).all(|made| made.constant) && !inner {
                         parts.truncate(parts_at);
                         shape.truncate(nodes, items, slots);
-                        parts.push(self.wrap(t)?);
+                        parts.push(self.wrap(template)?);
                         done.push(Made { node: shape.add(Template::Const(index(&parts[..parts_at]))), slots: Vec::new(), constant: true, escapes: false });
                         continue;
                     }
@@ -270,23 +270,23 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                     let tail = tail.map(|made| made.node);
                     let items = shape.items(built.into_iter().zip(ellipses).map(|(made, ellipses)| (made.node, ellipses, made.slots)));
                     let kind = if vector { SyntaxKind::Vector } else { SyntaxKind::List };
-                    let set = self.tree.scopes_of(t)?;
+                    let set = self.tree.scopes_of(template)?;
                     let meta = self.meta(set, kind)?;
                     let like = index(parts);
-                    parts.push(Syntax::new(self.mc, Value::NIL, self.tree.span(t), Some(meta))?.value(self.mc));
+                    parts.push(Syntax::new(self.mc, Value::NIL, self.tree.span(template), Some(meta))?.value(self.mc));
                     let node = shape.add(Template::Seq { items, tail, vector, like });
                     done.push(Made { node, slots: all, constant: false, escapes: inner });
                     continue;
                 }
             };
-            let (items, tail, vector) = match self.tree.view(t)? {
-                View::Id if !escaped && self.is_aux(t, Aux::Ellipsis)? => return Err(self.error(ExpandErrorKind::BadSyntax, t)),
+            let (items, tail, vector) = match self.tree.view(template)? {
+                View::Id if !escaped && self.is_aux(template, Aux::Ellipsis)? => return Err(self.error(ExpandErrorKind::BadSyntax, template)),
                 View::Id => {
-                    if let Binding::Pattern { var, depth } = self.resolve(t)? {
+                    if let Binding::Pattern { var, depth } = self.resolve(template)? {
                         if nesting < depth {
-                            return Err(self.error(ExpandErrorKind::BadSyntax, t));
+                            return Err(self.error(ExpandErrorKind::BadSyntax, template));
                         }
-                        let slot = used.iter().position(|&(v, _)| v == var).unwrap_or_else(|| {
+                        let slot = used.iter().position(|&(used_var, _)| used_var == var).unwrap_or_else(|| {
                             used.push((var, depth));
                             used.len() - 1
                         });
@@ -313,7 +313,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             };
             let Some(vector) = vector else {
                 let at = index(parts);
-                parts.push(self.wrap(t)?);
+                parts.push(self.wrap(template)?);
                 done.push(Made { node: shape.add(Template::Const(at)), slots: Vec::new(), constant: true, escapes: false });
                 continue;
             };
@@ -323,17 +323,17 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             let mut i = 0;
             while i < items.len() {
                 let item = items[i];
-                let mut n = 0;
+                let mut count = 0;
                 while !escaped && i + 1 < items.len() && self.is_aux(items[i + 1], Aux::Ellipsis)? {
-                    n += 1;
+                    count += 1;
                     i += 1;
                 }
-                todo.extend([Task::Visit(item, nesting + n, escaped), Task::Item(item, n, nesting)]);
-                ellipses.push(n);
+                todo.extend([Task::Visit(item, nesting + count, escaped), Task::Item(item, count, nesting)]);
+                ellipses.push(count);
                 i += 1;
             }
             todo.extend(tail.map(|tail| Task::Visit(tail, nesting, escaped)));
-            todo.push(Task::Seq { t, ellipses, tail: tail.is_some(), vector, start });
+            todo.push(Task::Seq { t: template, ellipses, tail: tail.is_some(), vector, start });
             todo[at..].reverse();
         }
         Ok(shape)

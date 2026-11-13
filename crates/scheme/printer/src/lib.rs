@@ -51,8 +51,8 @@ pub enum PrintError {
 }
 
 impl From<Error> for PrintError {
-    fn from(e: Error) -> Self {
-        Self::Arena(e)
+    fn from(error: Error) -> Self {
+        Self::Arena(error)
     }
 }
 
@@ -63,10 +63,10 @@ impl From<fmt::Error> for PrintError {
 }
 
 impl fmt::Display for PrintError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::TooLong => f.write_str("text too long to print"),
-            Self::Arena(e) => write!(f, "{e:?} while printing"),
+            Self::TooLong => formatter.write_str("text too long to print"),
+            Self::Arena(error) => write!(formatter, "{error:?} while printing"),
         }
     }
 }
@@ -141,14 +141,14 @@ impl Hasher for Fold {
     }
 
     fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.write_u64(self.0 ^ u64::from(b));
+        for &byte in bytes {
+            self.write_u64(self.0 ^ u64::from(byte));
         }
     }
 
-    fn write_u64(&mut self, n: u64) {
-        let m = u128::from(n) * 0x9e37_79b9_7f4a_7c15;
-        self.0 = m as u64 ^ (m >> 64) as u64;
+    fn write_u64(&mut self, value: u64) {
+        let product = u128::from(value) * 0x9e37_79b9_7f4a_7c15;
+        self.0 = product as u64 ^ (product >> 64) as u64;
     }
 }
 
@@ -161,36 +161,36 @@ enum Label {
     Number(u64),
 }
 
-/// Whether `v` holds other values the printer writes.
-fn is_container<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> bool {
-    Pair::of(v).is_some()
-        || AnyVector::of(v).is_some()
-        || Syntax::of(v).is_some()
-        || v.downcast::<MultiValue>(mc).is_some()
-        || v.downcast::<Condition>(mc).is_some()
-        || v.downcast::<Struct>(mc).is_some()
+/// Whether `value` holds other values the printer writes.
+fn is_container<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> bool {
+    Pair::of(value).is_some()
+        || AnyVector::of(value).is_some()
+        || Syntax::of(value).is_some()
+        || value.downcast::<MultiValue>(mc).is_some()
+        || value.downcast::<Condition>(mc).is_some()
+        || value.downcast::<Struct>(mc).is_some()
 }
 
-/// The `i`th value `v` holds that's written, if it has one.
-fn child<'gc>(mc: &Mutation<'gc>, v: Value<'gc>, i: usize) -> Option<Value<'gc>> {
-    if let Some(pair) = Pair::of(v) {
+/// The `i`th value `value` holds that's written, if it has one.
+fn child<'gc>(mc: &Mutation<'gc>, value: Value<'gc>, i: usize) -> Option<Value<'gc>> {
+    if let Some(pair) = Pair::of(value) {
         return [pair.head(mc), pair.tail(mc)].get(i).copied();
     }
-    if let Some(vector) = AnyVector::of(v) {
+    if let Some(vector) = AnyVector::of(value) {
         return vector.get(mc, i);
     }
-    if let Some(syntax) = Syntax::of(v) {
+    if let Some(syntax) = Syntax::of(value) {
         return (i == 0).then(|| syntax.datum(mc));
     }
-    if let Some(many) = v.downcast::<MultiValue>(mc) {
+    if let Some(many) = value.downcast::<MultiValue>(mc) {
         let items = many.items(mc);
         return (i < items.len()).then(|| items.get(i));
     }
-    if let Some(made) = v.downcast::<Struct>(mc) {
+    if let Some(made) = value.downcast::<Struct>(mc) {
         let fields = made.items(mc);
         return (i < fields.len()).then(|| fields.get(i));
     }
-    let condition = v.downcast::<Condition>(mc)?;
+    let condition = value.downcast::<Condition>(mc)?;
     [condition.message(mc), condition.irritants(mc)].get(i).copied()
 }
 
@@ -198,36 +198,36 @@ fn child<'gc>(mc: &Mutation<'gc>, v: Value<'gc>, i: usize) -> Option<Value<'gc>>
 /// as long, but for syntax, which is written as its datum, so the walk stops past `limit`.
 fn cycles<'gc>(mc: &Mutation<'gc>, root: Value<'gc>, limit: usize) -> Result<Map<Label>, PrintError> {
     let (mut on_path, mut labels) = (Map::default(), Map::default());
-    let mutable = |v: Value<'gc>| Vector::of(v).is_some() || v.downcast::<Struct>(mc).is_some();
+    let mutable = |value: Value<'gc>| Vector::of(value).is_some() || value.downcast::<Struct>(mc).is_some();
     if mutable(root) {
         on_path.insert(root.to_bits(), ());
     }
     let (mut path, mut walked) = (vec![(root, 0)], 0usize);
-    while let Some((v, i)) = path.last_mut() {
-        let Some(c) = child(mc, *v, *i) else {
-            if mutable(*v) {
-                on_path.remove(&v.to_bits());
+    while let Some((parent, index)) = path.last_mut() {
+        let Some(item) = child(mc, *parent, *index) else {
+            if mutable(*parent) {
+                on_path.remove(&parent.to_bits());
             }
             path.pop();
             continue;
         };
-        *i += 1;
-        if !is_container(mc, c) {
+        *index += 1;
+        if !is_container(mc, item) {
             continue;
         }
-        if mutable(c) {
+        if mutable(item) {
             // One that's labelled is written in full once, and after as its label.
-            if on_path.contains_key(&c.to_bits()) || labels.contains_key(&c.to_bits()) {
-                labels.insert(c.to_bits(), Label::Pending);
+            if on_path.contains_key(&item.to_bits()) || labels.contains_key(&item.to_bits()) {
+                labels.insert(item.to_bits(), Label::Pending);
                 continue;
             }
-            on_path.insert(c.to_bits(), ());
+            on_path.insert(item.to_bits(), ());
         }
-        walked += usize::from(Syntax::of(c).is_none());
+        walked += usize::from(Syntax::of(item).is_none());
         if walked > limit {
             return Err(PrintError::TooLong);
         }
-        path.push((c, 0));
+        path.push((item, 0));
     }
     Ok(labels)
 }
@@ -238,23 +238,23 @@ fn shared<'gc>(mc: &Mutation<'gc>, root: Value<'gc>, limit: usize) -> Result<Map
     let (mut seen, mut labels) = (Map::default(), Map::default());
     seen.insert(root.to_bits(), ());
     let (mut path, mut walked) = (vec![(root, 0)], 0usize);
-    while let Some((v, i)) = path.last_mut() {
-        let Some(c) = child(mc, *v, *i) else {
+    while let Some((parent, index)) = path.last_mut() {
+        let Some(item) = child(mc, *parent, *index) else {
             path.pop();
             continue;
         };
-        *i += 1;
-        if !is_container(mc, c) {
+        *index += 1;
+        if !is_container(mc, item) {
             continue;
         }
-        if seen.insert(c.to_bits(), ()).is_some() {
-            labels.insert(c.to_bits(), Label::Pending);
+        if seen.insert(item.to_bits(), ()).is_some() {
+            labels.insert(item.to_bits(), Label::Pending);
         } else {
-            walked += usize::from(Syntax::of(c).is_none());
+            walked += usize::from(Syntax::of(item).is_none());
             if walked > limit {
                 return Err(PrintError::TooLong);
             }
-            path.push((c, 0));
+            path.push((item, 0));
         }
     }
     Ok(labels)
@@ -294,7 +294,7 @@ impl<'gc> Printer<'_, 'gc> {
         let mut work = vec![Work::Value(value)];
         while let Some(next) = work.pop() {
             match next {
-                Work::Value(v) => self.value(v, &mut work)?,
+                Work::Value(value) => self.value(value, &mut work)?,
                 Work::Text(text) => self.out.push_str(text),
                 Work::Tail(rest) => {
                     if rest == Value::NIL {
@@ -324,13 +324,13 @@ impl<'gc> Printer<'_, 'gc> {
         Ok(())
     }
 
-    fn value(&mut self, v: Value<'gc>, work: &mut Vec<Work<'gc>>) -> Result<(), PrintError> {
+    fn value(&mut self, value: Value<'gc>, work: &mut Vec<Work<'gc>>) -> Result<(), PrintError> {
         let mc = self.mc;
         if !self.labels.is_empty()
-            && let Some(label) = self.labels.get_mut(&v.to_bits())
+            && let Some(label) = self.labels.get_mut(&value.to_bits())
         {
             match *label {
-                Label::Number(n) => return Ok(write!(self.out, "#{n}#")?),
+                Label::Number(number) => return Ok(write!(self.out, "#{number}#")?),
                 Label::Pending => {
                     *label = Label::Number(self.next);
                     write!(self.out, "#{}=", self.next)?;
@@ -338,35 +338,35 @@ impl<'gc> Printer<'_, 'gc> {
                 }
             }
         }
-        if let Some(pair) = Pair::of(v) {
+        if let Some(pair) = Pair::of(value) {
             self.out.push('(');
             work.extend([Work::Text(")"), Work::Tail(pair.tail(mc)), Work::Value(pair.head(mc))]);
-        } else if AnyVector::of(v).is_some() {
+        } else if AnyVector::of(value).is_some() {
             self.out.push_str("#(");
-            work.extend([Work::Text(")"), Work::Items(v, 0)]);
-        } else if let Some(syntax) = Syntax::of(v) {
+            work.extend([Work::Text(")"), Work::Items(value, 0)]);
+        } else if let Some(syntax) = Syntax::of(value) {
             self.syntax(syntax, work);
-        } else if let Some(many) = v.downcast::<MultiValue>(mc) {
+        } else if let Some(many) = value.downcast::<MultiValue>(mc) {
             self.out.push_str("#<values");
             if !many.items(mc).is_empty() {
                 self.out.push(' ');
             }
-            work.extend([Work::Text(">"), Work::Items(v, 0)]);
-        } else if let Some(condition) = v.downcast::<Condition>(mc) {
+            work.extend([Work::Text(">"), Work::Items(value, 0)]);
+        } else if let Some(condition) = value.downcast::<Condition>(mc) {
             self.condition(condition, work)?;
-        } else if let Some(made) = v.downcast::<Struct>(mc) {
+        } else if let Some(made) = value.downcast::<Struct>(mc) {
             self.out.push_str("#(struct:");
             self.type_name(made.kind(mc).map(|kind| kind.name(mc)));
             if !made.items(mc).is_empty() {
                 self.out.push(' ');
             }
-            work.extend([Work::Text(")"), Work::Items(v, 0)]);
-        } else if let Some(kind) = v.downcast::<StructType>(mc) {
+            work.extend([Work::Text(")"), Work::Items(value, 0)]);
+        } else if let Some(kind) = value.downcast::<StructType>(mc) {
             self.out.push_str("#<struct-type:");
             self.type_name(Some(kind.name(mc)));
             self.out.push('>');
         } else {
-            self.atom(v)?;
+            self.atom(value)?;
         }
         Ok(())
     }
@@ -385,8 +385,8 @@ impl<'gc> Printer<'_, 'gc> {
             self.in_syntax += 1;
             work.extend([Work::Text(">"), Work::LeaveSyntax]);
         }
-        if let Some(SyntaxKind::Abbreviation(a)) = syntax.kind(self.mc) {
-            self.out.push_str(prefix(a));
+        if let Some(SyntaxKind::Abbreviation(abbreviation)) = syntax.kind(self.mc) {
+            self.out.push_str(prefix(abbreviation));
         }
         work.push(Work::Value(datum));
     }
@@ -420,78 +420,78 @@ impl<'gc> Printer<'_, 'gc> {
         Ok(())
     }
 
-    fn atom(&mut self, v: Value<'gc>) -> Result<(), PrintError> {
+    fn atom(&mut self, value: Value<'gc>) -> Result<(), PrintError> {
         let mc = self.mc;
         let write = self.mode != Mode::Display;
-        if let Some(n) = v.as_fixnum() {
-            write!(self.out, "{n}")?;
-        } else if let Some(s) = self.strings.string(v) {
+        if let Some(fixnum) = value.as_fixnum() {
+            write!(self.out, "{fixnum}")?;
+        } else if let Some(text) = self.strings.string(value) {
             if write {
-                self.write_string(s, '"');
+                self.write_string(text, '"');
             } else {
                 // Stop writing once we exceed the remaining byte budget, so multi-byte UTF-8 doesn't overshoot it.
                 let mut written = 0;
                 let room = self.room();
-                for c in string::chars(&self.strings, s) {
-                    let len = c.len_utf8();
-                    self.out.push(c);
+                for character in string::chars(&self.strings, text) {
+                    let len = character.len_utf8();
+                    self.out.push(character);
                     written += len;
                     if written > room {
                         break;
                     }
                 }
             }
-        } else if let Some(symbol) = Symbol::of(v) {
+        } else if let Some(symbol) = Symbol::of(value) {
             self.symbol(symbol, write)?;
-        } else if let Some(keyword) = Keyword::of(v) {
+        } else if let Some(keyword) = Keyword::of(value) {
             let name = string::display(&self.strings, keyword.symbol(self.mc).name(self.mc)).to_string();
             self.out.push_str("#:");
-            let bars = name.is_empty() || name.bytes().any(ends_name) || name.chars().any(|c| c.is_control() || c.is_whitespace());
+            let bars = name.is_empty() || name.bytes().any(ends_name) || name.chars().any(|character| character.is_control() || character.is_whitespace());
             if write && bars { self.write_text(name.chars(), '|') } else { self.out.push_str(&name) }
-        } else if let Some(c) = v.as_char() {
+        } else if let Some(character) = value.as_char() {
             if write {
-                self.write_char(c);
+                self.write_char(character);
             } else {
-                self.out.push(c);
+                self.out.push(character);
             }
-        } else if let Some(z) = self.nums.number(v) {
-            self.number(z)?;
-        } else if let Some(bytes) = Bytevectors::new(mc).bytevector(v) {
+        } else if let Some(number) = self.nums.number(value) {
+            self.number(number)?;
+        } else if let Some(bytes) = Bytevectors::new(mc).bytevector(value) {
             self.out.push_str("#u8(");
-            // Each byte is written as a character or more, so no more bytes are copied out than there is room to write.
+            // Each byte takes at least one character of output. Copy out only as many bytes as could still fit.
             let shown = bytes.len(mc).min(self.room().saturating_add(1));
-            for (i, b) in bytes.bytes(mc, 0, shown).iter().enumerate() {
+            for (i, byte) in bytes.bytes(mc, 0, shown).iter().enumerate() {
                 if i > 0 {
                     self.out.push(' ');
                 }
-                write!(self.out, "{b}")?;
+                write!(self.out, "{byte}")?;
             }
             self.out.push(')');
-        } else if let Some(name) = ragwort_vm::report::procedure_name(mc, v) {
+        } else if let Some(name) = ragwort_vm::report::procedure_name(mc, value) {
             self.out.push_str("#<procedure ");
             self.symbol(name, false)?;
             self.out.push('>');
         } else {
-            self.out.push_str(match v {
+            self.out.push_str(match value {
                 Value::NIL => "()",
                 Value::TRUE => "#t",
                 Value::FALSE => "#f",
                 Value::VOID => "#<void>",
                 Value::UNDEFINED => "#<undefined>",
                 Value::UNSUPPLIED => "#<unsupplied>",
-                _ if v.downcast::<Closure>(mc).is_some() || v.downcast::<KeywordProcedure>(mc).is_some() => "#<procedure>",
-                _ if v.downcast::<Continuation>(mc).is_some() => "#<continuation>",
-                _ if v.downcast::<ExternalRef>(mc).is_some() => "#<external>",
-                _ if v.downcast::<Task>(mc).is_some() => "#<coroutine>",
-                _ if v.downcast::<Tag>(mc).is_some() => "#<prompt-tag>",
+                _ if value.downcast::<Closure>(mc).is_some() || value.downcast::<KeywordProcedure>(mc).is_some() => "#<procedure>",
+                _ if value.downcast::<Continuation>(mc).is_some() => "#<continuation>",
+                _ if value.downcast::<ExternalRef>(mc).is_some() => "#<external>",
+                _ if value.downcast::<Task>(mc).is_some() => "#<coroutine>",
+                _ if value.downcast::<Tag>(mc).is_some() => "#<prompt-tag>",
                 _ => "#<object>",
             });
         }
         Ok(())
     }
 
-    fn number(&mut self, z: ragwort_types::num::Number<'gc>) -> Result<(), PrintError> {
-        self.out.push_str(&complex::to_string(&self.nums, z, 10)?);
+    fn number(&mut self, number: ragwort_types::num::Number<'gc>) -> Result<(), PrintError> {
+        self.out.push_str(&complex::to_string(&self.nums, number, 10)?);
         Ok(())
     }
 
@@ -511,18 +511,18 @@ impl<'gc> Printer<'_, 'gc> {
             || name == "."
             || name.starts_with('#')
             || name.bytes().any(ends_name)
-            || name.chars().any(|c| c.is_control() || c.is_whitespace())
+            || name.chars().any(|character| character.is_control() || character.is_whitespace())
             || starts_numeric(name)
-            || might_be_number(name) && number::parse(&self.nums, name).map_or(true, |n| n.is_some())
+            || might_be_number(name) && number::parse(&self.nums, name).map_or(true, |parsed| parsed.is_some())
     }
 
-    fn write_string(&mut self, s: ragwort_types::string::Str<'gc>, quote: char) {
-        // Each character is written as a byte or more, so no more characters are taken than there is room to write.
-        let chars: Vec<char> = string::chars(&self.strings, s).take(self.room().saturating_add(1)).collect();
+    fn write_string(&mut self, text: ragwort_types::string::Str<'gc>, quote: char) {
+        // Each character takes at least one byte of output. Take only as many characters as could still fit.
+        let chars: Vec<char> = string::chars(&self.strings, text).take(self.room().saturating_add(1)).collect();
         self.write_text(chars.into_iter(), quote);
     }
 
-    /// Returns the number of bytes that can still be written before the output is past its limit.
+    /// Returns the number of bytes that can still be written before the output exceeds its limit.
     fn room(&self) -> usize {
         self.limit.saturating_sub(self.out.len())
     }
@@ -530,12 +530,12 @@ impl<'gc> Printer<'_, 'gc> {
     /// `chars` between `quote`s, with escapes for what wouldn't read back.
     fn write_text(&mut self, chars: impl Iterator<Item = char>, quote: char) {
         self.out.push(quote);
-        for c in chars {
-            match c {
+        for character in chars {
+            match character {
                 '\\' => self.out.push_str("\\\\"),
-                _ if c == quote => {
+                _ if character == quote => {
                     self.out.push('\\');
-                    self.out.push(c);
+                    self.out.push(character);
                 }
                 '\n' => self.out.push_str("\\n"),
                 '\t' => self.out.push_str("\\t"),
@@ -543,15 +543,15 @@ impl<'gc> Printer<'_, 'gc> {
                 '\x07' => self.out.push_str("\\a"),
                 '\x08' => self.out.push_str("\\b"),
                 '\0' => self.out.push_str("\\0"),
-                _ if unseen(c) => _ = write!(self.out, "\\x{:x};", c as u32),
-                _ => self.out.push(c),
+                _ if unseen(character) => _ = write!(self.out, "\\x{:x};", character as u32),
+                _ => self.out.push(character),
             }
         }
         self.out.push(quote);
     }
 
-    fn write_char(&mut self, c: char) {
-        let name = match c {
+    fn write_char(&mut self, character: char) {
+        let name = match character {
             '\x07' => "alarm",
             '\x08' => "backspace",
             '\x7f' => "delete",
@@ -562,13 +562,13 @@ impl<'gc> Printer<'_, 'gc> {
             ' ' => "space",
             '\t' => "tab",
             // Alone, what joins or varies emoji shows nothing either.
-            _ if unseen(c) || c.is_whitespace() || c == '\u{200d}' || ('\u{fe00}'..='\u{fe0f}').contains(&c) => {
-                _ = write!(self.out, "#\\x{:x}", c as u32);
+            _ if unseen(character) || character.is_whitespace() || character == '\u{200d}' || ('\u{fe00}'..='\u{fe0f}').contains(&character) => {
+                _ = write!(self.out, "#\\x{:x}", character as u32);
                 return;
             }
             _ => {
                 self.out.push_str("#\\");
-                self.out.push(c);
+                self.out.push(character);
                 return;
             }
         };
@@ -577,20 +577,20 @@ impl<'gc> Printer<'_, 'gc> {
     }
 }
 
-/// Whether `c` shows nothing where it's written: controls, noncharacters, and the marks that
+/// Whether `character` shows nothing where it's written: controls, noncharacters, and the marks that
 /// only steer layout, such as zero-width spaces and direction marks. Joiners and variation
 /// selectors are left out, as emoji are made of them.
-fn unseen(c: char) -> bool {
-    let n = c as u32;
-    c.is_control()
-        || (0xFDD0..=0xFDEF).contains(&n)
-        || n & 0xFFFE == 0xFFFE
-        || matches!(n, 0xAD | 0x200B | 0x200C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB)
+fn unseen(character: char) -> bool {
+    let code = character as u32;
+    character.is_control()
+        || (0xFDD0..=0xFDEF).contains(&code)
+        || code & 0xFFFE == 0xFFFE
+        || matches!(code, 0xAD | 0x200B | 0x200C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB)
 }
 
-/// What `a` is written as.
-fn prefix(a: Abbreviation) -> &'static str {
-    match a {
+/// What `abbreviation` is written as.
+fn prefix(abbreviation: Abbreviation) -> &'static str {
+    match abbreviation {
         Abbreviation::Quote => "'",
         Abbreviation::Quasiquote => "`",
         Abbreviation::Unquote => ",",

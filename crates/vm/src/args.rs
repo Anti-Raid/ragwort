@@ -33,7 +33,9 @@ enum Held<'gc> {
 
 const _: () = assert!(size_of::<Held<'static>>() <= size_of::<Slots<'static>>() + size_of::<u64>());
 
-/// Returns `last`, the final argument of an `apply`, as the list of arguments it spreads into. Multiple values are not a list, although the arguments of `call-with-values` are held the same way, so they are a [`Fault::WrongType`]. Whether `last` is a proper list is checked where its elements are bound.
+/// Checks `last`, the final argument of an `apply`, and returns it as the list to spread.
+///
+/// Returns [`Fault::WrongType`] if `last` is a multiple-values object. Such an object is not a list, although `call-with-values` passes its arguments in the same field. This function does not check that `last` is a proper list. That check happens where the elements are bound.
 fn spread<'gc>(mc: &Mutation<'gc>, last: Value<'gc>) -> Result<Value<'gc>, Fault> {
     if last.downcast::<MultiValue>(mc).is_some() { Err(Fault::WrongType) } else { Ok(last) }
 }
@@ -50,12 +52,12 @@ impl<'gc> Args<'gc> {
         Args { held: inline(&[]), rest: Value::NIL }
     }
 
-    pub(crate) fn one(a: Value<'gc>) -> Self {
-        Args { held: inline(&[a]), rest: Value::NIL }
+    pub(crate) fn one(value: Value<'gc>) -> Self {
+        Args { held: inline(&[value]), rest: Value::NIL }
     }
 
-    pub(crate) fn two(a: Value<'gc>, b: Value<'gc>) -> Self {
-        Args { held: inline(&[a, b]), rest: Value::NIL }
+    pub(crate) fn two(first: Value<'gc>, second: Value<'gc>) -> Self {
+        Args { held: inline(&[first, second]), rest: Value::NIL }
     }
 
     /// Constructs an `Args` sequence starting with `first`, followed by the elements in `rest` (a list or [`MultiValue`]).
@@ -76,14 +78,14 @@ impl<'gc> Args<'gc> {
     fn held(self) -> usize {
         match self.held {
             Held::Slots(slots) => slots.len(),
-            Held::Inline(_, n) => usize::from(n),
+            Held::Inline(_, count) => usize::from(count),
         }
     }
 
-    fn held_get(self, i: usize) -> Value<'gc> {
+    fn held_get(self, index: usize) -> Value<'gc> {
         match self.held {
-            Held::Slots(slots) => slots.get(i),
-            Held::Inline(values, _) => values[i],
+            Held::Slots(slots) => slots.get(index),
+            Held::Inline(values, _) => values[index],
         }
     }
 
@@ -92,35 +94,35 @@ impl<'gc> Args<'gc> {
         if let Some(mv) = self.rest.downcast::<MultiValue>(mc) {
             return Ok(self.held() + mv.items(mc).len());
         }
-        // A pair knows the length of the list it starts, so the rest is not walked.
+        // A pair stores the length of the list that it starts, so this does not walk the list.
         let rest = Pairs::new(mc).list_len(self.rest).ok_or(Fault::WrongType)?;
         usize::try_from(rest).ok().and_then(|rest| self.held().checked_add(rest)).ok_or(Fault::OutOfRange)
     }
 
-    /// Retrieves the argument at 0-based index `i`, returning [`Fault::Arity`] if `i` is out of bounds.
-    pub(crate) fn get(self, mc: &Mutation<'gc>, i: usize) -> Result<Value<'gc>, Fault> {
-        if i < self.held() {
-            return Ok(self.held_get(i));
+    /// Retrieves the argument at 0-based index `index`, returning [`Fault::Arity`] if `index` is out of bounds.
+    pub(crate) fn get(self, mc: &Mutation<'gc>, index: usize) -> Result<Value<'gc>, Fault> {
+        if index < self.held() {
+            return Ok(self.held_get(index));
         }
-        let i = i - self.held();
+        let index = index - self.held();
         if let Some(mv) = self.rest.downcast::<MultiValue>(mc) {
             let items = mv.items(mc);
-            return if i < items.len() { Ok(items.get(i)) } else { Err(Fault::Arity) };
+            return if index < items.len() { Ok(items.get(index)) } else { Err(Fault::Arity) };
         }
         let mut at = self.rest;
-        for _ in 0..i {
+        for _ in 0..index {
             at = Pair::of(at).ok_or(Fault::Arity)?.tail(mc);
         }
         Ok(Pair::of(at).ok_or(Fault::Arity)?.head(mc))
     }
 
-    /// Returns a new `Args` slice containing the arguments starting from index `k` onward.
-    pub(crate) fn tail(self, mc: &Mutation<'gc>, k: usize) -> Result<Self, Fault> {
+    /// Returns a new `Args` slice containing the arguments starting from index `start` onward.
+    pub(crate) fn tail(self, mc: &Mutation<'gc>, start: usize) -> Result<Self, Fault> {
         let held = self.held();
-        if k <= held {
+        if start <= held {
             let held = match self.held {
-                Held::Slots(slots) => Held::Slots(slots.slice(k..held).ok_or(Fault::Malformed)?),
-                Held::Inline(values, n) => inline(&values[k..usize::from(n)]),
+                Held::Slots(slots) => Held::Slots(slots.slice(start..held).ok_or(Fault::Malformed)?),
+                Held::Inline(values, count) => inline(&values[start..usize::from(count)]),
             };
             return Ok(Args { held, rest: self.rest });
         }
@@ -128,7 +130,7 @@ impl<'gc> Args<'gc> {
             return Err(Fault::Malformed);
         }
         let mut at = self.rest;
-        for _ in held..k {
+        for _ in held..start {
             at = Pair::of(at).ok_or(Fault::Arity)?.tail(mc);
         }
         Ok(Args::list(at))
@@ -137,14 +139,14 @@ impl<'gc> Args<'gc> {
     /// Spreads the final argument (which must be a list) in place, matching `apply` calling semantics.
     pub(crate) fn spread_last(self, mc: &Mutation<'gc>) -> Result<Self, Fault> {
         if self.rest == Value::NIL {
-            let n = self.held().checked_sub(1).ok_or(Fault::Arity)?;
+            let last = self.held().checked_sub(1).ok_or(Fault::Arity)?;
             let held = match self.held {
-                Held::Slots(slots) => Held::Slots(slots.slice(0..n).ok_or(Fault::Malformed)?),
-                Held::Inline(values, _) => inline(&values[..n]),
+                Held::Slots(slots) => Held::Slots(slots.slice(0..last).ok_or(Fault::Malformed)?),
+                Held::Inline(values, _) => inline(&values[..last]),
             };
-            return Ok(Args { held, rest: spread(mc, self.held_get(n))? });
+            return Ok(Args { held, rest: spread(mc, self.held_get(last))? });
         }
-        // The arguments past the held ones are a list that the caller supplied, such as the list of an outer `apply`.
+        // Here `rest` is a list that the caller supplied, such as the list of an outer `apply`.
         let mut before = Vec::new();
         let mut at = Pair::of(self.rest).ok_or(Fault::WrongType)?;
         while let Some(next) = Pair::of(at.tail(mc)) {
@@ -156,22 +158,22 @@ impl<'gc> Args<'gc> {
         }
         let pairs = Pairs::new(mc);
         let mut rest = spread(mc, at.head(mc))?;
-        for &v in before.iter().rev() {
-            rest = pairs.cons(v, rest)?.value(mc);
+        for &value in before.iter().rev() {
+            rest = pairs.cons(value, rest)?.value(mc);
         }
         Ok(Args { held: self.held, rest })
     }
 
     /// Writes the held positional arguments into the argument register slots of `frame` starting at `fp` on `stack` (handling potential overlap), and returns the number of written arguments. Any remaining arguments remain in `rest`.
     pub(crate) fn write(self, mc: &Mutation<'gc>, stack: &Stack, frame: Frame<'_, 'gc>, fp: usize) -> Result<u8, Fault> {
-        let argc = u8::try_from(self.held()).ok().filter(|&n| usize::from(n) <= MAX_ARGS).ok_or(Fault::Malformed)?;
+        let argc = u8::try_from(self.held()).ok().filter(|&count| usize::from(count) <= MAX_ARGS).ok_or(Fault::Malformed)?;
         match self.held {
             Held::Slots(slots) => {
                 if !stack.write(mc, fp + usize::from(ARGS), slots) {
                     return Err(Fault::Malformed);
                 }
             }
-            Held::Inline(values, n) => (ARGS..).zip(&values[..usize::from(n)]).for_each(|(r, &v)| frame.set(r, v)),
+            Held::Inline(values, count) => (ARGS..).zip(&values[..usize::from(count)]).for_each(|(register, &value)| frame.set(register, value)),
         }
         Ok(argc)
     }
@@ -180,7 +182,7 @@ impl<'gc> Args<'gc> {
     pub(crate) fn values(self, mc: &Mutation<'gc>) -> Result<Value<'gc>, Fault> {
         match (self.held(), self.rest) {
             (1, Value::NIL) => Ok(self.held_get(0)),
-            (n, Value::NIL) => values(mc, (0..n).map(|i| self.held_get(i))),
+            (count, Value::NIL) => values(mc, (0..count).map(|i| self.held_get(i))),
             (0, rest) if rest.downcast::<MultiValue>(mc).is_some() => Ok(rest),
             _ => values(mc, self.iter(mc)?),
         }
@@ -240,14 +242,14 @@ impl<'gc> Iterator for Iter<'_, 'gc> {
 
     fn next(&mut self) -> Option<Value<'gc>> {
         self.left = self.left.checked_sub(1)?;
-        let i = self.i;
+        let index = self.i;
         self.i += 1;
         let held = self.args.held();
-        if i < held {
-            return Some(self.args.held_get(i));
+        if index < held {
+            return Some(self.args.held_get(index));
         }
         if let Some(items) = self.items {
-            return Some(items.get(i - held));
+            return Some(items.get(index - held));
         }
         let pair = Pair::of(self.rest)?;
         self.rest = pair.tail(self.mc);

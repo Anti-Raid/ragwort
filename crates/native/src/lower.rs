@@ -58,14 +58,14 @@ pub enum LowerErrorKind {
 }
 
 impl From<OutOfMemory> for LowerErrorKind {
-    fn from(e: OutOfMemory) -> Self {
-        Self::Arena(e.into())
+    fn from(error: OutOfMemory) -> Self {
+        Self::Arena(error.into())
     }
 }
 
 impl From<Error> for LowerErrorKind {
-    fn from(e: Error) -> Self {
-        Self::Arena(e)
+    fn from(error: Error) -> Self {
+        Self::Arena(error)
     }
 }
 
@@ -78,9 +78,9 @@ pub struct LowerError {
 }
 
 impl LowerError {
-    /// Returns the lowering error for `e`, which the module builder reported for the name at `span` when it declared an item.
-    pub fn declared(e: ModuleError, span: SyntaxSpan<'_>) -> Self {
-        let kind = match e {
+    /// Converts `error`, an error from declaring an item, into a lowering error. `span` is the span that the module builder reported with the error.
+    pub fn declared(error: ModuleError, span: SyntaxSpan<'_>) -> Self {
+        let kind = match error {
             ModuleError::Duplicate => LowerErrorKind::Duplicate,
             ModuleError::Conflict => LowerErrorKind::Conflict,
             ModuleError::NotDefined => LowerErrorKind::NotDefined,
@@ -93,9 +93,11 @@ impl LowerError {
         Self { kind, start: span.start(), end: span.end() }
     }
 
-    /// Returns the lowering error that `e` stands for, if `e` is the compiler's report of a misused top-level name. The compiler resolves the names of the module's variables and imports, so it is the one that finds such an error, at the position the lowerer gave the name.
-    pub fn located(e: CompileError) -> Option<Self> {
-        let CompileError::Global { kind, start, end } = e else { return None };
+    /// Converts `error` into a lowering error if `error` is a [`CompileError::Global`], and returns `None` otherwise.
+    ///
+    /// The lowerer does not resolve module-level names. The compiler does, so the compiler is where an unbound or immutable name is found. The error carries the span that the lowerer gave the name.
+    pub fn located(error: CompileError) -> Option<Self> {
+        let CompileError::Global { kind, start, end } = error else { return None };
         let kind = match kind {
             GlobalError::Unbound => LowerErrorKind::Unbound,
             GlobalError::Immutable => LowerErrorKind::Immutable,
@@ -107,8 +109,8 @@ impl LowerError {
 }
 
 impl fmt::Display for LowerErrorKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
             LowerErrorKind::NotAForm => "a list that doesn't start with a form's name",
             LowerErrorKind::BadShape => "a form with the wrong parts",
             LowerErrorKind::Duplicate => "a name bound twice",
@@ -131,16 +133,16 @@ impl fmt::Display for LowerErrorKind {
 }
 
 impl fmt::Display for LowerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} at bytes {}..{}", self.kind, self.start, self.end)
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} at bytes {}..{}", self.kind, self.start, self.end)
     }
 }
 
 impl std::error::Error for LowerError {}
 
 impl From<Error> for LowerError {
-    fn from(e: Error) -> Self {
-        Self { kind: e.into(), start: 0, end: 0 }
+    fn from(error: Error) -> Self {
+        Self { kind: error.into(), start: 0, end: 0 }
     }
 }
 
@@ -211,7 +213,7 @@ struct Formals<'gc> {
 
 impl Formals<'_> {
     fn is_plain(&self) -> bool {
-        self.params.iter().all(|p| p.keyword.is_none() && !p.optional)
+        self.params.iter().all(|param| param.keyword.is_none() && !param.optional)
     }
 }
 
@@ -220,27 +222,27 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
     /// [internal intrinsics](Intrinsic::is_internal) only if `internals`.
     pub fn new(mc: &'a Mutation<'gc>, symbols: Symbols<'gc>, hosts: &'static [HostDef], internals: bool) -> Result<Self, Error> {
         let strings = Strings::new(mc);
-        let symbol = |name: &str| symbols.intern_str(&strings, name).map(|s| s.value(mc));
+        let symbol = |name: &str| symbols.intern_str(&strings, name).map(|interned| interned.value(mc));
         let mut forms = HashMap::new();
         for (name, form) in FORMS {
             forms.insert(symbol(name)?.to_bits(), form);
         }
         let mut prims = HashMap::new();
-        for &i in Intrinsic::ALL {
-            if internals || !i.is_internal() {
-                prims.insert(symbol(i.name())?.to_bits(), Prim::Intrinsic(i));
+        for &intrinsic in Intrinsic::ALL {
+            if internals || !intrinsic.is_internal() {
+                prims.insert(symbol(intrinsic.name())?.to_bits(), Prim::Intrinsic(intrinsic));
             }
         }
-        for &r in Request::ALL {
-            prims.insert(symbol(r.name())?.to_bits(), Prim::Request(r));
+        for &request in Request::ALL {
+            prims.insert(symbol(request.name())?.to_bits(), Prim::Request(request));
         }
         let mut named_hosts = HashMap::new();
         for def in hosts {
             named_hosts.insert(symbol(def.name)?.to_bits(), def);
         }
         let mut abbreviations = Vec::with_capacity(Abbreviation::ALL.len());
-        for a in Abbreviation::ALL {
-            abbreviations.push(symbol(a.name())?);
+        for abbreviation in Abbreviation::ALL {
+            abbreviations.push(symbol(abbreviation.name())?);
         }
         Ok(Self {
             mc,
@@ -254,7 +256,9 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         })
     }
 
-    /// Lowers the top-level form `node` to an item, making its local variables from `locals`. The item names what it defines, requires, provides and refers to, and the module builder resolves those names.
+    /// Lowers the top-level form `node` to an [`Item`]. Local variables are allocated from `locals`.
+    ///
+    /// The item refers to module-level bindings by name: what it defines, requires, provides and uses. The module builder resolves those names.
     pub fn item(&mut self, locals: &mut Locals<'gc>, node: Syntax<'gc>) -> Result<Item<'gc>, LowerError> {
         self.scope.clear();
         let items = match self.head(node) {
@@ -292,7 +296,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
     fn struct_form(&self, node: Syntax<'gc>, parts: &[Syntax<'gc>]) -> Result<structs::Form<'gc>, LowerError> {
         let bad = LowerErrorKind::BadShape;
         let is_name = |node: &Syntax<'gc>| node.kind(self.mc) == Some(SyntaxKind::Identifier);
-        let option = |node: Syntax<'gc>| self.keyword(node).map(|k| chars(&self.strings, k.symbol(self.mc).name(self.mc)).collect::<String>());
+        let option = |node: Syntax<'gc>| self.keyword(node).map(|keyword| chars(&self.strings, keyword.symbol(self.mc).name(self.mc)).collect::<String>());
         let mut rest = parts.iter().copied();
         let Some(name) = rest.next().filter(is_name) else { return Err(self.error(bad, node)) };
         let Some(mut next) = rest.next() else { return Err(self.error(bad, node)) };
@@ -345,17 +349,17 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
     /// The parameters `formals` has: names, `[name default]`s and keywords before either, and a
     /// rest parameter, as Racket's `lambda` takes them.
     fn formals(&self, formals: Syntax<'gc>) -> Result<Formals<'gc>, LowerError> {
-        let mut f = Formals { params: Vec::new(), names: Vec::new(), defaults: Vec::new(), rest: None };
+        let mut parsed = Formals { params: Vec::new(), names: Vec::new(), defaults: Vec::new(), rest: None };
         let items = match formals.kind(self.mc) {
             Some(SyntaxKind::Identifier) => {
-                f.rest = Some(formals);
-                return Ok(f);
+                parsed.rest = Some(formals);
+                return Ok(parsed);
             }
             Some(SyntaxKind::List) => {
                 let mut elements = self.pairs.elements(formals.datum(self.mc));
-                let items = elements.by_ref().map(|v| self.syntax(v, formals)).collect::<Result<Vec<_>, _>>()?;
+                let items = elements.by_ref().map(|value| self.syntax(value, formals)).collect::<Result<Vec<_>, _>>()?;
                 let rest = elements.rest();
-                f.rest = if rest == Value::NIL { None } else { Some(self.name(self.syntax(rest, formals)?)?) };
+                parsed.rest = if rest == Value::NIL { None } else { Some(self.name(self.syntax(rest, formals)?)?) };
                 items
             }
             _ => return Err(self.error(LowerErrorKind::BadShape, formals)),
@@ -375,18 +379,18 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
                 },
                 _ => return Err(self.error(LowerErrorKind::BadShape, at)),
             };
-            if keyword.is_some() && f.params.iter().any(|p| p.keyword == keyword) {
+            if keyword.is_some() && parsed.params.iter().any(|param| param.keyword == keyword) {
                 return Err(self.error(LowerErrorKind::Duplicate, item));
             }
             // As in Racket, a required positional parameter can't follow an optional one.
-            if keyword.is_none() && default.is_none() && f.params.iter().any(|p| p.keyword.is_none() && p.optional) {
+            if keyword.is_none() && default.is_none() && parsed.params.iter().any(|param| param.keyword.is_none() && param.optional) {
                 return Err(self.error(LowerErrorKind::BadShape, at));
             }
-            f.params.push(keyword::Param { keyword, optional: default.is_some() });
-            f.names.push(name);
-            f.defaults.push(default);
+            parsed.params.push(keyword::Param { keyword, optional: default.is_some() });
+            parsed.names.push(name);
+            parsed.defaults.push(default);
         }
-        Ok(f)
+        Ok(parsed)
     }
 
     /// The keyword `node` is, if it's one.
@@ -421,13 +425,13 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             let items = self.list(spec)?;
             let Some((&head, args)) = items.split_first() else { return Err(self.error(LowerErrorKind::BadShape, spec)) };
             let word = self.text(head).filter(|_| head.kind(self.mc) == Some(SyntaxKind::Identifier));
-            let named = |n: &Syntax<'gc>| -> Result<(String, SyntaxSpan<'gc>), LowerError> { Ok((self.identifier(*n)?, n.span(self.mc))) };
+            let named = |node: &Syntax<'gc>| -> Result<(String, SyntaxSpan<'gc>), LowerError> { Ok((self.identifier(*node)?, node.span(self.mc))) };
             let (filter, inner) = match (word.as_deref(), args) {
                 (Some("only-in"), &[inner, ref names @ ..]) => (Filter::Only(names.iter().map(named).collect::<Result<_, _>>()?), inner),
                 (Some("except-in"), &[inner, ref names @ ..]) => (Filter::Except(names.iter().map(named).collect::<Result<_, _>>()?), inner),
                 (Some("prefix-in"), &[prefix, inner]) => (Filter::Prefix(self.identifier(prefix)?), inner),
                 (Some("rename-in"), &[inner, ref renames @ ..]) => {
-                    let renames = renames.iter().map(|&r| self.pair_of_names(r).map(|(old, new)| (old, new, r.span(self.mc)))).collect::<Result<_, _>>()?;
+                    let renames = renames.iter().map(|&rename| self.pair_of_names(rename).map(|(old, new)| (old, new, rename.span(self.mc)))).collect::<Result<_, _>>()?;
                     (Filter::Rename(renames), inner)
                 }
                 _ => return Err(self.error(LowerErrorKind::BadShape, spec)),
@@ -453,7 +457,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
                 self.name(name)?;
                 let constructors = match options {
                     [] => true,
-                    &[option] if self.keyword(option).is_some_and(|k| chars(&self.strings, k.symbol(self.mc).name(self.mc)).eq("omit-constructor".chars())) => false,
+                    &[option] if self.keyword(option).is_some_and(|keyword| chars(&self.strings, keyword.symbol(self.mc).name(self.mc)).eq("omit-constructor".chars())) => false,
                     _ => return Err(self.error(LowerErrorKind::BadShape, spec)),
                 };
                 out.push(Provide::Struct { name: name.datum(self.mc), constructors, span: name.span(self.mc) });
@@ -488,15 +492,15 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
     /// The text of `node`, if it's an identifier or a string.
     fn text(&self, node: Syntax<'gc>) -> Option<String> {
         let datum = node.datum(self.mc);
-        let s = match node.kind(self.mc)? {
+        let string = match node.kind(self.mc)? {
             SyntaxKind::Identifier => Symbol::of(datum)?.name(self.mc),
             SyntaxKind::Literal => self.strings.string(datum)?,
             _ => return None,
         };
-        Some(chars(&self.strings, s).collect())
+        Some(chars(&self.strings, string).collect())
     }
 
-    /// Returns the source position of the form `node`, which a call or operation lowered from it reports in an error.
+    /// Returns the source position of the form `node`. Error reports use it for a call or operation lowered from the form.
     fn position(&self, node: Syntax<'gc>) -> Option<Position<'gc>> {
         Position::of(self.mc, node.span(self.mc))
     }
@@ -516,34 +520,34 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             /// A list of so many items, and a tail if it's dotted.
             List(usize, bool, Syntax<'gc>),
         }
-        let oom = |this: &Self, e: OutOfMemory, node| this.error(e, node);
+        let oom = |this: &Self, error: OutOfMemory, node| this.error(error, node);
         let mut todo = vec![Task::Node(root)];
         let mut done = Vec::new();
         while let Some(task) = todo.pop() {
             let node = match task {
                 Task::Node(node) => node,
-                Task::Item(v, parent) => self.syntax(v, parent)?,
+                Task::Item(value, parent) => self.syntax(value, parent)?,
                 Task::Abbreviation(name, node) => {
                     let inner = done.pop().expect("an abbreviation's datum");
-                    done.push(self.pairs.list(&[name, inner]).map_err(|e| oom(self, e, node))?);
+                    done.push(self.pairs.list(&[name, inner]).map_err(|error| oom(self, error, node))?);
                     continue;
                 }
-                Task::Vector(n, node) => {
-                    let items = done.split_off(done.len() - n);
-                    done.push(Vectors::new(self.mc).immutable_from_slice(&items).map_err(|e| oom(self, e, node))?.value(self.mc));
+                Task::Vector(count, node) => {
+                    let items = done.split_off(done.len() - count);
+                    done.push(Vectors::new(self.mc).immutable_from_slice(&items).map_err(|error| oom(self, error, node))?.value(self.mc));
                     continue;
                 }
-                Task::List(n, dotted, node) => {
+                Task::List(count, dotted, node) => {
                     let rest = if dotted { done.pop().expect("a list's tail") } else { Value::NIL };
-                    let items = done.split_off(done.len() - n);
-                    done.push(self.pairs.list_with_tail(items, rest).map_err(|e| oom(self, e, node))?);
+                    let items = done.split_off(done.len() - count);
+                    done.push(self.pairs.list_with_tail(items, rest).map_err(|error| oom(self, error, node))?);
                     continue;
                 }
             };
             match node.kind(self.mc) {
                 Some(SyntaxKind::Identifier | SyntaxKind::Literal) => done.push(node.datum(self.mc)),
-                Some(SyntaxKind::Abbreviation(a)) => {
-                    let name = self.abbreviations[a as usize];
+                Some(SyntaxKind::Abbreviation(abbreviation)) => {
+                    let name = self.abbreviations[abbreviation as usize];
                     let inner = self.inner(node)?;
                     todo.extend([Task::Abbreviation(name, node), Task::Node(inner)]);
                 }
@@ -551,7 +555,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
                     let vector = Vectors::new(self.mc).vector(node.datum(self.mc)).ok_or_else(|| self.error(LowerErrorKind::Unsupported, node))?;
                     let items: Vec<_> = (0..vector.len(self.mc)).filter_map(|i| vector.get(self.mc, i)).collect();
                     todo.push(Task::Vector(items.len(), node));
-                    todo.extend(items.into_iter().rev().map(|v| Task::Item(v, node)));
+                    todo.extend(items.into_iter().rev().map(|value| Task::Item(value, node)));
                 }
                 Some(SyntaxKind::List) => {
                     let mut elements = self.pairs.elements(node.datum(self.mc));
@@ -562,7 +566,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
                     if dotted {
                         todo.push(Task::Item(rest, node));
                     }
-                    todo.extend(items.into_iter().rev().map(|v| Task::Item(v, node)));
+                    todo.extend(items.into_iter().rev().map(|value| Task::Item(value, node)));
                 }
                 _ => return Err(self.error(LowerErrorKind::Unsupported, node)),
             }
@@ -570,7 +574,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         Ok(done.pop().expect("a datum"))
     }
 
-    /// Returns the innermost local variable in scope that the identifier `name` names, if it names one. Any other name is left to the compiler, which resolves it to a variable of the module or an import.
+    /// Returns the innermost local variable named `name` that is in scope, if there is one. Any other name is left to the compiler, which resolves it to a module variable or an import.
     fn local(&self, name: Syntax<'gc>) -> Option<Var> {
         self.scope.get(&name.datum(self.mc).to_bits()).and_then(|vars| vars.last()).copied()
     }
@@ -611,7 +615,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             return Err(self.error(LowerErrorKind::BadShape, node));
         }
         let mut elements = self.pairs.elements(node.datum(self.mc));
-        let items = elements.by_ref().map(|v| self.syntax(v, node)).collect::<Result<_, _>>()?;
+        let items = elements.by_ref().map(|value| self.syntax(value, node)).collect::<Result<_, _>>()?;
         if elements.rest() != Value::NIL {
             return Err(self.error(LowerErrorKind::BadShape, node));
         }
@@ -623,9 +627,9 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         self.syntax(node.datum(self.mc), node)
     }
 
-    /// `v`, a part of `node`, as syntax, which the reader makes every part of a list.
-    fn syntax(&self, v: Value<'gc>, node: Syntax<'gc>) -> Result<Syntax<'gc>, LowerError> {
-        Syntax::of(v).ok_or_else(|| self.error(LowerErrorKind::Unsupported, node))
+    /// `value`, a part of `node`, as syntax, which the reader makes every part of a list.
+    fn syntax(&self, value: Value<'gc>, node: Syntax<'gc>) -> Result<Syntax<'gc>, LowerError> {
+        Syntax::of(value).ok_or_else(|| self.error(LowerErrorKind::Unsupported, node))
     }
 
     fn error(&self, kind: impl Into<LowerErrorKind>, node: Syntax<'gc>) -> LowerError {
@@ -638,14 +642,14 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
 /// the machine's stack however deeply it nests.
 struct Lowering<'s, 'a, 'gc> {
     l: &'s mut Lowerer<'a, 'gc>,
-    /// The module's supply of local variables and lambda IDs.
+    /// The module's allocator of local variables and lambda IDs.
     locals: &'s mut Locals<'gc>,
 }
 
 /// What lowering an expression does next. Each call lowers an expression.
 type Lo<'s, 'a, 'gc> = Step<'s, Lowering<'s, 'a, 'gc>, Syntax<'gc>, Core<'gc>, LowerError>;
 
-/// A `%lambda` with optional or keyword parameters being lowered: the parameters bound so far, and the index `next` of the first parameter still to bind.
+/// The state of lowering a `%lambda` that has optional or keyword parameters. `params` holds the parameters bound so far, and `next` is the index of the next parameter to bind.
 struct Optional<'gc> {
     node: Syntax<'gc>,
     formals: Formals<'gc>,
@@ -664,7 +668,7 @@ struct Sequential<'gc> {
 }
 
 impl<'s, 'a, 'gc> Lowering<'s, 'a, 'gc> {
-    /// Makes a local variable for each of `names` and brings the names into scope.
+    /// Allocates a local variable for each of `names` and brings the names into scope.
     fn bind(&mut self, names: &[Syntax<'gc>]) -> Vec<Var> {
         let mut vars = Vec::with_capacity(names.len());
         for name in names {
@@ -677,23 +681,23 @@ impl<'s, 'a, 'gc> Lowering<'s, 'a, 'gc> {
     }
 
     fn expr(&mut self, node: Syntax<'gc>) -> Result<Lo<'s, 'a, 'gc>, LowerError> {
-        let l = &mut *self.l;
-        Ok(Step::Done(match node.kind(l.mc) {
-            Some(SyntaxKind::Identifier) => l.reference(node),
-            Some(SyntaxKind::Literal | SyntaxKind::Vector) => Core::Quote(l.datum(node)?),
-            Some(SyntaxKind::Abbreviation(Abbreviation::Quote)) => Core::Quote(l.datum(l.inner(node)?)?),
+        let lowerer = &mut *self.l;
+        Ok(Step::Done(match node.kind(lowerer.mc) {
+            Some(SyntaxKind::Identifier) => lowerer.reference(node),
+            Some(SyntaxKind::Literal | SyntaxKind::Vector) => Core::Quote(lowerer.datum(node)?),
+            Some(SyntaxKind::Abbreviation(Abbreviation::Quote)) => Core::Quote(lowerer.datum(lowerer.inner(node)?)?),
             Some(SyntaxKind::List) => return self.form(node),
-            _ => return Err(l.error(LowerErrorKind::Unsupported, node)),
+            _ => return Err(lowerer.error(LowerErrorKind::Unsupported, node)),
         }))
     }
 
     fn form(&mut self, node: Syntax<'gc>) -> Result<Lo<'s, 'a, 'gc>, LowerError> {
-        let l = &mut *self.l;
-        let items = l.list(node)?;
-        let form = items.first().filter(|head| head.kind(l.mc) == Some(SyntaxKind::Identifier)).and_then(|head| l.forms.get(&head.datum(l.mc).to_bits()));
-        let Some(&form) = form else { return Err(l.error(LowerErrorKind::NotAForm, node)) };
+        let lowerer = &mut *self.l;
+        let items = lowerer.list(node)?;
+        let form = items.first().filter(|head| head.kind(lowerer.mc) == Some(SyntaxKind::Identifier)).and_then(|head| lowerer.forms.get(&head.datum(lowerer.mc).to_bits()));
+        let Some(&form) = form else { return Err(lowerer.error(LowerErrorKind::NotAForm, node)) };
         match (form, &items[1..]) {
-            (Form::Quote, &[datum]) => Ok(Step::Done(Core::Quote(l.datum(datum)?))),
+            (Form::Quote, &[datum]) => Ok(Step::Done(Core::Quote(lowerer.datum(datum)?))),
             (Form::If, &[test, then, other]) => steps::all(vec![test, then, other], |_, parts| {
                 let [test, then, other] = <[Core<'gc>; 3]>::try_from(parts).map_err(|_| ()).expect("three parts");
                 Ok(Step::Done(Core::If(Box::new(test), Box::new(then), Box::new(other))))
@@ -701,49 +705,49 @@ impl<'s, 'a, 'gc> Lowering<'s, 'a, 'gc> {
             (Form::Let | Form::Letrec, &[binds, ref body @ ..]) => self.binding(matches!(form, Form::Letrec), node, binds, body.to_vec()),
             (Form::LetStar, &[binds, ref body @ ..]) => self.sequential(node, binds, body.to_vec()),
             (Form::Set, &[name, value]) => {
-                l.name(name)?;
-                let local = l.local(name);
-                Ok(Step::then(value, move |s: &mut Self, value| {
+                lowerer.name(name)?;
+                let local = lowerer.local(name);
+                Ok(Step::then(value, move |this: &mut Self, value| {
                     Ok(Step::Done(match local {
                         Some(var) => Core::Set(Place::Local(var), Box::new(value)),
-                        None => Core::SetGlobal(name.datum(s.l.mc), Box::new(value), name.span(s.l.mc)),
+                        None => Core::SetGlobal(name.datum(this.l.mc), Box::new(value), name.span(this.l.mc)),
                     }))
                 }))
             }
-            (Form::Define | Form::Struct | Form::Require | Form::Provide, _) => Err(l.error(LowerErrorKind::Definition, node)),
+            (Form::Define | Form::Struct | Form::Require | Form::Provide, _) => Err(lowerer.error(LowerErrorKind::Definition, node)),
             (Form::Lambda, &[formals, ref body @ ..]) => self.lambda(node, formals, body.to_vec()),
-            (Form::App, &[f, ref args @ ..]) if args.iter().any(|&a| l.keyword(a).is_some()) => self.keyword_call(node, f, args.to_vec()),
-            (Form::App, &[f, ref args @ ..]) => {
+            (Form::App, &[callee, ref args @ ..]) if args.iter().any(|&arg| lowerer.keyword(arg).is_some()) => self.keyword_call(node, callee, args.to_vec()),
+            (Form::App, &[callee, ref args @ ..]) => {
                 let args = args.to_vec();
-                Ok(Step::then(f, move |_: &mut Self, f| steps::all(args, move |s: &mut Self, args| Ok(Step::Done(Core::App(Box::new(f), args, s.l.position(node)))))))
+                Ok(Step::then(callee, move |_: &mut Self, callee| steps::all(args, move |this: &mut Self, args| Ok(Step::Done(Core::App(Box::new(callee), args, this.l.position(node)))))))
             }
             (Form::Intrinsic, &[name, ref args @ ..]) => self.intrinsic(node, name, args.to_vec(), false),
             (Form::ApplyIntrinsic, &[name, ref args @ ..]) if !args.is_empty() => self.intrinsic(node, name, args.to_vec(), true),
             (Form::CallHost, &[name, ref args @ ..]) => self.call_host(node, name, args.to_vec()),
-            _ => Err(l.error(LowerErrorKind::BadShape, node)),
+            _ => Err(lowerer.error(LowerErrorKind::BadShape, node)),
         }
     }
 
     /// A `%let`, or if `recursive`, a `%letrec`.
     fn binding(&mut self, recursive: bool, node: Syntax<'gc>, binds: Syntax<'gc>, body: Vec<Syntax<'gc>>) -> Result<Lo<'s, 'a, 'gc>, LowerError> {
-        let l = &mut *self.l;
+        let lowerer = &mut *self.l;
         if body.is_empty() {
-            return Err(l.error(LowerErrorKind::BadShape, node));
+            return Err(lowerer.error(LowerErrorKind::BadShape, node));
         }
         let (mut names, mut inits) = (Vec::new(), Vec::new());
-        for bind in l.list(binds)? {
-            let bind = l.list(bind)?;
-            let &[name, init] = bind.as_slice() else { return Err(l.error(LowerErrorKind::BadShape, binds)) };
-            names.push(l.name(name)?);
+        for bind in lowerer.list(binds)? {
+            let bind = lowerer.list(bind)?;
+            let &[name, init] = bind.as_slice() else { return Err(lowerer.error(LowerErrorKind::BadShape, binds)) };
+            names.push(lowerer.name(name)?);
             inits.push(init);
         }
-        l.distinct(&names)?;
+        lowerer.distinct(&names)?;
         // A `%letrec`'s names are in scope in its inits, a `%let`'s only in its body.
         let vars = if recursive { self.bind(&names) } else { Vec::new() };
-        steps::all(inits, move |s: &mut Self, inits: Vec<Core<'gc>>| {
-            let vars = if recursive { vars } else { s.bind(&names) };
-            s.body(body, move |s, body| {
-                s.l.unbind(&names);
+        steps::all(inits, move |this: &mut Self, inits: Vec<Core<'gc>>| {
+            let vars = if recursive { vars } else { this.bind(&names) };
+            this.body(body, move |this, body| {
+                this.l.unbind(&names);
                 let binds = vars.into_iter().zip(inits).collect();
                 Ok(Step::Done(if recursive { Core::Letrec(binds, Box::new(body)) } else { Core::Let(binds, Box::new(body)) }))
             })
@@ -759,11 +763,11 @@ impl<'s, 'a, 'gc> Lowering<'s, 'a, 'gc> {
         self.sequential_from(Sequential { binds, left, names: Vec::new(), lets: Vec::new(), body })
     }
 
-    fn sequential_from(&mut self, mut q: Sequential<'gc>) -> Result<Lo<'s, 'a, 'gc>, LowerError> {
-        let Some(bind) = q.left.next() else {
-            let Sequential { names, mut lets, body, .. } = q;
-            return self.body(body, move |s, mut core| {
-                s.l.unbind(&names);
+    fn sequential_from(&mut self, mut sequential: Sequential<'gc>) -> Result<Lo<'s, 'a, 'gc>, LowerError> {
+        let Some(bind) = sequential.left.next() else {
+            let Sequential { names, mut lets, body, .. } = sequential;
+            return self.body(body, move |this, mut core| {
+                this.l.unbind(&names);
                 while let Some(bind) = lets.pop() {
                     core = Core::Let(vec![bind], Box::new(core));
                 }
@@ -771,88 +775,88 @@ impl<'s, 'a, 'gc> Lowering<'s, 'a, 'gc> {
             });
         };
         let bind = self.l.list(bind)?;
-        let &[name, init] = bind.as_slice() else { return Err(self.l.error(LowerErrorKind::BadShape, q.binds)) };
+        let &[name, init] = bind.as_slice() else { return Err(self.l.error(LowerErrorKind::BadShape, sequential.binds)) };
         let name = self.l.name(name)?;
-        Ok(Step::then(init, move |s: &mut Self, init| {
-            q.lets.extend(s.bind(&[name]).into_iter().zip([init]));
-            q.names.push(name);
-            s.sequential_from(q)
+        Ok(Step::then(init, move |this: &mut Self, init| {
+            sequential.lets.extend(this.bind(&[name]).into_iter().zip([init]));
+            sequential.names.push(name);
+            this.sequential_from(sequential)
         }))
     }
 
     /// A `%lambda`.
     fn lambda(&mut self, node: Syntax<'gc>, formals: Syntax<'gc>, body: Vec<Syntax<'gc>>) -> Result<Lo<'s, 'a, 'gc>, LowerError> {
-        let l = &mut *self.l;
+        let lowerer = &mut *self.l;
         if body.is_empty() {
-            return Err(l.error(LowerErrorKind::BadShape, node));
+            return Err(lowerer.error(LowerErrorKind::BadShape, node));
         }
-        let formals = l.formals(formals)?;
+        let formals = lowerer.formals(formals)?;
         let mut names = formals.names.clone();
         names.extend(formals.rest);
-        l.distinct(&names)?;
+        lowerer.distinct(&names)?;
         if !formals.is_plain() {
             let params = Vec::with_capacity(formals.names.len());
             return self.defaults(Optional { node, formals, body, params, next: 0 });
         }
         let params = formals.names.len();
         let mut vars = self.bind(&names);
-        self.body(body, move |s, body| {
-            s.l.unbind(&names);
+        self.body(body, move |this, body| {
+            this.l.unbind(&names);
             let rest = (vars.len() > params).then(|| vars.pop()).flatten();
-            let id = s.locals.lambda();
-            Ok(Step::Done(Core::Lambda(Lambda { id, params: vars, optional: 0, rest, body: Box::new(body), name: None, at: Position::of(s.l.mc, node.span(s.l.mc)) })))
+            let id = this.locals.lambda();
+            Ok(Step::Done(Core::Lambda(Lambda { id, params: vars, optional: 0, rest, body: Box::new(body), name: None, at: Position::of(this.l.mc, node.span(this.l.mc)) })))
         })
     }
 
-    /// Binds the remaining parameters of an optional lambda, lowering the default of each one that has a default before binding it, so that a default sees only the parameters before it, then lowers the body.
-    fn defaults(&mut self, mut f: Optional<'gc>) -> Result<Lo<'s, 'a, 'gc>, LowerError> {
-        while let Some(&name) = f.formals.names.get(f.next) {
-            let (keyword, default) = (f.formals.params[f.next].keyword, f.formals.defaults[f.next]);
-            f.next += 1;
+    /// Binds the remaining parameters of an optional lambda, then lowers the body. A default is lowered before its parameter is bound, so it can refer only to earlier parameters.
+    fn defaults(&mut self, mut optional: Optional<'gc>) -> Result<Lo<'s, 'a, 'gc>, LowerError> {
+        while let Some(&name) = optional.formals.names.get(optional.next) {
+            let (keyword, default) = (optional.formals.params[optional.next].keyword, optional.formals.defaults[optional.next]);
+            optional.next += 1;
             let Some(default) = default else {
                 let var = self.bind(&[name])[0];
-                f.params.push(Formal { var, keyword, default: None });
+                optional.params.push(Formal { var, keyword, default: None });
                 continue;
             };
-            return Ok(Step::then(default, move |s: &mut Self, default| {
-                let var = s.bind(&[name])[0];
-                f.params.push(Formal { var, keyword, default: Some(default) });
-                s.defaults(f)
+            return Ok(Step::then(default, move |this: &mut Self, default| {
+                let var = this.bind(&[name])[0];
+                optional.params.push(Formal { var, keyword, default: Some(default) });
+                this.defaults(optional)
             }));
         }
-        let rest = f.formals.rest.map(|name| self.bind(&[name])[0]);
-        let Optional { node, formals, body, params, .. } = f;
-        self.body(body, move |s, body| {
-            s.l.unbind(&formals.names);
-            s.l.unbind(&formals.rest.into_iter().collect::<Vec<_>>());
-            let mc = s.l.mc;
-            let lambda = OptionalLambda { id: s.locals.lambda(), params, rest, body: Box::new(body), name: None, at: Position::of(mc, node.span(mc)) };
+        let rest = optional.formals.rest.map(|name| self.bind(&[name])[0]);
+        let Optional { node, formals, body, params, .. } = optional;
+        self.body(body, move |this, body| {
+            this.l.unbind(&formals.names);
+            this.l.unbind(&formals.rest.into_iter().collect::<Vec<_>>());
+            let mc = this.l.mc;
+            let lambda = OptionalLambda { id: this.locals.lambda(), params, rest, body: Box::new(body), name: None, at: Position::of(mc, node.span(mc)) };
             Ok(Step::Done(Core::OptionalLambda(lambda)))
         })
     }
 
-    /// Lowers an `%app` of `f` on `args`, some of which are passed by keyword, into a [`Core::KeywordApp`].
-    fn keyword_call(&mut self, node: Syntax<'gc>, f: Syntax<'gc>, args: Vec<Syntax<'gc>>) -> Result<Lo<'s, 'a, 'gc>, LowerError> {
-        let l = &mut *self.l;
+    /// Lowers an `%app` of `callee` that has keyword arguments in `args` into a [`Core::KeywordApp`].
+    fn keyword_call(&mut self, node: Syntax<'gc>, callee: Syntax<'gc>, args: Vec<Syntax<'gc>>) -> Result<Lo<'s, 'a, 'gc>, LowerError> {
+        let lowerer = &mut *self.l;
         let (mut kinds, mut nodes) = (Vec::new(), Vec::new());
         let mut items = args.into_iter();
         while let Some(arg) = items.next() {
-            let Some(k) = l.keyword(arg) else {
+            let Some(keyword) = lowerer.keyword(arg) else {
                 kinds.push(None);
                 nodes.push(arg);
                 continue;
             };
-            let value = items.next().ok_or_else(|| l.error(LowerErrorKind::BadShape, arg))?;
-            if kinds.contains(&Some(k)) {
-                return Err(l.error(LowerErrorKind::Duplicate, arg));
+            let value = items.next().ok_or_else(|| lowerer.error(LowerErrorKind::BadShape, arg))?;
+            if kinds.contains(&Some(keyword)) {
+                return Err(lowerer.error(LowerErrorKind::Duplicate, arg));
             }
-            kinds.push(Some(k));
+            kinds.push(Some(keyword));
             nodes.push(value);
         }
-        Ok(Step::then(f, move |_: &mut Self, f| {
-            steps::all(nodes, move |s: &mut Self, values| {
+        Ok(Step::then(callee, move |_: &mut Self, callee| {
+            steps::all(nodes, move |this: &mut Self, values| {
                 let args = kinds.into_iter().zip(values).map(|(keyword, value)| Arg { keyword, value }).collect();
-                Ok(Step::Done(Core::KeywordApp(Box::new(f), args, s.l.position(node))))
+                Ok(Step::Done(Core::KeywordApp(Box::new(callee), args, this.l.position(node))))
             })
         }))
     }
@@ -860,45 +864,45 @@ impl<'s, 'a, 'gc> Lowering<'s, 'a, 'gc> {
     /// An `%intrinsic`, or if `spread`, an `%apply-intrinsic`, whose argument count is only known
     /// as it runs.
     fn intrinsic(&mut self, node: Syntax<'gc>, name: Syntax<'gc>, args: Vec<Syntax<'gc>>, spread: bool) -> Result<Lo<'s, 'a, 'gc>, LowerError> {
-        let l = &mut *self.l;
-        l.name(name)?;
-        let &prim = l.prims.get(&name.datum(l.mc).to_bits()).ok_or_else(|| l.error(LowerErrorKind::UnknownIntrinsic, name))?;
+        let lowerer = &mut *self.l;
+        lowerer.name(name)?;
+        let &prim = lowerer.prims.get(&name.datum(lowerer.mc).to_bits()).ok_or_else(|| lowerer.error(LowerErrorKind::UnknownIntrinsic, name))?;
         if spread {
-            return steps::all(args, move |s: &mut Self, args| Ok(Step::Done(Core::ApplyIntrinsic(prim, args, s.l.position(node)))));
+            return steps::all(args, move |this: &mut Self, args| Ok(Step::Done(Core::ApplyIntrinsic(prim, args, this.l.position(node)))));
         }
         let takes = match prim {
-            Prim::Intrinsic(i) => i.arity().is_none_or(|arity| usize::from(arity) == args.len()),
-            Prim::Request(r) => r.takes(args.len()),
-            Prim::Host(h) => h.takes(args.len()),
+            Prim::Intrinsic(intrinsic) => intrinsic.arity().is_none_or(|arity| usize::from(arity) == args.len()),
+            Prim::Request(request) => request.takes(args.len()),
+            Prim::Host(host) => host.takes(args.len()),
             Prim::Slot(op, _) => op.arity() == args.len(),
         };
         if !takes {
-            return Err(l.error(LowerErrorKind::Arity, node));
+            return Err(lowerer.error(LowerErrorKind::Arity, node));
         }
-        steps::all(args, move |s: &mut Self, args| Ok(Step::Done(Core::Intrinsic(prim, args, s.l.position(node)))))
+        steps::all(args, move |this: &mut Self, args| Ok(Step::Done(Core::Intrinsic(prim, args, this.l.position(node)))))
     }
 
     /// A `%call-host` of the host function named `name`.
     fn call_host(&mut self, node: Syntax<'gc>, name: Syntax<'gc>, args: Vec<Syntax<'gc>>) -> Result<Lo<'s, 'a, 'gc>, LowerError> {
-        let l = &mut *self.l;
-        l.name(name)?;
-        let &def = l.hosts.get(&name.datum(l.mc).to_bits()).ok_or_else(|| l.error(LowerErrorKind::UnknownHost, name))?;
+        let lowerer = &mut *self.l;
+        lowerer.name(name)?;
+        let &def = lowerer.hosts.get(&name.datum(lowerer.mc).to_bits()).ok_or_else(|| lowerer.error(LowerErrorKind::UnknownHost, name))?;
         if !def.takes(args.len()) {
-            return Err(l.error(LowerErrorKind::Arity, node));
+            return Err(lowerer.error(LowerErrorKind::Arity, node));
         }
-        steps::all(args, move |s: &mut Self, args| Ok(Step::Done(Core::Intrinsic(Prim::Host(def), args, s.l.position(node)))))
+        steps::all(args, move |this: &mut Self, args| Ok(Step::Done(Core::Intrinsic(Prim::Host(def), args, this.l.position(node)))))
     }
 
     /// A body's expressions, in order, as one, to `then`.
     fn body(&mut self, nodes: Vec<Syntax<'gc>>, then: impl FnOnce(&mut Self, Core<'gc>) -> Result<Lo<'s, 'a, 'gc>, LowerError> + 's) -> Result<Lo<'s, 'a, 'gc>, LowerError> {
-        steps::all(nodes, move |s: &mut Self, mut cores| {
+        steps::all(nodes, move |this: &mut Self, mut cores| {
             let body = cores.pop().expect("bodies aren't empty");
             if cores.is_empty() {
-                return then(s, body);
+                return then(this, body);
             }
             // One `let` of what the forms before the last return, however many there are.
-            let binds = cores.into_iter().map(|core| (s.locals.fresh(), core)).collect();
-            then(s, Core::Let(binds, Box::new(body)))
+            let binds = cores.into_iter().map(|core| (this.locals.fresh(), core)).collect();
+            then(this, Core::Let(binds, Box::new(body)))
         })
     }
 }

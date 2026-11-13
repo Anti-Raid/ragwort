@@ -107,14 +107,14 @@ pub enum ExpandErrorKind {
 }
 
 impl From<OutOfMemory> for ExpandErrorKind {
-    fn from(e: OutOfMemory) -> Self {
-        Self::Arena(e.into())
+    fn from(error: OutOfMemory) -> Self {
+        Self::Arena(error.into())
     }
 }
 
 impl From<ragwort_types::Error> for ExpandErrorKind {
-    fn from(e: ragwort_types::Error) -> Self {
-        Self::Arena(e)
+    fn from(error: ragwort_types::Error) -> Self {
+        Self::Arena(error)
     }
 }
 
@@ -127,20 +127,20 @@ pub struct ExpandError {
 }
 
 impl From<OutOfMemory> for ExpandError {
-    fn from(e: OutOfMemory) -> Self {
-        Self { kind: e.into(), start: 0, end: 0 }
+    fn from(error: OutOfMemory) -> Self {
+        Self { kind: error.into(), start: 0, end: 0 }
     }
 }
 
 impl From<ragwort_types::Error> for ExpandError {
-    fn from(e: ragwort_types::Error) -> Self {
-        Self { kind: e.into(), start: 0, end: 0 }
+    fn from(error: ragwort_types::Error) -> Self {
+        Self { kind: error.into(), start: 0, end: 0 }
     }
 }
 
 impl fmt::Display for ExpandErrorKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
             ExpandErrorKind::BadSyntax => "bad syntax",
             ExpandErrorKind::Duplicate => "an identifier bound twice",
             ExpandErrorKind::Definition => "a definition where an expression goes",
@@ -163,8 +163,8 @@ impl fmt::Display for ExpandErrorKind {
 }
 
 impl fmt::Display for ExpandError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} at bytes {}..{}", self.kind, self.start, self.end)
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} at bytes {}..{}", self.kind, self.start, self.end)
     }
 }
 
@@ -178,26 +178,26 @@ pub enum Error {
 }
 
 impl From<OutOfMemory> for Error {
-    fn from(e: OutOfMemory) -> Self {
-        Error::Expand(e.into())
+    fn from(error: OutOfMemory) -> Self {
+        Error::Expand(error.into())
     }
 }
 
 impl From<ReadError> for Error {
-    fn from(e: ReadError) -> Self {
-        Error::Read(e)
+    fn from(error: ReadError) -> Self {
+        Error::Read(error)
     }
 }
 
 impl From<ExpandError> for Error {
-    fn from(e: ExpandError) -> Self {
-        Error::Expand(e)
+    fn from(error: ExpandError) -> Self {
+        Error::Expand(error)
     }
 }
 
 impl From<CompileError> for Error {
-    fn from(e: CompileError) -> Self {
-        Error::Compile(e)
+    fn from(error: CompileError) -> Self {
+        Error::Compile(error)
     }
 }
 

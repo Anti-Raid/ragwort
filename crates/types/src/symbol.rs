@@ -20,9 +20,9 @@ pub struct Symbol<'gc>(Gc<'gc, objects::Sym>);
 
 impl<'gc> Symbol<'gc> {
     #[inline]
-    pub fn of(v: Value<'gc>) -> Option<Self> {
-        match Data::of(v) {
-            Some(Data::Sym(s)) => Some(Self(s)),
+    pub fn of(value: Value<'gc>) -> Option<Self> {
+        match Data::of(value) {
+            Some(Data::Sym(sym)) => Some(Self(sym)),
             _ => None,
         }
     }
@@ -48,9 +48,9 @@ pub struct Keyword<'gc>(Gc<'gc, objects::Keyword>);
 
 impl<'gc> Keyword<'gc> {
     #[inline]
-    pub fn of(v: Value<'gc>) -> Option<Self> {
-        match Data::of(v) {
-            Some(Data::Keyword(k)) => Some(Self(k)),
+    pub fn of(value: Value<'gc>) -> Option<Self> {
+        match Data::of(value) {
+            Some(Data::Keyword(keyword)) => Some(Self(keyword)),
             _ => None,
         }
     }
@@ -89,9 +89,9 @@ impl<'gc> Symbols<'gc> {
         Ok(symbols)
     }
 
-    pub fn of(v: Value<'gc>) -> Option<Self> {
-        match Data::of(v) {
-            Some(Data::Interned(t)) => Some(Self(t)),
+    pub fn of(value: Value<'gc>) -> Option<Self> {
+        match Data::of(value) {
+            Some(Data::Interned(interned)) => Some(Self(interned)),
             _ => None,
         }
     }
@@ -105,14 +105,14 @@ impl<'gc> Symbols<'gc> {
         self.0.seed(mc)
     }
 
-    pub fn intern(self, h: &Strings<'_, 'gc>, s: Str<'gc>) -> Result<Symbol<'gc>, Error> {
-        string::intern(h, &self.interner(h), s).map(Symbol)
+    pub fn intern(self, strings: &Strings<'_, 'gc>, name: Str<'gc>) -> Result<Symbol<'gc>, Error> {
+        string::intern(strings, &self.interner(strings), name).map(Symbol)
     }
 
-    /// The symbol named `s`, made without making a string first unless the name is new.
+    /// The symbol named `name`, made without making a string first unless the name is new.
     #[inline]
-    pub fn intern_str(self, h: &Strings<'_, 'gc>, s: &str) -> Result<Symbol<'gc>, Error> {
-        string::intern_str(h, &self.interner(h), s).map(Symbol)
+    pub fn intern_str(self, strings: &Strings<'_, 'gc>, name: &str) -> Result<Symbol<'gc>, Error> {
+        string::intern_str(strings, &self.interner(strings), name).map(Symbol)
     }
 
     /// The keyword named as `symbol` is.
@@ -123,8 +123,8 @@ impl<'gc> Symbols<'gc> {
     }
 
     #[inline]
-    fn interner<'a>(self, h: &Strings<'a, 'gc>) -> Interner<'a, 'gc> {
-        let mc = h.mutation();
+    fn interner<'a>(self, strings: &Strings<'a, 'gc>) -> Interner<'a, 'gc> {
+        let mc = strings.mutation();
         let table = GcTable::of(self.0.table(mc).expect("an intern table has its table"));
         Interner { mc, seed: self.0.seed(mc), table }
     }
@@ -165,7 +165,7 @@ impl<'gc> Table<Strings<'_, 'gc>> for Interner<'_, 'gc> {
     }
 
     #[inline]
-    fn name(&self, h: &Strings<'_, 'gc>, symbol: Self::Entry) -> Str<'gc> {
-        h.string(symbol.name(self.mc)).expect("a symbol's name is a string")
+    fn name(&self, strings: &Strings<'_, 'gc>, symbol: Self::Entry) -> Str<'gc> {
+        strings.string(symbol.name(self.mc)).expect("a symbol's name is a string")
     }
 }

@@ -46,17 +46,17 @@ pub(crate) fn optimize<'s, 'd, 'gc>(mc: &Mutation<'gc>, src: &mut L2<'s, 'gc>, r
     let (mut uses, mut used, mut assigned) = (HashMap::<Var, UseStats>::default(), HashSet::default(), HashSet::default());
     for id in src.deep(root) {
         match src[id] {
-            Node::Ref(v) => {
-                used.insert(v);
-                uses.entry(v).or_default().total += 1;
+            Node::Ref(var) => {
+                used.insert(var);
+                uses.entry(var).or_default().total += 1;
             }
-            Node::Set(v, _) => {
-                assigned.insert(v);
-                uses.entry(v).or_default().total += 2;
+            Node::Set(var, _) => {
+                assigned.insert(var);
+                uses.entry(var).or_default().total += 2;
             }
-            Node::App(f, args) => {
-                if let Node::Ref(v) = src[f] {
-                    let entry = uses.entry(v).or_default();
+            Node::App(function, args) => {
+                if let Node::Ref(var) = src[function] {
+                    let entry = uses.entry(var).or_default();
                     entry.valid_calls += 1;
                     entry.call_arity = src[args].len();
                 }
@@ -257,17 +257,17 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         self.vals.pop().expect("a node made")
     }
 
-    /// Drains and returns the last `n` target node IDs from the value stack.
-    fn last(&mut self, n: usize) -> Vec<Id<'d>> {
-        self.vals.split_off(self.vals.len() - n)
+    /// Drains and returns the last `count` target node IDs from the value stack.
+    fn last(&mut self, count: usize) -> Vec<Id<'d>> {
+        self.vals.split_off(self.vals.len() - count)
     }
 
-    fn quote(&mut self, v: Value<'gc>) -> Id<'d> {
-        self.out.add(Node::Quote(v))
+    fn quote(&mut self, value: Value<'gc>) -> Id<'d> {
+        self.out.add(Node::Quote(value))
     }
 
-    fn arm_raw(&mut self, e: Id<'s>) -> usize {
-        self.arms.push(Arm::Raw(e));
+    fn arm_raw(&mut self, expr: Id<'s>) -> usize {
+        self.arms.push(Arm::Raw(expr));
         self.arms.len() - 1
     }
 
@@ -307,27 +307,27 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                 self.small_bodies.pop();
                 return;
             }
-            Task::LateBind(frame, v) => {
+            Task::LateBind(frame, var) => {
                 let lambda = self.pop();
                 if let Node::Lambda(fun) = self.out[lambda]
                     && self.inline_depth < MAX_INLINE_DEPTH
                     && self.is_small_inlinable(fun)
                 {
-                    self.small_funcs.insert(v, fun);
+                    self.small_funcs.insert(var, fun);
                 }
-                return self.lets[frame].kept.push(Bind::Val(v, lambda));
+                return self.lets[frame].kept.push(Bind::Val(var, lambda));
             }
             Task::Hide => return self.hidden.push(std::mem::take(&mut self.slot_derived)),
             Task::Show => return self.slot_derived = self.hidden.pop().expect("hidden"),
             Task::DerivedElse { truthy, subject, kind, other, test } => {
-                if let Some(v) = truthy {
-                    self.truthy_vars.remove(&v);
+                if let Some(var) = truthy {
+                    self.truthy_vars.remove(&var);
                 }
                 return then.extend([Task::ArmOf(other, subject, kind, false), Task::If(test)]);
             }
-            Task::Test(t, o) => {
+            Task::Test(consequent, other) => {
                 let test = self.pop();
-                return self.simplify_if(test, t, o, then);
+                return self.simplify_if(test, consequent, other, then);
             }
             Task::Then(first) => {
                 let second = self.pop();
@@ -338,14 +338,14 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                 if self.out[binds].is_empty() { body } else { self.out.add(Node::Let(binds, body)) }
             }
             Task::Seq => {
-                let (b, a) = (self.pop(), self.pop());
-                self.seq(a, b)
+                let (second, first) = (self.pop(), self.pop());
+                self.seq(first, second)
             }
-            Task::Set(v) => {
+            Task::Set(var) => {
                 let value = self.pop();
-                let target = match self.subst.get(&v).copied() {
-                    Some(Subst::Var(u)) => u,
-                    _ => v,
+                let target = match self.subst.get(&var).copied() {
+                    Some(Subst::Var(aliased)) => aliased,
+                    _ => var,
                 };
                 if self.used.contains(&target) {
                     self.out.add(Node::Set(target, value))
@@ -354,44 +354,44 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                     self.seq(value, void)
                 }
             }
-            Task::VarElse { v, newly, other, test } => {
+            Task::VarElse { v: var, newly, other, test } => {
                 if newly {
-                    self.truthy_vars.remove(&v);
+                    self.truthy_vars.remove(&var);
                 }
-                let prev = self.subst.insert(v, Subst::Quote(Value::FALSE));
-                return then.extend([Task::Arm(other), Task::VarDone { v, prev, test }]);
+                let prev = self.subst.insert(var, Subst::Quote(Value::FALSE));
+                return then.extend([Task::Arm(other), Task::VarDone { v: var, prev, test }]);
             }
-            Task::VarDone { v, prev, test } => {
-                let (other, t) = (self.pop(), self.pop());
-                self.restore(v, prev);
-                self.branches(test, t, other)
+            Task::VarDone { v: var, prev, test } => {
+                let (other, consequent) = (self.pop(), self.pop());
+                self.restore(var, prev);
+                self.branches(test, consequent, other)
             }
-            Task::PredElse { pred, v, newly, prev_subst, prev_fact, other, test } => {
+            Task::PredElse { pred, v: var, newly, prev_subst, prev_fact, other, test } => {
                 if newly {
-                    self.truthy_vars.remove(&v);
+                    self.truthy_vars.remove(&var);
                 }
                 if pred == Intrinsic::IsNull {
-                    self.restore(v, prev_subst);
+                    self.restore(var, prev_subst);
                 }
-                self.pred_facts.insert((pred, v), false);
-                return then.extend([Task::Arm(other), Task::PredDone { pred, v, prev_fact, test }]);
+                self.pred_facts.insert((pred, var), false);
+                return then.extend([Task::Arm(other), Task::PredDone { pred, v: var, prev_fact, test }]);
             }
-            Task::PredDone { pred, v, prev_fact, test } => {
-                let (other, t) = (self.pop(), self.pop());
+            Task::PredDone { pred, v: var, prev_fact, test } => {
+                let (other, consequent) = (self.pop(), self.pop());
                 match prev_fact {
-                    Some(prev) => _ = self.pred_facts.insert((pred, v), prev),
-                    None => _ = self.pred_facts.remove(&(pred, v)),
+                    Some(prev) => _ = self.pred_facts.insert((pred, var), prev),
+                    None => _ = self.pred_facts.remove(&(pred, var)),
                 }
-                self.branches(test, t, other)
+                self.branches(test, consequent, other)
             }
             Task::If(test) => {
-                let (other, t) = (self.pop(), self.pop());
-                self.branches(test, t, other)
+                let (other, consequent) = (self.pop(), self.pop());
+                self.branches(test, consequent, other)
             }
             Task::Bind(i) => return self.bind(i, then),
-            Task::Val(v) => {
+            Task::Val(var) => {
                 let init = self.pop();
-                return self.bound(v, init);
+                return self.bound(var, init);
             }
             Task::Fix(group) => {
                 let bodies = self.last(self.src[group].len());
@@ -403,8 +403,8 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                 let body = self.pop();
                 let frame = self.lets.pop().expect("in a let");
                 for &bind in &frame.kept {
-                    for v in self.out.vars(bind) {
-                        self.small_funcs.remove(&v);
+                    for var in self.out.vars(bind) {
+                        self.small_funcs.remove(&var);
                     }
                 }
                 self.finish_let(frame.kept, body)
@@ -418,23 +418,23 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                 self.at(site);
                 return self.callee(args, site, then);
             }
-            Task::Call(n) => {
-                let args = self.last(n);
-                let f = self.pop();
-                return self.opt_app(f, args, then);
+            Task::Call(count) => {
+                let args = self.last(count);
+                let function = self.pop();
+                return self.opt_app(function, args, then);
             }
-            Task::App(n) => {
-                let args = self.last(n);
-                let (f, args) = (self.pop(), self.out.list(args));
+            Task::App(count) => {
+                let args = self.last(count);
+                let (function, args) = (self.pop(), self.out.list(args));
                 self.slot_derived.clear();
-                self.out.add(Node::App(f, args))
+                self.out.add(Node::App(function, args))
             }
-            Task::Intrinsic(prim, n) => {
-                let args = self.last(n);
+            Task::Intrinsic(prim, count) => {
+                let args = self.last(count);
                 self.opt_intrinsic(prim, args)
             }
-            Task::ApplyIntrinsic(prim, n) => {
-                let args = self.last(n);
+            Task::ApplyIntrinsic(prim, count) => {
+                let args = self.last(count);
                 let args = self.out.list(args);
                 self.ran(prim);
                 self.out.add(Node::ApplyIntrinsic(prim, args))
@@ -477,39 +477,39 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         let site = self.src.site(id);
         self.at(site);
         let made = match node {
-            Node::Quote(v) => Node::Quote(v),
-            Node::Ref(v) => match self.subst.get(&v).copied() {
+            Node::Quote(value) => Node::Quote(value),
+            Node::Ref(var) => match self.subst.get(&var).copied() {
                 Some(Subst::Quote(val)) => Node::Quote(val),
-                Some(Subst::Var(u)) => Node::Ref(u),
-                None => Node::Ref(v),
+                Some(Subst::Var(aliased)) => Node::Ref(aliased),
+                None => Node::Ref(var),
             },
-            Node::If(test, t, o) => {
-                let (t, o) = (self.arm_raw(t), self.arm_raw(o));
-                return then.extend([Task::Expr(test), Task::Test(t, o)]);
+            Node::If(test, consequent, other) => {
+                let (consequent, other) = (self.arm_raw(consequent), self.arm_raw(other));
+                return then.extend([Task::Expr(test), Task::Test(consequent, other)]);
             }
-            Node::Seq(a, b) => return then.extend([Task::Expr(a), Task::Expr(b), Task::Seq]),
+            Node::Seq(first, second) => return then.extend([Task::Expr(first), Task::Expr(second), Task::Seq]),
             Node::Let(binds, body) => {
                 let binds = self.src[binds]
                     .iter()
                     .map(|&bind| match bind {
-                        Bind::Val(v, init) => BindIn::Val(v, Init::Src(init)),
+                        Bind::Val(var, init) => BindIn::Val(var, Init::Src(init)),
                         Bind::Fix(group) => BindIn::Fix(group),
                     })
                     .collect();
                 return self.open_let(binds, body, then);
             }
-            Node::Set(v, value) => return then.extend([Task::Expr(value), Task::Set(v)]),
-            Node::App(f, args) => return self.app(f, args, site, then),
+            Node::Set(var, value) => return then.extend([Task::Expr(value), Task::Set(var)]),
+            Node::App(function, args) => return self.app(function, args, site, then),
             Node::Lambda(fun) => {
                 let small = std::mem::take(&mut self.next_small);
                 return then.extend(self.body_tasks(fun, small).into_iter().chain([Task::Function(fun)]));
             }
             Node::Intrinsic(prim, args) => {
-                then.extend(self.src[args].iter().map(|&a| Task::Expr(a)));
+                then.extend(self.src[args].iter().map(|&arg| Task::Expr(arg)));
                 return then.extend([Task::At(site), Task::Intrinsic(prim, self.src[args].len())]);
             }
             Node::ApplyIntrinsic(prim, args) => {
-                then.extend(self.src[args].iter().map(|&a| Task::Expr(a)));
+                then.extend(self.src[args].iter().map(|&arg| Task::Expr(arg)));
                 return then.extend([Task::At(site), Task::ApplyIntrinsic(prim, self.src[args].len())]);
             }
         };
@@ -519,78 +519,78 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
 
     /// Constructs an optimized function record in `out` from source function `fun` with optimized body `body`.
     fn function(&mut self, fun: Fun<'s>, body: Id<'d>) -> Fun<'d> {
-        let f = self.src[fun];
-        let params = self.out.list(self.src[f.params].iter().copied());
-        self.out.function(Function { id: f.id, optional: f.optional, params, rest: f.rest, body })
+        let func = self.src[fun];
+        let params = self.out.list(self.src[func.params].iter().copied());
+        self.out.function(Function { id: func.id, optional: func.optional, params, rest: func.rest, body })
     }
 
-    fn restore(&mut self, v: Var, prev: Option<Subst<'gc>>) {
+    fn restore(&mut self, var: Var, prev: Option<Subst<'gc>>) {
         match prev {
-            Some(prev) => _ = self.subst.insert(v, prev),
-            None => _ = self.subst.remove(&v),
+            Some(prev) => _ = self.subst.insert(var, prev),
+            None => _ = self.subst.remove(&var),
         }
     }
 
     fn arm(&mut self, arm: usize, then: &mut Vec<Task<'s, 'd, 'gc>>) {
         match self.arms[arm] {
-            Arm::Raw(e) => then.push(Task::Expr(e)),
-            Arm::If(test, t, o) => self.simplify_if(test, t, o, then),
+            Arm::Raw(expr) => then.push(Task::Expr(expr)),
+            Arm::If(test, consequent, other) => self.simplify_if(test, consequent, other, then),
         }
     }
 
     /// Constructs an `If` node from optimized test and branches, eliminating the condition if both branches evaluate to the same constant or variable.
-    fn branches(&mut self, test: Id<'d>, t: Id<'d>, other: Id<'d>) -> Id<'d> {
-        let same = match (self.out[t], self.out[other]) {
-            (Node::Quote(a), Node::Quote(b)) => a == b,
-            (Node::Ref(a), Node::Ref(b)) => a == b,
+    fn branches(&mut self, test: Id<'d>, consequent: Id<'d>, other: Id<'d>) -> Id<'d> {
+        let same = match (self.out[consequent], self.out[other]) {
+            (Node::Quote(left), Node::Quote(right)) => left == right,
+            (Node::Ref(left), Node::Ref(right)) => left == right,
             _ => false,
         };
-        if same { self.seq(test, t) } else { self.out.add(Node::If(test, t, other)) }
+        if same { self.seq(test, consequent) } else { self.out.add(Node::If(test, consequent, other)) }
     }
 
     /// Simplifies `(if test then other)` given an already-optimized `test` expression, folding branches or recording dominating branch facts.
-    fn simplify_if(&mut self, mut test: Id<'d>, mut t: usize, mut o: usize, then: &mut Vec<Task<'s, 'd, 'gc>>) {
+    fn simplify_if(&mut self, mut test: Id<'d>, mut consequent: usize, mut other: usize, then: &mut Vec<Task<'s, 'd, 'gc>>) {
         // Post-processing tasks to apply to the constructed `if` expression, scheduled in reverse order.
         let mut after = Vec::new();
         loop {
             let node = self.out[test];
             match node {
                 // Constant condition folding: `(if #f then other) -> other` and `(if <truthy-const> then other) -> then`.
-                Node::Quote(v) => then.push(Task::Arm(if v == Value::FALSE { o } else { t })),
+                Node::Quote(value) => then.push(Task::Arm(if value == Value::FALSE { other } else { consequent })),
                 // Variable known to be truthy along the current dominating branch: folds directly to the `then` branch.
-                Node::Ref(v) if self.truthy_vars.contains(&v) => then.push(Task::Arm(t)),
+                Node::Ref(var) if self.truthy_vars.contains(&var) => then.push(Task::Arm(consequent)),
                 // Statically known non-false expression: sequences the test for side effects and selects the `then` branch.
-                _ if self.out.is_always_truthy(test) => then.extend([Task::Arm(t), Task::Then(test)]),
+                _ if self.out.is_always_truthy(test) => then.extend([Task::Arm(consequent), Task::Then(test)]),
                 // Inverts branches for logical negation: `(if (not x) then other) -> (if x other then)`.
                 Node::Intrinsic(Prim::Intrinsic(Intrinsic::Not), args) if self.out[args].len() == 1 => {
                     test = self.out[args][0];
-                    std::mem::swap(&mut t, &mut o);
+                    std::mem::swap(&mut consequent, &mut other);
                     continue;
                 }
                 // Hoists effect prefix: `(if (seq a b) then other) -> (seq a (if b then other))`.
-                Node::Seq(a, b) => {
-                    after.push(Task::Then(a));
-                    test = b;
+                Node::Seq(first, second) => {
+                    after.push(Task::Then(first));
+                    test = second;
                     continue;
                 }
                 // Normalizes short-circuit conjunction in test position:
                 // `(if (if a b #f) then other) -> (if a (if b then other) other)` when `other` is a duplicate-safe expression (constant or variable).
-                Node::If(a, b, c)
-                    if matches!(self.out[c], Node::Quote(Value::FALSE))
-                        && matches!(self.arms[o], Arm::Raw(e) if matches!(self.src[e], Node::Quote(_) | Node::Ref(_))) =>
+                Node::If(inner_test, inner_then, inner_else)
+                    if matches!(self.out[inner_else], Node::Quote(Value::FALSE))
+                        && matches!(self.arms[other], Arm::Raw(expr) if matches!(self.src[expr], Node::Quote(_) | Node::Ref(_))) =>
                 {
-                    let Arm::Raw(e) = self.arms[o] else { unreachable!() };
-                    let copy = self.src.add(self.src[e]);
+                    let Arm::Raw(expr) = self.arms[other] else { unreachable!() };
+                    let copy = self.src.add(self.src[expr]);
                     let copy = self.arm_raw(copy);
-                    self.arms.push(Arm::If(b, t, copy));
-                    t = self.arms.len() - 1;
-                    test = a;
+                    self.arms.push(Arm::If(inner_then, consequent, copy));
+                    consequent = self.arms.len() - 1;
+                    test = inner_test;
                     continue;
                 }
                 // Records dominating variable truthiness: `v` is known truthy in `then`, and `#f` in `other`.
-                Node::Ref(v) if !self.assigned.contains(&v) => {
-                    let newly = self.truthy_vars.insert(v);
-                    then.extend([Task::Arm(t), Task::VarElse { v, newly, other: o, test }]);
+                Node::Ref(var) if !self.assigned.contains(&var) => {
+                    let newly = self.truthy_vars.insert(var);
+                    then.extend([Task::Arm(consequent), Task::VarElse { v: var, newly, other, test }]);
                 }
                 // Records struct type test outcomes: in `then`, the subject is an instance of the struct type; in `other`, it is not.
                 Node::Intrinsic(Prim::Intrinsic(Intrinsic::IsStructDerivedFrom), args)
@@ -599,24 +599,24 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                         && let Some(kind) = self.struct_type(kind) =>
                 {
                     let truthy = match subject {
-                        Subject::Local(v) => self.truthy_vars.insert(v).then_some(v),
+                        Subject::Local(var) => self.truthy_vars.insert(var).then_some(var),
                         Subject::Slot(_) => None,
                     };
-                    then.extend([Task::ArmOf(t, subject, kind, true), Task::DerivedElse { truthy, subject, kind, other: o, test }]);
+                    then.extend([Task::ArmOf(consequent, subject, kind, true), Task::DerivedElse { truthy, subject, kind, other, test }]);
                 }
                 // Records dominating type-predicate outcomes: in `then`, `(pred, v)` holds true; in `other`, it holds false.
                 Node::Intrinsic(Prim::Intrinsic(pred), args)
                     if self.out[args].len() == 1
                         && pred.is_type_predicate()
-                        && matches!(self.out[self.out[args][0]], Node::Ref(v) if !self.assigned.contains(&v)) =>
+                        && matches!(self.out[self.out[args][0]], Node::Ref(var) if !self.assigned.contains(&var)) =>
                 {
-                    let Node::Ref(v) = self.out[self.out[args][0]] else { unreachable!() };
-                    let prev_fact = self.pred_facts.insert((pred, v), true);
-                    let newly = (pred != Intrinsic::IsBoolean) && self.truthy_vars.insert(v);
-                    let prev_subst = if pred == Intrinsic::IsNull { self.subst.insert(v, Subst::Quote(Value::NIL)) } else { None };
-                    then.extend([Task::Arm(t), Task::PredElse { pred, v, newly, prev_subst, prev_fact, other: o, test }]);
+                    let Node::Ref(var) = self.out[self.out[args][0]] else { unreachable!() };
+                    let prev_fact = self.pred_facts.insert((pred, var), true);
+                    let newly = (pred != Intrinsic::IsBoolean) && self.truthy_vars.insert(var);
+                    let prev_subst = if pred == Intrinsic::IsNull { self.subst.insert(var, Subst::Quote(Value::NIL)) } else { None };
+                    then.extend([Task::Arm(consequent), Task::PredElse { pred, v: var, newly, prev_subst, prev_fact, other, test }]);
                 }
-                _ => then.extend([Task::Arm(t), Task::Arm(o), Task::If(test)]),
+                _ => then.extend([Task::Arm(consequent), Task::Arm(other), Task::If(test)]),
             }
             break;
         }
@@ -632,8 +632,8 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
 
     /// Optimizes binding `i` of the innermost `let` frame after all preceding bindings have been processed.
     fn bind(&mut self, i: usize, then: &mut Vec<Task<'s, 'd, 'gc>>) {
-        let (v, init) = match self.frame().binds[i] {
-            BindIn::Val(v, init) => (v, init),
+        let (var, init) = match self.frame().binds[i] {
+            BindIn::Val(var, init) => (var, init),
             BindIn::Fix(group) => {
                 for &(_, fun) in &self.src[group] {
                     then.extend(self.body_tasks(fun, false));
@@ -642,30 +642,30 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             }
         };
         // Eliminates unused source lambdas. Single-call lambdas remain unoptimized in source form until inlined at their call site, avoiding redundant optimization passes. Compiler-generated variables are uncounted and bypassed.
-        if !self.assigned.contains(&v)
-            && let Init::Src(e) = init
-            && let Node::Lambda(fun) = self.src[e]
-            && let Some(&stats) = self.uses.get(&v)
+        if !self.assigned.contains(&var)
+            && let Init::Src(expr) = init
+            && let Node::Lambda(fun) = self.src[expr]
+            && let Some(&stats) = self.uses.get(&var)
         {
             if stats.total == 0 {
                 return;
             }
             if stats.total == 1 && stats.valid_calls == 1 && takes(self.src, fun, stats.call_arity) {
-                self.single_use.insert(v, (fun, self.lets.len() - 1));
+                self.single_use.insert(var, (fun, self.lets.len() - 1));
                 return;
             }
             // Functions referenced only in call position across multiple call sites and small enough in source form are designated small to preserve eligibility for call-site cloning.
             self.next_small = stats.valid_calls == stats.total && self.small_as_written(fun);
         }
         match init {
-            Init::Src(e) => then.extend([Task::Expr(e), Task::Val(v)]),
-            Init::Done(init) => self.bound(v, init),
+            Init::Src(expr) => then.extend([Task::Expr(expr), Task::Val(var)]),
+            Init::Done(init) => self.bound(var, init),
         }
     }
 
-    /// Records the optimized binding `v = init` in the innermost `let` frame and registers any newly learned value facts.
-    fn bound(&mut self, v: Var, mut init: Id<'d>) {
-        if !self.assigned.contains(&v) {
+    /// Records the optimized binding `var = init` in the innermost `let` frame and registers any newly learned value facts.
+    fn bound(&mut self, var: Var, mut init: Id<'d>) {
+        if !self.assigned.contains(&var) {
             if let Some((kind, args)) = self.out.made_struct(self.mc, init) {
                 // Ensures each struct field argument is a named variable or constant so subsequent field reads resolve cleanly; complex field expressions are bound to fresh variables.
                 let mut args = self.out[args].to_vec();
@@ -677,27 +677,27 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                     }
                 }
                 let parts = args[1..].iter().map(|&arg| self.out[arg]).collect();
-                self.known_structs.insert(v, (kind, parts));
+                self.known_structs.insert(var, (kind, parts));
                 init = self.make(Prim::Intrinsic(Intrinsic::MakeStruct), args);
             }
             match self.out[init] {
                 Node::Quote(val) => {
-                    self.subst.insert(v, Subst::Quote(val));
+                    self.subst.insert(var, Subst::Quote(val));
                     return;
                 }
-                Node::Ref(u) if !self.assigned.contains(&u) => {
-                    self.subst.insert(v, Subst::Var(u));
+                Node::Ref(aliased) if !self.assigned.contains(&aliased) => {
+                    self.subst.insert(var, Subst::Var(aliased));
                     return;
                 }
-                Node::Lambda(fun) if self.inline_depth < MAX_INLINE_DEPTH && self.is_small_inlinable(fun) => _ = self.small_funcs.insert(v, fun),
-                Node::Intrinsic(Prim::Intrinsic(Intrinsic::Cons), parts) if self.out[parts].iter().all(|&p| self.copyable(p)) => {
+                Node::Lambda(fun) if self.inline_depth < MAX_INLINE_DEPTH && self.is_small_inlinable(fun) => _ = self.small_funcs.insert(var, fun),
+                Node::Intrinsic(Prim::Intrinsic(Intrinsic::Cons), parts) if self.out[parts].iter().all(|&part| self.copyable(part)) => {
                     let parts = [self.out[self.out[parts][0]], self.out[self.out[parts][1]]];
-                    self.known_pairs.insert(v, parts);
+                    self.known_pairs.insert(var, parts);
                 }
                 _ => {}
             }
         }
-        self.frame().kept.push(Bind::Val(v, init));
+        self.frame().kept.push(Bind::Val(var, init));
     }
 
     /// Sequences `first` for side effects, followed by `second`, dropping `first` if it is pure.
@@ -709,34 +709,34 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
     fn seq_all(&mut self, firsts: Vec<Id<'d>>, second: Id<'d>) -> Id<'d> {
         let mut todo: Vec<Id<'d>> = firsts.into_iter().rev().collect();
         let mut effects = Vec::new();
-        while let Some(e) = todo.pop() {
-            if self.out.is_pure(self.mc, e) {
+        while let Some(expr) = todo.pop() {
+            if self.out.is_pure(self.mc, expr) {
                 continue;
             }
-            match self.out[e] {
-                Node::Seq(a, b) => todo.extend([b, a]),
-                Node::Intrinsic(Prim::Intrinsic(i), args) if i.is_discardable() => todo.extend(self.out[args].iter().rev()),
-                Node::Intrinsic(Prim::Host(h), args) if h.purity == Purity::Discardable => todo.extend(self.out[args].iter().rev()),
-                Node::If(test, t, o) if self.out.is_pure(self.mc, t) && self.out.is_pure(self.mc, o) => todo.push(test),
-                _ => effects.push(e),
+            match self.out[expr] {
+                Node::Seq(prefix, inner) => todo.extend([inner, prefix]),
+                Node::Intrinsic(Prim::Intrinsic(intrinsic), args) if intrinsic.is_discardable() => todo.extend(self.out[args].iter().rev()),
+                Node::Intrinsic(Prim::Host(host), args) if host.purity == Purity::Discardable => todo.extend(self.out[args].iter().rev()),
+                Node::If(test, consequent, other) if self.out.is_pure(self.mc, consequent) && self.out.is_pure(self.mc, other) => todo.push(test),
+                _ => effects.push(expr),
             }
         }
         if effects.len() < 2 {
             return match effects.pop() {
-                Some(e) => self.out.add(Node::Seq(e, second)),
+                Some(effect) => self.out.add(Node::Seq(effect, second)),
                 None => second,
             };
         }
-        let binds: Vec<Bind<'d>> = effects.into_iter().map(|e| Bind::Val(self.supply.fresh_var(), e)).collect();
+        let binds: Vec<Bind<'d>> = effects.into_iter().map(|effect| Bind::Val(self.supply.fresh_var(), effect)).collect();
         let binds = self.out.list(binds);
         self.out.add(Node::Let(binds, second))
     }
 
-    /// Returns true if expression `e` can be freely duplicated without duplicating computation or mutating state (i.e. constants or unassigned variables).
-    fn copyable(&self, e: Id<'d>) -> bool {
-        match self.out[e] {
+    /// Returns true if expression `expr` can be freely duplicated without duplicating computation or mutating state (i.e. constants or unassigned variables).
+    fn copyable(&self, expr: Id<'d>) -> bool {
+        match self.out[expr] {
             Node::Quote(_) => true,
-            Node::Ref(u) => !self.assigned.contains(&u),
+            Node::Ref(var) => !self.assigned.contains(&var),
             _ => false,
         }
     }
@@ -751,11 +751,11 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
     }
 
     /// Optimizes a source application `(f args...)`. Enclosing `Let` bindings and effect sequences (`Seq`) around the callee are floated outwards (e.g. `((let (...) f) x) -> (let (...) (f x))`). Directly applied lambdas and single-use procedures are inlined while body and arguments are still in source form, ensuring they are optimized only once in context.
-    fn app(&mut self, f: Id<'s>, args: Span<'s, Id<'s>>, site: u32, then: &mut Vec<Task<'s, 'd, 'gc>>) {
-        match self.src[f] {
-            Node::Seq(a, b) => {
-                let call = self.src.add(Node::App(b, args));
-                return then.push(Task::Expr(self.src.add(Node::Seq(a, call))));
+    fn app(&mut self, function: Id<'s>, args: Span<'s, Id<'s>>, site: u32, then: &mut Vec<Task<'s, 'd, 'gc>>) {
+        match self.src[function] {
+            Node::Seq(first, second) => {
+                let call = self.src.add(Node::App(second, args));
+                return then.push(Task::Expr(self.src.add(Node::Seq(first, call))));
             }
             Node::Let(binds, body) => {
                 let call = self.src.add(Node::App(body, args));
@@ -768,36 +768,36 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             }
             _ => {}
         }
-        then.extend([Task::Expr(f), Task::Callee(args, site)]);
+        then.extend([Task::Expr(function), Task::Callee(args, site)]);
     }
 
     /// Continues optimizing a call where the operator has already been lowered; handles inlining of single-use lambdas.
     fn callee(&mut self, args: Span<'s, Id<'s>>, site: u32, then: &mut Vec<Task<'s, 'd, 'gc>>) {
-        let f = self.pop();
-        let n = self.src[args].len();
-        if let Node::Ref(v) = self.out[f]
-            && let Some((fun, frame)) = self.single_use.remove(&v)
+        let function = self.pop();
+        let count = self.src[args].len();
+        if let Node::Ref(var) = self.out[function]
+            && let Some((fun, frame)) = self.single_use.remove(&var)
         {
             // Within a function marked to remain small, do not inline single-use lambdas; instead, bind the optimized lambda at its original binding site and emit a call, preventing code bloat.
             if self.small_bodies.last() == Some(&true) {
-                self.vals.push(f);
+                self.vals.push(function);
                 let small = self.small_as_written(fun);
-                then.extend(self.body_tasks(fun, small).into_iter().chain([Task::Function(fun), Task::LateBind(frame, v)]));
-                then.extend(self.src[args].iter().map(|&a| Task::Expr(a)));
-                return then.extend([Task::At(site), Task::Call(n)]);
+                then.extend(self.body_tasks(fun, small).into_iter().chain([Task::Function(fun), Task::LateBind(frame, var)]));
+                then.extend(self.src[args].iter().map(|&arg| Task::Expr(arg)));
+                return then.extend([Task::At(site), Task::Call(count)]);
             }
-            if takes(self.src, fun, n) {
+            if takes(self.src, fun, count) {
                 let binds = self.bind_src(fun, args);
                 self.inlined_src(self.src[fun].id, self.src[fun].body, site);
                 return self.open_let(binds, self.src[fun].body, then);
             }
             then.extend(self.body_tasks(fun, false).into_iter().chain([Task::Function(fun)]));
-            then.extend(self.src[args].iter().map(|&a| Task::Expr(a)));
-            return then.extend([Task::At(site), Task::App(n)]);
+            then.extend(self.src[args].iter().map(|&arg| Task::Expr(arg)));
+            return then.extend([Task::At(site), Task::App(count)]);
         }
-        self.vals.push(f);
-        then.extend(self.src[args].iter().map(|&a| Task::Expr(a)));
-        then.extend([Task::At(site), Task::Call(n)]);
+        self.vals.push(function);
+        then.extend(self.src[args].iter().map(|&arg| Task::Expr(arg)));
+        then.extend([Task::At(site), Task::Call(count)]);
     }
 
     /// Schedules worklist tasks to optimize the body of `fun`: stashes module-slot facts before entry, evaluates the body, and rolls back local facts learned within it upon exit.
@@ -807,14 +807,14 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
 
     /// Creates source-level `Let` bindings pairing `fun`'s formal parameters with actual argument expressions `args`.
     fn bind_src(&mut self, fun: Fun<'s>, args: Span<'s, Id<'s>>) -> Vec<BindIn<'s, 'd>> {
-        let f = self.src[fun];
-        let params = self.src[f.params].to_vec();
+        let func = self.src[fun];
+        let params = self.src[func.params].to_vec();
         let mut args = self.src[args].to_vec();
         // Missing optional parameters are bound to `#<unsupplied>`, matching the VM calling convention.
         while args.len() < params.len() {
             args.push(self.src.add(Node::Quote(Value::UNSUPPLIED)));
         }
-        let rest = f.rest.map(|rest| {
+        let rest = func.rest.map(|rest| {
             let mut list = self.src.add(Node::Quote(Value::NIL));
             for item in args.split_off(params.len()).into_iter().rev() {
                 let pair = self.src.list([item, list]);
@@ -822,7 +822,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             }
             (rest, list)
         });
-        params.into_iter().zip(args).chain(rest).map(|(v, e)| BindIn::Val(v, Init::Src(e))).collect()
+        params.into_iter().zip(args).chain(rest).map(|(var, expr)| BindIn::Val(var, Init::Src(expr))).collect()
     }
 
     /// Creates target `Let` bindings pairing `params` and optional `rest` with already-optimized argument expressions `args`.
@@ -841,46 +841,46 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
     }
 
     /// Optimizes an application where both the callee operator and all argument expressions have already been lowered.
-    fn opt_app(&mut self, mut f: Id<'d>, args: Vec<Id<'d>>, then: &mut Vec<Task<'s, 'd, 'gc>>) {
+    fn opt_app(&mut self, mut function: Id<'d>, args: Vec<Id<'d>>, then: &mut Vec<Task<'s, 'd, 'gc>>) {
         // Hoists any `Let` bindings or `Seq` expressions out of the operator expression, matching `app`.
         let mut wraps = Vec::new();
         loop {
-            match self.out[f] {
-                Node::Seq(a, b) => {
-                    wraps.push(Task::Then(a));
-                    f = b;
+            match self.out[function] {
+                Node::Seq(prefix, inner) => {
+                    wraps.push(Task::Then(prefix));
+                    function = inner;
                 }
                 Node::Let(binds, body) => {
                     wraps.push(Task::Within(binds));
-                    f = body;
+                    function = body;
                 }
                 _ => break,
             }
         }
         // Resolves small dispatcher functions that immediately delegate to another procedure based on known facts, iteratively resolving chains of dispatchers.
         while args.is_empty()
-            && let Node::Ref(v) = self.out[f]
-            && let Some(&fun) = self.small_funcs.get(&v)
+            && let Node::Ref(var) = self.out[function]
+            && let Some(&fun) = self.small_funcs.get(&var)
             && let Some(to) = self.picked(fun)
         {
-            f = to;
+            function = to;
         }
-        let made = match self.out[f] {
+        let made = match self.out[function] {
             // Direct beta-reduction of an already-optimized lambda: binds parameters to arguments around the existing body without re-optimizing it.
             Node::Lambda(fun) if takes(self.out, fun, args.len()) => {
                 let func = self.out[fun];
                 let params = self.out[func.params].to_vec();
                 self.inlined_out(func.id, func.body, self.out.current());
-                let binds = self.bind_done(params, func.rest, args).into_iter().map(|(v, e)| Bind::Val(v, e)).collect();
+                let binds = self.bind_done(params, func.rest, args).into_iter().map(|(var, expr)| Bind::Val(var, expr)).collect();
                 // The pre-optimized lambda body may contain arbitrary calls with side effects; clear module-slot facts.
                 self.slot_derived.clear();
                 self.finish_let(binds, func.body)
             }
             // Clones small local procedures at their call sites with alpha-renamed variables, re-optimizing the cloned body with concrete argument values (unless currently within a function marked to remain small).
-            Node::Ref(v)
+            Node::Ref(var)
                 if self.inline_depth < MAX_INLINE_DEPTH
                     && self.small_bodies.last() != Some(&true)
-                    && let Some(&fun) = self.small_funcs.get(&v)
+                    && let Some(&fun) = self.small_funcs.get(&var)
                     && takes(self.out, fun, args.len()) =>
             {
                 let renamed = self.alpha_rename(fun);
@@ -888,7 +888,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                 let func = self.src[renamed];
                 self.inlined_src(func.id, func.body, self.out.current());
                 let params = self.src[func.params].to_vec();
-                let binds = self.bind_done(params, func.rest, args).into_iter().map(|(v, e)| BindIn::Val(v, Init::Done(e))).collect();
+                let binds = self.bind_done(params, func.rest, args).into_iter().map(|(var, expr)| BindIn::Val(var, Init::Done(expr))).collect();
                 self.open_let(binds, func.body, then);
                 then.push(Task::Inlined);
                 return then.extend(wraps.into_iter().rev());
@@ -896,7 +896,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             _ => {
                 let args = self.out.list(args);
                 self.slot_derived.clear();
-                self.out.add(Node::App(f, args))
+                self.out.add(Node::App(function, args))
             }
         };
         self.vals.push(made);
@@ -945,8 +945,8 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         self.out.add(Node::Intrinsic(prim, args))
     }
 
-    fn truth(&mut self, b: bool) -> Id<'d> {
-        self.quote(if b { Value::TRUE } else { Value::FALSE })
+    fn truth(&mut self, truthy: bool) -> Id<'d> {
+        self.quote(if truthy { Value::TRUE } else { Value::FALSE })
     }
 
     fn rules(&mut self, prim: Prim, intrinsic: Intrinsic, mut args: Vec<Id<'d>>) -> Id<'d> {
@@ -957,11 +957,11 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         }
 
         // Rule 1: Compile-time constant folding for pure intrinsics with constant operands via `Intrinsic::is_pure_foldable`.
-        if intrinsic.is_pure_foldable() && args.iter().all(|&a| matches!(self.out[a], Node::Quote(_))) {
+        if intrinsic.is_pure_foldable() && args.iter().all(|&arg| matches!(self.out[arg], Node::Quote(_))) {
             let values: Vec<Value<'gc>> = args
                 .iter()
-                .map(|&a| match self.out[a] {
-                    Node::Quote(v) => v,
+                .map(|&arg| match self.out[arg] {
+                    Node::Quote(value) => value,
                     _ => unreachable!(),
                 })
                 .collect();
@@ -977,8 +977,8 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         // The constant operand has no side effects, so reordering preserves evaluation semantics.
         // `(- x 0)` is preserved to distinguish `-0.0` from `0.0`.
         if matches!(intrinsic, Intrinsic::Add | Intrinsic::Sub) && args.len() == 2 {
-            let constant = |e: Node<'d, 'gc>| match e {
-                Node::Quote(v) => v.as_fixnum(),
+            let constant = |node: Node<'d, 'gc>| match node {
+                Node::Quote(value) => value.as_fixnum(),
                 _ => None,
             };
             if intrinsic == Intrinsic::Add && constant(self.out[args[0]]).is_some() && constant(self.out[args[1]]).is_none() {
@@ -986,7 +986,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                 return self.make(prim, args);
             }
             if intrinsic == Intrinsic::Sub
-                && let Some(neg) = constant(self.out[args[1]]).filter(|&k| k != 0).and_then(i64::checked_neg).and_then(Value::fixnum)
+                && let Some(neg) = constant(self.out[args[1]]).filter(|&offset| offset != 0).and_then(i64::checked_neg).and_then(Value::fixnum)
             {
                 args[1] = self.quote(neg);
                 return self.make(Prim::Intrinsic(Intrinsic::Add), args);
@@ -996,8 +996,8 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         // Replaces variables known to hold immutable pairs with their original `cons` constructor for subsequent peephole folding (except for `list?` predicates, which could trigger infinite unfolding).
         if args.len() == 1
             && (intrinsic.cxr_step().is_some() || (intrinsic.is_type_predicate() && intrinsic != Intrinsic::IsList))
-            && let Node::Ref(v) = self.out[args[0]]
-            && let Some(&[head, tail]) = self.known_pairs.get(&v)
+            && let Node::Ref(var) = self.out[args[0]]
+            && let Some(&[head, tail]) = self.known_pairs.get(&var)
         {
             let parts = [self.out.add(head), self.out.add(tail)];
             args[0] = self.make(Prim::Intrinsic(Intrinsic::Cons), parts.to_vec());
@@ -1006,28 +1006,28 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         // Rule 2: Store-to-load forwarding for `car`..`cddddr` accessors on `(cons head tail)`, preserving left-to-right argument evaluation order.
         if let Some((is_car, rest)) = intrinsic.cxr_step()
             && args.len() == 1
-            && let Node::Intrinsic(Prim::Intrinsic(Intrinsic::Cons), c) = self.out[args[0]]
-            && self.out[c].len() == 2
+            && let Node::Intrinsic(Prim::Intrinsic(Intrinsic::Cons), pair) = self.out[args[0]]
+            && self.out[pair].len() == 2
         {
-            let (head, tail) = (self.out[c][0], self.out[c][1]);
+            let (head, tail) = (self.out[pair][0], self.out[pair][1]);
             if !is_car {
                 let next = match rest {
-                    Some(r) => self.opt_intrinsic(Prim::Intrinsic(r), vec![tail]),
+                    Some(step) => self.opt_intrinsic(Prim::Intrinsic(step), vec![tail]),
                     None => tail,
                 };
                 return self.seq(head, next);
             }
             if self.out.is_pure(self.mc, tail) {
                 return match rest {
-                    Some(r) => self.opt_intrinsic(Prim::Intrinsic(r), vec![head]),
+                    Some(step) => self.opt_intrinsic(Prim::Intrinsic(step), vec![head]),
                     None => head,
                 };
             }
             let tmp = self.supply.fresh_var();
-            let r = self.out.add(Node::Ref(tmp));
+            let reference = self.out.add(Node::Ref(tmp));
             let projected = match rest {
-                Some(rest) => self.opt_intrinsic(Prim::Intrinsic(rest), vec![r]),
-                None => r,
+                Some(rest) => self.opt_intrinsic(Prim::Intrinsic(rest), vec![reference]),
+                None => reference,
             };
             let body = self.seq(tail, projected);
             let binds = self.out.list([Bind::Val(tmp, head)]);
@@ -1037,22 +1037,22 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         // Rule 3: Store-to-load forwarding for boxes: `(unbox (box x)) -> x`.
         if intrinsic == Intrinsic::Unbox
             && args.len() == 1
-            && let Node::Intrinsic(Prim::Intrinsic(Intrinsic::MakeBox), b) = self.out[args[0]]
-            && self.out[b].len() == 1
+            && let Node::Intrinsic(Prim::Intrinsic(Intrinsic::MakeBox), boxed) = self.out[args[0]]
+            && self.out[boxed].len() == 1
         {
-            return self.out[b][0];
+            return self.out[boxed][0];
         }
 
         // Rule 4: Simplifies `not` on statically truthy expressions or known truthy variables: `(not <truthy>) -> (seq <truthy> #f)`.
         if intrinsic == Intrinsic::Not && args.len() == 1 {
-            if let Node::Ref(v) = self.out[args[0]]
-                && self.truthy_vars.contains(&v)
+            if let Node::Ref(var) = self.out[args[0]]
+                && self.truthy_vars.contains(&var)
             {
                 return self.truth(false);
             }
             if self.out.is_always_truthy(args[0]) {
-                let f = self.truth(false);
-                return self.seq(args[0], f);
+                let falsy = self.truth(false);
+                return self.seq(args[0], falsy);
             }
         }
 
@@ -1062,15 +1062,15 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                 return self.truth(known);
             }
             match self.out[args[0]] {
-                Node::Intrinsic(Prim::Intrinsic(Intrinsic::Cons), c) if self.out[c].len() == 2 => {
+                Node::Intrinsic(Prim::Intrinsic(Intrinsic::Cons), pair) if self.out[pair].len() == 2 => {
                     if intrinsic != Intrinsic::IsList {
                         let res = self.truth(intrinsic == Intrinsic::IsPair);
-                        return self.seq_all(self.out[c].to_vec(), res);
+                        return self.seq_all(self.out[pair].to_vec(), res);
                     }
                 }
-                Node::Intrinsic(Prim::Intrinsic(Intrinsic::MakeBox), b) if self.out[b].len() == 1 => {
+                Node::Intrinsic(Prim::Intrinsic(Intrinsic::MakeBox), boxed) if self.out[boxed].len() == 1 => {
                     let res = self.truth(intrinsic == Intrinsic::IsBox);
-                    return self.seq_all(self.out[b].to_vec(), res);
+                    return self.seq_all(self.out[boxed].to_vec(), res);
                 }
                 Node::Lambda(_) => return self.truth(intrinsic == Intrinsic::IsProcedure),
                 _ => {
@@ -1087,27 +1087,27 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         //    - Canonicalize empty list check: `(eq? x '()) -> (null? x)` (avoids loading `'()` literal)
         //    - Canonicalize boolean false check: `(eq? x #f) -> (not x)` (enables branch inversion in `if`)
         if matches!(intrinsic, Intrinsic::Eq | Intrinsic::Eqv | Intrinsic::Equal) && args.len() == 2 {
-            if let (Node::Ref(a), Node::Ref(b)) = (self.out[args[0]], self.out[args[1]])
-                && a == b
-                && !self.assigned.contains(&a)
+            if let (Node::Ref(left), Node::Ref(right)) = (self.out[args[0]], self.out[args[1]])
+                && left == right
+                && !self.assigned.contains(&left)
             {
                 return self.truth(true);
             }
             if matches!(self.out[args[1]], Node::Quote(Value::NIL)) {
-                let x = args.swap_remove(0);
-                return self.opt_intrinsic(Prim::Intrinsic(Intrinsic::IsNull), vec![x]);
+                let operand = args.swap_remove(0);
+                return self.opt_intrinsic(Prim::Intrinsic(Intrinsic::IsNull), vec![operand]);
             }
             if matches!(self.out[args[0]], Node::Quote(Value::NIL)) {
-                let x = args.pop().expect("checked 2 eq args");
-                return self.opt_intrinsic(Prim::Intrinsic(Intrinsic::IsNull), vec![x]);
+                let operand = args.pop().expect("checked 2 eq args");
+                return self.opt_intrinsic(Prim::Intrinsic(Intrinsic::IsNull), vec![operand]);
             }
             if matches!(self.out[args[1]], Node::Quote(Value::FALSE)) {
-                let x = args.swap_remove(0);
-                return self.opt_intrinsic(Prim::Intrinsic(Intrinsic::Not), vec![x]);
+                let operand = args.swap_remove(0);
+                return self.opt_intrinsic(Prim::Intrinsic(Intrinsic::Not), vec![operand]);
             }
             if matches!(self.out[args[0]], Node::Quote(Value::FALSE)) {
-                let x = args.pop().expect("checked 2 eq args");
-                return self.opt_intrinsic(Prim::Intrinsic(Intrinsic::Not), vec![x]);
+                let operand = args.pop().expect("checked 2 eq args");
+                return self.opt_intrinsic(Prim::Intrinsic(Intrinsic::Not), vec![operand]);
             }
         }
 
@@ -1124,24 +1124,24 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         self.make(prim, args)
     }
 
-    /// Checks whether expression `e` satisfies type predicate `pred`, based on currently known type facts.
-    fn of_kind(&self, pred: Intrinsic, e: Id<'d>) -> Option<bool> {
+    /// Checks whether expression `expr` satisfies type predicate `pred`, based on currently known type facts.
+    fn of_kind(&self, pred: Intrinsic, expr: Id<'d>) -> Option<bool> {
         // A struct instance satisfies `struct?` and disproves all other disjoint primitive type predicates.
-        if let Some(subject) = self.subject(e)
+        if let Some(subject) = self.subject(expr)
             && self.known(subject).is_some_and(|known| !known.is.is_empty())
         {
             return Some(pred == Intrinsic::IsStruct);
         }
-        let Node::Ref(v) = self.out[e] else { return None };
-        if let Some(&known) = self.pred_facts.get(&(pred, v)) {
+        let Node::Ref(var) = self.out[expr] else { return None };
+        if let Some(&known) = self.pred_facts.get(&(pred, var)) {
             return Some(known);
         }
-        if self.known_structs.contains_key(&v) {
+        if self.known_structs.contains_key(&var) {
             return Some(pred == Intrinsic::IsStruct);
         }
         // Deduces predicate outcome from known predicate facts using implications:
         // if `P` implies `Q` and `P` holds, `Q` is true; if `Q` implies `P` and `P` is false, `Q` is false; if `P` and `Q` are disjoint and `P` holds, `Q` is false.
-        let known = |holds: bool, tells: &dyn Fn(Intrinsic) -> bool| self.pred_facts.iter().any(|(&(other, u), &val)| u == v && val == holds && tells(other));
+        let known = |holds: bool, tells: &dyn Fn(Intrinsic) -> bool| self.pred_facts.iter().any(|(&(other, fact_var), &val)| fact_var == var && val == holds && tells(other));
         if known(true, &|other| other.implies(pred)) {
             return Some(true);
         }
@@ -1154,8 +1154,8 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
     /// Evaluates whether the already-optimized condition `test` statically evaluates to true or false under current facts.
     fn decided(&self, test: Id<'d>) -> Option<bool> {
         match self.out[test] {
-            Node::Quote(v) => Some(v != Value::FALSE),
-            Node::Ref(v) if self.truthy_vars.contains(&v) => Some(true),
+            Node::Quote(value) => Some(value != Value::FALSE),
+            Node::Ref(var) if self.truthy_vars.contains(&var) => Some(true),
             Node::Intrinsic(Prim::Intrinsic(Intrinsic::IsStructDerivedFrom), args) if let [tested, kind] = self.out[args] => self.derives(self.subject(tested)?, self.struct_type(kind)?),
             Node::Intrinsic(Prim::Intrinsic(pred), args) if pred.is_type_predicate() && let [tested] = self.out[args] => self.of_kind(pred, tested),
             _ => None,
@@ -1166,32 +1166,32 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
     ///
     /// For example, given `(lambda () (if (point? x) (matched) (next)))`, if `x` is known not to be a `point`, a call resolves directly to `(next)`.
     fn picked(&self, fun: Fun<'d>) -> Option<Id<'d>> {
-        let f = self.out[fun];
-        if !self.out[f.params].is_empty() || f.rest.is_some() {
+        let func = self.out[fun];
+        if !self.out[func.params].is_empty() || func.rest.is_some() {
             return None;
         }
-        let mut e = f.body;
-        while let Node::If(test, t, o) = self.out[e] {
-            e = if self.decided(test)? { t } else { o };
+        let mut expr = func.body;
+        while let Node::If(test, consequent, other) = self.out[expr] {
+            expr = if self.decided(test)? { consequent } else { other };
         }
-        match self.out[e] {
+        match self.out[expr] {
             Node::App(to, args) if self.out[args].is_empty() && matches!(self.out[to], Node::Ref(_)) => Some(to),
             _ => None,
         }
     }
 
-    /// Returns the struct type descriptor if `e` evaluates to a constant struct type object.
-    fn struct_type(&self, e: Id<'d>) -> Option<Gc<'gc, StructType>> {
-        match self.out[e] {
+    /// Returns the struct type descriptor if `expr` evaluates to a constant struct type object.
+    fn struct_type(&self, expr: Id<'d>) -> Option<Gc<'gc, StructType>> {
+        match self.out[expr] {
             Node::Quote(kind) => kind.downcast::<StructType>(self.mc),
             _ => None,
         }
     }
 
-    /// Identifies the tracking subject (an unassigned local variable or a module slot) accessed by expression `e`.
-    fn subject(&self, e: Id<'d>) -> Option<Subject> {
-        match self.out[e] {
-            Node::Ref(v) if !self.assigned.contains(&v) => Some(Subject::Local(v)),
+    /// Identifies the tracking subject (an unassigned local variable or a module slot) accessed by expression `expr`.
+    fn subject(&self, expr: Id<'d>) -> Option<Subject> {
+        match self.out[expr] {
+            Node::Ref(var) if !self.assigned.contains(&var) => Some(Subject::Local(var)),
             Node::Intrinsic(Prim::Slot(SlotOp::Load | SlotOp::LoadChecked, slot), _) => Some(Subject::Slot(slot)),
             _ => None,
         }
@@ -1199,14 +1199,14 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
 
     fn known(&self, subject: Subject) -> Option<&Known<'gc>> {
         match subject {
-            Subject::Local(v) => self.derived.get(&v),
+            Subject::Local(var) => self.derived.get(&var),
             Subject::Slot(slot) => self.slot_derived.get(&slot),
         }
     }
 
     fn known_mut(&mut self, subject: Subject) -> Option<&mut Known<'gc>> {
         match subject {
-            Subject::Local(v) => self.derived.get_mut(&v),
+            Subject::Local(var) => self.derived.get_mut(&var),
             Subject::Slot(slot) => self.slot_derived.get_mut(&slot),
         }
     }
@@ -1224,7 +1224,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             return;
         }
         let known = match subject {
-            Subject::Local(v) => self.derived.entry(v).or_default(),
+            Subject::Local(var) => self.derived.entry(var).or_default(),
             Subject::Slot(slot) => self.slot_derived.entry(slot).or_default(),
         };
         if is {
@@ -1238,8 +1238,8 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
     /// Queries whether `subject` is known to instantiate or not instantiate struct type `kind`.
     fn derives(&self, subject: Subject, kind: Gc<'gc, StructType>) -> Option<bool> {
         let mc = self.mc;
-        if let Subject::Local(v) = subject
-            && let Some(&(made_as, _)) = self.known_structs.get(&v)
+        if let Subject::Local(var) = subject
+            && let Some(&(made_as, _)) = self.known_structs.get(&var)
         {
             return Some(structs::derives(mc, made_as, kind));
         }
@@ -1263,8 +1263,8 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
     /// Simplifies struct-related intrinsic operations on `args` (type checks or field accesses) using known struct facts and constructor arguments.
     fn struct_rules(&mut self, intrinsic: Intrinsic, args: &[Id<'d>]) -> Option<Id<'d>> {
         let mc = self.mc;
-        let index = |this: &Self, e: Id<'d>| match this.out[e] {
-            Node::Quote(k) => k.as_fixnum().and_then(|k| usize::try_from(k).ok()),
+        let index = |this: &Self, expr: Id<'d>| match this.out[expr] {
+            Node::Quote(value) => value.as_fixnum().and_then(|number| usize::try_from(number).ok()),
             _ => None,
         };
         match (intrinsic, args) {
@@ -1279,17 +1279,17 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             }
             // An immutable field read on a variable bound to a newly constructed struct resolves directly to the field value supplied at construction.
             (Intrinsic::StructField | Intrinsic::StructFixedField, &[read, at]) => {
-                let (Node::Ref(v), k) = (self.out[read], index(self, at)?) else { return None };
-                let (made_as, parts) = self.known_structs.get(&v)?;
-                if structs::is_mutable(mc, *made_as, k) {
+                let (Node::Ref(var), position) = (self.out[read], index(self, at)?) else { return None };
+                let (made_as, parts) = self.known_structs.get(&var)?;
+                if structs::is_mutable(mc, *made_as, position) {
                     return None;
                 }
-                let part = *parts.get(k)?;
+                let part = *parts.get(position)?;
                 Some(self.out.add(part))
             }
             (Intrinsic::StructRef, &[read, kind, at]) => {
-                let (kind, k) = (self.struct_type(kind)?, index(self, at)?);
-                if k >= kind.fields(mc) as usize {
+                let (kind, position) = (self.struct_type(kind)?, index(self, at)?);
+                if position >= kind.fields(mc) as usize {
                     return None;
                 }
                 if let Some(subject) = self.subject(read) {
@@ -1297,7 +1297,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                         return None;
                     }
                     // Because the struct type is statically verified, replace the checked accessor with an unchecked field read; immutable fields return constant values.
-                    let unchecked = if structs::is_mutable(mc, kind, k) { Intrinsic::StructField } else { Intrinsic::StructFixedField };
+                    let unchecked = if structs::is_mutable(mc, kind, position) { Intrinsic::StructField } else { Intrinsic::StructFixedField };
                     return Some(self.opt_intrinsic(Prim::Intrinsic(unchecked), vec![read, at]));
                 }
                 // When an ephemeral struct is constructed solely to read a single field, extract that field directly and sequence remaining field expressions for effects.
@@ -1313,7 +1313,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                         binds.push(Bind::Val(bound, value));
                         part = self.out.add(Node::Ref(bound));
                     }
-                    if i == k {
+                    if i == position {
                         field = Some(part);
                     }
                 }
@@ -1335,7 +1335,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
     }
 
     fn is_small_inlinable(&self, fun: Fun<'d>) -> bool {
-        if self.out.params(fun).any(|v| self.assigned.contains(&v)) {
+        if self.out.params(fun).any(|param| self.assigned.contains(&param)) {
             return false;
         }
         small(self.out, &self.assigned, self.out[fun].body, &mut 0)
@@ -1343,62 +1343,62 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
 
     /// Clones small function `fun` into the source table, assigning fresh variables to avoid capture during inlining.
     fn alpha_rename(&mut self, fun: Fun<'d>) -> Fun<'s> {
-        let f = self.out[fun];
+        let func = self.out[fun];
         let mut map = HashMap::default();
-        let params: Vec<Var> = self.out[f.params]
+        let params: Vec<Var> = self.out[func.params]
             .iter()
-            .map(|&v| {
+            .map(|&param| {
                 let fresh = self.supply.fresh_var();
-                map.insert(v, fresh);
+                map.insert(param, fresh);
                 fresh
             })
             .collect();
-        let rest = f.rest.map(|v| {
+        let rest = func.rest.map(|rest| {
             let fresh = self.supply.fresh_var();
-            map.insert(v, fresh);
+            map.insert(rest, fresh);
             fresh
         });
-        let body = self.rename(f.body, &mut map);
+        let body = self.rename(func.body, &mut map);
         let params = self.src.list(params);
         let id = self.supply.fresh_lambda();
-        self.names.copy(f.id, id);
-        self.src.function(Function { id, params, optional: f.optional, rest, body })
+        self.names.copy(func.id, id);
+        self.src.function(Function { id, params, optional: func.optional, rest, body })
     }
 
-    /// Recursively copies expression `e` into the source AST table while substituting variables according to `map`.
-    fn rename(&mut self, e: Id<'d>, map: &mut HashMap<Var, Var>) -> Id<'s> {
-        let node = match self.out[e] {
-            Node::Quote(v) => Node::Quote(v),
-            Node::Ref(v) => Node::Ref(map.get(&v).copied().unwrap_or(v)),
-            Node::If(a, b, c) => {
-                let (a, b) = (self.rename(a, map), self.rename(b, map));
-                Node::If(a, b, self.rename(c, map))
+    /// Recursively copies expression `expr` into the source AST table while substituting variables according to `map`.
+    fn rename(&mut self, expr: Id<'d>, map: &mut HashMap<Var, Var>) -> Id<'s> {
+        let node = match self.out[expr] {
+            Node::Quote(value) => Node::Quote(value),
+            Node::Ref(var) => Node::Ref(map.get(&var).copied().unwrap_or(var)),
+            Node::If(test, consequent, other) => {
+                let (test, consequent) = (self.rename(test, map), self.rename(consequent, map));
+                Node::If(test, consequent, self.rename(other, map))
             }
-            Node::Seq(a, b) => {
-                let a = self.rename(a, map);
-                Node::Seq(a, self.rename(b, map))
+            Node::Seq(first, second) => {
+                let first = self.rename(first, map);
+                Node::Seq(first, self.rename(second, map))
             }
             Node::Let(binds, body) => {
                 let mut renamed = Vec::with_capacity(self.out[binds].len());
                 for i in 0..self.out[binds].len() {
-                    let Bind::Val(v, init) = self.out[binds][i] else { unreachable!("small inlinable functions have no Fix") };
+                    let Bind::Val(var, init) = self.out[binds][i] else { unreachable!("small inlinable functions have no Fix") };
                     let init = self.rename(init, map);
                     let fresh = self.supply.fresh_var();
-                    map.insert(v, fresh);
+                    map.insert(var, fresh);
                     renamed.push(Bind::Val(fresh, init));
                 }
                 let body = self.rename(body, map);
                 Node::Let(self.src.list(renamed), body)
             }
-            Node::App(f, args) => {
-                let f = self.rename(f, map);
-                Node::App(f, self.rename_all(args, map))
+            Node::App(function, args) => {
+                let function = self.rename(function, map);
+                Node::App(function, self.rename_all(args, map))
             }
             Node::Intrinsic(prim, args) => Node::Intrinsic(prim, self.rename_all(args, map)),
             Node::ApplyIntrinsic(prim, args) => Node::ApplyIntrinsic(prim, self.rename_all(args, map)),
             Node::Set(..) | Node::Lambda(_) => unreachable!("small inlinable functions have no Set/Lambda"),
         };
-        self.src.at(self.out.site(e));
+        self.src.at(self.out.site(expr));
         self.src.add(node)
     }
 
@@ -1408,31 +1408,31 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
     }
 }
 
-/// Counts AST nodes in `e` to determine if it is small enough for inlining, short-circuiting as soon as the accumulated size exceeds [`MAX_INLINE_SIZE`].
-fn small<'x>(tree: &L2<'x, '_>, assigned: &HashSet<Var>, e: Id<'x>, size: &mut usize) -> bool {
+/// Counts AST nodes in `expr` to determine if it is small enough for inlining, short-circuiting as soon as the accumulated size exceeds [`MAX_INLINE_SIZE`].
+fn small<'x>(tree: &L2<'x, '_>, assigned: &HashSet<Var>, expr: Id<'x>, size: &mut usize) -> bool {
     *size += 1;
     if *size > MAX_INLINE_SIZE {
         return false;
     }
-    match tree[e] {
+    match tree[expr] {
         Node::Quote(_) => true,
-        Node::Ref(v) => !assigned.contains(&v),
-        Node::If(a, b, c) => [a, b, c].into_iter().all(|part| small(tree, assigned, part, size)),
-        Node::Seq(a, b) => small(tree, assigned, a, size) && small(tree, assigned, b, size),
+        Node::Ref(var) => !assigned.contains(&var),
+        Node::If(test, consequent, other) => [test, consequent, other].into_iter().all(|part| small(tree, assigned, part, size)),
+        Node::Seq(first, second) => small(tree, assigned, first, size) && small(tree, assigned, second, size),
         Node::Let(binds, body) => {
-            tree[binds].iter().all(|&b| matches!(b, Bind::Val(v, init) if !assigned.contains(&v) && small(tree, assigned, init, size))) && small(tree, assigned, body, size)
+            tree[binds].iter().all(|&bind| matches!(bind, Bind::Val(var, init) if !assigned.contains(&var) && small(tree, assigned, init, size))) && small(tree, assigned, body, size)
         }
         Node::Set(..) | Node::Lambda(_) => false,
-        Node::App(f, args) => small(tree, assigned, f, size) && tree[args].iter().all(|&a| small(tree, assigned, a, size)),
-        Node::Intrinsic(_, args) | Node::ApplyIntrinsic(_, args) => tree[args].iter().all(|&a| small(tree, assigned, a, size)),
+        Node::App(function, args) => small(tree, assigned, function, size) && tree[args].iter().all(|&arg| small(tree, assigned, arg, size)),
+        Node::Intrinsic(_, args) | Node::ApplyIntrinsic(_, args) => tree[args].iter().all(|&arg| small(tree, assigned, arg, size)),
     }
 }
 
 /// Verifies that function `fun` accepts `argc` arguments, ensuring that any rest list expansion does not exceed [`MAX_REST_INLINE`].
 fn takes<'x>(tree: &L2<'x, '_>, fun: Fun<'x>, argc: usize) -> bool {
-    let f = tree[fun];
-    let (most, least) = (tree[f.params].len(), tree[f.params].len() - f.optional as usize);
-    match f.rest {
+    let func = tree[fun];
+    let (most, least) = (tree[func.params].len(), tree[func.params].len() - func.optional as usize);
+    match func.rest {
         None => (least..=most).contains(&argc),
         Some(_) => argc >= least && argc.saturating_sub(most) <= MAX_REST_INLINE,
     }

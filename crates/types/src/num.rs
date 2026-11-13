@@ -63,23 +63,23 @@ impl<'a, 'gc> Nums<'a, 'gc> {
     }
 
     #[inline]
-    pub fn integer(&self, v: Value<'gc>) -> Option<Integer<'gc>> {
-        (v.is_fixnum() || matches!(Numbers::of(v), Some(Numbers::Big(_)))).then_some(Integer(v))
+    pub fn integer(&self, value: Value<'gc>) -> Option<Integer<'gc>> {
+        (value.is_fixnum() || matches!(Numbers::of(value), Some(Numbers::Big(_)))).then_some(Integer(value))
     }
 
     #[inline]
-    pub fn rational(&self, v: Value<'gc>) -> Option<Rational<'gc>> {
-        (v.is_fixnum() || matches!(Numbers::of(v), Some(Numbers::Big(_) | Numbers::Ratio(_)))).then_some(Rational(v))
+    pub fn rational(&self, value: Value<'gc>) -> Option<Rational<'gc>> {
+        (value.is_fixnum() || matches!(Numbers::of(value), Some(Numbers::Big(_) | Numbers::Ratio(_)))).then_some(Rational(value))
     }
 
     #[inline]
-    pub fn real(&self, v: Value<'gc>) -> Option<Real<'gc>> {
-        (v.is_flonum() || self.rational(v).is_some()).then_some(Real(v))
+    pub fn real(&self, value: Value<'gc>) -> Option<Real<'gc>> {
+        (value.is_flonum() || self.rational(value).is_some()).then_some(Real(value))
     }
 
     #[inline]
-    pub fn number(&self, v: Value<'gc>) -> Option<Number<'gc>> {
-        (v.is_flonum() || v.is_fixnum() || Numbers::of(v).is_some()).then_some(Number(v))
+    pub fn number(&self, value: Value<'gc>) -> Option<Number<'gc>> {
+        (value.is_flonum() || value.is_fixnum() || Numbers::of(value).is_some()).then_some(Number(value))
     }
 }
 
@@ -87,16 +87,16 @@ impl<'gc> ComplexHost for Nums<'_, 'gc> {
     type Number = Number<'gc>;
 
     #[inline]
-    fn complex_view(&self, x: Number<'gc>) -> ComplexView<Real<'gc>> {
-        match Numbers::of(x.0) {
-            Some(Numbers::Complex(z)) => ComplexView::Complex { re: Real(z.re(self.mc)), im: Real(z.im(self.mc)) },
-            _ => ComplexView::Real(Real(x.0)),
+    fn complex_view(&self, number: Number<'gc>) -> ComplexView<Real<'gc>> {
+        match Numbers::of(number.0) {
+            Some(Numbers::Complex(complex)) => ComplexView::Complex { re: Real(complex.re(self.mc)), im: Real(complex.im(self.mc)) },
+            _ => ComplexView::Real(Real(number.0)),
         }
     }
 
     #[inline]
-    fn of_real(&self, x: Real<'gc>) -> Number<'gc> {
-        Number(x.0)
+    fn of_real(&self, real: Real<'gc>) -> Number<'gc> {
+        Number(real.0)
     }
 
     fn complex(&self, re: Real<'gc>, im: Real<'gc>) -> Result<Number<'gc>, Error> {
@@ -108,21 +108,21 @@ impl<'gc> RealHost for Nums<'_, 'gc> {
     type Real = Real<'gc>;
 
     #[inline]
-    fn real_view(&self, x: Real<'gc>) -> RealView<Rational<'gc>> {
-        match x.0.as_flonum(self.mc) {
-            Some(f) => RealView::Flonum(f),
-            None => RealView::Exact(Rational(x.0)),
+    fn real_view(&self, real: Real<'gc>) -> RealView<Rational<'gc>> {
+        match real.0.as_flonum(self.mc) {
+            Some(flonum) => RealView::Flonum(flonum),
+            None => RealView::Exact(Rational(real.0)),
         }
     }
 
     #[inline]
-    fn of_rational(&self, x: Rational<'gc>) -> Real<'gc> {
-        Real(x.0)
+    fn of_rational(&self, rational: Rational<'gc>) -> Real<'gc> {
+        Real(rational.0)
     }
 
     #[inline]
-    fn flonum(&self, f: f64) -> Result<Real<'gc>, Error> {
-        Ok(Real(Value::flonum(self.mc, f)?))
+    fn flonum(&self, float: f64) -> Result<Real<'gc>, Error> {
+        Ok(Real(Value::flonum(self.mc, float)?))
     }
 }
 
@@ -130,16 +130,16 @@ impl<'gc> RationalHost for Nums<'_, 'gc> {
     type Rational = Rational<'gc>;
 
     #[inline]
-    fn rational_view(&self, x: Rational<'gc>) -> RationalView<Integer<'gc>> {
-        match Numbers::of(x.0) {
-            Some(Numbers::Ratio(r)) => RationalView::Ratio { num: Integer(r.num(self.mc)), den: Integer(r.den(self.mc)) },
-            _ => RationalView::Integer(Integer(x.0)),
+    fn rational_view(&self, rational: Rational<'gc>) -> RationalView<Integer<'gc>> {
+        match Numbers::of(rational.0) {
+            Some(Numbers::Ratio(ratio)) => RationalView::Ratio { num: Integer(ratio.num(self.mc)), den: Integer(ratio.den(self.mc)) },
+            _ => RationalView::Integer(Integer(rational.0)),
         }
     }
 
     #[inline]
-    fn of_int(&self, x: Integer<'gc>) -> Rational<'gc> {
-        Rational(x.0)
+    fn of_int(&self, integer: Integer<'gc>) -> Rational<'gc> {
+        Rational(integer.0)
     }
 
     fn ratio(&self, num: Integer<'gc>, den: Integer<'gc>) -> Result<Rational<'gc>, Error> {
@@ -152,18 +152,18 @@ impl<'gc> Host for Nums<'_, 'gc> {
     type Error = Error;
 
     #[inline]
-    fn view(&self, x: Integer<'gc>) -> IntView<'_> {
-        if let Some(n) = x.0.as_fixnum() {
-            return IntView::Small(n);
+    fn view(&self, integer: Integer<'gc>) -> IntView<'_> {
+        if let Some(fixnum) = integer.0.as_fixnum() {
+            return IntView::Small(fixnum);
         }
-        let Some(Numbers::Big(big)) = Numbers::of(x.0) else { panic!("integers are fixnums or bigs") };
+        let Some(Numbers::Big(big)) = Numbers::of(integer.0) else { panic!("integers are fixnums or bigs") };
         let digits = &big.items(self.mc).words()[..big.digits(self.mc) as usize];
         IntView::Big { negative: big.negative(self.mc), digits: Digits::new(digits) }
     }
 
     #[inline]
-    fn small(&self, n: i64) -> Option<Integer<'gc>> {
-        Value::fixnum(n).map(Integer)
+    fn small(&self, number: i64) -> Option<Integer<'gc>> {
+        Value::fixnum(number).map(Integer)
     }
 
     fn big(&self, negative: bool, len: usize, init: impl FnOnce(RWDigits<'_>) -> usize) -> Result<Integer<'gc>, Error> {
@@ -178,17 +178,17 @@ impl<'gc> Host for Nums<'_, 'gc> {
     }
 
     #[inline]
-    fn small_add(&self, x: Integer<'gc>, y: Integer<'gc>) -> Option<Integer<'gc>> {
-        x.0.fixnum_add(y.0).map(Integer)
+    fn small_add(&self, left: Integer<'gc>, right: Integer<'gc>) -> Option<Integer<'gc>> {
+        left.0.fixnum_add(right.0).map(Integer)
     }
 
     #[inline]
-    fn small_sub(&self, x: Integer<'gc>, y: Integer<'gc>) -> Option<Integer<'gc>> {
-        x.0.fixnum_sub(y.0).map(Integer)
+    fn small_sub(&self, left: Integer<'gc>, right: Integer<'gc>) -> Option<Integer<'gc>> {
+        left.0.fixnum_sub(right.0).map(Integer)
     }
 
     #[inline]
-    fn small_mul(&self, x: Integer<'gc>, y: Integer<'gc>) -> Option<Integer<'gc>> {
-        x.0.fixnum_mul(y.0).map(Integer)
+    fn small_mul(&self, left: Integer<'gc>, right: Integer<'gc>) -> Option<Integer<'gc>> {
+        left.0.fixnum_mul(right.0).map(Integer)
     }
 }

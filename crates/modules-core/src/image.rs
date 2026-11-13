@@ -75,8 +75,8 @@ pub fn save<'gc>(mc: &Mutation<'gc>, roots: &[Value<'gc>]) -> Result<Vec<u8>, Sa
 /// saved with. `hosts` are the host functions the image's code can call.
 pub fn load<'gc>(mc: &Mutation<'gc>, bytes: &[u8], hosts: impl IntoIterator<Item = &'static HostDef>) -> Result<Vec<Value<'gc>>, ImageError> {
     let hosts = Hosts::new(hosts).map_err(ImageError::SameHost)?;
-    image::load(mc, stamp(), bytes, &descs(), &kinds(), &hosts).map_err(|e| match hosts.missing() {
+    image::load(mc, stamp(), bytes, &descs(), &kinds(), &hosts).map_err(|error| match hosts.missing() {
         Some(name) => ImageError::Host(name),
-        None => ImageError::Load(e),
+        None => ImageError::Load(error),
     })
 }

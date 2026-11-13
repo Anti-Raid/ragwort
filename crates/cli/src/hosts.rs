@@ -34,7 +34,7 @@ pub fn flush() {
 
 fn show<'gc>(cx: &mut HostContext<'_, 'gc>, args: HostArgs<'_, 'gc>, mode: Mode) -> Result<Reply<'gc>, Fault> {
     let value = args.get(0).ok_or(Fault::Arity)?;
-    let text = to_string(cx.mc(), value, mode, LIMIT).map_err(|e| match e {
+    let text = to_string(cx.mc(), value, mode, LIMIT).map_err(|error| match error {
         PrintError::TooLong => Fault::OutOfRange,
         PrintError::Arena(_) => Fault::OutOfMemory,
     })?;
