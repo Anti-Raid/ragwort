@@ -248,7 +248,7 @@ pub enum Fault {
     OutOfFuel,
     /// User-level exception raised via `error` or `make-error`.
     Error,
-    /// Attempted to resume a coroutine that is not in a pending state (i.e. already running, finished, or failed).
+    /// Attempted to resume a coroutine that is not in a pending state (i.e. already running, dead, or failed).
     NotPending,
     /// Syntax error (as created by `make-syntax-error`), indicating malformed syntax such as a macro use unmatched by any `syntax-case` pattern.
     Syntax,

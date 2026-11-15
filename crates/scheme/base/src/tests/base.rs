@@ -2461,6 +2461,14 @@ fn a_host_matches_on_what_was_raised() {
         assert_eq!(procedure_name(mc, procedure).map(|name| show(mc, name.value(mc))), Some("f".to_string()));
     });
     reported("(car)", |_, report| assert!(matches!(report.error, Raised::Arity { procedure: Some(_), given: 0, .. })));
+    // A receiving call reports how many values it passed to its consumer.
+    reported("(define three (car (list (lambda () (values 1 2 3))))) (define (f a b) a) (+ 1 (call-with-values three f))", |mc, report| {
+        let Raised::Arity { operation: None, procedure: Some(procedure), given: 3 } = report.error else { panic!("{:?}", report.error) };
+        assert_eq!(procedure_name(mc, procedure).map(|name| show(mc, name.value(mc))), Some("f".to_string()));
+    });
+    reported("(define one (car (list (lambda () 1)))) (define (f a b) a) (call-with-values one f)", |_, report| {
+        assert!(matches!(report.error, Raised::Arity { procedure: Some(_), given: 1, .. }), "{:?}", report.error);
+    });
     reported("(define two (car (list (lambda () (values 1 2))))) (+ 1 (two))", |mc, report| {
         assert_eq!(report.error, Raised::ValueCount { received: Some(2) });
         assert_eq!(ragwort_printer_scheme::render(mc, &report, usize::MAX), "error: wrong number of values: 2");

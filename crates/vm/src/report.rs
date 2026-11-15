@@ -95,7 +95,7 @@ fn count<'gc>(number: u8) -> Value<'gc> {
 /// Identifies the origin of `fault` from the instruction that raised it: the instruction before `pc` in `code`, executing in `frame`.
 ///
 /// Returns an origin with no name and no irritants when the instruction does not explain the fault.
-pub(crate) fn origin<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, code: Gc<'gc, Bytecode>, pc: usize, values: Value<'gc>, fault: Fault) -> Result<Origin<'gc>, Fault> {
+pub(crate) fn origin<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, code: Gc<'gc, Bytecode>, pc: usize, received: Value<'gc>, fault: Fault) -> Result<Origin<'gc>, Fault> {
     let unknown = Origin { operation: None, irritants: Value::NIL };
     let Some(&op) = pc.checked_sub(1).and_then(|at| code.ops(mc)?.get(at)) else { return Ok(unknown) };
     let registers = |base: u8, count: u8| (0..count).map(move |i| frame.get(base.wrapping_add(i)));
@@ -111,14 +111,11 @@ pub(crate) fn origin<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, code: Gc<'g
         Op::Call { base, args } if fault == Fault::Arity => (None, list(mc, [frame.get(base), count(args)].into_iter())?),
         // A failed tail call has already moved the callee into the frame's closure register.
         Op::TailCall { args, .. } if fault == Fault::Arity => (None, list(mc, [frame.get(CLOSURE), count(args)].into_iter())?),
-        // `values` is the list of values that the load did not take. The irritant is how many there are.
-        Op::LoadAcc { .. } if fault == Fault::ValueCount => {
-            let received = Pairs::new(mc).list_len(values).and_then(|received| i64::try_from(received).ok()).and_then(Value::fixnum);
-            (None, list(mc, [received.unwrap_or(Value::VOID)].into_iter())?)
-        }
-        // A receiving call does not say how many values it passed. A failed tail call has already moved the callee, as above.
-        Op::CallReceived { base } if fault == Fault::Arity => (None, list(mc, [frame.get(base)].into_iter())?),
-        Op::TailCallReceived { .. } if fault == Fault::Arity => (None, list(mc, [frame.get(CLOSURE)].into_iter())?),
+        // `received` is how many values the accumulator held. A load takes exactly one, so the irritant is that number.
+        Op::LoadAcc { .. } if fault == Fault::ValueCount => (None, list(mc, [received].into_iter())?),
+        // A receiving call passes the values in the accumulator, so `received` is its number of arguments. A failed tail call has already moved the callee, as above.
+        Op::CallReceived { base } if fault == Fault::Arity => (None, list(mc, [frame.get(base), received].into_iter())?),
+        Op::TailCallReceived { .. } if fault == Fault::Arity => (None, list(mc, [frame.get(CLOSURE), received].into_iter())?),
         Op::LoadSlotChecked { slot, .. } | Op::StoreSlotChecked { slot, .. } if fault == Fault::Unbound => {
             let names = code.module(mc).and_then(|module| AnyVector::of(module.names(mc)));
             let Some(name) = names.and_then(|names| names.get(mc, slot as usize)) else { return Ok(unknown) };

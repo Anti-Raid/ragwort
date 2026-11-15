@@ -361,6 +361,8 @@ impl<'s, 'gc> Run<'s, 'gc> {
             self.cx.fuel.pause();
         }
         match reply {
+            // The marker is not a value. A host that returned it would make the accumulator claim a list it does not have.
+            Reply::Value(Value::VALUES) => Err(Fault::WrongType.into()),
             Reply::Value(value) => {
                 self.cx.acc = value;
                 if tail { self.ret() } else { Ok(()) }
@@ -420,7 +422,7 @@ impl<'s, 'gc> Run<'s, 'gc> {
     fn received(&mut self, base: u8, tail: bool) -> Result<(), Exit<'gc>> {
         let acc = self.cx.acc;
         let call = if acc == Value::VALUES {
-            Call { base, argc: 0, rest: std::mem::replace(&mut self.cx.values, Value::NIL) }
+            Call { base, argc: 0, rest: self.cx.values }
         } else {
             let call = Call { base, argc: 1, rest: Value::NIL };
             fits(call)?;

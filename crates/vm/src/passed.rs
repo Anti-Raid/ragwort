@@ -22,6 +22,7 @@ use ragwort_types::pair::{Pair, Pairs};
 use crate::Fault;
 use crate::frame::ARGS;
 use crate::machine::{Outer, Then};
+use crate::run::MAX_ARGS;
 
 /// Values held in stack slots, followed by the elements of the list `rest`.
 #[derive(Clone, Copy)]
@@ -157,6 +158,10 @@ impl<'gc> Outer<'_, 'gc> {
     /// Call this last, when everything the call needs from the stack has been read. It can move the stack to a new segment, and nothing else may use the stack between this and the call.
     pub(crate) fn pass(&mut self, values: &[Value<'gc>]) -> Result<Passed<'gc>, Fault> {
         let mc = self.mc();
+        // A frame's registers wrap around its window, so more values than a call can take would overwrite the first ones.
+        if values.len() > MAX_ARGS {
+            return Err(Fault::Malformed);
+        }
         let fp = self.segments.bottom(0)?;
         let frame = self.segments.frame(fp)?;
         for (register, &value) in (ARGS..).zip(values) {

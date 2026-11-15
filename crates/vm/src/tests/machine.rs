@@ -1135,6 +1135,27 @@ static HOSTS: [HostDef; 5] = [
 ];
 const DEFER: u32 = 3;
 
+fn marker_host<'s, 'gc>(_: &mut HostContext<'s, 'gc>, _: HostArgs<'s, 'gc>) -> Result<Reply<'gc>, Fault> {
+    Ok(Reply::Value(Value::VALUES))
+}
+
+static MARKER: [HostDef; 1] = [crate::host!("marker", 0, Purity::Impure, marker_host)];
+
+/// The marker the accumulator holds for several values is not a value. A host cannot return it or pass it in.
+#[test]
+fn the_values_marker_is_not_a_value_a_host_can_pass() {
+    let mut arena = Arena::new(1 << 24, 0);
+    arena.mutate(|mc| {
+        let tail: Func<'_> = (0, &[], &[Op::TailCallHost { base: 2, args: 0, host: 0 }]);
+        let loaded: Func<'_> = (0, &[], &[Op::CallHost { base: 2, args: 0, host: 0 }, Op::LoadAcc { dst: 2 }, Op::Return { src: 2 }]);
+        let same: Func<'_> = (1, &[], &[Op::Return { src: 1 }]);
+        let codes = module_calling(mc, &[], &MARKER, &[tail, loaded, same]);
+        assert_eq!(run(mc, codes[0], &[]), Err(Fault::WrongType));
+        assert_eq!(run(mc, codes[1], &[]), Err(Fault::WrongType));
+        assert!(matches!(Machine::new(mc, MIN_SEGMENT, closure(mc, codes[2]), &[Value::VALUES]), Err(Fault::WrongType)));
+    });
+}
+
 #[test]
 fn host_functions_are_the_same_when_their_functions_are() {
     assert_eq!(HOSTS[0], crate::host!("add", -1, Purity::Pure, add_host));

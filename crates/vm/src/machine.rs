@@ -144,6 +144,9 @@ impl Machine {
     /// Resumes a machine that suspended via `co/yield`, passing `args` as the return value of the yield
     /// expression. Returns `Err(Fault::NotPending)` if the machine is not waiting on a yield.
     pub fn resume<'gc>(&mut self, mc: &Mutation<'gc>, args: &[Value<'gc>]) -> Result<Outcome<'gc>, Fault> {
+        if args.contains(&Value::VALUES) {
+            return Err(Fault::WrongType);
+        }
         let (acc, values) = match *args {
             [value] => (value, Value::NIL),
             _ => (Value::VALUES, Pairs::new(mc).list(args)?),
@@ -157,6 +160,9 @@ impl Machine {
     /// function's return value. Returns `Err(Fault::NotPending)` if the machine is not waiting on a
     /// deferred host call.
     pub fn reply<'gc>(&mut self, mc: &Mutation<'gc>, answer: Value<'gc>) -> Result<Outcome<'gc>, Fault> {
+        if answer == Value::VALUES {
+            return Err(Fault::WrongType);
+        }
         self.answer(mc, Waiting::Host, answer)?;
         self.run(mc)
     }
@@ -184,7 +190,8 @@ impl Machine {
     fn save<'gc>(&mut self, mc: &Mutation<'gc>, task: Gc<'gc, Task>, regs: &Regs<'gc>) {
         (self.fp, self.pc) = (regs.fp, regs.pc);
         task.set_acc(mc, regs.acc);
-        task.set_values(mc, regs.values);
+        // The list is meaningful only beside the marker. A stale one is dropped here, so it does not stay alive past this run.
+        task.set_values(mc, if regs.acc == Value::VALUES { regs.values } else { Value::NIL });
         let len = self.stack.segment(mc).len(mc);
         self.stack.set_top((regs.fp + WINDOW).min(len));
     }
@@ -321,7 +328,10 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         match blame {
             Blame::Instruction => {
                 let (Some(code), Ok(frame)) = (self.regs.code, self.segments.frame(self.regs.fp)) else { return Ok(Origin { operation: None, irritants: Value::NIL }) };
-                report::origin(mc, frame, code, self.regs.pc, self.regs.values, fault)
+                // What the accumulator held when the instruction failed: one value, or the list beside the marker.
+                let received = if self.regs.acc == Value::VALUES { Pairs::new(mc).list_len(self.regs.values) } else { Some(1) };
+                let received = received.and_then(|received| i64::try_from(received).ok()).and_then(Value::fixnum).unwrap_or(Value::VOID);
+                report::origin(mc, frame, code, self.regs.pc, received, fault)
             }
             Blame::Callee(callee) => Ok(Origin { operation: None, irritants: Pairs::new(mc).cons(callee, Value::NIL)?.value(mc) }),
             Blame::Nothing => Ok(Origin { operation: None, irritants: Value::NIL }),
@@ -540,6 +550,9 @@ impl<'a, 'gc> Outer<'a, 'gc> {
 
     /// Starts a machine's first call: `procedure` with `args`.
     fn begin(&mut self, procedure: Value<'gc>, args: &[Value<'gc>]) -> Result<(), Fault> {
+        if args.contains(&Value::VALUES) {
+            return Err(Fault::WrongType);
+        }
         let passed = if args.len() <= MAX_ARGS { self.pass(args)? } else { Passed::list(Pairs::new(self.mc()).list(args)?) };
         self.start(procedure, passed)
     }

@@ -191,6 +191,7 @@ impl<'gc> Outer<'_, 'gc> {
                 give(mc, self.task(), segment);
             }
             task.set_segment(mc, None);
+            task.set_base(mc, 0);
         }
         prompts::empty(mc, task);
         task.set_prompts(mc, Value::NIL);
