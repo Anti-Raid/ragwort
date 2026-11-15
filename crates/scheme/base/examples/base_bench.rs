@@ -98,37 +98,79 @@ fn arena() -> Arena {
     arena
 }
 
+/// A fresh arena in which `text` is loaded and all its forms but the last have run. Returns the arena, the time loading took, and a machine that is ready to run the last form.
+fn prepared(text: &str, native: bool) -> (Arena, Duration, Machine) {
+    let mut arena = arena();
+    arena.collect();
+    let (loaded, machine) = arena.mutate(|mc| {
+        let symbols = Symbols::of(mc.root(0)).expect("table");
+        let prelude = mc.root(1).downcast::<Module>(mc).expect("the prelude");
+        let session = SyntaxSession::new(mc, text).expect("session");
+        let start = Instant::now();
+        let loaded = if native {
+            ragwort_native::load(mc, symbols, "main", &[], &[&session], &mut NoModules).expect("load")
+        } else {
+            load(mc, symbols, prelude, "main", &[&session], &[], &mut NoModules).expect("load")
+        };
+        let mut thunks = loaded.thunks;
+        let loaded = start.elapsed();
+        let last = thunks.pop().expect("a form");
+        for thunk in thunks {
+            run(mc, thunk);
+        }
+        (loaded, Machine::new(mc, MIN_SEGMENT, last, &[]).expect("machine"))
+    });
+    (arena, loaded, machine)
+}
+
 /// Best time over a few runs of loading `text`, or if `run_all`, of running what it loads, all
 /// but the last form before timing, then the last.
 fn time(text: &str, native: bool, run_all: bool) -> Duration {
     let mut best = Duration::MAX;
     for _ in 0..5 {
-        let mut arena = arena();
-        arena.collect();
-        let (loaded, mut machine) = arena.mutate(|mc| {
-            let symbols = Symbols::of(mc.root(0)).expect("table");
-            let prelude = mc.root(1).downcast::<Module>(mc).expect("the prelude");
-            let session = SyntaxSession::new(mc, text).expect("session");
-            let start = Instant::now();
-            let loaded = if native {
-                ragwort_native::load(mc, symbols, "main", &[], &[&session], &mut NoModules).expect("load")
-            } else {
-                load(mc, symbols, prelude, "main", &[&session], &[], &mut NoModules).expect("load")
-            };
-            let mut thunks = loaded.thunks;
-            let loaded = start.elapsed();
-            let last = thunks.pop().expect("a form");
-            for thunk in thunks {
-                run(mc, thunk);
-            }
-            (loaded, Machine::new(mc, MIN_SEGMENT, last, &[]).expect("machine"))
-        });
+        let (mut arena, loaded, mut machine) = prepared(text, native);
         if !run_all {
             best = best.min(loaded);
             continue;
         }
         let start = Instant::now();
         while !arena.step(|mc| matches!(black_box(machine.run(mc).expect("run")), Outcome::Done(_))).expect("room") {}
+        best = best.min(start.elapsed());
+    }
+    best
+}
+
+/// Best time over a few runs of the last form of `text`, which yields to the host over and over. The host reads what is yielded and resumes the machine at once, in the same step, until a run pauses. If `answers`, it resumes with one value, and otherwise with none.
+fn time_yields(text: &str, answers: bool) -> Duration {
+    let mut best = Duration::MAX;
+    for _ in 0..5 {
+        let (mut arena, _, mut machine) = prepared(text, false);
+        let start = Instant::now();
+        // Whether the machine waits at a yield that the next step has to resume.
+        let mut waiting = false;
+        let mut done = false;
+        while !done {
+            done = arena
+                .step(|mc| {
+                    loop {
+                        let outcome = if waiting && answers { machine.resume(mc, &[Value::TRUE]) } else { machine.run(mc) };
+                        match outcome.expect("run") {
+                            Outcome::Yielded(yielded) => {
+                                black_box(yielded);
+                                waiting = true;
+                            }
+                            // The machine pauses by itself when the collector is due. An answer it was given is kept, so the next step only runs it.
+                            Outcome::Paused => {
+                                waiting = false;
+                                return false;
+                            }
+                            Outcome::Done(_) => return true,
+                            Outcome::Raised(_) | Outcome::Deferred(_) => panic!("raised or deferred"),
+                        }
+                    }
+                })
+                .expect("room");
+        }
         best = best.min(start.elapsed());
     }
     best
@@ -211,6 +253,17 @@ fn main() {
          (define (drain n) (if (eqv? n 0) 0 (begin (co/resume a) (co/resume b) (drain (+ n -2))))) (drain {N})"
     );
     println!("two coroutines resumed in turn: {:.1} ns per round trip", per(time(&turns, false, true)));
+    let hosted = format!("(define (emit n) (if (eqv? n 0) 0 (begin (co/yield n) (emit (+ n -1))))) (emit {N})");
+    println!("yield to the host and back:    {:.1} ns per round trip", per(time_yields(&hosted, false)));
+    let silent = format!("(define (emit n) (if (eqv? n 0) 0 (begin (co/yield) (emit (+ n -1))))) (emit {N})");
+    println!("the same, yielding no values:  {:.1} ns per round trip", per(time_yields(&silent, false)));
+    let answered = format!("(define (emit n last) (if (eqv? n 0) last (emit (+ n -1) (co/yield n)))) (emit {N} 0)");
+    println!("the same, with a value back:   {:.1} ns per round trip", per(time_yields(&answered, true)));
+    let nested = format!(
+        "(define (emit n) (if (eqv? n 0) 0 (begin (co/yield n) (emit (+ n -1)))))
+         (define (deep d n) (if (eqv? d 0) (emit n) (+ 1 (deep (+ d -1) n)))) (deep 20 {N})"
+    );
+    println!("the same, 20 calls deep:       {:.1} ns per round trip", per(time_yields(&nested, false)));
     let spawn = format!("(define (spawn n) (if (eqv? n 0) 0 (begin (co/resume (make-coroutine (lambda () n))) (spawn (+ n -1))))) (spawn {})", N / 100);
     println!("make and finish a coroutine:   {:.1} ns each", per(time(&spawn, false, true)) * 100.0);
     let respawn = format!("(define co (make-coroutine (lambda () 0))) (define (respawn n) (if (eqv? n 0) 0 (begin (co/resume (co/reset co (lambda () n))) (respawn (+ n -1))))) (respawn {})", N / 100);

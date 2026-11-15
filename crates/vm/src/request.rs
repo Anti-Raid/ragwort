@@ -184,12 +184,8 @@ impl Request {
                 outer.guard(arg(1)?, false, self == Request::Guard)?;
                 Then::Call(arg(0)?, Passed::none())
             }
-            Request::Resume => Then::Resume(arg(0)?, args.skip(mc, 1)?),
-            Request::TryResume => {
-                outer.guard(Value::FALSE, true, true)?;
-                Then::Resume(arg(0)?, args.skip(mc, 1)?)
-            }
-            Request::Yield => Then::Yield(args),
+            // `Outer::request` makes these switches itself.
+            Request::Resume | Request::TryResume | Request::Yield => return Err(Fault::Malformed),
             Request::ResumeError => Then::ResumeError(arg(0)?, arg(1)?),
             Request::Close => Then::Close(arg(0)?, Value::FALSE),
             Request::Reset => {

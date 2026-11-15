@@ -140,6 +140,9 @@ impl<'gc> Passed<'gc> {
         if let Some(slots) = self.slots.filter(|slots| slots.len() == 1 && self.rest == Value::NIL) {
             return Ok(Taken::One(slots.get(0)));
         }
+        if self.rest == Value::NIL && self.count() == 0 {
+            return Ok(Taken::List(Value::NIL));
+        }
         if !Pairs::new(mc).is_list(self.rest) {
             return Err(Fault::WrongType);
         }

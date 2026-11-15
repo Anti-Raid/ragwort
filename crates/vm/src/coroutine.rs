@@ -3,29 +3,31 @@
 //! Coroutines maintain independent continuation marks, prompts, and metacontinuations, preserving
 //! delimited context across yields.
 //!
-//! Coroutine context switching is implemented as a stack cut (analogous to invoking a one-shot
-//! continuation): the suspended task reifies its active frames into its continuation chain and
-//! preserves its base offset, while the VM stack switches to the target task's segment to resume in
-//! place without copying frames.
+//! A switch between coroutines moves the VM stack to the other task's segment. The task that switches
+//! away is parked: it records the frame and the instruction it goes on with, and its frames stay where
+//! they are. When values come back, it goes on there, and nothing is copied or allocated. Its frames
+//! are saved to its continuation chain only if something else happens to it first, such as an error
+//! raised into it. See [`Outer::park`].
 //!
 //! Suspended coroutines require no stack headroom beyond their live frames. When a coroutine suspends
 //! and another task runs, if its underlying segment is not referenced by any continuation, its live
 //! frames are compacted into a tightly-sized segment and the original segment is recycled as the
-//! active task's spare segment. Only the most recently suspended coroutine retains its full segment in
-//! place, allowing generators that alternate execution with a consumer to switch without any frame
-//! copying.
+//! active task's spare segment. A few suspended coroutines keep their segment, so coroutines that run
+//! in turn switch without any frame copying. See [`idle`].
 //!
 //! The machine's root task is also structured as a coroutine; yielding from the root task suspends the
 //! machine and returns control to the host.
 
 use ragwort_types::gc::raw::Raw;
-use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Segment, Value, WINDOW};
+use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Segment, Stack, Value, WINDOW};
 use ragwort_types::pair::Pairs;
+use ragwort_types::vector::{Vector, Vectors};
 
 use crate::passed::Passed;
 use crate::machine::{Outer, Step, Then};
 use crate::prompts;
 use crate::segments::records;
+use crate::frame::Link;
 use crate::objects::{Frames, FramesFields, Task, TaskFields};
 use crate::{Fault, Outcome};
 
@@ -34,12 +36,26 @@ use crate::{Fault, Outcome};
 /// segments.
 const FIRST_SEGMENT: usize = WINDOW + 64;
 
+/// The most suspended coroutines of a machine that keep the stack segment they ran on. See [`idle`].
+const IDLE: usize = 4;
+
 pub(crate) const PENDING: u32 = 0;
 pub(crate) const RUNNING: u32 = 1;
 pub(crate) const DEAD: u32 = 2;
 pub(crate) const FAILED: u32 = 3;
 /// The state of a coroutine while `co/close` or `co/reset` runs its `after` winders. It counts as running everywhere, except that it cannot yield.
 pub(crate) const CLOSING: u32 = 4;
+
+/// The most slots of frames below the parked frame that a parked task leaves live on its stack. See
+/// [`Outer::park`].
+pub(crate) const PARKED: usize = WINDOW;
+
+/// Set in a task's `park_base`, above the register number, for a task parked by `co/try-resume`.
+///
+/// Such a task has a guard record on its chain that was pushed after it parked, so the record is above
+/// the parked frames. Values that come back go through the record first. The parked frames are never
+/// saved to the chain: the guard catches whatever is raised into the task.
+pub(crate) const TRIED: u32 = 1 << 8;
 
 /// Creates a pending coroutine initialized to invoke procedure `body` upon its first resumption.
 pub(crate) fn new<'gc>(mc: &Mutation<'gc>, body: Value<'gc>) -> Result<Gc<'gc, Task>, OutOfMemory> {
@@ -53,7 +69,7 @@ pub(crate) fn root<'gc>(mc: &Mutation<'gc>) -> Result<Gc<'gc, Task>, OutOfMemory
 
 fn task<'gc>(mc: &Mutation<'gc>, body: Value<'gc>, state: u32) -> Result<Gc<'gc, Task>, OutOfMemory> {
     let none = Value::FALSE;
-    Task::new(mc, Value::VOID, none, Value::NIL, Value::NIL, Value::NIL, None, 0, body, none, none, none, none, None, 0, state)
+    Task::new(mc, Value::VOID, none, Value::NIL, Value::NIL, Value::NIL, None, 0, body, none, none, none, none, None, 0, state, 0, 0, 0)
 }
 
 pub(crate) fn of<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Option<Gc<'gc, Task>> {
@@ -80,7 +96,7 @@ fn give<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, segment: Gc<'gc, Segment>)
 
 impl<'gc> Outer<'_, 'gc> {
     /// Resumes coroutine `co` with arguments `args` (implementing `co/resume`), assuming the caller's
-    /// continuation has already been saved to its chain.
+    /// frames are parked or its continuation has been saved to its chain.
     pub(crate) fn resume_coroutine(&mut self, co: Value<'gc>, args: Passed<'gc>) -> Step<'gc> {
         let mc = self.mc();
         let co = of(mc, co).ok_or(Fault::WrongType)?;
@@ -91,7 +107,7 @@ impl<'gc> Outer<'_, 'gc> {
         let args = args.take(mc)?;
         let body = self.switch_to(co, RUNNING)?;
         if body == Value::FALSE {
-            return self.then(args.returned());
+            return self.returned(args);
         }
         let args = self.repass(args)?;
         self.then(Then::Call(body, args))
@@ -111,6 +127,8 @@ impl<'gc> Outer<'_, 'gc> {
             return Err(Fault::NotPending);
         }
         self.switch_to(co, RUNNING)?;
+        // The value is raised on top of the coroutine's frames, so they are saved first.
+        self.settle()?;
         self.then(Then::Raise(raised, false))
     }
 
@@ -135,6 +153,8 @@ impl<'gc> Outer<'_, 'gc> {
             PENDING => {
                 if !prompts::winds(mc, co, None)?.is_empty() {
                     self.switch_to(co, CLOSING)?;
+                    // The `after` thunks run on top of the coroutine's frames, so they are saved first.
+                    self.settle()?;
                     // The new body of a reset waits in `body`, which a started coroutine does not use. It is installed when the close ends, whether the `after` thunks return or one of them fails.
                     co.set_body(mc, renew);
                     let then = self.unwind_closing()?;
@@ -150,20 +170,15 @@ impl<'gc> Outer<'_, 'gc> {
     }
 
     /// Makes the suspended coroutine `co` the running task, in `state`, on its own stack. The caller's
-    /// continuation must already be saved to its chain.
+    /// frames must already be parked, or its continuation saved to its chain.
     ///
     /// Returns the body of a coroutine that has not started, which the caller now calls or drops. Returns
     /// `#f` for one that has started.
     fn switch_to(&mut self, co: Gc<'gc, Task>, state: u32) -> Result<Value<'gc>, Fault> {
         let mc = self.mc();
         let from = self.task();
-        self.leave(from)?;
-        if self.root.idle(mc) == Value::object(mc, co) {
-            self.root.set_idle(mc, Value::FALSE);
-        }
-        from.set_resumed(mc, Value::object(mc, co));
-        co.set_resumer(mc, Value::object(mc, from));
-        co.set_state(mc, state);
+        leave(mc, self.segments.stack, from)?;
+        resumed(mc, from, co, state);
         let body = co.body(mc);
         if body == Value::FALSE && co.segment(mc).is_some() {
             self.enter_task(co)?;
@@ -181,18 +196,19 @@ impl<'gc> Outer<'_, 'gc> {
     /// as a spare if nothing else holds the frames on it, which is the check [`compact`] makes.
     fn discard(&mut self, task: Gc<'gc, Task>) -> Result<(), Fault> {
         let mc = self.mc();
-        if self.root.idle(mc) == Value::object(mc, task) {
-            self.root.set_idle(mc, Value::FALSE);
-        }
+        unlist(mc, self.root, task);
         if let Some(segment) = task.segment(mc) {
             let base = task.base(mc) as usize;
             if held(mc, task.chain(mc), segment, base).is_some() {
-                segment.slots(mc).slice(0..base).ok_or(Fault::Malformed)?.fill(mc, Value::VOID);
+                // Parked frames lie above `base`. They are dropped with the rest.
+                let top = parked_top(mc, task).unwrap_or(base);
+                segment.slots(mc).slice(0..top).ok_or(Fault::Malformed)?.fill(mc, Value::VOID);
                 give(mc, self.task(), segment);
             }
             task.set_segment(mc, None);
             task.set_base(mc, 0);
         }
+        task.set_park_base(mc, 0);
         prompts::empty(mc, task);
         task.set_prompts(mc, Value::NIL);
         task.set_spare(mc, None);
@@ -201,7 +217,7 @@ impl<'gc> Outer<'_, 'gc> {
     }
 
     /// Suspends the active coroutine (implementing `co/yield`), returning `yielded` to its resumer,
-    /// assuming the coroutine's continuation is already preserved on its chain.
+    /// assuming the coroutine's frames are parked or its continuation is preserved on its chain.
     pub(crate) fn yield_coroutine(&mut self, yielded: Passed<'gc>) -> Step<'gc> {
         let mc = self.mc();
         let from = self.task();
@@ -220,20 +236,16 @@ impl<'gc> Outer<'_, 'gc> {
         };
         // The values are taken off this task's stack before the stack moves back to the resumer's.
         let yielded = yielded.take(mc)?;
-        self.leave(from)?;
-        // Clear any cached spare segment so a suspended coroutine retains only segments holding live frames.
-        from.set_spare(mc, None);
-        from.set_state(mc, PENDING);
-        from.set_resumer(mc, Value::FALSE);
-        let last = of(mc, self.root.idle(mc)).filter(|&task| task != from);
-        self.root.set_idle(mc, Value::object(mc, from));
-        self.back(to)?;
-        if let Some(task) = last
+        leave(mc, self.segments.stack, from)?;
+        suspended(mc, from, to);
+        let evicted = idle(mc, self.root, from)?;
+        self.enter_task(to)?;
+        if let Some(task) = evicted
             && let Some(segment) = compact(mc, task)?
         {
             give(mc, to, segment);
         }
-        self.then(yielded.returned())
+        self.returned(yielded)
     }
 
     /// Terminates the active coroutine with final status `state` (completed or failed) and switches back
@@ -251,6 +263,9 @@ impl<'gc> Outer<'_, 'gc> {
         prompts::empty(mc, task);
         task.set_prompts(mc, Value::NIL);
         task.set_spare(mc, None);
+        // A task that has ended waits nowhere: it has no segment.
+        task.set_segment(mc, None);
+        unlist(mc, self.root, task);
         self.back(to)?;
         if let Some(segment) = freed {
             give(mc, to, segment);
@@ -273,17 +288,6 @@ impl<'gc> Outer<'_, 'gc> {
         Ok(Segment::new(mc, FIRST_SEGMENT)?)
     }
 
-    /// Preserves the active task's base offset and compacts idle segments before switching away, since
-    /// all live frames below base have been reified into its chain.
-    fn leave(&mut self, task: Gc<'gc, Task>) -> Result<(), Fault> {
-        let (mc, stack) = (self.mc(), &self.segments.stack);
-        let base = stack.base();
-        stack.set_top(base);
-        task.set_segment(mc, Some(stack.segment(mc)));
-        task.set_base(mc, u32::try_from(base).map_err(|_| Fault::Malformed)?);
-        Ok(())
-    }
-
     /// Switches execution context back to coroutine `to`, which originally resumed the active task.
     fn back(&mut self, to: Gc<'gc, Task>) -> Result<(), Fault> {
         to.set_resumed(self.mc(), Value::FALSE);
@@ -298,10 +302,101 @@ impl<'gc> Outer<'_, 'gc> {
         if !self.segments.stack.resume(mc, segment, task.base(mc) as usize) {
             return Err(Fault::Malformed);
         }
-        task.set_segment(mc, None);
         self.segments.task = task;
         Ok(())
     }
+}
+
+/// Records where the running task `task` stops on `stack`, before the stack moves to another task. All
+/// its frames below the base of the stack are in its chain already.
+pub(crate) fn leave<'gc>(mc: &Mutation<'gc>, stack: &Stack, task: Gc<'gc, Task>) -> Result<(), Fault> {
+    let base = stack.base();
+    // The frames of a parked task stay live above `base`, up to the register of its request.
+    stack.set_top(parked_top(mc, task).unwrap_or(base));
+    // A task that comes back to the segment it last waited on writes it once.
+    let segment = stack.segment(mc);
+    if task.segment(mc) != Some(segment) {
+        task.set_segment(mc, Some(segment));
+    }
+    task.set_base(mc, u32::try_from(base).map_err(|_| Fault::Malformed)?);
+    Ok(())
+}
+
+/// Marks `co` as running in `state`, resumed by `from`.
+pub(crate) fn resumed<'gc>(mc: &Mutation<'gc>, from: Gc<'gc, Task>, co: Gc<'gc, Task>, state: u32) {
+    from.set_resumed(mc, Value::object(mc, co));
+    co.set_resumer(mc, Value::object(mc, from));
+    co.set_state(mc, state);
+}
+
+/// Marks `from` as suspended. It was resumed by `to`, which runs again.
+pub(crate) fn suspended<'gc>(mc: &Mutation<'gc>, from: Gc<'gc, Task>, to: Gc<'gc, Task>) {
+    // Clear any cached spare segment so a suspended coroutine retains only segments holding live frames.
+    if from.spare(mc).is_some() {
+        from.set_spare(mc, None);
+    }
+    from.set_state(mc, PENDING);
+    from.set_resumer(mc, Value::FALSE);
+    to.set_resumed(mc, Value::FALSE);
+}
+
+/// Returns the frame that parks for a request, and the link it goes on with: the instruction and the
+/// register that receives the result. The request is at register `base` of the frame at `fp`, whose
+/// next instruction is `pc`.
+///
+/// `caller` is the frame's own link if the request is in tail position, and `None` otherwise. A request
+/// in tail position returns its result to the frame's caller. The frame is given up, as a return would
+/// give it up, and the caller is the frame that parks. Returns `None` for a bottom frame, whose caller
+/// is on the chain, and for a frame that was entered with marks, whose marks and handlers hold until
+/// the request is over. Their frames have to be saved.
+pub(crate) fn place(fp: usize, pc: usize, base: u8, caller: Option<Link>) -> Option<(usize, Link)> {
+    let Some(link) = caller else { return Some((fp, Link::to(pc, base))) };
+    if link.is_bottom() || link.marks {
+        return None;
+    }
+    Some((fp.checked_sub(usize::from(link.base))?, Link::to(link.pc, link.base)))
+}
+
+/// Records that `task` is parked in the frame at `fp` and goes on at `at`. `tried` is set for
+/// `co/try-resume`. See [`TRIED`]. Returns `false`, with nothing recorded, if the position does not fit
+/// the task's fields.
+pub(crate) fn park<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, fp: usize, at: Link, tried: bool) -> bool {
+    let (Ok(fp), Ok(pc)) = (u32::try_from(fp), u32::try_from(at.pc)) else { return false };
+    task.set_park_fp(mc, fp);
+    task.set_park_pc(mc, pc);
+    task.set_park_base(mc, u32::from(at.base) | if tried { TRIED } else { 0 });
+    true
+}
+
+/// Returns whether `task` switched away at a request without saving its frames to its chain. See
+/// [`Outer::park`].
+pub(crate) fn is_parked<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>) -> bool {
+    task.park_base(mc) != 0
+}
+
+/// Returns the slot where the parked frames of `task` end, or `None` if it is not parked.
+pub(crate) fn parked_top<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>) -> Option<usize> {
+    let park = task.park_base(mc);
+    if park == 0 { None } else { Some((task.park_fp(mc) + (park & 0xFF)) as usize) }
+}
+
+/// Saves the parked frames of `task`, which is suspended, to its chain. The record is the one
+/// [`Outer::keep`] would have made when the task switched away. It is needed wherever a task that is not
+/// running is read through its chain: compaction and call traces.
+pub(crate) fn unpark<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>) -> Result<(), Fault> {
+    // Only a suspended coroutine is unparked this way, and a task parked by `co/try-resume` is running.
+    if !is_parked(mc, task) || task.park_base(mc) & TRIED != 0 {
+        return Ok(());
+    }
+    let segment = task.segment(mc).ok_or(Fault::Malformed)?;
+    let base = task.park_base(mc);
+    let end = task.park_fp(mc).checked_add(base).ok_or(Fault::Malformed)?;
+    let link = Link::to(task.park_pc(mc) as usize, base as u8).value().ok_or(Fault::Malformed)?;
+    let record = Frames::new(mc, Some(segment), task.base(mc), end, link, task.attachments(mc), true, false, task.chain(mc))?;
+    task.set_chain(mc, Value::object(mc, record));
+    task.set_base(mc, end);
+    task.set_park_base(mc, 0);
+    Ok(())
 }
 
 /// Returns what a `co/close` or `co/reset` of `task` returns, once `task` holds nothing any more. A
@@ -324,35 +419,106 @@ pub(crate) fn reset<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, body: Value<'g
     task.set_state(mc, PENDING);
 }
 
+/// Returns whether `task` is among the idle coroutines of the machine whose root task is `root`. See
+/// [`idle`].
+fn listed<'gc>(mc: &Mutation<'gc>, root: Gc<'gc, Task>, task: Gc<'gc, Task>) -> bool {
+    let Some(list) = Vector::of(root.idle(mc)) else { return false };
+    let (items, task) = (list.items(mc), Value::object(mc, task));
+    for at in 0..items.len() {
+        if items.get(at) == task {
+            return true;
+        }
+    }
+    false
+}
+
+/// Lists `from`, which is suspending, among the idle coroutines of the machine whose root task is
+/// `root`. Returns the coroutine that leaves the list to make room, if any. The caller compacts it.
+///
+/// An idle coroutine keeps its frames on the segment it ran on, so resuming it copies nothing. The
+/// list bounds how many do: at most [`IDLE`]. It is a vector in the `idle` field of `root`, newest
+/// first, made when the first coroutine is listed.
+///
+/// - A coroutine that is already listed keeps its place. So a few coroutines that run in turn stay
+///   listed, and none of them is copied out and back on each switch.
+/// - A coroutine that is not listed is put first. If the list is full, the oldest entry leaves.
+/// - A coroutine that ends leaves the list. See [`unlist`].
+///
+/// The list refers to tasks and does not own them in any other way. A coroutine that several machines
+/// resume in turn can be in the list of each. That is safe, because [`compact`] checks the task it is
+/// given.
+fn idle<'gc>(mc: &Mutation<'gc>, root: Gc<'gc, Task>, from: Gc<'gc, Task>) -> Result<Option<Gc<'gc, Task>>, OutOfMemory> {
+    if listed(mc, root, from) {
+        return Ok(None);
+    }
+    let list = match Vector::of(root.idle(mc)) {
+        Some(list) => list,
+        None => {
+            let list = Vectors::new(mc).make(IDLE, Value::FALSE)?;
+            root.set_idle(mc, list.value(mc));
+            list
+        }
+    };
+    let items = list.items(mc);
+    // The new entry takes the first place. The entries before the first free place move down by one. If no place is free, the last entry leaves.
+    let mut free = items.len().saturating_sub(1);
+    for at in 0..items.len() {
+        if of(mc, items.get(at)).is_none() {
+            free = at;
+            break;
+        }
+    }
+    let evicted = of(mc, items.get(free));
+    for at in (0..free).rev() {
+        items.set(mc, at + 1, items.get(at));
+    }
+    items.set(mc, 0, Value::object(mc, from));
+    Ok(evicted)
+}
+
+/// Takes `task`, which no longer waits on a segment, off the idle list of `root`. See [`idle`].
+fn unlist<'gc>(mc: &Mutation<'gc>, root: Gc<'gc, Task>, task: Gc<'gc, Task>) {
+    let Some(list) = Vector::of(root.idle(mc)) else { return };
+    let (items, task) = (list.items(mc), Value::object(mc, task));
+    for at in 0..items.len() {
+        if items.get(at) == task {
+            items.set(mc, at, Value::FALSE);
+        }
+    }
+}
+
 /// Compacts a suspended task's frames into a tightly-sized segment if its continuation chain contains
 /// all frames below base and no external continuation references them, freeing the original segment.
 /// Only shallow stacks (within one frame window) are compacted to avoid repeated copying costs for
 /// deep call stacks.
 fn compact<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>) -> Result<Option<Gc<'gc, Segment>>, Fault> {
     let Some(segment) = task.segment(mc).filter(|_| task.state(mc) == PENDING) else { return Ok(None) };
+    unpark(mc, task)?;
     let (base, chain) = (task.base(mc) as usize, task.chain(mc));
-    let Some(held) = held(mc, chain, segment, base).filter(|_| base <= WINDOW) else { return Ok(None) };
+    let Some(count) = held(mc, chain, segment, base).filter(|_| base <= WINDOW) else { return Ok(None) };
     if base > 0 {
         let frames = segment.slots(mc).slice(0..base).ok_or(Fault::Malformed)?;
         let copy = Segment::holding(mc, frames)?;
         frames.fill(mc, Value::VOID);
-        held.iter().for_each(|record| record.set_segment(mc, Some(copy)));
+        for record in records(mc, chain).take(count) {
+            record.set_segment(mc, Some(copy));
+        }
     }
     task.set_segment(mc, None);
     Ok(Some(segment))
 }
 
-/// Returns the one-shot records at the head of `chain` that together hold all the frames of `segment` below `end`, without owning the segment. Returns `None` if the head of the chain is not such a run of records.
-fn held<'gc>(mc: &Mutation<'gc>, chain: Value<'gc>, segment: Gc<'gc, Segment>, mut end: usize) -> Option<Vec<Gc<'gc, Frames>>> {
-    let mut held = Vec::new();
+/// Counts the one-shot records at the head of `chain` that together hold all the frames of `segment` below `end`, without owning the segment. Returns `None` if the head of the chain is not such a run of records. The count lets the caller walk the same records again, so nothing is allocated to remember them.
+fn held<'gc>(mc: &Mutation<'gc>, chain: Value<'gc>, segment: Gc<'gc, Segment>, mut end: usize) -> Option<usize> {
+    let mut count = 0;
     let mut records = records(mc, chain);
     while end > 0 {
         let record = records.next()?;
         if record.segment(mc) != Some(segment) || !record.one_shot(mc) || record.owns(mc) || record.end(mc) as usize != end {
             return None;
         }
-        held.push(record);
+        count += 1;
         end = record.start(mc) as usize;
     }
-    Some(held)
+    Some(count)
 }

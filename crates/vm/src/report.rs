@@ -170,6 +170,27 @@ fn calls<'gc>(mc: &Mutation<'gc>, chain: Value<'gc>, entries: &mut Entries<'gc>)
     true
 }
 
+/// Appends the calls in the parked frames of `task` to `entries`, innermost first: the frame that switched away, then its callers down to the bottom frame of the task's stack. Returns `false` once `entries` is full.
+fn parked<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, entries: &mut Entries<'gc>) -> bool {
+    let (true, Some(segment)) = (coroutine::is_parked(mc, task), task.segment(mc)) else { return true };
+    let slots = segment.slots(mc);
+    let (fp, pc) = (task.park_fp(mc) as usize, task.park_pc(mc) as usize);
+    let code = |at: usize| if at < slots.len() { slots.get(at).downcast::<Closure>(mc).and_then(|closure| closure.code(mc)) } else { None };
+    let Some(top) = code(fp) else { return true };
+    if !entries.push(mc, top, pc) {
+        return false;
+    }
+    let Ok(link) = frame::link_at(mc, slots, fp) else { return true };
+    for caller in frame::callers(mc, slots, task.base(mc) as usize, fp, link) {
+        let Ok(caller) = caller else { break };
+        let Some(code) = code(caller.at) else { break };
+        if !entries.push(mc, code, caller.pc) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Records the calls in progress when a condition is raised by `task`, innermost first.
 ///
 /// `first` is the function that raised a fault and the index of the instruction after the failed one. The VM discards that function's frame before raising, so it is not among the continuation records. The walk covers the task's continuation, its enclosing prompts, and the tasks that resumed it.
@@ -184,7 +205,8 @@ pub(crate) fn capture<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, first: Optio
     let mut running = Some(task);
     let mut tasks = 0;
     while let Some(task) = running.filter(|_| complete && tasks < TRACE) {
-        complete = calls(mc, task.chain(mc), &mut entries);
+        // A task that waits for the one above it may be parked. Its frames are then on its segment, above everything on its chain.
+        complete = parked(mc, task, &mut entries) && calls(mc, task.chain(mc), &mut entries);
         let mut prompts = task.prompts(mc);
         while let Some(cell) = Pair::of(prompts).filter(|_| complete) {
             if let Some(prompt) = cell.head(mc).downcast::<Prompt>(mc) {

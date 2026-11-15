@@ -8,6 +8,7 @@ members = [
     "crates/native",
     "crates/num",
     "crates/modules-core",
+    "crates/ragwort",
     "crates/string",
     "crates/types",
     "crates/vm",

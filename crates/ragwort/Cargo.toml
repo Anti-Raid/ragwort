@@ -1,0 +1,16 @@
+[package]
+name = "ragwort"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ragwort-vm = { path = "../vm", default-features = false }
+ragwort-compiler = { path = "../compiler", default-features = false }
+
+[features]
+default = ["mmap", "arena"]
+mmap = ["ragwort-vm/mmap", "ragwort-compiler/mmap"]
+arena = ["ragwort-compiler/arena"]
+
+[lints]
+workspace = true

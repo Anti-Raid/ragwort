@@ -3,11 +3,12 @@ use ragwort_types::gc::raw::Raw;
 use ragwort_types::gc::{Gc, Mutation, Root, Segment, Slots, Stack, Value, WINDOW};
 use ragwort_types::pair::{Pair, Pairs};
 
-use crate::passed::Passed;
+use crate::passed::{Passed, Taken};
 use crate::frame::{self, ARGS, CLOSURE, Link};
 use crate::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Condition, ConditionFields, Continuation, KeywordProcedure, Native, NativeFields, Task, TaskFields};
 use crate::run::{self, Exit, HostThen, MAX_ARGS, Regs, bind};
 use crate::segments::{CHUNK, Resume, Segments};
+use crate::wind::Kind;
 use crate::module::Deferred;
 use crate::report::{self, Failure, Origin};
 use crate::{Fault, Fuel, Request, coroutine, keyword, prompts};
@@ -22,6 +23,7 @@ pub const MIN_SEGMENT: usize = CHUNK + 2 * WINDOW;
 /// The default stack segment capacity (16,384 slots), used when no custom segment size is
 /// specified.
 pub const SEGMENT: usize = 1 << 14;
+
 
 /// The outcome of executing a VM task run.
 #[derive(Debug, PartialEq, Eq)]
@@ -67,6 +69,9 @@ pub struct Machine {
     fuel: u64,
     finished: bool,
     waiting: Waiting,
+    /// Whether the last run returned [`Outcome::Paused`] without going on, because the machine waits
+    /// for its host and the collector was owed a step. The next run goes on whatever is owed.
+    held: bool,
 }
 
 impl Machine {
@@ -78,7 +83,7 @@ impl Machine {
         let task = coroutine::root(mc)?;
         let mut regs = Regs { fp: 0, pc: 0, acc: Value::VOID, values: Value::NIL, code: None };
         Outer::new(mc, &mut stack, task, task, &mut regs, segment).begin(procedure, args)?;
-        let mut machine = Machine { stack, task: Root::new(mc, task)?, fp: 0, pc: 0, segment, fuel: u64::MAX, finished: false, waiting: Waiting::No };
+        let mut machine = Machine { stack, task: Root::new(mc, task)?, fp: 0, pc: 0, segment, fuel: u64::MAX, finished: false, waiting: Waiting::No, held: false };
         machine.save(mc, task, &regs);
         Ok(machine)
     }
@@ -96,7 +101,7 @@ impl Machine {
         task.set_idle(mc, last.idle(mc));
         let mut regs = Regs { fp: 0, pc: 0, acc: Value::VOID, values: Value::NIL, code: None };
         Outer::new(mc, &mut self.stack, task, task, &mut regs, self.segment).begin(procedure, args)?;
-        (self.task, self.finished, self.waiting) = (Root::new(mc, task)?, false, Waiting::No);
+        (self.task, self.finished, self.waiting, self.held) = (Root::new(mc, task)?, false, Waiting::No, false);
         self.save(mc, task, &regs);
         Ok(())
     }
@@ -115,9 +120,23 @@ impl Machine {
     /// step is due ([`Mutation::step_due`]). If previously paused on a yield or a deferred host call, it
     /// automatically resumes (with an empty value list or void, respectively). Returns
     /// `Err(Fault::Finished)` if called on an already completed machine.
+    ///
+    /// A machine that waits on a yield or a deferred host call does not go on while a collection step
+    /// is due. The run returns [`Outcome::Paused`] at once, as do [`Machine::resume`],
+    /// [`Machine::reply`] and [`Machine::raise`]. What the host passed is kept, and the next run
+    /// delivers it. So a host that answers a machine over and over in one step still lets the
+    /// collector run, as long as it ends the step when it sees [`Outcome::Paused`]. The run after such
+    /// a pause always goes on, so a machine cannot be held back twice in a row.
     pub fn run<'gc>(&mut self, mc: &Mutation<'gc>) -> Result<Outcome<'gc>, Fault> {
         if self.finished {
             return Err(Fault::Finished);
+        }
+        if self.waiting != Waiting::No {
+            let held = std::mem::replace(&mut self.held, false);
+            if !held && mc.step_due() {
+                self.held = true;
+                return Ok(Outcome::Paused);
+            }
         }
         let mut task = coroutine::current(mc, self.task.get(mc).expect("a machine runs in its own arena"));
         let mut regs = Regs { fp: self.fp, pc: self.pc, acc: task.acc(mc), values: task.values(mc), code: None };
@@ -143,6 +162,9 @@ impl Machine {
 
     /// Resumes a machine that suspended via `co/yield`, passing `args` as the return value of the yield
     /// expression. Returns `Err(Fault::NotPending)` if the machine is not waiting on a yield.
+    ///
+    /// Returns [`Outcome::Paused`] without resuming if a collection step is due. The values are kept:
+    /// call [`Machine::run`] in the next step. See [`Machine::run`].
     pub fn resume<'gc>(&mut self, mc: &Mutation<'gc>, args: &[Value<'gc>]) -> Result<Outcome<'gc>, Fault> {
         if args.contains(&Value::VALUES) {
             return Err(Fault::WrongType);
@@ -159,6 +181,9 @@ impl Machine {
     /// Resumes a machine that suspended on a deferred host function call, supplying `answer` as the host
     /// function's return value. Returns `Err(Fault::NotPending)` if the machine is not waiting on a
     /// deferred host call.
+    ///
+    /// Returns [`Outcome::Paused`] without resuming if a collection step is due. The answer is kept:
+    /// call [`Machine::run`] in the next step. See [`Machine::run`].
     pub fn reply<'gc>(&mut self, mc: &Mutation<'gc>, answer: Value<'gc>) -> Result<Outcome<'gc>, Fault> {
         if answer == Value::VALUES {
             return Err(Fault::WrongType);
@@ -169,8 +194,13 @@ impl Machine {
 
     /// Resumes a machine waiting on a deferred host function call by raising `raised` as an exception at
     /// the point of suspension.
+    ///
+    /// Returns [`Outcome::Paused`] without resuming if a collection step is due. The value is kept:
+    /// call [`Machine::run`] in the next step. See [`Machine::run`].
     pub fn raise<'gc>(&mut self, mc: &Mutation<'gc>, raised: Value<'gc>) -> Result<Outcome<'gc>, Fault> {
-        self.answer(mc, Waiting::Host, raised)?;
+        // A raise that was held back for the collector is still to be made, and the host may ask for it again.
+        let on = if self.waiting == Waiting::Raise { Waiting::Raise } else { Waiting::Host };
+        self.answer(mc, on, raised)?;
         self.waiting = Waiting::Raise;
         self.run(mc)
     }
@@ -251,8 +281,6 @@ pub(crate) enum Then<'gc> {
     ReturnValues(Value<'gc>),
     /// Returns what the accumulator already holds to the current continuation.
     Forward,
-    /// Resumes the specified coroutine with arguments.
-    Resume(Value<'gc>, Passed<'gc>),
     /// Resumes the specified coroutine by raising the given value inside it.
     ResumeError(Value<'gc>, Value<'gc>),
     /// Closes the specified coroutine. Then, unless the second value is `#f`, makes it pending again with that procedure as its body.
@@ -263,8 +291,6 @@ pub(crate) enum Then<'gc> {
     /// An uncaught exception value, indicating whether all `dynamic-wind` `after` thunks have already
     /// run.
     Uncaught(Value<'gc>, bool),
-    /// Yields the given values from the currently executing coroutine.
-    Yield(Passed<'gc>),
 }
 
 /// State for the outer execution loop between inner loop invocations, providing access to the stack,
@@ -346,7 +372,14 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         let origin = self.origin(fault, blame)?;
         let failure = Failure { fault, operation: origin.operation };
         let raised = Value::object(mc, Condition::new(mc, mc.frozen(failure)?, Value::VOID, origin.irritants, Value::FALSE)?);
-        if self.regs.fp > self.segments.stack.base()
+        // A request that parked its task and then failed is raised on top of the task's frames.
+        self.settle()?;
+        let task = self.task();
+        if coroutine::is_parked(mc, task) {
+            // A `co/try-resume` that failed stays parked, and its guard catches the condition. The call trace reads the parked frames through the task, as it does for a task that waits.
+            task.set_segment(mc, Some(self.segments.stack.segment(mc)));
+            task.set_base(mc, u32::try_from(self.segments.stack.base()).map_err(|_| Fault::Malformed)?);
+        } else if self.regs.fp > self.segments.stack.base()
             && let Ok(frame) = self.segments.frame(self.regs.fp)
             && let Ok(link) = frame::link_of(mc, frame)
         {
@@ -388,6 +421,8 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         if renew != Value::FALSE {
             coroutine::reset(mc, task, renew);
         }
+        // The value is raised on top of the resumer's frames, so they are saved first.
+        self.settle()?;
         self.raise(obj, false)
     }
 
@@ -416,8 +451,18 @@ impl<'a, 'gc> Outer<'a, 'gc> {
             }
         }
         let args = Passed::slots(self.registers(base, count)?, rest);
-        // An abort saves the caller's frames itself, and only when it has to.
-        if request != Request::Abort {
+        // A switch to another coroutine, or a yield to the host, comes back to this frame. So the frame is parked and not saved. The switch is made from here directly, because it is all a coroutine does between two runs of the inner loop.
+        if matches!(request, Request::Resume | Request::TryResume | Request::Yield) {
+            self.park(base, tail, request == Request::TryResume)?;
+            if request == Request::Yield {
+                return self.yield_coroutine(args);
+            }
+            if request == Request::TryResume {
+                self.guard(Value::FALSE, true, true)?;
+            }
+            return self.resume_coroutine(args.get(mc, 0)?, args.skip(mc, 1)?);
+        } else if request != Request::Abort {
+            // An abort saves the caller's frames itself, and only when it has to.
             self.keep(base, tail)?;
         }
         let then = request.run(self, args, base, tail)?;
@@ -442,6 +487,15 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         self.segments.stack.segment(mc).slots(mc).slice(at..at + usize::from(count)).ok_or(Fault::Malformed)
     }
 
+    /// Returns `taken` to the current continuation.
+    pub(crate) fn returned(&mut self, taken: Taken<'gc>) -> Step<'gc> {
+        match taken {
+            Taken::One(value) => self.regs.acc = value,
+            Taken::List(list) => self.regs.set_values(self.mc(), list),
+        }
+        self.resume()
+    }
+
     pub(crate) fn then(&mut self, then: Then<'gc>) -> Step<'gc> {
         match then {
             Then::Call(procedure, args) => self.apply(procedure, args),
@@ -454,12 +508,10 @@ impl<'a, 'gc> Outer<'a, 'gc> {
                 self.resume()
             }
             Then::Forward => self.resume(),
-            Then::Resume(co, args) => self.resume_coroutine(co, args),
             Then::ResumeError(co, raised) => self.resume_error(co, raised),
             Then::Close(co, renew) => self.close_coroutine(co, renew),
             Then::Raise(obj, continuable) => self.raise(obj, continuable),
             Then::Uncaught(obj, unwound) => self.uncaught(obj, unwound),
-            Then::Yield(values) => self.yield_coroutine(values),
         }
     }
 
@@ -508,6 +560,67 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         self.segments.reify(end, link)
     }
 
+    /// Readies the running task to switch away at the request in register `base`, without saving its
+    /// frames to its chain as [`Outer::keep`] does.
+    ///
+    /// The task remembers the frame and the instruction it goes on with. When values come back,
+    /// [`Outer::resume`] continues there directly. Anything else that happens to the task first calls
+    /// [`Outer::settle`] or [`coroutine::unpark`], which save the frames after all.
+    ///
+    /// - A request in tail position (`tail`) parks the frame's caller. Some frames cannot do that, and
+    ///   are saved as before. See [`coroutine::place`].
+    /// - `tried` is set for `co/try-resume`, which pushes a guard record after this. See
+    ///   [`coroutine::TRIED`].
+    ///
+    /// The frames of the stack stay live while the task waits, and each switch hands them over to the
+    /// collector. So if more than [`coroutine::PARKED`] slots lie below the parked frame, those are saved
+    /// to the chain here, once, and the parked frame becomes the bottom frame.
+    fn park(&mut self, base: u8, tail: bool, tried: bool) -> Result<(), Fault> {
+        let (mc, task) = (self.mc(), self.task());
+        let caller = if tail { Some(frame::link_of(mc, self.segments.frame(self.regs.fp)?)?) } else { None };
+        let Some((fp, parked)) = coroutine::place(self.regs.fp, self.regs.pc, base, caller) else { return self.keep(base, tail) };
+        if fp - self.segments.stack.base() > coroutine::PARKED {
+            let link = frame::link_of(mc, self.segments.frame(fp)?)?;
+            self.segments.reify(fp, link)?;
+            frame::set_link(mc, self.segments.frame(fp)?, Link::BOTTOM)?;
+        }
+        if !coroutine::park(mc, task, fp, parked, tried) {
+            return self.keep(base, tail);
+        }
+        Ok(())
+    }
+
+    /// Returns whether the record at the head of `task`'s chain is the guard of a `co/try-resume`.
+    fn tried_guard(&self, task: Gc<'gc, Task>) -> bool {
+        let mc = self.mc();
+        task.chain(mc).downcast::<Native>(mc).is_some_and(|native| native.kind(mc) == Kind::Guarded as u32 && native.b(mc) == Value::TRUE)
+    }
+
+    /// Saves the parked frames of the running task to its chain, as [`Outer::keep`] would have when the
+    /// task switched away. It does nothing for a task that is not parked.
+    ///
+    /// Call it before anything that starts a frame at the base of the stack, or reads the task's chain,
+    /// while the task may still be parked: a raise into it, its unwinding, a fault.
+    ///
+    /// A task parked by `co/try-resume` is left parked. Its guard record is already on the chain above
+    /// where the frames would go, and that guard catches whatever is raised into the task, so nothing
+    /// starts on top of the frames.
+    pub(crate) fn settle(&mut self) -> Result<(), Fault> {
+        let (mc, task) = (self.mc(), self.task());
+        let base = task.park_base(mc);
+        if base == 0 || base & coroutine::TRIED != 0 {
+            return Ok(());
+        }
+        task.set_park_base(mc, 0);
+        let (fp, pc) = (task.park_fp(mc) as usize, task.park_pc(mc) as usize);
+        // As in `keep`: the request's registers must lie past the frame's link.
+        let closure = self.segments.frame(fp)?.get(CLOSURE).downcast::<Closure>(mc).ok_or(Fault::Malformed)?;
+        if base <= u32::from(frame::link_slot_of(mc, closure)?) {
+            return Err(Fault::Malformed);
+        }
+        self.segments.reify(fp + base as usize, Link::to(pc, base as u8))
+    }
+
     /// Transfers an overflowing call frame and its caller's linkage onto a new stack segment.
     fn overflow(&mut self, callee: usize, argc: u8, rest: Value<'gc>) -> Result<(), Fault> {
         let base = callee - self.regs.fp;
@@ -524,6 +637,13 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         let mc = self.mc();
         loop {
             let task = self.task();
+            // A parked task goes on in the frame it switched away from. Its frames are above everything on its chain, except the guard record of a `co/try-resume`, which is handled first.
+            let park = task.park_base(mc);
+            if park != 0 && (park & coroutine::TRIED == 0 || !self.tried_guard(task)) {
+                task.set_park_base(mc, 0);
+                (self.regs.fp, self.regs.pc) = (task.park_fp(mc) as usize, task.park_pc(mc) as usize);
+                return Ok(None);
+            }
             if let Some(native) = task.chain(mc).downcast::<Native>(mc) {
                 task.set_chain(mc, native.next(mc));
                 task.set_attachments(mc, native.attachments(mc));

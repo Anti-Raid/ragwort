@@ -1866,12 +1866,13 @@ fn run_to_outcome(arena: &mut Arena, machine: &mut Machine, mut resume: bool) ->
     }
 }
 
-/// A coroutine that waits while another one yields has its frames copied into storage of their own size. What those frames hold must stay alive: here each holds values nothing else refers to, the collector runs, and new allocations reuse whatever it freed.
+/// A coroutine that waits while several others yield has its frames copied into storage of their own size. The coroutines here wait at different depths, some too deep to be copied. What their frames hold must stay alive: here each holds values nothing else refers to, the collector runs, and new allocations reuse whatever it freed.
 #[test]
 fn a_waiting_coroutines_frames_keep_what_they_hold() {
     let mut arena = arena();
     let text = "(let ()
-                  (define (make i) (make-coroutine (lambda () (let ((x (list i (number->string i) (vector i (string-append \"s\" (number->string i)))))) (co/yield 0) x))))
+                  (define (dig n x) (if (eqv? n 0) (begin (co/yield 0) x) (let ((got (dig (- n 1) x))) (if (pair? got) got #f))))
+                  (define (make i) (make-coroutine (lambda () (let ((x (list i (number->string i) (vector i (string-append \"s\" (number->string i)))))) (dig (modulo i 25) x)))))
                   (define (kept? i x) (and (pair? x) (eqv? (car x) i) (equal? (cadr x) (number->string i)) (vector? (caddr x)) (equal? (vector-ref (caddr x) 1) (string-append \"s\" (number->string i)))))
                   (define (churn n acc) (if (eqv? n 0) acc (churn (- n 1) (list n n n))))
                   (let ((waiting (let loop ((i 0) (made '())) (if (eqv? i 100) (reverse made) (loop (+ i 1) (cons (make i) made))))))
@@ -2009,6 +2010,256 @@ fn closed_coroutines_leave_nothing_behind() {
                         (let ((co (one))) (co/resume co) (co/close co) (loop (+ i 1))))))";
     let mut machine = machine(&mut arena, text);
     assert_eq!(run_to_outcome(&mut arena, &mut machine, false), "done 20000");
+}
+
+/// A coroutine and its resumer switch back and forth many times while the collector runs. Each keeps values in its frame that nothing else refers to. The coroutine yields in three ways: from its own loop, from a helper that then returns, and from the bottom of a recursion, shallow on odd turns and deep on even ones. Every switch must come back to the frames it left, with what they held.
+#[test]
+fn switches_come_back_to_the_frames_they_left() {
+    let mut arena = arena();
+    let text = "(let ()
+                  (define (churn n acc) (if (eqv? n 0) acc (churn (- n 1) (list n n n))))
+                  (define (emit x) (co/yield x) 'emitted)
+                  (define (down n) (if (eqv? n 0) (begin (co/yield 'bottom) 0) (+ 1 (down (- n 1)))))
+                  (define gen
+                    (make-coroutine
+                      (lambda ()
+                        (let loop ((i 0) (kept (list 0 \"0\")))
+                          (let* ((sent (co/yield (list 'plain i kept)))
+                                 (helped (emit (list 'helper sent)))
+                                 (depth (down (if (odd? i) 10 400))))
+                            (loop (+ i 1) (list depth helped (number->string i))))))))
+                  (let loop ((round 0) (good 0))
+                    (if (eqv? round 40)
+                        good
+                        (let* ((mine (list round (number->string round)))
+                               (plain (co/resume gen))
+                               (garbage1 (churn 3000 0))
+                               (helper (co/resume gen (* round 2)))
+                               (garbage2 (churn 3000 0))
+                               (bottom (co/resume gen))
+                               (before (- round 1))
+                               (expected (if (eqv? round 0) (list 0 \"0\") (list (if (odd? before) 10 400) 'emitted (number->string before)))))
+                          (churn 3000 0)
+                          (loop (+ round 1)
+                                (if (and (equal? mine (list round (number->string round)))
+                                         (equal? plain (list 'plain round expected))
+                                         (equal? helper (list 'helper (* round 2)))
+                                         (eq? bottom 'bottom))
+                                    (+ good 1)
+                                    good))))))";
+    let mut machine = machine(&mut arena, text);
+    assert_eq!(run_to_outcome(&mut arena, &mut machine, false), "done 40");
+}
+
+#[test]
+fn a_waiting_resumer_takes_errors_and_closes_like_any_task() {
+    // The resumer waits in a frame that holds a value. A failing coroutine raises into that frame, and a guard or a handler there sees it.
+    let failing = "(define co (make-coroutine (lambda () (co/yield 1) (raise 'boom))))";
+    assert_eq!(eval(&format!("{failing} (co/resume co) (let ((kept (list 1 2))) (list (guard (e (#t (list 'caught e))) (+ 1 (co/resume co))) kept (co/status co)))")), "((caught boom) (1 2) error)");
+    assert_eq!(eval(&format!("{failing} (co/resume co) (let ((kept (list 1 2))) (list (with-exception-handler (lambda (e) 5) (lambda () (guard (e (#f 0)) (+ 1 (guard (e ((eq? e 'boom) 41)) (co/resume co)))))) kept))")), "(42 (1 2))");
+    // A fault in the request itself, here a resume of something that is not a coroutine, is raised in the frame that made it.
+    assert_eq!(eval("(let ((kept (list 1 2))) (list (guard (e (#t (error-object-kind e))) (+ 1 (co/resume 5))) kept))"), "(wrong-type (1 2))");
+    assert_eq!(eval("(define co (make-coroutine (lambda () 1))) (co/resume co) (let ((kept (list 1 2))) (list (guard (e (#t (error-object-kind e))) (+ 1 (co/resume co))) kept))"), "(not-pending (1 2))");
+    // `co/try-resume` in the middle of an expression catches the failure itself. Nothing is raised in the frame, and what the frame holds stays.
+    assert_eq!(eval(&format!("{failing} (co/resume co) (let ((kept (list 1 2))) (co/try-resume co) (co/try-resume 5) (list kept (co/status co)))")), "((1 2) error)");
+    assert_eq!(eval(&format!("{failing} (co/resume co) (let ((kept (list 1 2))) (list (guard (e (#t (error-object-kind e))) (+ 1 (co/try-resume co))) kept))")), "(value-count (1 2))");
+    // A coroutine that waits at a yield in the middle of an expression is closed, reset and failed from outside like any other.
+    let waiting = "(define log '()) (define co (make-coroutine (lambda () (dynamic-wind (lambda () 0) (lambda () (+ 1 (co/yield 'y))) (lambda () (set! log (cons 'out log)))))))";
+    assert_eq!(eval(&format!("{waiting} (co/resume co) (co/close co) (list (co/status co) log)")), "(dead (out))");
+    assert_eq!(eval(&format!("{waiting} (co/resume co) (co/reset co (lambda () 'new)) (list (co/resume co) log)")), "(new (out))");
+    assert_eq!(eval(&format!("{waiting} (co/resume co) (list (guard (e (#t e)) (co/resume-error co 'bad)) (co/status co) log)")), "(bad error (out))");
+    assert_eq!(eval(&format!("{waiting} (co/resume co) (list (co/resume co 41) (co/status co) log)")), "(42 dead (out))");
+}
+
+/// A switch requested in tail position, by `co/try-resume`, or by a yield to the host comes back to the frames it left, as a plain `co/resume` in the middle of an expression does. The collector runs in between.
+#[test]
+fn switches_in_every_position_come_back_to_their_frames() {
+    let mut arena = arena();
+    let text = "(let ()
+                  (define (churn n acc) (if (eqv? n 0) acc (churn (- n 1) (list n n n))))
+                  (define (step co . args) (apply co/resume co args))
+                  (define (tried co x) (co/try-resume co x))
+                  (define (emit x) (co/yield x))
+                  (define (down n x) (if (eqv? n 0) (emit x) (down (- n 1) x)))
+                  (define (under n x) (if (eqv? n 0) (emit x) (+ 1 (under (- n 1) x))))
+                  (define gen
+                    (make-coroutine
+                      (lambda (start)
+                        (let loop ((i 0) (kept (list 0 \"0\")))
+                          (let* ((sent (emit (list 'tail i kept)))
+                                 (deep (under 300 (list 'deep sent)))
+                                 (flat (down 300 (list 'flat deep))))
+                            (if (eqv? i 30) (raise (list 'over flat)) (loop (+ i 1) (list flat (number->string i)))))))))
+                  (let loop ((round 0) (good 0))
+                    (let* ((mine (list round (number->string round)))
+                           (tail (step gen 'first))
+                           (garbage1 (churn 3000 0))
+                           (deep (call-with-values (lambda () (co/try-resume gen (* round 2))) list))
+                           (told (co/yield (list 'host round mine)))
+                           (flat (call-with-values (lambda () (tried gen 3)) list))
+                           (garbage2 (churn 3000 0))
+                           (before (- round 1))
+                           (expected (if (eqv? round 0) (list 0 \"0\") (list 'first (number->string before)))))
+                      (if (and (equal? mine (list round (number->string round)))
+                               (equal? tail (list 'tail round expected))
+                               (equal? deep (list #t (list 'deep (* round 2))))
+                               (equal? told (+ round 100))
+                               (equal? flat (list #t (list 'flat 303))))
+                          (if (eqv? round 30)
+                              (list (+ good 1) (call-with-values (lambda () (tried gen 'last)) list) (co/status gen))
+                              (loop (+ round 1) (+ good 1)))
+                          (list 'bad round tail deep told flat)))))";
+    let mut machine = machine(&mut arena, text);
+    let mut told: Option<i64> = None;
+    let mut hosted = Vec::new();
+    let done = loop {
+        let outcome = arena.step(|mc| {
+            let outcome = if let Some(value) = told.take() { machine.resume(mc, &[Value::fixnum(value).unwrap()]) } else { machine.run(mc) };
+            match outcome.unwrap() {
+                Outcome::Paused => None,
+                outcome => Some((matches!(outcome, Outcome::Yielded(_)), show_outcome(mc, Ok(outcome)))),
+            }
+        });
+        match outcome.unwrap() {
+            None => {}
+            Some((true, yielded)) => {
+                told = Some(100 + hosted.len() as i64);
+                hosted.push(yielded);
+            }
+            Some((false, done)) => break done,
+        }
+    };
+    assert_eq!((hosted.len(), done.as_str()), (31, "done (31 (#f (over last)) error)"));
+    assert_eq!(hosted[7], "yielded ((host 7 (7 \"7\")))");
+}
+
+#[test]
+fn switches_keep_their_place_in_call_traces() {
+    let names = "(define (names e) (map car (error-object-traceback e))) (define (body) (+ 1 (error \"bad\")))";
+    // The frames of a task that waits for a coroutine follow the coroutine's own in the trace.
+    let waiting = "(define (runner co) (+ 1 (co/resume co))) (define (outer co) (+ 1 (runner co)))";
+    assert_eq!(eval(&format!("{names} {waiting} (guard (e (#t (names e))) (outer (make-coroutine body)))")), "(body runner outer #f)");
+    assert_eq!(eval(&format!("{names} {waiting} (define (late) (co/yield 1) (+ 1 (error \"late\"))) (define co (make-coroutine late)) (co/resume co) (guard (e (#t (names e))) (outer co))")), "(late runner outer #f)");
+    // A resume in tail position leaves no entry, as a call in tail position leaves none.
+    assert_eq!(eval(&format!("{names} (define (runner co) (co/resume co)) (define (outer co) (+ 1 (runner co))) (guard (e (#t (names e))) (outer (make-coroutine body)))")), "(body outer #f)");
+    // `co/try-resume` returns the condition with the trace it had where it was raised. That holds too when the resume itself fails.
+    let tried = "(define (try co) (call-with-values (lambda () (co/try-resume co)) (lambda (ok e) (list ok (names e))))) (define (outer co) (cons 'x (try co)))";
+    assert_eq!(eval(&format!("{names} {tried} (outer (make-coroutine body))")), "(x #f (body try outer))");
+    assert_eq!(eval(&format!("{names} {tried} (outer 5)")), "(x #f (try outer))");
+    // More frames wait than a task leaves on its stack, so some are saved when it switches.
+    let deep = "(define (deep n co) (if (eqv? n 0) (+ 1 (co/resume co)) (+ 1 (deep (- n 1) co))))";
+    assert_eq!(eval(&format!("{names} {deep} (guard (e (#t (length (names e)))) (deep 300 (make-coroutine body)))")), "64");
+    assert_eq!(eval(&format!("{deep} (deep 300 (make-coroutine (lambda () (co/yield 1) 5)))")), "302");
+}
+
+/// Coroutines that are resumed in turn each come back to what their frames held, however many take part. A few idle coroutines keep their frames in place and the rest are copied out, so the groups here are both smaller and larger than that number. Between groups, some coroutines are closed, some end, and some are left suspended.
+#[test]
+fn coroutines_run_in_turn_in_any_number() {
+    let mut arena = arena();
+    let text = "(let ()
+                  (define (churn n acc) (if (eqv? n 0) acc (churn (- n 1) (list n n n))))
+                  (define (make i rounds)
+                    (make-coroutine
+                      (lambda ()
+                        (let loop ((round 0) (kept (list i \"x\")))
+                          (if (eqv? round rounds)
+                              'over
+                              (begin (co/yield (list i round kept)) (loop (+ round 1) (list i (number->string round)))))))))
+                  (define (rotate count rounds)
+                    (let ((cos (let build ((i 0) (made '())) (if (eqv? i count) (reverse made) (build (+ i 1) (cons (make i (if (odd? i) rounds (+ rounds 5))) made))))))
+                      (let loop ((round 0) (bad 0))
+                        (if (eqv? round rounds)
+                            (let finish ((rest cos) (i 0) (bad bad))
+                              (cond ((null? rest) bad)
+                                    ((odd? i) (finish (cdr rest) (+ i 1) (if (eq? (co/resume (car rest)) 'over) bad (+ bad 1))))
+                                    ((eqv? (modulo i 4) 0) (co/close (car rest)) (finish (cdr rest) (+ i 1) bad))
+                                    (else (finish (cdr rest) (+ i 1) bad))))
+                            (loop (+ round 1)
+                                  (let each ((rest cos) (i 0) (bad bad))
+                                    (if (null? rest)
+                                        (begin (churn 500 0) bad)
+                                        (let ((got (co/resume (car rest))))
+                                          (each (cdr rest) (+ i 1) (if (equal? got (list i round (if (eqv? round 0) (list i \"x\") (list i (number->string (- round 1)))))) bad (+ bad 1)))))))))))
+                  (list (rotate 1 40) (rotate 2 40) (rotate 3 40) (rotate 4 40) (rotate 5 40) (rotate 6 40) (rotate 13 40) (rotate 2 40)))";
+    let mut machine = machine(&mut arena, text);
+    assert_eq!(run_to_outcome(&mut arena, &mut machine, false), "done (0 0 0 0 0 0 0 0)");
+}
+
+#[test]
+fn an_ended_coroutine_is_closed_and_reset_where_it_is_asked() {
+    let ended = "(define co (make-coroutine (lambda () 1))) (co/resume co)";
+    let failed = "(define co (make-coroutine (lambda () (raise 'boom)))) (guard (e (#t e)) (co/resume co))";
+    for made in [ended, failed] {
+        // In the middle of an expression and in tail position, with values held in the frame around it.
+        assert_eq!(eval(&format!("{made} (let ((kept (list 1 2))) (list (eq? co (co/reset co (lambda () 'again))) (co/status co) (co/resume co) (co/status co) kept))")), "(#t pending again dead (1 2))");
+        assert_eq!(eval(&format!("{made} (define (renew thunk) (co/reset co thunk)) (define (shut) (co/close co)) (list (eq? co (renew (lambda (x) (+ x 1)))) (co/resume co 41) (begin (shut) (co/status co)) (eq? (shut) (if #f #f)))")), "(#t 42 dead #t)");
+        // What is not a procedure is refused, and the coroutine stays as it was.
+        assert_eq!(eval(&format!("{made} (define before (co/status co)) (list (guard (e (#t (error-object-kind e))) (co/reset co 5)) (eq? before (co/status co)))")), "(wrong-type #t)");
+    }
+    // A coroutine that ends and is reset over and over runs its newest body each time.
+    assert_eq!(eval("(define co (make-coroutine (lambda () 0))) (let loop ((i 0) (sum 0)) (if (eqv? i 1000) sum (let ((got (co/resume co))) (co/reset co (lambda () (+ i 1))) (loop (+ i 1) (+ sum got)))))"), "499500");
+}
+
+/// Frames that were entered with marks, a guard or a handler switch to a coroutine and come back with them, at any depth. So does a coroutine that yields from such a frame, whether it is then resumed, failed, closed or reset.
+#[test]
+fn marks_and_guards_hold_across_switches() {
+    let counter = "(define (gen) (make-coroutine (lambda () (let loop ((i 0)) (if (eqv? i 3) (raise 'boom) (begin (co/yield (list i (mark-value 'k 'none))) (loop (+ i 1))))))))";
+    let marked = "(define (marked co) (call-with-mark 'k 'mine (lambda () (let ((got (co/resume co))) (list got (mark-value 'k 'none))))))
+                  (define (deep n co) (if (eqv? n 0) (marked co) (cons n (deep (- n 1) co))))";
+    assert_eq!(eval(&format!("{counter} {marked} (define co (gen)) (list (marked co) (length (deep 40 co)) (call-with-mark 'k 'outer (lambda () (let ((got (deep 40 co))) (list (length got) (mark-value 'k 'none))))) (guard (e (#t (list 'top e))) (deep 40 co)))")), "(((0 none) mine) 42 (42 outer) (top boom))");
+    let guarded = "(define (guarded co) (guard (e (#t (list 'caught e (mark-value 'k 'none)))) (list 'ok (co/resume co) (mark-value 'k 'none))))
+                   (define (deep n co) (if (eqv? n 0) (guarded co) (let ((got (deep (- n 1) co))) (if (pair? got) got #f))))
+                   (define (outer co) (call-with-mark 'k 'outer (lambda () (let ((got (deep 40 co))) (list got (mark-value 'k 'none))))))";
+    assert_eq!(eval(&format!("{counter} {guarded} (define co (gen)) (list (guarded co) (outer co) (outer co) (outer co))")), "((ok (0 none) none) ((ok (1 none) outer) outer) ((ok (2 none) outer) outer) ((caught boom outer) outer))");
+    let handled = "(with-exception-handler (lambda (e) 'handled) (lambda () (let* ((first (co/resume co)) (second (co/resume co))) (list first second (guard (e (#t (list 'guarded e))) (co/resume co))))))";
+    assert_eq!(eval(&format!("{counter} (define co (gen)) (define (tail-marked co) (call-with-mark 'k 'tail (lambda () (co/resume co)))) (list (tail-marked co) (mark-value 'k 'none) {handled})")), "((0 none) none ((1 none) (2 none) (guarded boom)))");
+    let worker = "(define log '())
+                  (define (worker) (call-with-mark 'k 'w (lambda () (dynamic-wind (lambda () 0) (lambda () (let dig ((n 40)) (if (eqv? n 0) (list (co/yield (mark-value 'k 'none)) (mark-value 'k 'none)) (cons n (dig (- n 1)))))) (lambda () (set! log (cons (mark-value 'k 'none) log)))))))
+                  (define (started) (let ((co (make-coroutine worker))) (co/resume co) co))";
+    assert_eq!(eval(&format!("{worker} (define co (started)) (list (length (co/resume co 'in)) (co/status co) log)")), "(42 dead (w))");
+    assert_eq!(eval(&format!("{worker} (define co (started)) (list (guard (e (#t e)) (co/resume-error co 'bad)) (co/status co) log)")), "(bad error (w))");
+    assert_eq!(eval(&format!("{worker} (define co (started)) (co/close co) (list (co/status co) log)")), "(dead (w))");
+    assert_eq!(eval(&format!("{worker} (define co (started)) (co/reset co (lambda () 'fresh)) (list (co/resume co) log)")), "(fresh (w))");
+}
+
+/// A host answers each yield at once, in the same step, and ends the step only when a run says it paused. The lists of yielded values add up to more than the arena holds, and the program allocates nothing else that would make it pause. So this only works if the machine pauses for the collector when it is resumed. Each answer reaches its yield, also the ones given when the machine paused instead of going on.
+#[test]
+fn a_host_that_answers_yields_at_once_still_lets_the_collector_run() {
+    let mut arena = arena();
+    let text = "(let loop ((i 0) (bad 0))
+                  (if (eqv? i 300000)
+                      bad
+                      (let ((got (co/yield i i i i)))
+                        (loop (+ i 1) (if (eqv? got (+ i 1)) bad (+ bad 1))))))";
+    let mut machine = machine(&mut arena, text);
+    let (mut yields, mut pauses) = (0, 0);
+    let mut answer = None;
+    let done = loop {
+        let done = arena.step(|mc| {
+            loop {
+                let outcome = match answer.take() {
+                    Some(value) => machine.resume(mc, &[Value::fixnum(value).unwrap()]),
+                    None => machine.run(mc),
+                };
+                match outcome.unwrap() {
+                    Outcome::Yielded(_) => {
+                        yields += 1;
+                        answer = Some(yields);
+                    }
+                    Outcome::Paused => {
+                        pauses += 1;
+                        return None;
+                    }
+                    outcome => return Some(show_outcome(mc, Ok(outcome))),
+                }
+            }
+        });
+        if let Some(done) = done.unwrap() {
+            break done;
+        }
+    };
+    assert_eq!((done.as_str(), yields), ("done 0", 300000));
+    assert!(pauses > 0, "expected the machine to pause for collections");
 }
 
 #[test]

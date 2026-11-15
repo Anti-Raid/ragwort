@@ -122,6 +122,7 @@ impl<'gc> Segments<'_, 'gc> {
                 if !self.stack.resume(mc, segment, start) {
                     return Err(Fault::Malformed);
                 }
+                self.moved();
                 task.set_chain(mc, record.next(mc));
                 return Ok(Some(Resume { fp: top, pc: link.pc }));
             }
@@ -220,6 +221,7 @@ impl<'gc> Segments<'_, 'gc> {
             task.set_spare(mc, None);
             let base = task.spare_base(mc) as usize;
             if base + need <= spare.len(mc) && self.stack.resume(mc, spare, base) {
+                self.moved();
                 return Ok(());
             }
         }
@@ -228,7 +230,18 @@ impl<'gc> Segments<'_, 'gc> {
         }
         let len = self.stack.segment(mc).len(mc).saturating_mul(2).clamp(need, self.size);
         self.stack.switch(mc, Segment::new(mc, len)?);
+        self.moved();
         Ok(())
+    }
+
+    /// Forgets the segment the running task last waited on, now that its stack has moved to another
+    /// one. The task records a segment when it switches away, and keeps the record while it runs so
+    /// that coming back to the same segment writes nothing. Left in place after a move, it would keep
+    /// a segment alive that the task no longer uses.
+    fn moved(&self) {
+        if self.task.segment(self.mc).is_some() {
+            self.task.set_segment(self.mc, None);
+        }
     }
 
     /// Retrieves the continuation marks belonging to the caller of the frame at `fp` (governed by

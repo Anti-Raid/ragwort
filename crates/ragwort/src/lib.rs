@@ -1,0 +1,1 @@
+//! The high-level API for embedding Ragwort in a Rust program.

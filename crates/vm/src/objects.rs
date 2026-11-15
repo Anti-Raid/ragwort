@@ -71,9 +71,11 @@ objects! {
     ///
     /// `body` contains the initial entry procedure before execution begins. While `co/reset` is closing the coroutine, it holds the new body instead. `resumer` points to the task that resumed this one, while `resumed` points to any task currently resumed by it. While suspended, active stack frames reside on `segment` starting at `base` (or are preserved entirely within `chain`). `state` tracks whether the coroutine is pending, running, dead, failed, or being closed.
     ///
-    /// The machine's primary root task also tracks `idle` (the most recently suspended coroutine whose frames remain resident on their segment until another task suspends).
+    /// `idle` of a machine's root task is a vector of the suspended coroutines whose frames stay on the segment they ran on, or `#f` before the first one. See `coroutine::idle`.
     ///
     /// `values` preserves the accumulator's list of values between run steps, as `acc` preserves the accumulator.
+    ///
+    /// A task that switched away at a `co/resume`, `co/try-resume` or `co/yield` is parked: its frames from `base` up stay on its segment and are not in `chain`. `park_fp` is the frame that made the request, `park_pc` the instruction it goes on with, and `park_base` the register of the request, which is 0 for a task that is not parked.
     pub struct Task {
         acc: Value,
         chain: Value,
@@ -90,6 +92,9 @@ objects! {
         segment: Member<Segment>,
         base: u32,
         state: u32,
+        park_fp: u32,
+        park_pc: u32,
+        park_base: u32,
     }
     /// A runtime module instance: holds top-level variable slots (initialized to `UNDEFINED` until defined) accessed by slot instructions, an immutable vector of variable `names` for diagnostic messages, a host function table indexed by [`Op::CallHost`], and an opaque compiler-defined `interface` describing exports for importing modules.
     pub struct Module {

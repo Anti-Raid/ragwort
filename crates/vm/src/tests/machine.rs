@@ -1311,6 +1311,41 @@ fn external_refs_hold_the_hosts_data_and_trace_their_value() {
     assert!(dropped.get());
 }
 
+/// A machine that waits for its host does not go on while a collection step is due. The answer it was given is kept, and the next run delivers it.
+#[test]
+fn a_waiting_machine_pauses_for_the_collector_and_keeps_its_answer() {
+    let mut arena = Arena::new(1 << 24, 0);
+    arena.mutate(|mc| {
+        // `(+ 1 (defer 10))`
+        let code: &[Op] = &[
+            Op::LoadConst { dst: 2, index: 0 },
+            Op::CallHost { base: 2, args: 1, host: DEFER },
+            Op::LoadAcc { dst: 3 },
+            Op::AddImm { dst: 3, a: 3, imm: 1 },
+            Op::Return { src: 3 },
+        ];
+        let code = module_calling(mc, &[fix(10)], &HOSTS, &[(0, &[], code)])[0];
+        let mut waiting = [0; 3].map(|_| {
+            let mut machine = Machine::new(mc, MIN_SEGMENT, closure(mc, code), &[]).unwrap();
+            assert!(matches!(to_end(mc, &mut machine), Ok(Outcome::Deferred(_))));
+            machine
+        });
+        // Allocate until the step owes the collector work.
+        let mut made = Value::NIL;
+        while !mc.step_due() {
+            made = Pairs::new(mc).cons(Value::TRUE, made).unwrap().value(mc);
+        }
+        let [replied, raised, asked_twice] = &mut waiting;
+        assert_eq!(replied.reply(mc, fix(41)), Ok(Outcome::Paused));
+        assert_eq!(replied.run(mc), Ok(Outcome::Done(fix(42))));
+        assert_eq!(raised.raise(mc, fix(7)), Ok(Outcome::Paused));
+        assert_eq!(raised.run(mc), Ok(Outcome::Raised(fix(7))));
+        // The host may also make the same call again. The second one goes on, though the step is still due.
+        assert_eq!(asked_twice.raise(mc, fix(7)), Ok(Outcome::Paused));
+        assert_eq!(asked_twice.raise(mc, fix(8)), Ok(Outcome::Raised(fix(8))));
+    });
+}
+
 #[test]
 fn what_the_host_raises_goes_to_the_raise_handler() {
     let mut arena = Arena::new(1 << 24, 0);

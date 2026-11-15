@@ -14,7 +14,7 @@ use crate::module::{Deferred, HostArgs, HostContext, HostDef, Reply};
 use crate::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Guard, KeywordProcedure, KeywordProcedureFields, ModuleFields, Task, TaskFields};
 use crate::prompts::{self, handler_key};
 use crate::segments;
-use crate::{Context, Control, Fault, Op, Request};
+use crate::{Context, Control, Fault, Op, Request, coroutine};
 
 /// The maximum number of arguments a call can pass directly in registers; arguments and the
 /// subsequent frame link occupy the remainder of the frame window.
@@ -383,7 +383,8 @@ impl<'s, 'gc> Run<'s, 'gc> {
 
     /// Optimizes `apply` directly into a call by spreading the final list. Non-tail invocations of `with-mark`, `with-exception-handler`, or `guard` set
     /// continuation marks in the callee's frame window (preserving previous marks beneath it for return
-    /// restoration). All other requests exit to the outer loop.
+    /// restoration). A close or reset of a coroutine that has ended finishes here too. All other requests
+    /// exit to the outer loop.
     ///
     /// Kept out of line. Inlined into the instruction loop, it made every plain call measurably slower.
     #[inline(never)]
@@ -410,9 +411,38 @@ impl<'s, 'gc> Run<'s, 'gc> {
                 None => return Err(Exit::Request { base, args, request, spread, tail }),
             },
             Request::WithHandler | Request::Guard | Request::GuardQuiet if !spread && !tail && args == 2 => return self.marked_call(base, args, request),
+            Request::Close | Request::Reset if !spread => match self.ended(base, args, request) {
+                Some(value) => {
+                    self.cx.acc = value;
+                    return if tail { self.ret() } else { Ok(()) };
+                }
+                None => return Err(Exit::Request { base, args, request, spread, tail }),
+            },
             _ => return Err(Exit::Request { base, args, request, spread, tail }),
         };
         if tail { self.tail_call(call) } else { self.call(call, false) }
+    }
+
+    /// Closes or resets the coroutine in register `base` if it has ended. Such a coroutine holds nothing,
+    /// so there is nothing to unwind and no task to switch to. Returns what the request returns: void
+    /// for a close, the coroutine for a reset. Returns `None` if the outer loop has to make the request.
+    #[inline(never)]
+    fn ended(&mut self, base: u8, args: u8, request: Request) -> Option<Value<'gc>> {
+        let (mc, frame) = (self.cx.mc, self.cx.frame);
+        let coroutine = frame.get(base);
+        let task = coroutine::of(mc, coroutine)?;
+        if !matches!(task.state(mc), coroutine::DEAD | coroutine::FAILED) {
+            return None;
+        }
+        if request == Request::Close {
+            return if args == 1 { Some(Value::VOID) } else { None };
+        }
+        let thunk = frame.get(base + 1);
+        if args != 2 || !crate::intrinsic::is_procedure(mc, thunk) {
+            return None;
+        }
+        coroutine::reset(mc, task, thunk);
+        Some(coroutine)
     }
 
     /// Calls the procedure in register `base` with the values in the accumulator, which the last call

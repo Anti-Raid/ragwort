@@ -48,6 +48,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ragwort"
+version = "0.1.0"
+dependencies = [
+ "ragwort-compiler",
+ "ragwort-vm",
+]
+
+[[package]]
 name = "ragwort-alloc"
 version = "0.1.0"
 dependencies = [
