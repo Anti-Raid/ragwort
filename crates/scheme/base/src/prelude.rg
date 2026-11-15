@@ -231,7 +231,10 @@
 (%define co/yield (%lambda args (%apply-intrinsic co/yield args)))
 (%define co/running (%lambda () (%intrinsic co/running)))
 (%define co/status
-  (%lambda (co) (%intrinsic vector-ref #(pending running finished error) (%intrinsic coroutine-state co))))
+  (%lambda (co) (%intrinsic vector-ref #(pending running dead error running) (%intrinsic coroutine-state co))))
+(%define co/resume-error (%lambda (co obj) (%intrinsic co/resume-error co obj)))
+(%define co/close (%lambda (co) (%intrinsic co/close co)))
+(%define co/reset (%lambda (co thunk) (%intrinsic co/reset co thunk)))
 
 (%define null? (%lambda (x) (%intrinsic null? x)))
 (%define pair? (%lambda (x) (%intrinsic pair? x)))

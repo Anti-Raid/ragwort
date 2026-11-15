@@ -93,6 +93,21 @@ named! {
         /// [`Outcome::Yielded`](crate::Outcome::Yielded). When resumed, returns the arguments passed to
         /// `co/resume`.
         Yield = "co/yield",
+        /// `(co/resume-error co obj)`: resumes pending coroutine `co` by raising `obj` inside it, at the
+        /// `co/yield` it is suspended in. If the coroutine catches `obj`, this returns as `co/resume` does.
+        /// If it does not, the coroutine fails and `obj` is raised at the call site. A coroutine that has
+        /// not started fails without running its body.
+        ResumeError = "co/resume-error",
+        /// `(co/close co)`: ends suspended coroutine `co` without running the rest of its body. The `after`
+        /// thunks of the `dynamic-wind` calls it is suspended in run first, innermost first. Returns void.
+        /// A coroutine that is already dead or failed is left as it is. An `after` thunk that raises with
+        /// no handler fails the coroutine, and the value is raised at the call site. `co/yield` fails
+        /// while a coroutine is being closed.
+        Close = "co/close",
+        /// `(co/reset co thunk)`: closes `co` as `co/close` does, then makes it pending again with
+        /// procedure `thunk` as its body. Returns `co`. If an `after` thunk raises with no handler, the
+        /// value is raised at the call site, and `co` is pending with the new body all the same.
+        Reset = "co/reset",
         /// `(keyword-apply f kws vals arg ... list)`: calls `f` with keyword arguments defined by sorted symbol
         /// list `kws` and matching value list `vals`, followed by positional arguments `arg ...` and the
         /// unpacked elements of `list`. See [`crate::keyword`].
@@ -108,7 +123,8 @@ impl Request {
             Request::Apply | Request::Receive => (2, None),
             Request::WithMark | Request::CallWithPrompt => (3, None),
             Request::Capture | Request::WithHandler | Request::Guard | Request::GuardQuiet => (2, Some(2)),
-            Request::CallCc | Request::Raise | Request::RaiseContinuable => (1, Some(1)),
+            Request::CallCc | Request::Raise | Request::RaiseContinuable | Request::Close => (1, Some(1)),
+            Request::ResumeError | Request::Reset => (2, Some(2)),
             Request::Abort | Request::Resume | Request::TryResume | Request::Compose | Request::Collect => (1, None),
             Request::Yield => (0, None),
             Request::KeywordApply => (4, None),
@@ -120,8 +136,8 @@ impl Request {
     pub fn fixed(self) -> usize {
         match self {
             Request::Yield => 0,
-            Request::Apply | Request::Collect | Request::Abort | Request::Compose | Request::CallCc | Request::Raise | Request::RaiseContinuable | Request::Resume | Request::TryResume => 1,
-            Request::Receive | Request::Capture | Request::WithHandler | Request::Guard | Request::GuardQuiet => 2,
+            Request::Apply | Request::Collect | Request::Abort | Request::Compose | Request::CallCc | Request::Raise | Request::RaiseContinuable | Request::Resume | Request::TryResume | Request::Close => 1,
+            Request::Receive | Request::Capture | Request::WithHandler | Request::Guard | Request::GuardQuiet | Request::ResumeError | Request::Reset => 2,
             Request::WithMark | Request::CallWithPrompt | Request::KeywordApply => 3,
         }
     }
@@ -174,6 +190,15 @@ impl Request {
                 Then::Resume(arg(0)?, args.skip(mc, 1)?)
             }
             Request::Yield => Then::Yield(args),
+            Request::ResumeError => Then::ResumeError(arg(0)?, arg(1)?),
+            Request::Close => Then::Close(arg(0)?, Value::FALSE),
+            Request::Reset => {
+                let thunk = arg(1)?;
+                if !crate::intrinsic::is_procedure(mc, thunk) {
+                    return Err(Fault::WrongType);
+                }
+                Then::Close(arg(0)?, thunk)
+            }
             Request::KeywordApply => crate::keyword::apply(mc, arg(0)?, arg(1)?, arg(2)?, args.skip(mc, 3)?.spread_last(mc)?)?,
         })
     }

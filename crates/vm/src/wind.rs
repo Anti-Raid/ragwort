@@ -14,7 +14,7 @@ use ragwort_types::gc::{Gc, Value};
 use ragwort_types::pair::{Pair, Pairs};
 use ragwort_types::string::{self, Strings};
 
-use crate::Fault;
+use crate::{Fault, coroutine};
 use crate::passed::Passed;
 use crate::machine::{Outer, Then, condition};
 use crate::objects::{Bytecode, Continuation, ContinuationFields, Guard, GuardFields, Native, NativeFields, PromptFields, TaskFields, WinderFields};
@@ -49,10 +49,14 @@ pub(crate) enum Kind {
     Receive,
     /// The producer of a `collect` request returned. Returns the list of the values it returned.
     Collect,
+    /// The `after` winders of the coroutine that `co/close` or `co/reset` is closing have all run. Ends
+    /// the coroutine and returns to the task that closed it. The new body for a reset waits in the
+    /// task's `body`.
+    Closed,
 }
 
 impl Kind {
-    const ALL: [Kind; 10] = [
+    const ALL: [Kind; 11] = [
         Kind::Handled,
         Kind::Guarded,
         Kind::Winds,
@@ -63,6 +67,7 @@ impl Kind {
         Kind::Catch,
         Kind::Receive,
         Kind::Collect,
+        Kind::Closed,
     ];
 
     fn of(index: u32) -> Result<Kind, Fault> {
@@ -130,6 +135,11 @@ impl<'gc> Outer<'_, 'gc> {
                 Then::Call(first, received)
             }
             Kind::Collect => Then::Return(self.regs.list(mc)?),
+            Kind::Closed => {
+                let (to, renew) = (coroutine::of(mc, task.resumer(mc)).ok_or(Fault::Malformed)?, task.body(mc));
+                self.end(task, coroutine::DEAD, to)?;
+                coroutine::closed(mc, task, renew)
+            }
         })
     }
 
@@ -175,6 +185,17 @@ impl<'gc> Outer<'_, 'gc> {
         let mc = self.mc();
         let todo = winds_todo(mc, &prompts::winds(mc, self.task(), None)?, &[])?;
         self.unwind(todo, Kind::Uncaught, obj, Value::VOID)
+    }
+
+    /// Runs all the `after` winders of the running task, which is a coroutine being closed, and then
+    /// finishes the close. See [`Kind::Closed`].
+    ///
+    /// An `after` thunk that raises with no handler takes the path of any uncaught error: the remaining
+    /// winders run, the coroutine fails, and the value is raised in the task that closed it.
+    pub(crate) fn unwind_closing(&mut self) -> Result<Then<'gc>, Fault> {
+        let mc = self.mc();
+        let todo = winds_todo(mc, &prompts::winds(mc, self.task(), None)?, &[])?;
+        self.unwind(todo, Kind::Closed, Value::VOID, Value::VOID)
     }
 
     /// Invokes `thunk` with `handler` installed as the innermost entry in the exception handlers

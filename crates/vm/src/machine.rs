@@ -134,7 +134,7 @@ impl Machine {
             _ => Waiting::No,
         };
         if self.finished {
-            let state = if matches!(outcome, Ok(Outcome::Done(_))) { coroutine::FINISHED } else { coroutine::FAILED };
+            let state = if matches!(outcome, Ok(Outcome::Done(_))) { coroutine::DEAD } else { coroutine::FAILED };
             self.task.get(mc).expect("a machine runs in its own arena").set_state(mc, state);
         }
         self.save(mc, task, &regs);
@@ -246,6 +246,10 @@ pub(crate) enum Then<'gc> {
     Forward,
     /// Resumes the specified coroutine with arguments.
     Resume(Value<'gc>, Passed<'gc>),
+    /// Resumes the specified coroutine by raising the given value inside it.
+    ResumeError(Value<'gc>, Value<'gc>),
+    /// Closes the specified coroutine. Then, unless the second value is `#f`, makes it pending again with that procedure as its body.
+    Close(Value<'gc>, Value<'gc>),
     /// Raises an exception value, indicating whether execution resumes with the handler's return value
     /// (continuable).
     Raise(Value<'gc>, bool),
@@ -368,7 +372,12 @@ impl<'a, 'gc> Outer<'a, 'gc> {
             return self.then(then);
         }
         let Some(to) = coroutine::of(mc, task.resumer(mc)) else { return Ok(Some(Outcome::Raised(obj))) };
+        // A coroutine that fails while a reset is closing it is reset all the same. The value is still raised in the task that asked for the reset.
+        let renew = if task.state(mc) == coroutine::CLOSING { task.body(mc) } else { Value::FALSE };
         self.end(task, coroutine::FAILED, to)?;
+        if renew != Value::FALSE {
+            coroutine::reset(mc, task, renew);
+        }
         self.raise(obj, false)
     }
 
@@ -436,6 +445,8 @@ impl<'a, 'gc> Outer<'a, 'gc> {
             }
             Then::Forward => self.resume(),
             Then::Resume(co, args) => self.resume_coroutine(co, args),
+            Then::ResumeError(co, raised) => self.resume_error(co, raised),
+            Then::Close(co, renew) => self.close_coroutine(co, renew),
             Then::Raise(obj, continuable) => self.raise(obj, continuable),
             Then::Uncaught(obj, unwound) => self.uncaught(obj, unwound),
             Then::Yield(values) => self.yield_coroutine(values),
@@ -523,7 +534,7 @@ impl<'a, 'gc> Outer<'a, 'gc> {
                 continue;
             }
             let Some(to) = coroutine::of(mc, task.resumer(mc)) else { return Ok(Some(Outcome::Done(self.regs.first(mc)))) };
-            self.end(task, coroutine::FINISHED, to)?;
+            self.end(task, coroutine::DEAD, to)?;
         }
     }
 

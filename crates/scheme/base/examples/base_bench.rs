@@ -213,12 +213,16 @@ fn main() {
     println!("two coroutines resumed in turn: {:.1} ns per round trip", per(time(&turns, false, true)));
     let spawn = format!("(define (spawn n) (if (eqv? n 0) 0 (begin (co/resume (make-coroutine (lambda () n))) (spawn (+ n -1))))) (spawn {})", N / 100);
     println!("make and finish a coroutine:   {:.1} ns each", per(time(&spawn, false, true)) * 100.0);
+    let respawn = format!("(define co (make-coroutine (lambda () 0))) (define (respawn n) (if (eqv? n 0) 0 (begin (co/resume (co/reset co (lambda () n))) (respawn (+ n -1))))) (respawn {})", N / 100);
+    println!("reset and finish a coroutine:  {:.1} ns each", per(time(&respawn, false, true)) * 100.0);
 
     let each = |name: &str, body: &str| {
         let text = format!("(define (go n) (if (eqv? n 0) 0 (begin {body} (go (+ n -1))))) (go {})", N / 100);
         println!("{name:<31}{:.1} ns each", per(time(&text, false, true)) * 100.0);
     };
     each("try-resume a finishing coro:", "(co/try-resume (make-coroutine (lambda () n)))");
+    each("make, suspend and close a coro:", "(let ((co (make-coroutine (lambda () (co/yield n))))) (co/resume co) (co/close co))");
+    each("the same, closing in a wind:", "(let ((co (make-coroutine (lambda () (dynamic-wind (lambda () 1) (lambda () (co/yield n)) (lambda () 2)))))) (co/resume co) (co/close co))");
     each("raise-continuable to handler:", "(with-exception-handler (lambda (e) e) (lambda () (raise-continuable n)))");
     each("guard catching a raise:", "(guard (e (#t e)) (raise n))");
     each("guard, nothing raised:", "(guard (e (#t e)) n)");

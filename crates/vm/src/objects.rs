@@ -69,7 +69,7 @@ objects! {
     pub struct Native { kind: u32, a: Value, b: Value, attachments: Value, next: Value }
     /// A coroutine task representing an arena-allocated execution state managed by a [`crate::Machine`]: preserves the result accumulator (`acc`) between run steps, the continuation record chain (`chain`), continuation marks (`attachments` as an association list of `(key . value)` pairs), active dynamic [`Winder`]s, and enclosing delimited prompts (`prompts`). `spare` and `spare_base` retain a cached stack segment reused during stack overflows.
     ///
-    /// `body` contains the initial entry procedure before execution begins. `resumer` points to the task that resumed this one, while `resumed` points to any task currently resumed by it. While suspended, active stack frames reside on `segment` starting at `base` (or are preserved entirely within `chain`). `state` tracks whether the coroutine is pending, running, finished, or failed.
+    /// `body` contains the initial entry procedure before execution begins. While `co/reset` is closing the coroutine, it holds the new body instead. `resumer` points to the task that resumed this one, while `resumed` points to any task currently resumed by it. While suspended, active stack frames reside on `segment` starting at `base` (or are preserved entirely within `chain`). `state` tracks whether the coroutine is pending, running, dead, failed, or being closed.
     ///
     /// The machine's primary root task also tracks `idle` (the most recently suspended coroutine whose frames remain resident on their segment until another task suspends).
     ///

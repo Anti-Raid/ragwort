@@ -36,8 +36,10 @@ const FIRST_SEGMENT: usize = WINDOW + 64;
 
 pub(crate) const PENDING: u32 = 0;
 pub(crate) const RUNNING: u32 = 1;
-pub(crate) const FINISHED: u32 = 2;
+pub(crate) const DEAD: u32 = 2;
 pub(crate) const FAILED: u32 = 3;
+/// The state of a coroutine while `co/close` or `co/reset` runs its `after` winders. It counts as running everywhere, except that it cannot yield.
+pub(crate) const CLOSING: u32 = 4;
 
 /// Creates a pending coroutine initialized to invoke procedure `body` upon its first resumption.
 pub(crate) fn new<'gc>(mc: &Mutation<'gc>, body: Value<'gc>) -> Result<Gc<'gc, Task>, OutOfMemory> {
@@ -87,6 +89,73 @@ impl<'gc> Outer<'_, 'gc> {
         }
         // The values are taken off this task's stack before the stack moves to the coroutine's.
         let args = args.take(mc)?;
+        let body = self.switch_to(co, RUNNING)?;
+        if body == Value::FALSE {
+            return self.then(args.returned());
+        }
+        let args = self.repass(args)?;
+        self.then(Then::Call(body, args))
+    }
+
+    /// Resumes coroutine `co` by raising `raised` inside it (implementing `co/resume-error`). The
+    /// `co/yield` it is suspended in raises the value instead of returning.
+    ///
+    /// A handler or guard in the coroutine can catch it, and the coroutine then goes on as after any
+    /// resume. If nothing catches it, the coroutine fails and the value is raised again here, as when a
+    /// resumed coroutine fails by itself. A coroutine that has not started fails without running its
+    /// body.
+    pub(crate) fn resume_error(&mut self, co: Value<'gc>, raised: Value<'gc>) -> Step<'gc> {
+        let mc = self.mc();
+        let co = of(mc, co).ok_or(Fault::WrongType)?;
+        if co.state(mc) != PENDING {
+            return Err(Fault::NotPending);
+        }
+        self.switch_to(co, RUNNING)?;
+        self.then(Then::Raise(raised, false))
+    }
+
+    /// Closes coroutine `co` (implementing `co/close`). If `renew` is a procedure, the coroutine is then
+    /// made pending again with `renew` as its body (implementing `co/reset`). `renew` is `#f` for a
+    /// plain close.
+    ///
+    /// - A dead or failed coroutine has nothing to close.
+    /// - A suspended coroutine with no winders is dropped where it is. Nothing runs.
+    /// - A suspended coroutine with winders becomes the running task, in state [`CLOSING`], until its
+    ///   `after` thunks have run. They run innermost first, in the coroutine's own context. See
+    ///   [`Kind::Closed`](crate::wind::Kind::Closed).
+    ///
+    /// An `after` thunk that raises with no handler fails the coroutine, and the value is raised in the
+    /// task that closed it. A reset still installs the new body, so the coroutine can be used again.
+    ///
+    /// Fails with [`Fault::NotPending`] for a coroutine that is running or closing.
+    pub(crate) fn close_coroutine(&mut self, co: Value<'gc>, renew: Value<'gc>) -> Step<'gc> {
+        let mc = self.mc();
+        let co = of(mc, co).ok_or(Fault::WrongType)?;
+        match co.state(mc) {
+            PENDING => {
+                if !prompts::winds(mc, co, None)?.is_empty() {
+                    self.switch_to(co, CLOSING)?;
+                    // The new body of a reset waits in `body`, which a started coroutine does not use. It is installed when the close ends, whether the `after` thunks return or one of them fails.
+                    co.set_body(mc, renew);
+                    let then = self.unwind_closing()?;
+                    return self.then(then);
+                }
+                self.discard(co)?;
+                co.set_state(mc, DEAD);
+            }
+            DEAD | FAILED => {}
+            _ => return Err(Fault::NotPending),
+        }
+        self.then(closed(mc, co, renew))
+    }
+
+    /// Makes the suspended coroutine `co` the running task, in `state`, on its own stack. The caller's
+    /// continuation must already be saved to its chain.
+    ///
+    /// Returns the body of a coroutine that has not started, which the caller now calls or drops. Returns
+    /// `#f` for one that has started.
+    fn switch_to(&mut self, co: Gc<'gc, Task>, state: u32) -> Result<Value<'gc>, Fault> {
+        let mc = self.mc();
         let from = self.task();
         self.leave(from)?;
         if self.root.idle(mc) == Value::object(mc, co) {
@@ -94,21 +163,40 @@ impl<'gc> Outer<'_, 'gc> {
         }
         from.set_resumed(mc, Value::object(mc, co));
         co.set_resumer(mc, Value::object(mc, from));
-        co.set_state(mc, RUNNING);
+        co.set_state(mc, state);
         let body = co.body(mc);
         if body == Value::FALSE && co.segment(mc).is_some() {
             self.enter_task(co)?;
-            return self.then(args.returned());
+            return Ok(body);
         }
         let segment = self.free_segment(from)?;
         self.segments.stack.switch(mc, segment);
         self.segments.task = co;
-        if body == Value::FALSE {
-            return self.then(args.returned());
-        }
         co.set_body(mc, Value::FALSE);
-        let args = self.repass(args)?;
-        self.then(Then::Call(body, args))
+        Ok(body)
+    }
+
+    /// Drops everything the suspended coroutine `task` holds, without running anything: its body, its
+    /// continuation, its marks, its winders and its prompts. Its stack segment goes to the running task
+    /// as a spare if nothing else holds the frames on it, which is the check [`compact`] makes.
+    fn discard(&mut self, task: Gc<'gc, Task>) -> Result<(), Fault> {
+        let mc = self.mc();
+        if self.root.idle(mc) == Value::object(mc, task) {
+            self.root.set_idle(mc, Value::FALSE);
+        }
+        if let Some(segment) = task.segment(mc) {
+            let base = task.base(mc) as usize;
+            if held(mc, task.chain(mc), segment, base).is_some() {
+                segment.slots(mc).slice(0..base).ok_or(Fault::Malformed)?.fill(mc, Value::VOID);
+                give(mc, self.task(), segment);
+            }
+            task.set_segment(mc, None);
+        }
+        prompts::empty(mc, task);
+        task.set_prompts(mc, Value::NIL);
+        task.set_spare(mc, None);
+        task.set_body(mc, Value::FALSE);
+        Ok(())
     }
 
     /// Suspends the active coroutine (implementing `co/yield`), returning `yielded` to its resumer,
@@ -116,6 +204,10 @@ impl<'gc> Outer<'_, 'gc> {
     pub(crate) fn yield_coroutine(&mut self, yielded: Passed<'gc>) -> Step<'gc> {
         let mc = self.mc();
         let from = self.task();
+        // A coroutine that is being closed runs only to unwind. It has no resume to yield to.
+        if from.state(mc) == CLOSING {
+            return Err(Fault::NotPending);
+        }
         let Some(to) = of(mc, from.resumer(mc)) else {
             if !Pairs::new(mc).is_list(yielded.rest) {
                 return Err(Fault::WrongType);
@@ -209,6 +301,26 @@ impl<'gc> Outer<'_, 'gc> {
         self.segments.task = task;
         Ok(())
     }
+}
+
+/// Returns what a `co/close` or `co/reset` of `task` returns, once `task` holds nothing any more. A
+/// close returns void. A reset first makes `task` pending again with the procedure `renew` as its body,
+/// and returns the coroutine.
+pub(crate) fn closed<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, renew: Value<'gc>) -> Then<'gc> {
+    if renew == Value::FALSE {
+        return Then::Return(Value::VOID);
+    }
+    reset(mc, task, renew);
+    Then::Return(Value::object(mc, task))
+}
+
+/// Makes `task`, which has ended and holds nothing, a pending coroutine again with the procedure `body`
+/// as its body.
+pub(crate) fn reset<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, body: Value<'gc>) {
+    task.set_body(mc, body);
+    task.set_acc(mc, Value::VOID);
+    task.set_values(mc, Value::NIL);
+    task.set_state(mc, PENDING);
 }
 
 /// Compacts a suspended task's frames into a tightly-sized segment if its continuation chain contains

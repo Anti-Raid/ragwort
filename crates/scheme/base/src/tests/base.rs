@@ -1280,7 +1280,7 @@ fn coroutines_resume_and_yield_values_both_ways() {
                       (let* ((s0 (co/status co)) (y0 (co/resume co 1 2)) (s1 (co/status co)) (y1 (co/resume co 10))
                              (y2 (co/resume co 'x)) (s2 (co/status co)))
                         (list s0 y0 s1 y1 y2 s2 (coroutine? co) (coroutine? car)))";
-    assert_eq!(eval(round_trip), "(pending 3 pending 20 (1 2 10 x) finished #t #f)");
+    assert_eq!(eval(round_trip), "(pending 3 pending 20 (1 2 10 x) dead #t #f)");
     assert_eq!(eval("(define co (make-coroutine (lambda () (co/status co)))) (co/resume co)"), "running");
     assert_eq!(eval("(call-with-values (lambda () (co/resume (make-coroutine (lambda () (co/yield 1 2))))) list)"), "(1 2)");
     assert_eq!(eval("(call-with-values (lambda () (co/resume (make-coroutine (lambda () (co/yield))))) list)"), "()");
@@ -1303,7 +1303,7 @@ fn co_running_is_the_innermost_running_coroutine() {
     let from_inside = "(define top (co/running)) (co/resume (make-coroutine (lambda () (co/resume top))))";
     assert_eq!(eval_in(&mut arena(), from_inside), Ok(Err(Fault::NotPending)));
     // Each top-level form runs in a machine of its own, which has finished by the next.
-    assert_eq!(eval("(define top (co/running)) (co/status top)"), "finished");
+    assert_eq!(eval("(define top (co/running)) (co/status top)"), "dead");
 }
 
 #[test]
@@ -1313,12 +1313,12 @@ fn a_yield_goes_to_what_resumed_the_coroutine() {
                                   (let* ((a (co/resume inner)) (s (co/status outer)) (b (co/yield a)) (c (co/resume inner)))
                                     (list s b c (co/status inner))))))
                   (let* ((first (co/resume outer)) (rest (co/resume outer 'sent))) (list first rest (co/status outer)))";
-    assert_eq!(eval(nested), "(i1 (running sent i-done finished) finished)");
+    assert_eq!(eval(nested), "(i1 (running sent i-done dead) dead)");
     let walk = "(define (walk n) (if (eqv? n 0) 0 (begin (co/yield n) (+ 1 (walk (- n 1))))))
                 (define co (make-coroutine (lambda () (walk 20000))))
                 (let loop ((sum 0))
                   (let ((v (co/resume co)))
-                    (if (eq? (co/status co) 'finished) (list sum v) (loop (+ sum v)))))";
+                    (if (eq? (co/status co) 'dead) (list sum v) (loop (+ sum v)))))";
     assert_eq!(eval(walk), "(200010000 20000)");
     let many = "(define cos (let loop ((i 0) (acc '()))
                               (if (eqv? i 200) acc (loop (+ i 1) (cons (make-coroutine (lambda () (co/yield i) (* i 2))) acc)))))
@@ -1333,7 +1333,7 @@ fn coroutines_keep_their_own_prompts_and_continuations() {
     assert_eq!(eval("(co/resume (make-coroutine (lambda () (+ 1 (call/cc (lambda (k) (k 41)))))))"), "42");
     let prompt = "(define co (make-coroutine (lambda () (call-with-continuation-prompt (lambda () (+ 1 (co/yield 'in)))))))
                   (list (co/resume co) (co/resume co 5) (co/status co))";
-    assert_eq!(eval(prompt), "(in 6 finished)");
+    assert_eq!(eval(prompt), "(in 6 dead)");
     let escape = "(define co (make-coroutine (lambda () (call/cc (lambda (k) (co/yield 'a) (k 'escaped) 'not)))))
                   (list (co/resume co) (co/resume co))";
     assert_eq!(eval(escape), "(a escaped)");
@@ -1366,7 +1366,7 @@ fn suspended_frames_survive_being_moved_and_shared() {
                              (list (down 3) (call-with-continuation-prompt (lambda () (down 2))) (down 30)))))
                 (let* ((a (co/resume co)) (b (co/resume co 'x)) (c (co/resume co 'y)) (d (co/resume co 'z)))
                   (list a b c (car d) (cadr d) (co/status co)))";
-    assert_eq!(eval(deep), "(bottom bottom bottom (3 (2 (1 x))) (2 (1 y)) finished)");
+    assert_eq!(eval(deep), "(bottom bottom bottom (3 (2 (1 x))) (2 (1 y)) dead)");
 }
 
 #[test]
@@ -1893,6 +1893,122 @@ fn continuations_captured_at_every_level_of_a_deep_recursion_fit() {
     let text = "(let () (define (level n) (if (eqv? n 0) 0 (+ (call/cc (lambda (k) (k 1))) (level (- n 1))))) (level 5000))";
     let mut machine = machine(&mut arena, text);
     assert_eq!(run_to_outcome(&mut arena, &mut machine, false), "done 5000");
+}
+
+/// Definitions for the coroutine tests below: a log, and `(winding)`, which makes a coroutine that yields inside two nested `dynamic-wind` calls.
+const WINDING: &str = "(define log '()) (define (note x) (set! log (cons x log)) x)
+    (define (winding)
+      (make-coroutine (lambda ()
+        (dynamic-wind (lambda () (note 'in1))
+                      (lambda () (dynamic-wind (lambda () (note 'in2)) (lambda () (co/yield 'y) (note 'not)) (lambda () (note 'out2))))
+                      (lambda () (note 'out1))))))";
+
+/// Evaluates `text` after [`WINDING`]. A raised value is shown as `(raised value)`, with an error object shown by its kind.
+fn coroutine_case(text: &str) -> String {
+    eval(&format!("{WINDING} (guard (e (#t (list 'raised (if (error-object? e) (error-object-kind e) e)))) {text})"))
+}
+
+#[test]
+fn closing_a_coroutine_runs_its_afters_and_ends_it() {
+    // A coroutine that never started, and one suspended outside any `dynamic-wind`, end without running anything.
+    assert_eq!(coroutine_case("(let ((co (make-coroutine (lambda () (note 'ran))))) (co/close co) (list (co/status co) (reverse log)))"), "(dead ())");
+    assert_eq!(coroutine_case("(let ((co (make-coroutine (lambda () (co/yield 1) (note 'ran))))) (co/resume co) (co/close co) (list (co/status co) (reverse log)))"), "(dead ())");
+    assert_eq!(coroutine_case("(co/close (make-coroutine (lambda () 1)))"), "#<void>");
+    // The `after` thunks run once, innermost first. The rest of the body does not run, and the coroutine cannot be resumed.
+    assert_eq!(coroutine_case("(let ((co (winding))) (co/resume co) (co/close co) (co/close co) (list (co/status co) (reverse log)))"), "(dead (in1 in2 out2 out1))");
+    assert_eq!(coroutine_case("(let ((co (winding))) (co/resume co) (co/close co) (co/resume co))"), "(raised not-pending)");
+    // They run in the coroutine's own context: its marks, and itself as the running coroutine, which reports running.
+    let own = "(letrec ((co (make-coroutine (lambda ()
+                 (with-continuation-mark 'k 'mine
+                   (car (list (dynamic-wind (lambda () 0) (lambda () (co/yield 1)) (lambda () (note (list (mark-value 'k 'none) (eq? (co/running) co) (co/status co))))))))))))
+                 (co/resume co) (co/close co) (reverse log))";
+    assert_eq!(coroutine_case(own), "((mine #t running))");
+    // A coroutine whose frames were copied while it waited closes the same way.
+    assert_eq!(coroutine_case("(let ((a (winding)) (b (make-coroutine (lambda () (co/yield 0))))) (co/resume a) (co/resume b) (co/close a) (list (co/status a) (co/status b) (reverse log)))"), "(dead pending (in1 in2 out2 out1))");
+    // A dead or failed coroutine is left as it is.
+    assert_eq!(coroutine_case("(let ((co (make-coroutine (lambda () (raise 'boom))))) (guard (e (#t e)) (co/resume co)) (co/close co) (co/status co))"), "error");
+    assert_eq!(coroutine_case("(let ((co (make-coroutine (lambda () 1)))) (co/resume co) (co/close co) (co/status co))"), "dead");
+    // A running coroutine cannot be closed: the root, a coroutine closing itself, or one that is waiting for a coroutine it resumed.
+    assert_eq!(coroutine_case("(co/close (co/running))"), "(raised not-pending)");
+    assert_eq!(coroutine_case("(co/resume (make-coroutine (lambda () (co/close (co/running)))))"), "(raised not-pending)");
+    assert_eq!(coroutine_case("(letrec ((outer (make-coroutine (lambda () (co/resume (make-coroutine (lambda () (co/close outer)))))))) (co/resume outer))"), "(raised not-pending)");
+    assert_eq!(coroutine_case("(co/close 5)"), "(raised wrong-type)");
+}
+
+#[test]
+fn a_close_that_fails_or_yields_fails_the_coroutine() {
+    let failing = |after: &str| {
+        format!(
+            "(let ((co (make-coroutine (lambda ()
+                         (dynamic-wind (lambda () (note 'in1))
+                                       (lambda () (dynamic-wind (lambda () (note 'in2)) (lambda () (co/yield 'y)) (lambda () (note 'out2) {after})))
+                                       (lambda () (note 'out1)))))))
+               (co/resume co)
+               (list (guard (e (#t (if (error-object? e) (error-object-kind e) e))) (co/close co)) (co/status co) (reverse log)))"
+        )
+    };
+    // An `after` thunk that raises: the outer ones still run, the coroutine fails, and the value is raised at the close.
+    assert_eq!(coroutine_case(&failing("(raise 'oops)")), "(oops error (in1 in2 out2 out1))");
+    // A coroutine that is being closed cannot yield.
+    assert_eq!(coroutine_case(&failing("(co/yield 'late)")), "(not-pending error (in1 in2 out2 out1))");
+    // A reset whose close fails raises the value too, and the coroutine is reset all the same.
+    let reset = failing("(raise 'oops)").replace("(co/close co)", "(co/reset co (lambda () 'new))").replace("(co/status co) (reverse log)", "(co/status co) (co/resume co) (co/status co) (reverse log)");
+    assert_eq!(coroutine_case(&reset), "(oops pending new dead (in1 in2 out2 out1))");
+    // An `after` thunk can catch its own errors, and the close then succeeds.
+    assert_eq!(coroutine_case(&failing("(guard (e (#t (note 'caught))) (co/yield 'late))")), "(#<void> dead (in1 in2 out2 caught out1))");
+}
+
+#[test]
+fn a_reset_coroutine_runs_a_new_body() {
+    // A coroutine that finished is used again, with new arguments.
+    let reused = "(let ((co (make-coroutine (lambda (x) (+ x 1)))))
+                    (list (co/resume co 1) (co/status co) (eq? (co/reset co (lambda (x y) (co/yield (* x y)) 'end)) co) (co/status co) (co/resume co 3 4) (co/resume co) (co/status co)))";
+    assert_eq!(coroutine_case(reused), "(2 dead #t pending 12 end dead)");
+    // A suspended coroutine is closed first. One that never started only gets the new body. One that failed starts again.
+    assert_eq!(coroutine_case("(let ((co (winding))) (co/resume co) (co/reset co (lambda () 'new)) (list (reverse log) (co/status co) (co/resume co)))"), "((in1 in2 out2 out1) pending new)");
+    assert_eq!(coroutine_case("(let ((co (make-coroutine (lambda () (note 'old))))) (co/reset co (lambda () 'new)) (list (co/resume co) (reverse log)))"), "(new ())");
+    assert_eq!(coroutine_case("(let ((co (make-coroutine (lambda () (raise 'boom))))) (guard (e (#t e)) (co/resume co)) (co/reset co (lambda () 'again)) (list (co/status co) (co/resume co)))"), "(pending again)");
+    // The new body must be a procedure. A wrong one leaves the coroutine as it was.
+    assert_eq!(coroutine_case("(let ((co (make-coroutine (lambda () (co/yield 1) 2)))) (co/resume co) (list (guard (e (#t (error-object-kind e))) (co/reset co 5)) (co/status co) (co/resume co)))"), "(wrong-type pending 2)");
+    assert_eq!(coroutine_case("(co/reset (co/running) (lambda () 1))"), "(raised not-pending)");
+    assert_eq!(coroutine_case("(co/reset 5 (lambda () 1))"), "(raised wrong-type)");
+    // One coroutine serves many bodies in turn.
+    assert_eq!(coroutine_case("(let ((co (make-coroutine (lambda () 0)))) (let loop ((i 0) (sum 0)) (if (eqv? i 1000) sum (begin (co/reset co (lambda () i)) (loop (+ i 1) (+ sum (co/resume co)))))))"), "499500");
+}
+
+#[test]
+fn a_coroutine_resumed_with_an_error_raises_it_at_its_yield() {
+    // The coroutine catches the value where it yielded, and goes on.
+    let caught = "(let ((co (make-coroutine (lambda () (let ((got (guard (e (#t (list 'caught e))) (co/yield 'ready)))) (co/yield got) 'end)))))
+                    (list (co/resume co) (co/resume-error co 'bad) (co/resume co) (co/status co)))";
+    assert_eq!(coroutine_case(caught), "(ready (caught bad) end dead)");
+    // Nothing catches it: the `after` thunks run, the coroutine fails, and the value is raised at the call.
+    assert_eq!(coroutine_case("(let ((co (winding))) (co/resume co) (list (guard (e (#t (list 'raised e))) (co/resume-error co 'bad)) (co/status co) (reverse log)))"), "((raised bad) error (in1 in2 out2 out1))");
+    // A coroutine that has not started fails without running its body.
+    assert_eq!(coroutine_case("(let ((co (make-coroutine (lambda () (note 'ran))))) (list (guard (e (#t (list 'raised e))) (co/resume-error co 'bad)) (co/status co) (reverse log)))"), "((raised bad) error ())");
+    // An error object keeps its identity, and a handler in the coroutine sees it.
+    let handled = "(let* ((problem (guard (e (#t e)) (error \"bad input\" 7)))
+                          (co (make-coroutine (lambda () (with-exception-handler (lambda (e) (co/yield (eq? e problem)) 0) (lambda () (co/yield 'ready)))))))
+                     (list (co/resume co) (co/resume-error co problem)))";
+    assert_eq!(coroutine_case(handled), "(ready #t)");
+    // Only a pending coroutine can be resumed this way.
+    assert_eq!(coroutine_case("(let ((co (make-coroutine (lambda () 1)))) (co/resume co) (co/resume-error co 'bad))"), "(raised not-pending)");
+    assert_eq!(coroutine_case("(co/resume-error (co/running) 'bad)"), "(raised not-pending)");
+    assert_eq!(coroutine_case("(co/resume-error 5 'bad)"), "(raised wrong-type)");
+}
+
+/// Coroutines are made, suspended inside a `dynamic-wind` and closed, over and over. What a closed coroutine held must become free, or this does not fit in the arena.
+#[test]
+fn closed_coroutines_leave_nothing_behind() {
+    let mut arena = arena();
+    let text = "(let ((count 0))
+                  (define (one) (make-coroutine (lambda () (dynamic-wind (lambda () 0) (lambda () (co/yield (make-vector 64 0))) (lambda () (set! count (+ count 1)))))))
+                  (let loop ((i 0))
+                    (if (eqv? i 20000)
+                        count
+                        (let ((co (one))) (co/resume co) (co/close co) (loop (+ i 1))))))";
+    let mut machine = machine(&mut arena, text);
+    assert_eq!(run_to_outcome(&mut arena, &mut machine, false), "done 20000");
 }
 
 #[test]

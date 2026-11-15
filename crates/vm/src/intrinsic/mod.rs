@@ -632,7 +632,7 @@ named! {
         /// `(coroutine? x)`: returns `#t` if `x` is a coroutine object, and `#f` otherwise.
         IsCoroutine = ("coroutine?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `(coroutine-state co)`: returns an integer encoding the execution state of coroutine `co`
-        /// (0: pending, 1: running, 2: finished, 3: failed).
+        /// (0: pending, 1: running, 2: dead, 3: failed, 4: closing).
         CoroutineState = ("coroutine-state", takes(1, TRUTHY)),
         /// `(error-object? x)`: returns `#t` if `x` is an error condition object ([`Condition`]),
         /// whether created by `make-error` or VM faults, and `#f` otherwise.
@@ -1322,7 +1322,7 @@ fn fixnum<'gc>(integer: i64) -> Value<'gc> {
 
 /// Returns whether value `value` is callable as a procedure (a closure, a continuation, or a
 /// keyword procedure).
-fn is_procedure<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> bool {
+pub(crate) fn is_procedure<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> bool {
     value.downcast::<objects::Closure>(mc).is_some()
         || value.downcast::<objects::Continuation>(mc).is_some()
         || value.downcast::<objects::KeywordProcedure>(mc).is_some()
