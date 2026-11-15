@@ -800,7 +800,7 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         let fused = tail.is_some() || test.is_some();
         self.site(if fused { block.sites[count - 1] } else { block.end_site });
         match (tail, test, &block.end) {
-            (Some((prim, args)), _, _) => self.tail_prim(prim, args),
+            (Some((prim, args, spread)), _, _) => self.tail_prim(prim, args, spread),
             (None, Some((intrinsic, args)), End::Branch { then, other, .. }) => {
                 let branch_if = self.inverted[index];
                 let (target, fall) = if branch_if { (*then, *other) } else { (*other, *then) };
@@ -822,19 +822,34 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
 
     /// If `block` ends by returning the result of an intrinsic instruction, returns the intrinsic and its arguments
     /// so it can be emitted using a specialized tail-return opcode.
-    fn tail<'b>(&self, block: &'b l5::BlockData<'_, 'gc>) -> Option<(Prim, &'b [Val])> {
-        let (Some(Inst::Prim { dst, prim, args, spread: false }), End::Return(returned)) = (block.insts.last(), &block.end) else { return None };
-        let tail = matches!(prim, Prim::Intrinsic(_)) && self.imms[dst.0 as usize].is_none();
-        (tail && dst == returned && self.uses[dst.0 as usize] == 1).then_some((*prim, args.as_slice()))
+    fn tail<'b>(&self, block: &'b l5::BlockData<'_, 'gc>) -> Option<(Prim, &'b [Val], bool)> {
+        let (Some(Inst::Prim { dst, prim, args, spread }), End::Return(returned)) = (block.insts.last(), &block.end) else { return None };
+        // Only `values` returns a spread list of its own, because it returns the elements as values.
+        let tail = match prim {
+            Prim::Intrinsic(Intrinsic::Values) => true,
+            Prim::Intrinsic(_) => !spread && self.imms[dst.0 as usize].is_none(),
+            _ => false,
+        };
+        (tail && dst == returned && self.uses[dst.0 as usize] == 1).then_some((*prim, args.as_slice(), *spread))
     }
 
-    fn tail_prim(&mut self, prim: Prim, args: &[Val]) -> Result<(), CompileError> {
+    fn tail_prim(&mut self, prim: Prim, args: &[Val], spread: bool) -> Result<(), CompileError> {
         let count = args.len() as u8;
+        // `values` in tail position returns its arguments as values. One argument is an ordinary return.
+        if prim == Prim::Intrinsic(Intrinsic::Values) {
+            let op = match (self.stage(self.first, None, args, true), spread) {
+                (Some(base), false) => Op::ReturnValues { src: base, count },
+                (Some(base), true) => Op::ReturnSpread { base, args: count },
+                (None, _) => Op::ReturnSpread { base: self.spread(args, spread), args: 1 },
+            };
+            self.ops.push(op);
+            return Ok(());
+        }
         match (prim, self.stage(self.first, None, args, true)) {
             (Prim::Intrinsic(intrinsic), Some(base)) => self.ops.push(Op::TailCallIntrinsic { base, args: count, intrinsic }),
             (Prim::Intrinsic(intrinsic), None) => {
                 let base = self.list(args, None);
-                self.ops.extend([Op::ApplyIntrinsic { base, args: 1, intrinsic }, Op::LoadAcc { dst: SCRATCH }, Op::Return { src: SCRATCH }]);
+                self.ops.extend([Op::ApplyIntrinsic { base, args: 1, intrinsic }, Op::ReturnReceived]);
             }
             _ => unreachable!("only intrinsics return their own values"),
         }
@@ -998,7 +1013,20 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         let host = if let Prim::Host(def) = prim { Some(self.module.host(def)?) } else { None };
         let count = args.len() as u8;
         let staged = self.stage(base, None, args, matches!(prim, Prim::Intrinsic(_)));
+        // A `collect` is a call whose values are loaded as a list.
+        if let (Prim::Request(Request::Collect), false, Some(base)) = (prim, spread, staged) {
+            self.ops.push(Op::Call { base, args: count - 1 });
+            if self.used(dst) {
+                self.write(dst, |dst| Op::LoadValues { dst });
+            }
+            return Ok(());
+        }
         let op = match (prim, spread, staged) {
+            // The consumer is staged below the producer. The producer's frame starts above the consumer, so the consumer is still in place when the producer returns.
+            (Prim::Request(Request::Receive), false, Some(base)) => {
+                self.ops.push(Op::Call { base: base + 1, args: count - 2 });
+                Op::CallReceived { base }
+            }
             (Prim::Intrinsic(intrinsic), false, Some(base)) => Op::CallIntrinsic { base, args: count, intrinsic },
             (Prim::Intrinsic(intrinsic), true, Some(base)) => Op::ApplyIntrinsic { base, args: count, intrinsic },
             (Prim::Intrinsic(intrinsic), _, None) => Op::ApplyIntrinsic { base: self.spread(args, spread), args: 1, intrinsic },
@@ -1099,8 +1127,22 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
     fn end(&mut self, function: &Function<'_, 'gc>, end: &End<'_>, next: Option<usize>) -> Result<(), CompileError> {
         match end {
             End::Return(value) => {
-                let src = self.read(*value, 0);
-                self.ops.push(Op::Return { src });
+                // A value that this block just took from the accumulator is returned from there. What a call returned is then returned as it is, however many values it is.
+                let taken = match self.ops.last() {
+                    Some(&Op::LoadAcc { dst }) => self.ops.len() > self.fence && self.loc(*value) == Loc::Reg(dst),
+                    _ => false,
+                };
+                if taken {
+                    self.ops.pop();
+                    // The return takes the place of the load, so nothing is emitted at the position the end of the block was recorded for.
+                    if self.sited.last().is_some_and(|&(at, _)| at > self.ops.len()) {
+                        self.sited.pop();
+                    }
+                    self.ops.push(Op::ReturnReceived);
+                } else {
+                    let src = self.read(*value, 0);
+                    self.ops.push(Op::Return { src });
+                }
             }
             End::Jump(to, args) => {
                 let params = &function.blocks[to.0 as usize].params;
@@ -1130,11 +1172,9 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
                 match (self.stage(self.first, None, args, false), spread) {
                     // A guard continuation retains its caller frame; invoking it from that frame allows the VM
                     // to reuse the existing handler in place without creating a new prompt.
-                    (Some(base), false) if matches!(request, Request::Guard | Request::GuardQuiet) => self.ops.extend([
-                        Op::CallRequest { base, args: count, request },
-                        Op::LoadAcc { dst: SCRATCH },
-                        Op::Return { src: SCRATCH },
-                    ]),
+                    (Some(base), false) if matches!(request, Request::Guard | Request::GuardQuiet) => self.ops.extend([Op::CallRequest { base, args: count, request }, Op::ReturnReceived]),
+                    (Some(base), false) if request == Request::Collect => self.ops.extend([Op::Call { base, args: count - 1 }, Op::LoadValues { dst: SCRATCH }, Op::Return { src: SCRATCH }]),
+                    (Some(base), false) if request == Request::Receive => self.ops.extend([Op::Call { base: base + 1, args: count - 2 }, Op::TailCallReceived { base }]),
                     (Some(base), false) => self.ops.push(Op::TailCallRequest { base, args: count, request }),
                     (Some(base), true) => self.ops.push(Op::TailApplyRequest { base, args: count, request }),
                     (None, _) => {

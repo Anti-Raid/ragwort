@@ -15,10 +15,9 @@ use ragwort_types::pair::{Pair, Pairs};
 use ragwort_types::string::{self, Strings};
 
 use crate::Fault;
-use crate::intrinsic::values;
-use crate::args::Args;
+use crate::passed::Passed;
 use crate::machine::{Outer, Then, condition};
-use crate::objects::{Bytecode, Continuation, ContinuationFields, Guard, GuardFields, MultiValue, Native, NativeFields, Prompt, PromptFields, TaskFields, WinderFields};
+use crate::objects::{Bytecode, Continuation, ContinuationFields, Guard, GuardFields, Native, NativeFields, PromptFields, TaskFields, WinderFields};
 use crate::prompts::{self, Wind, default_tag, handler_key};
 use crate::segments::{Cut, cut_at};
 
@@ -46,10 +45,14 @@ pub(crate) enum Kind {
     Uncaught,
     /// Value `b` was raised within [`Guard`] `a`; unwinds the stack to where the guard was established.
     Catch,
+    /// The producer of a `receive` request returned. Calls consumer `a` with the values it returned.
+    Receive,
+    /// The producer of a `collect` request returned. Returns the list of the values it returned.
+    Collect,
 }
 
 impl Kind {
-    const ALL: [Kind; 8] = [
+    const ALL: [Kind; 10] = [
         Kind::Handled,
         Kind::Guarded,
         Kind::Winds,
@@ -58,6 +61,8 @@ impl Kind {
         Kind::Compose,
         Kind::Uncaught,
         Kind::Catch,
+        Kind::Receive,
+        Kind::Collect,
     ];
 
     fn of(index: u32) -> Result<Kind, Fault> {
@@ -88,23 +93,19 @@ impl<'gc> Outer<'_, 'gc> {
                 let message = string::from_str(&Strings::new(mc), "exception handler returned")?.value();
                 Then::Raise(condition(mc, Fault::Error, message, Pairs::new(mc).cons(first, Value::NIL)?.value(mc))?, false)
             }
-            Kind::Guarded if second == Value::FALSE => Then::Return(self.regs.acc),
-            Kind::Guarded => {
-                let acc = self.regs.acc;
-                let all = if acc.downcast::<MultiValue>(mc).is_some() { Args::before(Value::TRUE, acc) } else { Args::two(Value::TRUE, acc) };
-                Then::Return(all.values(mc)?)
-            }
+            Kind::Guarded if second == Value::FALSE => Then::Forward,
+            Kind::Guarded => Then::ReturnValues(Pairs::new(mc).cons(Value::TRUE, self.regs.list(mc)?)?.value(mc)),
             Kind::Winds => match Pair::of(first) {
                 Some(cell) => {
                     let wind = Pair::of(cell.head(mc)).ok_or(Fault::Malformed)?;
                     self.push(Kind::Winds, cell.tail(mc), second)?;
                     task.set_winders(mc, wind.tail(mc));
-                    Then::Call(wind.head(mc), Args::none())
+                    Then::Call(wind.head(mc), Passed::none())
                 }
                 None => self.native(second.downcast::<Native>(mc).ok_or(Fault::Malformed)?)?,
             },
-            Kind::Abort => self.abort_now(first, Args::list(second))?,
-            Kind::Escape | Kind::Compose => self.go_now(first, kind == Kind::Escape, Args::list(second))?,
+            Kind::Abort => self.abort_now(first, Passed::list(second))?,
+            Kind::Escape | Kind::Compose => self.go_now(first, kind == Kind::Escape, Passed::list(second))?,
             Kind::Uncaught => Then::Uncaught(first, true),
             Kind::Catch => {
                 let guard = first.downcast::<Guard>(mc).ok_or(Fault::Malformed)?;
@@ -118,14 +119,17 @@ impl<'gc> Outer<'_, 'gc> {
                     return Err(Fault::Malformed);
                 }
                 task.set_prompts(mc, under);
-                task.set_chain(mc, chain);
-                task.set_attachments(mc, marks);
-                task.set_winders(mc, guard.winders(mc));
+                prompts::install(mc, task, chain, marks, guard.winders(mc));
                 match guard.handler(mc) {
-                    Value::FALSE => Then::Return(values(mc, [Value::FALSE, second].into_iter())?),
-                    handler => Then::Call(handler, Args::one(second)),
+                    Value::FALSE => Then::ReturnValues(Pairs::new(mc).list(&[Value::FALSE, second])?),
+                    handler => Then::Call(handler, self.pass(&[second])?),
                 }
             }
+            Kind::Receive => {
+                let received = if self.regs.acc == Value::VALUES { Passed::list(self.regs.values) } else { self.pass(&[self.regs.acc])? };
+                Then::Call(first, received)
+            }
+            Kind::Collect => Then::Return(self.regs.list(mc)?),
         })
     }
 
@@ -162,7 +166,7 @@ impl<'gc> Outer<'_, 'gc> {
         if !continuable {
             self.push(Kind::Handled, obj, Value::VOID)?;
         }
-        Ok(Then::Call(handler, Args::one(obj)))
+        Ok(Then::Call(handler, self.pass(&[obj])?))
     }
 
     /// Executes all remaining `after` winders for an unhandled exception `obj`, then transitions to
@@ -179,7 +183,7 @@ impl<'gc> Outer<'_, 'gc> {
         let (mc, task) = (self.mc(), self.task());
         let handlers = prompts::mark(mc, task, handler_key(), Value::NIL)?;
         self.segments.set_mark(handler_key(), Pairs::new(mc).cons(handler, handlers)?.value(mc))?;
-        Ok(Then::Call(thunk, Args::none()))
+        Ok(Then::Call(thunk, Passed::none()))
     }
 
     /// Pushes a new [`Guard`] record wrapping `handler` onto the chain (flagged as `co/try-resume` if
@@ -201,40 +205,50 @@ impl<'gc> Outer<'_, 'gc> {
         if let Some(cut) = cut_at(mc, task.chain(mc), guard)? {
             return Ok((0, cut, task.prompts(mc)));
         }
-        let (mut part, mut at) = (1, task.prompts(mc));
-        while let Some(cell) = Pair::of(at) {
-            let prompt = cell.head(mc).downcast::<Prompt>(mc).ok_or(Fault::Malformed)?;
+        for (part, entry) in prompts::each(mc, task.prompts(mc)).enumerate() {
+            let (prompt, under) = entry?;
             if let Some(cut) = cut_at(mc, prompt.chain(mc), guard)? {
-                return Ok((part, cut, cell.tail(mc)));
+                return Ok((part + 1, cut, under));
             }
-            (part, at) = (part + 1, cell.tail(mc));
         }
         Err(Fault::Malformed)
     }
 
     /// Aborts to the nearest prompt matching `tag` with `args`, after unwinding all `after` winders up to
     /// that prompt.
-    pub(crate) fn abort(&mut self, tag: Value<'gc>, args: Args<'gc>) -> Result<Then<'gc>, Fault> {
+    ///
+    /// `base` and `tail` say where the abort was requested, as [`Outer::keep`] takes them. An abort
+    /// discards the frames up to the prompt, so the caller's frames are not saved first. They are
+    /// saved in two cases: when a winder has to run, because it runs on top of them, and when the
+    /// abort fails, so that the error's trace includes the caller.
+    pub(crate) fn abort(&mut self, tag: Value<'gc>, args: Passed<'gc>, base: u8, tail: bool) -> Result<Then<'gc>, Fault> {
         let mc = self.mc();
-        let todo = winds_todo(mc, &prompts::winds(mc, self.task(), Some(tag))?, &[])?;
-        if todo == Value::NIL {
-            return self.abort_now(tag, args);
+        let winds = prompts::tag_of(mc, tag).and_then(|tag| prompts::winds(mc, self.task(), Some(tag)));
+        match winds.and_then(|winds| winds_todo(mc, &winds, &[])) {
+            Ok(Value::NIL) => self.abort_now(tag, args),
+            Ok(todo) => {
+                self.keep(base, tail)?;
+                self.unwind(todo, Kind::Abort, tag, args.to_list(mc)?)
+            }
+            Err(fault) => {
+                self.keep(base, tail)?;
+                Err(fault)
+            }
         }
-        self.unwind(todo, Kind::Abort, tag, args.to_list(mc)?)
     }
 
-    fn abort_now(&mut self, tag: Value<'gc>, args: Args<'gc>) -> Result<Then<'gc>, Fault> {
+    fn abort_now(&mut self, tag: Value<'gc>, args: Passed<'gc>) -> Result<Then<'gc>, Fault> {
         let mc = self.mc();
         Ok(match prompts::abort(mc, self.task(), tag)? {
             Some(handler) => Then::Call(handler, args),
-            None => Then::Call(args.get(mc, 0)?, args.tail(mc, 1)?),
+            None => Then::Call(args.get(mc, 0)?, args.skip(mc, 1)?),
         })
     }
 
     /// Reinstates continuation `continuation` with `args` after executing necessary `before` and `after` winders:
     /// escape continuations unwind winders exited up to the common ancestor and rewind newly entered
     /// winders, while composable continuations rewind all of their own winders.
-    pub(crate) fn go_to(&mut self, continuation: Gc<'gc, Continuation>, args: Args<'gc>) -> Result<Then<'gc>, Fault> {
+    pub(crate) fn go_to(&mut self, continuation: Gc<'gc, Continuation>, args: Passed<'gc>) -> Result<Then<'gc>, Fault> {
         let mc = self.mc();
         let to = prompts::winds_of(mc, continuation)?;
         let (todo, kind) = if continuation.escape(mc) {
@@ -252,13 +266,13 @@ impl<'gc> Outer<'_, 'gc> {
 
     /// Directly resumes continuation `continuation` with `args`, dispatching as either an escape continuation or a
     /// composable continuation.
-    fn go_now(&mut self, continuation: Value<'gc>, escape: bool, args: Args<'gc>) -> Result<Then<'gc>, Fault> {
+    fn go_now(&mut self, continuation: Value<'gc>, escape: bool, args: Passed<'gc>) -> Result<Then<'gc>, Fault> {
         let (mc, task) = (self.mc(), self.task());
         if escape {
             prompts::clear_to_default(mc, task)?;
         }
         prompts::compose(mc, task, continuation.downcast::<Continuation>(mc).ok_or(Fault::Malformed)?)?;
-        Ok(Then::Return(args.values(mc)?))
+        args.returned(mc)
     }
 }
 

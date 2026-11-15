@@ -132,11 +132,14 @@
 
 (%define apply (%lambda (f . args) (%apply-intrinsic apply f args)))
 (%define keyword-apply (%lambda (f kws vals . args) (%apply-intrinsic keyword-apply f kws vals args)))
-(%define procedure-keywords (%lambda (f) (%intrinsic procedure-keywords f)))
+(%define procedure-keywords
+  (%lambda (f)
+    (%let ((both (%intrinsic procedure-keywords f)))
+      (%intrinsic values (%intrinsic car both) (%intrinsic cdr both)))))
 (%define values (%lambda xs (%apply-intrinsic values xs)))
 (%define call-with-values
   (%lambda (producer consumer)
-    (%intrinsic apply-values consumer (%app producer))))
+    (%intrinsic receive consumer producer)))
 
 (%define default-continuation-prompt-tag (%lambda () (%intrinsic default-continuation-prompt-tag)))
 (%define make-continuation-prompt-tag (%lambda args (%apply-intrinsic make-continuation-prompt-tag args)))
@@ -172,10 +175,10 @@
     (%let* ((_ (%app before))
             (outside (%intrinsic winders))
             (_ (%intrinsic set-winders! (%intrinsic cons (%intrinsic make-winder before after) outside)))
-            (result (%app thunk))
+            (results (%intrinsic collect thunk))
             (_ (%intrinsic set-winders! outside)))
       (%app after)
-      result)))
+      (%apply-intrinsic values results))))
 (%define abort-current-continuation (%lambda (tag . args) (%apply-intrinsic abort tag args)))
 (%define call/cc (%lambda (f) (%intrinsic call/cc f)))
 (%define call-with-current-continuation (%lambda (f) (%intrinsic call/cc f)))

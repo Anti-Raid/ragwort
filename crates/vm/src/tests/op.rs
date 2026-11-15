@@ -5,7 +5,7 @@ use ragwort_types::constant::Constants;
 use ragwort_types::vector::Vectors;
 
 use super::*;
-use crate::objects::{BoxFields, MultiValueFields};
+use crate::objects::BoxFields;
 use crate::op::Fuel;
 
 fn fix<'gc>(n: i64) -> Value<'gc> {
@@ -27,7 +27,7 @@ fn steps_run_against_the_frame() {
         let vectors = Vectors::new(mc);
         let constants = Constants::of(vectors.immutable_from_slice(&[fix(7)]).unwrap().value(mc)).unwrap();
         let upvalues = vectors.from_slice(&[Value::TRUE]).unwrap().items(mc);
-        let mut cx = Context { mc, task: crate::coroutine::root(mc).unwrap(), frame, constants, upvalues, acc: Value::VOID, fuel: Fuel { run: u64::MAX, rest: 0 } };
+        let mut cx = Context { mc, task: crate::coroutine::root(mc).unwrap(), frame, constants, upvalues, acc: Value::VOID, values: Value::NIL, fuel: Fuel { run: u64::MAX, rest: 0 } };
 
         assert_eq!(step(Op::LoadConst { dst: 0, index: 0 }, &mut cx), Ok(Control::Next));
         assert_eq!(step(Op::Move { dst: 1, src: 0 }, &mut cx), Ok(Control::Next));
@@ -103,7 +103,7 @@ fn malformed_bytecode_faults() {
         let vectors = Vectors::new(mc);
         let constants = Constants::of(vectors.immutable_from_slice(&[]).unwrap().value(mc)).unwrap();
         let upvalues = vectors.from_slice(&[]).unwrap().items(mc);
-        let mut cx = Context { mc, task: crate::coroutine::root(mc).unwrap(), frame, constants, upvalues, acc: Value::VOID, fuel: Fuel { run: u64::MAX, rest: 0 } };
+        let mut cx = Context { mc, task: crate::coroutine::root(mc).unwrap(), frame, constants, upvalues, acc: Value::VOID, values: Value::NIL, fuel: Fuel { run: u64::MAX, rest: 0 } };
         frame.set(0, fix(1));
         let requests = [
             Op::CallRequest { base: 1, args: 1, request: Request::WithMark },
@@ -143,7 +143,7 @@ fn closures_capture_registers_upvalues_and_each_other() {
         let stray = code(mc, &[Capture::Upvalue(9)]);
         let constants = Constants::of(vectors.immutable_from_slice(&[fix(7), even, odd, stray]).unwrap().value(mc)).unwrap();
         let upvalues = vectors.from_slice(&[fix(11)]).unwrap().items(mc);
-        let mut cx = Context { mc, task: crate::coroutine::root(mc).unwrap(), frame, constants, upvalues, acc: Value::VOID, fuel: Fuel { run: u64::MAX, rest: 0 } };
+        let mut cx = Context { mc, task: crate::coroutine::root(mc).unwrap(), frame, constants, upvalues, acc: Value::VOID, values: Value::NIL, fuel: Fuel { run: u64::MAX, rest: 0 } };
 
         frame.set(0, fix(5));
         assert_eq!(step(Op::NewClosure { dst: 1, count: 2, code: 1 }, &mut cx), Ok(Control::Next));
@@ -174,7 +174,7 @@ fn with_frame(f: impl for<'s, 'gc> FnOnce(&mut Context<'s, 'gc>)) {
         let vectors = Vectors::new(mc);
         let constants = Constants::of(vectors.immutable_from_slice(&[]).unwrap().value(mc)).unwrap();
         let upvalues = vectors.from_slice(&[]).unwrap().items(mc);
-        f(&mut Context { mc, task: crate::coroutine::root(mc).unwrap(), frame, constants, upvalues, acc: Value::VOID, fuel: Fuel { run: u64::MAX, rest: 0 } });
+        f(&mut Context { mc, task: crate::coroutine::root(mc).unwrap(), frame, constants, upvalues, acc: Value::VOID, values: Value::NIL, fuel: Fuel { run: u64::MAX, rest: 0 } });
     });
 }
 
@@ -360,33 +360,39 @@ fn equality_goes_as_deep_as_it_should() {
 }
 
 #[test]
-fn values_are_an_object() {
+fn a_load_takes_exactly_one_value() {
     with_frame(|cx| {
         let (mc, frame) = (cx.mc, cx.frame);
-        let call = |cx: &mut Context<'_, '_>, base, args, intrinsic| Op::CallIntrinsic { base, args, intrinsic }.step(cx);
+        // Each instruction goes through `step`, so the test holds one copy of the inlined instruction loop.
+        let step = |cx: &mut Context<'_, '_>, op: Op| op.step(cx);
+        let call = |cx: &mut Context<'_, '_>, base, args, intrinsic| step(cx, Op::CallIntrinsic { base, args, intrinsic });
         (0..3).for_each(|i| frame.set(20 + i, fix(i64::from(i) + 10)));
-        call(cx, 20, 3, Intrinsic::Values).unwrap();
-        frame.set(30, cx.acc);
-        call(cx, 30, 1, Intrinsic::IsValues).unwrap();
-        assert_eq!(cx.acc, Value::TRUE);
-        call(cx, 30, 1, Intrinsic::ValuesLength).unwrap();
-        assert_eq!(cx.acc, fix(3));
-        frame.set(31, fix(2));
-        call(cx, 30, 2, Intrinsic::ValuesRef).unwrap();
-        assert_eq!(cx.acc, fix(12));
-        frame.set(31, fix(3));
-        assert_eq!(call(cx, 30, 2, Intrinsic::ValuesRef), Err(Fault::OutOfRange));
-        frame.set(31, Value::NIL);
-        assert_eq!(call(cx, 30, 2, Intrinsic::ValuesRef), Err(Fault::WrongType));
-
-        // Calling `values` with a single argument produces the scalar value itself, whereas zero arguments returns an empty multiple-values object.
+        // `values` of one argument is that argument, which a load takes. An intrinsic returns no other number of values.
         call(cx, 20, 1, Intrinsic::Values).unwrap();
         assert_eq!(cx.acc, fix(10));
-        call(cx, 20, 1, Intrinsic::IsValues).unwrap();
-        assert_eq!(cx.acc, Value::FALSE);
-        assert_eq!(call(cx, 20, 1, Intrinsic::ValuesLength), Err(Fault::WrongType));
-        call(cx, 20, 0, Intrinsic::Values).unwrap();
-        assert_eq!(cx.acc.downcast::<objects::MultiValue>(mc).map(|v| v.items(mc).len()), Some(0));
+        step(cx, Op::LoadAcc { dst: 30 }).unwrap();
+        assert_eq!(frame.get(30), fix(10));
+        assert_eq!(call(cx, 20, 3, Intrinsic::Values), Err(Fault::ValueCount));
+        assert_eq!(call(cx, 20, 0, Intrinsic::Values), Err(Fault::ValueCount));
+        // A return of several values, or of none, leaves the marker and the list of them. A load takes neither.
+        assert_eq!(step(cx, Op::ReturnValues { src: 20, count: 3 }), Ok(Control::Return));
+        assert_eq!((cx.acc, Pairs::new(mc).elements(cx.values).collect::<Vec<_>>()), (Value::VALUES, vec![fix(10), fix(11), fix(12)]));
+        assert_eq!(step(cx, Op::LoadAcc { dst: 30 }), Err(Fault::ValueCount));
+        assert_eq!(step(cx, Op::ReturnValues { src: 20, count: 0 }), Ok(Control::Return));
+        assert_eq!((cx.acc, cx.values), (Value::VALUES, Value::NIL));
+        assert_eq!(step(cx, Op::LoadAcc { dst: 30 }), Err(Fault::ValueCount));
+        assert_eq!(frame.get(30), fix(10));
+        // A return of one value, spread or not, is an ordinary value.
+        assert_eq!(step(cx, Op::ReturnValues { src: 21, count: 1 }), Ok(Control::Return));
+        assert_eq!(cx.acc, fix(11));
+        frame.set(23, Pairs::new(mc).list(&[fix(7)]).unwrap());
+        assert_eq!(step(cx, Op::ReturnSpread { base: 23, args: 1 }), Ok(Control::Return));
+        assert_eq!(cx.acc, fix(7));
+        // A spread return puts the registers before the elements of the list, which must be a proper list.
+        assert_eq!(step(cx, Op::ReturnSpread { base: 22, args: 2 }), Ok(Control::Return));
+        assert_eq!((cx.acc, Pairs::new(mc).elements(cx.values).collect::<Vec<_>>()), (Value::VALUES, vec![fix(12), fix(7)]));
+        frame.set(23, fix(5));
+        assert_eq!(step(cx, Op::ReturnSpread { base: 22, args: 2 }), Err(Fault::WrongType));
     });
 }
 

@@ -11,8 +11,9 @@ use ragwort_types::pair::{Pair, Pairs};
 use crate::frame::{self, ARGS, CLOSURE, Kept, Link, MAX_PARAMS, SAVED_MARKS, Shape};
 use crate::op::Fuel;
 use crate::module::{Deferred, HostArgs, HostContext, HostDef, Reply};
-use crate::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Guard, ModuleFields, MultiValue, MultiValueFields, Task, TaskFields};
+use crate::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Guard, KeywordProcedure, KeywordProcedureFields, ModuleFields, Task, TaskFields};
 use crate::prompts::{self, handler_key};
+use crate::segments;
 use crate::{Context, Control, Fault, Op, Request};
 
 /// The maximum number of arguments a call can pass directly in registers; arguments and the
@@ -25,9 +26,43 @@ pub(crate) struct Regs<'gc> {
     pub(crate) fp: usize,
     pub(crate) pc: usize,
     pub(crate) acc: Value<'gc>,
+    /// The list of values a call returned, when `acc` is [`Value::VALUES`]. It is not meaningful otherwise.
+    pub(crate) values: Value<'gc>,
     /// The bytecode the inner loop was executing when it last exited, used to find the instruction that raised a fault.
     pub(crate) code: Option<Gc<'gc, Bytecode>>,
 }
+
+impl<'gc> Regs<'gc> {
+    /// Puts the values in the proper list `list` into the accumulator. A list of one element puts that element there as one value.
+    pub(crate) fn set_values(&mut self, mc: &Mutation<'gc>, list: Value<'gc>) {
+        match Pair::of(list) {
+            Some(cell) if cell.tail(mc) == Value::NIL => self.acc = cell.head(mc),
+            _ => (self.acc, self.values) = (Value::VALUES, list),
+        }
+    }
+
+    /// Returns the values in the accumulator as a list.
+    pub(crate) fn list(&self, mc: &Mutation<'gc>) -> Result<Value<'gc>, Fault> {
+        if self.acc == Value::VALUES {
+            return Ok(self.values);
+        }
+        Ok(Pairs::new(mc).cons(self.acc, Value::NIL)?.value(mc))
+    }
+
+    /// Returns the first value in the accumulator, or void if it holds none.
+    pub(crate) fn first(&self, mc: &Mutation<'gc>) -> Value<'gc> {
+        if self.acc != Value::VALUES {
+            return self.acc;
+        }
+        Pair::of(self.values).map_or(Value::VOID, |cell| cell.head(mc))
+    }
+}
+
+/// The most leading arguments of a first-class `apply` for it to be laid out as a call inside the inner loop.
+const LEADING: usize = 4;
+
+/// The most keywords a procedure can accept for a `keyword-apply` to be laid out as a call inside the inner loop.
+const KEYWORDS: usize = 8;
 
 /// The reason the inner execution loop suspended or exited.
 pub(crate) enum Exit<'gc> {
@@ -74,7 +109,7 @@ pub(crate) fn exec<'s, 'gc>(mc: &'s Mutation<'gc>, stack: &'s Stack, task: Gc<'g
         Err(fault) => return Exit::Fault(fault),
     };
     let Err(exit) = run.go();
-    (regs.fp, regs.pc, regs.acc, *fuel) = (run.fp, run.pc, run.cx.acc, run.cx.fuel);
+    (regs.fp, regs.pc, regs.acc, regs.values, *fuel) = (run.fp, run.pc, run.cx.acc, run.cx.values, run.cx.fuel);
     regs.code = Some(run.code);
     exit
 }
@@ -121,7 +156,7 @@ impl<'s, 'gc> Run<'s, 'gc> {
         let code = closure.code(mc).ok_or(Fault::Malformed)?;
         let (ops, constants, link) = load(mc, code)?;
         Ok(Run {
-            cx: Context { mc, task, frame, constants, upvalues: closure.items(mc), acc: regs.acc, fuel },
+            cx: Context { mc, task, frame, constants, upvalues: closure.items(mc), acc: regs.acc, values: regs.values, fuel },
             stack,
             code,
             ops,
@@ -159,6 +194,10 @@ impl<'s, 'gc> Run<'s, 'gc> {
                 Control::TailCall { base, args } => {
                     self.charge()?;
                     self.tail_call(Call::new(base, args))?;
+                }
+                Control::CallReceived { base, tail } => {
+                    self.charge()?;
+                    self.received(base, tail)?;
                 }
                 Control::CallRequest { base, args, request, spread } => {
                     self.charge()?;
@@ -219,12 +258,38 @@ impl<'s, 'gc> Run<'s, 'gc> {
         self.enter(frame, self.fp, closure, call, link)
     }
 
-    /// Resolves the target closure of `call`; any non-closure target exits to the outer loop for
-    /// invocation.
+    /// Resolves the target closure of `call`. A keyword procedure called without keywords resolves
+    /// to its plain closure. Any other non-closure target exits to the outer loop for invocation.
     #[inline(always)]
     fn closure(&self, call: Call<'gc>, tail: bool) -> Result<Gc<'gc, Closure>, Exit<'gc>> {
+        match self.cx.frame.get(call.base).downcast::<Closure>(self.cx.mc) {
+            Some(closure) => Ok(closure),
+            None => self.plain(call, tail),
+        }
+    }
+
+    /// Resolves a `call` whose target is a keyword procedure to the procedure's plain closure. The
+    /// plain closure replaces the keyword procedure in the frame, because a frame's closure register
+    /// must hold the closure that runs in it.
+    ///
+    /// Two calls exit to the outer loop instead, which raises the error and names the keyword
+    /// procedure in it. One is a call to a procedure with a required keyword, which has no plain
+    /// closure. The other is a call with a number of arguments the plain closure does not take.
+    #[inline(never)]
+    fn plain(&self, call: Call<'gc>, tail: bool) -> Result<Gc<'gc, Closure>, Exit<'gc>> {
+        let (mc, frame) = (self.cx.mc, self.cx.frame);
         let (base, argc, rest) = (call.base, call.argc, call.rest);
-        self.cx.frame.get(base).downcast::<Closure>(self.cx.mc).ok_or(Exit::Call { base, argc, rest, tail })
+        let exit = Exit::Call { base, argc, rest, tail };
+        let Some(keyed) = frame.get(base).downcast::<KeywordProcedure>(mc) else { return Err(exit) };
+        let plain = keyed.plain(mc);
+        let Some(closure) = plain.downcast::<Closure>(mc) else { return Err(exit) };
+        let given = Pairs::new(mc).list_len(rest).map(|listed| listed + u64::from(argc));
+        let takes = closure.code(mc).zip(given).is_some_and(|(code, given)| Shape::of(code.arity(mc)).takes(given));
+        if !takes {
+            return Err(exit);
+        }
+        frame.set(base, plain);
+        Ok(closure)
     }
 
     /// Binds arguments for `closure` in `frame` at `fp`, records its return `link`, and begins executing
@@ -314,36 +379,170 @@ impl<'s, 'gc> Run<'s, 'gc> {
         }
     }
 
-    /// Optimizes `apply` and `apply-values` directly into calls by spreading the final list or
-    /// [`MultiValue`]. Non-tail invocations of `with-mark`, `with-exception-handler`, or `guard` set
+    /// Optimizes `apply` directly into a call by spreading the final list. Non-tail invocations of `with-mark`, `with-exception-handler`, or `guard` set
     /// continuation marks in the callee's frame window (preserving previous marks beneath it for return
     /// restoration). All other requests exit to the outer loop.
-    #[inline(always)]
+    ///
+    /// Kept out of line. Inlined into the instruction loop, it made every plain call measurably slower.
+    #[inline(never)]
     fn request(&mut self, base: u8, args: u8, request: Request, spread: bool, tail: bool) -> Result<(), Exit<'gc>> {
         let frame = self.cx.frame;
         let call = match request {
             // An unspread `(apply f x ... list)` call is already laid out as a call frame starting at `base`, with
             // the trailing list ready to spread.
-            Request::Apply if !spread => {
-                let rest = frame.get(base + args - 1);
-                if rest.downcast::<MultiValue>(self.cx.mc).is_some() {
-                    return Err(Fault::WrongType.into());
-                }
-                Call { base, argc: args - 2, rest }
-            }
-            Request::ApplyValues if !spread => {
-                let value = frame.get(base + 1);
-                if value.downcast::<MultiValue>(self.cx.mc).is_some() {
-                    Call { base, argc: 0, rest: value }
-                } else {
-                    Call { base, argc: 1, rest: Value::NIL }
-                }
-            }
+            Request::Apply if !spread => Call { base, argc: args - 2, rest: frame.get(base + args - 1) },
+            // The first-class `apply` procedure passes `f` and the list of its other arguments. In `(apply f list)`
+            // that list holds only `list`, so the call is `f` with `list` spread. Leading arguments are put in
+            // front of it. A last argument that is not a proper list exits to the outer loop.
+            Request::Apply if spread && args == 2 => match self.applied(frame.get(base + 1))? {
+                Some(rest) => Call { base, argc: 0, rest },
+                None => return Err(Exit::Request { base, args, request, spread, tail }),
+            },
+            Request::KeywordApply if !spread => match self.keyword_call(base, args) {
+                Some(call) => call,
+                None => return Err(Exit::Request { base, args, request, spread, tail }),
+            },
             Request::WithMark if !spread && !tail && args >= 3 => return self.marked_call(base, args, request),
+            Request::WithMark | Request::WithHandler if !spread && tail => match self.tail_mark(base, args, request)? {
+                Some(call) => call,
+                None => return Err(Exit::Request { base, args, request, spread, tail }),
+            },
             Request::WithHandler | Request::Guard | Request::GuardQuiet if !spread && !tail && args == 2 => return self.marked_call(base, args, request),
             _ => return Err(Exit::Request { base, args, request, spread, tail }),
         };
         if tail { self.tail_call(call) } else { self.call(call, false) }
+    }
+
+    /// Calls the procedure in register `base` with the values in the accumulator, which the last call
+    /// returned. One value is moved into the argument register. A list of values is the call's rest
+    /// list, which binding spreads.
+    #[inline(never)]
+    fn received(&mut self, base: u8, tail: bool) -> Result<(), Exit<'gc>> {
+        let acc = self.cx.acc;
+        let call = if acc == Value::VALUES {
+            Call { base, argc: 0, rest: std::mem::replace(&mut self.cx.values, Value::NIL) }
+        } else {
+            let call = Call { base, argc: 1, rest: Value::NIL };
+            fits(call)?;
+            self.cx.frame.set(base + ARGS, acc);
+            call
+        };
+        if tail { self.tail_call(call) } else { self.call(call, false) }
+    }
+
+    /// Sets the mark of a `with-mark` or `with-exception-handler` in tail position on the current frame, and returns the call to make in its place.
+    ///
+    /// The frame must be able to hold marks of its own: either it is the bottom frame, whose caller's marks are those of the chain, or its link has `marks` set, so its caller's marks are saved below it. Returns `None` for any other frame. The outer loop then saves the caller's frames, which makes this frame the bottom one.
+    #[inline(never)]
+    fn tail_mark(&mut self, base: u8, args: u8, request: Request) -> Result<Option<Call<'gc>>, Fault> {
+        let (mc, frame, task) = (self.cx.mc, self.cx.frame, self.cx.task);
+        let link = Link::of(frame.get(self.link)).ok_or(Fault::Malformed)?;
+        let under = if link.is_bottom() {
+            segments::restored(mc, task.chain(mc))
+        } else if link.marks {
+            let caller = self.fp.checked_sub(usize::from(link.base)).and_then(|caller| self.stack.frame(mc, caller)).ok_or(Fault::Malformed)?;
+            caller.get(Kept::under(usize::from(link.base), 0)?.marks as u8)
+        } else {
+            return Ok(None);
+        };
+        let (key, value, call) = match request {
+            Request::WithMark => (frame.get(base), frame.get(base + 1), Call { base: base + 2, argc: args - 3, rest: Value::NIL }),
+            _ => {
+                let handlers = prompts::mark(mc, task, handler_key(), Value::NIL)?;
+                let handlers = Pairs::new(mc).cons(frame.get(base), handlers)?.value(mc);
+                (handler_key(), handlers, Call { base: base + 1, argc: 0, rest: Value::NIL })
+            }
+        };
+        task.set_attachments(mc, segments::marked(mc, task.attachments(mc), under, key, value)?);
+        if mc.step_due() {
+            self.cx.fuel.pause();
+        }
+        Ok(Some(call))
+    }
+
+    /// Lays out a `keyword-apply` in registers `base..base + args` as a call to the core of its keyword procedure, and returns that call.
+    ///
+    /// The core takes one argument for each keyword the procedure accepts, in the procedure's order, and then the positional arguments. An accepted keyword that the call does not give is passed as [`Value::UNSUPPLIED`].
+    ///
+    /// Returns `None`, with the registers untouched, for a call this does not handle: a procedure that takes no keywords, a keyword the procedure does not accept, a required keyword that is missing, keywords out of order, or more keywords than [`KEYWORDS`]. The outer loop then runs the request and reports any error.
+    #[inline(never)]
+    fn keyword_call(&mut self, base: u8, args: u8) -> Option<Call<'gc>> {
+        let (mc, frame) = (self.cx.mc, self.cx.frame);
+        let callee = frame.get(base).downcast::<KeywordProcedure>(mc)?;
+        let core = callee.core(mc);
+        core.downcast::<Closure>(mc)?;
+        let pairs = Pairs::new(mc);
+        let (mut given, mut values) = (frame.get(base + 1), frame.get(base + 2));
+        let mut passed = [Value::UNSUPPLIED; KEYWORDS];
+        let mut count = 0;
+        for accepted in pairs.elements(callee.keywords(mc)) {
+            if count == KEYWORDS {
+                return None;
+            }
+            match (Pair::of(given), Pair::of(values)) {
+                (Some(keyword), Some(value)) if keyword.head(mc) == accepted => {
+                    passed[count] = value.head(mc);
+                    (given, values) = (keyword.tail(mc), value.tail(mc));
+                }
+                _ if pairs.elements(callee.required(mc)).any(|required| required == accepted) => return None,
+                _ => {}
+            }
+            count += 1;
+        }
+        // Keywords that are left over are unknown to the procedure or out of order.
+        if given != Value::NIL || values != Value::NIL {
+            return None;
+        }
+        // The positional arguments are in the registers after the three operands, and the last register holds the list of the rest.
+        let positional = usize::from(args) - 4;
+        let rest = frame.get(base + args - 1);
+        // The core goes right below its first argument. Up to two keyword values fit in the registers of the operands. More of them move the positional arguments up.
+        let shift = count.saturating_sub(2);
+        let core_at = usize::from(base) + 2 + shift - count;
+        if core_at + 1 + count + positional > WINDOW {
+            return None;
+        }
+        let first = usize::from(base) + 3;
+        if shift > 0 {
+            for i in (0..positional).rev() {
+                frame.set((first + shift + i) as u8, frame.get((first + i) as u8));
+            }
+        }
+        frame.set(core_at as u8, core);
+        for (i, &value) in passed[..count].iter().enumerate() {
+            frame.set((core_at + 1 + i) as u8, value);
+        }
+        Some(Call { base: core_at as u8, argc: (count + positional) as u8, rest })
+    }
+
+    /// Returns the arguments that the first-class `apply` passes on, as one list. `operands` is the list of its arguments after the procedure: some leading arguments, then a proper list. The result is the leading arguments followed by the elements of that list.
+    ///
+    /// Returns `None` for operands of any other shape, and for more than [`LEADING`] leading arguments. The outer loop then runs the request and reports any error.
+    #[inline(never)]
+    fn applied(&mut self, operands: Value<'gc>) -> Result<Option<Value<'gc>>, Fault> {
+        let (mc, pairs) = (self.cx.mc, Pairs::new(self.cx.mc));
+        let Some(mut cell) = Pair::of(operands) else { return Ok(None) };
+        let mut leading = [Value::VOID; LEADING];
+        let mut count = 0;
+        while let Some(next) = Pair::of(cell.tail(mc)) {
+            if count == LEADING {
+                return Ok(None);
+            }
+            leading[count] = cell.head(mc);
+            count += 1;
+            cell = next;
+        }
+        let mut rest = cell.head(mc);
+        if cell.tail(mc) != Value::NIL || !pairs.is_list(rest) {
+            return Ok(None);
+        }
+        for &value in leading[..count].iter().rev() {
+            rest = pairs.cons(value, rest)?.value(mc);
+        }
+        if count > 0 && mc.step_due() {
+            self.cx.fuel.pause();
+        }
+        Ok(Some(rest))
     }
 
     /// Performs a non-tail marked call for `with-mark`, `with-exception-handler`, or `guard`. Sets the
@@ -430,9 +629,6 @@ pub(crate) fn bind<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, a
 
 #[inline(never)]
 fn bind_slow<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, mut argc: u8, mut rest: Value<'gc>) -> Result<(), Fault> {
-    if let Some(mv) = rest.downcast::<MultiValue>(mc) {
-        return bind_values(mc, frame, arity, argc, mv);
-    }
     let shape = Shape::of(arity);
     if shape.slots() > u64::from(MAX_PARAMS) {
         return bind_spread(mc, frame, shape, argc, rest);
@@ -507,40 +703,5 @@ fn bind_spread<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, shape: Shape, mut
         return Err(Fault::Arity);
     }
     frame.set(ARGS + keep, rest);
-    Ok(())
-}
-
-/// Binds arguments when trailing arguments are provided as a [`MultiValue`] object from
-/// `apply-values`.
-fn bind_values<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, mut argc: u8, mv: Gc<'gc, MultiValue>) -> Result<(), Fault> {
-    let items = mv.items(mc);
-    let shape = Shape::of(arity);
-    if shape.slots() > u64::from(MAX_PARAMS) {
-        let rest = Pairs::new(mc).list_with_tail((0..items.len()).map(|i| items.get(i)), Value::NIL)?;
-        return bind_spread(mc, frame, shape, argc, rest);
-    }
-    let (required, fixed) = counts(shape)?;
-    let mut idx = 0;
-    while argc < fixed {
-        let item = match () {
-            () if idx < items.len() => items.get(idx),
-            () if argc < required => return Err(Fault::Arity),
-            () => Value::UNSUPPLIED,
-        };
-        frame.set(ARGS + argc, item);
-        (idx, argc) = (idx + 1, argc + 1);
-    }
-    if !shape.rest {
-        if argc > fixed || idx < items.len() {
-            return Err(Fault::Arity);
-        }
-        return Ok(());
-    }
-    let pairs = Pairs::new(mc);
-    let mut rest = pairs.list_with_tail((idx.min(items.len())..items.len()).map(|i| items.get(i)), Value::NIL)?;
-    for i in (fixed..argc).rev() {
-        rest = pairs.cons(frame.get(ARGS + i), rest)?.value(mc);
-    }
-    frame.set(ARGS + fixed, rest);
     Ok(())
 }

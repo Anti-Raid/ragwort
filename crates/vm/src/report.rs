@@ -11,7 +11,8 @@ use ragwort_types::syntax::SyntaxSource;
 use ragwort_types::vector::{AnyVector, Vectors};
 
 use crate::frame::{self, CLOSURE, Link};
-use crate::objects::{Bytecode, BytecodeFields, Sites, SitesFields, Closure, ClosureFields, Condition, ConditionFields, Frames, FramesFields, KeywordProcedure, KeywordProcedureFields, ModuleFields, Native, NativeFields, Prompt, PromptFields, Task, TaskFields};
+use crate::objects::{Bytecode, BytecodeFields, Sites, SitesFields, Closure, ClosureFields, Condition, ConditionFields, FramesFields, KeywordProcedure, KeywordProcedureFields, ModuleFields, Prompt, PromptFields, Task, TaskFields};
+use crate::segments::records;
 use crate::{Fault, HostDef, Intrinsic, Op, coroutine};
 
 /// A built-in operation that can raise a fault.
@@ -94,7 +95,7 @@ fn count<'gc>(number: u8) -> Value<'gc> {
 /// Identifies the origin of `fault` from the instruction that raised it: the instruction before `pc` in `code`, executing in `frame`.
 ///
 /// Returns an origin with no name and no irritants when the instruction does not explain the fault.
-pub(crate) fn origin<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, code: Gc<'gc, Bytecode>, pc: usize, fault: Fault) -> Result<Origin<'gc>, Fault> {
+pub(crate) fn origin<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, code: Gc<'gc, Bytecode>, pc: usize, values: Value<'gc>, fault: Fault) -> Result<Origin<'gc>, Fault> {
     let unknown = Origin { operation: None, irritants: Value::NIL };
     let Some(&op) = pc.checked_sub(1).and_then(|at| code.ops(mc)?.get(at)) else { return Ok(unknown) };
     let registers = |base: u8, count: u8| (0..count).map(move |i| frame.get(base.wrapping_add(i)));
@@ -110,6 +111,14 @@ pub(crate) fn origin<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, code: Gc<'g
         Op::Call { base, args } if fault == Fault::Arity => (None, list(mc, [frame.get(base), count(args)].into_iter())?),
         // A failed tail call has already moved the callee into the frame's closure register.
         Op::TailCall { args, .. } if fault == Fault::Arity => (None, list(mc, [frame.get(CLOSURE), count(args)].into_iter())?),
+        // `values` is the list of values that the load did not take. The irritant is how many there are.
+        Op::LoadAcc { .. } if fault == Fault::ValueCount => {
+            let received = Pairs::new(mc).list_len(values).and_then(|received| i64::try_from(received).ok()).and_then(Value::fixnum);
+            (None, list(mc, [received.unwrap_or(Value::VOID)].into_iter())?)
+        }
+        // A receiving call does not say how many values it passed. A failed tail call has already moved the callee, as above.
+        Op::CallReceived { base } if fault == Fault::Arity => (None, list(mc, [frame.get(base)].into_iter())?),
+        Op::TailCallReceived { .. } if fault == Fault::Arity => (None, list(mc, [frame.get(CLOSURE)].into_iter())?),
         Op::LoadSlotChecked { slot, .. } | Op::StoreSlotChecked { slot, .. } if fault == Fault::Unbound => {
             let names = code.module(mc).and_then(|module| AnyVector::of(module.names(mc)));
             let Some(name) = names.and_then(|names| names.get(mc, slot as usize)) else { return Ok(unknown) };
@@ -148,30 +157,20 @@ impl<'gc> Entries<'gc> {
 }
 
 /// Appends the calls held by the continuation records of `chain` to `entries`, innermost first. Returns `false` once `entries` is full.
-fn calls<'gc>(mc: &Mutation<'gc>, mut chain: Value<'gc>, entries: &mut Entries<'gc>) -> bool {
-    loop {
-        if let Some(native) = chain.downcast::<Native>(mc) {
-            chain = native.next(mc);
-            continue;
-        }
-        let Some(record) = chain.downcast::<Frames>(mc) else { return true };
+fn calls<'gc>(mc: &Mutation<'gc>, chain: Value<'gc>, entries: &mut Entries<'gc>) -> bool {
+    for record in records(mc, chain) {
         let Some(segment) = record.segment(mc) else { return true };
-        let slots = segment.slots(mc);
-        let (start, mut at) = (record.start(mc) as usize, record.end(mc) as usize);
-        let mut link = Link::of(record.link(mc));
-        // Each link gives the distance down to the frame it returns into and the instruction that frame resumes at.
-        while let Some(Link { pc, base, .. }) = link.filter(|link| link.base > 0) {
-            let Some(below) = at.checked_sub(usize::from(base)).filter(|&below| below >= start && below < slots.len()) else { break };
-            let Some(code) = slots.get(below).downcast::<Closure>(mc).and_then(|closure| closure.code(mc)) else { break };
-            if !entries.push(mc, code, pc) {
+        let Some(link) = Link::of(record.link(mc)) else { continue };
+        // Each link gives the distance down to the frame it returns into and the instruction that frame resumes at. A frame that cannot be read ends the record's part of the trace.
+        for caller in frame::callers(mc, segment.slots(mc), record.start(mc) as usize, record.end(mc) as usize, link) {
+            let Ok(caller) = caller else { break };
+            let Some(code) = segment.slots(mc).get(caller.at).downcast::<Closure>(mc).and_then(|closure| closure.code(mc)) else { break };
+            if !entries.push(mc, code, caller.pc) {
                 return false;
             }
-            at = below;
-            let next = at + usize::from(frame::link_slot(code.arity(mc)));
-            link = if next < slots.len() { Link::of(slots.get(next)) } else { None };
         }
-        chain = record.next(mc);
     }
+    true
 }
 
 /// Records the calls in progress when a condition is raised by `task`, innermost first.
@@ -348,6 +347,8 @@ pub enum Raised<'gc> {
     String { error: StrError, operation: Option<Operation>, operands: Value<'gc> },
     /// A procedure or operation was called with a number of arguments it does not accept. `procedure` is the procedure that was called, when the call was to a procedure and not to a built-in operation.
     Arity { operation: Option<Operation>, procedure: Option<Value<'gc>>, given: usize },
+    /// A place that takes exactly one value received `received` values.
+    ValueCount { received: Option<usize> },
     /// A call's target was not a procedure.
     NotProcedure { value: Option<Value<'gc>> },
     /// A variable was read or assigned before its definition ran.
@@ -397,6 +398,9 @@ fn decoded<'gc>(mc: &Mutation<'gc>, raised: Value<'gc>) -> Raised<'gc> {
             let given = Pair::of(operands).and_then(|cell| Pair::of(cell.tail(mc))).and_then(|cell| cell.head(mc).as_fixnum());
             Raised::Arity { operation, procedure: first, given: given.and_then(|given| usize::try_from(given).ok()).unwrap_or(0) }
         }
+        // The `values` operation lists the values it was given. A load lists only how many there were.
+        Fault::ValueCount if operation.is_some() => Raised::ValueCount { received: Pairs::new(mc).list_len(operands).and_then(|received| usize::try_from(received).ok()) },
+        Fault::ValueCount => Raised::ValueCount { received: first.and_then(Value::as_fixnum).and_then(|received| usize::try_from(received).ok()) },
         Fault::NotProcedure => Raised::NotProcedure { value: first },
         Fault::Unbound => Raised::Unbound { name: first.and_then(Symbol::of) },
         Fault::Keyword => Raised::Keyword { message, irritants: operands },

@@ -29,7 +29,7 @@ use ragwort_types::symbol::{Keyword, Symbol};
 use ragwort_types::syntax::{Abbreviation, Syntax, SyntaxKind};
 use ragwort_types::vector::{AnyVector, Vector};
 use ragwort_vm::report::{Failure, Raised, Report};
-use ragwort_vm::objects::{Closure, Condition, ConditionFields, Continuation, ExternalRef, KeywordProcedure, MultiValue, MultiValueFields, Tag, Task};
+use ragwort_vm::objects::{Closure, Condition, ConditionFields, Continuation, ExternalRef, KeywordProcedure, Tag, Task};
 use ragwort_vm::objects::{Struct, StructFields, StructType, StructTypeFields};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -166,7 +166,6 @@ fn is_container<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> bool {
     Pair::of(value).is_some()
         || AnyVector::of(value).is_some()
         || Syntax::of(value).is_some()
-        || value.downcast::<MultiValue>(mc).is_some()
         || value.downcast::<Condition>(mc).is_some()
         || value.downcast::<Struct>(mc).is_some()
 }
@@ -181,10 +180,6 @@ fn child<'gc>(mc: &Mutation<'gc>, value: Value<'gc>, i: usize) -> Option<Value<'
     }
     if let Some(syntax) = Syntax::of(value) {
         return (i == 0).then(|| syntax.datum(mc));
-    }
-    if let Some(many) = value.downcast::<MultiValue>(mc) {
-        let items = many.items(mc);
-        return (i < items.len()).then(|| items.get(i));
     }
     if let Some(made) = value.downcast::<Struct>(mc) {
         let fields = made.items(mc);
@@ -346,12 +341,6 @@ impl<'gc> Printer<'_, 'gc> {
             work.extend([Work::Text(")"), Work::Items(value, 0)]);
         } else if let Some(syntax) = Syntax::of(value) {
             self.syntax(syntax, work);
-        } else if let Some(many) = value.downcast::<MultiValue>(mc) {
-            self.out.push_str("#<values");
-            if !many.items(mc).is_empty() {
-                self.out.push(' ');
-            }
-            work.extend([Work::Text(">"), Work::Items(value, 0)]);
         } else if let Some(condition) = value.downcast::<Condition>(mc) {
             self.condition(condition, work)?;
         } else if let Some(made) = value.downcast::<Struct>(mc) {
@@ -479,6 +468,7 @@ impl<'gc> Printer<'_, 'gc> {
                 Value::VOID => "#<void>",
                 Value::UNDEFINED => "#<undefined>",
                 Value::UNSUPPLIED => "#<unsupplied>",
+                Value::VALUES => "#<values>",
                 _ if value.downcast::<Closure>(mc).is_some() || value.downcast::<KeywordProcedure>(mc).is_some() => "#<procedure>",
                 _ if value.downcast::<Continuation>(mc).is_some() => "#<continuation>",
                 _ if value.downcast::<ExternalRef>(mc).is_some() => "#<external>",

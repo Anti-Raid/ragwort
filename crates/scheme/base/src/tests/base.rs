@@ -268,7 +268,7 @@ fn prelude_procedures() {
           (reverse out))
     ";
     assert_eq!(eval(pausable), "(1 2 3 4 5 6 7 8 9)");
-    assert_eq!(eval_in(&mut arena(), "(apply + (values 1 2))"), Ok(Err(Fault::WrongType)));
+    assert_eq!(eval_in(&mut arena(), "(apply + (values 1 2))"), Ok(Err(Fault::ValueCount)));
     assert_eq!(eval_in(&mut arena(), "(call-with-values (lambda () (values 1 2)) (lambda (a) a))"), Ok(Err(Fault::Arity)));
     assert_eq!(eval("(list (length '(1 2 3)) (reverse '(1 2 3)) (append '(1) '(2 3) '() '(4 . 5)))"), "(3 (3 2 1) (1 2 3 4 . 5))");
     assert_eq!(eval("(list (list-tail '(1 2 3) 1) (list-ref '(1 2 3) 2) (memq 'c '(a b c d)) (assv 2 '((1 . a) (2 . b))))"), "((2 3) 3 (c d) (2 . b))");
@@ -1430,16 +1430,16 @@ fn the_host_resumes_a_machine_that_yields() {
                     (list a b c)))";
     let mut machine = machine(&mut arena, text);
     assert_eq!(arena.mutate(|mc| show_outcome(mc, machine.resume(mc, &[]))), "Err(NotPending)");
-    assert_eq!(arena.mutate(|mc| settled(mc, &mut machine, |m| m.run(mc))), "yielded (1 a)");
+    assert_eq!(arena.mutate(|mc| settled(mc, &mut machine, |m| m.run(mc))), "yielded ((1 a))");
     // What the coroutines hold stays alive while they wait.
     arena.collect();
-    assert_eq!(arena.mutate(|mc| settled(mc, &mut machine, |m| m.resume(mc, &[Value::fixnum(10).unwrap()]))), "yielded (1 b)");
+    assert_eq!(arena.mutate(|mc| settled(mc, &mut machine, |m| m.resume(mc, &[Value::fixnum(10).unwrap()]))), "yielded ((1 b))");
     arena.collect();
     assert_eq!(arena.mutate(|mc| settled(mc, &mut machine, |m| m.resume(mc, &[Value::fixnum(20).unwrap()]))), "done (10 20 (done 1))");
     assert_eq!(arena.mutate(|mc| show_outcome(mc, machine.resume(mc, &[]))), "Err(Finished)");
     // Plain `run` goes on from a yield with no values.
     let mut machine = self::machine(&mut arena, "(call-with-values (lambda () (co/yield 'x)) list)");
-    assert_eq!(arena.mutate(|mc| settled(mc, &mut machine, |m| m.run(mc))), "yielded x");
+    assert_eq!(arena.mutate(|mc| settled(mc, &mut machine, |m| m.run(mc))), "yielded (x)");
     assert_eq!(arena.mutate(|mc| settled(mc, &mut machine, |m| m.run(mc))), "done ()");
 }
 
@@ -1470,7 +1470,7 @@ fn a_coroutine_two_machines_resume_in_turn_is_copied_where_it_waits() {
         let machine = &mut machines[i % 2];
         seen.push(arena.mutate(|mc| show_outcome(mc, if i < 2 { machine.run(mc) } else { machine.resume(mc, &[]) })));
     }
-    assert_eq!(seen, (0..8).map(|i| format!("yielded {i}")).collect::<Vec<_>>());
+    assert_eq!(seen, (0..8).map(|i| format!("yielded ({i})")).collect::<Vec<_>>());
 }
 
 #[test]
@@ -1606,7 +1606,7 @@ fn keyword_mistakes_name_the_keyword() {
 
 #[test]
 fn apply_spreads_only_a_proper_list() {
-    let caught = |text: &str| eval(&format!("(define mv (values 1 2)) (define a (car (list apply))) (guard (e (#t (error-object-kind e))) {text})"));
+    let caught = |text: &str| eval(&format!("(define two (car (list (lambda () (values 1 2))))) (define a (car (list apply))) (guard (e (#t (error-object-kind e))) {text})"));
     // The last argument is a proper list, whether or not the procedure takes a rest parameter.
     assert_eq!(caught("(apply list 1 2 '(3 4))"), "(1 2 3 4)");
     assert_eq!(caught("(apply apply list 1 '(2 (3 4)))"), "(1 2 3 4)");
@@ -1614,11 +1614,240 @@ fn apply_spreads_only_a_proper_list() {
     for improper in ["(apply list 1)", "(apply list 1 2 '(3 . 4))", "(apply (lambda (a . r) r) 1 2)", "(apply apply list 1 '(2 3))", "(keyword-apply list '() '() 1 2)"] {
         assert_eq!(caught(improper), "wrong-type", "{improper}");
     }
-    // Multiple values are not a list of arguments, however `apply` is reached, and the error can be caught.
-    for values in ["(apply list mv)", "(a list mv)", "(a apply list mv)", "(a a list mv)", "(a keyword-apply list '() '() mv)", "(a (lambda (x . r) r) 0 mv)"] {
-        assert_eq!(caught(values), "wrong-type", "{values}");
+    // Several values are not a list of arguments, however `apply` is reached. The call that would take them as one argument fails, and the error can be caught.
+    for values in ["(apply list (two))", "(a list (two))", "(a apply list (two))", "(a keyword-apply list '() '() (two))", "(a (lambda (x . r) r) 0 (two))"] {
+        assert_eq!(caught(values), "value-count", "{values}");
     }
     assert_eq!(caught("(call-with-values (lambda () (values 1 2 3)) (lambda (a . r) (list a r)))"), "(1 (2 3))");
+}
+
+#[test]
+fn calls_through_a_value_reach_keyword_procedures_and_apply() {
+    // `pick` hides each procedure from the compiler, so every call below is resolved while it runs.
+    let defs = "(define (greet name [mark 1] #:loud [loud #f]) (list name mark loud))
+                (define (needs #:key key) key)
+                (define (down n #:step [step 1]) (if (eqv? n 0) 0 (+ 1 ((pick 3) (- n step)))))
+                (define procs (vector greet needs apply down list))
+                (define (pick i) (vector-ref procs i))";
+    let caught = |text: &str| eval(&format!("{defs} (guard (e (#t (list (error-object-kind e) (error-object-irritants e)))) {text})"));
+    // A keyword procedure called without keywords, in tail and non-tail position.
+    assert_eq!(caught("((pick 0) 7)"), "(7 1 #f)");
+    assert_eq!(caught("(car ((pick 0) 7 8))"), "7");
+    assert_eq!(caught("((pick 0) 7 #:loud #t)"), "(7 1 #t)");
+    assert_eq!(caught("(apply (pick 0) 7 '(8))"), "(7 8 #f)");
+    // Deep enough to continue on further stack segments.
+    assert_eq!(caught("((pick 3) 100000)"), "100000");
+    // A call the procedure cannot take names the keyword procedure.
+    for wrong in ["((pick 0))", "(car ((pick 0) 1 2 3))", "(apply (pick 0) '())", "((pick 2) (pick 0) '(1 2 3))"] {
+        assert_eq!(caught(wrong), "(arity (#<procedure greet>))", "{wrong}");
+    }
+    assert_eq!(caught("((pick 1))"), "(keyword (#:key))");
+    assert_eq!(caught("((pick 2) (pick 1) '())"), "(keyword (#:key))");
+    // The first-class `apply`, in tail and non-tail position.
+    assert_eq!(caught("((pick 2) (pick 4) '(1 2))"), "(1 2)");
+    assert_eq!(caught("(car ((pick 2) (pick 0) '(7)))"), "7");
+    assert_eq!(caught("((pick 2) (pick 4) '())"), "()");
+    assert_eq!(caught("((pick 2) (pick 4) 1 2 '(3))"), "(1 2 3)");
+    assert_eq!(caught("((pick 2) (pick 2) (pick 4) '((1 2)))"), "(1 2)");
+    for improper in ["((pick 2) (pick 4) 5)", "((pick 2) (pick 4) '(1 . 2))"] {
+        assert_eq!(caught(improper), "(wrong-type ())", "{improper}");
+    }
+}
+
+#[test]
+fn multiple_values_pass_through_control_forms() {
+    let received = |producer: &str| eval(&format!("(call-with-values (lambda () {producer}) list)"));
+    assert_eq!(received("(values)"), "()");
+    assert_eq!(received("(values 1)"), "(1)");
+    assert_eq!(received("(apply values '(1 2 3))"), "(1 2 3)");
+    // The body and a clause of `guard`.
+    assert_eq!(received("(guard (e (#t 'caught)) (values 1 2))"), "(1 2)");
+    assert_eq!(received("(guard (e (#t (values 'a 'b))) (raise 'x))"), "(a b)");
+    // A handler's thunk, and the handler of a continuable raise.
+    assert_eq!(received("(with-exception-handler (lambda (e) 0) (lambda () (values 1 2)))"), "(1 2)");
+    assert_eq!(received("(with-exception-handler (lambda (e) (values 5 6)) (lambda () (raise-continuable 'x)))"), "(5 6)");
+    // A marked thunk, a prompt's thunk and a prompt's handler.
+    assert_eq!(received("(call-with-mark 'key 1 (lambda () (values 1 2)))"), "(1 2)");
+    assert_eq!(received("(call-with-continuation-prompt (lambda () (values 1 2)))"), "(1 2)");
+    let tag = "(default-continuation-prompt-tag)";
+    assert_eq!(received(&format!("(call-with-continuation-prompt (lambda () (abort-current-continuation {tag} 1 2)) {tag} (lambda (a b) (values a b 3)))")), "(1 2 3)");
+    // The thunk of `dynamic-wind`, and a continuation called from inside one.
+    assert_eq!(received("(dynamic-wind (lambda () 0) (lambda () (values)) (lambda () 0))"), "()");
+    assert_eq!(received("(dynamic-wind (lambda () 0) (lambda () (values 1 2 3)) (lambda () 0))"), "(1 2 3)");
+    for (given, got) in [("", "()"), ("1", "(1)"), ("1 2 3", "(1 2 3)")] {
+        assert_eq!(received(&format!("(call/cc (lambda (k) (dynamic-wind (lambda () 0) (lambda () (k {given})) (lambda () 0))))")), got, "{given}");
+    }
+    // A coroutine's yield and its last result.
+    let coroutine = "(define co (make-coroutine (lambda () (co/yield 1 2) (values 3 4))))";
+    assert_eq!(eval(&format!("{coroutine} (list (call-with-values (lambda () (co/resume co)) list) (call-with-values (lambda () (co/resume co)) list))")), "((1 2) (3 4))");
+}
+
+/// Each level returns two values to a receiver one call deeper, so the values cross from one stack
+/// segment back to the previous one many times while the collector runs in steps.
+#[test]
+fn multiple_values_return_across_stack_segments() {
+    let mut arena = arena();
+    let text = "(let ()
+                  (define (deep n) (if (eqv? n 0) (values 1 2) (call-with-values (lambda () (deep (- n 1))) (lambda (a b) (values (+ a 1) (+ b 1))))))
+                  (call-with-values (lambda () (deep 100000)) list))";
+    let mut machine = machine(&mut arena, text);
+    let done = loop {
+        let outcome = arena.step(|mc| match machine.run(mc).unwrap() {
+            Outcome::Paused => None,
+            Outcome::Done(value) => Some(show(mc, value)),
+            other => panic!("{other:?}"),
+        });
+        if let Some(done) = outcome.unwrap() {
+            break done;
+        }
+    };
+    assert_eq!(done, "(100001 100002)");
+}
+
+#[test]
+fn a_place_for_one_value_takes_no_other_number() {
+    // The procedures are reached through a list, so the compiler does not see what they return.
+    let defs = "(define two (car (list (lambda () (values 1 2))))) (define none (car (list (lambda () (values)))))";
+    let caught = |text: &str| eval(&format!("{defs} (guard (e (#t (list (error-object-kind e) (error-object-irritants e)))) {text})"));
+    for (several, received) in [("(+ 1 (two))", 2), ("(list (none))", 0), ("(let ((x (two))) (list x))", 2), ("(if (two) 1 2)", 2), ("(vector-ref (vector 1 2) (none))", 0)] {
+        assert_eq!(caught(several), format!("(value-count ({received}))"), "{several}");
+    }
+    assert_eq!(caught("(let ((k (call/cc (lambda (k) k)))) (if (procedure? k) (k 1 2) k))"), "(value-count (2))");
+    // A result that nothing uses is not checked.
+    assert_eq!(caught("(begin (two) 5)"), "5");
+    // A call's result is passed on as it is, to its own caller or to a receiver.
+    assert_eq!(caught("(call-with-values (lambda () (two)) list)"), "(1 2)");
+    assert_eq!(caught("(call-with-values (lambda () (if (pair? (list 1)) (two) 3)) list)"), "(1 2)");
+    assert_eq!(caught("(call-with-values (lambda () (guard (e (#f 0)) (two))) list)"), "(1 2)");
+    assert_eq!(caught("(call-with-values none list)"), "()");
+}
+
+#[test]
+fn values_are_bound_by_let_values_and_define_values() {
+    assert_eq!(eval("(let-values (((a b) (values 1 2)) ((c) (values 3)) (all (values 4 5)) ((d . more) (values 6 7 8))) (list a b c all d more))"), "(1 2 3 (4 5) 6 (7 8))");
+    assert_eq!(eval("(let-values () 5)"), "5");
+    assert_eq!(eval("(let-values (((a b) (values 1 2))) (define c (+ a b)) (list a b c))"), "(1 2 3)");
+    // The inits of `let-values` see none of its variables. Those of `let*-values` see the ones before.
+    assert_eq!(eval("(let ((a 'outer)) (let-values (((a) (values 1)) ((b) (values a))) (list a b)))"), "(1 outer)");
+    assert_eq!(eval("(let ((a 'outer)) (let*-values (((a) (values 1)) ((b c) (values a (+ a 1)))) (list a b c)))"), "(1 1 2)");
+    assert_eq!(eval("(let*-values () 5)"), "5");
+    // The values can come from any call, and a temporary of the expansion is not visible to the body.
+    assert_eq!(eval("(define (two) (values 1 2)) (define t0-0 'mine) (let-values (((a b) (two)) ((c d) (two))) (list a b c d t0-0))"), "(1 2 1 2 mine)");
+    // `define-values` defines each variable, at the top level and in a body.
+    assert_eq!(eval("(define-values (a b . more) (values 1 2 3 4)) (define-values all (values 5 6)) (define-values () (values)) (list a b more all)"), "(1 2 (3 4) (5 6))");
+    assert_eq!(eval("(define (f) (define-values (a b) (values 1 2)) (define c (+ a b)) (list a b c)) (f)"), "(1 2 3)");
+    // The number of values must fit the formals.
+    let caught = |text: &str| eval(&format!("(guard (e (#t (error-object-kind e))) {text})"));
+    assert_eq!(caught("(let-values (((a b) (values 1 2 3))) a)"), "arity");
+    assert_eq!(caught("(let-values (((a b) 1) ((c) 2)) a)"), "arity");
+    assert_eq!(caught("(let () (define-values (a) (values)) a)"), "arity");
+    for bad in ["(let-values ((a)) 1)", "(let-values (((a 1) 2)) 3)", "(let-values (((a) 1)))", "(define-values (a 1) 2)", "(define-values (a))", "(let*-values ((5 1)) 2)"] {
+        assert_eq!(error(bad).0, ExpandErrorKind::BadSyntax, "{bad}");
+    }
+}
+
+#[test]
+fn receiving_from_a_known_producer_keeps_its_order_and_checks() {
+    // The compiler removes a producer whose body it can see. What runs, and in what order, stays the same.
+    let defs = "(define log '()) (define (note x) (set! log (cons x log)) x) (define (two x) (values x (+ x 1)))";
+    let caught = |text: &str| eval(&format!("{defs} (guard (e (#t (error-object-kind e))) {text})"));
+    assert_eq!(caught("(call-with-values (lambda () (note 1) (values (note 2) (note 3))) (lambda (a b) (note 4) (list a b (reverse log))))"), "(2 3 (1 2 3 4))");
+    assert_eq!(caught("(call-with-values (lambda () (let ((x (note 1))) (values x (+ x 1)))) list)"), "(1 2)");
+    assert_eq!(caught("(call-with-values (lambda () (two (note 7))) (lambda (a b) (list a b (reverse log))))"), "(7 8 (7))");
+    assert_eq!(caught("(call-with-values (lambda () (two 1)) +)"), "3");
+    assert_eq!(caught("(call-with-values (lambda () 5) (lambda (a) (+ a 1)))"), "6");
+    assert_eq!(caught("(call-with-values (lambda () (note 5)) list)"), "(5)");
+    assert_eq!(caught("(call-with-values (lambda () (values)) (lambda () 'none))"), "none");
+    assert_eq!(caught("(call-with-values (lambda () (values 1 2 3)) (lambda (a . more) (list a more)))"), "(1 (2 3))");
+    assert_eq!(caught("(let ((c (lambda (a b) (- a b)))) (call-with-values (lambda () (values 5 3)) c))"), "2");
+    // A producer or consumer that is used again is left alone.
+    assert_eq!(caught("(let ((p (lambda () (values 1 2)))) (list (call-with-values p list) (call-with-values p list)))"), "((1 2) (1 2))");
+    assert_eq!(caught("(let ((c (lambda (a b) (- a b)))) (list (call-with-values (lambda () (values 5 3)) c) (c 1 1)))"), "(2 0)");
+    // The number of values is still checked against the consumer.
+    for wrong in ["(call-with-values (lambda () (values 1 2 3)) (lambda (a b) a))", "(call-with-values (lambda () 5) (lambda (a b) a))", "(call-with-values (lambda () (two 1)) (lambda (a) a))", "(call-with-values (lambda () (values)) (lambda (a) a))"] {
+        assert_eq!(caught(wrong), "arity", "{wrong}");
+    }
+}
+
+#[test]
+fn keyword_calls_through_a_value_match_while_they_run() {
+    // `pick` hides each procedure from the compiler, so the keywords of every call below are matched when the call runs.
+    let defs = "(define (none a) (list a))
+                (define (one a #:x [x 'dx]) (list a x))
+                (define (two a b #:x [x 'dx] #:y y) (list a b x y))
+                (define (four a #:p [p 1] #:q [q 2] #:r [r 3] #:s [s 4] . more) (list a p q r s more))
+                (define (nine #:a [a 1] #:b [b 2] #:c [c 3] #:d [d 4] #:e [e 5] #:f [f 6] #:g [g 7] #:h [h 8] #:i [i 9] z) (list a b c d e f g h i z))
+                (define procs (vector none one two four nine))
+                (define (pick i) (vector-ref procs i))";
+    let caught = |text: &str| eval(&format!("{defs} (guard (e (#t (list (error-object-kind e) (error-object-irritants e)))) {text})"));
+    // One, two and more accepted keywords, given in any order, in tail and non-tail position.
+    assert_eq!(caught("((pick 1) 1 #:x 2)"), "(1 2)");
+    assert_eq!(caught("(car ((pick 1) 1 #:x 2))"), "1");
+    assert_eq!(caught("((pick 2) 1 2 #:y 3)"), "(1 2 dx 3)");
+    assert_eq!(caught("((pick 2) #:y 3 1 #:x 4 2)"), "(1 2 4 3)");
+    assert_eq!(caught("((pick 3) 0 #:s 's #:q 'q)"), "(0 1 q 3 s ())");
+    assert_eq!(caught("(cdr ((pick 3) 0 5 6 7 #:r 'r #:p 'p))"), "(p 2 r 4 (5 6 7))");
+    assert_eq!(caught("((pick 4) #:i 'i 0 #:a 'a)"), "(a 2 3 4 5 6 7 8 i 0)");
+    // The arguments are evaluated in the order they are written.
+    assert_eq!(caught("(let* ((log '()) (note (lambda (x) (set! log (cons x log)) x))) (list ((pick 2) (note 1) #:y (note 2) (note 3) #:x (note 4)) (reverse log)))"), "((1 3 4 2) (1 2 3 4))");
+    // The errors are the ones the general path reports.
+    assert_eq!(caught("((pick 2) 1 2)"), "(keyword (#:y))");
+    assert_eq!(caught("((pick 2) 1 2 #:y 3 #:z 4)"), "(keyword (#:z))");
+    assert_eq!(caught("((pick 0) 1 #:x 2)"), "(keyword (#:x))");
+    assert_eq!(caught("((pick 1) #:x 2)"), "(arity ())");
+    assert_eq!(caught("((pick 1) 1 2 #:x 2)"), "(arity ())");
+    assert_eq!(caught("(5 1 #:x 2)"), "(keyword (#:x))");
+}
+
+#[test]
+fn marks_set_in_tail_position_stay_on_their_frame() {
+    // Each turn of the loop replaces the mark of the same frame, so the loop keeps one mark however long it runs.
+    let count = "(define (count n) (if (eqv? n 0) (mark-value 'depth 'none) (with-continuation-mark 'depth n (count (- n 1)))))";
+    assert_eq!(eval(&format!("{count} (count 100000)")), "1");
+    assert_eq!(eval(&format!("{count} (list (count 3) (mark-value 'depth 'none))")), "(1 none)");
+    // A mark set in tail position inside a marked call belongs to that call's frame, and goes when it returns.
+    let inner = "(define (inner) (with-continuation-mark 'a 2 (mark-value 'a 0)))";
+    assert_eq!(eval(&format!("{inner} (with-continuation-mark 'a 1 (list (inner) (mark-value 'a 0)))")), "(2 1)");
+    assert_eq!(eval(&format!("{inner} (with-continuation-mark 'b 1 (list (with-continuation-mark 'a 5 (inner)) (mark-value 'a 0) (mark-value 'b 0)))")), "(2 0 1)");
+    // A different key in tail position adds to the frame's marks.
+    assert_eq!(eval("(define (both) (with-continuation-mark 'a 1 (with-continuation-mark 'b 2 (list (mark-value 'a 0) (mark-value 'b 0))))) (both)"), "(1 2)");
+    // A handler installed in tail position works the same way.
+    let handled = "(define (handled) (with-exception-handler (lambda (e) (list 'inner e)) (lambda () (raise-continuable 'x))))";
+    assert_eq!(eval(&format!("{handled} (with-exception-handler (lambda (e) (list 'outer e)) (lambda () (list (with-continuation-mark 'a 1 (handled)) (raise-continuable 'y))))")), "((inner x) (outer y))");
+}
+
+/// Each level makes one call of every kind the VM builds itself, and then recurses without a tail call. The stack segments are the smallest size, so over the levels each kind of call starts at every distance from the end of a segment, including the ones that need a new segment.
+#[test]
+fn calls_the_vm_builds_work_at_any_stack_depth() {
+    let mut arena = arena();
+    let text = "(let ((tag (default-continuation-prompt-tag)))
+                  (define (level n)
+                    (if (eqv? n 0)
+                        0
+                        (+ (call/cc (lambda (k) (k 1)))
+                           (call/cc (lambda (k) (dynamic-wind (lambda () 0) (lambda () (k 1)) (lambda () 0))))
+                           (with-exception-handler (lambda (e) e) (lambda () (raise-continuable 1)))
+                           (guard (e (#t e)) (raise 1))
+                           (guard (e (#t 1)) (car n))
+                           (car (call-with-continuation-prompt (lambda () (abort-current-continuation tag 1 2)) tag list))
+                           (call-with-values (lambda () (call/cc (lambda (k) (k 1 2 3)))) (lambda (a b c) a))
+                           (co/resume (make-coroutine (lambda (x) x)) 1)
+                           (let ((co (make-coroutine (lambda () (co/yield 1 2) 3)))) (call-with-values (lambda () (co/resume co)) (lambda (a b) a)))
+                           (car ((car (list apply)) list 1 2 (list 3)))
+                           (level (- n 1)))))
+                  (level 300))";
+    let mut machine = machine(&mut arena, text);
+    let done = loop {
+        let outcome = arena.step(|mc| match machine.run(mc).unwrap() {
+            Outcome::Paused => None,
+            Outcome::Done(value) => Some(show(mc, value)),
+            other => panic!("{other:?}"),
+        });
+        if let Some(done) = outcome.unwrap() {
+            break done;
+        }
+    };
+    assert_eq!(done, "3000");
 }
 
 #[test]
@@ -2071,6 +2300,10 @@ fn a_host_matches_on_what_was_raised() {
         assert_eq!(procedure_name(mc, procedure).map(|name| show(mc, name.value(mc))), Some("f".to_string()));
     });
     reported("(car)", |_, report| assert!(matches!(report.error, Raised::Arity { procedure: Some(_), given: 0, .. })));
+    reported("(define two (car (list (lambda () (values 1 2))))) (+ 1 (two))", |mc, report| {
+        assert_eq!(report.error, Raised::ValueCount { received: Some(2) });
+        assert_eq!(ragwort_printer_scheme::render(mc, &report, usize::MAX), "error: wrong number of values: 2");
+    });
     reported("(5 1)", |mc, report| {
         let Raised::NotProcedure { value: Some(value) } = report.error else { panic!("{:?}", report.error) };
         assert_eq!(show(mc, value), "5");

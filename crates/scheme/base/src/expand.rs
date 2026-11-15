@@ -57,6 +57,9 @@ pub(crate) enum Form {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Macro {
     LetStar,
+    LetValues,
+    LetStarValues,
+    DefineValues,
     And,
     Or,
     When,
@@ -93,7 +96,7 @@ pub(crate) enum Keyword {
     Aux(Aux),
 }
 
-const KEYWORDS: [(&str, Keyword); 42] = [
+const KEYWORDS: [(&str, Keyword); 45] = [
     ("struct-copy", Keyword::Macro(Macro::StructCopy)),
     ("struct", Keyword::Form(Form::Struct)),
     ("quote", Keyword::Form(Form::Quote)),
@@ -120,6 +123,9 @@ const KEYWORDS: [(&str, Keyword); 42] = [
     ("match", Keyword::Macro(Macro::Match)),
     ("with-syntax", Keyword::Macro(Macro::WithSyntax)),
     ("let*", Keyword::Macro(Macro::LetStar)),
+    ("let-values", Keyword::Macro(Macro::LetValues)),
+    ("let*-values", Keyword::Macro(Macro::LetStarValues)),
+    ("define-values", Keyword::Macro(Macro::DefineValues)),
     ("and", Keyword::Macro(Macro::And)),
     ("or", Keyword::Macro(Macro::Or)),
     ("when", Keyword::Macro(Macro::When)),

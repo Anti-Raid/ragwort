@@ -19,7 +19,7 @@ use ragwort_types::gc::{Frame, Gc, Mutation, Segment, Stack, Value, WINDOW};
 use ragwort_types::pair::{Pair, Pairs};
 
 use crate::Fault;
-use crate::frame::{self, Kept, Link};
+use crate::frame::{self, Caller, Kept, Link};
 use crate::objects::{Frames, FramesFields, Native, NativeFields, Spill, SpillFields, Task, TaskFields};
 use crate::wind::Kind;
 
@@ -196,24 +196,7 @@ impl<'gc> Segments<'_, 'gc> {
     /// marks operate in constant space.
     pub(crate) fn set_mark(&self, key: Value<'gc>, value: Value<'gc>) -> Result<(), Fault> {
         let (mc, task) = (self.mc, self.task);
-        let restored = restored(mc, task.chain(mc));
-        let (pairs, mut at, mut own) = (Pairs::new(mc), task.attachments(mc), Vec::new());
-        while at != restored {
-            let cell = Pair::of(at).ok_or(Fault::Malformed)?;
-            own.push(Pair::of(cell.head(mc)).ok_or(Fault::Malformed)?);
-            at = cell.tail(mc);
-        }
-        let mut marks = task.attachments(mc);
-        if own.iter().any(|mark| mark.head(mc) == key) {
-            marks = restored;
-            for mark in own.into_iter().rev() {
-                let value = if mark.head(mc) == key { value } else { mark.tail(mc) };
-                marks = pairs.cons(pairs.cons(mark.head(mc), value)?.value(mc), marks)?.value(mc);
-            }
-        } else {
-            marks = pairs.cons(pairs.cons(key, value)?.value(mc), marks)?.value(mc);
-        }
-        task.set_attachments(mc, marks);
+        task.set_attachments(mc, marked(mc, task.attachments(mc), restored(mc, task.chain(mc)), key, value)?);
         Ok(())
     }
 
@@ -260,22 +243,58 @@ impl<'gc> Segments<'_, 'gc> {
     }
 }
 
+/// Returns the marks `attachments` with `key` marked `value` on the frame that owns the marks above `under`. `under` is the tail of `attachments` that belongs to the frame's caller. A mark the frame already has for `key` is replaced, so a loop that sets a mark in tail position runs in constant space.
+pub(crate) fn marked<'gc>(mc: &Mutation<'gc>, attachments: Value<'gc>, under: Value<'gc>, key: Value<'gc>, value: Value<'gc>) -> Result<Value<'gc>, Fault> {
+    let (pairs, mut at, mut own) = (Pairs::new(mc), attachments, Vec::new());
+    while at != under {
+        let cell = Pair::of(at).ok_or(Fault::Malformed)?;
+        own.push(Pair::of(cell.head(mc)).ok_or(Fault::Malformed)?);
+        at = cell.tail(mc);
+    }
+    if !own.iter().any(|mark| mark.head(mc) == key) {
+        return Ok(pairs.cons(pairs.cons(key, value)?.value(mc), attachments)?.value(mc));
+    }
+    let mut marks = under;
+    for mark in own.into_iter().rev() {
+        let value = if mark.head(mc) == key { value } else { mark.tail(mc) };
+        marks = pairs.cons(pairs.cons(mark.head(mc), value)?.value(mc), marks)?.value(mc);
+    }
+    Ok(marks)
+}
+
 /// Marks one-shot continuation records in `chain` as multi-shot, ensuring they are copied rather than
 /// resumed in place when reinstated by captured continuations. Traversal stops at the first multi-shot
 /// record since one-shot records only ever reside at the head of the chain.
-pub(crate) fn promote<'gc>(mc: &Mutation<'gc>, mut chain: Value<'gc>) {
-    loop {
-        if let Some(record) = chain.downcast::<Frames>(mc) {
-            if !record.one_shot(mc) {
-                break;
-            }
-            record.set_one_shot(mc, false);
-            chain = record.next(mc);
-        } else if let Some(native) = chain.downcast::<Native>(mc) {
-            chain = native.next(mc);
-        } else {
+pub(crate) fn promote<'gc>(mc: &Mutation<'gc>, chain: Value<'gc>) {
+    for record in records(mc, chain) {
+        if !record.one_shot(mc) {
             break;
         }
+        record.set_one_shot(mc, false);
+    }
+}
+
+/// Returns the records of `chain` that hold frames, innermost first. Native records are passed over.
+pub(crate) fn records<'m, 'gc>(mc: &'m Mutation<'gc>, chain: Value<'gc>) -> Records<'m, 'gc> {
+    Records { mc, at: chain }
+}
+
+/// Walks the frame records of a continuation chain, as [`records`] describes.
+pub(crate) struct Records<'m, 'gc> {
+    mc: &'m Mutation<'gc>,
+    at: Value<'gc>,
+}
+
+impl<'gc> Iterator for Records<'_, 'gc> {
+    type Item = Gc<'gc, Frames>;
+
+    fn next(&mut self) -> Option<Gc<'gc, Frames>> {
+        while let Some(native) = self.at.downcast::<Native>(self.mc) {
+            self.at = native.next(self.mc);
+        }
+        let record = self.at.downcast::<Frames>(self.mc)?;
+        self.at = record.next(self.mc);
+        Some(record)
     }
 }
 
@@ -304,14 +323,12 @@ pub(crate) fn cut_at<'gc>(mc: &Mutation<'gc>, mut chain: Value<'gc>, guard: Valu
             Ok(kept) if link.marks && slots.get(kept.guard) == guard => Some(kept),
             _ => None,
         };
-        let mut link = Link::of(record.link(mc)).ok_or(Fault::Malformed)?;
+        let link = Link::of(record.link(mc)).ok_or(Fault::Malformed)?;
         if set_for(end, link).is_some() {
             return Ok(Some(Cut { chain, marks: record.attachments(mc), free: free(mc, chain, None) }));
         }
-        let mut at = end;
-        while link.base > 0 {
-            at = at.checked_sub(usize::from(link.base)).filter(|&at| at >= start).ok_or(Fault::Malformed)?;
-            link = frame::link_at(mc, slots, at)?;
+        for caller in frame::callers(mc, slots, start, end, link) {
+            let Caller { at, link, .. } = caller?;
             if let Some(kept) = set_for(at, link) {
                 let (marks, value) = (slots.get(kept.marks), link.value().ok_or(Fault::Malformed)?);
                 let cut = Frames::new(mc, Some(segment), slot(start)?, slot(at)?, value, marks, record.one_shot(mc), false, record.next(mc))?;

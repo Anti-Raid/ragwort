@@ -13,10 +13,11 @@ use ragwort_types::gc::Value;
 use ragwort_types::{Wire, named};
 
 use crate::Fault;
-use crate::args::Args;
+use crate::passed::Passed;
 use crate::machine::{Outer, Then};
-use crate::objects::{Continuation, MultiValue};
+use crate::objects::Continuation;
 use crate::prompts::{self, tag_of};
+use crate::wind::Kind;
 
 named! {
     #[repr(u16)]
@@ -27,9 +28,15 @@ named! {
         /// into a rest list. Executed directly as a call in the inner loop when arguments are already laid out
         /// in registers.
         Apply = "apply",
-        /// `(apply-values f v)`: calls `f` with the multiple values contained in `v` if `v` is a
-        /// [`MultiValue`], or with `v` itself as a single argument.
-        ApplyValues = "apply-values",
+        /// `(receive consumer producer arg ...)`: calls `producer` with `arg ...`, then calls `consumer`
+        /// with the values it returned. The compiler emits a call followed by
+        /// [`Op::CallReceived`](crate::Op::CallReceived) for it. The request itself runs only when its
+        /// arguments are spread from a list.
+        Receive = "receive",
+        /// `(collect producer arg ...)`: calls `producer` with `arg ...` and returns the values it
+        /// returned as one list. The compiler emits a call followed by
+        /// [`Op::LoadValues`](crate::Op::LoadValues) for it, as it does for `receive`.
+        Collect = "collect",
         /// `(with-mark key value f arg ...)`: invokes `f` with arguments `arg ...`, attaching a continuation
         /// mark pairing `key` with `value` to the call's continuation. In tail position, replaces any existing
         /// mark for `key` in the current frame to preserve constant stack space.
@@ -98,62 +105,76 @@ impl Request {
     /// is malformed.
     pub fn takes(self, args: usize) -> bool {
         let (least, most) = match self {
-            Request::Apply => (2, None),
+            Request::Apply | Request::Receive => (2, None),
             Request::WithMark | Request::CallWithPrompt => (3, None),
-            Request::ApplyValues | Request::Capture | Request::WithHandler | Request::Guard | Request::GuardQuiet => (2, Some(2)),
+            Request::Capture | Request::WithHandler | Request::Guard | Request::GuardQuiet => (2, Some(2)),
             Request::CallCc | Request::Raise | Request::RaiseContinuable => (1, Some(1)),
-            Request::Abort | Request::Resume | Request::TryResume | Request::Compose => (1, None),
+            Request::Abort | Request::Resume | Request::TryResume | Request::Compose | Request::Collect => (1, None),
             Request::Yield => (0, None),
             Request::KeywordApply => (4, None),
         };
         args >= least && most.is_none_or(|most| args <= most)
     }
 
-    /// Executes the request with `args`, which must satisfy [takes](Request::takes).
-    pub(crate) fn run<'gc>(self, outer: &mut Outer<'_, 'gc>, args: Args<'gc>) -> Result<Then<'gc>, Fault> {
+    /// Returns the number of leading operands the request reads itself. The operands after them are passed on to a procedure or returned.
+    pub fn fixed(self) -> usize {
+        match self {
+            Request::Yield => 0,
+            Request::Apply | Request::Collect | Request::Abort | Request::Compose | Request::CallCc | Request::Raise | Request::RaiseContinuable | Request::Resume | Request::TryResume => 1,
+            Request::Receive | Request::Capture | Request::WithHandler | Request::Guard | Request::GuardQuiet => 2,
+            Request::WithMark | Request::CallWithPrompt | Request::KeywordApply => 3,
+        }
+    }
+
+    /// Executes the request with `args`, which must satisfy [takes](Request::takes). `base` and `tail` say where the request was made, as [`Outer::keep`] takes them.
+    pub(crate) fn run<'gc>(self, outer: &mut Outer<'_, 'gc>, args: Passed<'gc>, base: u8, tail: bool) -> Result<Then<'gc>, Fault> {
         let (mc, task) = (outer.mc(), outer.task());
         let arg = |index| args.get(mc, index);
         Ok(match self {
-            Request::Apply => Then::Call(arg(0)?, args.tail(mc, 1)?.spread_last(mc)?),
-            Request::ApplyValues => {
-                let value = arg(1)?;
-                Then::Call(arg(0)?, if value.downcast::<MultiValue>(mc).is_some() { Args::list(value) } else { Args::one(value) })
+            Request::Apply => Then::Call(arg(0)?, args.skip(mc, 1)?.spread_last(mc)?),
+            Request::Receive => {
+                outer.push(Kind::Receive, arg(0)?, Value::VOID)?;
+                Then::Call(arg(1)?, args.skip(mc, 2)?)
+            }
+            Request::Collect => {
+                outer.push(Kind::Collect, Value::VOID, Value::VOID)?;
+                Then::Call(arg(0)?, args.skip(mc, 1)?)
             }
             Request::WithMark => {
                 outer.segments.set_mark(arg(0)?, arg(1)?)?;
-                Then::Call(arg(2)?, args.tail(mc, 3)?)
+                Then::Call(arg(2)?, args.skip(mc, 3)?)
             }
             Request::CallWithPrompt => {
                 prompts::push(mc, task, tag_of(mc, arg(0)?)?, arg(1)?)?;
-                Then::Call(arg(2)?, args.tail(mc, 3)?)
+                Then::Call(arg(2)?, args.skip(mc, 3)?)
             }
-            Request::Abort => outer.abort(tag_of(mc, arg(0)?)?, args.tail(mc, 1)?)?,
+            Request::Abort => outer.abort(arg(0)?, args.skip(mc, 1)?, base, tail)?,
             Request::Capture => {
                 let continuation = prompts::capture(mc, task, tag_of(mc, arg(0)?)?, false)?;
-                Then::Call(arg(1)?, Args::one(continuation))
+                Then::Call(arg(1)?, outer.pass(&[continuation])?)
             }
             Request::CallCc => {
                 let continuation = prompts::capture(mc, task, prompts::default_tag(), true)?;
-                Then::Call(arg(0)?, Args::one(continuation))
+                Then::Call(arg(0)?, outer.pass(&[continuation])?)
             }
             Request::Compose => {
                 prompts::compose(mc, task, arg(0)?.downcast::<Continuation>(mc).ok_or(Fault::WrongType)?)?;
-                Then::Return(args.tail(mc, 1)?.values(mc)?)
+                args.skip(mc, 1)?.returned(mc)?
             }
             Request::WithHandler => outer.with_handler(arg(0)?, arg(1)?)?,
             Request::Raise => Then::Raise(arg(0)?, false),
             Request::RaiseContinuable => Then::Raise(arg(0)?, true),
             Request::Guard | Request::GuardQuiet => {
                 outer.guard(arg(1)?, false, self == Request::Guard)?;
-                Then::Call(arg(0)?, Args::none())
+                Then::Call(arg(0)?, Passed::none())
             }
-            Request::Resume => Then::Resume(arg(0)?, args.tail(mc, 1)?),
+            Request::Resume => Then::Resume(arg(0)?, args.skip(mc, 1)?),
             Request::TryResume => {
                 outer.guard(Value::FALSE, true, true)?;
-                Then::Resume(arg(0)?, args.tail(mc, 1)?)
+                Then::Resume(arg(0)?, args.skip(mc, 1)?)
             }
-            Request::Yield => Then::Yield(outer.values(args)?),
-            Request::KeywordApply => crate::keyword::apply(mc, arg(0)?, arg(1)?, arg(2)?, args.tail(mc, 3)?.spread_last(mc)?)?,
+            Request::Yield => Then::Yield(args),
+            Request::KeywordApply => crate::keyword::apply(mc, arg(0)?, arg(1)?, arg(2)?, args.skip(mc, 3)?.spread_last(mc)?)?,
         })
     }
 }

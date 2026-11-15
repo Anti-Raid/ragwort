@@ -1,6 +1,5 @@
 //! Ragwort's virtual machine: executes register-based bytecode using segmented stacks allocated in the garbage-collected arena.
 
-mod args;
 mod coroutine;
 mod equal;
 pub mod image;
@@ -11,6 +10,7 @@ mod machine;
 pub mod module;
 pub mod objects;
 mod op;
+mod passed;
 mod prompts;
 pub mod report;
 pub mod structs;

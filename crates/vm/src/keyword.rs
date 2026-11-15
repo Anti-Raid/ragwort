@@ -8,7 +8,7 @@ use ragwort_types::string::{self, Strings};
 use ragwort_types::symbol::Keyword;
 
 use crate::Fault;
-use crate::args::Args;
+use crate::passed::Passed;
 use crate::frame::Shape;
 use crate::machine::{Then, condition};
 use crate::objects::{BytecodeFields, Closure, ClosureFields, KeywordProcedure, KeywordProcedureFields};
@@ -31,7 +31,7 @@ pub fn signature<'gc>(mc: &Mutation<'gc>, callee: Value<'gc>) -> Option<(Vec<(Ke
 }
 
 /// Dispatches a call to keyword procedure `callee` when no keyword arguments are supplied, passing positional `args`.
-pub(crate) fn positional<'gc>(mc: &Mutation<'gc>, callee: Gc<'gc, KeywordProcedure>, args: Args<'gc>) -> Result<Then<'gc>, Fault> {
+pub(crate) fn positional<'gc>(mc: &Mutation<'gc>, callee: Gc<'gc, KeywordProcedure>, args: Passed<'gc>) -> Result<Then<'gc>, Fault> {
     match callee.plain(mc) {
         Value::FALSE => apply(mc, Value::object(mc, callee), Value::NIL, Value::NIL, args),
         plain => Ok(Then::Call(plain, args)),
@@ -39,7 +39,7 @@ pub(crate) fn positional<'gc>(mc: &Mutation<'gc>, callee: Gc<'gc, KeywordProcedu
 }
 
 /// Implements `(keyword-apply f kws vals arg ...)`: invokes `callee` with keyword arguments `kws` (which must be sorted and distinct) and corresponding values `vals`, followed by positional arguments `args`. Raises a keyword fault if an unexpected keyword is supplied or if a required keyword is missing.
-pub(crate) fn apply<'gc>(mc: &Mutation<'gc>, callee: Value<'gc>, kws: Value<'gc>, vals: Value<'gc>, args: Args<'gc>) -> Result<Then<'gc>, Fault> {
+pub(crate) fn apply<'gc>(mc: &Mutation<'gc>, callee: Value<'gc>, kws: Value<'gc>, vals: Value<'gc>, args: Passed<'gc>) -> Result<Then<'gc>, Fault> {
     let pairs = Pairs::new(mc);
     let mut given = Vec::new();
     for (kw, val) in pairs.elements(kws).zip(pairs.elements(vals)) {
@@ -74,7 +74,7 @@ pub(crate) fn apply<'gc>(mc: &Mutation<'gc>, callee: Value<'gc>, kws: Value<'gc>
         }
     }
     let list = pairs.list_with_tail(values, args.to_list(mc)?)?;
-    Ok(Then::Call(callee.core(mc), Args::list(list)))
+    Ok(Then::Call(callee.core(mc), Passed::list(list)))
 }
 
 fn raise<'gc>(mc: &Mutation<'gc>, message: &str, kw: Value<'gc>) -> Result<Then<'gc>, Fault> {

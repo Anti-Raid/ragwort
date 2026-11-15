@@ -493,7 +493,7 @@ fn apply_takes_lists_longer_than_a_frame() {
 fn calls_and_lambdas_of_any_size() {
     let symbols = |n| vec!["'a"; n].join(" ");
     let names = |n| (0..n).map(|i| format!("p{i}")).collect::<Vec<_>>().join(" ");
-    assert_eq!(eval(&format!("(%intrinsic values-length (%intrinsic values {}))", symbols(300))), "300");
+    assert_eq!(eval(&format!("(%intrinsic receive (%lambda xs (%intrinsic length xs)) (%lambda () (%intrinsic values {})))", symbols(300))), "300");
     assert_eq!(eval(&format!("(%app (%lambda xs xs) {})", symbols(300))).matches('a').count(), 300);
     let wide = format!("(%app (%lambda ({}) (%intrinsic cons p0 p299)) {})", names(300), (0..300).map(|i| format!("'s{i}")).collect::<Vec<_>>().join(" "));
     assert_eq!(eval(&wide), "(s0 . s299)");
@@ -513,7 +513,7 @@ fn apply_intrinsic_spreads_its_last_argument() {
     assert_eq!(eval("(%apply-intrinsic + '(1 2 3))"), "6");
     assert_eq!(eval("(%apply-intrinsic + 1 2 '(3 4))"), "10");
     assert_eq!(eval("(%apply-intrinsic cons 'a '(b))"), "(a . b)");
-    assert_eq!(eval("(%intrinsic values-length (%apply-intrinsic values 'a '(b c)))"), "3");
+    assert_eq!(eval("(%intrinsic receive (%lambda xs (%intrinsic length xs)) (%lambda () (%apply-intrinsic values 'a '(b c))))"), "3");
     assert_eq!(fault("(%apply-intrinsic cons 'a '(b c))"), Fault::Arity);
     assert_eq!(fault("(%apply-intrinsic + 1 'x)"), Fault::WrongType);
     let tag = "(%let ((tag (%intrinsic make-continuation-prompt-tag)))

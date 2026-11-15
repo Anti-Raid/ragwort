@@ -54,6 +54,8 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                     }
                 }
             }
+            (Macro::LetValues | Macro::LetStarValues, &[binds, ref body @ ..]) if !body.is_empty() => self.let_values(stx, kind == Macro::LetStarValues, binds, body),
+            (Macro::DefineValues, &[formals, init]) => self.define_values(stx, formals, init),
             (Macro::And, []) => self.value(Value::TRUE, stx),
             (Macro::And | Macro::Or, &[expr]) => Ok(expr),
             (Macro::And, &[expr, ref rest @ ..]) => {
@@ -149,6 +151,98 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let bind = self.list(&[temp, value], at)?;
         let binds = self.list(&[bind], at)?;
         self.build(at, "let", &[&[binds, body]])
+    }
+
+    /// `(call-with-values (lambda () init) (lambda formals body ...))`.
+    fn receiving(&mut self, at: Stx, formals: Stx, init: Stx, body: &[Stx]) -> Result<Stx, ExpandError> {
+        let none = self.list(&[], at)?;
+        let producer = self.build(at, "lambda", &[&[none, init]])?;
+        let consumer = self.build(at, "lambda", &[&[formals], body])?;
+        self.build(at, "call-with-values", &[&[producer, consumer]])
+    }
+
+    /// Formals of the same shape as `formals`, with a temporary in place of each variable, and
+    /// each variable with its temporary. `prefix` keeps the temporaries of one clause apart from
+    /// those of another.
+    fn temporaries(&mut self, formals: Stx, prefix: usize) -> Result<(Stx, Vec<(Stx, Stx)>), ExpandError> {
+        let (vars, tail) = match self.tree.view(formals)? {
+            View::Id => (Vec::new(), Some(formals)),
+            View::List(vars, tail) => (vars, tail),
+            _ => return Err(self.error(ExpandErrorKind::BadSyntax, formals)),
+        };
+        let mut pairs = Vec::with_capacity(vars.len() + 1);
+        for (position, &var) in vars.iter().chain(&tail).enumerate() {
+            if !self.is_id(var) {
+                return Err(self.error(ExpandErrorKind::BadSyntax, var));
+            }
+            pairs.push((var, self.introduce(&format!("t{prefix}-{position}"), var)?));
+        }
+        let temps: Vec<Stx> = pairs.iter().map(|&(_, temp)| temp).collect();
+        let span = self.tree.span(formals);
+        let shaped = match (tail, temps.split_last()) {
+            (Some(_), Some((&last, []))) if vars.is_empty() => last,
+            (Some(_), Some((&last, before))) => self.tree.list(before, Some(last), span)?,
+            _ => self.tree.list(&temps, None, span)?,
+        };
+        Ok((shaped, pairs))
+    }
+
+    /// `let-values` and `let*-values`. Each clause is a `call-with-values` whose consumer takes
+    /// the clause's formals.
+    ///
+    /// The clauses of `let*-values` nest, so each sees the variables before it. The inits of
+    /// `let-values` see none of its variables, so with several clauses the consumers take
+    /// temporaries and a `let` innermost binds the variables.
+    fn let_values(&mut self, stx: Stx, sequential: bool, binds: Stx, body: &[Stx]) -> Result<Stx, ExpandError> {
+        let mut clauses = Vec::new();
+        for bind in self.proper(binds)? {
+            let &[formals, init] = self.proper(bind)?.as_slice() else { return Err(self.error(ExpandErrorKind::BadSyntax, bind)) };
+            clauses.push((formals, init));
+        }
+        let none = self.list(&[], stx)?;
+        match *clauses.as_slice() {
+            [] => self.build(stx, "let", &[&[none], body]),
+            [(formals, init)] => self.receiving(stx, formals, init, body),
+            [(formals, init), ..] if sequential => {
+                let mut rest = Vec::with_capacity(clauses.len() - 1);
+                for &(formals, init) in &clauses[1..] {
+                    rest.push(self.list(&[formals, init], stx)?);
+                }
+                let rest = self.list(&rest, stx)?;
+                let inner = self.build(stx, "let*-values", &[&[rest], body])?;
+                self.receiving(stx, formals, init, &[inner])
+            }
+            _ => {
+                let (mut shaped, mut binds) = (Vec::with_capacity(clauses.len()), Vec::new());
+                for (prefix, &(formals, _)) in clauses.iter().enumerate() {
+                    let (formals, pairs) = self.temporaries(formals, prefix)?;
+                    shaped.push(formals);
+                    for (var, temp) in pairs {
+                        binds.push(self.list(&[var, temp], stx)?);
+                    }
+                }
+                let binds = self.list(&binds, stx)?;
+                let mut inner = self.build(stx, "let", &[&[binds], body])?;
+                for (&formals, &(_, init)) in shaped.iter().zip(&clauses).rev() {
+                    inner = self.receiving(stx, formals, init, &[inner])?;
+                }
+                Ok(inner)
+            }
+        }
+    }
+
+    /// `(begin (define var (void)) ... (call-with-values (lambda () init) (lambda temps (set! var temp) ... (void))))`.
+    fn define_values(&mut self, stx: Stx, formals: Stx, init: Stx) -> Result<Stx, ExpandError> {
+        let (shaped, pairs) = self.temporaries(formals, 0)?;
+        let void = self.build(stx, "void", &[])?;
+        let (mut forms, mut sets) = (Vec::with_capacity(pairs.len() + 1), Vec::with_capacity(pairs.len() + 1));
+        for (var, temp) in pairs {
+            forms.push(self.build(stx, "define", &[&[var, void]])?);
+            sets.push(self.build(stx, "set!", &[&[var, temp]])?);
+        }
+        sets.push(void);
+        forms.push(self.receiving(stx, shaped, init, &sets)?);
+        self.build(stx, "begin", &[&forms])
     }
 
     /// The variables and inits of `((var init) ...)`.

@@ -71,7 +71,9 @@ objects! {
     ///
     /// `body` contains the initial entry procedure before execution begins. `resumer` points to the task that resumed this one, while `resumed` points to any task currently resumed by it. While suspended, active stack frames reside on `segment` starting at `base` (or are preserved entirely within `chain`). `state` tracks whether the coroutine is pending, running, finished, or failed.
     ///
-    /// The machine's primary root task also tracks `idle` (the most recently suspended coroutine whose frames remain resident on their segment until another task suspends) and pre-allocated singleton sentinel values in `none`.
+    /// The machine's primary root task also tracks `idle` (the most recently suspended coroutine whose frames remain resident on their segment until another task suspends).
+    ///
+    /// `values` preserves the accumulator's list of values between run steps, as `acc` preserves the accumulator.
     pub struct Task {
         acc: Value,
         chain: Value,
@@ -84,7 +86,7 @@ objects! {
         resumer: Value,
         resumed: Value,
         idle: Value,
-        none: Value,
+        values: Value,
         segment: Member<Segment>,
         base: u32,
         state: u32,
@@ -98,8 +100,6 @@ objects! {
     } items Value
     /// A host reference wrapper passed to host procedures: contains arbitrary host `data` allocated outside the arena (dropped upon GC finalization) and a `held` garbage-collected value traced by the GC to preserve associated arena objects.
     pub struct ExternalRef { held: Value, data: Frozen<std::boxed::Box<dyn std::any::Any>> }
-    /// Represents multiple return values produced by `(values ...)` when returning zero or multiple (other than exactly one) values, unpacked by values intrinsics.
-    pub struct MultiValue {} items Value
     /// A procedure accepting keyword arguments (see [`crate::keyword`]): wraps a `core` procedure and an optional `plain` procedure, accompanied by sorted lists of accepted `keywords` and `required` keywords.
     pub struct KeywordProcedure { plain: Value, core: Value, keywords: Value, required: Value }
     /// Descriptor for a record structure type (see [`crate::structs`]):

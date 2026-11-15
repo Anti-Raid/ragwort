@@ -1,13 +1,12 @@
 
 use ragwort_types::gc::raw::Raw;
 use ragwort_types::gc::{Gc, Mutation, Root, Segment, Slots, Stack, Value, WINDOW};
-use ragwort_types::pair::Pairs;
+use ragwort_types::pair::{Pair, Pairs};
 
-use crate::args::Args;
-use crate::frame::{self, CLOSURE, Link};
-use crate::intrinsic::values;
+use crate::passed::Passed;
+use crate::frame::{self, ARGS, CLOSURE, Link};
 use crate::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Condition, ConditionFields, Continuation, KeywordProcedure, Native, NativeFields, Task, TaskFields};
-use crate::run::{self, Exit, HostThen, Regs, bind};
+use crate::run::{self, Exit, HostThen, MAX_ARGS, Regs, bind};
 use crate::segments::{CHUNK, Resume, Segments};
 use crate::module::Deferred;
 use crate::report::{self, Failure, Origin};
@@ -27,7 +26,7 @@ pub const SEGMENT: usize = 1 << 14;
 /// The outcome of executing a VM task run.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome<'gc> {
-    /// The task completed successfully and produced this return value.
+    /// The task completed successfully and produced this return value. If it returned several values, this is the first. If it returned none, this is void.
     Done(Value<'gc>),
     /// The task paused because a GC step became due (or fuel was exhausted); execution can resume in a
     /// subsequent run.
@@ -35,8 +34,8 @@ pub enum Outcome<'gc> {
     /// An unhandled exception or condition raised by the task, returned after executing all intervening
     /// `dynamic-wind` `after` thunks. For VM faults, this contains a `Condition` object.
     Raised(Value<'gc>),
-    /// The root task yielded these values directly via `co/yield` (rather than an inner resumed
-    /// coroutine). Can be resumed by calling [`Machine::resume`].
+    /// The root task yielded directly via `co/yield` (rather than an inner resumed coroutine). This is
+    /// the list of the values it yielded. Can be resumed by calling [`Machine::resume`].
     Yielded(Value<'gc>),
     /// A host function returned [`Reply::Defer`](crate::Reply::Defer), suspending execution. Resumed by
     /// calling [`Machine::reply`] with the result or [`Machine::raise`] to raise an exception at the
@@ -77,8 +76,8 @@ impl Machine {
         let segment = segment.max(MIN_SEGMENT);
         let mut stack = mc.stack(Segment::new(mc, segment)?)?;
         let task = coroutine::root(mc)?;
-        let mut regs = Regs { fp: 0, pc: 0, acc: Value::VOID, code: None };
-        Outer::new(mc, &mut stack, task, task, &mut regs, segment).start(procedure, args_of(mc, args)?)?;
+        let mut regs = Regs { fp: 0, pc: 0, acc: Value::VOID, values: Value::NIL, code: None };
+        Outer::new(mc, &mut stack, task, task, &mut regs, segment).begin(procedure, args)?;
         let mut machine = Machine { stack, task: Root::new(mc, task)?, fp: 0, pc: 0, segment, fuel: u64::MAX, finished: false, waiting: Waiting::No };
         machine.save(mc, task, &regs);
         Ok(machine)
@@ -95,9 +94,8 @@ impl Machine {
         let task = coroutine::root(mc)?;
         let last = self.task.get(mc).expect("a machine runs in its own arena");
         task.set_idle(mc, last.idle(mc));
-        task.set_none(mc, last.none(mc));
-        let mut regs = Regs { fp: 0, pc: 0, acc: Value::VOID, code: None };
-        Outer::new(mc, &mut self.stack, task, task, &mut regs, self.segment).start(procedure, args_of(mc, args)?)?;
+        let mut regs = Regs { fp: 0, pc: 0, acc: Value::VOID, values: Value::NIL, code: None };
+        Outer::new(mc, &mut self.stack, task, task, &mut regs, self.segment).begin(procedure, args)?;
         (self.task, self.finished, self.waiting) = (Root::new(mc, task)?, false, Waiting::No);
         self.save(mc, task, &regs);
         Ok(())
@@ -122,7 +120,7 @@ impl Machine {
             return Err(Fault::Finished);
         }
         let mut task = coroutine::current(mc, self.task.get(mc).expect("a machine runs in its own arena"));
-        let mut regs = Regs { fp: self.fp, pc: self.pc, acc: task.acc(mc), code: None };
+        let mut regs = Regs { fp: self.fp, pc: self.pc, acc: task.acc(mc), values: task.values(mc), code: None };
         let mut fuel = Fuel { run: self.fuel, rest: 0 };
         let outcome = match self.drive(mc, &mut task, &mut regs, &mut fuel) {
             Ok(Outcome::Paused) if fuel.left() == 0 => Err(Fault::OutOfFuel),
@@ -146,7 +144,12 @@ impl Machine {
     /// Resumes a machine that suspended via `co/yield`, passing `args` as the return value of the yield
     /// expression. Returns `Err(Fault::NotPending)` if the machine is not waiting on a yield.
     pub fn resume<'gc>(&mut self, mc: &Mutation<'gc>, args: &[Value<'gc>]) -> Result<Outcome<'gc>, Fault> {
-        self.answer(mc, Waiting::Yield, values(mc, args.iter().copied())?)?;
+        let (acc, values) = match *args {
+            [value] => (value, Value::NIL),
+            _ => (Value::VALUES, Pairs::new(mc).list(args)?),
+        };
+        self.answer(mc, Waiting::Yield, acc)?;
+        coroutine::current(mc, self.task.get(mc).expect("a machine runs in its own arena")).set_values(mc, values);
         self.run(mc)
     }
 
@@ -181,6 +184,7 @@ impl Machine {
     fn save<'gc>(&mut self, mc: &Mutation<'gc>, task: Gc<'gc, Task>, regs: &Regs<'gc>) {
         (self.fp, self.pc) = (regs.fp, regs.pc);
         task.set_acc(mc, regs.acc);
+        task.set_values(mc, regs.values);
         let len = self.stack.segment(mc).len(mc);
         self.stack.set_top((regs.fp + WINDOW).min(len));
     }
@@ -215,15 +219,6 @@ impl Machine {
     }
 }
 
-fn args_of<'gc>(mc: &Mutation<'gc>, args: &[Value<'gc>]) -> Result<Args<'gc>, Fault> {
-    Ok(match *args {
-        [] => Args::none(),
-        [value] => Args::one(value),
-        [first, second] => Args::two(first, second),
-        _ => Args::list(Pairs::new(mc).list(args)?),
-    })
-}
-
 /// What the outer loop holds responsible for a fault, which determines what the raised condition reports.
 enum Blame<'gc> {
     /// The fault did not come from an identifiable operation.
@@ -242,19 +237,23 @@ pub(crate) type Step<'gc> = Result<Option<Outcome<'gc>>, Fault>;
 /// continuation modifications.
 pub(crate) enum Then<'gc> {
     /// Calls the specified procedure with arguments, returning to the current continuation.
-    Call(Value<'gc>, Args<'gc>),
+    Call(Value<'gc>, Passed<'gc>),
     /// Returns the given value to the current continuation.
     Return(Value<'gc>),
+    /// Returns the values in the given proper list to the current continuation.
+    ReturnValues(Value<'gc>),
+    /// Returns what the accumulator already holds to the current continuation.
+    Forward,
     /// Resumes the specified coroutine with arguments.
-    Resume(Value<'gc>, Args<'gc>),
+    Resume(Value<'gc>, Passed<'gc>),
     /// Raises an exception value, indicating whether execution resumes with the handler's return value
     /// (continuable).
     Raise(Value<'gc>, bool),
     /// An uncaught exception value, indicating whether all `dynamic-wind` `after` thunks have already
     /// run.
     Uncaught(Value<'gc>, bool),
-    /// Yields the given value from the currently executing coroutine.
-    Yield(Value<'gc>),
+    /// Yields the given values from the currently executing coroutine.
+    Yield(Passed<'gc>),
 }
 
 /// State for the outer execution loop between inner loop invocations, providing access to the stack,
@@ -318,7 +317,7 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         match blame {
             Blame::Instruction => {
                 let (Some(code), Ok(frame)) = (self.regs.code, self.segments.frame(self.regs.fp)) else { return Ok(Origin { operation: None, irritants: Value::NIL }) };
-                report::origin(mc, frame, code, self.regs.pc, fault)
+                report::origin(mc, frame, code, self.regs.pc, self.regs.values, fault)
             }
             Blame::Callee(callee) => Ok(Origin { operation: None, irritants: Pairs::new(mc).cons(callee, Value::NIL)?.value(mc) }),
             Blame::Nothing => Ok(Origin { operation: None, irritants: Value::NIL }),
@@ -376,15 +375,33 @@ impl<'a, 'gc> Outer<'a, 'gc> {
     /// Executes `request` using arguments starting at register `base` (spreading the final argument as a
     /// list if `spread` is set), while preserving registers beyond the retained continuation.
     fn request(&mut self, base: u8, args: u8, request: Request, spread: bool, tail: bool) -> Step<'gc> {
-        let mut args = Args::slots(self.registers(base, args)?, Value::NIL);
+        let mc = self.mc();
+        let (mut count, mut rest) = (args, Value::NIL);
         if spread {
-            args = args.spread_last(self.mc())?;
-            if !request.takes(args.len(self.mc())?) {
+            // The last register holds the list of the operands after the ones in registers.
+            count -= 1;
+            rest = self.registers(base, args)?.get(usize::from(count));
+            let listed = Pairs::new(mc).list_len(rest).ok_or(Fault::WrongType)?;
+            if !usize::try_from(listed).is_ok_and(|listed| request.takes(usize::from(count) + listed)) {
                 return Err(Fault::Arity);
             }
+            // The request reads its own operands from registers, so any that are in the list move out of it.
+            let frame = self.segments.frame(self.regs.fp)?;
+            while usize::from(count) < request.fixed() {
+                let cell = Pair::of(rest).ok_or(Fault::Malformed)?;
+                if usize::from(base) + usize::from(count) >= WINDOW {
+                    return Err(Fault::Malformed);
+                }
+                frame.set(base + count, cell.head(mc));
+                (count, rest) = (count + 1, cell.tail(mc));
+            }
         }
-        self.keep(base, tail)?;
-        let then = request.run(self, args)?;
+        let args = Passed::slots(self.registers(base, count)?, rest);
+        // An abort saves the caller's frames itself, and only when it has to.
+        if request != Request::Abort {
+            self.keep(base, tail)?;
+        }
+        let then = request.run(self, args, base, tail)?;
         self.then(then)
     }
 
@@ -392,7 +409,7 @@ impl<'a, 'gc> Outer<'a, 'gc> {
     /// and elements of `rest` as arguments.
     fn call(&mut self, base: u8, argc: u8, rest: Value<'gc>, tail: bool) -> Step<'gc> {
         let slots = self.registers(base, argc + 1)?;
-        let args = Args::slots(slots.slice(1..slots.len()).ok_or(Fault::Malformed)?, rest);
+        let args = Passed::slots(slots.slice(1..slots.len()).ok_or(Fault::Malformed)?, rest);
         self.keep(base, tail)?;
         self.then(Then::Call(slots.get(0), args))
     }
@@ -413,6 +430,11 @@ impl<'a, 'gc> Outer<'a, 'gc> {
                 self.regs.acc = value;
                 self.resume()
             }
+            Then::ReturnValues(list) => {
+                self.regs.set_values(self.mc(), list);
+                self.resume()
+            }
+            Then::Forward => self.resume(),
             Then::Resume(co, args) => self.resume_coroutine(co, args),
             Then::Raise(obj, continuable) => self.raise(obj, continuable),
             Then::Uncaught(obj, unwound) => self.uncaught(obj, unwound),
@@ -422,7 +444,7 @@ impl<'a, 'gc> Outer<'a, 'gc> {
 
     /// Applies `procedure` to `args`. For a closure, establishes a new bottom frame; for a continuation,
     /// unwinds and rewinds intervening winders before resuming with the provided arguments.
-    fn apply(&mut self, procedure: Value<'gc>, args: Args<'gc>) -> Step<'gc> {
+    fn apply(&mut self, procedure: Value<'gc>, args: Passed<'gc>) -> Step<'gc> {
         if let Some(continuation) = procedure.downcast::<Continuation>(self.mc()) {
             let then = self.go_to(continuation, args)?;
             return self.then(then);
@@ -485,12 +507,12 @@ impl<'a, 'gc> Outer<'a, 'gc> {
                 task.set_chain(mc, native.next(mc));
                 task.set_attachments(mc, native.attachments(mc));
                 match self.native(native)? {
-                    Then::Return(value) => {
-                        self.regs.acc = value;
-                        continue;
-                    }
+                    Then::Return(value) => self.regs.acc = value,
+                    Then::ReturnValues(list) => self.regs.set_values(mc, list),
+                    Then::Forward => {}
                     then => return self.then(then),
                 }
+                continue;
             }
             if let Some(Resume { fp, pc }) = self.segments.underflow()? {
                 (self.regs.fp, self.regs.pc) = (fp, pc);
@@ -500,24 +522,44 @@ impl<'a, 'gc> Outer<'a, 'gc> {
             if prompts::pop(mc, task)? {
                 continue;
             }
-            let Some(to) = coroutine::of(mc, task.resumer(mc)) else { return Ok(Some(Outcome::Done(self.regs.acc))) };
+            let Some(to) = coroutine::of(mc, task.resumer(mc)) else { return Ok(Some(Outcome::Done(self.regs.first(mc)))) };
             self.end(task, coroutine::FINISHED, to)?;
         }
     }
 
+    /// Starts a machine's first call: `procedure` with `args`.
+    fn begin(&mut self, procedure: Value<'gc>, args: &[Value<'gc>]) -> Result<(), Fault> {
+        let passed = if args.len() <= MAX_ARGS { self.pass(args)? } else { Passed::list(Pairs::new(self.mc()).list(args)?) };
+        self.start(procedure, passed)
+    }
+
     /// Sets up the initial stack frame at the base of the stack and binds `args` to enter closure
     /// `procedure`.
-    fn start(&mut self, procedure: Value<'gc>, mut args: Args<'gc>) -> Result<(), Fault> {
+    fn start(&mut self, procedure: Value<'gc>, args: Passed<'gc>) -> Result<(), Fault> {
         let mc = self.mc();
-        let fp = if self.segments.fits(0) {
+        let held = args.held();
+        let argc = u8::try_from(held.map_or(0, Slots::len)).ok().filter(|&count| usize::from(count) <= MAX_ARGS).ok_or(Fault::Malformed)?;
+        let fp = if args.placed {
             self.segments.stack.base()
+        } else if self.segments.fits(0) {
+            let fp = self.segments.stack.base();
+            if let Some(slots) = held
+                && !self.segments.stack.write(mc, fp + usize::from(ARGS), slots)
+            {
+                return Err(Fault::Malformed);
+            }
+            fp
         } else {
-            args = args.detach(mc)?;
-            self.segments.bottom(0)?
+            // The slots are cleared when the stack moves to a new segment, so the values are copied out first.
+            let saved: Vec<Value<'gc>> = held.map_or(Vec::new(), |slots| (0..slots.len()).map(|i| slots.get(i)).collect());
+            let fp = self.segments.bottom(0)?;
+            let frame = self.segments.frame(fp)?;
+            for (register, value) in (ARGS..).zip(saved) {
+                frame.set(register, value);
+            }
+            fp
         };
-        let (stack, frame) = (&*self.segments.stack, self.segments.frame(fp)?);
-        let argc = args.write(mc, stack, frame, fp)?;
-        frame.set(CLOSURE, procedure);
+        self.segments.frame(fp)?.set(CLOSURE, procedure);
         self.enter(fp, argc, args.rest, Link::BOTTOM)
     }
 

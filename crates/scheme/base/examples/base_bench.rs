@@ -183,7 +183,8 @@ fn main() {
     println!("command by match:              {:.1} ns per iteration", per(time(&command(matched), false, true)));
     println!("command by cond:               {:.1} ns per iteration", per(time(&command(by_hand), false, true)));
     let defs = "(define (pf a b) (+ a b)) (define (of a [b 1]) (+ a b)) (define (kf a #:b [b 1]) (+ a b))
-                (define kv (let ([f (lambda (a #:b [b 1]) (+ a b))]) f))";
+                (define kv (let ([f (lambda (a #:b [b 1]) (+ a b))]) f)) (define ap (car (list apply)))
+                (define two (car (list (lambda (a) (values a 1)))))";
     let summing = |call: &str| format!("{defs} (define (count n acc) (if (eqv? n 0) acc (count (- n 1) (+ acc {call})))) (count {N} 0)");
     for (name, call) in [
         ("positional call", "(pf n 1)"),
@@ -191,6 +192,10 @@ fn main() {
         ("keyword, direct to the core", "(kf n #:b 1)"),
         ("keyword, matched at run time", "(kv n #:b 1)"),
         ("keyword procedure, no keywords", "(kv n)"),
+        ("apply through a variable", "(ap pf (list n 1))"),
+        ("apply through a variable, one leading", "(ap pf n '(1))"),
+        ("call-with-values of 2", "(call-with-values (lambda () (values n 1)) pf)"),
+        ("call-with-values through a call", "(call-with-values (lambda () (two n)) pf)"),
     ] {
         println!("{name:<30} {:.1} ns per iteration", per(time(&summing(call), false, true)));
     }
@@ -219,6 +224,8 @@ fn main() {
     each("guard, nothing raised:", "(guard (e (#t e)) n)");
     each("guard catching a VM fault:", "(guard (e (#t e)) (car n))");
     each("call-with-mark:", "(call-with-mark 'k n (lambda () (mark-value 'k #f)))");
+    each("mark set in tail position:", "(call-with-mark 'k n (lambda () (with-continuation-mark 'k 1 (mark-value 'k #f))))");
+    each("abort to a prompt:", "(call-with-continuation-prompt (lambda () (abort-current-continuation (default-continuation-prompt-tag) n)) (default-continuation-prompt-tag) (lambda (x) x))");
     each("dynamic-wind, nothing raised:", "(dynamic-wind (lambda () 1) (lambda () n) (lambda () 2))");
     each("call/cc escape:", "(call/cc (lambda (k) (k n)))");
     each("call/cc escape from a wind:", "(call/cc (lambda (k) (dynamic-wind (lambda () 1) (lambda () (k n)) (lambda () 2))))");

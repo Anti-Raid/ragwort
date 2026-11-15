@@ -25,7 +25,7 @@ use crate::hash::{HashMap, HashSet};
 
 use ragwort_types::gc::{Gc, Mutation, Value};
 use ragwort_vm::objects::{StructType, StructTypeFields};
-use ragwort_vm::{Fuel, Intrinsic, Purity, structs};
+use ragwort_vm::{Fuel, Intrinsic, Purity, Request, structs};
 
 use crate::ir::{Origins, Supply};
 use crate::ir::l2::{Bind, Fun, Function, Id, L2, Node, Span};
@@ -80,6 +80,7 @@ pub(crate) fn optimize<'s, 'd, 'gc>(mc: &Mutation<'gc>, src: &mut L2<'s, 'gc>, r
         small_bodies: Vec::new(),
         next_small: false,
         small_funcs: HashMap::default(),
+        lone_funcs: HashMap::default(),
         known_pairs: HashMap::default(),
         known_structs: HashMap::default(),
         derived: HashMap::default(),
@@ -230,6 +231,8 @@ struct Cp0<'m, 't, 's, 'd, 'gc> {
     next_small: bool,
     /// Small, unassigned, leaf lambdas (containing no nested lambdas) eligible for inlining via cloning at call sites.
     small_funcs: HashMap<Var, Fun<'d>>,
+    /// Unassigned variables bound to a lambda and referenced exactly once, each with its function and the index of the `let` frame that holds its binding. A rule that takes the function's body removes the binding.
+    lone_funcs: HashMap<Var, (Fun<'d>, usize)>,
     /// Unassigned variables bound to `(cons a b)` where `a` and `b` are constants or unassigned variables.
     /// Because pairs are immutable, car and cdr accesses throughout the variable's scope resolve directly to `a` and `b`.
     known_pairs: HashMap<Var, [Node<'d, 'gc>; 2]>,
@@ -405,6 +408,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                 for &bind in &frame.kept {
                     for var in self.out.vars(bind) {
                         self.small_funcs.remove(&var);
+                        self.lone_funcs.remove(&var);
                     }
                 }
                 self.finish_let(frame.kept, body)
@@ -689,7 +693,14 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                     self.subst.insert(var, Subst::Var(aliased));
                     return;
                 }
-                Node::Lambda(fun) if self.inline_depth < MAX_INLINE_DEPTH && self.is_small_inlinable(fun) => _ = self.small_funcs.insert(var, fun),
+                Node::Lambda(fun) => {
+                    if self.uses.get(&var).is_some_and(|stats| stats.total == 1) {
+                        self.lone_funcs.insert(var, (fun, self.lets.len() - 1));
+                    }
+                    if self.inline_depth < MAX_INLINE_DEPTH && self.is_small_inlinable(fun) {
+                        self.small_funcs.insert(var, fun);
+                    }
+                }
                 Node::Intrinsic(Prim::Intrinsic(Intrinsic::Cons), parts) if self.out[parts].iter().all(|&part| self.copyable(part)) => {
                     let parts = [self.out[self.out[parts][0]], self.out[self.out[parts][1]]];
                     self.known_pairs.insert(var, parts);
@@ -903,7 +914,116 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         then.extend(wraps.into_iter().rev());
     }
 
+    /// Optimizes `(receive consumer producer)` when the producer is a lambda of no parameters whose body shows what it returns.
+    ///
+    /// - A body `(values e ...)`, and a body that returns exactly one value, pass those values to the consumer directly: `(consumer e ...)`.
+    /// - A body that is a call `(f a ...)` becomes `(receive consumer f a ...)`, which calls `f` without creating the producer.
+    ///
+    /// Bindings and effects around the end of the body move outside the new expression. The consumer must be a lambda, a variable or a constant, so that evaluating it later is not observable.
+    fn receive(&mut self, args: Vec<Id<'d>>) -> Id<'d> {
+        let prim = Prim::Request(Request::Receive);
+        let direct = match *args.as_slice() {
+            [consumer, producer] if matches!(self.out[consumer], Node::Lambda(_) | Node::Ref(_) | Node::Quote(_)) => self.lambda(producer).and_then(|fun| {
+                let function = self.out[fun];
+                if self.out[function.params].is_empty() && function.rest.is_none() { Some((consumer, producer, function.body)) } else { None }
+            }),
+            _ => None,
+        };
+        // The rules below take the producer's body. They apply only to a body whose end is one of the forms they know.
+        let end = direct.map(|(_, _, mut end)| {
+            while let Node::Seq(_, inner) | Node::Let(_, inner) = self.out[end] {
+                end = inner;
+            }
+            self.out[end]
+        });
+        let known = matches!(end, Some(Node::Quote(_) | Node::Ref(_) | Node::Lambda(_) | Node::Set(..) | Node::App(..) | Node::Intrinsic(Prim::Intrinsic(_) | Prim::Slot(..), _)));
+        let Some((consumer, producer, mut body)) = direct.filter(|_| known) else {
+            let args = self.out.list(args);
+            self.ran(prim);
+            return self.out.add(Node::Intrinsic(prim, args));
+        };
+        self.taken(producer);
+        let mut wraps = Vec::new();
+        loop {
+            match self.out[body] {
+                Node::Seq(prefix, inner) => {
+                    wraps.push(Task::Then(prefix));
+                    body = inner;
+                }
+                Node::Let(binds, inner) => {
+                    wraps.push(Task::Within(binds));
+                    body = inner;
+                }
+                _ => break,
+            }
+        }
+        let mut made = match self.out[body] {
+            Node::Intrinsic(Prim::Intrinsic(Intrinsic::Values), values) => {
+                let values = self.out[values].to_vec();
+                self.pass(consumer, values)
+            }
+            Node::Quote(_) | Node::Ref(_) | Node::Lambda(_) | Node::Set(..) | Node::Intrinsic(Prim::Intrinsic(_) | Prim::Slot(..), _) => self.pass(consumer, vec![body]),
+            Node::App(function, passed) => {
+                let mut all = vec![consumer, function];
+                all.extend_from_slice(&self.out[passed]);
+                let all = self.out.list(all);
+                self.ran(prim);
+                self.out.add(Node::Intrinsic(prim, all))
+            }
+            _ => unreachable!("the end of the body was checked"),
+        };
+        for wrap in wraps.into_iter().rev() {
+            made = match wrap {
+                Task::Then(prefix) => self.seq(prefix, made),
+                Task::Within(binds) => {
+                    if self.out[binds].is_empty() { made } else { self.out.add(Node::Let(binds, made)) }
+                }
+                _ => unreachable!("only binding forms float out"),
+            };
+        }
+        made
+    }
+
+    /// Returns the function of `expr` if it is a lambda, or a variable that is bound to a lambda and referenced only here.
+    fn lambda(&self, expr: Id<'d>) -> Option<Fun<'d>> {
+        match self.out[expr] {
+            Node::Lambda(fun) => Some(fun),
+            Node::Ref(var) => self.lone_funcs.get(&var).map(|&(fun, _)| fun),
+            _ => None,
+        }
+    }
+
+    /// Records that a rule took the body of the function [`lambda`](Self::lambda) found for `expr`. If `expr` is a variable, its binding goes, because the body now has another place.
+    fn taken(&mut self, expr: Id<'d>) {
+        let Node::Ref(var) = self.out[expr] else { return };
+        let Some((_, frame)) = self.lone_funcs.remove(&var) else { return };
+        self.small_funcs.remove(&var);
+        self.lets[frame].kept.retain(|bind| !matches!(bind, Bind::Val(bound, _) if *bound == var));
+    }
+
+    /// Builds the call of `consumer` on `values`. A consumer that is a lambda of exactly that many parameters is not called: its parameters are bound to the values around its body.
+    fn pass(&mut self, consumer: Id<'d>, values: Vec<Id<'d>>) -> Id<'d> {
+        if let Some(fun) = self.lambda(consumer) {
+            let function = self.out[fun];
+            if function.optional == 0 && function.rest.is_none() && self.out[function.params].len() == values.len() {
+                self.taken(consumer);
+                if values.is_empty() {
+                    return function.body;
+                }
+                let params = self.out[function.params].to_vec();
+                let binds = self.out.list(params.into_iter().zip(values).map(|(param, value)| Bind::Val(param, value)));
+                return self.out.add(Node::Let(binds, function.body));
+            }
+        }
+        let values = self.out.list(values);
+        self.slot_derived.clear();
+        self.out.add(Node::App(consumer, values))
+    }
+
     fn opt_intrinsic(&mut self, prim: Prim, mut args: Vec<Id<'d>>) -> Id<'d> {
+        if prim == Prim::Request(Request::Receive) {
+            return self.receive(args);
+        }
         let Prim::Intrinsic(intrinsic) = prim else {
             let args = self.out.list(args);
             self.ran(prim);

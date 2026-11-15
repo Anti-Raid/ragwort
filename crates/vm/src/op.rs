@@ -4,7 +4,7 @@ use ragwort_types::{Error, Wire, named};
 use ragwort_types::gc::{Frame, Gc, Mutation, OutOfMemory, Slots, Value, WINDOW};
 use ragwort_types::constant::Constants;
 use ragwort_types::num::NumError;
-use ragwort_types::pair::Pair;
+use ragwort_types::pair::{Pair, Pairs};
 use ragwort_types::string::StrError;
 
 use crate::frame::CLOSURE;
@@ -37,10 +37,22 @@ named! {
         Call { base: u8, args: u8 } = "call",
         /// Performs a tail call to the procedure in register `base` with `args` arguments, shifting arguments down into the current frame window. The existing return link is preserved so the callee returns directly to the current caller.
         TailCall { base: u8, args: u8 } = "tail-call",
+        /// Calls the procedure in register `base` with the values the last call returned, which are in the accumulator. One value becomes the only argument, in register `base + 1`. Emitted after the call to the producer of a `call-with-values`.
+        CallReceived { base: u8 } = "call-received",
+        /// Tail-call variant of `CallReceived`: the procedure returns directly to the current caller.
+        TailCallReceived { base: u8 } = "tail-call-received",
         /// Copies register `src` into the accumulator and returns control to the caller.
         Return { src: u8 } = "return",
-        /// Loads the return value currently in the accumulator into register `dst`.
+        /// Loads the return value currently in the accumulator into register `dst`. Fails with [`Fault::ValueCount`] unless the accumulator holds exactly one value.
         LoadAcc { dst: u8 } = "load-acc",
+        /// Loads the values in the accumulator into register `dst` as a list, however many there are. Emitted after the call to the producer of a `collect`.
+        LoadValues { dst: u8 } = "load-values",
+        /// Returns control to the caller with the accumulator as it is. The caller receives what the last call or operation returned, however many values that is.
+        ReturnReceived = "return-received",
+        /// Returns the values in `count` registers starting at `src` to the caller. This is `(values x ...)` in tail position. Any number of values other than one is returned as a list beside the accumulator, which only a receiving call or another return takes.
+        ReturnValues { src: u8, count: u8 } = "return-values",
+        /// Returns values as `ReturnValues` does, like `apply`: the values are those in the `args - 1` registers starting at `base`, followed by the elements of the list in the last of the `args` registers.
+        ReturnSpread { base: u8, args: u8 } = "return-spread",
         /// Loads upvalue `index` of the current closure into register `dst`. Upvalues are populated upon closure creation; mutable variables are captured within indirection boxes accessed via box intrinsics.
         LoadUpvalue { dst: u8, index: u32 } = "load-upvalue",
         /// Instantiates `count` closures from bytecode objects in constant pool indices `code..code + count` into registers `dst..dst + count`, then initializes each closure's upvalues according to its capture list. All closures are allocated before initializing upvalues, allowing mutually recursive procedures (such as from `letrec`) to capture each other via register references.
@@ -115,7 +127,50 @@ pub struct Context<'s, 'gc> {
     /// Captured upvalues belonging to the currently executing closure.
     pub upvalues: Slots<'gc>,
     pub acc: Value<'gc>,
+    /// The list of values the last call returned, when `acc` is [`Value::VALUES`].
+    pub values: Value<'gc>,
     pub fuel: Fuel,
+}
+
+impl<'gc> Context<'_, 'gc> {
+    /// Loads the values in the accumulator into register `dst` as a list. Kept out of line, like [`Context::set_values`], so that the instruction loop stays small.
+    #[inline(never)]
+    fn load_values(&mut self, dst: u8) -> Result<(), Fault> {
+        let mc = self.mc;
+        let list = if self.acc == Value::VALUES {
+            std::mem::replace(&mut self.values, Value::NIL)
+        } else {
+            Pairs::new(mc).cons(self.acc, Value::NIL)?.value(mc)
+        };
+        self.frame.set(dst, list);
+        if mc.step_due() {
+            self.fuel.pause();
+        }
+        Ok(())
+    }
+
+    /// Puts the values of `count` registers from `first`, followed by the elements of the proper list `rest`, into the accumulator. Exactly one value goes there as it is. Any other number goes there as a list.
+    #[inline(never)]
+    fn set_values(&mut self, first: u8, count: u8, rest: Value<'gc>) -> Result<(), Fault> {
+        let (mc, frame) = (self.mc, self.frame);
+        if count == 1 && rest == Value::NIL {
+            self.acc = frame.get(first);
+            return Ok(());
+        }
+        let pairs = Pairs::new(mc);
+        let mut list = rest;
+        for i in (0..count).rev() {
+            list = pairs.cons(frame.get(first + i), list)?.value(mc);
+        }
+        match Pair::of(list) {
+            Some(cell) if cell.tail(mc) == Value::NIL => self.acc = cell.head(mc),
+            _ => (self.acc, self.values) = (Value::VALUES, list),
+        }
+        if mc.step_due() {
+            self.fuel.pause();
+        }
+        Ok(())
+    }
 }
 
 /// Tracks remaining execution fuel for cooperative multitasking and bounded execution: calls and branches consume one unit from `run`, pausing execution when exhausted. Computationally heavy intrinsics deduct from `run` and then `rest`. Pausing execution (e.g. for GC step cycles) transfers remaining `run` fuel to `rest`.
@@ -156,6 +211,8 @@ pub enum Control {
     /// Transfers control to a procedure call starting at register `base` with `args` arguments.
     Call { base: u8, args: u8 },
     TailCall { base: u8, args: u8 },
+    /// Calls the procedure in register `base` with the values in the accumulator, as a tail call if `tail` is set.
+    CallReceived { base: u8, tail: bool },
     /// Dispatches a control operation `request` with `args` argument registers starting at `base`, unpacking trailing list elements if `spread` is true.
     CallRequest { base: u8, args: u8, request: Request, spread: bool },
     TailCallRequest { base: u8, args: u8, request: Request, spread: bool },
@@ -197,13 +254,15 @@ pub enum Fault {
     Syntax,
     /// Keyword argument error: an unsupported keyword was supplied or a required keyword parameter was omitted.
     Keyword,
+    /// A place that takes exactly one value was given none or several, as in `(+ 1 (values 2 3))`.
+    ValueCount,
     Num(NumError),
     Str(StrError),
 }
 
 impl Fault {
     /// String names corresponding to fault kind codes, matching Scheme's `error-object-kind`.
-    pub const KINDS: [&str; 20] = [
+    pub const KINDS: [&str; 21] = [
         "malformed",
         "out-of-memory",
         "wrong-type",
@@ -224,10 +283,11 @@ impl Fault {
         "syntax",
         "keyword",
         "not-utf8",
+        "value-count",
     ];
 
     /// A short description of each fault kind, indexed as [`Fault::KINDS`] is. An error report shows it after the name of the failed operation, as in `car: wrong type of argument: 5`.
-    pub const MESSAGES: [&str; 20] = [
+    pub const MESSAGES: [&str; 21] = [
         "malformed bytecode",
         "out of memory",
         "wrong type of argument",
@@ -248,6 +308,7 @@ impl Fault {
         "bad syntax",
         "bad keyword argument",
         "invalid UTF-8",
+        "wrong number of values",
     ];
 
     /// Returns the short description of this fault from [`Fault::MESSAGES`].
@@ -278,6 +339,7 @@ impl Fault {
             Fault::Syntax => 17,
             Fault::Keyword => 18,
             Fault::Str(StrError::NotUtf8) => 19,
+            Fault::ValueCount => 20,
         }
     }
 
@@ -342,11 +404,38 @@ impl Op {
             }
             Op::Call { base, args } => return Ok(Control::Call { base, args }),
             Op::TailCall { base, args } => return Ok(Control::TailCall { base, args }),
+            Op::CallReceived { base } => return Ok(Control::CallReceived { base, tail: false }),
+            Op::TailCallReceived { base } => return Ok(Control::CallReceived { base, tail: true }),
             Op::Return { src } => {
                 cx.acc = frame.get(src);
                 return Ok(Control::Return);
             }
-            Op::LoadAcc { dst } => frame.set(dst, cx.acc),
+            Op::LoadAcc { dst } => {
+                if cx.acc == Value::VALUES {
+                    return Err(Fault::ValueCount);
+                }
+                frame.set(dst, cx.acc);
+            }
+            Op::LoadValues { dst } => cx.load_values(dst)?,
+            Op::ReturnReceived => return Ok(Control::Return),
+            Op::ReturnValues { src, count } => {
+                if usize::from(src) + usize::from(count) > WINDOW {
+                    return Err(Fault::Malformed);
+                }
+                cx.set_values(src, count, Value::NIL)?;
+                return Ok(Control::Return);
+            }
+            Op::ReturnSpread { base, args } => {
+                if args == 0 || usize::from(base) + usize::from(args) > WINDOW {
+                    return Err(Fault::Malformed);
+                }
+                let rest = frame.get(base + args - 1);
+                if !Pairs::new(mc).is_list(rest) {
+                    return Err(Fault::WrongType);
+                }
+                cx.set_values(base, args - 1, rest)?;
+                return Ok(Control::Return);
+            }
             Op::LoadUpvalue { dst, index } => {
                 let index = index as usize;
                 if index >= cx.upvalues.len() {

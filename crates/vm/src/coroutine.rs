@@ -20,11 +20,13 @@
 
 use ragwort_types::gc::raw::Raw;
 use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Segment, Value, WINDOW};
+use ragwort_types::pair::Pairs;
 
-use crate::args::Args;
-use crate::intrinsic::values;
+use crate::passed::Passed;
 use crate::machine::{Outer, Step, Then};
-use crate::objects::{Frames, FramesFields, Native, NativeFields, Task, TaskFields};
+use crate::prompts;
+use crate::segments::records;
+use crate::objects::{Frames, FramesFields, Task, TaskFields};
 use crate::{Fault, Outcome};
 
 /// The initial capacity allocated for a coroutine's first stack segment: accommodates one frame window
@@ -77,13 +79,14 @@ fn give<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, segment: Gc<'gc, Segment>)
 impl<'gc> Outer<'_, 'gc> {
     /// Resumes coroutine `co` with arguments `args` (implementing `co/resume`), assuming the caller's
     /// continuation has already been saved to its chain.
-    pub(crate) fn resume_coroutine(&mut self, co: Value<'gc>, args: Args<'gc>) -> Step<'gc> {
+    pub(crate) fn resume_coroutine(&mut self, co: Value<'gc>, args: Passed<'gc>) -> Step<'gc> {
         let mc = self.mc();
         let co = of(mc, co).ok_or(Fault::WrongType)?;
         if co.state(mc) != PENDING {
             return Err(Fault::NotPending);
         }
-        let args = args.detach(mc)?;
+        // The values are taken off this task's stack before the stack moves to the coroutine's.
+        let args = args.take(mc)?;
         let from = self.task();
         self.leave(from)?;
         if self.root.idle(mc) == Value::object(mc, co) {
@@ -95,27 +98,35 @@ impl<'gc> Outer<'_, 'gc> {
         let body = co.body(mc);
         if body == Value::FALSE && co.segment(mc).is_some() {
             self.enter_task(co)?;
-            return self.then(Then::Return(self.values(args)?));
+            return self.then(args.returned());
         }
         let segment = self.free_segment(from)?;
         self.segments.stack.switch(mc, segment);
         self.segments.task = co;
         if body == Value::FALSE {
-            return self.then(Then::Return(self.values(args)?));
+            return self.then(args.returned());
         }
         co.set_body(mc, Value::FALSE);
+        let args = self.repass(args)?;
         self.then(Then::Call(body, args))
     }
 
     /// Suspends the active coroutine (implementing `co/yield`), returning `yielded` to its resumer,
     /// assuming the coroutine's continuation is already preserved on its chain.
-    pub(crate) fn yield_coroutine(&mut self, yielded: Value<'gc>) -> Step<'gc> {
+    pub(crate) fn yield_coroutine(&mut self, yielded: Passed<'gc>) -> Step<'gc> {
         let mc = self.mc();
         let from = self.task();
         let Some(to) = of(mc, from.resumer(mc)) else {
-            self.regs.acc = self.values(Args::none())?;
+            if !Pairs::new(mc).is_list(yielded.rest) {
+                return Err(Fault::WrongType);
+            }
+            let yielded = yielded.to_list(mc)?;
+            // A run that resumes without values resumes the yield with none.
+            self.regs.set_values(mc, Value::NIL);
             return Ok(Some(Outcome::Yielded(yielded)));
         };
+        // The values are taken off this task's stack before the stack moves back to the resumer's.
+        let yielded = yielded.take(mc)?;
         self.leave(from)?;
         // Clear any cached spare segment so a suspended coroutine retains only segments holding live frames.
         from.set_spare(mc, None);
@@ -129,20 +140,7 @@ impl<'gc> Outer<'_, 'gc> {
         {
             give(mc, to, segment);
         }
-        self.then(Then::Return(yielded))
-    }
-
-    /// Converts `args` into a return value representation: returns a single value if one argument was
-    /// passed, a `MultiValue` if multiple, or an empty `MultiValue` if none.
-    pub(crate) fn values(&self, args: Args<'gc>) -> Result<Value<'gc>, Fault> {
-        let (mc, root) = (self.mc(), self.root);
-        if args.len(mc)? != 0 {
-            return args.values(mc);
-        }
-        if root.none(mc) == Value::FALSE {
-            root.set_none(mc, values(mc, std::iter::empty())?);
-        }
-        Ok(root.none(mc))
+        self.then(yielded.returned())
     }
 
     /// Terminates the active coroutine with final status `state` (completed or failed) and switches back
@@ -157,9 +155,7 @@ impl<'gc> Outer<'_, 'gc> {
         let freed = (base == 0).then(|| stack.segment(mc));
         task.set_state(mc, state);
         task.set_resumer(mc, Value::FALSE);
-        task.set_chain(mc, Value::FALSE);
-        task.set_attachments(mc, Value::NIL);
-        task.set_winders(mc, Value::NIL);
+        prompts::empty(mc, task);
         task.set_prompts(mc, Value::NIL);
         task.set_spare(mc, None);
         self.back(to)?;
@@ -222,35 +218,29 @@ impl<'gc> Outer<'_, 'gc> {
 fn compact<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>) -> Result<Option<Gc<'gc, Segment>>, Fault> {
     let Some(segment) = task.segment(mc).filter(|_| task.state(mc) == PENDING) else { return Ok(None) };
     let (base, chain) = (task.base(mc) as usize, task.chain(mc));
-    if base > WINDOW || !holds(mc, chain, segment, base, |_| ()) {
-        return Ok(None);
-    }
+    let Some(held) = held(mc, chain, segment, base).filter(|_| base <= WINDOW) else { return Ok(None) };
     if base > 0 {
         let copy = Segment::new(mc, base)?;
         let frames = segment.slots(mc).slice(0..base).ok_or(Fault::Malformed)?;
         copy.slots(mc).copy_from(mc, frames);
         frames.fill(mc, Value::VOID);
-        holds(mc, chain, segment, base, |record| record.set_segment(mc, Some(copy)));
+        held.iter().for_each(|record| record.set_segment(mc, Some(copy)));
     }
     task.set_segment(mc, None);
     Ok(Some(segment))
 }
 
-/// Verifies whether one-shot records at the head of `chain` (skipping native records) encompass all
-/// frames in `segment` below `end` without retaining ownership, passing each visited record to `each`.
-fn holds<'gc>(mc: &Mutation<'gc>, mut chain: Value<'gc>, segment: Gc<'gc, Segment>, mut end: usize, mut each: impl FnMut(Gc<'gc, Frames>)) -> bool {
+/// Returns the one-shot records at the head of `chain` that together hold all the frames of `segment` below `end`, without owning the segment. Returns `None` if the head of the chain is not such a run of records.
+fn held<'gc>(mc: &Mutation<'gc>, chain: Value<'gc>, segment: Gc<'gc, Segment>, mut end: usize) -> Option<Vec<Gc<'gc, Frames>>> {
+    let mut held = Vec::new();
+    let mut records = records(mc, chain);
     while end > 0 {
-        if let Some(native) = chain.downcast::<Native>(mc) {
-            chain = native.next(mc);
-            continue;
-        }
-        let Some(record) = chain.downcast::<Frames>(mc) else { return false };
+        let record = records.next()?;
         if record.segment(mc) != Some(segment) || !record.one_shot(mc) || record.owns(mc) || record.end(mc) as usize != end {
-            return false;
+            return None;
         }
-        each(record);
+        held.push(record);
         end = record.start(mc) as usize;
-        chain = record.next(mc);
     }
-    true
+    Some(held)
 }

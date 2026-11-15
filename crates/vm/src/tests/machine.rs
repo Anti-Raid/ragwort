@@ -3,8 +3,8 @@ use ragwort_types::pair::{Pair, Pairs};
 use ragwort_types::vector::Vectors;
 
 use super::*;
-use crate::Intrinsic::{Add, Car, Cons, Eq, IsValues, MakeBox, MakePromptTag, MarkValue, SetBox, Unbox, Values, ValuesLength, ValuesRef};
-use crate::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Condition, ConditionFields, MultiValue, MultiValueFields, Tag};
+use crate::Intrinsic::{Add, Car, Cons, Eq, MakeBox, MakePromptTag, MarkValue, SetBox, Unbox};
+use crate::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Condition, ConditionFields, Tag};
 use crate::objects::{ExternalRef, ExternalRefFields, Module};
 use crate::{Capture, Fault, HostArgs, HostContext, HostDef, Op, Purity, Reply, Request};
 
@@ -68,15 +68,28 @@ fn items<'gc>(mc: &Mutation<'gc>, mut v: Value<'gc>) -> Vec<i64> {
     out
 }
 
-/// Extracts the result of a completed task as a vector of `i64` fixnums, unpacking `MultiValue` instances or wrapping a single scalar return value.
-fn fixnums<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Vec<i64> {
-    spread(mc, value).iter().map(|v| v.as_fixnum().unwrap()).collect()
+/// Returns the fixnums in the proper list `list`, such as the values a [`collecting`] machine finished with.
+fn fixnums<'gc>(mc: &Mutation<'gc>, list: Value<'gc>) -> Vec<i64> {
+    spread(mc, list).iter().map(|value| value.as_fixnum().unwrap()).collect()
 }
 
-fn spread<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Vec<Value<'gc>> {
-    let Some(values) = value.downcast::<MultiValue>(mc) else { return vec![value] };
-    let items = values.items(mc);
-    (0..items.len()).map(|i| items.get(i)).collect()
+/// Returns the elements of the proper list `list`, such as the values a task yielded.
+fn spread<'gc>(mc: &Mutation<'gc>, list: Value<'gc>) -> Vec<Value<'gc>> {
+    Pairs::new(mc).elements(list).collect()
+}
+
+/// Creates a machine that calls `procedure` with `args` and finishes with the list of all the values it returned. A machine finishes with one value, so this is how a test sees several.
+fn collecting<'gc>(mc: &Mutation<'gc>, procedure: Value<'gc>, args: &[Value<'gc>]) -> Result<Machine, Fault> {
+    // `(lambda (f . args) (receive (lambda all all) f . args))`
+    let all: Func<'_> = (-1, &[], &[Op::Return { src: 1 }]);
+    let collect = [
+        Op::NewClosure { dst: 5, count: 1, code: 1 },
+        Op::Move { dst: 6, src: 1 },
+        Op::Move { dst: 7, src: 2 },
+        Op::TailApplyRequest { base: 5, args: 3, request: Request::Receive },
+    ];
+    let collector = closure(mc, module(mc, &[], &[(-2, &[], &collect), all])[0]);
+    Machine::new(mc, MIN_SEGMENT, collector, &[&[procedure][..], args].concat())
 }
 
 /// Retrieves the underlying [`Fault`] code from an active or raised [`Condition`] object.
@@ -96,7 +109,7 @@ fn to_end<'gc>(mc: &Mutation<'gc>, machine: &mut Machine) -> Result<Outcome<'gc>
 
 /// Executes `code` with `args` to completion in a single GC step. Fixnum returns are preserved directly, while linked lists representing digit sequences (e.g. `(1 2 3)`) are flattened into integers (e.g. `123`).
 fn run<'gc>(mc: &Mutation<'gc>, code: Gc<'gc, Bytecode>, args: &[Value<'gc>]) -> Result<Vec<i64>, Fault> {
-    let mut machine = Machine::new(mc, MIN_SEGMENT, closure(mc, code), args)?;
+    let mut machine = collecting(mc, closure(mc, code), args)?;
     let values = match to_end(mc, &mut machine)? {
         Outcome::Done(value) => spread(mc, value),
         Outcome::Raised(raised) => return Err(fault(mc, raised)),
@@ -111,7 +124,7 @@ fn finish(arena: &mut Arena, mut machine: Machine) -> Result<(Vec<i64>, usize), 
     for runs in 1.. {
         let done = arena.step(|mc| -> Result<_, Fault> {
             Ok(match machine.run(mc)? {
-                Outcome::Done(value) => Some(fixnums(mc, value)),
+                Outcome::Done(value) => Some(vec![value.as_fixnum().unwrap()]),
                 Outcome::Raised(raised) => return Err(fault(mc, raised)),
                 Outcome::Paused => None,
                 Outcome::Yielded(_) | Outcome::Deferred(_) => unreachable!(),
@@ -131,7 +144,7 @@ fn call(constants: &[i64], funcs: &[Func<'_>], args: &[i64]) -> Result<Vec<i64>,
         let constants = table(mc, constants);
         let codes = module(mc, &constants, funcs);
         let args: Vec<_> = args.iter().map(|&n| fix(n)).collect();
-        let mut machine = Machine::new(mc, MIN_SEGMENT, closure(mc, codes[0]), &args)?;
+        let mut machine = collecting(mc, closure(mc, codes[0]), &args)?;
         match to_end(mc, &mut machine)? {
             Outcome::Done(value) => Ok(fixnums(mc, value)),
             Outcome::Raised(raised) => Err(fault(mc, raised)),
@@ -275,7 +288,7 @@ fn rest_arguments_and_apply() {
 }
 
 #[test]
-fn multiple_values_are_an_object() {
+fn several_values_are_returned_but_not_loaded() {
     // Defines a procedure returning three values: `(define (three) (values 1 2 3))`.
     let three: Func<'_> = (
         0,
@@ -284,13 +297,13 @@ fn multiple_values_are_an_object() {
             Op::LoadConst { dst: 2, index: 0 },
             Op::LoadConst { dst: 3, index: 1 },
             Op::LoadConst { dst: 4, index: 2 },
-            Op::TailCallIntrinsic { base: 2, args: 3, intrinsic: Values },
+            Op::ReturnValues { src: 2, count: 3 },
         ],
     );
     let funcs = |main: &'static [Op]| -> [Func<'static>; 2] { [(0, &[], main), three] };
     let constants = [1, 2, 3, 0];
 
-    // Returning multiple values directly from a task succeeds and unpacks them; attempting to pass them to a single-value operation like `(+ 1 (three))` raises a type error.
+    // Returning multiple values directly from a task succeeds and unpacks them; attempting to pass them to a single-value operation like `(+ 1 (three))` raises a value-count error.
     let tail = &[Op::NewClosure { dst: 3, count: 1, code: 5 }, Op::TailCall { base: 3, args: 0 }];
     assert_eq!(call(&constants, &funcs(tail), &[]), Ok(vec![1, 2, 3]));
     let add = &[
@@ -302,32 +315,72 @@ fn multiple_values_are_an_object() {
         Op::LoadAcc { dst: 2 },
         Op::Return { src: 2 },
     ];
-    assert_eq!(call(&constants, &funcs(add), &[]), Err(Fault::WrongType));
+    assert_eq!(call(&constants, &funcs(add), &[]), Err(Fault::ValueCount));
+    // A call's result is returned as it is, so the values pass through `(define (again) (three))` when it is not a tail call.
+    let again = &[Op::NewClosure { dst: 5, count: 1, code: 5 }, Op::Call { base: 5, args: 0 }, Op::ReturnReceived];
+    assert_eq!(call(&constants, &funcs(again), &[]), Ok(vec![1, 2, 3]));
 
-    // Inspects multiple values as a first-class object: `(let ((v (three))) (if (values? v) (+ (values-length v) (values-ref v 0)) v))`.
-    let apart = &[
-        Op::NewClosure { dst: 5, count: 1, code: 5 },
-        Op::Call { base: 5, args: 0 },
-        Op::LoadAcc { dst: 2 },
-        Op::CallIntrinsic { base: 2, args: 1, intrinsic: IsValues },
-        Op::LoadAcc { dst: 3 },
-        Op::JumpIfFalse { test: 3, offset: 9 },
-        Op::CallIntrinsic { base: 2, args: 1, intrinsic: ValuesLength },
-        Op::LoadAcc { dst: 4 },
-        Op::Move { dst: 5, src: 2 },
-        Op::LoadConst { dst: 6, index: 3 },
-        Op::CallIntrinsic { base: 5, args: 2, intrinsic: ValuesRef },
-        Op::LoadAcc { dst: 5 },
-        Op::CallIntrinsic { base: 4, args: 2, intrinsic: Add },
-        Op::LoadAcc { dst: 4 },
-        Op::Return { src: 4 },
-        Op::Return { src: 2 },
-    ];
-    assert_eq!(call(&constants, &funcs(apart), &[]), Ok(vec![4]));
-
-    // Calling `(values)` with zero arguments produces an empty multiple-values object.
-    let none = &[Op::TailCallIntrinsic { base: 2, args: 0, intrinsic: Values }];
+    // Returning no values at all leaves a receiver nothing.
+    let none = &[Op::ReturnValues { src: 2, count: 0 }];
     assert_eq!(call(&constants, &funcs(none), &[]), Ok(vec![]));
+}
+
+#[test]
+fn a_consumer_receives_what_a_producer_returns() {
+    // `(define (three) (values 1 2 3))`, `(define (one) 7)` and `(define (sum . xs) (apply + xs))`.
+    let three: Func<'_> = (
+        0,
+        &[],
+        &[
+            Op::LoadConst { dst: 2, index: 0 },
+            Op::LoadConst { dst: 3, index: 1 },
+            Op::LoadConst { dst: 4, index: 2 },
+            Op::ReturnValues { src: 2, count: 3 },
+        ],
+    );
+    let one: Func<'_> = (0, &[], &[Op::LoadConst { dst: 2, index: 3 }, Op::Return { src: 2 }]);
+    let sum: Func<'_> = (-1, &[], &[Op::ApplyIntrinsic { base: 1, args: 1, intrinsic: Add }, Op::LoadAcc { dst: 3 }, Op::Return { src: 3 }]);
+    let constants = [1, 2, 3, 7];
+    // Function 0 is the entry. `producer` and `consumer` are the constant indexes of the other three.
+    let (three_code, one_code, sum_code) = (5, 6, 7);
+    let run = |producer: u32, consumer: u32, receive: &[Op]| {
+        let mut main = vec![Op::NewClosure { dst: 5, count: 1, code: consumer }, Op::NewClosure { dst: 6, count: 1, code: producer }];
+        main.extend_from_slice(receive);
+        call(&constants, &[(0, &[], &main), three, one, sum], &[])
+    };
+    let back = [Op::LoadAcc { dst: 2 }, Op::Return { src: 2 }];
+    // The instructions the compiler emits: a call to the producer, then a call that receives.
+    let called = [&[Op::Call { base: 6, args: 0 }, Op::CallReceived { base: 5 }][..], &back].concat();
+    let tail_called = [Op::Call { base: 6, args: 0 }, Op::TailCallReceived { base: 5 }];
+    // The request, which pushes a record that receives when the producer returns.
+    let requested = [&[Op::CallRequest { base: 5, args: 2, request: Request::Receive }][..], &back].concat();
+    let tail_requested = [Op::TailCallRequest { base: 5, args: 2, request: Request::Receive }];
+    for receive in [&called[..], &tail_called, &requested, &tail_requested] {
+        assert_eq!(run(three_code, sum_code, receive), Ok(vec![6]), "{receive:?}");
+        assert_eq!(run(one_code, sum_code, receive), Ok(vec![7]), "{receive:?}");
+        // A consumer that takes no arguments is given three, or one.
+        assert_eq!(run(three_code, one_code, receive), Err(Fault::Arity), "{receive:?}");
+        assert_eq!(run(one_code, one_code, receive), Err(Fault::Arity), "{receive:?}");
+    }
+    // A collecting call loads the values as one list, which `sum` then takes spread.
+    let collected = [&[Op::Call { base: 6, args: 0 }, Op::LoadValues { dst: 6 }, Op::TailCallRequest { base: 5, args: 2, request: Request::Apply }][..]].concat();
+    let collect_requested = [
+        Op::Move { dst: 8, src: 6 },
+        Op::CallRequest { base: 8, args: 1, request: Request::Collect },
+        Op::LoadAcc { dst: 6 },
+        Op::TailCallRequest { base: 5, args: 2, request: Request::Apply },
+    ];
+    for collect in [&collected[..], &collect_requested] {
+        assert_eq!(run(three_code, sum_code, collect), Ok(vec![6]), "{collect:?}");
+        assert_eq!(run(one_code, sum_code, collect), Ok(vec![7]), "{collect:?}");
+    }
+    // The producer's own arguments follow it. Here `sum` is both procedures, and it is called with 1 and 7.
+    let with_arguments = |receive: &[Op]| [&[Op::LoadConst { dst: 7, index: 0 }, Op::LoadConst { dst: 8, index: 3 }][..], receive].concat();
+    let called = with_arguments(&[Op::Call { base: 6, args: 2 }, Op::TailCallReceived { base: 5 }]);
+    let requested = with_arguments(&[Op::TailCallRequest { base: 5, args: 4, request: Request::Receive }]);
+    for receive in [called, requested] {
+        assert_eq!(run(sum_code, sum_code, &receive), Ok(vec![8]), "{receive:?}");
+    }
 }
 
 /// Upvalue indices provided to function 0 when executing under the prelude, exposing core prelude procedures and the default prompt tag.
@@ -402,27 +455,37 @@ fn with_raise_handler<'gc>(mc: &Mutation<'gc>, handler: Value<'gc>, thunk: Value
     closure(mc, module(mc, &[handler, thunk], &[(0, &[], &code)])[0])
 }
 
+/// Returns the prelude's `run` procedure and function 0 of `funcs` closed over the prelude's procedures, which `run` takes as its thunk.
+fn prelude_main<'gc>(mc: &Mutation<'gc>, constants: &[i64], funcs: &[Func<'_>]) -> (Value<'gc>, Value<'gc>) {
+    let (run, upvalues) = prelude(mc);
+    let constants = table(mc, constants);
+    let codes = module(mc, &constants, funcs);
+    let main = Closure::new(mc, Some(codes[0]), upvalues.len(), Value::VOID).unwrap();
+    upvalues.iter().enumerate().for_each(|(i, &v)| main.items(mc).set(mc, i, v));
+    (run, Value::object(mc, main))
+}
+
 /// Executes function 0 within the prelude's delimited prompt environment—supplying prelude procedures as upvalues and directing VM faults to `raise`—and passes the final [`Outcome`] to `check`.
 fn prelude_outcome(constants: &[i64], funcs: &[Func<'_>], check: impl for<'gc> FnOnce(&Mutation<'gc>, Outcome<'gc>)) {
     let mut arena = Arena::new(1 << 24, 0);
     arena.mutate(|mc| {
-        let (run, upvalues) = prelude(mc);
-        let constants = table(mc, constants);
-        let codes = module(mc, &constants, funcs);
-        let main = Closure::new(mc, Some(codes[0]), upvalues.len(), Value::VOID).unwrap();
-        upvalues.iter().enumerate().for_each(|(i, &v)| main.items(mc).set(mc, i, v));
-        let mut machine = Machine::new(mc, MIN_SEGMENT, run, &[Value::object(mc, main)]).unwrap();
+        let (run, main) = prelude_main(mc, constants, funcs);
+        let mut machine = Machine::new(mc, MIN_SEGMENT, run, &[main]).unwrap();
         check(mc, to_end(mc, &mut machine).unwrap());
     });
 }
 
+/// Executes function 0 as [`prelude_outcome`] does and returns all the values it returned, which must be fixnums.
 fn prelude_call(constants: &[i64], funcs: &[Func<'_>]) -> Vec<i64> {
-    let mut values = Vec::new();
-    prelude_outcome(constants, funcs, |mc, outcome| {
-        let Outcome::Done(value) = outcome else { panic!("{outcome:?}") };
-        values = fixnums(mc, value);
-    });
-    values
+    let mut arena = Arena::new(1 << 24, 0);
+    arena.mutate(|mc| {
+        let (run, main) = prelude_main(mc, constants, funcs);
+        let mut machine = collecting(mc, run, &[main]).unwrap();
+        match to_end(mc, &mut machine).unwrap() {
+            Outcome::Done(value) => fixnums(mc, value),
+            outcome => panic!("{outcome:?}"),
+        }
+    })
 }
 
 #[test]
@@ -558,7 +621,7 @@ fn marks_are_dropped_on_return_and_replaced_in_tail_position() {
         Op::LoadConst { dst: 4, index: 2 },
         Op::CallIntrinsic { base: 3, args: 2, intrinsic: MarkValue },
         Op::LoadAcc { dst: 3 },
-        Op::TailCallIntrinsic { base: 2, args: 2, intrinsic: Values },
+        Op::ReturnValues { src: 2, count: 2 },
     ];
     let get = [Op::LoadConst { dst: 2, index: 0 }, Op::LoadConst { dst: 3, index: 2 }, Op::TailCallIntrinsic { base: 2, args: 2, intrinsic: MarkValue }];
     let constants = [TAG, 1, 0, 100_000, -1];
@@ -1014,7 +1077,7 @@ fn module_variables_are_checked_until_defined() {
                     Op::LoadConst { dst: 2, index: 2 },
                     Op::StoreSlotChecked { src: 2, slot: 1 },
                     Op::LoadSlotChecked { dst: 4, slot: 1 },
-                    Op::TailCallIntrinsic { base: 3, args: 2, intrinsic: Values },
+                    Op::ReturnValues { src: 3, count: 2 },
                 ],
             ),
             (0, &[], &[Op::LoadSlot { dst: 2, slot: 2 }, Op::Return { src: 2 }]),

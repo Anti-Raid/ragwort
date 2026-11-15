@@ -545,6 +545,8 @@ impl<'gc> Value<'gc> {
     pub const UNDEFINED: Self = Self::constant(4);
     /// What an optional parameter is bound to when its call passes no argument for it.
     pub const UNSUPPLIED: Self = Self::constant(5);
+    /// What the VM's accumulator holds when a call returned no value or several values. The values are then in a list beside it. It is never stored in a variable.
+    pub const VALUES: Self = Self::constant(6);
     /// What an ephemeron's key and value become once the key dies.
     pub const BROKEN: Self = Self::constant(7);
 

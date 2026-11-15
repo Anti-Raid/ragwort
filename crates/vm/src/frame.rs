@@ -1,3 +1,76 @@
+//! The calling convention: how a frame is laid out, how a call passes arguments, and how a
+//! procedure returns values.
+//!
+//! # Frames
+//!
+//! A frame is a window of [`WINDOW`] registers on the stack segment, starting at its base.
+//!
+//! - Register [`CLOSURE`] (0) holds the closure that runs in the frame.
+//! - Registers from [`ARGS`] (1) hold the parameters. A procedure has at most [`MAX_PARAMS`]
+//!   parameter registers. See [`MAX_PARAMS`] for a procedure with more parameters.
+//! - The register after the parameters holds the return [`Link`]. [`link_slot`] returns its index.
+//! - The registers after the link are the procedure's locals and the staging area for its calls.
+//!
+//! A callee's frame overlaps its caller's. The caller puts the procedure in one of its registers,
+//! `base`, and the arguments in the registers after it. The callee's frame starts at `base`, so the
+//! procedure and the arguments are already where the callee expects them. `base` must be past the
+//! caller's link, because everything from `base` up belongs to the callee during the call.
+//!
+//! ```text
+//! caller:  [closure | params | link | locals ... | f | a | b | ...]
+//! callee:                                        [f | a | b | link | locals ...]
+//! ```
+//!
+//! A tail call moves the procedure and the arguments down to register 0 of the current frame and
+//! keeps the frame's link, so the callee returns to the current frame's caller.
+//!
+//! # Links
+//!
+//! A [`Link`] says where a frame returns to: the caller resumes at instruction `pc`, in the frame
+//! `base` registers below this one. A `base` of 0 marks the bottom frame of the segment. Returning
+//! from it leaves the inner loop, and the outer loop continues with the next record of the
+//! continuation chain.
+//!
+//! A link with `marks` set belongs to a call that changed the continuation marks. The caller's own
+//! marks are saved [`SAVED_MARKS`] registers below the callee's base, and the return restores them.
+//!
+//! # Arguments
+//!
+//! A call passes a number of arguments in registers, optionally followed by the elements of one
+//! list. Only `apply` and the calls that receive values pass a list.
+//!
+//! The callee's side checks the arguments, when the frame is entered:
+//!
+//! - The number of arguments must fit the procedure's [`Shape`], or the call fails with
+//!   [`Fault::Arity`].
+//! - A missing optional argument is bound to [`Value::UNSUPPLIED`].
+//! - Arguments past the fixed parameters are gathered into the rest parameter's list.
+//! - The list a call passes must be a proper list, or the call fails with [`Fault::WrongType`].
+//!
+//! The caller checks nothing. A call whose procedure is not a closure leaves the inner loop, and the
+//! outer loop decides what calling that value means.
+//!
+//! # Returned values
+//!
+//! A procedure returns through the accumulator, which is not a register of any frame.
+//!
+//! - One value is the common case. The accumulator holds the value itself.
+//! - No value, or several values, is the other case. The accumulator holds the marker
+//!   [`Value::VALUES`], and the values are in a list beside it. Only the instructions for
+//!   `(values x ...)` in tail position produce this.
+//!
+//! The side that takes the values checks how many there are:
+//!
+//! - A place that takes one value loads the accumulator into a register. That load fails with
+//!   [`Fault::ValueCount`] when the accumulator holds the marker.
+//! - A receiving call, as `call-with-values` compiles to, passes the values to its consumer as
+//!   arguments. The consumer's shape is then checked as for any call.
+//! - A return of what a call just returned passes the accumulator on unchanged.
+//! - A result that nothing uses is not checked.
+//!
+//! For example, `(+ 1 (f))` loads the result of `(f)` and fails if `f` returned two values, while
+//! `(call-with-values f list)` and a tail call `(f)` take whatever `f` returned.
+
 use ragwort_types::gc::{Frame, Gc, Mutation, Slots, Value, WINDOW};
 
 use crate::Fault;
@@ -125,6 +198,44 @@ pub(crate) fn link_at<'gc>(mc: &Mutation<'gc>, slots: Slots<'gc>, fp: usize) -> 
         return Err(Fault::Malformed);
     }
     Link::of(slots.get(at)).ok_or(Fault::Malformed)
+}
+
+/// Returns the frames below the frame at `at`, which returns through `link`, nearest caller first. The walk stays within `slots` and at or above slot `floor`, and ends at a bottom frame.
+pub(crate) fn callers<'m, 'gc>(mc: &'m Mutation<'gc>, slots: Slots<'gc>, floor: usize, at: usize, link: Link) -> Callers<'m, 'gc> {
+    Callers { mc, slots, floor, at, link }
+}
+
+/// A frame that a walk down the links reached: its base, the instruction it resumes at, and the link it returns through itself.
+pub(crate) struct Caller {
+    pub(crate) at: usize,
+    pub(crate) pc: usize,
+    pub(crate) link: Link,
+}
+
+/// Walks down the links of the frames in one run of stack slots, as [`callers`] describes. A frame that cannot be read ends the walk with [`Fault::Malformed`].
+pub(crate) struct Callers<'m, 'gc> {
+    mc: &'m Mutation<'gc>,
+    slots: Slots<'gc>,
+    floor: usize,
+    at: usize,
+    link: Link,
+}
+
+impl Iterator for Callers<'_, '_> {
+    type Item = Result<Caller, Fault>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.link.is_bottom() {
+            return None;
+        }
+        let above = std::mem::replace(&mut self.link, Link::BOTTOM);
+        let pc = above.pc;
+        let Some(at) = self.at.checked_sub(usize::from(above.base)).filter(|&at| at >= self.floor && at < self.slots.len()) else { return Some(Err(Fault::Malformed)) };
+        Some(link_at(self.mc, self.slots, at).map(|link| {
+            (self.at, self.link) = (at, link);
+            Caller { at, pc, link }
+        }))
+    }
 }
 
 /// Extracts and decodes the return [`Link`] stored in `frame`.

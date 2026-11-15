@@ -94,7 +94,7 @@ fn syntax_objects_are_values() {
     let text = "(list (syntax->datum #'(a (b . c) #(d e))) (identifier? #'x) (identifier? #'(x)) (syntax? 1)
                       (bound-identifier=? #'x #'x) (syntax-e #'5) (syntax->datum (datum->syntax #f '(p q))))";
     assert_eq!(eval(text), "((a (b . c) #(d e)) #t #f #f #t 5 (p q))");
-    assert_eq!(eval("(list #'(a 1) (lambda () 1) (values))"), "(#<syntax (a 1)> #<procedure> #<values>)");
+    assert_eq!(eval("(list #'(a 1) (lambda () 1))"), "(#<syntax (a 1)> #<procedure>)");
 }
 
 #[test]
