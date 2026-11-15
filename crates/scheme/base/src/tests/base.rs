@@ -1850,6 +1850,51 @@ fn calls_the_vm_builds_work_at_any_stack_depth() {
     assert_eq!(done, "3000");
 }
 
+/// Runs `machine` until it finishes or yields, letting the collector work whenever the run pauses.
+fn run_to_outcome(arena: &mut Arena, machine: &mut Machine, mut resume: bool) -> String {
+    loop {
+        let outcome = arena.step(|mc| {
+            let outcome = if std::mem::take(&mut resume) { machine.resume(mc, &[]) } else { machine.run(mc) };
+            match outcome.unwrap() {
+                Outcome::Paused => None,
+                outcome => Some(show_outcome(mc, Ok(outcome))),
+            }
+        });
+        if let Some(outcome) = outcome.unwrap() {
+            break outcome;
+        }
+    }
+}
+
+/// A coroutine that waits while another one yields has its frames copied into storage of their own size. What those frames hold must stay alive: here each holds values nothing else refers to, the collector runs, and new allocations reuse whatever it freed.
+#[test]
+fn a_waiting_coroutines_frames_keep_what_they_hold() {
+    let mut arena = arena();
+    let text = "(let ()
+                  (define (make i) (make-coroutine (lambda () (let ((x (list i (number->string i) (vector i (string-append \"s\" (number->string i)))))) (co/yield 0) x))))
+                  (define (kept? i x) (and (pair? x) (eqv? (car x) i) (equal? (cadr x) (number->string i)) (vector? (caddr x)) (equal? (vector-ref (caddr x) 1) (string-append \"s\" (number->string i)))))
+                  (define (churn n acc) (if (eqv? n 0) acc (churn (- n 1) (list n n n))))
+                  (let ((waiting (let loop ((i 0) (made '())) (if (eqv? i 100) (reverse made) (loop (+ i 1) (cons (make i) made))))))
+                    (for-each (lambda (co) (co/resume co)) waiting)
+                    (co/yield 'waiting)
+                    (churn 200000 0)
+                    (let loop ((i 0) (waiting waiting) (lost 0))
+                      (if (null? waiting) lost (loop (+ i 1) (cdr waiting) (if (kept? i (co/resume (car waiting))) lost (+ lost 1)))))))";
+    let mut machine = machine(&mut arena, text);
+    assert_eq!(run_to_outcome(&mut arena, &mut machine, false), "yielded (waiting)");
+    arena.collect();
+    assert_eq!(run_to_outcome(&mut arena, &mut machine, true), "done 0");
+}
+
+/// Each level captures a continuation and calls it at once. A reinstated continuation is copied back to the stack a chunk at a time, and what stays behind must not keep the whole stack segment it came from alive, or a recursion of this depth does not fit in the arena.
+#[test]
+fn continuations_captured_at_every_level_of_a_deep_recursion_fit() {
+    let mut arena = arena();
+    let text = "(let () (define (level n) (if (eqv? n 0) 0 (+ (call/cc (lambda (k) (k 1))) (level (- n 1))))) (level 5000))";
+    let mut machine = machine(&mut arena, text);
+    assert_eq!(run_to_outcome(&mut arena, &mut machine, false), "done 5000");
+}
+
 #[test]
 fn large_groups_of_mutually_recursive_closures_compile() {
     // Each procedure calls the next and captures `n`, so the group is one cycle of closures that escape.

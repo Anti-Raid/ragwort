@@ -25,6 +25,19 @@ impl Segment {
     pub fn new<'gc>(mc: &Mutation<'gc>, len: usize) -> Result<Gc<'gc, Segment>, OutOfMemory> {
         mc.alloc_items::<Segment, 1>([0], len, Value::VOID)
     }
+
+    /// A segment of exactly `frames.len()` slots that holds a copy of `frames`, such as the frames
+    /// of a continuation that no stack runs on.
+    ///
+    /// All of its slots are ordinary arena memory, so the collector traces them. A segment from
+    /// [`Segment::new`] has no ordinary slots until a stack uses it, and values copied into it are
+    /// not kept alive.
+    pub fn holding<'gc>(mc: &Mutation<'gc>, frames: Slots<'gc>) -> Result<Gc<'gc, Segment>, OutOfMemory> {
+        let ordinary = u32::try_from(frames.len()).map_err(|_| OutOfMemory)?;
+        let segment = mc.alloc_items::<Segment, 1>([u64::from(ordinary)], frames.len(), Value::VOID)?;
+        segment.slots(mc).copy_from(mc, frames);
+        Ok(segment)
+    }
 }
 
 /// What a stack is charged, beyond its segment.

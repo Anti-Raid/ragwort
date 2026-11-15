@@ -220,9 +220,8 @@ fn compact<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>) -> Result<Option<Gc<'gc
     let (base, chain) = (task.base(mc) as usize, task.chain(mc));
     let Some(held) = held(mc, chain, segment, base).filter(|_| base <= WINDOW) else { return Ok(None) };
     if base > 0 {
-        let copy = Segment::new(mc, base)?;
         let frames = segment.slots(mc).slice(0..base).ok_or(Fault::Malformed)?;
-        copy.slots(mc).copy_from(mc, frames);
+        let copy = Segment::holding(mc, frames)?;
         frames.fill(mc, Value::VOID);
         held.iter().for_each(|record| record.set_segment(mc, Some(copy)));
     }

@@ -139,8 +139,15 @@ impl<'gc> Segments<'_, 'gc> {
             let under = below(split, link.base)?;
             let caller_marks = if link.marks { slots.get(Kept::under(split, start)?.marks) } else { marks };
             if end - under > CHUNK {
-                let (start, at, link, one_shot) = (slot(start)?, slot(split)?, link.value().ok_or(Fault::Malformed)?, record.one_shot(mc));
-                break Value::object(mc, Frames::new(mc, Some(segment), start, at, link, caller_marks, one_shot, false, record.next(mc))?);
+                let (link, one_shot) = (link.value().ok_or(Fault::Malformed)?, record.one_shot(mc));
+                // The frames below the split stay behind in a record. A few frames get a segment of their own size. Sharing the record's segment would keep all of it alive for them, and a program that captures a continuation at every level of a deep recursion would then hold a chunk of stack for each level.
+                let remainder = if split - start <= CHUNK {
+                    let held = Segment::holding(mc, slots.slice(start..split).ok_or(Fault::Malformed)?)?;
+                    Frames::new(mc, Some(held), 0, slot(split - start)?, link, caller_marks, one_shot, false, record.next(mc))?
+                } else {
+                    Frames::new(mc, Some(segment), slot(start)?, slot(split)?, link, caller_marks, one_shot, false, record.next(mc))?
+                };
+                break Value::object(mc, remainder);
             }
             (split, marks) = (under, caller_marks);
         };

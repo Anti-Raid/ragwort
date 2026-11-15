@@ -80,6 +80,25 @@ fn churn(arena: &mut Arena) {
     });
 }
 
+/// A segment made to hold a copy of frames keeps their values alive, although no stack ever uses it.
+#[test]
+fn a_segment_holding_frames_keeps_their_values_alive() {
+    let mut arena = arena();
+    arena.mutate(|mc| {
+        let frames = Segment::new(mc, 8).unwrap().slots(mc);
+        for i in 0..8 {
+            frames.set(mc, i, num(mc, i as i64));
+        }
+        let held = Segment::holding(mc, frames).unwrap();
+        assert_eq!(held.len(mc), 8);
+        mc.set_root(0, Value::object(mc, held));
+    });
+    arena.collect();
+    churn(&mut arena);
+    arena.collect();
+    assert_eq!(rooted_segment(&mut arena, 0..8), expected(8, 0));
+}
+
 #[test]
 fn frame_writes_skip_the_barrier_and_minor_collections_see_them() {
     let mut arena = arena();
