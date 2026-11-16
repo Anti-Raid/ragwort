@@ -530,14 +530,19 @@ pub struct Refused;
 /// A table whose entries the host holds. See the [module docs](self) for what the arena does with
 /// one and what the host promises.
 ///
-/// A type is read-only unless it sets [`ExternalTable::WRITABLE`]. A read-only type implements the
-/// first four methods and leaves the rest as they are.
+/// A type is read-only unless it sets [`ExternalTable::WRITABLE`]. A read-only type implements
+/// `len`, `has`, `get` and `keys`, and leaves the rest as they are.
 pub trait ExternalTable: 'static {
     /// Whether programs can change the table. It is read once, when the table is made.
     const WRITABLE: bool = false;
 
     /// The number of entries.
     fn len(&self) -> usize;
+
+    /// Whether there are no entries.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     /// Whether there is an entry for `key`.
     fn has(&self, key: Key<'_>) -> bool;
