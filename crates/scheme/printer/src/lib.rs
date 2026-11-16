@@ -3,8 +3,11 @@
 //! written `#<...>`. Symbols that wouldn't read back as themselves are written in `|`, as the
 //! parser would read them.
 //!
-//! Pairs and the other data but mutable vectors and structs can't change, so a cycle goes
-//! through a mutable vector or a struct: those a cycle comes back to are labelled `#n=`, and with
+//! A table is written as `#table((key . value) ...)`, its entries in the order they were added.
+//! That form does not read back.
+//!
+//! Pairs and the other data but mutable vectors, structs and tables can't change, so a cycle goes
+//! through a mutable vector, a struct or a table: those a cycle comes back to are labelled `#n=`, and with
 //! `write-shared`, every datum that's shared, so printing always ends. Without `write-shared`, data shared without a cycle
 //! are written out each time, which can be exponentially long, so output stops at a limit, and
 //! so does the walk that finds the cycles, which writes no more than it walks. Neither recurses
@@ -21,15 +24,17 @@ use std::hash::{BuildHasherDefault, Hasher};
 use ragwort_parser_scheme::{ends_name, might_be_number, number, starts_numeric};
 use ragwort_types::Error;
 use ragwort_types::bytevector::Bytevectors;
+use ragwort_types::external::ExternalRef;
 use ragwort_types::gc::{Gc, Mutation, Value};
 use ragwort_types::num::{Nums, complex};
 use ragwort_types::pair::Pair;
 use ragwort_types::string::{self, Strings};
 use ragwort_types::symbol::{Keyword, Symbol};
 use ragwort_types::syntax::{Abbreviation, Syntax, SyntaxKind};
+use ragwort_types::table::Table;
 use ragwort_types::vector::{AnyVector, Vector};
 use ragwort_vm::report::{Failure, Raised, Report};
-use ragwort_vm::objects::{Closure, Condition, ConditionFields, Continuation, ExternalRef, KeywordProcedure, Tag, Task};
+use ragwort_vm::objects::{Closure, Condition, ConditionFields, Continuation, KeywordProcedure, Tag, Task};
 use ragwort_vm::objects::{Struct, StructFields, StructType, StructTypeFields};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -165,6 +170,7 @@ enum Label {
 fn is_container<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> bool {
     Pair::of(value).is_some()
         || AnyVector::of(value).is_some()
+        || Table::of(value).is_some()
         || Syntax::of(value).is_some()
         || value.downcast::<Condition>(mc).is_some()
         || value.downcast::<Struct>(mc).is_some()
@@ -178,6 +184,10 @@ fn child<'gc>(mc: &Mutation<'gc>, value: Value<'gc>, i: usize) -> Option<Value<'
     if let Some(vector) = AnyVector::of(value) {
         return vector.get(mc, i);
     }
+    // The two places of a removed entry hold a constant, which is no container, so the walks pass over it.
+    if let Some(table) = Table::of(value) {
+        return table.held(mc, i);
+    }
     if let Some(syntax) = Syntax::of(value) {
         return (i == 0).then(|| syntax.datum(mc));
     }
@@ -189,11 +199,11 @@ fn child<'gc>(mc: &Mutation<'gc>, value: Value<'gc>, i: usize) -> Option<Value<'
     [condition.message(mc), condition.irritants(mc)].get(i).copied()
 }
 
-/// The mutable vectors and structs in `root` that a cycle comes back to. What's walked is written at least
+/// The mutable vectors, structs and tables in `root` that a cycle comes back to. What's walked is written at least
 /// as long, but for syntax, which is written as its datum, so the walk stops past `limit`.
 fn cycles<'gc>(mc: &Mutation<'gc>, root: Value<'gc>, limit: usize) -> Result<Map<Label>, PrintError> {
     let (mut on_path, mut labels) = (Map::default(), Map::default());
-    let mutable = |value: Value<'gc>| Vector::of(value).is_some() || value.downcast::<Struct>(mc).is_some();
+    let mutable = |value: Value<'gc>| Vector::of(value).is_some() || Table::of(value).is_some() || value.downcast::<Struct>(mc).is_some();
     if mutable(root) {
         on_path.insert(root.to_bits(), ());
     }
@@ -263,6 +273,8 @@ enum Work<'gc> {
     Tail(Value<'gc>),
     /// The items of a vector or of multiple values from `at`.
     Items(Value<'gc>, usize),
+    /// The entries of a table from entry number `at`. The flag says whether one was written before them.
+    Entries(Table<'gc>, usize, bool),
     /// The end of a syntax object's datum.
     LeaveSyntax,
     /// Switches the printer to the given mode for the work that follows.
@@ -309,6 +321,16 @@ impl<'gc> Printer<'_, 'gc> {
                         work.extend([Work::Items(of, at + 1), Work::Value(item)]);
                     }
                 }
+                Work::Entries(table, mut at, written) => {
+                    // A removed entry leaves both its places broken, and is passed over.
+                    while table.held(self.mc, 2 * at) == Some(Value::BROKEN) {
+                        at += 1;
+                    }
+                    if let (Some(key), Some(value)) = (table.held(self.mc, 2 * at), table.held(self.mc, 2 * at + 1)) {
+                        self.out.push_str(if written { " (" } else { "(" });
+                        work.extend([Work::Entries(table, at + 1, true), Work::Text(")"), Work::Value(value), Work::Text(" . "), Work::Value(key)]);
+                    }
+                }
                 Work::LeaveSyntax => self.in_syntax -= 1,
                 Work::Mode(mode) => self.mode = mode,
             }
@@ -339,6 +361,9 @@ impl<'gc> Printer<'_, 'gc> {
         } else if AnyVector::of(value).is_some() {
             self.out.push_str("#(");
             work.extend([Work::Text(")"), Work::Items(value, 0)]);
+        } else if let Some(table) = Table::of(value) {
+            self.out.push_str("#table(");
+            work.extend([Work::Text(")"), Work::Entries(table, 0, false)]);
         } else if let Some(syntax) = Syntax::of(value) {
             self.syntax(syntax, work);
         } else if let Some(condition) = value.downcast::<Condition>(mc) {
@@ -456,6 +481,9 @@ impl<'gc> Printer<'_, 'gc> {
                 write!(self.out, "{byte}")?;
             }
             self.out.push(')');
+        } else if let Some(external) = ExternalRef::of(value) {
+            // An external reference is written as the name of its kind, which the host chose.
+            write!(self.out, "#<{}>", external.name(mc))?;
         } else if let Some(name) = ragwort_vm::report::procedure_name(mc, value) {
             self.out.push_str("#<procedure ");
             self.symbol(name, false)?;
@@ -471,7 +499,6 @@ impl<'gc> Printer<'_, 'gc> {
                 Value::VALUES => "#<values>",
                 _ if value.downcast::<Closure>(mc).is_some() || value.downcast::<KeywordProcedure>(mc).is_some() => "#<procedure>",
                 _ if value.downcast::<Continuation>(mc).is_some() => "#<continuation>",
-                _ if value.downcast::<ExternalRef>(mc).is_some() => "#<external>",
                 _ if value.downcast::<Task>(mc).is_some() => "#<coroutine>",
                 _ if value.downcast::<Tag>(mc).is_some() => "#<prompt-tag>",
                 _ => "#<object>",

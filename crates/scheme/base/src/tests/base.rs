@@ -2263,6 +2263,118 @@ fn a_host_that_answers_yields_at_once_still_lets_the_collector_run() {
 }
 
 #[test]
+fn tables_map_keys_to_values_in_the_order_they_were_added() {
+    assert_eq!(eval("(define t (make-table)) (list (table? t) (table? '()) (table? (vector)) (table-length t) (table-ref t 'a) (table-ref t 'a 'none) (table-has? t 'a) (table-delete! t 'a))"), "(#t #f #f 0 #f none #f #f)");
+    let filled = "(define t (make-table)) (table-set! t 'b 2) (table-set! t 'a 1) (table-set! t 'c 3)";
+    assert_eq!(eval(&format!("{filled} (list t (table-length t) (table-ref t 'a) (table-has? t 'c) (table-has? t 'd))")), "(#table((b . 2) (a . 1) (c . 3)) 3 1 #t #f)");
+    // Setting a key again keeps its place. Removing it and setting it again puts it last.
+    assert_eq!(eval(&format!("{filled} (table-set! t 'b 20) (list (table->list t) (table-delete! t 'b) (table-delete! t 'b) (begin (table-set! t 'b 200) (table->list t)))")), "(((b . 20) (a . 1) (c . 3)) #t #f ((a . 1) (c . 3) (b . 200)))");
+    assert_eq!(eval(&format!("{filled} (table-clear! t) (table-set! t 'z 26) (list t (table-length t))")), "(#table((z . 26)) 1)");
+    // A stored `#f` is a value like any other: only `table-has?` tells it from a missing key.
+    assert_eq!(eval("(define t (table 'off #f)) (list (table-ref t 'off 'none) (table-has? t 'off) (table-ref t 'on 'none) (table-has? t 'on))"), "(#f #t none #f)");
+    // `table` takes keys and values in turn, and `make-table` can be told how many entries to make room for.
+    assert_eq!(eval("(list (table) (table 'a 1 \"b\" 2 'a 3) (table-length (make-table 100)) (list->table '((x . 1) (y . 2))))"), "(#table() #table((a . 3) (\"b\" . 2)) 0 #table((x . 1) (y . 2)))");
+    assert_eq!(eval("(define t (table 'a 1 'b 2 'c 3)) (list (table-keys t) (table-values t) (table->vector t) (table->list (table-copy t)))"), "((a b c) (1 2 3) #(a 1 b 2 c 3) ((a . 1) (b . 2) (c . 3)))");
+    // Enough entries for the table to grow many times, added and removed in an order no hash would give.
+    let many = "(define t (make-table))
+                (let loop ((i 0)) (if (< i 3000) (begin (table-set! t (modulo (* i 7919) 3000) i) (loop (+ i 1)))))
+                (let loop ((i 0)) (if (< i 3000) (begin (if (odd? i) (table-delete! t i)) (loop (+ i 1)))))
+                (let loop ((keys (table-keys t)) (i 0) (in-order #t))
+                  (if (null? keys)
+                      (list (table-length t) i in-order (table-ref t 2998) (table-ref t 2999 'gone))
+                      (loop (cdr keys) (+ i 1) (and in-order (eqv? (table-ref t (car keys)) (let find ((j 0)) (if (eqv? (modulo (* j 7919) 3000) (car keys)) j (find (+ j 1)))))))))";
+    assert_eq!(eval(many), "(1500 1500 #t 2642 gone)");
+}
+
+#[test]
+fn table_keys_are_the_same_by_value_or_by_identity() {
+    // Strings by their characters, however they were made.
+    let strings = "(define t (table \"id\" 1 \"a key that is too long to fit in a word\" 2))
+                   (list (table-ref t (string-append \"i\" \"d\")) (table-ref t (string-append \"a key that is too long\" \" to fit in a word\")) (table-ref t \"ID\") (table-ref t 'id))";
+    assert_eq!(eval(strings), "(1 2 #f #f)");
+    // Numbers as `eqv?` has them: by value and exactness.
+    let numbers = "(define t (table 1 'one 1.0 'one-inexact 1/2 'half (expt 2 100) 'big -0.0 'minus-zero))
+                   (list (table-ref t 1) (table-ref t 1.0) (table-ref t (/ 2 4)) (table-ref t 0.5) (table-ref t (* (expt 2 50) (expt 2 50))) (table-ref t 0.0) (table-ref t (* -1.0 0.0)) (table-length t))";
+    assert_eq!(eval(numbers), "(one one-inexact half #f big #f minus-zero 5)");
+    // Symbols, characters, booleans and the empty list by what they are.
+    let constants = "(define t (table 'a 1 #\\a 2 #t 3 #f 4 '() 5 (string->symbol \"b\") 6))
+                     (list (table-ref t (string->symbol \"a\")) (table-ref t #\\a) (table-ref t #t) (table-ref t #f) (table-ref t '()) (table-ref t 'b) (table-ref t \"a\") (table-ref t #\\b))";
+    assert_eq!(eval(constants), "(1 2 3 4 5 6 #f #f)");
+    // Anything else by identity: a list, a vector, a procedure or a table is the key it is, whatever it holds.
+    let identity = "(define p (list 1 2)) (define v (vector 1 2)) (define f (lambda (x) x)) (define inner (table 'k 1))
+                    (define t (table p 'pair v 'vector f 'procedure inner 'table))
+                    (set-car! p 9) (vector-set! v 0 9) (table-set! inner 'k 2)
+                    (list (table-ref t p) (table-ref t v) (table-ref t f) (table-ref t inner) (table-ref t (list 9 2)) (table-ref t (vector 9 2)) (table-ref t (table 'k 2)) (table-ref t (lambda (x) x)))";
+    assert_eq!(eval(&identity.replace("(set-car! p 9) ", "")), "(pair vector procedure table #f #f #f #f)");
+}
+
+#[test]
+fn tables_are_walked_as_they_were_when_the_walk_began() {
+    let walked = "(define t (table 'a 1 'b 2 'c 3)) (define seen '())
+                  (table-for-each (lambda (key value) (set! seen (cons (list key value (table-length t)) seen)) (table-delete! t 'b) (table-set! t 'd 4) (table-set! t 'c 30)) t)
+                  (list (reverse seen) (table->list t))";
+    assert_eq!(eval(walked), "(((a 1 3) (b 2 3) (c 3 3)) ((a . 1) (c . 30) (d . 4)))");
+    assert_eq!(eval("(define t (table 'n 1)) (table-update! t 'n (lambda (n) (+ n 1))) (table-update! t 'm (lambda (m) (+ m 1)) 10) (table-update! t 'seen (lambda (seen) (not seen))) (table->list t)"), "((n . 2) (m . 11) (seen . #t))");
+    // A copy is a table of its own with the same entries in the same order.
+    assert_eq!(eval("(define t (table 'a 1 'b 2)) (define u (table-copy t)) (table-set! u 'a 10) (table-set! t 'c 3) (list (table->list t) (table->list u) (eq? t u))"), "(((a . 1) (b . 2) (c . 3)) ((a . 10) (b . 2)) #f)");
+}
+
+#[test]
+fn tables_are_equal_when_their_entries_are() {
+    assert_eq!(eval("(list (equal? (table) (table)) (equal? (table 'a 1 'b 2) (table 'b 2 'a 1)) (equal? (table 'a 1) (table 'a 2)) (equal? (table 'a 1) (table 'b 1)) (equal? (table 'a 1) (table 'a 1 'b 2)) (equal? (table 'a 1) '((a . 1))))"), "(#t #t #f #f #f #f)");
+    // Values are compared as `equal?` compares anything. Keys are matched as a table matches them.
+    assert_eq!(eval("(list (equal? (table 'a (list 1 \"two\" (vector 3))) (table 'a (list 1 \"two\" (vector 3)))) (equal? (table 'a (table 'b (table 'c 1))) (table 'a (table 'b (table 'c 1)))) (equal? (table \"k\" 1) (table (string-append \"k\") 1)) (equal? (table (list 1) 1) (table (list 1) 1)))"), "(#t #t #t #f)");
+    assert_eq!(eval("(define a (table 'x 1)) (define b (table 'x 1)) (list (eq? a b) (eqv? a b) (equal? a b) (eqv? a a) (begin (table-delete! b 'x) (table-set! b 'x 1) (equal? a b)))"), "(#f #f #t #t #t)");
+    // Tables that hold themselves are compared without end only if `equal?` did not stop at what it has seen.
+    assert_eq!(eval("(define a (table)) (define b (table)) (table-set! a 'self a) (table-set! b 'self b) (list (equal? a b) (begin (table-set! b 'more 1) (equal? a b)))"), "(#t #f)");
+}
+
+#[test]
+fn table_procedures_say_what_was_wrong() {
+    assert_eq!(uncaught("(table-ref 5 'a)"), "#<error table-ref: wrong type of argument 5 a #f>");
+    assert_eq!(uncaught("(table-set! (vector) 'a 1)"), "#<error table-set!: wrong type of argument #() a 1>");
+    assert_eq!(uncaught("(table-length \"t\")"), "#<error table-length: wrong type of argument \"t\">");
+    assert_eq!(eval("(map (lambda (thunk) (guard (e (#t (list (error-object-kind e) (error-object-who e)))) (thunk))) (list (lambda () (table 'a)) (lambda () (make-table 'many)) (lambda () (make-table -1)) (lambda () (table-keys 5)) (lambda () (list->table '(1 2))) (lambda () (table-for-each car 5))))"), "((arity table) (wrong-type make-table) (out-of-range make-table) (wrong-type table->vector) (wrong-type car) (wrong-type table->vector))");
+}
+
+/// A table with many entries, with keys of every kind, is read back whole after the collector has run many times while it grew. Keys that are lists and vectors are found by identity, wherever the collector moved them.
+#[test]
+fn a_large_table_keeps_its_entries_through_collections() {
+    let mut arena = arena();
+    let text = "(let ()
+                  (define t (make-table))
+                  (define kept (make-vector 4000 #f))
+                  (let fill ((i 0))
+                    (if (< i 4000)
+                        (let ((key (list i)))
+                          (vector-set! kept i key)
+                          (table-set! t key i)
+                          (table-set! t i (number->string i))
+                          (table-set! t (string-append \"key number \" (number->string i)) (list i i))
+                          (table-set! t (string->symbol (string-append \"s\" (number->string i))) (* i 1.5))
+                          (if (eqv? (modulo i 3) 0) (table-delete! t (- i 1)))
+                          (fill (+ i 1)))))
+                  (co/yield (table-length t))
+                  (let check ((i 0) (bad 0))
+                    (if (< i 4000)
+                        (check (+ i 1)
+                               (if (and (eqv? (table-ref t (vector-ref kept i)) i)
+                                        (equal? (table-ref t i 'gone) (if (and (eqv? (modulo (+ i 1) 3) 0) (< (+ i 1) 4000)) 'gone (number->string i)))
+                                        (equal? (table-ref t (string-append \"key number \" (number->string i))) (list i i))
+                                        (eqv? (table-ref t (string->symbol (string-append \"s\" (number->string i)))) (* i 1.5))
+                                        (not (table-has? t (list i))))
+                                   bad
+                                   (+ bad 1)))
+                        (list bad (table-length t) (car (table-keys t)) (table-ref t (car (table-keys t)))))))";
+    let mut machine = machine(&mut arena, text);
+    assert_eq!(run_to_outcome(&mut arena, &mut machine, false), "yielded (14667)");
+    arena.set_evacuate_all(true);
+    arena.collect();
+    arena.set_evacuate_all(false);
+    assert_eq!(run_to_outcome(&mut arena, &mut machine, true), "done (0 14667 (0) 0)");
+}
+
+#[test]
 fn large_groups_of_mutually_recursive_closures_compile() {
     // Each procedure calls the next and captures `n`, so the group is one cycle of closures that escape.
     for size in [2, 16, 17, 20, 30, 31, 40] {

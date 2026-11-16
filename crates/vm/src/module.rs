@@ -1,6 +1,6 @@
-//! Runtime representation of modules: defines the module instances storing top-level variables, host functions implemented in Rust, and host object reference wrappers.
+//! Runtime representation of modules: defines the module instances storing top-level variables and host functions implemented in Rust. A host function hands values of the host's own types to a program as external references, which are in [`ragwort_types::external`].
 //!
-//! A host function is defined using [`HostDef`]. The VM dispatch loop invokes it for [`crate::Op::CallHost`] operations via the host table of the calling module, passing arguments and a [`HostContext`]. Host functions are invoked from Scheme through native wrapper procedures using `%call-host`, which explicitly pass any required VM state (such as coroutine references or continuation marks) or host data (encapsulated in [`ExternalRef`]).
+//! A host function is defined using [`HostDef`]. The VM dispatch loop invokes it for [`crate::Op::CallHost`] operations via the host table of the calling module, passing arguments and a [`HostContext`]. Host functions are invoked from Scheme through native wrapper procedures using `%call-host`, which explicitly pass any required VM state (such as coroutine references or continuation marks) or host data (encapsulated in an [`ExternalRef`](ragwort_types::external::ExternalRef)).
 
 use std::any::{Any, TypeId};
 use std::fmt;
@@ -8,7 +8,7 @@ use std::fmt;
 use ragwort_types::gc::{Frame, Gc, Mutation, OutOfMemory, Value};
 use ragwort_types::vector::Vectors;
 
-use crate::objects::{ExternalRef, ExternalRefFields, Module, ModuleFields};
+use crate::objects::{Module, ModuleFields};
 use crate::{Fault, Fuel};
 
 /// Function signature for a host function callable from bytecode: receives a mutable [`HostContext`] and [`HostArgs`], returning a [`Reply`] or a [`Fault`].
@@ -201,17 +201,6 @@ pub fn set_interface<'gc, T: Any>(mc: &Mutation<'gc>, module: Gc<'gc, Module>, i
     let interface: Box<dyn Any> = Box::new(interface);
     module.set_interface(mc, mc.frozen(interface)?);
     Ok(())
-}
-
-/// Allocates an [`ExternalRef`] wrapping host payload `data`, charging `bytes` of external memory to the garbage collector heap, and associating it with GC-traced value `held`.
-pub fn external<'gc, T: Any>(mc: &Mutation<'gc>, data: T, bytes: usize, held: Value<'gc>) -> Result<Gc<'gc, ExternalRef>, OutOfMemory> {
-    let data: Box<dyn Any> = Box::new(data);
-    ExternalRef::new(mc, held, mc.frozen_owning(data, bytes)?)
-}
-
-/// Downcasts and returns a reference to the host payload stored in `external` if it is an [`ExternalRef`] wrapping type `T`.
-pub fn external_data<'gc, T: Any>(mc: &Mutation<'gc>, external: Value<'gc>) -> Option<&'gc T> {
-    external.downcast::<ExternalRef>(mc)?.data(mc)?.downcast_ref()
 }
 
 /// Returns `true` if an encoded arity integer (formatted as in [`Bytecode`](crate::objects::Bytecode)) accepts `count` arguments.

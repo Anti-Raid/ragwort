@@ -1,6 +1,7 @@
 //! Ragwort's data in the arena: the collector, in [`gc`], and the types it holds: numbers,
-//! strings, symbols, pairs, vectors and syntax, and the compiler's constant pools. Pairs,
-//! symbols, vectors and syntax are views of objects only this crate can change.
+//! strings, symbols, pairs, vectors, tables, external references and syntax, and the compiler's
+//! constant pools. Pairs, symbols, vectors, tables, external references and syntax are views of
+//! objects only this crate can change.
 
 extern crate self as ragwort_types;
 
@@ -14,6 +15,7 @@ pub struct UnknownName;
 
 pub mod bytevector;
 pub mod constant;
+pub mod external;
 pub mod gc;
 pub mod num;
 mod objects;
@@ -21,5 +23,6 @@ pub mod pair;
 pub mod string;
 pub mod symbol;
 pub mod syntax;
+pub mod table;
 pub mod vector;
 pub mod wire;

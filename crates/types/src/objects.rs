@@ -4,6 +4,7 @@
 use std::cell::RefCell;
 
 use crate::bytevector::{ExternalBuffer, ExternalBufferMut};
+use crate::external::Held;
 use crate::gc::table::TableHead;
 
 crate::gc::objects! {
@@ -44,4 +45,18 @@ crate::gc::objects! {
     pub(crate) struct SyntaxMeta { kind: u32, context: Member<SyntaxContext>, origin: Member<SyntaxOrigin> }
     /// `binding` is `#f` for none.
     pub(crate) struct Syntax { datum: Value, source: Member<SyntaxSource>, span: u64, meta: Member<SyntaxMeta>, binding: Value }
+    /// A reference to a value of a host type, which lives outside the arena with its kind and is
+    /// dropped once nothing reaches the reference. `kept` is a value that lives as long as it does.
+    pub(crate) struct External { kept: Value, payload: Frozen<Held> }
+    /// A table: its entries in the order they were added, and the index that finds them by key.
+    /// `live` counts the entries. `used` counts the places of `pairs` taken, dead ones included.
+    /// `seed` seeds the hashes. `epoch` is the count of moving collections the index was made
+    /// at, or `u64::MAX` while no key is hashed by where it is.
+    pub(crate) struct Table { index: Member<TableIndex>, pairs: Member<TableEntries>, live: u64, used: u64, seed: u64, epoch: u64 }
+    /// A table's index, probed linearly. A slot is 0 if it was never used. Otherwise its low half
+    /// is an entry's number plus one, and its high half is the high half of the key's hash.
+    pub(crate) struct TableIndex {} items u64
+    /// A table's entries, a key and a value each. Both are `Value::BROKEN` in an entry that was
+    /// removed and in the places not used yet.
+    pub(crate) struct TableEntries {} items Value
 }

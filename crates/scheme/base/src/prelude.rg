@@ -91,6 +91,74 @@
 (%define vector->list (%lambda (v) (%intrinsic vector->list v)))
 (%define list->vector (%lambda (xs) (%intrinsic list->vector xs)))
 
+; Tables: maps that keep their entries in the order they were added. A string, a number, a symbol,
+; a character or a boolean is a key by its value. Anything else is a key by identity.
+(%define table? (%lambda (x) (%intrinsic table? x)))
+(%define make-table (%lambda room (%apply-intrinsic make-table room)))
+(%define table (%lambda entries (%apply-intrinsic table entries)))
+(%define table-ref (%lambda (t key [default #f]) (%intrinsic table-ref t key default)))
+(%define table-set! (%lambda (t key value) (%intrinsic table-set! t key value)))
+(%define table-delete! (%lambda (t key) (%intrinsic table-delete! t key)))
+(%define table-has? (%lambda (t key) (%intrinsic table-has? t key)))
+(%define table-length (%lambda (t) (%intrinsic table-length t)))
+(%define table-clear! (%lambda (t) (%intrinsic table-clear! t)))
+(%define table->vector (%lambda (t) (%intrinsic table->vector t)))
+(%define table-update!
+  (%lambda (t key f [default #f])
+    (%intrinsic table-set! t key (%app f (%intrinsic table-ref t key default)))))
+; The procedures below read the table once, with `table->vector`, and work from that vector. So
+; they visit the entries the table had when they were called, whatever is done to it meanwhile.
+(%define table-keys
+  (%letrec ((keys (%lambda (entries at acc)
+                    (%if (%intrinsic = at 0)
+                         acc
+                         (%app keys entries (%intrinsic - at 2) (%intrinsic cons (%intrinsic vector-ref entries (%intrinsic - at 2)) acc))))))
+    (%lambda (t)
+      (%let ((entries (%intrinsic table->vector t)))
+        (%app keys entries (%intrinsic vector-length entries) '())))))
+(%define table-values
+  (%letrec ((values (%lambda (entries at acc)
+                      (%if (%intrinsic = at 0)
+                           acc
+                           (%app values entries (%intrinsic - at 2) (%intrinsic cons (%intrinsic vector-ref entries (%intrinsic - at 1)) acc))))))
+    (%lambda (t)
+      (%let ((entries (%intrinsic table->vector t)))
+        (%app values entries (%intrinsic vector-length entries) '())))))
+(%define table->list
+  (%letrec ((pairs (%lambda (entries at acc)
+                     (%if (%intrinsic = at 0)
+                          acc
+                          (%app pairs entries (%intrinsic - at 2)
+                                (%intrinsic cons (%intrinsic cons (%intrinsic vector-ref entries (%intrinsic - at 2)) (%intrinsic vector-ref entries (%intrinsic - at 1))) acc))))))
+    (%lambda (t)
+      (%let ((entries (%intrinsic table->vector t)))
+        (%app pairs entries (%intrinsic vector-length entries) '())))))
+(%define list->table
+  (%letrec ((fill (%lambda (t entries)
+                    (%if (%intrinsic null? entries)
+                         t
+                         (%let ((_ (%intrinsic table-set! t (%intrinsic car (%intrinsic car entries)) (%intrinsic cdr (%intrinsic car entries)))))
+                           (%app fill t (%intrinsic cdr entries)))))))
+    (%lambda (entries) (%app fill (%intrinsic make-table) entries))))
+(%define table-for-each
+  (%letrec ((each (%lambda (f entries at end)
+                    (%if (%intrinsic = at end)
+                         (%intrinsic void)
+                         (%let ((_ (%app f (%intrinsic vector-ref entries at) (%intrinsic vector-ref entries (%intrinsic + at 1)))))
+                           (%app each f entries (%intrinsic + at 2) end))))))
+    (%lambda (f t)
+      (%let ((entries (%intrinsic table->vector t)))
+        (%app each f entries 0 (%intrinsic vector-length entries))))))
+(%define table-copy
+  (%letrec ((fill (%lambda (copy entries at end)
+                    (%if (%intrinsic = at end)
+                         copy
+                         (%let ((_ (%intrinsic table-set! copy (%intrinsic vector-ref entries at) (%intrinsic vector-ref entries (%intrinsic + at 1)))))
+                           (%app fill copy entries (%intrinsic + at 2) end))))))
+    (%lambda (t)
+      (%let ((entries (%intrinsic table->vector t)))
+        (%app fill (%intrinsic make-table (%intrinsic table-length t)) entries 0 (%intrinsic vector-length entries))))))
+
 (%define + (%lambda xs (%apply-intrinsic + xs)))
 (%define - (%lambda xs (%apply-intrinsic - xs)))
 (%define * (%lambda xs (%apply-intrinsic * xs)))

@@ -242,6 +242,33 @@ fn main() {
         println!("{name:<30} {:.1} ns per iteration", per(time(&summing(call), false, true)));
     }
 
+    // A table of 8 entries as a payload has them, and one of 1000 integer keys. Each line reads or writes it once per iteration.
+    let tables = "(define t (table 'id 1 'name \"ann\" 'age 3 \"kind\" 4 \"a key that is too long to fit in a word\" 5 7 6 'last 7 'more 8))
+                  (define big (let fill ((i 0) (big (make-table))) (if (eqv? i 1000) big (begin (table-set! big i i) (fill (+ i 1) big)))))
+                  (define v (vector 1 2 3 4 5 6 7 8))";
+    let reading = |call: &str| format!("{tables} (define (count n acc) (if (eqv? n 0) acc (count (- n 1) (+ acc {call})))) (count {N} 0)");
+    for (name, call) in [
+        ("vector-ref, for comparison", "(vector-ref v 6)"),
+        ("table-ref, symbol key", "(table-ref t 'last)"),
+        ("table-ref, short string key", "(table-ref t \"kind\")"),
+        ("table-ref, long string key", "(table-ref t \"a key that is too long to fit in a word\")"),
+        ("table-ref, integer key", "(table-ref t 7)"),
+        ("table-ref, integer key of 1000", "(table-ref big (modulo n 1000))"),
+        ("table-ref, missing key", "(table-ref t 'none 0)"),
+        ("table-set!, key that is there", "(begin (table-set! t 'age n) 1)"),
+        ("table-set! and table-delete!", "(begin (table-set! t 'new n) (table-delete! t 'new) 1)"),
+    ] {
+        println!("{name:<31}{:.1} ns per iteration", per(time(&reading(call), false, true)));
+    }
+    let building = format!("(define (build n) (if (eqv? n 0) 0 (begin (table 'id n 'name \"ann\" 'age 3 'kind 4) (build (+ n -1))))) (build {})", N / 10);
+    println!("make a table of 4 entries:     {:.1} ns each", per(time(&building, false, true)) * 10.0);
+    let walking = format!(
+        "(define big (let fill ((i 0) (big (make-table))) (if (eqv? i 1000) big (begin (table-set! big i i) (fill (+ i 1) big)))))
+         (define (walk n sum) (if (eqv? n 0) sum (walk (+ n -1) (let ((sum sum)) (table-for-each (lambda (key value) (set! sum (+ sum value))) big) sum)))) (walk {} 0)",
+        N / 10_000
+    );
+    println!("table-for-each over 1000:      {:.1} ns per entry", per(time(&walking, false, true)) * 10.0);
+
     let switch = format!(
         "(define co (make-coroutine (lambda () (let loop ((i 0)) (co/yield i) (loop (+ i 1))))))
          (define (drain n) (if (eqv? n 0) 0 (begin (co/resume co) (drain (+ n -1))))) (drain {N})"

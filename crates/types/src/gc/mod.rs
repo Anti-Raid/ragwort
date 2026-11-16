@@ -1850,6 +1850,12 @@ impl<'gc> Mutation<'gc> {
         self.heap.m.roots.last().expect("the arena has a root for its intern table")
     }
 
+    /// How many collections so far have moved objects. A hash of where an object is holds only
+    /// while this stays the same.
+    pub(crate) fn moves(&self) -> u64 {
+        self.heap.m.evacuations.get()
+    }
+
     /// Charged its size, plus `HOST_COST`. Memory the value owns elsewhere, such as a
     /// `String`'s bytes, can be counted with [`HostRef::set_owned_bytes`].
     pub fn host<T: Any>(&self, value: T) -> Result<HostRef<'gc, T>, HostError> {

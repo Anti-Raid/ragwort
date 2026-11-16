@@ -2,10 +2,12 @@ use std::collections::HashMap;
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher, RandomState};
 
 use ragwort_types::bytevector::AnyBytevector;
+use ragwort_types::external::ExternalRef;
 use ragwort_types::gc::{Charge, Gc, Mutation, OutOfMemory, ScratchVec, Value};
 use ragwort_types::num::{Nums, complex};
 use ragwort_types::pair::Pair;
 use ragwort_types::string::{self, Strings};
+use ragwort_types::table::{Entries, Table};
 use ragwort_types::vector::{AnyVector, Vectors};
 
 use crate::Fault;
@@ -50,6 +52,8 @@ pub(crate) fn eqv<'gc>(mc: &Mutation<'gc>, left: Value<'gc>, right: Value<'gc>) 
 /// - Bytevectors with identical byte sequences;
 /// - Pairs, vectors, or boxes whose contents are recursively `equal?` (ignoring vector mutability, per Racket semantics);
 /// - Struct instances of the same struct type whose fields are pairwise `equal?`, provided the type is not an identity type.
+/// - Tables with the same keys, in any order, whose values are pairwise `equal?`. Keys are matched as tables match them.
+/// - External references of one kind that the kind says are equal. See [`ragwort_types::external`].
 ///
 /// Tracks fuel consumption (counting strings/bytevectors as 1 plus 1 per 8 characters or bytes)
 /// and raises [`Fault::OutOfFuel`] if comparison steps exceed `most`.
@@ -73,6 +77,13 @@ pub(crate) fn equal<'gc>(mc: &Mutation<'gc>, left: Value<'gc>, right: Value<'gc>
                     todo.push(Work::Fields(first, second, index + 1))?;
                 }
                 (xs.get(index), ys.get(index))
+            }
+            Some(Work::Entries(mut entries, second)) => {
+                let Some((key, value)) = entries.next() else { continue };
+                todo.push(Work::Entries(entries, second))?;
+                // The tables have as many entries as each other, so they have the same keys if the second has every key of the first.
+                let Some(other) = second.get(mc, key)? else { return Ok((false, compared)) };
+                (value, other)
             }
         };
         compared += 1;
@@ -110,11 +121,18 @@ pub(crate) fn equal<'gc>(mc: &Mutation<'gc>, left: Value<'gc>, right: Value<'gc>
             }
             continue;
         }
+        if let (Some(first), Some(second)) = (ExternalRef::of(left), ExternalRef::of(right)) {
+            if !first.same(mc, second) {
+                return Ok((false, compared));
+            }
+            continue;
+        }
         let (Some(first), Some(second)) = (Compound::of(mc, &vectors, left), Compound::of(mc, &vectors, right)) else { return Ok((false, compared)) };
         let same_shape = match (first, second) {
             (Compound::Vector(first), Compound::Vector(second)) => first.len(mc) == second.len(mc),
             (Compound::Pair(_), Compound::Pair(_)) | (Compound::Box(_), Compound::Box(_)) => true,
             (Compound::Struct(first), Compound::Struct(second)) => first.kind(mc) == second.kind(mc),
+            (Compound::Table(first), Compound::Table(second)) => first.len(mc) == second.len(mc),
             _ => false,
         };
         if !same_shape {
@@ -131,26 +149,30 @@ pub(crate) fn equal<'gc>(mc: &Mutation<'gc>, left: Value<'gc>, right: Value<'gc>
             (Compound::Vector(first), Compound::Vector(second)) if !first.is_empty(mc) => todo.push(Work::Items(first, second, 0))?,
             (Compound::Box(first), Compound::Box(second)) => next = Some((first.value(mc), second.value(mc))),
             (Compound::Struct(first), Compound::Struct(second)) if !first.items(mc).is_empty() => todo.push(Work::Fields(first, second, 0))?,
+            (Compound::Table(first), Compound::Table(second)) if !first.is_empty(mc) => todo.push(Work::Entries(first.entries(mc), second))?,
             _ => {}
         }
     }
 }
 
 /// Pending comparison tasks on the traversal stack: either a pair of arbitrary values,
-/// or corresponding elements of two vectors or struct instances starting from a given index offset.
+/// or corresponding elements of two vectors or struct instances starting from a given index offset,
+/// or the entries of a table that are still to be looked up in another table.
 enum Work<'gc> {
     Values(Value<'gc>, Value<'gc>),
     Items(AnyVector<'gc>, AnyVector<'gc>, usize),
     Fields(Gc<'gc, objects::Struct>, Gc<'gc, objects::Struct>, usize),
+    Entries(Entries<'gc>, Table<'gc>),
 }
 
-/// A compound data type compared recursively by content in `equal?` (pair, vector, box, or non-identity struct).
+/// A compound data type compared recursively by content in `equal?` (pair, vector, box, non-identity struct, or table).
 #[derive(Clone, Copy)]
 enum Compound<'gc> {
     Pair(Pair<'gc>),
     Vector(AnyVector<'gc>),
     Box(Gc<'gc, objects::Box>),
     Struct(Gc<'gc, objects::Struct>),
+    Table(Table<'gc>),
 }
 
 impl<'gc> Compound<'gc> {
@@ -160,6 +182,9 @@ impl<'gc> Compound<'gc> {
         }
         if let Some(vector) = vectors.vector(value) {
             return Some(Compound::Vector(vector));
+        }
+        if let Some(table) = Table::of(value) {
+            return Some(Compound::Table(table));
         }
         // Struct instances belonging to an identity type compare `equal?` strictly by pointer identity (`eq?`).
         if let Some(made) = value.downcast::<objects::Struct>(mc) {

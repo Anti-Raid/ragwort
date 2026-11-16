@@ -1,8 +1,10 @@
 use ragwort_types::bytevector::Bytevectors;
+use ragwort_types::external::{ExternalKind, ExternalRefs};
 use ragwort_types::gc::Arena;
 use ragwort_types::pair::Pairs;
 use ragwort_types::symbol::Symbols;
 use ragwort_types::syntax::{SyntaxMeta, SyntaxSpan};
+use ragwort_types::table::Tables;
 use ragwort_types::vector::Vectors;
 use ragwort_vm::Intrinsic;
 
@@ -215,10 +217,40 @@ fn syntax_is_written_as_its_datum_once() {
 }
 
 #[test]
+fn tables_are_written_with_their_entries_in_order() {
+    with(|mc| {
+        let tables = Tables::new(mc);
+        let table = tables.make().unwrap();
+        assert_eq!(write(mc, table.value(mc)), "#table()");
+        let entries = [(symbol(mc, "name"), text(mc, "ragwort")), (text(mc, "id"), number(mc, "7")), (number(mc, "2"), Pairs::new(mc).list(&[Value::TRUE, Value::char('x')]).unwrap())];
+        for (key, value) in entries {
+            table.set(mc, key, value).unwrap();
+        }
+        assert_eq!(write(mc, table.value(mc)), r#"#table((name . "ragwort") ("id" . 7) (2 . (#t #\x)))"#);
+        assert_eq!(display(mc, table.value(mc)), "#table((name . ragwort) (id . 7) (2 . (#t x)))");
+        // A removed entry leaves no trace, wherever it was.
+        table.delete(mc, text(mc, "id")).unwrap();
+        assert_eq!(write(mc, table.value(mc)), r#"#table((name . "ragwort") (2 . (#t #\x)))"#);
+        table.delete(mc, symbol(mc, "name")).unwrap();
+        table.delete(mc, number(mc, "2")).unwrap();
+        assert_eq!(write(mc, table.value(mc)), "#table()");
+        // A table can hold itself, as a value or as a key, and tables nest.
+        let (outer, inner) = (tables.make().unwrap(), tables.make().unwrap());
+        inner.set(mc, symbol(mc, "up"), outer.value(mc)).unwrap();
+        outer.set(mc, symbol(mc, "in"), inner.value(mc)).unwrap();
+        outer.set(mc, outer.value(mc), Value::NIL).unwrap();
+        assert_eq!(write(mc, outer.value(mc)), "#0=#table((in . #table((up . #0#))) (#0# . ()))");
+        let twice = Pairs::new(mc).list(&[inner.value(mc), inner.value(mc)]).unwrap();
+        assert_eq!(to_string(mc, twice, Mode::Shared, usize::MAX).unwrap(), "(#0=#table((up . #1=#table((in . #0#) (#1# . ())))) #0#)");
+    });
+}
+
+#[test]
 fn external_refs_and_undefined_print_as_what_they_are() {
     with(|mc| {
-        let external = Value::object(mc, ragwort_vm::module::external(mc, 5_u8, 0, Value::NIL).unwrap());
+        static BYTE: ExternalKind<u8> = ExternalKind::by_identity("byte");
+        let external = ExternalRefs::new(mc).make(&BYTE, 5, 0, Value::NIL).unwrap().value(mc);
         let list = Pairs::new(mc).list(&[external, Value::UNDEFINED]).unwrap();
-        assert_eq!(write(mc, list), "(#<external> #<undefined>)");
+        assert_eq!(write(mc, list), "(#<byte> #<undefined>)");
     });
 }

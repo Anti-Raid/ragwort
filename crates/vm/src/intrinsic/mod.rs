@@ -12,6 +12,7 @@ mod numeric;
 mod operands;
 mod structs;
 mod syntax;
+mod tables;
 mod text;
 mod vectors;
 
@@ -27,6 +28,7 @@ use ragwort_types::num::{Nums, complex};
 use ragwort_types::pair::{Pair, Pairs};
 use ragwort_types::string::{self, Strings};
 use ragwort_types::symbol::{Keyword, Symbol};
+use ragwort_types::table::Table;
 use ragwort_types::vector::AnyVector;
 
 use crate::op::{Context, Fuel};
@@ -273,7 +275,7 @@ named! {
         /// value and exactness, and `#f` otherwise.
         Eqv = ("eqv?", takes(2, FOLD | DISCARD | COMMUTE)),
         /// `(equal? a b)`: returns `#t` if `a` and `b` satisfy `eqv?` or are recursively structurally
-        /// equivalent (comparing strings, pairs, vectors, or boxes by content). Terminates on cyclic
+        /// equivalent (comparing strings, pairs, vectors, boxes, or tables by content). Terminates on cyclic
         /// structures and deducts one VM fuel unit per 1,024 comparisons, raising [`Fault::OutOfFuel`]
         /// if fuel is exhausted.
         Equal = ("equal?", takes(2, FOLD | COMMUTE)),
@@ -591,6 +593,32 @@ named! {
         /// `(list->vector xs)`: allocates and returns a mutable vector populated with the elements of
         /// proper list `xs`.
         ListToVector = ("list->vector", takes(1, TRUTHY)),
+        /// `(table? x)`: returns `#t` if `x` is a table, and `#f` otherwise.
+        IsTable = ("table?", takes(1, FOLD | DISCARD | PREDICATE)),
+        /// `(make-table [room])`: allocates an empty table. With `room`, the table can take that many
+        /// entries before it has to grow.
+        MakeTable = ("make-table", any(TRUTHY)),
+        /// `(table key value ...)`: allocates a table with an entry for each `key` and `value`, in that
+        /// order. A key given twice keeps its first place and its last value.
+        MakeTableOf = ("table", any(TRUTHY)),
+        /// `(table-ref t key default)`: returns the value of `key` in table `t`, or `default` if `t` has
+        /// no such key.
+        TableRef = ("table-ref", takes(3, 0)),
+        /// `(table-set! t key value)`: sets the value of `key` in table `t`, returning `#<void>`. A key
+        /// that `t` does not have yet becomes its last entry.
+        TableSet = ("table-set!", takes(3, TRUTHY)),
+        /// `(table-delete! t key)`: removes the entry of `key` from table `t`. Returns `#t` if `t` had
+        /// one, and `#f` otherwise.
+        TableDelete = ("table-delete!", takes(2, 0)),
+        /// `(table-has? t key)`: returns `#t` if table `t` has an entry for `key`, and `#f` otherwise.
+        TableHas = ("table-has?", takes(2, 0)),
+        /// `(table-length t)`: returns the number of entries in table `t`.
+        TableLength = ("table-length", takes(1, TRUTHY)),
+        /// `(table-clear! t)`: removes every entry from table `t`, returning `#<void>`.
+        TableClear = ("table-clear!", takes(1, TRUTHY)),
+        /// `(table->vector t)`: allocates a mutable vector of the keys and values of table `t`: each key
+        /// followed by its value, in the order the entries were added.
+        TableToVector = ("table->vector", takes(1, TRUTHY)),
         /// `(box x)`: allocates and returns a newly created mutable box initialized with value `x`.
         MakeBox = ("box", takes(1, DISCARD | TRUTHY)),
         /// `(unbox b)`: dereferences box `b`, returning its current stored value.
@@ -1245,6 +1273,16 @@ impl Intrinsic {
             | Intrinsic::BytevectorLength
             | Intrinsic::BytevectorRef
             | Intrinsic::BytevectorSet => self.bytevector(mc, operands, fuel)?,
+            Intrinsic::IsTable => boolean(Table::of(operands.get(0)).is_some()),
+            Intrinsic::MakeTable
+            | Intrinsic::MakeTableOf
+            | Intrinsic::TableRef
+            | Intrinsic::TableSet
+            | Intrinsic::TableDelete
+            | Intrinsic::TableHas
+            | Intrinsic::TableLength
+            | Intrinsic::TableClear
+            | Intrinsic::TableToVector => self.table(mc, operands, fuel)?,
             Intrinsic::IsVector => boolean(AnyVector::of(operands.get(0)).is_some()),
             Intrinsic::MakeVector
             | Intrinsic::MakeVectorOf

@@ -103,8 +103,6 @@ objects! {
         hosts: Frozen<std::boxed::Box<[&'static crate::module::HostDef]>>,
         interface: Frozen<std::boxed::Box<dyn std::any::Any>>,
     } items Value
-    /// A host reference wrapper passed to host procedures: contains arbitrary host `data` allocated outside the arena (dropped upon GC finalization) and a `held` garbage-collected value traced by the GC to preserve associated arena objects.
-    pub struct ExternalRef { held: Value, data: Frozen<std::boxed::Box<dyn std::any::Any>> }
     /// A procedure accepting keyword arguments (see [`crate::keyword`]): wraps a `core` procedure and an optional `plain` procedure, accompanied by sorted lists of accepted `keywords` and `required` keywords.
     pub struct KeywordProcedure { plain: Value, core: Value, keywords: Value, required: Value }
     /// Descriptor for a record structure type (see [`crate::structs`]):

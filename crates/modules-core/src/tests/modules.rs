@@ -237,6 +237,36 @@ fn an_image_holds_modules_for_another_arena() {
     assert_eq!(cut, Err(image::ImageError::Load(ragwort_types::gc::image::LoadError::Malformed)));
 }
 
+/// A table saved in an image is found whole in the arena that loads it: its entries in their order, and each key as the key it was. A key that is a list is one by identity, and the list is somewhere else in the new arena.
+#[test]
+fn an_image_keeps_tables_and_their_keys() {
+    let library = "(provide scores point lookup)
+                   (define point (list 1 2))
+                   (define scores (table 'ann 1 \"a key that is too long to fit in a word\" 2 3 'three 2.5 'half point 'here))
+                   (table-set! scores (expt 2 100) 'big)
+                   (table-delete! scores 3)
+                   (define (lookup key) (table-ref scores key 'none))";
+    let user = "(require library)
+                (list (table->list scores) (lookup 'ann) (lookup \"a key that is too long to fit in a word\") (lookup 3) (lookup 2.5) (lookup (expt 2 100)) (lookup point) (lookup (list 1 2))
+                      (begin (table-set! scores 'new 9) (table-delete! scores 'ann) (table-keys scores)))";
+    let expected = "(((ann . 1) (\"a key that is too long to fit in a word\" . 2) (2.5 . half) ((1 2) . here) (1267650600228229401496703205376 . big)) 1 2 none half big here none \
+                    (\"a key that is too long to fit in a word\" 2.5 (1 2) 1267650600228229401496703205376 new))";
+    let mut arena = arena();
+    assert_eq!(module_in(&mut arena, "library", &[(Scheme, library)]).map(|ran| ran.is_ok()), Ok(true));
+    arena.collect();
+    let bytes = arena.mutate(|mc| image::save(mc, &[mc.root(0), mc.root(1), mc.root(2)])).unwrap();
+    assert_eq!(module_in(&mut arena, "user", &[(Scheme, user)]), Ok(Ok(expected.into())));
+    for _ in 0..2 {
+        let mut other = Arena::new(1 << 24, 3);
+        other.mutate(|mc| {
+            let roots = image::load(mc, &bytes, HOSTS.iter()).unwrap();
+            roots.iter().enumerate().for_each(|(i, &root)| mc.set_root(i, root));
+        });
+        other.collect();
+        assert_eq!(module_in(&mut other, "user", &[(Scheme, user)]), Ok(Ok(expected.into())));
+    }
+}
+
 /// Two host functions of one name, which do different things: each is a module's own.
 mod sums {
     use super::*;

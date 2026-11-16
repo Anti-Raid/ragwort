@@ -1,3 +1,4 @@
+use ragwort_types::external::{ExternalKind, ExternalRef, ExternalRefs};
 use ragwort_types::gc::{Arena, Gc, Mutation, Value};
 use ragwort_types::pair::{Pair, Pairs};
 use ragwort_types::vector::Vectors;
@@ -5,7 +6,7 @@ use ragwort_types::vector::Vectors;
 use super::*;
 use crate::Intrinsic::{Add, Car, Cons, Eq, MakeBox, MakePromptTag, MarkValue, SetBox, Unbox};
 use crate::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Condition, ConditionFields, Tag};
-use crate::objects::{ExternalRef, ExternalRefFields, Module};
+use crate::objects::Module;
 use crate::{Capture, Fault, HostArgs, HostContext, HostDef, Op, Purity, Reply, Request};
 
 fn fix<'gc>(n: i64) -> Value<'gc> {
@@ -1270,6 +1271,40 @@ fn host_functions_spend_the_machines_fuel() {
     });
 }
 
+/// Applies `intrinsic` to `args` outside any machine.
+fn apply<'gc>(mc: &Mutation<'gc>, intrinsic: crate::Intrinsic, args: &[Value<'gc>]) -> Result<Value<'gc>, Fault> {
+    intrinsic.run(mc, args, &mut crate::Fuel { run: u64::MAX, rest: 0 })
+}
+
+/// `equal?` and tables compare external references as their kind says. `eq?` and `eqv?` compare them by identity.
+#[test]
+fn external_references_are_equal_as_their_kind_says() {
+    struct UserId(u64);
+    static USER_ID: ExternalKind<UserId> = ExternalKind::by_value("user-id", |first, second| first.0 == second.0, |id| id.0);
+    static HANDLE: ExternalKind<u64> = ExternalKind::by_identity("handle");
+    Arena::new(1 << 24, 0).mutate(|mc| {
+        let externals = ExternalRefs::new(mc);
+        let user = |id| externals.make(&USER_ID, UserId(id), 0, Value::NIL).unwrap().value(mc);
+        let handle = |number| externals.make(&HANDLE, number, 0, Value::NIL).unwrap().value(mc);
+        let (ann, again, bo) = (user(7), user(7), user(8));
+        let truth = |flag| if flag { Value::TRUE } else { Value::FALSE };
+        for (first, second, equal) in [(ann, again, true), (ann, ann, true), (ann, bo, false), (ann, handle(7), false), (handle(7), handle(7), false), (ann, fix(7), false)] {
+            assert_eq!(apply(mc, crate::Intrinsic::Equal, &[first, second]), Ok(truth(equal)));
+            assert_eq!(apply(mc, crate::Intrinsic::Eqv, &[first, second]), Ok(truth(first == second)));
+            assert_eq!(apply(mc, crate::Intrinsic::Eq, &[first, second]), Ok(truth(first == second)));
+        }
+        // Inside other data too: lists of equal references are equal, and a table finds a key by an equal reference.
+        let (one, other) = (Pairs::new(mc).list(&[ann, bo]).unwrap(), Pairs::new(mc).list(&[again, user(8)]).unwrap());
+        assert_eq!(apply(mc, crate::Intrinsic::Equal, &[one, other]), Ok(Value::TRUE));
+        let table = apply(mc, crate::Intrinsic::MakeTableOf, &[ann, fix(1), handle(7), fix(2)]).unwrap();
+        assert_eq!(apply(mc, crate::Intrinsic::TableRef, &[table, again, Value::FALSE]), Ok(fix(1)));
+        assert_eq!(apply(mc, crate::Intrinsic::TableRef, &[table, handle(7), Value::FALSE]), Ok(Value::FALSE));
+        assert_eq!(apply(mc, crate::Intrinsic::TableHas, &[table, bo]), Ok(Value::FALSE));
+        let same_entries = apply(mc, crate::Intrinsic::MakeTableOf, &[fix(0), again]).unwrap();
+        assert_eq!(apply(mc, crate::Intrinsic::Equal, &[apply(mc, crate::Intrinsic::MakeTableOf, &[fix(0), ann]).unwrap(), same_entries]), Ok(Value::TRUE));
+    });
+}
+
 #[test]
 fn external_refs_hold_the_hosts_data_and_trace_their_value() {
     struct Dropped(std::rc::Rc<std::cell::Cell<bool>>);
@@ -1280,7 +1315,7 @@ fn external_refs_hold_the_hosts_data_and_trace_their_value() {
     }
     type State = (Dropped, std::cell::Cell<i64>);
     fn count<'s, 'gc>(cx: &mut HostContext<'s, 'gc>, args: HostArgs<'s, 'gc>) -> Result<Reply<'gc>, Fault> {
-        let (_, n) = crate::module::external_data::<State>(cx.mc(), args.get(0).unwrap()).ok_or(Fault::WrongType)?;
+        let (_, n) = args.get(0).and_then(ExternalRef::of).and_then(|external| external.data::<State>(cx.mc())).ok_or(Fault::WrongType)?;
         n.set(n.get() + 1);
         Ok(Reply::Value(fix(n.get())))
     }
@@ -1289,8 +1324,9 @@ fn external_refs_hold_the_hosts_data_and_trace_their_value() {
     let mut arena = Arena::new(1 << 24, 1);
     arena.mutate(|mc| {
         let state: State = (Dropped(dropped.clone()), std::cell::Cell::new(0));
-        let external = crate::module::external(mc, state, 0, list(mc, &[1, 2])).unwrap();
-        mc.set_root(0, Value::object(mc, external));
+        static STATE: ExternalKind<State> = ExternalKind::by_identity("state");
+        let external = ExternalRefs::new(mc).make(&STATE, state, 0, list(mc, &[1, 2])).unwrap();
+        mc.set_root(0, external.value(mc));
     });
     arena.set_evacuate_all(true);
     arena.collect();
@@ -1301,8 +1337,8 @@ fn external_refs_hold_the_hosts_data_and_trace_their_value() {
         let codes = module_calling(mc, &[external, fix(3)], &COUNT, &[(0, &[], &counted), (0, &[], &wrong)]);
         assert_eq!((run(mc, codes[0], &[]), run(mc, codes[0], &[])), (Ok(vec![1]), Ok(vec![2])));
         assert_eq!(run(mc, codes[1], &[]), Err(Fault::WrongType));
-        assert_eq!(items(mc, external.downcast::<ExternalRef>(mc).unwrap().held(mc)), [1, 2]);
-        assert!(crate::module::external_data::<i64>(mc, external).is_none());
+        assert_eq!(items(mc, ExternalRef::of(external).unwrap().kept(mc)), [1, 2]);
+        assert!(ExternalRef::of(external).unwrap().data::<i64>(mc).is_none());
         mc.set_root(0, Value::NIL);
     });
     assert!(!dropped.get());
