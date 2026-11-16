@@ -37,7 +37,7 @@ impl Intrinsic {
                 let len = vector.len(mc);
                 fuel.spend(len as u64 / equal::PER_FUEL)?;
                 let pairs = Pairs::new(mc);
-                let mut list = Value::NIL;
+                let mut list = Value::NULL;
                 for i in (0..len).rev() {
                     list = pairs.cons(vector.get(mc, i).expect("in range"), list)?.value(mc);
                 }

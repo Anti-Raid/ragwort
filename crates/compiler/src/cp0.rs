@@ -75,6 +75,7 @@ pub(crate) fn optimize<'s, 'd, 'gc>(mc: &Mutation<'gc>, src: &mut L2<'s, 'gc>, r
         assigned,
         subst: HashMap::default(),
         truthy_vars: HashSet::default(),
+        falsy_vars: HashSet::default(),
         pred_facts: HashMap::default(),
         single_use: HashMap::default(),
         small_bodies: Vec::new(),
@@ -166,7 +167,7 @@ enum Task<'s, 'd, 'gc> {
     Set(Var),
     /// Handles the `else` branch of `(if v ...)`, assuming `v` is `#f`, after finishing the `then` branch where `v` was truthy.
     VarElse { v: Var, newly: bool, other: usize, test: Id<'d> },
-    VarDone { v: Var, prev: Option<Subst<'gc>>, test: Id<'d> },
+    VarDone { v: Var, newly: bool, test: Id<'d> },
     /// Handles the `else` branch of `(if (pred v) ...)`, assuming the predicate is false, after finishing the `then` branch where it held true.
     PredElse { pred: Intrinsic, v: Var, newly: bool, prev_subst: Option<Subst<'gc>>, prev_fact: Option<bool>, other: usize, test: Id<'d> },
     PredDone { pred: Intrinsic, v: Var, prev_fact: Option<bool>, test: Id<'d> },
@@ -218,8 +219,10 @@ struct Cp0<'m, 't, 's, 'd, 'gc> {
     used: HashSet<Var>,
     assigned: HashSet<Var>,
     subst: HashMap<Var, Subst<'gc>>,
-    /// Unassigned variables known to hold a truthy (non-`#f`) value along the current dominating control-flow branch.
+    /// Unassigned variables known to hold a truthy value along the current dominating control-flow branch.
     truthy_vars: HashSet<Var>,
+    /// Unassigned variables known to hold a false value (`#f`, `#nil` or `#none`) along the current dominating control-flow branch.
+    falsy_vars: HashSet<Var>,
     /// Dominating type-predicate outcomes `(pred, var) -> bool` known for unassigned variables along the current branch.
     pred_facts: HashMap<(Intrinsic, Var), bool>,
     /// Unassigned `Let`-bound lambdas referenced exactly once in call position, stored in unoptimized source form along with their enclosing `let` frame index.
@@ -361,12 +364,14 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                 if newly {
                     self.truthy_vars.remove(&var);
                 }
-                let prev = self.subst.insert(var, Subst::Quote(Value::FALSE));
-                return then.extend([Task::Arm(other), Task::VarDone { v: var, prev, test }]);
+                let newly = self.falsy_vars.insert(var);
+                return then.extend([Task::Arm(other), Task::VarDone { v: var, newly, test }]);
             }
-            Task::VarDone { v: var, prev, test } => {
+            Task::VarDone { v: var, newly, test } => {
                 let (other, consequent) = (self.pop(), self.pop());
-                self.restore(var, prev);
+                if newly {
+                    self.falsy_vars.remove(&var);
+                }
                 self.branches(test, consequent, other)
             }
             Task::PredElse { pred, v: var, newly, prev_subst, prev_fact, other, test } => {
@@ -559,10 +564,12 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         loop {
             let node = self.out[test];
             match node {
-                // Constant condition folding: `(if #f then other) -> other` and `(if <truthy-const> then other) -> then`.
-                Node::Quote(value) => then.push(Task::Arm(if value == Value::FALSE { other } else { consequent })),
+                // Constant condition folding: `(if <false-const> then other) -> other` and `(if <truthy-const> then other) -> then`.
+                Node::Quote(value) => then.push(Task::Arm(if value.is_false() { other } else { consequent })),
                 // Variable known to be truthy along the current dominating branch: folds directly to the `then` branch.
                 Node::Ref(var) if self.truthy_vars.contains(&var) => then.push(Task::Arm(consequent)),
+                // Variable known to be false along the current dominating branch: folds directly to the `other` branch.
+                Node::Ref(var) if self.falsy_vars.contains(&var) => then.push(Task::Arm(other)),
                 // Statically known non-false expression: sequences the test for side effects and selects the `then` branch.
                 _ if self.out.is_always_truthy(test) => then.extend([Task::Arm(consequent), Task::Then(test)]),
                 // Inverts branches for logical negation: `(if (not x) then other) -> (if x other then)`.
@@ -577,10 +584,31 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                     test = second;
                     continue;
                 }
+                // Normalizes `and` in test position. `(and a b)` is `(let ((t a)) (if t b t))`, which gives the false value of `a` itself when `a` is false.
+                // As a test, it only matters that the value is false: `(if (let ((t a)) (if t b t)) then other) -> (if a (if b then other) other)`.
+                // This needs `t` to have no other use, and `other` to be a duplicate-safe expression (constant or variable).
+                Node::Let(binds, body)
+                    if let [Bind::Val(temp, init)] = self.out[binds]
+                        && let Node::If(inner_test, inner_then, inner_else) = self.out[body]
+                        && matches!((self.out[inner_test], self.out[inner_else]), (Node::Ref(tested), Node::Ref(given)) if tested == temp && given == temp)
+                        && self.uses.get(&temp).is_some_and(|uses| uses.total == 2)
+                        && !self.assigned.contains(&temp)
+                        && matches!(self.arms[other], Arm::Raw(expr) if matches!(self.src[expr], Node::Quote(_) | Node::Ref(_))) =>
+                {
+                    let Arm::Raw(expr) = self.arms[other] else { unreachable!() };
+                    let copy = self.src.add(self.src[expr]);
+                    let copy = self.arm_raw(copy);
+                    self.arms.push(Arm::If(inner_then, consequent, copy));
+                    consequent = self.arms.len() - 1;
+                    test = init;
+                    continue;
+                }
                 // Normalizes short-circuit conjunction in test position:
-                // `(if (if a b #f) then other) -> (if a (if b then other) other)` when `other` is a duplicate-safe expression (constant or variable).
+                // `(if (if a b <false>) then other) -> (if a (if b then other) other)` when `other` is a duplicate-safe expression (constant or variable).
+                // `<false>` is a false constant, or `a` itself when `a` is a variable, which is false where the inner `if` gives it.
                 Node::If(inner_test, inner_then, inner_else)
-                    if matches!(self.out[inner_else], Node::Quote(Value::FALSE))
+                    if (matches!(self.out[inner_else], Node::Quote(value) if value.is_false())
+                        || matches!((self.out[inner_test], self.out[inner_else]), (Node::Ref(tested), Node::Ref(given)) if tested == given && !self.assigned.contains(&tested)))
                         && matches!(self.arms[other], Arm::Raw(expr) if matches!(self.src[expr], Node::Quote(_) | Node::Ref(_))) =>
                 {
                     let Arm::Raw(expr) = self.arms[other] else { unreachable!() };
@@ -591,7 +619,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                     test = inner_test;
                     continue;
                 }
-                // Records dominating variable truthiness: `v` is known truthy in `then`, and `#f` in `other`.
+                // Records dominating variable truthiness: `v` is known truthy in `then`, and false in `other`. Which of the false values it is there is not known, so its uses in `other` stay as they are.
                 Node::Ref(var) if !self.assigned.contains(&var) => {
                     let newly = self.truthy_vars.insert(var);
                     then.extend([Task::Arm(consequent), Task::VarElse { v: var, newly, other, test }]);
@@ -616,8 +644,8 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                 {
                     let Node::Ref(var) = self.out[self.out[args][0]] else { unreachable!() };
                     let prev_fact = self.pred_facts.insert((pred, var), true);
-                    let newly = (pred != Intrinsic::IsBoolean) && self.truthy_vars.insert(var);
-                    let prev_subst = if pred == Intrinsic::IsNull { self.subst.insert(var, Subst::Quote(Value::NIL)) } else { None };
+                    let newly = !matches!(pred, Intrinsic::IsBoolean | Intrinsic::IsNil | Intrinsic::IsNone) && self.truthy_vars.insert(var);
+                    let prev_subst = if pred == Intrinsic::IsNull { self.subst.insert(var, Subst::Quote(Value::NULL)) } else { None };
                     then.extend([Task::Arm(consequent), Task::PredElse { pred, v: var, newly, prev_subst, prev_fact, other, test }]);
                 }
                 _ => then.extend([Task::Arm(consequent), Task::Arm(other), Task::If(test)]),
@@ -826,7 +854,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             args.push(self.src.add(Node::Quote(Value::UNSUPPLIED)));
         }
         let rest = func.rest.map(|rest| {
-            let mut list = self.src.add(Node::Quote(Value::NIL));
+            let mut list = self.src.add(Node::Quote(Value::NULL));
             for item in args.split_off(params.len()).into_iter().rev() {
                 let pair = self.src.list([item, list]);
                 list = self.src.add(Node::Intrinsic(Prim::Intrinsic(Intrinsic::Cons), pair));
@@ -842,7 +870,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             args.push(self.quote(Value::UNSUPPLIED));
         }
         let rest = rest.map(|rest| {
-            let mut list = self.quote(Value::NIL);
+            let mut list = self.quote(Value::NULL);
             for item in args.split_off(params.len()).into_iter().rev() {
                 list = self.opt_intrinsic(Prim::Intrinsic(Intrinsic::Cons), vec![item, list]);
             }
@@ -1170,6 +1198,11 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             {
                 return self.truth(false);
             }
+            if let Node::Ref(var) = self.out[args[0]]
+                && self.falsy_vars.contains(&var)
+            {
+                return self.truth(true);
+            }
             if self.out.is_always_truthy(args[0]) {
                 let falsy = self.truth(false);
                 return self.seq(args[0], falsy);
@@ -1205,7 +1238,8 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         // Rule 6: Equality simplifications (`eq?`, `eqv?`, `equal?`):
         //    - Reflexive identity: `(eq? x x) -> #t`
         //    - Canonicalize empty list check: `(eq? x '()) -> (null? x)` (avoids loading `'()` literal)
-        //    - Canonicalize boolean false check: `(eq? x #f) -> (not x)` (enables branch inversion in `if`)
+        //    - Canonicalize the checks for `#nil` and `#none` the same way: `(eq? x #nil) -> (nil? x)`, `(eq? x #none) -> (none? x)`
+        //    A check for `#f` stays as it is: `(not x)` also holds for `#nil` and `#none`.
         if matches!(intrinsic, Intrinsic::Eq | Intrinsic::Eqv | Intrinsic::Equal) && args.len() == 2 {
             if let (Node::Ref(left), Node::Ref(right)) = (self.out[args[0]], self.out[args[1]])
                 && left == right
@@ -1213,21 +1247,23 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             {
                 return self.truth(true);
             }
-            if matches!(self.out[args[1]], Node::Quote(Value::NIL)) {
+            if matches!(self.out[args[1]], Node::Quote(Value::NULL)) {
                 let operand = args.swap_remove(0);
                 return self.opt_intrinsic(Prim::Intrinsic(Intrinsic::IsNull), vec![operand]);
             }
-            if matches!(self.out[args[0]], Node::Quote(Value::NIL)) {
+            if matches!(self.out[args[0]], Node::Quote(Value::NULL)) {
                 let operand = args.pop().expect("checked 2 eq args");
                 return self.opt_intrinsic(Prim::Intrinsic(Intrinsic::IsNull), vec![operand]);
             }
-            if matches!(self.out[args[1]], Node::Quote(Value::FALSE)) {
-                let operand = args.swap_remove(0);
-                return self.opt_intrinsic(Prim::Intrinsic(Intrinsic::Not), vec![operand]);
-            }
-            if matches!(self.out[args[0]], Node::Quote(Value::FALSE)) {
-                let operand = args.pop().expect("checked 2 eq args");
-                return self.opt_intrinsic(Prim::Intrinsic(Intrinsic::Not), vec![operand]);
+            for (constant, predicate) in [(Value::NIL, Intrinsic::IsNil), (Value::NONE, Intrinsic::IsNone)] {
+                if matches!(self.out[args[1]], Node::Quote(value) if value == constant) {
+                    let operand = args.swap_remove(0);
+                    return self.opt_intrinsic(Prim::Intrinsic(predicate), vec![operand]);
+                }
+                if matches!(self.out[args[0]], Node::Quote(value) if value == constant) {
+                    let operand = args.pop().expect("checked 2 eq args");
+                    return self.opt_intrinsic(Prim::Intrinsic(predicate), vec![operand]);
+                }
             }
         }
 
@@ -1274,8 +1310,9 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
     /// Evaluates whether the already-optimized condition `test` statically evaluates to true or false under current facts.
     fn decided(&self, test: Id<'d>) -> Option<bool> {
         match self.out[test] {
-            Node::Quote(value) => Some(value != Value::FALSE),
+            Node::Quote(value) => Some(value.is_true()),
             Node::Ref(var) if self.truthy_vars.contains(&var) => Some(true),
+            Node::Ref(var) if self.falsy_vars.contains(&var) => Some(false),
             Node::Intrinsic(Prim::Intrinsic(Intrinsic::IsStructDerivedFrom), args) if let [tested, kind] = self.out[args] => self.derives(self.subject(tested)?, self.struct_type(kind)?),
             Node::Intrinsic(Prim::Intrinsic(pred), args) if pred.is_type_predicate() && let [tested] = self.out[args] => self.of_kind(pred, tested),
             _ => None,

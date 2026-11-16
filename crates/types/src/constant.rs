@@ -146,7 +146,7 @@ impl ConstPool {
     /// The constants as they are now, in a vector the unit's code shares.
     pub fn finish<'gc>(&self, mc: &Mutation<'gc>) -> Result<Constants<'gc>, Error> {
         let items = self.items(mc).items(mc);
-        Ok(Constants(Vectors::new(mc).immutable_with(self.len(), |i| items.map_or(Value::NIL, |slots| slots.get(i)))?))
+        Ok(Constants(Vectors::new(mc).immutable_with(self.len(), |i| items.map_or(Value::NULL, |slots| slots.get(i)))?))
     }
 
     fn hash<'gc>(&self, mc: &Mutation<'gc>, key: Content<'gc>) -> Result<u64, Error> {

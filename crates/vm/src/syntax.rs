@@ -52,7 +52,7 @@ pub(crate) fn to_datum<'gc>(mc: &Mutation<'gc>, value: Value<'gc>, fuel: &mut Fu
                 rest = Syntax::of(pair.tail(mc)).map_or(pair.tail(mc), |syntax| syntax.datum(mc));
                 count += 1;
             }
-            let tail = rest != Value::NIL;
+            let tail = rest != Value::NULL;
             if tail {
                 todo.push(Step::Visit(rest));
             }
@@ -114,7 +114,7 @@ impl<'gc> Walk<'gc> {
     /// Constructs a Scheme list (or improper list if `tail` is true) from the top `count` values on the stack,
     /// optionally wrapping the result in a syntax object with metadata `meta`.
     fn list(&mut self, mc: &Mutation<'gc>, count: usize, tail: bool, meta: Option<(SyntaxSpan<'gc>, SyntaxMeta<'gc>)>) -> Result<(), Fault> {
-        let tail = if tail { self.done.pop().expect("a tail") } else { Value::NIL };
+        let tail = if tail { self.done.pop().expect("a tail") } else { Value::NULL };
         let items = self.done.split_off(self.done.len() - count);
         let list = Pairs::new(mc).list_with_tail(items, tail)?;
         self.made(mc, list, meta)
@@ -183,7 +183,7 @@ pub(crate) fn to_syntax<'gc>(mc: &Mutation<'gc>, context: Value<'gc>, datum: Val
                 rest = pair.tail(mc);
                 count += 1;
             }
-            let tail = rest != Value::NIL;
+            let tail = rest != Value::NULL;
             if tail {
                 todo.push(Step::Visit(rest));
             }
@@ -268,7 +268,7 @@ pub(crate) fn temporaries<'gc>(mc: &Mutation<'gc>, list: Value<'gc>, name: Value
             at = pair.tail(mc);
         } else if let Some(rest) = Syntax::of(at).filter(|syntax| syntax.kind(mc) == Some(SyntaxKind::List)) {
             at = rest.datum(mc);
-        } else if at == Value::NIL {
+        } else if at == Value::NULL {
             break;
         } else {
             return Err(Fault::WrongType);

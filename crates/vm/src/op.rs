@@ -6,6 +6,7 @@ use ragwort_types::constant::Constants;
 use ragwort_types::num::NumError;
 use ragwort_types::pair::{Pair, Pairs};
 use ragwort_types::string::StrError;
+use ragwort_types::table::TableError;
 
 use crate::frame::CLOSURE;
 use crate::objects::{self, BytecodeFields, ClosureFields, ModuleFields, SpillFields, Task};
@@ -27,7 +28,7 @@ named! {
         LoadConst { dst: u8, index: u32 } = "load-const",
         /// Unconditionally jumps by `offset` instructions relative to the next instruction.
         Jump { offset: i32 } = "jump",
-        /// Branches by `offset` instructions if register `test` contains `#f` (`Value::FALSE`).
+        /// Branches by `offset` instructions if register `test` contains a false value (see `Value::is_false`).
         JumpIfFalse { test: u8, offset: i32 } = "jump-if-false",
         /// Executes unary `intrinsic` on operand `a`, branching by `offset` if the boolean truthiness of the result matches `branch_if`.
         BranchIntrinsic1 { a: u8, intrinsic: Intrinsic, branch_if: bool, offset: i16 } = "branch-intrinsic1",
@@ -138,9 +139,9 @@ impl<'gc> Context<'_, 'gc> {
     fn load_values(&mut self, dst: u8) -> Result<(), Fault> {
         let mc = self.mc;
         let list = if self.acc == Value::VALUES {
-            std::mem::replace(&mut self.values, Value::NIL)
+            std::mem::replace(&mut self.values, Value::NULL)
         } else {
-            Pairs::new(mc).cons(self.acc, Value::NIL)?.value(mc)
+            Pairs::new(mc).cons(self.acc, Value::NULL)?.value(mc)
         };
         self.frame.set(dst, list);
         if mc.step_due() {
@@ -153,7 +154,7 @@ impl<'gc> Context<'_, 'gc> {
     #[inline(never)]
     fn set_values(&mut self, first: u8, count: u8, rest: Value<'gc>) -> Result<(), Fault> {
         let (mc, frame) = (self.mc, self.frame);
-        if count == 1 && rest == Value::NIL {
+        if count == 1 && rest == Value::NULL {
             self.acc = frame.get(first);
             return Ok(());
         }
@@ -163,7 +164,7 @@ impl<'gc> Context<'_, 'gc> {
             list = pairs.cons(frame.get(first + i), list)?.value(mc);
         }
         match Pair::of(list) {
-            Some(cell) if cell.tail(mc) == Value::NIL => self.acc = cell.head(mc),
+            Some(cell) if cell.tail(mc) == Value::NULL => self.acc = cell.head(mc),
             _ => (self.acc, self.values) = (Value::VALUES, list),
         }
         if mc.step_due() {
@@ -355,6 +356,17 @@ impl From<OutOfMemory> for Fault {
     }
 }
 
+impl From<TableError> for Fault {
+    fn from(error: TableError) -> Self {
+        match error {
+            TableError::Immutable => Self::Immutable,
+            // A host that does not take a key or a value says so for what they are.
+            TableError::Refused => Self::WrongType,
+            TableError::Arena(error) => error.into(),
+        }
+    }
+}
+
 impl From<Error> for Fault {
     fn from(error: Error) -> Self {
         match error {
@@ -380,7 +392,7 @@ impl Op {
             Op::LoadConst { dst, index } => frame.set(dst, cx.constants.get(mc, index).ok_or(Fault::Malformed)?),
             Op::Jump { offset } => return Ok(Control::Jump(offset)),
             Op::JumpIfFalse { test, offset } => {
-                if frame.get(test) == Value::FALSE {
+                if frame.get(test).is_false() {
                     return Ok(Control::Jump(offset));
                 }
             }
@@ -389,7 +401,7 @@ impl Op {
                     return Err(Fault::Malformed);
                 }
                 let val = intrinsic.exec1(cx, operand)?;
-                if (val != Value::FALSE) == branch_if {
+                if val.is_true() == branch_if {
                     return Ok(Control::Jump(i32::from(offset)));
                 }
             }
@@ -398,7 +410,7 @@ impl Op {
                     return Err(Fault::Malformed);
                 }
                 let val = intrinsic.exec2(cx, left, right)?;
-                if (val != Value::FALSE) == branch_if {
+                if val.is_true() == branch_if {
                     return Ok(Control::Jump(i32::from(offset)));
                 }
             }
@@ -422,7 +434,7 @@ impl Op {
                 if usize::from(src) + usize::from(count) > WINDOW {
                     return Err(Fault::Malformed);
                 }
-                cx.set_values(src, count, Value::NIL)?;
+                cx.set_values(src, count, Value::NULL)?;
                 return Ok(Control::Return);
             }
             Op::ReturnSpread { base, args } => {
@@ -603,7 +615,7 @@ fn list<'gc>(mc: &Mutation<'gc>, mut list: Value<'gc>) -> Result<Vec<Value<'gc>>
         items.push(pair.head(mc));
         list = pair.tail(mc);
     }
-    if list != Value::NIL {
+    if list != Value::NULL {
         return Err(Fault::WrongType);
     }
     Ok(items)

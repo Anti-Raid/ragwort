@@ -20,7 +20,7 @@ fn bytes_pack_and_read_back() {
         assert!(h.mutable(literal.value(mc)).is_none());
         assert!(!literal.same_bytes(mc, h.immutable_from_slice(&[7; 11]).unwrap()));
         assert!(h.make(0, 1).unwrap().value(mc) != h.make(0, 1).unwrap().value(mc));
-        assert_eq!(h.bytevector(Value::NIL), None);
+        assert_eq!(h.bytevector(Value::NULL), None);
     });
 }
 

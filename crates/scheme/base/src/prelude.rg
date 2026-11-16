@@ -40,6 +40,10 @@
 (%define equal? (%lambda (a b) (%intrinsic equal? a b)))
 (%define not (%lambda (x) (%intrinsic not x)))
 (%define boolean? (%lambda (x) (%intrinsic boolean? x)))
+; The three false values are #f, #nil and #none. #nil stands where there is no value at all. #none
+; is a value that says "none".
+(%define nil? (%lambda (x) (%intrinsic nil? x)))
+(%define none? (%lambda (x) (%intrinsic none? x)))
 (%define procedure? (%lambda (x) (%intrinsic procedure? x)))
 (%define continuation? (%lambda (x) (%intrinsic continuation? x)))
 (%define void (%lambda args (%intrinsic void)))
@@ -92,7 +96,8 @@
 (%define list->vector (%lambda (xs) (%intrinsic list->vector xs)))
 
 ; Tables: maps that keep their entries in the order they were added. A string, a number, a symbol,
-; a character or a boolean is a key by its value. Anything else is a key by identity.
+; a character or a boolean is a key by its value. Anything else is a key by identity. For a key
+; the table does not have, `table-ref` gives its third argument, or #f without one.
 (%define table? (%lambda (x) (%intrinsic table? x)))
 (%define make-table (%lambda room (%apply-intrinsic make-table room)))
 (%define table (%lambda entries (%apply-intrinsic table entries)))

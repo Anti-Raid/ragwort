@@ -58,10 +58,12 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             (Macro::DefineValues, &[formals, init]) => self.define_values(stx, formals, init),
             (Macro::And, []) => self.value(Value::TRUE, stx),
             (Macro::And | Macro::Or, &[expr]) => Ok(expr),
+            // `and` gives the first false value itself, which is `#f`, `#nil` or `#none`. So it is kept in a temporary, as `or` keeps its first true value.
             (Macro::And, &[expr, ref rest @ ..]) => {
+                let temp = self.introduce("t", stx)?;
                 let rest = self.build(stx, "and", &[rest])?;
-                let no = self.value(Value::FALSE, stx)?;
-                self.build(stx, "if", &[&[expr, rest, no]])
+                let test = self.build(stx, "if", &[&[temp, rest, temp]])?;
+                self.with_temp(stx, temp, expr, test)
             }
             (Macro::Or, []) => self.value(Value::FALSE, stx),
             (Macro::Or, &[expr, ref rest @ ..]) => {

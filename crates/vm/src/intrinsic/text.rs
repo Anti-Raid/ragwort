@@ -132,21 +132,21 @@ impl Intrinsic {
             }
             Intrinsic::StringSplit => {
                 let string = string_of(operands.get(0))?;
-                let sep = if operands.get(1) == Value::FALSE { None } else { Some(string_of(operands.get(1))?) };
+                let sep = if operands.get(1).is_false() { None } else { Some(string_of(operands.get(1))?) };
                 spend(fuel, string)?;
-                string_split(mc, string, sep, operands.get(2) != Value::FALSE, operands.get(3) != Value::FALSE)?
+                string_split(mc, string, sep, operands.get(2).is_true(), operands.get(3).is_true())?
             }
             Intrinsic::StringTrim => {
                 let string = string_of(operands.get(0))?;
-                let sep = if operands.get(1) == Value::FALSE { None } else { Some(string_of(operands.get(1))?) };
+                let sep = if operands.get(1).is_false() { None } else { Some(string_of(operands.get(1))?) };
                 spend(fuel, string)?;
-                let (left, right, repeat) = (operands.get(2) != Value::FALSE, operands.get(3) != Value::FALSE, operands.get(4) != Value::FALSE);
+                let (left, right, repeat) = (operands.get(2).is_true(), operands.get(3).is_true(), operands.get(4).is_true());
                 trimmed(&strings, string, sep, left, right, repeat)?.value()
             }
             Intrinsic::StringReplace => {
                 let (string, from, to) = (string_of(operands.get(0))?, string_of(operands.get(1))?, string_of(operands.get(2))?);
                 spend(fuel, string)?;
-                string_replace(mc, string, from, to, operands.get(3) != Value::FALSE)?
+                string_replace(mc, string, from, to, operands.get(3).is_true())?
             }
             _ => unreachable!("{self:?} isn't a text procedure"),
         };
@@ -264,7 +264,7 @@ fn string_split<'gc>(mc: &Mutation<'gc>, string: Str<'gc>, sep: Option<Str<'gc>>
         Some(sep) => {
             let string = if trim { trimmed(&strings, string, Some(sep), true, true, repeat)? } else { string };
             if trim && string::len(&strings, string) == 0 {
-                return Ok(Value::NIL);
+                return Ok(Value::NULL);
             }
             let all = string::split(&strings, string, sep).collect::<Result<Vec<_>, _>>()?;
             let last = all.len().saturating_sub(1);

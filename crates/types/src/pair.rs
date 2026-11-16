@@ -69,7 +69,7 @@ impl<'a, 'gc> Pairs<'a, 'gc> {
 
     /// A list of `items`.
     pub fn list(&self, items: &[Value<'gc>]) -> Result<Value<'gc>, OutOfMemory> {
-        self.list_with_tail(items.iter().copied(), Value::NIL)
+        self.list_with_tail(items.iter().copied(), Value::NULL)
     }
 
     /// Prepends `items`, in order, to a proper or dotted `tail`.
@@ -91,7 +91,7 @@ impl<'a, 'gc> Pairs<'a, 'gc> {
     pub fn list_len(&self, value: Value<'gc>) -> Option<u64> {
         match Pair::of(value) {
             Some(pair) => pair.list_len(self.mc),
-            None => (value == Value::NIL).then_some(0),
+            None => (value == Value::NULL).then_some(0),
         }
     }
 

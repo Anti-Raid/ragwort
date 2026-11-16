@@ -24,8 +24,8 @@
 //! let mut arena = Arena::new(1 << 20, 0);
 //! arena.mutate(|mc| {
 //!     let externals = ExternalRefs::new(mc);
-//!     let ann = externals.make(&USER_ID, UserId(7), 0, Value::NIL).unwrap();
-//!     let same = externals.make(&USER_ID, UserId(7), 0, Value::NIL).unwrap();
+//!     let ann = externals.make(&USER_ID, UserId(7), 0, Value::NULL).unwrap();
+//!     let same = externals.make(&USER_ID, UserId(7), 0, Value::NULL).unwrap();
 //!     assert!(ann != same && ann.same(mc, same));
 //!     assert_eq!(ann.data::<UserId>(mc).map(|id| id.0), Some(7));
 //!     assert_eq!(ann.name(mc), "user-id");
@@ -193,7 +193,7 @@ impl<'a, 'gc> ExternalRefs<'a, 'gc> {
     /// - `bytes` is charged to the arena's budget for what `data` owns outside it, until the
     ///   reference is collected.
     /// - `kept` is a value of the arena that stays alive as long as the reference does, for data
-    ///   that goes with the host's value. Pass [`Value::NIL`] for none.
+    ///   that goes with the host's value. Pass [`Value::NULL`] for none.
     pub fn make<T: Any>(&self, kind: &'static ExternalKind<T>, data: T, bytes: usize, kept: Value<'gc>) -> Result<ExternalRef<'gc>, OutOfMemory> {
         let held = Held { kind, data: Box::new(data) };
         Ok(ExternalRef(objects::External::new(self.mc, kept, self.mc.frozen_owning(held, bytes)?)?))

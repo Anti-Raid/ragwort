@@ -51,7 +51,7 @@ impl<'gc> Taken<'gc> {
 
 impl<'gc> Passed<'gc> {
     pub(crate) fn none() -> Self {
-        Passed { slots: None, rest: Value::NIL, placed: false }
+        Passed { slots: None, rest: Value::NULL, placed: false }
     }
 
     /// Returns the elements of the list `rest` as passed values.
@@ -100,7 +100,7 @@ impl<'gc> Passed<'gc> {
 
     /// Spreads the last value, which must be a list, as `apply` does: its elements take its place. This does not check that it is a proper list. That check happens where the values are bound.
     pub(crate) fn spread_last(self, mc: &Mutation<'gc>) -> Result<Self, Fault> {
-        if self.rest == Value::NIL {
+        if self.rest == Value::NULL {
             let slots = self.held().ok_or(Fault::Arity)?;
             let last = slots.len() - 1;
             return Ok(Passed { slots: slots.slice(0..last), rest: slots.get(last), placed: self.placed });
@@ -112,7 +112,7 @@ impl<'gc> Passed<'gc> {
             before.push(at.head(mc));
             at = next;
         }
-        if at.tail(mc) != Value::NIL {
+        if at.tail(mc) != Value::NULL {
             return Err(Fault::WrongType);
         }
         let pairs = Pairs::new(mc);
@@ -137,11 +137,11 @@ impl<'gc> Passed<'gc> {
 
     /// Takes the values off the stack. Exactly one value is taken as it is, without allocating. Fails with [`Fault::WrongType`] if `rest` is not a proper list.
     pub(crate) fn take(self, mc: &Mutation<'gc>) -> Result<Taken<'gc>, Fault> {
-        if let Some(slots) = self.slots.filter(|slots| slots.len() == 1 && self.rest == Value::NIL) {
+        if let Some(slots) = self.slots.filter(|slots| slots.len() == 1 && self.rest == Value::NULL) {
             return Ok(Taken::One(slots.get(0)));
         }
-        if self.rest == Value::NIL && self.count() == 0 {
-            return Ok(Taken::List(Value::NIL));
+        if self.rest == Value::NULL && self.count() == 0 {
+            return Ok(Taken::List(Value::NULL));
         }
         if !Pairs::new(mc).is_list(self.rest) {
             return Err(Fault::WrongType);
@@ -172,7 +172,7 @@ impl<'gc> Outer<'_, 'gc> {
         }
         let at = fp + usize::from(ARGS);
         let slots = self.segments.stack.segment(mc).slots(mc).slice(at..at + values.len()).ok_or(Fault::Malformed)?;
-        Ok(Passed { slots: Some(slots), rest: Value::NIL, placed: true })
+        Ok(Passed { slots: Some(slots), rest: Value::NULL, placed: true })
     }
 
     /// Returns `taken` as passed values again: one value is written into the bottom frame, as [`Outer::pass`] does.

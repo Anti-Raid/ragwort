@@ -726,7 +726,7 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
                 let mut given: Vec<Keyword<'gc>> = keyword_vars.iter().map(|&(keyword, _)| keyword).collect();
                 keyword::sort(mc, &mut given);
                 let keywords: Vec<Value<'gc>> = given.iter().map(|keyword| keyword.value(mc)).collect();
-                let mut values = self.tree.add(Node::Quote(Value::NIL));
+                let mut values = self.tree.add(Node::Quote(Value::NULL));
                 for keyword in given.iter().rev() {
                     let &(_, var) = keyword_vars.iter().find(|&&(given, _)| given == *keyword).expect("a keyword the call gives");
                     let pair = [self.tree.add(Node::Ref(var)), values];
@@ -736,7 +736,7 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
                 let keywords = Node::Quote(Pairs::new(mc).list(&keywords)?);
                 let mut all = vec![self.tree.add(Node::Ref(procedure)), self.tree.add(keywords), values];
                 all.extend(positional);
-                all.push(self.tree.add(Node::Quote(Value::NIL)));
+                all.push(self.tree.add(Node::Quote(Value::NULL)));
                 let all = self.tree.list(all);
                 self.tree.add(Node::Intrinsic(Prim::Request(Request::KeywordApply), all))
             }

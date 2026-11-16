@@ -172,7 +172,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         }
         let specs = match self.tree.view(next)? {
             View::List(specs, None) => specs,
-            View::Datum(Value::NIL) => Vec::new(),
+            View::Datum(Value::NULL) => Vec::new(),
             _ => return Err(self.error(bad, next)),
         };
         let mut fields = Vec::with_capacity(specs.len());

@@ -304,7 +304,7 @@ impl<'gc> Printer<'_, 'gc> {
                 Work::Value(value) => self.value(value, &mut work)?,
                 Work::Text(text) => self.out.push_str(text),
                 Work::Tail(rest) => {
-                    if rest == Value::NIL {
+                    if rest == Value::NULL {
                     } else if let Some(pair) = Pair::of(rest).filter(|_| !self.labels.contains_key(&rest.to_bits())) {
                         self.out.push(' ');
                         work.extend([Work::Tail(pair.tail(self.mc)), Work::Value(pair.head(self.mc))]);
@@ -415,7 +415,7 @@ impl<'gc> Printer<'_, 'gc> {
         if self.mode == Mode::Display {
             // The irritants are written even when the condition is displayed, so that a string irritant keeps its quotes.
             work.extend([Work::Mode(Mode::Display), Work::Tail(irritants), Work::Mode(Mode::Write)]);
-            if irritants != Value::NIL {
+            if irritants != Value::NULL {
                 work.push(Work::Text(":"));
             }
         } else {
@@ -490,9 +490,11 @@ impl<'gc> Printer<'_, 'gc> {
             self.out.push('>');
         } else {
             self.out.push_str(match value {
-                Value::NIL => "()",
+                Value::NULL => "()",
                 Value::TRUE => "#t",
                 Value::FALSE => "#f",
+                Value::NIL => "#nil",
+                Value::NONE => "#none",
                 Value::VOID => "#<void>",
                 Value::UNDEFINED => "#<undefined>",
                 Value::UNSUPPLIED => "#<unsupplied>",

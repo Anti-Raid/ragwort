@@ -33,14 +33,14 @@ fn passed_values_are_read_skipped_and_spread() {
 
         // The last value is spread, whether it is in a slot or at the end of the list.
         let last = Vectors::new(mc).from_slice(&[fix(0), fix(1), rest]).unwrap().items(mc);
-        assert_eq!(all(mc, Passed::slots(last, Value::NIL).spread_last(mc).unwrap()), [fix(0), fix(1), fix(7), fix(8)]);
+        assert_eq!(all(mc, Passed::slots(last, Value::NULL).spread_last(mc).unwrap()), [fix(0), fix(1), fix(7), fix(8)]);
         let listed = pairs.list(&[fix(2), rest]).unwrap();
         assert_eq!(all(mc, Passed::slots(slots.slice(0..2).unwrap(), listed).spread_last(mc).unwrap()), [fix(0), fix(1), fix(2), fix(7), fix(8)]);
         assert_eq!(Passed::none().spread_last(mc).map(|_| ()), Err(Fault::Arity));
 
         // Exactly one value is taken as it is. Any other number is taken as a list.
-        assert!(matches!(Passed::slots(slots.slice(1..2).unwrap(), Value::NIL).take(mc), Ok(Taken::One(value)) if value == fix(1)));
-        assert!(matches!(Passed::none().take(mc), Ok(Taken::List(Value::NIL))));
+        assert!(matches!(Passed::slots(slots.slice(1..2).unwrap(), Value::NULL).take(mc), Ok(Taken::One(value)) if value == fix(1)));
+        assert!(matches!(Passed::none().take(mc), Ok(Taken::List(Value::NULL))));
         assert!(matches!(Passed::list(pairs.list(&[fix(9)]).unwrap()).take(mc), Ok(Taken::List(list)) if pairs.elements(list).eq([fix(9)])));
         assert!(matches!(Passed::slots(slots, fix(5)).take(mc), Err(Fault::WrongType)));
     });

@@ -833,7 +833,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
                         let body = this.ex.build(at, "if", &[&[is_null, finished, more]])?;
                         let mut binds = vec![this.ex.list(&[xs, list.stx], at)?];
                         for &acc in &accs {
-                            let empty = this.ex.value(Value::NIL, at)?;
+                            let empty = this.ex.value(Value::NULL, at)?;
                             let empty = this.ex.quoted(empty, at)?;
                             binds.push(this.ex.list(&[acc, empty], at)?);
                         }

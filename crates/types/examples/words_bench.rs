@@ -98,7 +98,7 @@ fn main() {
     time("minor, 1M vector, 1K stores x 100", 7, || {
         let mut arena = Arena::new(REGION, 1);
         arena.mutate(|mc| {
-            let vector = Vector::new(mc, 1_000_000, Value::NIL).expect("alloc");
+            let vector = Vector::new(mc, 1_000_000, Value::NULL).expect("alloc");
             mc.set_root(0, Value::object(mc, vector));
         });
         arena.collect();
@@ -108,7 +108,7 @@ fn main() {
                 let vector = mc.root(0).downcast::<Vector>(mc).expect("vector");
                 for i in 0..1000 {
                     let at = (round * 1000 + i) * 7919 % 1_000_000;
-                    vector.items(mc).set(mc, at as usize, pair(mc, fixnum(i), Value::NIL));
+                    vector.items(mc).set(mc, at as usize, pair(mc, fixnum(i), Value::NULL));
                 }
             });
             arena.collect_minor();
@@ -177,7 +177,7 @@ fn main() {
     time("fixnum store 50M", 7, || {
         let mut arena = Arena::new(REGION, 1);
         arena.mutate(|mc| {
-            let p = pair(mc, Value::NIL, Value::NIL);
+            let p = pair(mc, Value::NULL, Value::NULL);
             mc.set_root(0, p);
         });
         arena.collect();
@@ -213,7 +213,7 @@ fn main() {
         time(name, 7, || {
             let mut arena = Arena::new(REGION, 2);
             arena.mutate(|mc| {
-                let p = pair(mc, Value::NIL, Value::NIL);
+                let p = pair(mc, Value::NULL, Value::NULL);
                 for root in 0..2 {
                     let v = Vector::new(mc, 1_000_000, p).expect("alloc");
                     mc.set_root(root, Value::object(mc, v));
@@ -243,7 +243,7 @@ fn main() {
         time(name, 7, || {
             let mut arena = Arena::new(REGION, 1);
             let stack = arena.mutate(|mc| {
-                let p = pair(mc, Value::NIL, Value::NIL);
+                let p = pair(mc, Value::NULL, Value::NULL);
                 let v = Vector::new(mc, 2048, p).expect("alloc");
                 mc.set_root(0, Value::object(mc, v));
                 let segment = mc.alloc_items::<Segment, 1>([0], 2048, p).expect("alloc");
@@ -367,7 +367,7 @@ fn main() {
     time("flonum store 50M", 7, || {
         let mut arena = Arena::new(REGION, 1);
         arena.mutate(|mc| {
-            let p = pair(mc, Value::NIL, Value::NIL);
+            let p = pair(mc, Value::NULL, Value::NULL);
             mc.set_root(0, p);
         });
         arena.collect();
@@ -423,7 +423,7 @@ fn main() {
         arena.mutate(|mc| {
             let table = Table::new(mc, 500_000).expect("alloc");
             for i in 0..500_000 {
-                let key = pair(mc, fixnum(i), Value::NIL);
+                let key = pair(mc, fixnum(i), Value::NULL);
                 table.set_entry(mc, i as usize, key, pair(mc, fixnum(i), key));
                 if i % 2 == 0 {
                     let held = pair(mc, key, mc.root(1));

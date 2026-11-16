@@ -1259,7 +1259,7 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         match tail {
             Some(tail) => self.mov(Loc::Reg(list), self.loc(tail)),
             None => {
-                let index = self.module.constant(Value::NIL).expect("the constants have room for '()");
+                let index = self.module.constant(Value::NULL).expect("the constants have room for '()");
                 self.ops.push(Op::LoadConst { dst: list, index });
             }
         }

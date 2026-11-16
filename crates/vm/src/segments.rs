@@ -69,7 +69,7 @@ impl<'gc> Segments<'_, 'gc> {
         let (start, old) = (self.stack.base(), self.stack.segment(mc));
         let caller = self.frame(fp)?;
         let link = frame::link_of(mc, caller)?;
-        let marks = if fp > start { self.marks_under(fp, link)? } else { Value::NIL };
+        let marks = if fp > start { self.marks_under(fp, link)? } else { Value::NULL };
         let mut moved = [Value::VOID; WINDOW];
         for (i, slot) in moved[..len].iter_mut().enumerate() {
             *slot = caller.get(i as u8);
@@ -375,7 +375,7 @@ fn free<'gc>(mc: &Mutation<'gc>, chain: Value<'gc>, at: Option<usize>) -> Option
     Some((record.segment(mc)?, at.unwrap_or(record.end(mc) as usize)))
 }
 
-/// Returns the continuation marks restored by the topmost record in `chain`, or `Value::NIL` if the
+/// Returns the continuation marks restored by the topmost record in `chain`, or `Value::NULL` if the
 /// chain is empty.
 pub(crate) fn restored<'gc>(mc: &Mutation<'gc>, chain: Value<'gc>) -> Value<'gc> {
     if let Some(record) = chain.downcast::<Frames>(mc) {
@@ -383,7 +383,7 @@ pub(crate) fn restored<'gc>(mc: &Mutation<'gc>, chain: Value<'gc>) -> Value<'gc>
     } else if let Some(native) = chain.downcast::<Native>(mc) {
         native.attachments(mc)
     } else {
-        Value::NIL
+        Value::NULL
     }
 }
 

@@ -102,7 +102,7 @@ fn dropping_the_session_releases_text_but_preserves_locations() {
         let session = arena.mutate(|mc| {
             let session = SyntaxSession::named(mc, "bot.scm", &text).unwrap();
             let span = SyntaxSpan::new(mc, session.source(mc).unwrap(), offset, offset + 1).unwrap();
-            mc.set_root(0, Syntax::new(mc, Value::NIL, span, None).unwrap().value(mc));
+            mc.set_root(0, Syntax::new(mc, Value::NULL, span, None).unwrap().value(mc));
             session
         });
         let clone = session.clone();

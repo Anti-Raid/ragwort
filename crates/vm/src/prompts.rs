@@ -57,7 +57,7 @@ pub(crate) fn abort<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, tag: Value<'gc
         }
         None => {
             empty(mc, task);
-            task.set_prompts(mc, Value::NIL);
+            task.set_prompts(mc, Value::NULL);
             Ok(None)
         }
     }
@@ -70,7 +70,7 @@ pub(crate) fn capture<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, tag: Value<'
     let prompts = match find(mc, task, tag)? {
         Some(found) => {
             found.above.iter().for_each(|entry| promote(mc, entry.chain(mc)));
-            list(mc, &found.above, Value::NIL)?
+            list(mc, &found.above, Value::NULL)?
         }
         None => {
             for entry in each(mc, task.prompts(mc)) {
@@ -87,7 +87,7 @@ pub(crate) fn capture<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, tag: Value<'
 /// an untagged prompt unless the current continuation is already empty (such as in tail position under
 /// a prompt).
 pub(crate) fn compose<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, continuation: Gc<'gc, Continuation>) -> Result<(), Fault> {
-    if task.chain(mc) != Value::FALSE || task.attachments(mc) != Value::NIL || task.winders(mc) != Value::NIL {
+    if task.chain(mc) != Value::FALSE || task.attachments(mc) != Value::NULL || task.winders(mc) != Value::NULL {
         push(mc, task, Value::VOID, Value::VOID)?;
     }
     let mut above = Vec::new();
@@ -167,7 +167,7 @@ pub(crate) fn winds_above<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, parts: u
     let mut under = each(mc, task.prompts(mc));
     let mut from = task.winders(mc);
     for _ in 0..parts {
-        gather(mc, from, Value::NIL, &mut winds)?;
+        gather(mc, from, Value::NULL, &mut winds)?;
         from = under.next().ok_or(Fault::Malformed)??.0.winders(mc);
     }
     gather(mc, from, winders, &mut winds)?;
@@ -182,13 +182,13 @@ pub(crate) type Wind<'gc> = (Gc<'gc, Winder>, Value<'gc>);
 /// nearest prompt matching `tag` (or through all prompts if `tag` is `None`).
 fn winds_in<'gc>(mc: &Mutation<'gc>, winders: Value<'gc>, prompts: Value<'gc>, tag: Option<Value<'gc>>) -> Result<Vec<Wind<'gc>>, Fault> {
     let mut winds = Vec::new();
-    gather(mc, winders, Value::NIL, &mut winds)?;
+    gather(mc, winders, Value::NULL, &mut winds)?;
     for entry in each(mc, prompts) {
         let (prompt, _) = entry?;
         if tag.is_some_and(|tag| prompt.tag(mc) == tag) {
             return Ok(winds);
         }
-        gather(mc, prompt.winders(mc), Value::NIL, &mut winds)?;
+        gather(mc, prompt.winders(mc), Value::NULL, &mut winds)?;
     }
     match tag {
         Some(tag) if tag != default_tag() => Err(Fault::NoPrompt),
@@ -226,7 +226,7 @@ fn nearest<'gc>(mc: &Mutation<'gc>, mut marks: Value<'gc>, key: Value<'gc>) -> R
 
 fn nearest_each<'gc>(mc: &Mutation<'gc>, parts: &[Value<'gc>], key: Value<'gc>, default: Value<'gc>) -> Result<Value<'gc>, Fault> {
     let pairs = Pairs::new(mc);
-    let mut list = Value::NIL;
+    let mut list = Value::NULL;
     for &marks in parts.iter().rev() {
         list = pairs.cons(nearest(mc, marks, key)?.unwrap_or(default), list)?.value(mc);
     }
@@ -273,7 +273,7 @@ fn restore<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, prompt: Gc<'gc, Prompt>
 /// Clears the active continuation chain, marks, and winders in `task`, establishing an empty
 /// delimited continuation up to the nearest prompt.
 pub(crate) fn empty<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>) {
-    install(mc, task, Value::FALSE, Value::NIL, Value::NIL);
+    install(mc, task, Value::FALSE, Value::NULL, Value::NULL);
 }
 
 /// Makes `chain`, `attachments` and `winders` the continuation of `task` up to its nearest prompt: its chain of records, its marks and its active winders.

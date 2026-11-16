@@ -574,7 +574,7 @@ impl Inline {
                 for arg in cx.rest.iter_mut().flatten() {
                     items.push(arg.take(target));
                 }
-                let mut list = target.quote(Value::NIL);
+                let mut list = target.quote(Value::NULL);
                 for item in items.into_iter().rev() {
                     list = target.prim(Prim::Intrinsic(Intrinsic::Cons), vec![item, list]);
                 }

@@ -273,7 +273,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                     let set = self.tree.scopes_of(template)?;
                     let meta = self.meta(set, kind)?;
                     let like = index(parts);
-                    parts.push(Syntax::new(self.mc, Value::NIL, self.tree.span(template), Some(meta))?.value(self.mc));
+                    parts.push(Syntax::new(self.mc, Value::NULL, self.tree.span(template), Some(meta))?.value(self.mc));
                     let node = shape.add(Template::Seq { items, tail, vector, like });
                     done.push(Made { node, slots: all, constant: false, escapes: inner });
                     continue;

@@ -260,9 +260,9 @@ impl<'gc> Matcher<'_, 'gc> {
                     let (before_len, after_len, len) = (before.len(), after.len(), items.len());
                     let end = rests[len];
                     let fits = match (repeat, tail) {
-                        (None, None) => len == before_len && end == Value::NIL,
+                        (None, None) => len == before_len && end == Value::NULL,
                         (None, Some(_)) => len >= before_len,
-                        (Some(_), None) => len >= before_len + after_len && end == Value::NIL,
+                        (Some(_), None) => len >= before_len + after_len && end == Value::NULL,
                         (Some(_), Some(_)) => len >= before_len + after_len,
                     };
                     if fits {
@@ -304,7 +304,7 @@ fn list_items<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Option<(Vec<Value<'
         Some(_) => return None,
         None => value,
     };
-    if at != Value::NIL && Pair::of(at).is_none() {
+    if at != Value::NULL && Pair::of(at).is_none() {
         return None;
     }
     let (mut items, mut rests) = (Vec::new(), Vec::new());
@@ -331,7 +331,7 @@ fn vector_items<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Option<(Vec<Value
     };
     let vector = AnyVector::of(datum)?;
     let items: Vec<_> = (0..vector.len(mc)).filter_map(|i| vector.get(mc, i)).collect();
-    let rests = vec![Value::NIL; items.len() + 1];
+    let rests = vec![Value::NULL; items.len() + 1];
     Some((items, rests))
 }
 
@@ -417,7 +417,7 @@ impl<'gc> Builder<'_, 'gc> {
                 Build::Seq(node, start) => {
                     let Template::Seq { tail, vector, like, .. } = shape.nodes[node as usize] else { unreachable!("a sequence's node") };
                     let like = Syntax::of(self.item(like)?).ok_or(Fault::Malformed)?;
-                    let tail = if tail.is_some() && !vector { made.pop().expect("a tail") } else { Value::NIL };
+                    let tail = if tail.is_some() && !vector { made.pop().expect("a tail") } else { Value::NULL };
                     let out = made.split_off(start);
                     let datum = if vector { Vectors::new(mc).immutable_from_slice(&out)?.value(mc) } else { Pairs::new(mc).list_with_tail(out, tail)? };
                     made.push(Syntax::new(mc, datum, like.span(mc), like.metadata(mc))?.value(mc));

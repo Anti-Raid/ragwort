@@ -19,7 +19,7 @@ fn arena() -> Arena {
             run(mc, thunk).unwrap();
         }
         mc.set_root(1, Value::object(mc, loaded.module));
-        mc.set_root(2, Value::NIL);
+        mc.set_root(2, Value::NULL);
     });
     arena
 }
@@ -265,6 +265,168 @@ fn an_image_keeps_tables_and_their_keys() {
         other.collect();
         assert_eq!(module_in(&mut other, "user", &[(Scheme, user)]), Ok(Ok(expected.into())));
     }
+}
+
+/// A host's own data as tables: an event it received, which programs read, and a set of counters, which they also change.
+mod events {
+    use ragwort_types::Error;
+    use ragwort_types::gc::Mutation;
+    use ragwort_types::string::from_str;
+    use ragwort_types::table::{ExternalTable, Key, Refused, Tables};
+    use ragwort_types::vector::Vectors;
+
+    use super::*;
+
+    /// A message, with the fields a JSON payload has: a number, text, a nested object, an array, `false` and `null`.
+    struct Message;
+    struct Author;
+
+    #[derive(Default)]
+    struct Counters(Vec<(String, i64)>);
+
+    const FIELDS: [&str; 6] = ["id", "content", "author", "mentions", "pinned", "edited"];
+
+    impl ExternalTable for Message {
+        fn len(&self) -> usize {
+            FIELDS.len()
+        }
+
+        fn has(&self, key: Key<'_>) -> bool {
+            matches!(key, Key::Symbol(name) if FIELDS.contains(&name))
+        }
+
+        fn get<'gc>(&self, mc: &Mutation<'gc>, key: Key<'_>) -> Result<Option<Value<'gc>>, Error> {
+            let text = |text: &str| from_str(&Strings::new(mc), text).map(|text| text.value());
+            Ok(Some(match key {
+                Key::Symbol("id") => Value::fixnum(7).expect("a small number"),
+                Key::Symbol("content") => text("hello from the host")?,
+                Key::Symbol("author") => Tables::new(mc).external(Author, 0)?.value(mc),
+                Key::Symbol("mentions") => Vectors::new(mc).immutable_from_slice(&[text("ann")?, text("bo")?])?.value(mc),
+                Key::Symbol("pinned") => Value::FALSE,
+                Key::Symbol("edited") => Value::NONE,
+                _ => return Ok(None),
+            }))
+        }
+
+        fn keys(&self) -> impl Iterator<Item = Key<'_>> {
+            FIELDS.into_iter().map(Key::Symbol)
+        }
+    }
+
+    impl ExternalTable for Author {
+        fn len(&self) -> usize {
+            1
+        }
+
+        fn has(&self, key: Key<'_>) -> bool {
+            key == Key::Symbol("name")
+        }
+
+        fn get<'gc>(&self, mc: &Mutation<'gc>, key: Key<'_>) -> Result<Option<Value<'gc>>, Error> {
+            Ok(if self.has(key) { Some(from_str(&Strings::new(mc), "cy")?.value()) } else { None })
+        }
+
+        fn keys(&self) -> impl Iterator<Item = Key<'_>> {
+            std::iter::once(Key::Symbol("name"))
+        }
+    }
+
+    impl ExternalTable for Counters {
+        const WRITABLE: bool = true;
+
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        fn has(&self, key: Key<'_>) -> bool {
+            matches!(key, Key::String(name) if self.0.iter().any(|(held, _)| held == name))
+        }
+
+        fn get<'gc>(&self, _: &Mutation<'gc>, key: Key<'_>) -> Result<Option<Value<'gc>>, Error> {
+            let Key::String(name) = key else { return Ok(None) };
+            Ok(self.0.iter().find(|(held, _)| held == name).and_then(|&(_, count)| Value::fixnum(count)))
+        }
+
+        fn keys(&self) -> impl Iterator<Item = Key<'_>> {
+            self.0.iter().map(|(name, _)| Key::String(name))
+        }
+
+        fn set<'gc>(&mut self, _: &Mutation<'gc>, key: Key<'_>, value: Value<'gc>) -> Result<(), Refused> {
+            let (Key::String(name), Some(count)) = (key, value.as_fixnum()) else { return Err(Refused) };
+            match self.0.iter_mut().find(|(held, _)| held == name) {
+                Some(entry) => entry.1 = count,
+                None => self.0.push((name.to_string(), count)),
+            }
+            Ok(())
+        }
+
+        fn delete(&mut self, key: Key<'_>) -> bool {
+            let before = self.0.len();
+            self.0.retain(|(held, _)| key != Key::String(held));
+            self.0.len() < before
+        }
+
+        fn clear(&mut self) {
+            self.0.clear();
+        }
+    }
+
+    fn message<'s, 'gc>(cx: &mut ragwort_vm::HostContext<'s, 'gc>, _: ragwort_vm::HostArgs<'s, 'gc>) -> Result<ragwort_vm::Reply<'gc>, Fault> {
+        Ok(ragwort_vm::Reply::Value(Tables::new(cx.mc()).external(Message, 0)?.value(cx.mc())))
+    }
+
+    fn counters<'s, 'gc>(cx: &mut ragwort_vm::HostContext<'s, 'gc>, _: ragwort_vm::HostArgs<'s, 'gc>) -> Result<ragwort_vm::Reply<'gc>, Fault> {
+        Ok(ragwort_vm::Reply::Value(Tables::new(cx.mc()).external(Counters::default(), 0)?.value(cx.mc())))
+    }
+
+    pub static HOSTS: [HostDef; 2] = [
+        ragwort_vm::host!("message", 0, ragwort_vm::Purity::Impure, message),
+        ragwort_vm::host!("counters", 0, ragwort_vm::Purity::Impure, counters),
+    ];
+}
+
+/// A program uses a table the host holds as it uses its own: it reads it, walks it, compares and prints it. It can change one only if the host's type says so.
+#[test]
+fn programs_use_tables_the_host_holds() {
+    let mut arena = arena();
+    let bindings = "(%define message (%lambda () (%call-host message))) (%define counters (%lambda () (%call-host counters))) (%provide (all-defined-out))";
+    assert_eq!(module_hosting(&mut arena, "events", &events::HOSTS, &[(Native, bindings)]), Ok(Ok("#<void>".into())));
+    let reading = "(require \"events\")
+                   (define msg (message))
+                   (list (table? msg) (table-length msg) (table-ref msg 'id) (table-ref msg 'content) (table-ref (table-ref msg 'author) 'name) (vector-ref (table-ref msg 'mentions) 1)
+                         (eq? (table-ref msg 'author) (table-ref msg 'author)) (eq? (table-ref msg 'content) (table-ref msg 'content))
+                         (table-ref msg 'missing) (table-ref msg 'missing 'none) (table-ref msg \"id\") (table-has? msg 'missing) (table-ref msg (list 'id)))";
+    assert_eq!(module_in(&mut arena, "reading", &[(Scheme, reading)]), Ok(Ok("(#t 6 7 \"hello from the host\" \"cy\" \"bo\" #t #t #f none #f #f #f)".into())));
+    // `false`, `null` and a key that is not there are three things.
+    let nothing = "(require \"events\")
+                   (define msg (message))
+                   (map (lambda (key) (list (table-has? msg key) (table-ref msg key 'absent) (if (table-ref msg key) 'true 'false))) '(pinned edited deleted))";
+    assert_eq!(module_in(&mut arena, "nothing", &[(Scheme, nothing)]), Ok(Ok("((#t #f false) (#t #none false) (#f absent false))".into())));
+    let walking = "(require \"events\")
+                   (define msg (message))
+                   (define seen '())
+                   (table-for-each (lambda (key value) (set! seen (cons key seen))) msg)
+                   (list (reverse seen) (table-keys msg) (length (table->list msg)) (table->list (table-copy (table-ref msg 'author)))
+                         (equal? (table-ref msg 'author) (table 'name \"cy\")) (equal? (table 'name \"cy\") (table-ref msg 'author)) (equal? msg (message)) (equal? msg (table 'id 7))
+                         msg)";
+    let written = "((id content author mentions pinned edited) (id content author mentions pinned edited) 6 ((name . \"cy\")) #t #t #t #f \
+                   #table((id . 7) (content . \"hello from the host\") (author . #table((name . \"cy\"))) (mentions . #(\"ann\" \"bo\")) (pinned . #f) (edited . #none)))";
+    assert_eq!(module_in(&mut arena, "walking", &[(Scheme, walking)]), Ok(Ok(written.into())));
+    let refused = "(require \"events\")
+                   (define msg (message))
+                   (define (kind thunk) (guard (e (#t (list (error-object-kind e) (error-object-who e)))) (thunk)))
+                   (list (kind (lambda () (table-set! msg 'id 8))) (kind (lambda () (table-delete! msg 'id))) (kind (lambda () (table-clear! msg))) (kind (lambda () (table-update! msg 'id (lambda (id) (+ id 1)))))
+                         (table-ref msg 'id) (table-length msg))";
+    assert_eq!(module_in(&mut arena, "refused", &[(Scheme, refused)]), Ok(Ok("((immutable table-set!) (immutable table-delete!) (immutable table-clear!) (immutable table-set!) 7 6)".into())));
+    let counting = "(require \"events\")
+                    (define counts (counters))
+                    (table-set! counts \"hits\" 1)
+                    (table-update! counts \"hits\" (lambda (hits) (+ hits 1)))
+                    (table-update! counts \"misses\" (lambda (misses) (+ misses 1)) 0)
+                    (define (kind thunk) (guard (e (#t (error-object-kind e))) (thunk)))
+                    (list (table->list counts) (table-length counts) (kind (lambda () (table-set! counts \"hits\" \"many\"))) (kind (lambda () (table-set! counts 'hits 1))) (table-ref counts \"hits\")
+                          (table-delete! counts \"hits\") (table-delete! counts \"hits\") (table-keys counts) (table->list counts) (begin (table-clear! counts) (list (table-length counts) counts)))";
+    assert_eq!(module_in(&mut arena, "counting", &[(Scheme, counting)]), Ok(Ok("(((\"hits\" . 2) (\"misses\" . 1)) 2 wrong-type wrong-type 2 #t #f (\"misses\") ((\"misses\" . 1)) (0 #table()))".into())));
 }
 
 /// Two host functions of one name, which do different things: each is a module's own.

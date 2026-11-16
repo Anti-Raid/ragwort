@@ -34,7 +34,7 @@ fn sample<'gc>(mc: &Mutation<'gc>) -> Value<'gc> {
     let big = int::expt(&nums, nums.integer(fix(2)).unwrap(), 100).unwrap().value();
     let float = Value::flonum(mc, 1e300).unwrap();
     let shared = pairs.cons(fix(1), fix(2)).unwrap().value(mc);
-    let vector = vectors.from_slice(&[shared, shared, Value::NIL]).unwrap();
+    let vector = vectors.from_slice(&[shared, shared, Value::NULL]).unwrap();
     vector.items(mc).set(mc, 2, vector.value(mc));
     let table = Table::<Strong>::new_eq(mc).unwrap();
     table.insert_eq(mc, shared, fix(10)).unwrap();
@@ -137,13 +137,13 @@ fn what_the_host_owns_is_not_saved() {
     let mut arena = Arena::new(1 << 22, 0);
     arena.mutate(|mc| {
         let host: HostRef<u32> = mc.host(5u32).unwrap();
-        let holder = Holder::new(mc, Some(host), Value::NIL).unwrap();
+        let holder = Holder::new(mc, Some(host), Value::NULL).unwrap();
         let number = Holder::DESC.number.unwrap();
         assert_eq!(save(mc, STAMP, &[Value::object(mc, holder)], &kinds()), Err(SaveError::Host(number)));
         // A frozen value of a kind that isn't given is the host's too.
         let session = SyntaxSession::new(mc, "text").unwrap();
         let span = SyntaxSpan::new(mc, session.source(mc).unwrap(), 0, 4).unwrap();
-        let source = Syntax::new(mc, Value::NIL, span, None).unwrap().value(mc);
+        let source = Syntax::new(mc, Value::NULL, span, None).unwrap().value(mc);
         assert!(matches!(save(mc, STAMP, &[source], &[]), Err(SaveError::Frozen(_))));
         assert!(save(mc, STAMP, &[source], &kinds()).is_ok());
         // A field that holds none of the host's is saved.

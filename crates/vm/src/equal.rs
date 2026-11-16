@@ -149,7 +149,7 @@ pub(crate) fn equal<'gc>(mc: &Mutation<'gc>, left: Value<'gc>, right: Value<'gc>
             (Compound::Vector(first), Compound::Vector(second)) if !first.is_empty(mc) => todo.push(Work::Items(first, second, 0))?,
             (Compound::Box(first), Compound::Box(second)) => next = Some((first.value(mc), second.value(mc))),
             (Compound::Struct(first), Compound::Struct(second)) if !first.items(mc).is_empty() => todo.push(Work::Fields(first, second, 0))?,
-            (Compound::Table(first), Compound::Table(second)) if !first.is_empty(mc) => todo.push(Work::Entries(first.entries(mc), second))?,
+            (Compound::Table(first), Compound::Table(second)) if !first.is_empty(mc) => todo.push(Work::Entries(first.entries(mc)?, second))?,
             _ => {}
         }
     }

@@ -57,7 +57,7 @@ fn immediates_need_no_slot() {
     Arena::new(1 << 20, 1).mutate(|mc| {
         let mut pool = ConstPool::new(mc).unwrap();
         let short = string::from_str(&Strings::new(mc), "!ping").unwrap().value();
-        for v in [fix(3), fix(-1), Value::inline_flonum(0.5).unwrap(), Value::TRUE, Value::FALSE, Value::NIL, Value::VOID, short] {
+        for v in [fix(3), fix(-1), Value::inline_flonum(0.5).unwrap(), Value::TRUE, Value::FALSE, Value::NULL, Value::VOID, short] {
             assert_eq!(pool.add(mc, v), Ok(Constant::Immediate(v.immediate().unwrap())));
         }
         assert!(pool.is_empty());
@@ -215,7 +215,7 @@ fn running_out_leaves_the_pool_whole() {
         let values = GcVec::<slot::Value>::new(mc).unwrap();
         for i in 0..50 {
             values.push(mc, make(mc, symbols, i).unwrap()).unwrap();
-            values.push(mc, Pairs::new(mc).cons(fix(i as i64), Value::NIL).unwrap().value(mc)).unwrap();
+            values.push(mc, Pairs::new(mc).cons(fix(i as i64), Value::NULL).unwrap().value(mc)).unwrap();
         }
         mc.set_root(1, Value::object(mc, values.head()));
         ConstPool::new(mc).unwrap()

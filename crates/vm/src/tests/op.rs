@@ -27,7 +27,7 @@ fn steps_run_against_the_frame() {
         let vectors = Vectors::new(mc);
         let constants = Constants::of(vectors.immutable_from_slice(&[fix(7)]).unwrap().value(mc)).unwrap();
         let upvalues = vectors.from_slice(&[Value::TRUE]).unwrap().items(mc);
-        let mut cx = Context { mc, task: crate::coroutine::root(mc).unwrap(), frame, constants, upvalues, acc: Value::VOID, values: Value::NIL, fuel: Fuel { run: u64::MAX, rest: 0 } };
+        let mut cx = Context { mc, task: crate::coroutine::root(mc).unwrap(), frame, constants, upvalues, acc: Value::VOID, values: Value::NULL, fuel: Fuel { run: u64::MAX, rest: 0 } };
 
         assert_eq!(step(Op::LoadConst { dst: 0, index: 0 }, &mut cx), Ok(Control::Next));
         assert_eq!(step(Op::Move { dst: 1, src: 0 }, &mut cx), Ok(Control::Next));
@@ -103,7 +103,7 @@ fn malformed_bytecode_faults() {
         let vectors = Vectors::new(mc);
         let constants = Constants::of(vectors.immutable_from_slice(&[]).unwrap().value(mc)).unwrap();
         let upvalues = vectors.from_slice(&[]).unwrap().items(mc);
-        let mut cx = Context { mc, task: crate::coroutine::root(mc).unwrap(), frame, constants, upvalues, acc: Value::VOID, values: Value::NIL, fuel: Fuel { run: u64::MAX, rest: 0 } };
+        let mut cx = Context { mc, task: crate::coroutine::root(mc).unwrap(), frame, constants, upvalues, acc: Value::VOID, values: Value::NULL, fuel: Fuel { run: u64::MAX, rest: 0 } };
         frame.set(0, fix(1));
         let requests = [
             Op::CallRequest { base: 1, args: 1, request: Request::WithMark },
@@ -143,7 +143,7 @@ fn closures_capture_registers_upvalues_and_each_other() {
         let stray = code(mc, &[Capture::Upvalue(9)]);
         let constants = Constants::of(vectors.immutable_from_slice(&[fix(7), even, odd, stray]).unwrap().value(mc)).unwrap();
         let upvalues = vectors.from_slice(&[fix(11)]).unwrap().items(mc);
-        let mut cx = Context { mc, task: crate::coroutine::root(mc).unwrap(), frame, constants, upvalues, acc: Value::VOID, values: Value::NIL, fuel: Fuel { run: u64::MAX, rest: 0 } };
+        let mut cx = Context { mc, task: crate::coroutine::root(mc).unwrap(), frame, constants, upvalues, acc: Value::VOID, values: Value::NULL, fuel: Fuel { run: u64::MAX, rest: 0 } };
 
         frame.set(0, fix(5));
         assert_eq!(step(Op::NewClosure { dst: 1, count: 2, code: 1 }, &mut cx), Ok(Control::Next));
@@ -174,7 +174,7 @@ fn with_frame(f: impl for<'s, 'gc> FnOnce(&mut Context<'s, 'gc>)) {
         let vectors = Vectors::new(mc);
         let constants = Constants::of(vectors.immutable_from_slice(&[]).unwrap().value(mc)).unwrap();
         let upvalues = vectors.from_slice(&[]).unwrap().items(mc);
-        f(&mut Context { mc, task: crate::coroutine::root(mc).unwrap(), frame, constants, upvalues, acc: Value::VOID, values: Value::NIL, fuel: Fuel { run: u64::MAX, rest: 0 } });
+        f(&mut Context { mc, task: crate::coroutine::root(mc).unwrap(), frame, constants, upvalues, acc: Value::VOID, values: Value::NULL, fuel: Fuel { run: u64::MAX, rest: 0 } });
     });
 }
 
@@ -208,7 +208,7 @@ fn intrinsics_run_in_place() {
         assert_eq!(cx.acc, Value::TRUE);
         assert_eq!(call(cx, 10, 1, Intrinsic::Car), Err(Fault::WrongType));
 
-        frame.set(31, Value::NIL);
+        frame.set(31, Value::NULL);
         call(cx, 31, 1, Intrinsic::IsNull).unwrap();
         assert_eq!(cx.acc, Value::TRUE);
         call(cx, 30, 2, Intrinsic::Eq).unwrap();
@@ -273,7 +273,7 @@ fn equality_goes_as_deep_as_it_should() {
 
         // Structural equality `equal?` compares pairs, mutable/immutable vectors, and boxes by recursively comparing their contents.
         let list = |items: &[_]| pairs.list(items).unwrap();
-        let tree = |n| list(&[text(long), list(&[big(n), boxed(fix(1))]), vectors.from_slice(&[fix(n), Value::NIL]).unwrap().value(mc)]);
+        let tree = |n| list(&[text(long), list(&[big(n), boxed(fix(1))]), vectors.from_slice(&[fix(n), Value::NULL]).unwrap().value(mc)]);
         assert!(!test(cx, eqv, tree(1), tree(1)));
         assert!(test(cx, equal, tree(1), tree(1)));
         assert!(!test(cx, equal, tree(1), tree(2)));
@@ -287,7 +287,7 @@ fn equality_goes_as_deep_as_it_should() {
         // Comparing long lists (200,000 items) and deep left-nested pair spines operates iteratively without consuming host Rust call stack frames.
         let long_list = || pairs.list(&(0..200_000).map(fix).collect::<Vec<_>>()).unwrap();
         assert!(test(cx, equal, long_list(), long_list()));
-        let deep = || (0..200_000).fold(Value::NIL, |v, _| pairs.cons(v, Value::NIL).unwrap().value(mc));
+        let deep = || (0..200_000).fold(Value::NULL, |v, _| pairs.cons(v, Value::NULL).unwrap().value(mc));
         assert!(test(cx, equal, deep(), deep()));
 
         // Structural equality comparison properly terminates on cyclic structures (such as self-referential boxes and mutually referential vectors) rather than looping infinitely.
@@ -379,7 +379,7 @@ fn a_load_takes_exactly_one_value() {
         assert_eq!((cx.acc, Pairs::new(mc).elements(cx.values).collect::<Vec<_>>()), (Value::VALUES, vec![fix(10), fix(11), fix(12)]));
         assert_eq!(step(cx, Op::LoadAcc { dst: 30 }), Err(Fault::ValueCount));
         assert_eq!(step(cx, Op::ReturnValues { src: 20, count: 0 }), Ok(Control::Return));
-        assert_eq!((cx.acc, cx.values), (Value::VALUES, Value::NIL));
+        assert_eq!((cx.acc, cx.values), (Value::VALUES, Value::NULL));
         assert_eq!(step(cx, Op::LoadAcc { dst: 30 }), Err(Fault::ValueCount));
         assert_eq!(frame.get(30), fix(10));
         // A return of one value, spread or not, is an ordinary value.
@@ -515,7 +515,7 @@ fn intrinsics_on_the_task_need_one_and_are_never_folded_or_moved() {
     let mut arena = Arena::new(1 << 20, 0);
     arena.mutate(|mc| {
         for &i in &dynamic {
-            let args = vec![Value::NIL; usize::from(i.arity().unwrap())];
+            let args = vec![Value::NULL; usize::from(i.arity().unwrap())];
             assert_eq!(run(mc, i, &args), Err(Fault::Malformed), "{i:?}");
         }
     });
@@ -567,7 +567,7 @@ fn structs_are_of_their_types_and_equal_by_their_fields_or_themselves() {
         assert_eq!(run(mc, Intrinsic::MakeStruct, &[point, fix(1)]), Err(Fault::Arity));
         assert_eq!(run(mc, Intrinsic::MakeStruct, &[point3, fix(1), fix(2), fix(3), fix(4)]), Err(Fault::Arity));
         assert_eq!(run(mc, Intrinsic::MakeStruct, &[fix(1), fix(1)]), Err(Fault::WrongType));
-        assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol("bad"), fix(1), Value::NIL, Value::NIL, plain]), Err(Fault::WrongType));
+        assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol("bad"), fix(1), Value::NULL, Value::NULL, plain]), Err(Fault::WrongType));
         assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol("bad"), Value::FALSE, pairs.list(&[fix(1)]).unwrap(), flags(1, false), plain]), Err(Fault::WrongType));
         assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol("bad"), Value::FALSE, names(&["x", "y"]), flags(1, false), plain]), Err(Fault::WrongType), "a flag for each field");
         let same = run(mc, Intrinsic::MakeStruct, &[point, fix(1), pairs.list(&[fix(2)]).unwrap()]).unwrap();
@@ -667,7 +667,7 @@ fn booleans_void_and_bytevectors() {
     arena.mutate(|mc| {
         let mut fuel = Fuel { run: u64::MAX, rest: 0 };
         assert_eq!(Intrinsic::IsBoolean.run(mc, &[Value::FALSE], &mut fuel), Ok(Value::TRUE));
-        assert_eq!(Intrinsic::IsBoolean.run(mc, &[Value::NIL], &mut fuel), Ok(Value::FALSE));
+        assert_eq!(Intrinsic::IsBoolean.run(mc, &[Value::NULL], &mut fuel), Ok(Value::FALSE));
         assert_eq!(Intrinsic::Void.run(mc, &[], &mut fuel), Ok(Value::VOID));
         assert_eq!(Intrinsic::Void.run(mc, &[fix(1), fix(2)], &mut fuel), Ok(Value::VOID));
         let h = ragwort_types::bytevector::Bytevectors::new(mc);
@@ -678,7 +678,7 @@ fn booleans_void_and_bytevectors() {
         assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(7), Value::FALSE, fix(1)], &mut fuel), Ok(fix(8)));
         assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(9), Value::FALSE, fix(1)], &mut fuel), Err(Fault::OutOfRange));
         assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(-1), Value::FALSE, fix(1)], &mut fuel), Err(Fault::OutOfRange));
-        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, Value::NIL, Value::FALSE, fix(1)], &mut fuel), Err(Fault::WrongType));
+        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, Value::NULL, Value::FALSE, fix(1)], &mut fuel), Err(Fault::WrongType));
         assert_eq!(Intrinsic::BytevectorRef.run(mc, &[fix(0), fix(0), Value::FALSE, fix(1)], &mut fuel), Err(Fault::WrongType));
         assert_eq!(Intrinsic::BytevectorSet.run(mc, &[bytes, fix(0), fix(256), Value::FALSE, fix(1)], &mut fuel), Err(Fault::OutOfRange));
         // Tests reading a 2-byte signed integer across word boundaries in big-endian byte order.
@@ -686,7 +686,7 @@ fn booleans_void_and_bytevectors() {
         assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(7), Value::FALSE, fix(-2)], &mut fuel), Ok(fix(-248)));
         assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(0), Value::FALSE, fix(0)], &mut fuel), Err(Fault::OutOfRange));
         assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(0), Value::FALSE, fix(9)], &mut fuel), Err(Fault::OutOfRange));
-        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(0), Value::NIL, fix(1)], &mut fuel), Err(Fault::WrongType));
+        assert_eq!(Intrinsic::BytevectorRef.run(mc, &[bytes, fix(0), Value::NULL, fix(1)], &mut fuel), Err(Fault::WrongType));
         assert_eq!(Intrinsic::BytevectorSet.run(mc, &[bytes, fix(9), fix(0), Value::FALSE, fix(1)], &mut fuel), Err(Fault::OutOfRange));
         let literal = h.immutable_from_slice(&[1]).unwrap().value(mc);
         assert_eq!(Intrinsic::BytevectorRef.run(mc, &[literal, fix(0), Value::FALSE, fix(1)], &mut fuel), Ok(fix(1)));

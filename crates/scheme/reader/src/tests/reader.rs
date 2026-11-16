@@ -144,6 +144,7 @@ fn malformed_text_is_an_error_where_it_goes_wrong() {
 #[test]
 fn reads_booleans_numbers_strings_and_characters() {
     assert_eq!(read("#t #f #true #false").unwrap(), ["#t", "#f", "#t", "#f"]);
+    assert_eq!(read("#nil #none (#nil . #none) #(#none) '#nil").unwrap(), ["#nil", "#none", "(#nil . #none)", "#(#none)", "'#nil"]);
     let numbers = "42 -5 +7 0 1/2 -6/4 #x-ff #XFF #b101 #o17 #d10 1.5 -.5 .5 1e3 1.5E-1 #e1.5 #e1e2 #i1/2 #x#e10 +inf.0 -inf.0";
     let read_as = [
         "42", "-5", "7", "0", "1/2", "-3/2", "-255", "255", "5", "15", "10", "1.5", "-0.5", "0.5", "1000.0", "0.15", "3/2",

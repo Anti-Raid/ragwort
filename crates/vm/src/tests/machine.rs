@@ -56,7 +56,7 @@ fn closure<'gc>(mc: &Mutation<'gc>, code: Gc<'gc, Bytecode>) -> Value<'gc> {
 
 fn list<'gc>(mc: &Mutation<'gc>, items: &[i64]) -> Value<'gc> {
     let pairs = Pairs::new(mc);
-    items.iter().rev().fold(Value::NIL, |tail, &n| pairs.cons(fix(n), tail).unwrap().value(mc))
+    items.iter().rev().fold(Value::NULL, |tail, &n| pairs.cons(fix(n), tail).unwrap().value(mc))
 }
 
 fn items<'gc>(mc: &Mutation<'gc>, mut v: Value<'gc>) -> Vec<i64> {
@@ -65,7 +65,7 @@ fn items<'gc>(mc: &Mutation<'gc>, mut v: Value<'gc>) -> Vec<i64> {
         out.push(pair.head(mc).as_fixnum().unwrap());
         v = pair.tail(mc);
     }
-    assert_eq!(v, Value::NIL);
+    assert_eq!(v, Value::NULL);
     out
 }
 
@@ -277,12 +277,12 @@ fn rest_arguments_and_apply() {
         assert_eq!(run(mc, codes[0], &[fix(1)]), Ok(vec![1]));
         for entry in [2, 3] {
             assert_eq!(run(mc, codes[entry], &[variadic, fix(1), list(mc, &[2, 3])]), Ok(vec![123]));
-            assert_eq!(run(mc, codes[entry], &[variadic, fix(1), Value::NIL]), Ok(vec![1]));
+            assert_eq!(run(mc, codes[entry], &[variadic, fix(1), Value::NULL]), Ok(vec![1]));
             assert_eq!(run(mc, codes[entry], &[exact, fix(1), list(mc, &[2, 3])]), Ok(vec![6]));
             assert_eq!(run(mc, codes[entry], &[exact, fix(1), list(mc, &[2])]), Err(Fault::Arity));
             assert_eq!(run(mc, codes[entry], &[exact, fix(1), list(mc, &[2, 3, 4])]), Err(Fault::Arity));
             assert_eq!(run(mc, codes[entry], &[exact, fix(1), fix(2)]), Err(Fault::WrongType));
-            assert_eq!(run(mc, codes[entry], &[fix(5), fix(1), Value::NIL]), Err(Fault::NotProcedure));
+            assert_eq!(run(mc, codes[entry], &[fix(5), fix(1), Value::NULL]), Err(Fault::NotProcedure));
         }
         assert_eq!(run(mc, codes[0], &[]), Err(Fault::Arity));
     });
@@ -1284,8 +1284,8 @@ fn external_references_are_equal_as_their_kind_says() {
     static HANDLE: ExternalKind<u64> = ExternalKind::by_identity("handle");
     Arena::new(1 << 24, 0).mutate(|mc| {
         let externals = ExternalRefs::new(mc);
-        let user = |id| externals.make(&USER_ID, UserId(id), 0, Value::NIL).unwrap().value(mc);
-        let handle = |number| externals.make(&HANDLE, number, 0, Value::NIL).unwrap().value(mc);
+        let user = |id| externals.make(&USER_ID, UserId(id), 0, Value::NULL).unwrap().value(mc);
+        let handle = |number| externals.make(&HANDLE, number, 0, Value::NULL).unwrap().value(mc);
         let (ann, again, bo) = (user(7), user(7), user(8));
         let truth = |flag| if flag { Value::TRUE } else { Value::FALSE };
         for (first, second, equal) in [(ann, again, true), (ann, ann, true), (ann, bo, false), (ann, handle(7), false), (handle(7), handle(7), false), (ann, fix(7), false)] {
@@ -1339,7 +1339,7 @@ fn external_refs_hold_the_hosts_data_and_trace_their_value() {
         assert_eq!(run(mc, codes[1], &[]), Err(Fault::WrongType));
         assert_eq!(items(mc, ExternalRef::of(external).unwrap().kept(mc)), [1, 2]);
         assert!(ExternalRef::of(external).unwrap().data::<i64>(mc).is_none());
-        mc.set_root(0, Value::NIL);
+        mc.set_root(0, Value::NULL);
     });
     assert!(!dropped.get());
     arena.collect();
@@ -1367,7 +1367,7 @@ fn a_waiting_machine_pauses_for_the_collector_and_keeps_its_answer() {
             machine
         });
         // Allocate until the step owes the collector work.
-        let mut made = Value::NIL;
+        let mut made = Value::NULL;
         while !mc.step_due() {
             made = Pairs::new(mc).cons(Value::TRUE, made).unwrap().value(mc);
         }

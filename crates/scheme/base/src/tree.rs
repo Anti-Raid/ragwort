@@ -182,7 +182,7 @@ impl<'a, 'gc> Tree<'a, 'gc> {
                     let mut elements = Pairs::new(mc).elements(node.datum(mc));
                     todo.extend(elements.by_ref().map(part));
                     let tail = elements.rest();
-                    let dotted = tail != Value::NIL;
+                    let dotted = tail != Value::NULL;
                     if dotted {
                         todo.push(part(tail));
                     }
@@ -222,7 +222,7 @@ impl<'a, 'gc> Tree<'a, 'gc> {
                 Task::Visit(stx) => stx,
                 Task::List(len, dotted) => {
                     let mut items = done.split_off(done.len() - len as usize);
-                    let tail = if dotted { items.pop().expect("a dotted list has a tail") } else { Value::NIL };
+                    let tail = if dotted { items.pop().expect("a dotted list has a tail") } else { Value::NULL };
                     done.push(Pairs::new(mc).list_with_tail(items, tail)?);
                     continue;
                 }

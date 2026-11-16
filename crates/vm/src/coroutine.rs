@@ -69,7 +69,7 @@ pub(crate) fn root<'gc>(mc: &Mutation<'gc>) -> Result<Gc<'gc, Task>, OutOfMemory
 
 fn task<'gc>(mc: &Mutation<'gc>, body: Value<'gc>, state: u32) -> Result<Gc<'gc, Task>, OutOfMemory> {
     let none = Value::FALSE;
-    Task::new(mc, Value::VOID, none, Value::NIL, Value::NIL, Value::NIL, None, 0, body, none, none, none, none, None, 0, state, 0, 0, 0)
+    Task::new(mc, Value::VOID, none, Value::NULL, Value::NULL, Value::NULL, None, 0, body, none, none, none, none, None, 0, state, 0, 0, 0)
 }
 
 pub(crate) fn of<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Option<Gc<'gc, Task>> {
@@ -210,7 +210,7 @@ impl<'gc> Outer<'_, 'gc> {
         }
         task.set_park_base(mc, 0);
         prompts::empty(mc, task);
-        task.set_prompts(mc, Value::NIL);
+        task.set_prompts(mc, Value::NULL);
         task.set_spare(mc, None);
         task.set_body(mc, Value::FALSE);
         Ok(())
@@ -231,7 +231,7 @@ impl<'gc> Outer<'_, 'gc> {
             }
             let yielded = yielded.to_list(mc)?;
             // A run that resumes without values resumes the yield with none.
-            self.regs.set_values(mc, Value::NIL);
+            self.regs.set_values(mc, Value::NULL);
             return Ok(Some(Outcome::Yielded(yielded)));
         };
         // The values are taken off this task's stack before the stack moves back to the resumer's.
@@ -261,7 +261,7 @@ impl<'gc> Outer<'_, 'gc> {
         task.set_state(mc, state);
         task.set_resumer(mc, Value::FALSE);
         prompts::empty(mc, task);
-        task.set_prompts(mc, Value::NIL);
+        task.set_prompts(mc, Value::NULL);
         task.set_spare(mc, None);
         // A task that has ended waits nowhere: it has no segment.
         task.set_segment(mc, None);
@@ -415,7 +415,7 @@ pub(crate) fn closed<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, renew: Value<
 pub(crate) fn reset<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, body: Value<'gc>) {
     task.set_body(mc, body);
     task.set_acc(mc, Value::VOID);
-    task.set_values(mc, Value::NIL);
+    task.set_values(mc, Value::NULL);
     task.set_state(mc, PENDING);
 }
 

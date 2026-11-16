@@ -545,7 +545,7 @@ fn random_stack_traffic_under_stress() {
                 for want in captured.iter().rev() {
                     let (segment, rest) = match list.downcast::<Pair>(mc) {
                         Some(pair) => (pair.car(mc), pair.cdr(mc)),
-                        None => (list, Value::NIL),
+                        None => (list, Value::NULL),
                     };
                     let slots = segment.downcast::<Segment>(mc).unwrap().slots(mc);
                     for (i, w) in want.iter().enumerate() {
@@ -583,8 +583,8 @@ fn dead_slots_written_while_marking_are_not_traced_by_drain() {
     let stack = new_stack(&mut arena, 512);
     let handle = arena.mutate(|mc| {
         mc.set_root(0, Value::VOID);
-        let inner = Pair::new(mc, num(mc, 1), Value::NIL).unwrap();
-        let outer = Pair::new(mc, Value::object(mc, inner), Value::NIL).unwrap();
+        let inner = Pair::new(mc, num(mc, 1), Value::NULL).unwrap();
+        let outer = Pair::new(mc, Value::object(mc, inner), Value::NULL).unwrap();
         Root::new(mc, outer).unwrap()
     });
     arena.collect();

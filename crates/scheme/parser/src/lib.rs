@@ -86,6 +86,10 @@ pub enum Token<'a> {
     /// A `.` on its own, before a list's tail.
     Dot,
     Boolean(bool),
+    /// `#nil`, which stands where there is no value.
+    Nil,
+    /// `#none`, a value that says "none".
+    NoneValue,
     Char(char),
     String(Cow<'a, str>),
     Identifier(Cow<'a, str>),
@@ -303,6 +307,8 @@ impl<'a> Lexer<'a> {
         Ok(Some(match () {
             () if is(&["#t", "#true"]) => Token::Boolean(true),
             () if is(&["#f", "#false"]) => Token::Boolean(false),
+            () if is(&["#nil"]) => Token::Nil,
+            () if is(&["#none"]) => Token::NoneValue,
             () if is(&["#!fold-case", "#!no-fold-case"]) => {
                 self.fold = token.len() == "#!fold-case".len();
                 return Ok(None);

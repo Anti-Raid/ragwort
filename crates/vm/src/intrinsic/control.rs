@@ -19,11 +19,11 @@ impl Intrinsic {
     #[inline(never)]
     pub(super) fn dynamic<'gc>(self, mc: &Mutation<'gc>, task: Gc<'gc, Task>, operands: impl Operands<'gc>, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
         if self == Intrinsic::FrameMarks {
-            let tag = if operands.get(2) == Value::FALSE { None } else { Some(prompts::tag_of(mc, operands.get(2))?) };
+            let tag = if operands.get(2).is_false() { None } else { Some(prompts::tag_of(mc, operands.get(2))?) };
             return Ok(made(mc, fuel, prompts::part_marks(mc, task, operands.get(0), operands.get(1), tag)?));
         }
         let winders = operands.get(0);
-        if winders != Value::NIL && !Pair::of(winders).is_some_and(|cell| cell.head(mc).downcast::<objects::Winder>(mc).is_some()) {
+        if winders != Value::NULL && !Pair::of(winders).is_some_and(|cell| cell.head(mc).downcast::<objects::Winder>(mc).is_some()) {
             return Err(Fault::WrongType);
         }
         task.set_winders(mc, winders);
@@ -56,7 +56,7 @@ impl Intrinsic {
                 }
                 let (required, keywords) = match procedure.downcast::<objects::KeywordProcedure>(mc) {
                     Some(keyed) => (keyed.required(mc), keyed.keywords(mc)),
-                    None => (Value::NIL, Value::NIL),
+                    None => (Value::NULL, Value::NULL),
                 };
                 made(mc, fuel, Pairs::new(mc).cons(required, keywords)?.value(mc))
             }
@@ -85,7 +85,7 @@ impl Intrinsic {
             Intrinsic::MakeSyntaxError if operands.count() < 2 => return Err(Fault::Arity),
             Intrinsic::MakeError | Intrinsic::MakeSyntaxError => {
                 let pairs = Pairs::new(mc);
-                let mut irritants = Value::NIL;
+                let mut irritants = Value::NULL;
                 for i in (1..operands.count()).rev() {
                     irritants = pairs.cons(operands.get(i), irritants)?.value(mc);
                 }

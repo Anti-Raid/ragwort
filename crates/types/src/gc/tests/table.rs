@@ -12,7 +12,7 @@ objects! {
 
 fn churn(mc: &Mutation<'_>) {
     for _ in 0..200_000 {
-        Pair::new(mc, Value::NIL, Value::NIL).unwrap();
+        Pair::new(mc, Value::NULL, Value::NULL).unwrap();
     }
 }
 
@@ -119,7 +119,7 @@ fn identity_tables_rehash_after_objects_move() {
         let keys = crate::gc::GcVec::<slot::Value>::new(mc).unwrap();
         for n in 0..3000 {
             churn_a_little(mc);
-            let key = Value::object(mc, Pair::new(mc, fix(n), Value::NIL).unwrap());
+            let key = Value::object(mc, Pair::new(mc, fix(n), Value::NULL).unwrap());
             keys.push(mc, key).unwrap();
             t.insert_eq(mc, key, fix(n)).unwrap();
         }
@@ -139,7 +139,7 @@ fn identity_tables_rehash_after_objects_move() {
                 assert_eq!(t.get_eq(mc, key).unwrap(), want, "round {round}: key {n}");
             }
             assert_eq!(t.get_eq(mc, fix(7)).unwrap(), Some(fix(-7)));
-            let fresh = Value::object(mc, Pair::new(mc, Value::NIL, Value::NIL).unwrap());
+            let fresh = Value::object(mc, Pair::new(mc, Value::NULL, Value::NULL).unwrap());
             assert_eq!(t.get_eq(mc, fresh).unwrap(), None);
             if round == 1 {
                 for key in keys.iter(mc).step_by(2) {
@@ -153,7 +153,7 @@ fn identity_tables_rehash_after_objects_move() {
 
 fn churn_a_little(mc: &Mutation<'_>) {
     for _ in 0..7 {
-        Pair::new(mc, Value::NIL, Value::NIL).unwrap();
+        Pair::new(mc, Value::NULL, Value::NULL).unwrap();
     }
 }
 
@@ -166,7 +166,7 @@ fn ephemeron_entries_die_with_their_keys() {
         let t = Table::<Ephemerons>::new_eq(mc).unwrap();
         let held = crate::gc::GcVec::<slot::Value>::new(mc).unwrap();
         for n in 0..2000 {
-            let key = Value::object(mc, Pair::new(mc, fix(n), Value::NIL).unwrap());
+            let key = Value::object(mc, Pair::new(mc, fix(n), Value::NULL).unwrap());
             let value = Value::object(mc, Pair::new(mc, key, fix(n)).unwrap());
             t.insert_eq(mc, key, value).unwrap();
             if n % 4 == 0 {
@@ -188,8 +188,8 @@ fn ephemeron_entries_die_with_their_keys() {
             assert_eq!(value.car(mc), key);
         }
         for n in 0..1000 {
-            let key = Value::object(mc, Pair::new(mc, fix(n), Value::NIL).unwrap());
-            t.insert_eq(mc, key, Value::NIL).unwrap();
+            let key = Value::object(mc, Pair::new(mc, fix(n), Value::NULL).unwrap());
+            t.insert_eq(mc, key, Value::NULL).unwrap();
         }
         assert_eq!(t.count(mc), 1500);
         assert!(held.iter(mc).all(|key| t.get_eq(mc, key).unwrap().is_some()));

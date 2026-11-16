@@ -402,7 +402,7 @@ impl fmt::Debug for Stack {
 /// arena.mutate(|mc| {
 ///     let mut stack = mc.stack(Segment::new(mc, 512).unwrap()).unwrap();
 ///     let frame = stack.frame(mc, 0).unwrap();
-///     frame.set(0, Value::NIL);
+///     frame.set(0, Value::NULL);
 ///     stack.capture(mc, 8);
 /// });
 /// ```
@@ -414,7 +414,7 @@ impl fmt::Debug for Stack {
 ///     let mut stack = mc.stack(Segment::new(mc, 512).unwrap()).unwrap();
 ///     let frame = stack.frame(mc, 0).unwrap();
 ///     stack.capture(mc, 8);
-///     frame.set(0, Value::NIL);
+///     frame.set(0, Value::NULL);
 /// });
 /// ```
 #[derive(Clone, Copy)]

@@ -59,7 +59,7 @@ fn garbage_is_reused() {
     for _ in 0..50 {
         arena.step(|mc| {
             for i in 0..10_000 {
-                Pair::new(mc, Value::fixnum(i).unwrap(), Value::NIL).unwrap();
+                Pair::new(mc, Value::fixnum(i).unwrap(), Value::NULL).unwrap();
             }
         })
         .unwrap();
@@ -102,8 +102,8 @@ fn stacks_and_vectors_are_traced_and_moved() {
     let mut arena = Arena::new(REGION, 1);
     let stack = arena.mutate(|mc| {
         let segment = Segment::new(mc, 1024).unwrap();
-        let vector = Vector::new(mc, 300_000, Value::NIL).unwrap();
-        let pair = Pair::new(mc, Value::fixnum(5).unwrap(), Value::NIL).unwrap();
+        let vector = Vector::new(mc, 300_000, Value::NULL).unwrap();
+        let pair = Pair::new(mc, Value::fixnum(5).unwrap(), Value::NULL).unwrap();
         vector.items(mc).set(mc, 299_999, Value::object(mc, pair));
         mc.set_root(0, Value::object(mc, vector));
         let stack = mc.stack(segment).unwrap();
@@ -156,7 +156,7 @@ fn forged_references_are_only_wrong() {
 /// strongly from root 1's vector.
 fn holders(arena: &mut Arena, n: usize) {
     arena.mutate(|mc| {
-        let kept = Vector::new(mc, n / 2, Value::NIL).unwrap();
+        let kept = Vector::new(mc, n / 2, Value::NULL).unwrap();
         mc.set_root(1, Value::object(mc, kept));
         for i in 0..n {
             let node = Node::new(mc, i as u64, None).unwrap();
@@ -221,7 +221,7 @@ fn incremental_marking_keeps_what_the_mutator_moves_around() {
             }
             let cut = cur.downcast::<Pair>(mc).unwrap();
             let tail = cut.cdr(mc);
-            cut.set_cdr(mc, Value::NIL);
+            cut.set_cdr(mc, Value::NULL);
             let fresh = Pair::new(mc, Value::fixnum(-1).unwrap(), tail).unwrap();
             mc.set_root(1, Value::object(mc, fresh));
         });
@@ -236,7 +236,7 @@ fn incremental_marking_keeps_what_the_mutator_moves_around() {
                 cur = cur.downcast::<Pair>(mc).unwrap().cdr(mc);
             }
             cur.downcast::<Pair>(mc).unwrap().set_cdr(mc, fresh.cdr(mc));
-            mc.set_root(1, Value::NIL);
+            mc.set_root(1, Value::NULL);
         });
         if arena.phase() == Phase::Marking {
             arena.collect_slice(4096);
@@ -255,7 +255,7 @@ fn steps_collect_as_they_go() {
     for step in 0..20_000 {
         arena.step(|mc| {
             for i in 0..100 {
-                Pair::new(mc, Value::fixnum(i).unwrap(), Value::NIL).unwrap();
+                Pair::new(mc, Value::fixnum(i).unwrap(), Value::NULL).unwrap();
             }
             let kept = Pair::new(mc, Value::fixnum(step).unwrap(), mc.root(0)).unwrap();
             mc.set_root(0, Value::object(mc, kept));
@@ -274,7 +274,7 @@ fn garbage_alone_needs_only_minors() {
     for _ in 0..2000 {
         arena.step(|mc| {
             for i in 0..1000 {
-                Pair::new(mc, Value::fixnum(i).unwrap(), Value::NIL).unwrap();
+                Pair::new(mc, Value::fixnum(i).unwrap(), Value::NULL).unwrap();
             }
         })
         .unwrap();
@@ -288,7 +288,7 @@ fn garbage_alone_needs_only_minors() {
 fn large_objects_reuse_freed_pages() {
     let mut arena = Arena::new(16 << 20, 1);
     for _ in 0..200 {
-        arena.step(|mc| Vector::new(mc, 128 << 10, Value::NIL).map(|_| ())).unwrap().unwrap();
+        arena.step(|mc| Vector::new(mc, 128 << 10, Value::NULL).map(|_| ())).unwrap().unwrap();
     }
     assert!(arena.pages_bytes() <= 16 << 20);
 }
@@ -341,7 +341,7 @@ fn allocation_during_lazy_sweeping_is_kept() {
     arena.mutate(|mc| {
         // Garbage, so the sweep has holes to hand out.
         for i in 0..200_000 {
-            Pair::new(mc, Value::fixnum(i).unwrap(), Value::NIL).unwrap();
+            Pair::new(mc, Value::fixnum(i).unwrap(), Value::NULL).unwrap();
         }
     });
     while arena.phase() != Phase::Sweeping {
@@ -380,10 +380,10 @@ fn free_pages_are_given_back() {
     arena.mutate(|mc| {
         // Fills half the region with 1 MiB vectors, each dropped as soon as the next one replaces it.
         for _ in 0..REGION >> 21 {
-            let v = Vector::new(mc, 128 << 10, Value::NIL).unwrap();
+            let v = Vector::new(mc, 128 << 10, Value::NULL).unwrap();
             mc.set_root(1, Value::object(mc, v));
         }
-        mc.set_root(1, Value::NIL);
+        mc.set_root(1, Value::NULL);
     });
     arena.collect();
     let committed = arena.committed_bytes();
@@ -434,7 +434,7 @@ fn flonums_round_trip_and_survive_moves() {
         // A type of the test's own registered first mustn't pass for a boxed flonum.
         let other = Pair::new(mc, Value::FALSE, Value::FALSE).unwrap();
         assert!(!Value::object(mc, other).is_flonum());
-        let mut list = Value::NIL;
+        let mut list = Value::NULL;
         for &f in &doubles {
             let v = Value::flonum(mc, f).unwrap();
             assert!(v.is_flonum());
@@ -443,14 +443,24 @@ fn flonums_round_trip_and_survive_moves() {
         }
         mc.set_root(0, list);
         assert!(Value::inline_flonum(1.5).is_some() && Value::inline_flonum(1e300).is_none());
-        for v in [fixnum(3), Value::NIL, Value::FALSE, Value::BROKEN] {
+        for v in [fixnum(3), Value::NULL, Value::FALSE, Value::BROKEN] {
             assert!(!v.is_flonum() && v.as_flonum(mc).is_none());
         }
-        for v in [fixnum(7), Value::inline_flonum(1.5).unwrap(), Value::NIL, Value::TRUE, Value::VOID] {
+        for v in [fixnum(7), Value::inline_flonum(1.5).unwrap(), Value::NULL, Value::TRUE, Value::VOID] {
             assert_eq!(v.immediate().map(Immediate::value), Some(v));
         }
         assert_eq!(Value::flonum(mc, 1e300).unwrap().immediate(), None);
         assert_eq!(Value::object(mc, other).immediate(), None);
+        // Three values are false, and each is a value of its own. Nothing else is false: not the empty list, not void, not zero.
+        let falses = [Value::FALSE, Value::NIL, Value::NONE];
+        for (index, &value) in falses.iter().enumerate() {
+            assert!(value.is_false() && !value.is_true() && value.immediate().map(Immediate::value) == Some(value));
+            assert!(falses.iter().skip(index + 1).all(|&later| later != value));
+        }
+        let trues = [Value::TRUE, Value::NULL, Value::VOID, Value::UNDEFINED, Value::UNSUPPLIED, Value::VALUES, Value::BROKEN];
+        for value in trues.into_iter().chain([fixnum(0), Value::char('\0'), Value::inline_flonum(0.0).unwrap(), Value::object(mc, other)]) {
+            assert!(value.is_true() && !value.is_false() && !falses.contains(&value), "{value:?}");
+        }
     });
     let check = |arena: &mut Arena| {
         arena.mutate(|mc| {
@@ -475,7 +485,7 @@ fn half_held_table(arena: &mut Arena, n: usize) {
     arena.mutate(|mc| {
         let table = Table::new(mc, n).unwrap();
         for i in 0..n {
-            let key = pair(mc, fixnum(i), Value::NIL);
+            let key = pair(mc, fixnum(i), Value::NULL);
             let value = pair(mc, fixnum(i), key);
             table.set_entry(mc, i, key, value);
             if i % 2 == 0 {
@@ -532,14 +542,14 @@ fn ephemeron_chains_are_followed() {
     let mut arena = Arena::new(REGION, 2);
     arena.mutate(|mc| {
         let table = Table::new(mc, LINKS + 1).unwrap();
-        let mut key = pair(mc, fixnum(LINKS), Value::NIL);
+        let mut key = pair(mc, fixnum(LINKS), Value::NULL);
         mc.set_root(1, key);
         for i in (0..LINKS).rev() {
-            let value = pair(mc, fixnum(i), Value::NIL);
+            let value = pair(mc, fixnum(i), Value::NULL);
             table.set_entry(mc, i, key, value);
             key = value;
         }
-        table.set_entry(mc, LINKS, pair(mc, fixnum(99), Value::NIL), fixnum(1));
+        table.set_entry(mc, LINKS, pair(mc, fixnum(99), Value::NULL), fixnum(1));
         mc.set_root(0, Value::object(mc, table));
     });
     arena.set_evacuate_all(true);
@@ -564,12 +574,12 @@ fn ephemeron_values_stored_while_marking_are_kept() {
     arena.mutate(|mc| {
         // Roots are traced last first: the table, the key, then the chain, deep enough that
         // its end is untraced when the value is taken from it.
-        let mut chain = pair(mc, pair(mc, fixnum(777), Value::NIL), Value::NIL);
+        let mut chain = pair(mc, pair(mc, fixnum(777), Value::NULL), Value::NULL);
         for i in 0..10_000 {
             chain = pair(mc, fixnum(i), chain);
         }
         mc.set_root(1, chain);
-        mc.set_root(2, pair(mc, fixnum(1), Value::NIL));
+        mc.set_root(2, pair(mc, fixnum(1), Value::NULL));
         mc.set_root(3, Value::object(mc, Table::new(mc, 1).unwrap()));
     });
     arena.set_evacuate_all(true);
@@ -577,12 +587,12 @@ fn ephemeron_values_stored_while_marking_are_kept() {
     assert_eq!(arena.phase(), Phase::Marking);
     arena.mutate(|mc| {
         let mut end = mc.root(1);
-        while cdr(mc, end) != Value::NIL {
+        while cdr(mc, end) != Value::NULL {
             end = cdr(mc, end);
         }
         let table = mc.root(3).downcast::<Table>(mc).unwrap();
         table.set_entry(mc, 0, mc.root(2), car(mc, end));
-        end.downcast::<Pair>(mc).unwrap().set_car(mc, Value::NIL);
+        end.downcast::<Pair>(mc).unwrap().set_car(mc, Value::NULL);
     });
     while arena.phase() != Phase::Idle {
         arena.collect_slice(1024);
@@ -590,7 +600,7 @@ fn ephemeron_values_stored_while_marking_are_kept() {
     arena.mutate(|mc| {
         // Fills the freed memory, so a value wrongly freed reads back as something else.
         for i in 0..300_000 {
-            pair(mc, fixnum(i), Value::NIL);
+            pair(mc, fixnum(i), Value::NULL);
         }
         let table = mc.root(3).downcast::<Table>(mc).unwrap();
         let (key, value) = table.entry(mc, 0).unwrap();
@@ -609,7 +619,7 @@ fn old_ephemerons_hold_young_values() {
     });
     arena.collect();
     arena.mutate(|mc| {
-        let key = pair(mc, fixnum(1), Value::NIL);
+        let key = pair(mc, fixnum(1), Value::NULL);
         let value = pair(mc, fixnum(2), key);
         mc.set_root(1, key);
         mc.root(0).downcast::<Cached>(mc).unwrap().set_cache(mc, (key, value));
@@ -623,7 +633,7 @@ fn old_ephemerons_hold_young_values() {
         })
     };
     assert_eq!(entry(&mut arena), Some((Some(1), Some(2))));
-    arena.mutate(|mc| mc.set_root(1, Value::NIL));
+    arena.mutate(|mc| mc.set_root(1, Value::NULL));
     arena.collect_minor();
     assert_eq!(entry(&mut arena), Some((Some(1), Some(2))));
     arena.collect();
@@ -636,8 +646,8 @@ fn immediate_keys_keep_their_values() {
     let mut arena = Arena::new(REGION, 1);
     arena.mutate(|mc| {
         let table = Table::new(mc, 2).unwrap();
-        table.set_entry(mc, 0, fixnum(1), pair(mc, fixnum(10), Value::NIL));
-        table.set_entry(mc, 1, Value::NIL, pair(mc, fixnum(20), Value::NIL));
+        table.set_entry(mc, 0, fixnum(1), pair(mc, fixnum(10), Value::NULL));
+        table.set_entry(mc, 1, Value::NULL, pair(mc, fixnum(20), Value::NULL));
         mc.set_root(0, Value::object(mc, table));
     });
     arena.collect_minor();
@@ -645,7 +655,7 @@ fn immediate_keys_keep_their_values() {
     arena.mutate(|mc| {
         let table = mc.root(0).downcast::<Table>(mc).unwrap();
         assert_eq!(table.entry(mc, 0).map(|(k, v)| (k, car(mc, v))), Some((fixnum(1), fixnum(10))));
-        assert_eq!(table.entry(mc, 1).map(|(k, v)| (k, car(mc, v))), Some((Value::NIL, fixnum(20))));
+        assert_eq!(table.entry(mc, 1).map(|(k, v)| (k, car(mc, v))), Some((Value::NULL, fixnum(20))));
     });
 }
 
@@ -684,7 +694,7 @@ fn stale_host_refs_never_read_the_next_value() {
 fn large_first_allocation_is_not_none() {
     let mut arena = Arena::new(REGION, 1);
     arena.mutate(|mc| {
-        let big = Vector::new(mc, 3000, Value::NIL).unwrap();
+        let big = Vector::new(mc, 3000, Value::NULL).unwrap();
         assert_ne!(big.to_word(), 0);
         let node = Node::new(mc, 0, None).unwrap();
         node.set_member(mc, 1, Some(big));
@@ -704,7 +714,7 @@ fn fields_past_the_declared_ones_panic() {
     let mut arena = Arena::new(1 << 20, 1);
     arena.mutate(|mc| {
         let pair = mc.alloc::<Pair, 2>([0, 0]).unwrap();
-        pair.set_value(mc, 2, Value::NIL);
+        pair.set_value(mc, 2, Value::NULL);
     });
 }
 
@@ -722,7 +732,7 @@ impl Drop for Flag {
 fn dropped_stacks_are_pruned() {
     let mut arena = Arena::new(REGION, 1);
     arena.mutate(|mc| {
-        let segments = Vector::new(mc, 200, Value::NIL).unwrap();
+        let segments = Vector::new(mc, 200, Value::NULL).unwrap();
         for i in 0..200 {
             segments.items(mc).set(mc, i, Value::object(mc, Segment::new(mc, WINDOW).unwrap()));
         }
@@ -799,10 +809,10 @@ fn dirty_cards_of_large_objects() {
     const LEN: usize = 300_000;
     let mut arena = Arena::new(REGION, 2);
     arena.mutate(|mc| {
-        let vector = Vector::new(mc, LEN, Value::NIL).unwrap();
+        let vector = Vector::new(mc, LEN, Value::NULL).unwrap();
         mc.set_root(0, Value::object(mc, vector));
         // Lands in the free lines after the vector's end.
-        let tail = pair(mc, Value::NIL, Value::NIL);
+        let tail = pair(mc, Value::NULL, Value::NULL);
         mc.set_root(1, tail);
     });
     arena.collect();
@@ -811,16 +821,16 @@ fn dirty_cards_of_large_objects() {
         let vector = mc.root(0).downcast::<Vector>(mc).unwrap();
         for &i in &stores {
             // Garbage between them, so no two share a line and survive together.
-            Vector::new(mc, 32, Value::NIL).unwrap();
-            vector.items(mc).set(mc, i, pair(mc, fixnum(i), Value::NIL));
+            Vector::new(mc, 32, Value::NULL).unwrap();
+            vector.items(mc).set(mc, i, pair(mc, fixnum(i), Value::NULL));
         }
         let tail = mc.root(1).downcast::<Pair>(mc).unwrap();
-        tail.set_car(mc, pair(mc, fixnum(1_000_001), Value::NIL));
+        tail.set_car(mc, pair(mc, fixnum(1_000_001), Value::NULL));
     });
     arena.collect_minor();
     arena.mutate(|mc| {
         for i in 0..300_000 {
-            pair(mc, fixnum(i), Value::NIL);
+            pair(mc, fixnum(i), Value::NULL);
         }
         let vector = mc.root(0).downcast::<Vector>(mc).unwrap();
         for &i in &stores {
@@ -828,17 +838,17 @@ fn dirty_cards_of_large_objects() {
         }
         assert_eq!(car(mc, car(mc, mc.root(1))), fixnum(1_000_001));
         // The vector dies; the tail pair, on its last page, lives on.
-        mc.set_root(0, Value::NIL);
+        mc.set_root(0, Value::NULL);
     });
     arena.collect();
     arena.mutate(|mc| {
         let tail = mc.root(1).downcast::<Pair>(mc).unwrap();
-        tail.set_cdr(mc, pair(mc, fixnum(1_000_002), Value::NIL));
+        tail.set_cdr(mc, pair(mc, fixnum(1_000_002), Value::NULL));
     });
     arena.collect_minor();
     arena.mutate(|mc| {
         for i in 0..300_000 {
-            pair(mc, fixnum(i), Value::NIL);
+            pair(mc, fixnum(i), Value::NULL);
         }
         let tail = mc.root(1).downcast::<Pair>(mc).unwrap();
         assert_eq!(car(mc, tail.cdr(mc)), fixnum(1_000_002));
@@ -853,7 +863,7 @@ fn characters_are_constants_apart_from_the_others() {
         assert_eq!(v.as_char(), Some(c));
         assert!(v.as_fixnum().is_none());
     }
-    for v in [Value::TRUE, Value::FALSE, Value::NIL, Value::VOID, Value::fixnum(97).unwrap()] {
+    for v in [Value::TRUE, Value::FALSE, Value::NULL, Value::VOID, Value::fixnum(97).unwrap()] {
         assert_eq!(v.as_char(), None);
     }
     assert_ne!(Value::char('a'), Value::char('b'));

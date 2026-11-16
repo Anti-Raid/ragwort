@@ -16,7 +16,7 @@ fn arena() -> Arena {
     let mut arena = Arena::new(1 << 24, 2);
     arena.mutate(|mc| {
         mc.set_root(0, Symbols::with_seed(mc, 1).unwrap().value(mc));
-        mc.set_root(1, Value::NIL);
+        mc.set_root(1, Value::NULL);
     });
     arena
 }
@@ -593,7 +593,7 @@ fn deferred_host_calls_go_to_what_runs_the_machine() {
                     outcome = if asked.len() == 3 { machine.run(mc) } else { machine.reply(mc, Value::fixnum(asked.len() as i64).unwrap()) };
                 }
                 Outcome::Paused => outcome = machine.run(mc),
-                Outcome::Done(v) => break (asked, show(mc, v), format!("{:?}", machine.reply(mc, Value::NIL).err())),
+                Outcome::Done(v) => break (asked, show(mc, v), format!("{:?}", machine.reply(mc, Value::NULL).err())),
                 other => panic!("{other:?}"),
             }
         }

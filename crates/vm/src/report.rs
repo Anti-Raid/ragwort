@@ -81,7 +81,7 @@ pub(crate) struct Origin<'gc> {
 
 fn list<'gc>(mc: &Mutation<'gc>, values: impl DoubleEndedIterator<Item = Value<'gc>>) -> Result<Value<'gc>, Fault> {
     let pairs = Pairs::new(mc);
-    let mut list = Value::NIL;
+    let mut list = Value::NULL;
     for value in values.rev() {
         list = pairs.cons(value, list)?.value(mc);
     }
@@ -96,7 +96,7 @@ fn count<'gc>(number: u8) -> Value<'gc> {
 ///
 /// Returns an origin with no name and no irritants when the instruction does not explain the fault.
 pub(crate) fn origin<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, code: Gc<'gc, Bytecode>, pc: usize, received: Value<'gc>, fault: Fault) -> Result<Origin<'gc>, Fault> {
-    let unknown = Origin { operation: None, irritants: Value::NIL };
+    let unknown = Origin { operation: None, irritants: Value::NULL };
     let Some(&op) = pc.checked_sub(1).and_then(|at| code.ops(mc)?.get(at)) else { return Ok(unknown) };
     let registers = |base: u8, count: u8| (0..count).map(move |i| frame.get(base.wrapping_add(i)));
     let (operation, irritants) = match op {
@@ -342,7 +342,7 @@ pub(crate) fn traceback<'gc>(mc: &Mutation<'gc>, condition: Gc<'gc, Condition>) 
         let line = if line == 0 { Value::FALSE } else { Value::fixnum(i64::from(line)).unwrap_or(Value::FALSE) };
         entries.push(list(mc, [name, file, line].into_iter())?);
     }
-    let mut all = Value::NIL;
+    let mut all = Value::NULL;
     for entry in entries.into_iter().rev() {
         all = pairs.cons(entry, all)?.value(mc);
     }

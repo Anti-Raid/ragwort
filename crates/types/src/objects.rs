@@ -5,6 +5,7 @@ use std::cell::RefCell;
 
 use crate::bytevector::{ExternalBuffer, ExternalBufferMut};
 use crate::external::Held;
+use crate::table::Hosted;
 use crate::gc::table::TableHead;
 
 crate::gc::objects! {
@@ -53,6 +54,11 @@ crate::gc::objects! {
     /// `seed` seeds the hashes. `epoch` is the count of moving collections the index was made
     /// at, or `u64::MAX` while no key is hashed by where it is.
     pub(crate) struct Table { index: Member<TableIndex>, pairs: Member<TableEntries>, live: u64, used: u64, seed: u64, epoch: u64 }
+    /// A table whose entries the host holds, in `host`. `memo` is a table of the values read from
+    /// the host so far, made at the first read. `walk` is the keys and values in the host's order,
+    /// made when the table is first walked and dropped when it is next written. `writable` says
+    /// whether programs can change the table.
+    pub(crate) struct ExternTable { memo: Member<Table>, walk: Member<TableEntries>, writable: bool, host: Frozen<RefCell<Box<dyn Hosted>>> }
     /// A table's index, probed linearly. A slot is 0 if it was never used. Otherwise its low half
     /// is an entry's number plus one, and its high half is the high half of the key's hash.
     pub(crate) struct TableIndex {} items u64

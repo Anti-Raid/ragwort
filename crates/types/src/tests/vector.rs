@@ -24,7 +24,7 @@ fn vectors_hold_what_they_were_made_with() {
         assert_eq!(read(mc, made), [Value::TRUE; 5]);
         let items: Vec<_> = (0..7).map(fix).collect();
         assert_eq!(read(mc, h.from_slice(&items).unwrap()), items);
-        assert!(h.make(0, Value::NIL).unwrap().items(mc).is_empty());
+        assert!(h.make(0, Value::NULL).unwrap().items(mc).is_empty());
         assert!(h.from_slice(&[]).unwrap().items(mc).is_empty());
         let slots = made.items(mc);
         slots.set(mc, 2, fix(9));
@@ -38,11 +38,11 @@ fn vectors_hold_what_they_were_made_with() {
 fn only_vectors_are_vectors() {
     arena().mutate(|mc| {
         let h = Vectors::new(mc);
-        let v = h.make(2, Value::NIL).unwrap().value(mc);
+        let v = h.make(2, Value::NULL).unwrap().value(mc);
         assert!(h.vector(v).is_some_and(AnyVector::is_mutable) && h.mutable(v).is_some());
         let pair = Pairs::new(mc).cons(fix(1), fix(2)).unwrap().value(mc);
         assert!(h.vector(pair).is_none() && h.mutable(pair).is_none());
-        assert!(h.vector(fix(1)).is_none() && h.vector(Value::NIL).is_none());
+        assert!(h.vector(fix(1)).is_none() && h.vector(Value::NULL).is_none());
     });
 }
 
@@ -50,8 +50,8 @@ fn only_vectors_are_vectors() {
 fn vectors_too_long_for_the_arena_fail() {
     arena().mutate(|mc| {
         let h = Vectors::new(mc);
-        assert_eq!(h.make(usize::MAX, Value::NIL).unwrap_err(), OutOfMemory);
-        assert_eq!(h.make(1 << 20, Value::NIL).unwrap_err(), OutOfMemory, "past the limit");
+        assert_eq!(h.make(usize::MAX, Value::NULL).unwrap_err(), OutOfMemory);
+        assert_eq!(h.make(1 << 20, Value::NULL).unwrap_err(), OutOfMemory, "past the limit");
     });
 }
 
@@ -61,7 +61,7 @@ fn vectors_too_long_for_the_arena_fail() {
 fn stores_into_old_vectors_keep_young_objects() {
     let mut arena = arena();
     arena.set_evacuate_all(true);
-    arena.mutate(|mc| mc.set_root(0, Vectors::new(mc).make(64, Value::NIL).unwrap().value(mc)));
+    arena.mutate(|mc| mc.set_root(0, Vectors::new(mc).make(64, Value::NULL).unwrap().value(mc)));
     arena.collect();
     arena.mutate(|mc| {
         let v = Vectors::new(mc).mutable(mc.root(0)).unwrap();
@@ -82,7 +82,7 @@ fn stores_into_old_vectors_keep_young_objects() {
             assert_eq!(len(0), Some(1));
             assert!((10..20).all(|i| len(i) == Some(2)));
             assert!((40..49).all(|i| len(i) == Some(3)));
-            assert_eq!(v.get(mc, 49), Some(Value::NIL));
+            assert_eq!(v.get(mc, 49), Some(Value::NULL));
         });
     };
     arena.collect_minor();

@@ -56,20 +56,21 @@ impl Intrinsic {
             Intrinsic::TableHas => {
                 let (table, key) = (table_of(operands.get(0))?, operands.get(1));
                 charge(mc, table, key, fuel)?;
-                boolean(table.get(mc, key)?.is_some())
+                boolean(table.has(mc, key)?)
             }
             Intrinsic::TableLength => Value::fixnum(table_of(operands.get(0))?.len(mc) as i64).expect("lengths are fixnums"),
             Intrinsic::TableClear => {
-                table_of(operands.get(0))?.clear(mc);
+                table_of(operands.get(0))?.clear(mc)?;
                 Value::VOID
             }
             Intrinsic::TableToVector => {
                 let table = table_of(operands.get(0))?;
-                let len = table.len(mc);
-                fuel.spend(len as u64 / equal::PER_FUEL)?;
-                let vector = Vectors::new(mc).make(2 * len, Value::VOID)?;
+                fuel.spend(table.len(mc) as u64 / equal::PER_FUEL)?;
+                // An external table reads its entries from the host here, so they are counted as they come.
+                let entries = table.entries(mc)?;
+                let vector = Vectors::new(mc).make(2 * entries.count(), Value::VOID)?;
                 let items = vector.items(mc);
-                for (position, (key, value)) in table.entries(mc).enumerate() {
+                for (position, (key, value)) in entries.enumerate() {
                     items.set(mc, 2 * position, key);
                     items.set(mc, 2 * position + 1, value);
                 }

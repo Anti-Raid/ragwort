@@ -1179,7 +1179,9 @@ impl fmt::Display for Constant<'_, '_> {
         let name = [
             (Value::TRUE, "#t"),
             (Value::FALSE, "#f"),
-            (Value::NIL, "()"),
+            (Value::NIL, "#nil"),
+            (Value::NONE, "#none"),
+            (Value::NULL, "()"),
             (Value::VOID, "#<void>"),
             (Value::UNDEFINED, "#<undefined>"),
             (Value::UNSUPPLIED, "#<unsupplied>"),

@@ -32,7 +32,7 @@
 //!
 //! let mut arena = Arena::new(1 << 20, 1);
 //! arena.mutate(|mc| {
-//!     let p = Pair::new(mc, Value::NIL, Value::TRUE).unwrap();
+//!     let p = Pair::new(mc, Value::NULL, Value::TRUE).unwrap();
 //!     assert_eq!(p.cdr(mc), Value::TRUE);
 //!     p.set_car(mc, Value::fixnum(1).unwrap());
 //!     assert_eq!(p.get(mc, Pair::CAR), Value::fixnum(1).unwrap());
@@ -41,7 +41,7 @@
 //!     let head = Node::new(mc, 1, Some(tail), None).unwrap();
 //!     assert_eq!(head.next(mc).map(|n| n.n(mc)), Some(2));
 //!
-//!     let v = Vector::new(mc, 3, Value::NIL).unwrap();
+//!     let v = Vector::new(mc, 3, Value::NULL).unwrap();
 //!     v.items(mc).set(mc, 0, Value::object(mc, p));
 //!
 //!     match Kind::of(v.items(mc).get(0)) {
@@ -119,7 +119,7 @@
 //! # objects! { kind Kind; struct Pair { car: Value, cdr: Value } struct Node { next: Member<Node> } }
 //! # let mut arena = Arena::new(1 << 20, 1);
 //! arena.mutate(|mc| {
-//!     let pair = Pair::new(mc, Value::NIL, Value::NIL).unwrap();
+//!     let pair = Pair::new(mc, Value::NULL, Value::NULL).unwrap();
 //!     let node = Node::new(mc, None).unwrap();
 //!     node.set_next(mc, Some(pair));
 //! });
@@ -145,7 +145,7 @@
 //! const CAR_AS_WORD: Field<Pair, slot::u64> = Field::new(0);
 //! # let mut arena = Arena::new(1 << 20, 1);
 //! arena.mutate(|mc| {
-//!     let pair = Pair::new(mc, Value::NIL, Value::NIL).unwrap();
+//!     let pair = Pair::new(mc, Value::NULL, Value::NULL).unwrap();
 //!     pair.get(mc, CAR_AS_WORD);
 //! });
 //! ```
@@ -273,6 +273,8 @@ const _: () = assert!(WINDOW.is_power_of_two() && WINDOW >= 32 && WINDOW <= 256)
 pub(crate) const TAG: u64 = 0b1111;
 pub(crate) const OBJECT: u64 = 0b0001;
 const CONSTANT: u64 = 0b1101;
+/// The bits of a constant's id that the false constants differ in: see [`Value::is_false`].
+const FALSE_IDS: u64 = (8 | 16) << 32;
 /// The bit of a constant's id that makes it a character.
 const CHAR: u64 = 1 << 31;
 /// A string of [`crate::string::INLINE_CHARS`] Latin-1 characters or fewer: the length in the next
@@ -538,7 +540,8 @@ pub struct Value<'gc> {
 impl<'gc> Value<'gc> {
     pub const FALSE: Self = Self::constant(0);
     pub const TRUE: Self = Self::constant(1);
-    pub const NIL: Self = Self::constant(2);
+    /// The empty list.
+    pub const NULL: Self = Self::constant(2);
     /// What a stack slot above `top` becomes.
     pub const VOID: Self = Self::constant(3);
     /// What a module's variable holds until it's defined.
@@ -549,6 +552,29 @@ impl<'gc> Value<'gc> {
     pub const VALUES: Self = Self::constant(6);
     /// What an ephemeron's key and value become once the key dies.
     pub const BROKEN: Self = Self::constant(7);
+    /// `#nil`: what stands where there is no value at all, as a table reads for a key it does not
+    /// have. It is false in a conditional. See [`Value::is_false`].
+    pub const NIL: Self = Self::constant(8);
+    /// `#none`: a value that is there and says "none", as a host gives for a `null`. It is false in
+    /// a conditional. See [`Value::is_false`].
+    pub const NONE: Self = Self::constant(16);
+
+    /// Whether a conditional takes the value as false. Three values are false: `#f`, `#nil` and
+    /// `#none`. Everything else is true, the empty list and void included.
+    ///
+    /// The ids of the three constants differ only in two bits, so clearing
+    /// those bits and comparing with `#f` tests for all three at once. No constant is made with
+    /// both bits set.
+    #[inline(always)]
+    pub const fn is_false(self) -> bool {
+        self.word & !FALSE_IDS == Self::FALSE.word
+    }
+
+    /// Whether a conditional takes the value as true: whether it is not [false](Value::is_false).
+    #[inline(always)]
+    pub const fn is_true(self) -> bool {
+        !self.is_false()
+    }
 
     const fn constant(id: u64) -> Self {
         Self::from_bits(id << 32 | CONSTANT)
@@ -1533,7 +1559,7 @@ impl Arena {
             next: Cell::new(TYPES - 1),
             cache: [const { Cell::new(None) }; 64],
             // One more, after the program's, for the arena's intern table.
-            roots: vec![Cell::new(Value::NIL.word); roots + 1].into_boxed_slice(),
+            roots: vec![Cell::new(Value::NULL.word); roots + 1].into_boxed_slice(),
             stacks: RefCell::new(Vec::new()),
             handles: RefCell::new(Vec::new()),
             id: NEXT_ARENA.fetch_add(1, Ordering::Relaxed),

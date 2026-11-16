@@ -33,7 +33,7 @@ pub fn signature<'gc>(mc: &Mutation<'gc>, callee: Value<'gc>) -> Option<(Vec<(Ke
 /// Dispatches a call to keyword procedure `callee` when no keyword arguments are supplied, passing positional `args`.
 pub(crate) fn positional<'gc>(mc: &Mutation<'gc>, callee: Gc<'gc, KeywordProcedure>, args: Passed<'gc>) -> Result<Then<'gc>, Fault> {
     match callee.plain(mc) {
-        Value::FALSE => apply(mc, Value::object(mc, callee), Value::NIL, Value::NIL, args),
+        Value::FALSE => apply(mc, Value::object(mc, callee), Value::NULL, Value::NULL, args),
         plain => Ok(Then::Call(plain, args)),
     }
 }
@@ -79,6 +79,6 @@ pub(crate) fn apply<'gc>(mc: &Mutation<'gc>, callee: Value<'gc>, kws: Value<'gc>
 
 fn raise<'gc>(mc: &Mutation<'gc>, message: &str, kw: Value<'gc>) -> Result<Then<'gc>, Fault> {
     let message = string::from_str(&Strings::new(mc), message)?.value();
-    let irritants = Pairs::new(mc).cons(kw, Value::NIL)?.value(mc);
+    let irritants = Pairs::new(mc).cons(kw, Value::NULL)?.value(mc);
     Ok(Then::Raise(condition(mc, Fault::Keyword, message, irritants)?, false))
 }

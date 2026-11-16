@@ -47,7 +47,7 @@ impl<'gc> Expander<'_, 'gc> {
                     }
                 },
                 Task::Make(stx, count, tail, kind) => {
-                    let tail = if tail { done.pop().expect("a tail") } else { Value::NIL };
+                    let tail = if tail { done.pop().expect("a tail") } else { Value::NULL };
                     let items = done.split_off(done.len() - count);
                     let datum = if kind == SyntaxKind::Vector { Vectors::new(mc).immutable_from_slice(&items)?.value(mc) } else { Pairs::new(mc).list_with_tail(items, tail)? };
                     (stx, datum, kind)
@@ -195,7 +195,7 @@ impl<'gc> Expander<'_, 'gc> {
             self.tree.scopes.charge(size_of::<Task<'gc>>())?;
             let (datum, span, kind, context) = match Syntax::of(value) {
                 Some(syntax) => (syntax.datum(mc), syntax.span(mc), syntax.kind(mc).ok_or_else(|| bad(self))?, syntax.context(mc)),
-                None if value == Value::NIL || Pair::of(value).is_some() => (value, self.tree.span(at), SyntaxKind::List, None),
+                None if value == Value::NULL || Pair::of(value).is_some() => (value, self.tree.span(at), SyntaxKind::List, None),
                 None if AnyVector::of(value).is_some() => (value, self.tree.span(at), SyntaxKind::Vector, None),
                 None if Symbol::of(value).is_some() => return Err(bad(self)),
                 None => (value, self.tree.span(at), SyntaxKind::Literal, None),
@@ -220,7 +220,7 @@ impl<'gc> Expander<'_, 'gc> {
                             break;
                         }
                     }
-                    let tail = rest != Value::NIL;
+                    let tail = rest != Value::NULL;
                     todo.push(Task::Make(span, items.len(), tail, false));
                     if tail {
                         todo.push(Task::Visit(rest));

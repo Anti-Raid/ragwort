@@ -319,8 +319,13 @@ named! {
         Assoc = ("assoc", takes(2, FOLD)),
         /// `(box? x)`: returns `#t` if `x` is a box, and `#f` otherwise.
         IsBox = ("box?", takes(1, FOLD | DISCARD | PREDICATE)),
-        /// `(not x)`: boolean negation, returning `#t` if `x` is `#f`, and `#f` for any other value.
+        /// `(not x)`: boolean negation, returning `#t` if `x` is false (`#f`, `#nil` or `#none`), and `#f`
+        /// for any other value.
         Not = ("not", takes(1, FOLD | DISCARD)),
+        /// `(nil? x)`: returns `#t` if `x` is `#nil`, and `#f` otherwise.
+        IsNil = ("nil?", takes(1, FOLD | DISCARD | PREDICATE)),
+        /// `(none? x)`: returns `#t` if `x` is `#none`, and `#f` otherwise.
+        IsNone = ("none?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `(boolean? x)`: returns `#t` if `x` is a boolean (`#t` or `#f`), and `#f` otherwise.
         IsBoolean = ("boolean?", takes(1, FOLD | DISCARD | PREDICATE)),
         /// `(keyword? x)`: returns `#t` if `x` is a keyword (e.g. `#:name`), and `#f` otherwise.
@@ -769,8 +774,8 @@ const REORDER: u16 = 1 << 2;
 /// Flag indicating that the intrinsic is a unary type predicate that inspects a value's type and
 /// never faults; see [`Intrinsic::is_type_predicate`].
 const PREDICATE: u16 = 1 << 3;
-/// Flag indicating that normal execution of the intrinsic never returns the boolean false
-/// value (`#f`); see [`Intrinsic::is_always_truthy`].
+/// Flag indicating that normal execution of the intrinsic never returns a false value (`#f`,
+/// `#nil` or `#none`); see [`Intrinsic::is_always_truthy`].
 const TRUTHY: u16 = 1 << 4;
 /// Flag designating an internal primitive that may only be emitted by the compiler and is
 /// inaccessible to user-level code; see [`Intrinsic::is_internal`].
@@ -863,7 +868,7 @@ impl Intrinsic {
     }
 
     /// Returns whether successful (non-faulting) execution of this intrinsic is guaranteed to
-    /// return a truthy value (any value other than `#f`).
+    /// return a truthy value (any value that is not false: see `Value::is_false`).
     pub const fn is_always_truthy(self) -> bool {
         self.has(TRUTHY)
     }
@@ -1063,7 +1068,7 @@ impl Intrinsic {
                 fuel.spend(compared / equal::PER_FUEL)?;
                 boolean(same)
             }
-            Intrinsic::IsNull => boolean(operands.get(0) == Value::NIL),
+            Intrinsic::IsNull => boolean(operands.get(0) == Value::NULL),
             Intrinsic::IsPair => boolean(Pair::of(operands.get(0)).is_some()),
             Intrinsic::IsList => boolean(Pairs::new(mc).is_list(operands.get(0))),
             Intrinsic::Length => {
@@ -1081,7 +1086,9 @@ impl Intrinsic {
                 find(mc, self, operands.get(0), operands.get(1), fuel)?
             }
             Intrinsic::IsBox => boolean(operands.get(0).downcast::<objects::Box>(mc).is_some()),
-            Intrinsic::Not => boolean(operands.get(0) == Value::FALSE),
+            Intrinsic::Not => boolean(operands.get(0).is_false()),
+            Intrinsic::IsNil => boolean(operands.get(0) == Value::NIL),
+            Intrinsic::IsNone => boolean(operands.get(0) == Value::NONE),
             Intrinsic::IsBoolean => boolean(operands.get(0) == Value::TRUE || operands.get(0) == Value::FALSE),
             Intrinsic::IsKeyword => boolean(Keyword::of(operands.get(0)).is_some()),
             Intrinsic::IsSymbol => boolean(Symbol::of(operands.get(0)).is_some()),

@@ -138,7 +138,7 @@ impl<'a, 'gc> Vectors<'a, 'gc> {
     }
 
     pub fn from_slice(&self, items: &[Value<'gc>]) -> Result<Vector<'gc>, OutOfMemory> {
-        let vector = self.make(items.len(), Value::NIL)?;
+        let vector = self.make(items.len(), Value::NULL)?;
         fill(self.mc, vector.items(self.mc), items.iter().copied());
         Ok(vector)
     }
@@ -148,7 +148,7 @@ impl<'a, 'gc> Vectors<'a, 'gc> {
     }
 
     pub fn immutable_with(&self, len: usize, fill: impl FnMut(usize) -> Value<'gc>) -> Result<ImmutableVector<'gc>, OutOfMemory> {
-        let vector = objects::ImmutableVector::new(self.mc, len, Value::NIL)?;
+        let vector = objects::ImmutableVector::new(self.mc, len, Value::NULL)?;
         self::fill(self.mc, vector.items(self.mc), (0..len).map(fill));
         Ok(ImmutableVector(vector))
     }
@@ -160,7 +160,7 @@ impl<'a, 'gc> Vectors<'a, 'gc> {
             AnyVector::Immutable(immutable) => Ok(immutable),
             AnyVector::Mutable(mutable) => {
                 let items = mutable.items(self.mc);
-                let frozen = objects::ImmutableVector::new(self.mc, items.len(), Value::NIL)?;
+                let frozen = objects::ImmutableVector::new(self.mc, items.len(), Value::NULL)?;
                 frozen.items(self.mc).copy_from(self.mc, items);
                 Ok(ImmutableVector(frozen))
             }

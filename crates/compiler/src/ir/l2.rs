@@ -117,12 +117,12 @@ impl<'id, 'gc> L2<'id, 'gc> {
         true
     }
 
-    /// Whether any normal return value of `id` is guaranteed not to be `#f`.
+    /// Whether any normal return value of `id` is guaranteed not to be false (`#f`, `#nil` or `#none`).
     pub(crate) fn is_always_truthy(&self, id: Id<'id>) -> bool {
         let mut todo = vec![id];
         while let Some(id) = todo.pop() {
             let truthy = match self[id] {
-                Node::Quote(value) => value != Value::FALSE,
+                Node::Quote(value) => value.is_true(),
                 Node::Lambda(_) | Node::Set(..) => true,
                 Node::Intrinsic(Prim::Intrinsic(intrinsic), _) => intrinsic.is_always_truthy(),
                 Node::Seq(_, last) | Node::Let(_, last) => {

@@ -14,7 +14,7 @@ fn pair<'gc>(mc: &Mutation<'gc>, car: Value<'gc>, cdr: Value<'gc>) -> Result<Val
 /// Grows root 0's list until an allocation fails.
 fn grow_until_full(arena: &mut Arena) -> Result<(), OutOfMemory> {
     arena.step(|mc| {
-        while let Ok(list) = pair(mc, Value::NIL, mc.root(0)) {
+        while let Ok(list) = pair(mc, Value::NULL, mc.root(0)) {
             mc.set_root(0, list);
         }
     })
@@ -37,10 +37,10 @@ fn the_limit_fails_the_step_and_the_arena_recovers() {
         n
     });
     assert!(len > 10_000, "{len}");
-    arena.mutate(|mc| mc.set_root(0, Value::NIL));
+    arena.mutate(|mc| mc.set_root(0, Value::NULL));
     arena.collect();
     for _ in 0..100 {
-        arena.step(|mc| (0..1000).try_for_each(|_| pair(mc, Value::NIL, Value::NIL).map(drop))).unwrap().unwrap();
+        arena.step(|mc| (0..1000).try_for_each(|_| pair(mc, Value::NULL, Value::NULL).map(drop))).unwrap().unwrap();
     }
 }
 
@@ -51,13 +51,13 @@ fn the_reserve_lets_a_step_finish_and_collects() {
     let mut arena = Arena::new(1 << 20, 1);
     arena.mutate(|mc| {
         while !mc.collection_due() {
-            pair(mc, Value::NIL, Value::NIL).unwrap();
+            pair(mc, Value::NULL, Value::NULL).unwrap();
         }
     });
     let (majors, _) = arena.collections();
     arena.step(|mc| {
         assert!(mc.collection_due());
-        pair(mc, Value::NIL, Value::NIL).unwrap();
+        pair(mc, Value::NULL, Value::NULL).unwrap();
     })
     .unwrap();
     assert_eq!(arena.collections().0, majors + 1);
@@ -70,9 +70,9 @@ fn optional_allocations_neither_fail_the_step_nor_use_the_reserve() {
     arena.set_reserve(1 << 20);
     arena
         .step(|mc| {
-            assert_eq!(mc.optional(|| pair(mc, Value::NIL, Value::NIL)).map(drop), Err(OutOfMemory));
+            assert_eq!(mc.optional(|| pair(mc, Value::NULL, Value::NULL)).map(drop), Err(OutOfMemory));
             assert!(!mc.collection_due());
-            pair(mc, Value::NIL, Value::NIL).unwrap();
+            pair(mc, Value::NULL, Value::NULL).unwrap();
             assert!(mc.collection_due());
         })
         .unwrap();
@@ -165,25 +165,25 @@ fn freed_hosts_ignore_owned_bytes() {
 fn injected_failures_fail_the_picked_allocation() {
     let mut arena = Arena::new(4 << 20, 1);
     arena.fail_after(Some(5));
-    let made = arena.mutate(|mc| (0..10).take_while(|_| pair(mc, Value::NIL, Value::NIL).is_ok()).count());
+    let made = arena.mutate(|mc| (0..10).take_while(|_| pair(mc, Value::NULL, Value::NULL).is_ok()).count());
     assert_eq!(made, 5);
     // Only once, and the next allocations go on in the same hole.
     let pages = arena.pages_bytes();
     arena.mutate(|mc| {
         for _ in 0..10 {
-            pair(mc, Value::NIL, Value::NIL).unwrap();
+            pair(mc, Value::NULL, Value::NULL).unwrap();
         }
     });
     assert_eq!(arena.pages_bytes(), pages);
     // Retried over and over, a step's allocations don't waste memory.
     for _ in 0..2000 {
         arena.fail_after(Some(50));
-        let result = arena.step(|mc| (0..100).try_for_each(|_| pair(mc, Value::NIL, Value::NIL).map(drop)));
+        let result = arena.step(|mc| (0..100).try_for_each(|_| pair(mc, Value::NULL, Value::NULL).map(drop)));
         assert_eq!(result, Err(OutOfMemory));
     }
     assert!(arena.pages_bytes() <= 1 << 20, "{} bytes of pages", arena.pages_bytes());
     arena.fail_after(None);
-    arena.step(|mc| (0..1000).try_for_each(|_| pair(mc, Value::NIL, Value::NIL).map(drop))).unwrap().unwrap();
+    arena.step(|mc| (0..1000).try_for_each(|_| pair(mc, Value::NULL, Value::NULL).map(drop))).unwrap().unwrap();
 }
 
 /// Minor collections sweep only the pages allocated into since the last, beside an old heap many
@@ -194,7 +194,7 @@ fn minor_collections_sweep_only_young_pages() {
     let mut arena = Arena::new(64 << 20, 1);
     arena.mutate(|mc| {
         for _ in 0..300_000 {
-            let list = pair(mc, Value::NIL, mc.root(0)).unwrap();
+            let list = pair(mc, Value::NULL, mc.root(0)).unwrap();
             mc.set_root(0, list);
         }
     });
@@ -203,11 +203,11 @@ fn minor_collections_sweep_only_young_pages() {
     for round in 0..50 {
         arena.mutate(|mc| {
             for _ in 0..20_000 {
-                pair(mc, Value::NIL, Value::NIL).unwrap();
+                pair(mc, Value::NULL, Value::NULL).unwrap();
             }
             // A new object linked from the old list's head.
             let head = mc.root(0).downcast::<Pair>(mc).unwrap();
-            head.set_car(mc, pair(mc, Value::fixnum(round).unwrap(), Value::NIL).unwrap());
+            head.set_car(mc, pair(mc, Value::fixnum(round).unwrap(), Value::NULL).unwrap());
         });
         let young = arena.meta.young_pages.iter(false).count();
         assert!(young * 10 < old, "{young} young pages of {old}");
@@ -234,10 +234,10 @@ fn a_minor_collection_gives_back_what_a_burst_freed() {
     let mut arena = Arena::new(64 << 20, 1);
     arena.mutate(|mc| {
         for _ in 0..1_000_000 {
-            pair(mc, Value::NIL, Value::NIL).unwrap();
+            pair(mc, Value::NULL, Value::NULL).unwrap();
         }
         // Keeps the last page, so the free ones before it are released rather than trimmed.
-        let last = pair(mc, Value::NIL, Value::NIL).unwrap();
+        let last = pair(mc, Value::NULL, Value::NULL).unwrap();
         mc.set_root(0, last);
     });
     assert!(arena.committed_bytes() > 20 << 20, "{}", arena.committed_bytes());
@@ -255,10 +255,10 @@ fn released_pages_are_refunded() {
     let mut arena = Arena::new(64 << 20, 1);
     arena.mutate(|mc| {
         for _ in 0..1_000_000 {
-            pair(mc, Value::NIL, Value::NIL).unwrap();
+            pair(mc, Value::NULL, Value::NULL).unwrap();
         }
         // Keeps the last page, so the free ones before it are released rather than trimmed.
-        let last = pair(mc, Value::NIL, Value::NIL).unwrap();
+        let last = pair(mc, Value::NULL, Value::NULL).unwrap();
         mc.set_root(0, last);
     });
     let peak = arena.used();
@@ -275,7 +275,7 @@ fn released_pages_are_refunded() {
     assert!(arena.used() < peak / 4, "{} of {peak}", arena.used());
     arena.mutate(|mc| {
         for _ in 0..1_000_000 {
-            pair(mc, Value::NIL, Value::NIL).unwrap();
+            pair(mc, Value::NULL, Value::NULL).unwrap();
         }
     });
     assert!(arena.used() >= peak - (1 << 20), "{} of {peak}", arena.used());
@@ -288,7 +288,7 @@ fn arena_with_live_pages(limit: usize) -> Arena {
     let mut arena = Arena::new(limit, 2);
     arena.mutate(|mc| {
         for _ in 0..40_000 {
-            mc.set_root(1, pair(mc, Value::NIL, mc.root(1)).unwrap());
+            mc.set_root(1, pair(mc, Value::NULL, mc.root(1)).unwrap());
         }
     });
     arena.collect();
@@ -343,9 +343,9 @@ fn a_nearly_full_heap_is_collected_in_slices() {
             .step(|mc| {
                 let table = GcVec::<slot::Value>::of(mc.root(0).downcast(mc).unwrap());
                 let entry = Value::object(mc, Bytes::new(mc, mc.frozen_owning(Box::from([0u8; 2000]), 2000).unwrap()).unwrap());
-                let entry = pair(mc, entry, Value::NIL).unwrap();
+                let entry = pair(mc, entry, Value::NULL).unwrap();
                 for _ in 0..4 {
-                    pair(mc, entry, Value::NIL).unwrap();
+                    pair(mc, entry, Value::NULL).unwrap();
                 }
                 if table.len(mc) < live {
                     table.push(mc, entry).unwrap();
@@ -396,7 +396,7 @@ fn host_tables_shrink_after_their_values_die() {
     assert_eq!(arena.hosts(), 501, "the live value at 500 keeps the slots before it");
     assert!(tables(&arena).0 < 2000 && tables(&arena).1 < 2000, "{:?}", tables(&arena));
     arena.mutate(|mc| assert_eq!(mc.host(0u8).unwrap().id, 0, "the lowest free id first"));
-    arena.mutate(|mc| mc.set_root(0, Value::NIL));
+    arena.mutate(|mc| mc.set_root(0, Value::NULL));
     arena.collect();
     assert_eq!(arena.hosts(), 0);
     assert!(tables(&arena).0 <= 64 && tables(&arena).1 <= 64, "{:?}", tables(&arena));
@@ -441,7 +441,7 @@ fn steps_that_end_when_due_keep_collection_incremental() {
     // A live list to keep marking, and garbage made in steps that end once one's due.
     arena.mutate(|mc| {
         for _ in 0..10_000 {
-            let list = pair(mc, Value::NIL, mc.root(0)).unwrap();
+            let list = pair(mc, Value::NULL, mc.root(0)).unwrap();
             mc.set_root(0, list);
         }
     });
@@ -452,7 +452,7 @@ fn steps_that_end_when_due_keep_collection_incremental() {
                 assert!(!mc.step_due() || mc.collection_due());
                 let mut n = 0;
                 while !mc.step_due() {
-                    pair(mc, Value::NIL, Value::NIL).unwrap();
+                    pair(mc, Value::NULL, Value::NULL).unwrap();
                     n += 1;
                 }
                 n

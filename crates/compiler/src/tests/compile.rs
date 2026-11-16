@@ -112,7 +112,7 @@ fn items<'gc>(mc: &Mutation<'gc>, mut v: Value<'gc>) -> Vec<i64> {
         out.push(pair.head(mc).as_fixnum().unwrap());
         v = pair.tail(mc);
     }
-    assert_eq!(v, Value::NIL);
+    assert_eq!(v, Value::NULL);
     out
 }
 
@@ -388,7 +388,7 @@ fn optional_parameters_are_unsupplied_when_left_out() {
         for (args, expect) in [(vec![1], Ok(101)), (vec![1, 2], Ok(3)), (vec![], Err(Fault::Arity)), (vec![1, 2, 3], if rest { Ok(3) } else { Err(Fault::Arity) })] {
             let direct = number(|_| app(f(rest), args.iter().map(|&n| q(n)).collect()));
             let applied = number(|_| {
-                let args = std::iter::once(f(rest)).chain(args.iter().map(|&n| q(n))).chain([Core::Quote(Value::NIL)]).collect();
+                let args = std::iter::once(f(rest)).chain(args.iter().map(|&n| q(n))).chain([Core::Quote(Value::NULL)]).collect();
                 Core::Intrinsic(Prim::Request(Request::Apply), args, None)
             });
             assert_eq!((direct, applied), (expect, expect), "{args:?}, rest {rest}");
@@ -410,7 +410,7 @@ fn keyword_lambda<'gc>(mc: &Mutation<'gc>) -> Core<'gc> {
     static NEXT: AtomicU32 = AtomicU32::new(1 << 20);
     let formal = |var, keyword: Option<&str>, default| Formal { var: Var(var), keyword: keyword.map(|name| self::keyword(mc, name)), default };
     let params = vec![formal(0, None, None), formal(1, None, Some(add(var(0), q(10)))), formal(2, Some("b"), None), formal(3, Some("a"), Some(add(var(1), q(100))))];
-    let body = [3, 2, 1, 0].into_iter().fold(Core::Quote(Value::NIL), |rest, v| prim(Cons, vec![var(v), rest]));
+    let body = [3, 2, 1, 0].into_iter().fold(Core::Quote(Value::NULL), |rest, v| prim(Cons, vec![var(v), rest]));
     Core::OptionalLambda(OptionalLambda { id: NEXT.fetch_add(1, Ordering::Relaxed), params, rest: None, body: Box::new(body), name: None, at: None })
 }
 
@@ -427,7 +427,7 @@ fn optional_lambdas_evaluate_defaults_in_order() {
         static NEXT: AtomicU32 = AtomicU32::new(1 << 21);
         let formal = |var, default| Formal { var: Var(var), keyword: None, default };
         let params = vec![formal(0, None), formal(1, Some(add(var(0), q(1)))), formal(2, Some(add(var(0), var(1))))];
-        let body = [2, 1, 0].into_iter().fold(Core::Quote(Value::NIL), |rest, v| prim(Cons, vec![var(v), rest]));
+        let body = [2, 1, 0].into_iter().fold(Core::Quote(Value::NULL), |rest, v| prim(Cons, vec![var(v), rest]));
         Core::OptionalLambda(OptionalLambda { id: NEXT.fetch_add(1, Ordering::Relaxed), params, rest: None, body: Box::new(body), name: None, at: None })
     }
     for (args, expect) in [(vec![1], Ok(vec![1, 2, 3])), (vec![1, 5], Ok(vec![1, 5, 6])), (vec![1, 5, 9], Ok(vec![1, 5, 9])), (vec![], Err(Fault::Arity)), (vec![1, 2, 3, 4], Err(Fault::Arity))] {
@@ -498,7 +498,7 @@ fn keyword_call_arguments_are_evaluated_as_written() {
             let f = OptionalLambda { id: 1 << 23, params: vec![formal(0, Some("a")), formal(1, Some("b")), formal(2, None)], rest: None, body: Box::new(q(0)), name: None, at: None };
             let arg = |name: Option<&str>, n| Arg { keyword: name.map(|name| keyword(mc, name)), value: noted(n) };
             let call = Core::KeywordApp(Box::new(var(10)), vec![arg(Some("b"), 1), arg(None, 2), arg(Some("a"), 3)], None);
-            letrec(vec![(10, Core::OptionalLambda(f))], let_(vec![(20, prim(MakeBox, vec![Core::Quote(Value::NIL)]))], seq(21, call, prim(Unbox, vec![var(20)]))))
+            letrec(vec![(10, Core::OptionalLambda(f))], let_(vec![(20, prim(MakeBox, vec![Core::Quote(Value::NULL)]))], seq(21, call, prim(Unbox, vec![var(20)]))))
         },
         |mc, result| assert_eq!(result.map(|v| items(mc, v)), Ok(vec![3, 2, 1])),
     );
@@ -923,7 +923,7 @@ fn values_are_made_where_they_go() {
     // (let loop ((xs '(1 2 3)) (acc '())) (if (null? xs) acc (loop (cdr xs) (cons (car xs) acc)))):
     // reuse each parameter's register for its next value only after all reads of the old value.
     fn reverse<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
-        let nil = || Core::Quote(Value::NIL);
+        let nil = || Core::Quote(Value::NULL);
         let list = prim(Cons, vec![q(1), prim(Cons, vec![q(2), prim(Cons, vec![q(3), nil()])])]);
         let step = app(var(0), vec![prim(Intrinsic::Cdr, vec![var(1)]), prim(Cons, vec![prim(Car, vec![var(1)]), var(2)])]);
         let body = when(prim(Intrinsic::IsNull, vec![var(1)]), var(2), step);
@@ -1076,7 +1076,7 @@ fn micropass_optimizations() {
 
         // 5. Store-to-load forwarding on `cadr`/`cons` and `unbox`/`box` eliminates allocations.
         //    (lambda (x y) (+ (cadr (cons x (cons y '()))) (unbox (box 1)))) -> (lambda (x y) (+ y 1))
-        let cadr_cons = prim(Intrinsic::Cadr, vec![prim(Cons, vec![var(0), prim(Cons, vec![var(1), Core::Quote(Value::NIL)])])]);
+        let cadr_cons = prim(Intrinsic::Cadr, vec![prim(Cons, vec![var(0), prim(Cons, vec![var(1), Core::Quote(Value::NULL)])])]);
         let unbox_box = prim(Unbox, vec![prim(MakeBox, vec![q(1)])]);
         let forwarded = lambda(&[0, 1], None, add(cadr_cons, unbox_box));
         let thunk = compile(mc, None, &forwarded).unwrap();
@@ -1116,7 +1116,7 @@ fn micropass_optimizations() {
         let ops = all_ops(mc, compile(mc, None, &in_let).unwrap());
         assert_eq!(conses(&ops), 0, "expected the pair in the let to go: {ops:?}");
         // `list?` must reuse the existing pair rather than allocate it again.
-        let listy = lambda(&[0], None, let_(vec![(1, prim(Cons, vec![var(0), Core::Quote(Value::NIL)]))], prim(Intrinsic::IsList, vec![var(1)])));
+        let listy = lambda(&[0], None, let_(vec![(1, prim(Cons, vec![var(0), Core::Quote(Value::NULL)]))], prim(Intrinsic::IsList, vec![var(1)])));
         let ops = all_ops(mc, compile(mc, None, &listy).unwrap());
         assert_eq!(conses(&ops), 1, "{ops:?}");
 
@@ -1308,7 +1308,7 @@ fn micropass_optimizations() {
         number(|_| {
             let calls = (0..12_000).map(|_| app(var(1), vec![])).collect();
             let far = lambda(&[0, 1], None, when(prim(Intrinsic::IsNull, vec![var(0)]), prim(Add, calls), q(0)));
-            app(far, vec![Core::Quote(Value::NIL), lambda(&[], None, q(1))])
+            app(far, vec![Core::Quote(Value::NULL), lambda(&[], None, q(1))])
         }),
         Ok(12_000)
     );

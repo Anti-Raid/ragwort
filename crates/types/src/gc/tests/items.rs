@@ -14,7 +14,7 @@ const BIG: usize = 100_000;
 /// Fills the space dead objects left, so a reference to one reads something else.
 fn churn(mc: &Mutation<'_>) {
     for _ in 0..300_000 {
-        Pair::new(mc, Value::NIL, Value::NIL).unwrap();
+        Pair::new(mc, Value::NULL, Value::NULL).unwrap();
     }
 }
 
@@ -55,7 +55,7 @@ fn member_items_keep_their_targets_and_follow_moves() {
 
 fn churn_a_little(mc: &Mutation<'_>) {
     for _ in 0..10 {
-        Pair::new(mc, Value::NIL, Value::NIL).unwrap();
+        Pair::new(mc, Value::NULL, Value::NULL).unwrap();
     }
 }
 
@@ -112,7 +112,7 @@ fn weak_items_clear_once_their_targets_die() {
     assert_eq!(arena.mutate(|mc| numbers(mc, weaks(mc, 0).items(mc))), expected);
     // Dropping the strong array kills the rest.
     arena.set_evacuate_all(false);
-    arena.mutate(|mc| mc.set_root(1, Value::NIL));
+    arena.mutate(|mc| mc.set_root(1, Value::NULL));
     arena.collect();
     assert!(arena.mutate(|mc| numbers(mc, weaks(mc, 0).items(mc))).iter().all(Option::is_none));
 }
@@ -162,7 +162,7 @@ fn member_item_stores_while_marking_keep_their_targets() {
     let mut arena = Arena::new(16 << 20, 2);
     arena.mutate(|mc| {
         let array = Nodes::new(mc, N, None).unwrap();
-        let mut list = Value::NIL;
+        let mut list = Value::NULL;
         for i in 0..N {
             list = Value::object(mc, Pair::new(mc, Value::object(mc, Node::new(mc, i as i64).unwrap()), list).unwrap());
         }
@@ -187,7 +187,7 @@ fn member_item_stores_while_marking_keep_their_targets() {
                         // Swap the pair's node and the array's.
                         let held = array.get(i);
                         array.set(mc, i, pair.car(mc).downcast::<Node>(mc));
-                        pair.set_car(mc, held.map_or(Value::NIL, |n| Value::object(mc, n)));
+                        pair.set_car(mc, held.map_or(Value::NULL, |n| Value::object(mc, n)));
                     }
                     i += 2;
                     cur = pair.cdr(mc);
@@ -289,7 +289,7 @@ fn member_item_reads_check_the_target_type() {
     let mut arena = Arena::new(1 << 20, 1);
     arena.mutate(|mc| {
         let array = Nodes::new(mc, 4, None).unwrap();
-        let pair = Pair::new(mc, Value::NIL, Value::NIL).unwrap();
+        let pair = Pair::new(mc, Value::NULL, Value::NULL).unwrap();
         array.item_slots::<slot::u64>(mc).set(mc, 2, pair.to_word());
         array.items(mc).get(2);
     });
@@ -301,7 +301,7 @@ fn weak_item_reads_check_the_target_type() {
     let mut arena = Arena::new(1 << 20, 1);
     arena.mutate(|mc| {
         let array = Weaks::new(mc, 4, None).unwrap();
-        let pair = Pair::new(mc, Value::NIL, Value::NIL).unwrap();
+        let pair = Pair::new(mc, Value::NULL, Value::NULL).unwrap();
         array.item_slots::<slot::u64>(mc).set(mc, 0, pair.to_word());
         array.items(mc).get(0);
     });

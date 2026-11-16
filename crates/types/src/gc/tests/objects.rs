@@ -73,8 +73,8 @@ fn fields_read_back_what_was_written() {
         l.set_label(mc, None);
         assert!(l.label(mc).is_none());
 
-        let c = Cached::new(mc, fixnum(1), (Value::NIL, fixnum(2)), 3).unwrap();
-        assert_eq!(c.cache(mc), Some((Value::NIL, fixnum(2))));
+        let c = Cached::new(mc, fixnum(1), (Value::NULL, fixnum(2)), 3).unwrap();
+        assert_eq!(c.cache(mc), Some((Value::NULL, fixnum(2))));
         assert_eq!((c.n(mc), c.after(mc)), (fixnum(1), 3));
     });
 }
@@ -86,10 +86,10 @@ fn objects_survive_collections_and_evacuation() {
         let mut list = None;
         for i in 0..10_000 {
             list = Some(Node::new(mc, i, list).unwrap());
-            Pair::new(mc, fixnum(i), Value::NIL).unwrap();
+            Pair::new(mc, fixnum(i), Value::NULL).unwrap();
         }
         mc.set_root(0, Value::object(mc, list.unwrap()));
-        let v = Vector::new(mc, 100, Value::NIL).unwrap();
+        let v = Vector::new(mc, 100, Value::NULL).unwrap();
         mc.set_root(1, Value::object(mc, v));
     });
     arena.collect_minor();
@@ -98,7 +98,7 @@ fn objects_survive_collections_and_evacuation() {
     arena.mutate(|mc| {
         let v = mc.root(1).downcast::<Vector>(mc).unwrap();
         for i in 0..100 {
-            v.items(mc).set(mc, i, Value::object(mc, Pair::new(mc, fixnum(i as i64), Value::NIL).unwrap()));
+            v.items(mc).set(mc, i, Value::object(mc, Pair::new(mc, fixnum(i as i64), Value::NULL).unwrap()));
         }
     });
     arena.collect();
@@ -175,11 +175,11 @@ fn word_and_ephemeron_items() {
         let table = Table::new(mc, 3).unwrap();
         assert_eq!(table.len(mc), 6);
         assert_eq!(table.entry(mc, 2), None);
-        let key = Value::object(mc, Pair::new(mc, Value::NIL, Value::NIL).unwrap());
+        let key = Value::object(mc, Pair::new(mc, Value::NULL, Value::NULL).unwrap());
         table.set_entry(mc, 0, key, fixnum(10));
-        table.set_entry(mc, 1, Value::object(mc, Pair::new(mc, Value::NIL, Value::NIL).unwrap()), fixnum(20));
+        table.set_entry(mc, 1, Value::object(mc, Pair::new(mc, Value::NULL, Value::NULL).unwrap()), fixnum(20));
         mc.set_root(1, Value::object(mc, table));
-        let keeper = Pair::new(mc, key, Value::NIL).unwrap();
+        let keeper = Pair::new(mc, key, Value::NULL).unwrap();
         mc.root(0).downcast::<Bytes>(mc).unwrap().set_tag(mc, 6);
         let v = Vector::new(mc, 1, Value::object(mc, keeper)).unwrap();
         let held = Pair::new(mc, Value::object(mc, v), mc.root(0)).unwrap();
@@ -199,10 +199,10 @@ fn word_and_ephemeron_items() {
 fn kinds_tell_the_group_types_apart() {
     let mut arena = Arena::new(1 << 20, 1);
     arena.mutate(|mc| {
-        let p = Pair::new(mc, Value::NIL, Value::NIL).unwrap();
+        let p = Pair::new(mc, Value::NULL, Value::NULL).unwrap();
         let n = Node::new(mc, 1, None).unwrap();
         let t = Table::new(mc, 1).unwrap();
-        let b = Box1::new(mc, Value::NIL).unwrap();
+        let b = Box1::new(mc, Value::NULL).unwrap();
         let s = Segment::new(mc, 4).unwrap();
         assert_eq!(Kind::of(Value::object(mc, p)), Some(Kind::Pair(p)));
         assert_eq!(Kind::of(Value::object(mc, n)), Some(Kind::Node(n)));
@@ -212,7 +212,7 @@ fn kinds_tell_the_group_types_apart() {
         assert_eq!(Later::of(Value::object(mc, p)), None);
         assert_eq!(Kind::of(Value::object(mc, s)), None);
         assert_eq!(Kind::of(Value::flonum(mc, 1e300).unwrap()), None);
-        for v in [Value::NIL, Value::TRUE, fixnum(3), Value::inline_flonum(1.5).unwrap()] {
+        for v in [Value::NULL, Value::TRUE, fixnum(3), Value::inline_flonum(1.5).unwrap()] {
             assert_eq!(Kind::of(v), None);
         }
         let v = Kind::Node(n).value(mc);
@@ -230,8 +230,8 @@ fn unnumbered_types_stay_clear_of_groups() {
     }
     let mut arena = Arena::new(1 << 20, 2);
     arena.mutate(|mc| {
-        let loose = mc.alloc::<Loose, 1>([Value::NIL.to_bits()]).unwrap();
-        let p = Pair::new(mc, Value::object(mc, loose), Value::NIL).unwrap();
+        let loose = mc.alloc::<Loose, 1>([Value::NULL.to_bits()]).unwrap();
+        let p = Pair::new(mc, Value::object(mc, loose), Value::NULL).unwrap();
         mc.set_root(0, Value::object(mc, p));
         assert_eq!(Kind::of(Value::object(mc, loose)), None);
         assert!(Value::object(mc, loose).downcast::<Loose>(mc).is_some());
@@ -257,8 +257,8 @@ mod overlapping {
 fn groups_that_overlap_panic() {
     let mut arena = Arena::new(1 << 20, 1);
     arena.mutate(|mc| {
-        Pair::new(mc, Value::NIL, Value::NIL).unwrap();
-        overlapping::Clashing::new(mc, Value::NIL).unwrap();
+        Pair::new(mc, Value::NULL, Value::NULL).unwrap();
+        overlapping::Clashing::new(mc, Value::NULL).unwrap();
     });
 }
 
@@ -267,7 +267,7 @@ fn groups_that_overlap_panic() {
 fn member_reads_check_the_target_type() {
     let mut arena = Arena::new(1 << 20, 1);
     arena.mutate(|mc| {
-        let pair = Pair::new(mc, Value::NIL, Value::NIL).unwrap();
+        let pair = Pair::new(mc, Value::NULL, Value::NULL).unwrap();
         let node = Node::new(mc, 1, None).unwrap();
         // Raw words can point a member at the wrong type; the typed read catches it.
         node.set_word(mc, 1, pair.to_word());

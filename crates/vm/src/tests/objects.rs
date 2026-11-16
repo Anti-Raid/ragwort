@@ -23,8 +23,8 @@ fn objects_live_beside_the_types_crates() {
         assert_eq!(code.ops(mc).unwrap()[1], Op::Return { src: 0 });
         assert!(Symbol::of(code.constants(mc)).is_some());
         let cell = mc.root(2).downcast::<super::Box>(mc).unwrap();
-        cell.set_value(mc, Value::NIL);
-        assert_eq!(cell.value(mc), Value::NIL);
+        cell.set_value(mc, Value::NULL);
+        assert_eq!(cell.value(mc), Value::NULL);
         assert!(matches!(Vm::of(mc.root(2)), Some(Vm::Box(_))));
     });
 }

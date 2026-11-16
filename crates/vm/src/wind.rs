@@ -96,7 +96,7 @@ impl<'gc> Outer<'_, 'gc> {
         Ok(match kind {
             Kind::Handled => {
                 let message = string::from_str(&Strings::new(mc), "exception handler returned")?.value();
-                Then::Raise(condition(mc, Fault::Error, message, Pairs::new(mc).cons(first, Value::NIL)?.value(mc))?, false)
+                Then::Raise(condition(mc, Fault::Error, message, Pairs::new(mc).cons(first, Value::NULL)?.value(mc))?, false)
             }
             Kind::Guarded if second == Value::FALSE => Then::Forward,
             Kind::Guarded => Then::ReturnValues(Pairs::new(mc).cons(Value::TRUE, self.regs.list(mc)?)?.value(mc)),
@@ -146,11 +146,11 @@ impl<'gc> Outer<'_, 'gc> {
     /// Executes each `(thunk . winders)` entry in `todo`, then proceeds with action `kind` parameterized by
     /// `first` and `second`.
     fn unwind(&mut self, todo: Value<'gc>, kind: Kind, first: Value<'gc>, second: Value<'gc>) -> Result<Then<'gc>, Fault> {
-        if todo == Value::NIL {
+        if todo == Value::NULL {
             return self.step(kind, first, second);
         }
         let mc = self.mc();
-        let then = Native::new(mc, kind as u32, first, second, Value::NIL, Value::FALSE)?;
+        let then = Native::new(mc, kind as u32, first, second, Value::NULL, Value::FALSE)?;
         self.step(Kind::Winds, todo, Value::object(mc, then))
     }
 
@@ -159,7 +159,7 @@ impl<'gc> Outer<'_, 'gc> {
     /// guard exists.
     pub(crate) fn raising(&mut self, obj: Value<'gc>, continuable: bool, first: Option<(Gc<'gc, Bytecode>, usize)>) -> Result<Then<'gc>, Fault> {
         let (mc, task) = (self.mc(), self.task());
-        let handlers = prompts::mark(mc, task, handler_key(), Value::NIL)?;
+        let handlers = prompts::mark(mc, task, handler_key(), Value::NULL)?;
         let handler = Pair::of(handlers).map(|cell| cell.head(mc));
         // The call trace is recorded before any unwinding, unless the guard that catches the condition opted out of it.
         let quiet = handler.and_then(|handler| handler.downcast::<Guard>(mc)).is_some_and(|guard| !guard.traced(mc));
@@ -202,7 +202,7 @@ impl<'gc> Outer<'_, 'gc> {
     /// continuation mark.
     pub(crate) fn with_handler(&mut self, handler: Value<'gc>, thunk: Value<'gc>) -> Result<Then<'gc>, Fault> {
         let (mc, task) = (self.mc(), self.task());
-        let handlers = prompts::mark(mc, task, handler_key(), Value::NIL)?;
+        let handlers = prompts::mark(mc, task, handler_key(), Value::NULL)?;
         self.segments.set_mark(handler_key(), Pairs::new(mc).cons(handler, handlers)?.value(mc))?;
         Ok(Then::Call(thunk, Passed::none()))
     }
@@ -213,7 +213,7 @@ impl<'gc> Outer<'_, 'gc> {
         let (mc, task) = (self.mc(), self.task());
         let guard = Value::object(mc, Guard::new(mc, handler, task.winders(mc), traced)?);
         self.push(Kind::Guarded, guard, if tried { Value::TRUE } else { Value::FALSE })?;
-        let (pairs, handlers) = (Pairs::new(mc), prompts::mark(mc, task, handler_key(), Value::NIL)?);
+        let (pairs, handlers) = (Pairs::new(mc), prompts::mark(mc, task, handler_key(), Value::NULL)?);
         let mark = pairs.cons(handler_key(), pairs.cons(guard, handlers)?.value(mc))?.value(mc);
         task.set_attachments(mc, pairs.cons(mark, task.attachments(mc))?.value(mc));
         Ok(())
@@ -246,7 +246,7 @@ impl<'gc> Outer<'_, 'gc> {
         let mc = self.mc();
         let winds = prompts::tag_of(mc, tag).and_then(|tag| prompts::winds(mc, self.task(), Some(tag)));
         match winds.and_then(|winds| winds_todo(mc, &winds, &[])) {
-            Ok(Value::NIL) => self.abort_now(tag, args),
+            Ok(Value::NULL) => self.abort_now(tag, args),
             Ok(todo) => {
                 self.keep(base, tail)?;
                 self.unwind(todo, Kind::Abort, tag, args.to_list(mc)?)
@@ -279,7 +279,7 @@ impl<'gc> Outer<'_, 'gc> {
         } else {
             (winds_todo(mc, &[], &to)?, Kind::Compose)
         };
-        if todo == Value::NIL {
+        if todo == Value::NULL {
             return self.go_now(Value::object(mc, continuation), kind == Kind::Escape, args);
         }
         self.unwind(todo, kind, Value::object(mc, continuation), args.to_list(mc)?)
@@ -301,7 +301,7 @@ impl<'gc> Outer<'_, 'gc> {
 /// (innermost first), followed by the `before` thunks of `entering` winders (outermost first).
 fn winds_todo<'gc>(mc: &ragwort_types::gc::Mutation<'gc>, leaving: &[Wind<'gc>], entering: &[Wind<'gc>]) -> Result<Value<'gc>, Fault> {
     let pairs = Pairs::new(mc);
-    let mut todo = Value::NIL;
+    let mut todo = Value::NULL;
     for &(winder, outside) in entering {
         todo = pairs.cons(pairs.cons(winder.before(mc), outside)?.value(mc), todo)?.value(mc);
     }

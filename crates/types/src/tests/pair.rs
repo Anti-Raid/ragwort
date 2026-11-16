@@ -19,13 +19,13 @@ fn fixnums<'gc>(p: &Pairs<'_, 'gc>, v: Value<'gc>) -> Vec<i64> {
 fn pairs_know_the_length_of_their_list() {
     arena().mutate(|mc| {
         let p = Pairs::new(mc);
-        let one = p.cons(fix(1), Value::NIL).unwrap();
-        assert_eq!((one.head(mc), one.tail(mc), one.list_len(mc)), (fix(1), Value::NIL, Some(1)));
+        let one = p.cons(fix(1), Value::NULL).unwrap();
+        assert_eq!((one.head(mc), one.tail(mc), one.list_len(mc)), (fix(1), Value::NULL, Some(1)));
         let two = p.cons(fix(0), one.value(mc)).unwrap();
         assert_eq!(two.list_len(mc), Some(2));
-        assert_eq!(p.list_len(Value::NIL), Some(0));
+        assert_eq!(p.list_len(Value::NULL), Some(0));
         assert_eq!(p.list_len(fix(3)), None);
-        assert!(p.is_list(two.value(mc)) && p.is_list(Value::NIL) && !p.is_list(Value::TRUE));
+        assert!(p.is_list(two.value(mc)) && p.is_list(Value::NULL) && !p.is_list(Value::TRUE));
     });
 }
 
@@ -44,7 +44,7 @@ fn improper_chains_have_no_length() {
         elements.by_ref().for_each(drop);
         assert_eq!(elements.rest(), fix(2));
         // A list as the head doesn't make the pair a list.
-        let nested = p.cons(p.cons(fix(1), Value::NIL).unwrap().value(mc), fix(9)).unwrap();
+        let nested = p.cons(p.cons(fix(1), Value::NULL).unwrap().value(mc), fix(9)).unwrap();
         assert_eq!(nested.list_len(mc), None);
     });
 }
@@ -57,10 +57,10 @@ fn lists_round_trip() {
         let list = p.list(&items).unwrap();
         assert_eq!(p.list_len(list), Some(10));
         assert_eq!(fixnums(&p, list), (0..10).collect::<Vec<_>>());
-        assert_eq!(p.list(&[]).unwrap(), Value::NIL);
+        assert_eq!(p.list(&[]).unwrap(), Value::NULL);
         let mut elements = p.elements(list);
         elements.by_ref().for_each(drop);
-        assert_eq!(elements.rest(), Value::NIL);
+        assert_eq!(elements.rest(), Value::NULL);
     });
 }
 
@@ -78,7 +78,7 @@ fn iterator_lists_preserve_tails_and_cached_lengths() {
             assert_eq!(pair.list_len(mc), Some(len));
             rest = pair.tail(mc);
         }
-        assert_eq!(rest, Value::NIL);
+        assert_eq!(rest, Value::NULL);
         assert_eq!(p.list_with_tail(std::iter::empty(), tail).unwrap(), tail);
         let dotted = p.list_with_tail((1..3).map(fix), fix(9)).unwrap();
         let dotted = p.list_with_tail(std::iter::once(fix(0)), dotted).unwrap();
@@ -106,7 +106,7 @@ fn other_objects_are_not_pairs() {
         let h = Nums::new(mc);
         let big = int::add(&h, int::from_i64(&h, Value::MAX_FIXNUM).unwrap(), int::from_i64(&h, 1).unwrap()).unwrap();
         assert!(p.pair(big.value()).is_none());
-        let holder = p.cons(big.value(), Value::NIL).unwrap();
+        let holder = p.cons(big.value(), Value::NULL).unwrap();
         assert!(p.pair(holder.value(mc)).is_some());
         assert_eq!(p.list_len(big.value()), None);
         assert_eq!(p.elements(fix(1)).count(), 0);
@@ -120,7 +120,7 @@ fn long_lists_keep_their_length_through_collections() {
     arena.set_evacuate_all(true);
     arena.mutate(|mc| {
         let p = Pairs::new(mc);
-        let mut list = Value::NIL;
+        let mut list = Value::NULL;
         for i in (0..n).rev() {
             list = p.cons(fix(i), list).unwrap().value(mc);
         }

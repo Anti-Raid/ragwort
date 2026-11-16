@@ -24,10 +24,10 @@ pub(super) fn reverse<'gc>(mc: &Mutation<'gc>, xs: Value<'gc>, fuel: &mut Fuel) 
     let pairs = Pairs::new(mc);
     let len = pairs.list_len(xs).ok_or(Fault::WrongType)?;
     if len == 0 {
-        return Ok(Value::NIL);
+        return Ok(Value::NULL);
     }
     fuel.spend(len / equal::PER_FUEL)?;
-    let mut acc = Value::NIL;
+    let mut acc = Value::NULL;
     for item in pairs.elements(xs) {
         acc = pairs.cons(item, acc)?.value(mc);
     }
@@ -39,7 +39,7 @@ pub(super) fn reverse<'gc>(mc: &Mutation<'gc>, xs: Value<'gc>, fuel: &mut Fuel) 
 pub(super) fn find<'gc>(mc: &Mutation<'gc>, kind: Intrinsic, target: Value<'gc>, mut xs: Value<'gc>, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
     let assoc = matches!(kind, Intrinsic::Assq | Intrinsic::Assv | Intrinsic::Assoc);
     let mut steps = 0u64;
-    while xs != Value::NIL {
+    while xs != Value::NULL {
         let pair = Pair::of(xs).ok_or(Fault::WrongType)?;
         let item = pair.head(mc);
         let candidate = if assoc { Pair::of(item).ok_or(Fault::WrongType)?.head(mc) } else { item };
@@ -87,8 +87,8 @@ pub(super) fn append<'gc>(mc: &Mutation<'gc>, args: impl ExactSizeIterator<Item 
         }
         lists.push(arg)?;
     }
-    let Some(mut last) = len.checked_sub(1) else { return Ok(Value::NIL) };
-    while last > 0 && lists[last] == Value::NIL {
+    let Some(mut last) = len.checked_sub(1) else { return Ok(Value::NULL) };
+    while last > 0 && lists[last] == Value::NULL {
         last -= 1;
     }
     let tail = lists[last];
@@ -117,11 +117,11 @@ pub(super) fn list_tail<'gc>(mc: &Mutation<'gc>, mut xs: Value<'gc>, count: usiz
     }
     fuel.spend(count as u64 / equal::PER_FUEL)?;
     for _ in 0..count {
-        let pair = Pair::of(xs).ok_or(if xs == Value::NIL { Fault::OutOfRange } else { Fault::WrongType })?;
+        let pair = Pair::of(xs).ok_or(if xs == Value::NULL { Fault::OutOfRange } else { Fault::WrongType })?;
         xs = pair.tail(mc);
     }
     if need_pair && Pair::of(xs).is_none() {
-        return Err(if xs == Value::NIL { Fault::OutOfRange } else { Fault::WrongType });
+        return Err(if xs == Value::NULL { Fault::OutOfRange } else { Fault::WrongType });
     }
     Ok(xs)
 }

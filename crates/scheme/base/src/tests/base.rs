@@ -20,8 +20,8 @@ fn arena_of(bytes: usize) -> Arena {
     arena.mutate(|mc| {
         let symbols = Symbols::with_seed(mc, 1).unwrap();
         mc.set_root(0, symbols.value(mc));
-        mc.set_root(1, Value::NIL);
-        mc.set_root(3, Value::NIL);
+        mc.set_root(1, Value::NULL);
+        mc.set_root(3, Value::NULL);
         let session = SyntaxSession::named(mc, "prelude", PRELUDE).unwrap();
         let loaded = ragwort_native::load(mc, symbols, PRELUDE_NAME, &[], &[&session], &mut NoModules).unwrap();
         for thunk in loaded.thunks {
@@ -2372,6 +2372,52 @@ fn a_large_table_keeps_its_entries_through_collections() {
     arena.collect();
     arena.set_evacuate_all(false);
     assert_eq!(run_to_outcome(&mut arena, &mut machine, true), "done (0 14667 (0) 0)");
+}
+
+#[test]
+fn three_values_are_false() {
+    // `#f`, `#nil` and `#none` are false in every conditional. Everything else is true, the empty list and void included.
+    assert_eq!(eval("(map (lambda (x) (if x 'true 'false)) (list #f #nil #none #t 0 \"\" '() (vector) (if #f #f)))"), "(false false false true true true true true true)");
+    assert_eq!(eval("(list (if #nil 1 2) (if #none 1 2) (not #nil) (not #none) (not #f) (not '()) (not 0))"), "(2 2 #t #t #t #f #f)");
+    assert_eq!(eval("(list (cond (#nil 1) (#none 2) (else 3)) (when #none 'ran) (unless #nil 'ran) (do ((i 0 (+ i 1)) (seen '() (cons i seen))) ((if (eqv? i 2) 'stop #none) seen) i))"), "(3 #<void> ran (1 0))");
+    // Each is a value of its own, written as it is read, and none of them is a boolean or the empty list.
+    assert_eq!(eval("(list #nil #none '#nil (list 'a #none) (vector #nil))"), "(#nil #none #nil (a #none) #(#nil))");
+    assert_eq!(eval("(list (eq? #nil #none) (eq? #nil #f) (eq? #none #f) (eqv? #nil #nil) (equal? #none #none) (eq? #nil '()) (equal? (list #nil) (list #none)))"), "(#f #f #f #t #t #f #f)");
+    assert_eq!(eval("(map (lambda (x) (list (nil? x) (none? x) (boolean? x) (null? x) (symbol? x))) (list #nil #none #f '()))"), "((#t #f #f #f #f) (#f #t #f #f #f) (#f #f #t #f #f) (#f #f #f #t #f))");
+    // `and` gives the first false value and `or` the last one, as they are. A procedure keeps the false value it is given.
+    assert_eq!(eval("(list (and 1 #none 2) (and #nil 1) (and 1 2 #f) (and 1 2) (and) (or #nil 5) (or #none #nil) (or #f #none) (or))"), "(#none #nil #f 2 #t 5 #nil #none #f)");
+    assert_eq!(eval("(define (first-or x y) (or x y)) (define (both x y) (and x y)) (list (first-or #nil #none) (first-or #none 1) (both #none 1) (both 1 #nil) (both 1 2))"), "(#none 1 #none #nil 2)");
+    // Procedures that take a flag or an optional value take any false value for "no".
+    assert_eq!(eval("(list (string-split \"a b  c\" #nil) (string-split \" a,b \" \",\" #:trim? #none) (string-replace \"aaa\" \"a\" \"b\" #:all? #nil))"), "((\"a\" \"b\" \"c\") (\" a\" \"b \") \"baa\")");
+}
+
+/// The compiler folds and reorders conditionals. With three false values it must not treat a false value as `#f`, and must still know what a test tells it.
+#[test]
+fn the_compiler_keeps_false_values_apart() {
+    // In the branch where a variable is false it still holds the false value it had.
+    assert_eq!(eval("(define (keep x) (if x 'true x)) (define (deep x) (if x 1 (if x 2 (list x)))) (list (map keep (list #f #nil #none 3)) (map deep (list #f #nil #none 3)))"), "((#f #nil #none true) ((#f) (#nil) (#none) 1))");
+    // A comparison with `#f` holds for `#f` only, where `not` holds for all three.
+    assert_eq!(eval("(define (is-false x) (eq? x #f)) (define (isnt x) (not x)) (define (pick x) (if (eq? x #f) 'f (if (eqv? #f x) 'f2 'other))) (list (map is-false (list #f #nil #none 0)) (map isnt (list #f #nil #none 0)) (map pick (list #f #nil #none)))"), "((#t #f #f #f) (#t #t #t #f) (f other other))");
+    assert_eq!(eval("(define (which x) (cond ((eq? x #nil) 'nil) ((eqv? #none x) 'none) ((not x) 'false) (else 'true))) (map which (list #nil #none #f '()))"), "(nil none false true)");
+    // A value known to be `#nil` or `#none` is known to be false, not true.
+    assert_eq!(eval("(define (after-nil x) (if (nil? x) (if x 'true 'false) 'other)) (define (after-none x) (if (none? x) (if (not x) 'false 'true) 'other)) (list (map after-nil (list #nil #none 1)) (map after-none (list #nil #none 1)))"), "((false other other) (other false other))");
+    // Constants fold to the right branch, alone and inside `and` and `or`.
+    assert_eq!(eval("(define (f x) (list (if #nil x 'no) (if #none x 'no) (if (and x #nil) 1 2) (if (or #none x) 1 2) (if (not #nil) 1 2) (and #none x) (or #nil x)))  (list (f 5) (f #f))"), "((no no 2 1 1 #none 5) (no no 2 2 1 #none #f))");
+    // `and` and `or` as tests take the same branches as they do as values.
+    let tests = "(define (t a b) (list (if (and a b) 'yes 'no) (if (or a b) 'yes 'no) (if (and (car a) b) 'yes 'no) (if (not (and (car a) b)) 'yes 'no)))
+                 (list (t (list 1) 2) (t (list #nil) 2) (t (list 1) #none) (t (list #f) #nil))";
+    assert_eq!(eval(tests), "((yes yes yes no) (yes yes no yes) (no yes no yes) (no yes no yes))");
+}
+
+#[test]
+fn tables_hold_false_values_like_any_other() {
+    // A missing key reads as `#f`, or as the default it is given. A stored `#nil`, `#none` or `#f` is an entry.
+    assert_eq!(eval("(define t (table 'a #nil 'b #none 'c #f)) (list t (table-length t) (table-ref t 'a 0) (table-ref t 'b 0) (table-ref t 'c 0) (table-ref t 'd) (table-ref t 'd #nil) (map (lambda (k) (table-has? t k)) '(a b c d)))"), "(#table((a . #nil) (b . #none) (c . #f)) 3 #nil #none #f #f #nil (#t #t #t #f))");
+    assert_eq!(eval("(define t (table 'a 1)) (table-set! t 'a #nil) (table-set! t 'b #none) (list (table-has? t 'a) (table-ref t 'a 0) (table-keys t) (or (table-ref t 'limit) 50) (or (table-ref t 'b) 'none-is-false))"), "(#t #nil (a b) 50 none-is-false)");
+    // They are keys by what they are, each its own.
+    assert_eq!(eval("(define t (table #nil 1 #none 2 #f 3 '() 4)) (list (table-ref t #nil) (table-ref t #none) (table-ref t #f) (table-ref t '()) (table-length t))"), "(1 2 3 4 4)");
+    assert_eq!(eval("(list (equal? (table 'a #none) (table 'a #none)) (equal? (table 'a #none) (table 'a #nil)) (equal? (table 'a #nil) (table)))"), "(#t #f #f)");
+    assert_eq!(eval("(define t (table 'n 1)) (table-update! t 'n (lambda (n) (and n (+ n 1)))) (table-update! t 'm (lambda (m) (or m 'new))) (table-update! t 'k (lambda (k) k) #none) (table->list t)"), "((n . 2) (m . new) (k . #none))");
 }
 
 #[test]

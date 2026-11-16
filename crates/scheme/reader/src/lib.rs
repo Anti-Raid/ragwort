@@ -198,6 +198,8 @@ impl<'a, 'gc> Reader<'a, 'gc> {
                     continue;
                 }
                 Token::Boolean(boolean) => self.node(if boolean { Value::TRUE } else { Value::FALSE }, self.literal, start)?,
+                Token::Nil => self.node(Value::NIL, self.literal, start)?,
+                Token::NoneValue => self.node(Value::NONE, self.literal, start)?,
                 Token::Char(character) => self.node(Value::char(character), self.literal, start)?,
                 Token::String(text) => {
                     let string = string::from_str(&self.strings, &text).map_err(|error| ReadError::new(error, start, self.at))?;
@@ -259,7 +261,7 @@ impl<'a, 'gc> Reader<'a, 'gc> {
         match self.open.pop() {
             Some(Open::List { start: open, close, first, tail, shape }) if close == bracket => {
                 let tail = match tail {
-                    Tail::None => Value::NIL,
+                    Tail::None => Value::NULL,
                     Tail::Datum(tail) => tail,
                     Tail::Dot(dot) => return Err(ReadError::new(ErrorKind::BadDot, dot, dot + 1)),
                 };

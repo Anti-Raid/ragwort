@@ -36,13 +36,13 @@ fn chars<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> &'gc [u8] {
 
 fn churn(mc: &Mutation<'_>) {
     for _ in 0..200_000 {
-        Pair::new(mc, Value::NIL, Value::NIL).unwrap();
+        Pair::new(mc, Value::NULL, Value::NULL).unwrap();
     }
 }
 
 fn list<'gc>(mc: &Mutation<'gc>, items: impl IntoIterator<Item = Value<'gc>>) -> Value<'gc> {
     let items: Vec<_> = items.into_iter().collect();
-    items.into_iter().rev().fold(Value::NIL, |tail, v| Value::object(mc, Pair::new(mc, v, tail).unwrap()))
+    items.into_iter().rev().fold(Value::NULL, |tail, v| Value::object(mc, Pair::new(mc, v, tail).unwrap()))
 }
 
 fn each<'gc>(mc: &Mutation<'gc>, mut list: Value<'gc>) -> Vec<Value<'gc>> {
@@ -109,7 +109,7 @@ fn dead_frozen_values_are_freed_and_refunded() {
     assert_eq!(arena.frozen_values(), 100, "old values outlive minor collections");
     arena.collect();
     assert_eq!(arena.frozen_values(), 50);
-    arena.mutate(|mc| mc.set_root(0, Value::NIL));
+    arena.mutate(|mc| mc.set_root(0, Value::NULL));
     arena.collect();
     arena.collect();
     assert_eq!((arena.frozen_values(), arena.meta.frozen.charged()), (0, 0));
@@ -177,7 +177,7 @@ fn frozen_values_drop_once_freed() {
     assert_eq!(drops.get(), 0);
     arena.collect_minor();
     assert_eq!(drops.get(), 10);
-    arena.mutate(|mc| mc.set_root(0, Value::NIL));
+    arena.mutate(|mc| mc.set_root(0, Value::NULL));
     arena.collect();
     assert_eq!(drops.get(), 11);
 }

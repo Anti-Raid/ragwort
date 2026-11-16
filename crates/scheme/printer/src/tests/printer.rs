@@ -84,7 +84,7 @@ fn lists_vectors_and_bytevectors_nest() {
         let dotted = pairs.cons(number(mc, "2"), number(mc, "3")).unwrap().value(mc);
         let bytes = Bytevectors::new(mc).immutable_from_slice(&[1, 255]).unwrap().value(mc);
         let empty = Vectors::new(mc).immutable_from_slice(&[]).unwrap().value(mc);
-        let list = pairs.list(&[number(mc, "1"), dotted, vector, bytes, empty, Value::NIL, Value::TRUE, Value::FALSE, Value::VOID]).unwrap();
+        let list = pairs.list(&[number(mc, "1"), dotted, vector, bytes, empty, Value::NULL, Value::TRUE, Value::FALSE, Value::VOID]).unwrap();
         assert_eq!(write(mc, list), r#"(1 (2 . 3) #(4 "x") #u8(1 255) #() () #t #f #<void>)"#);
         assert_eq!(display(mc, list), "(1 (2 . 3) #(4 x) #u8(1 255) #() () #t #f #<void>)");
     });
@@ -100,7 +100,7 @@ fn structs_are_written_with_their_fields() {
         let pairs = Pairs::new(mc);
         let (fields, mutable) = (pairs.list(&[symbol(mc, "x"), symbol(mc, "y")]).unwrap(), pairs.list(&[number(mc, "1"), number(mc, "1")]).unwrap());
         let point = run(mc, Intrinsic::MakeStructType, &[symbol(mc, "point"), Value::FALSE, fields, mutable, number(mc, "0")]);
-        let unit = run(mc, Intrinsic::MakeStructType, &[symbol(mc, "unit"), Value::FALSE, Value::NIL, Value::NIL, number(mc, "0")]);
+        let unit = run(mc, Intrinsic::MakeStructType, &[symbol(mc, "unit"), Value::FALSE, Value::NULL, Value::NULL, number(mc, "0")]);
         let p = run(mc, Intrinsic::MakeStruct, &[point, number(mc, "1"), text(mc, "two")]);
         let nested = run(mc, Intrinsic::MakeStruct, &[point, p, run(mc, Intrinsic::MakeStruct, &[unit])]);
         assert_eq!(write(mc, nested), r#"#(struct:point #(struct:point 1 "two") #(struct:unit))"#);
@@ -119,9 +119,9 @@ fn structs_are_written_with_their_fields() {
 fn deep_nesting_prints_without_recursion() {
     with(|mc| {
         let pairs = Pairs::new(mc);
-        let mut v = Value::NIL;
+        let mut v = Value::NULL;
         for _ in 0..100_000 {
-            v = pairs.cons(v, Value::NIL).unwrap().value(mc);
+            v = pairs.cons(v, Value::NULL).unwrap().value(mc);
         }
         assert_eq!(write(mc, v), format!("{}(){}", "(".repeat(100_000), ")".repeat(100_000)));
     });
@@ -137,7 +137,7 @@ fn cycles_are_labelled_and_shared_data_only_if_asked() {
         assert_eq!(display(mc, cyclic.value(mc)), "#0=#(1 #0#)");
         // A list that comes back to itself through a vector: the vector is labelled, the only
         // part of the cycle that could change to make it.
-        let inner = vectors.make(1, Value::NIL).unwrap();
+        let inner = vectors.make(1, Value::NULL).unwrap();
         let list = pairs.list(&[number(mc, "1"), inner.value(mc)]).unwrap();
         inner.items(mc).set(mc, 0, list);
         assert_eq!(write(mc, list), "(1 #0=#((1 #0#)))");
@@ -194,7 +194,7 @@ fn output_stops_at_the_limit() {
         assert_eq!(to_string(mc, text(mc, "abc"), Mode::Write, 5).unwrap(), "\"abc\"");
         assert_eq!(to_string(mc, text(mc, "abcd"), Mode::Display, 3), Err(PrintError::TooLong));
         // The walk that finds what is shared stops at the limit too.
-        let mut wide = Value::NIL;
+        let mut wide = Value::NULL;
         for _ in 0..500 {
             wide = pairs.cons(pairs.list(&[number(mc, "1")]).unwrap(), wide).unwrap().value(mc);
         }
@@ -238,7 +238,7 @@ fn tables_are_written_with_their_entries_in_order() {
         let (outer, inner) = (tables.make().unwrap(), tables.make().unwrap());
         inner.set(mc, symbol(mc, "up"), outer.value(mc)).unwrap();
         outer.set(mc, symbol(mc, "in"), inner.value(mc)).unwrap();
-        outer.set(mc, outer.value(mc), Value::NIL).unwrap();
+        outer.set(mc, outer.value(mc), Value::NULL).unwrap();
         assert_eq!(write(mc, outer.value(mc)), "#0=#table((in . #table((up . #0#))) (#0# . ()))");
         let twice = Pairs::new(mc).list(&[inner.value(mc), inner.value(mc)]).unwrap();
         assert_eq!(to_string(mc, twice, Mode::Shared, usize::MAX).unwrap(), "(#0=#table((up . #1=#table((in . #0#) (#1# . ())))) #0#)");
@@ -249,8 +249,10 @@ fn tables_are_written_with_their_entries_in_order() {
 fn external_refs_and_undefined_print_as_what_they_are() {
     with(|mc| {
         static BYTE: ExternalKind<u8> = ExternalKind::by_identity("byte");
-        let external = ExternalRefs::new(mc).make(&BYTE, 5, 0, Value::NIL).unwrap().value(mc);
+        let external = ExternalRefs::new(mc).make(&BYTE, 5, 0, Value::NULL).unwrap().value(mc);
         let list = Pairs::new(mc).list(&[external, Value::UNDEFINED]).unwrap();
         assert_eq!(write(mc, list), "(#<byte> #<undefined>)");
+        let nothing = Pairs::new(mc).list(&[Value::NIL, Value::NONE, Value::FALSE, Value::NULL]).unwrap();
+        assert_eq!((write(mc, nothing), display(mc, nothing)), ("(#nil #none #f ())".into(), "(#nil #none #f ())".into()));
     });
 }

@@ -81,7 +81,7 @@ impl Machine {
         let segment = segment.max(MIN_SEGMENT);
         let mut stack = mc.stack(Segment::new(mc, segment)?)?;
         let task = coroutine::root(mc)?;
-        let mut regs = Regs { fp: 0, pc: 0, acc: Value::VOID, values: Value::NIL, code: None };
+        let mut regs = Regs { fp: 0, pc: 0, acc: Value::VOID, values: Value::NULL, code: None };
         Outer::new(mc, &mut stack, task, task, &mut regs, segment).begin(procedure, args)?;
         let mut machine = Machine { stack, task: Root::new(mc, task)?, fp: 0, pc: 0, segment, fuel: u64::MAX, finished: false, waiting: Waiting::No, held: false };
         machine.save(mc, task, &regs);
@@ -99,7 +99,7 @@ impl Machine {
         let task = coroutine::root(mc)?;
         let last = self.task.get(mc).expect("a machine runs in its own arena");
         task.set_idle(mc, last.idle(mc));
-        let mut regs = Regs { fp: 0, pc: 0, acc: Value::VOID, values: Value::NIL, code: None };
+        let mut regs = Regs { fp: 0, pc: 0, acc: Value::VOID, values: Value::NULL, code: None };
         Outer::new(mc, &mut self.stack, task, task, &mut regs, self.segment).begin(procedure, args)?;
         (self.task, self.finished, self.waiting, self.held) = (Root::new(mc, task)?, false, Waiting::No, false);
         self.save(mc, task, &regs);
@@ -170,7 +170,7 @@ impl Machine {
             return Err(Fault::WrongType);
         }
         let (acc, values) = match *args {
-            [value] => (value, Value::NIL),
+            [value] => (value, Value::NULL),
             _ => (Value::VALUES, Pairs::new(mc).list(args)?),
         };
         self.answer(mc, Waiting::Yield, acc)?;
@@ -221,7 +221,7 @@ impl Machine {
         (self.fp, self.pc) = (regs.fp, regs.pc);
         task.set_acc(mc, regs.acc);
         // The list is meaningful only beside the marker. A stale one is dropped here, so it does not stay alive past this run.
-        task.set_values(mc, if regs.acc == Value::VALUES { regs.values } else { Value::NIL });
+        task.set_values(mc, if regs.acc == Value::VALUES { regs.values } else { Value::NULL });
         let len = self.stack.segment(mc).len(mc);
         self.stack.set_top((regs.fp + WINDOW).min(len));
     }
@@ -353,14 +353,14 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         let mc = self.mc();
         match blame {
             Blame::Instruction => {
-                let (Some(code), Ok(frame)) = (self.regs.code, self.segments.frame(self.regs.fp)) else { return Ok(Origin { operation: None, irritants: Value::NIL }) };
+                let (Some(code), Ok(frame)) = (self.regs.code, self.segments.frame(self.regs.fp)) else { return Ok(Origin { operation: None, irritants: Value::NULL }) };
                 // What the accumulator held when the instruction failed: one value, or the list beside the marker.
                 let received = if self.regs.acc == Value::VALUES { Pairs::new(mc).list_len(self.regs.values) } else { Some(1) };
                 let received = received.and_then(|received| i64::try_from(received).ok()).and_then(Value::fixnum).unwrap_or(Value::VOID);
                 report::origin(mc, frame, code, self.regs.pc, received, fault)
             }
-            Blame::Callee(callee) => Ok(Origin { operation: None, irritants: Pairs::new(mc).cons(callee, Value::NIL)?.value(mc) }),
-            Blame::Nothing => Ok(Origin { operation: None, irritants: Value::NIL }),
+            Blame::Callee(callee) => Ok(Origin { operation: None, irritants: Pairs::new(mc).cons(callee, Value::NULL)?.value(mc) }),
+            Blame::Nothing => Ok(Origin { operation: None, irritants: Value::NULL }),
         }
     }
 
@@ -430,7 +430,7 @@ impl<'a, 'gc> Outer<'a, 'gc> {
     /// list if `spread` is set), while preserving registers beyond the retained continuation.
     fn request(&mut self, base: u8, args: u8, request: Request, spread: bool, tail: bool) -> Step<'gc> {
         let mc = self.mc();
-        let (mut count, mut rest) = (args, Value::NIL);
+        let (mut count, mut rest) = (args, Value::NULL);
         if spread {
             // The last register holds the list of the operands after the ones in registers.
             count -= 1;

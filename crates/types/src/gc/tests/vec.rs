@@ -19,7 +19,7 @@ fn nums<'gc>(mc: &Mutation<'gc>) -> GcVec<'gc, slot::Member<Num>> {
 
 fn churn(mc: &Mutation<'_>) {
     for _ in 0..100_000 {
-        Pair::new(mc, Value::NIL, Value::NIL).unwrap();
+        Pair::new(mc, Value::NULL, Value::NULL).unwrap();
     }
 }
 

@@ -27,6 +27,15 @@ fn brackets_prefixes_and_atoms_are_tokens() {
 }
 
 #[test]
+fn nil_and_none_are_tokens_of_their_own() {
+    use Token::*;
+    assert_eq!(tokens("#nil #none #NIL #None (#nil)").unwrap(), [Nil, NoneValue, Nil, NoneValue, Open(Bracket::Round), Nil, Close(Bracket::Round)]);
+    // A longer name that starts the same way is not one of them.
+    assert!(tokens("#nile").is_err() && tokens("#nones").is_err());
+    assert_eq!(tokens("nil none").unwrap(), [Identifier(Cow::Borrowed("nil")), Identifier(Cow::Borrowed("none"))]);
+}
+
+#[test]
 fn spans_cover_each_token() {
     let spans: Vec<_> = Lexer::new(" (ab \"c d\" ; x\n #| y |# #\\x41)").map(|l| l.map(|l| (l.start, l.end)).unwrap()).collect();
     assert_eq!(spans, [(1, 2), (2, 4), (5, 10), (24, 29), (29, 30)]);

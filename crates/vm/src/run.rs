@@ -36,7 +36,7 @@ impl<'gc> Regs<'gc> {
     /// Puts the values in the proper list `list` into the accumulator. A list of one element puts that element there as one value.
     pub(crate) fn set_values(&mut self, mc: &Mutation<'gc>, list: Value<'gc>) {
         match Pair::of(list) {
-            Some(cell) if cell.tail(mc) == Value::NIL => self.acc = cell.head(mc),
+            Some(cell) if cell.tail(mc) == Value::NULL => self.acc = cell.head(mc),
             _ => (self.acc, self.values) = (Value::VALUES, list),
         }
     }
@@ -46,7 +46,7 @@ impl<'gc> Regs<'gc> {
         if self.acc == Value::VALUES {
             return Ok(self.values);
         }
-        Ok(Pairs::new(mc).cons(self.acc, Value::NIL)?.value(mc))
+        Ok(Pairs::new(mc).cons(self.acc, Value::NULL)?.value(mc))
     }
 
     /// Returns the first value in the accumulator, or void if it holds none.
@@ -125,7 +125,7 @@ struct Call<'gc> {
 
 impl<'gc> Call<'gc> {
     fn new(base: u8, argc: u8) -> Self {
-        Call { base, argc, rest: Value::NIL }
+        Call { base, argc, rest: Value::NULL }
     }
 }
 
@@ -454,7 +454,7 @@ impl<'s, 'gc> Run<'s, 'gc> {
         let call = if acc == Value::VALUES {
             Call { base, argc: 0, rest: self.cx.values }
         } else {
-            let call = Call { base, argc: 1, rest: Value::NIL };
+            let call = Call { base, argc: 1, rest: Value::NULL };
             fits(call)?;
             self.cx.frame.set(base + ARGS, acc);
             call
@@ -478,11 +478,11 @@ impl<'s, 'gc> Run<'s, 'gc> {
             return Ok(None);
         };
         let (key, value, call) = match request {
-            Request::WithMark => (frame.get(base), frame.get(base + 1), Call { base: base + 2, argc: args - 3, rest: Value::NIL }),
+            Request::WithMark => (frame.get(base), frame.get(base + 1), Call { base: base + 2, argc: args - 3, rest: Value::NULL }),
             _ => {
-                let handlers = prompts::mark(mc, task, handler_key(), Value::NIL)?;
+                let handlers = prompts::mark(mc, task, handler_key(), Value::NULL)?;
                 let handlers = Pairs::new(mc).cons(frame.get(base), handlers)?.value(mc);
-                (handler_key(), handlers, Call { base: base + 1, argc: 0, rest: Value::NIL })
+                (handler_key(), handlers, Call { base: base + 1, argc: 0, rest: Value::NULL })
             }
         };
         task.set_attachments(mc, segments::marked(mc, task.attachments(mc), under, key, value)?);
@@ -522,7 +522,7 @@ impl<'s, 'gc> Run<'s, 'gc> {
             count += 1;
         }
         // Keywords that are left over are unknown to the procedure or out of order.
-        if given != Value::NIL || values != Value::NIL {
+        if given != Value::NULL || values != Value::NULL {
             return None;
         }
         // The positional arguments are in the registers after the three operands, and the last register holds the list of the rest.
@@ -565,7 +565,7 @@ impl<'s, 'gc> Run<'s, 'gc> {
             cell = next;
         }
         let mut rest = cell.head(mc);
-        if cell.tail(mc) != Value::NIL || !pairs.is_list(rest) {
+        if cell.tail(mc) != Value::NULL || !pairs.is_list(rest) {
             return Ok(None);
         }
         for &value in leading[..count].iter().rev() {
@@ -588,7 +588,7 @@ impl<'s, 'gc> Run<'s, 'gc> {
             Request::Guard | Request::GuardQuiet => (frame.get(base), 0),
             _ => (frame.get(base + 1), 0),
         };
-        let call = Call { base: base + SAVED_MARKS, argc, rest: Value::NIL };
+        let call = Call { base: base + SAVED_MARKS, argc, rest: Value::NULL };
         fits(call)?;
         let takes = procedure.downcast::<Closure>(mc).and_then(|closure| closure.code(mc)).is_some_and(|code| code.arity(mc) == i64::from(argc));
         if !takes || self.fp + usize::from(call.base) > self.limit {
@@ -604,7 +604,7 @@ impl<'s, 'gc> Run<'s, 'gc> {
                 } else {
                     frame.get(base)
                 };
-                let handlers = prompts::mark(mc, task, handler_key(), Value::NIL)?;
+                let handlers = prompts::mark(mc, task, handler_key(), Value::NULL)?;
                 let guard = guarding.then_some(handler);
                 (handler_key(), pairs.cons(handler, handlers).map_err(Fault::from)?.value(mc), guard)
             }
@@ -649,7 +649,7 @@ fn load<'gc>(mc: &Mutation<'gc>, code: Gc<'gc, Bytecode>) -> Result<(&'gc [Op], 
 /// jump.
 #[inline(always)]
 pub(crate) fn bind<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, argc: u8, rest: Value<'gc>, fuel: &mut Fuel) -> Result<(), Fault> {
-    if arity == i64::from(argc) && argc <= MAX_PARAMS && rest == Value::NIL {
+    if arity == i64::from(argc) && argc <= MAX_PARAMS && rest == Value::NULL {
         return Ok(());
     }
     bind_slow(mc, frame, arity, argc, rest)?;
@@ -672,7 +672,7 @@ fn bind_slow<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, mut arg
                 rest = pair.tail(mc);
                 pair.head(mc)
             }
-            None if rest != Value::NIL => return Err(Fault::WrongType),
+            None if rest != Value::NULL => return Err(Fault::WrongType),
             None if argc < required => return Err(Fault::Arity),
             None => Value::UNSUPPLIED,
         };
@@ -682,7 +682,7 @@ fn bind_slow<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, mut arg
     if !shape.rest {
         return match () {
             () if argc > fixed || Pair::of(rest).is_some() => Err(Fault::Arity),
-            () if rest != Value::NIL => Err(Fault::WrongType),
+            () if rest != Value::NULL => Err(Fault::WrongType),
             () => Ok(()),
         };
     }
@@ -721,7 +721,7 @@ fn bind_spread<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, shape: Shape, mut
     let (variadic, slots) = (shape.rest, shape.slots());
     let keep = MAX_PARAMS - 1;
     while argc < keep {
-        let pair = Pair::of(rest).ok_or(if rest == Value::NIL { Fault::Arity } else { Fault::WrongType })?;
+        let pair = Pair::of(rest).ok_or(if rest == Value::NULL { Fault::Arity } else { Fault::WrongType })?;
         frame.set(ARGS + argc, pair.head(mc));
         (rest, argc) = (pair.tail(mc), argc + 1);
     }

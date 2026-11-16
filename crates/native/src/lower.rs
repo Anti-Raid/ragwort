@@ -359,7 +359,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
                 let mut elements = self.pairs.elements(formals.datum(self.mc));
                 let items = elements.by_ref().map(|value| self.syntax(value, formals)).collect::<Result<Vec<_>, _>>()?;
                 let rest = elements.rest();
-                parsed.rest = if rest == Value::NIL { None } else { Some(self.name(self.syntax(rest, formals)?)?) };
+                parsed.rest = if rest == Value::NULL { None } else { Some(self.name(self.syntax(rest, formals)?)?) };
                 items
             }
             _ => return Err(self.error(LowerErrorKind::BadShape, formals)),
@@ -538,7 +538,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
                     continue;
                 }
                 Task::List(count, dotted, node) => {
-                    let rest = if dotted { done.pop().expect("a list's tail") } else { Value::NIL };
+                    let rest = if dotted { done.pop().expect("a list's tail") } else { Value::NULL };
                     let items = done.split_off(done.len() - count);
                     done.push(self.pairs.list_with_tail(items, rest).map_err(|error| oom(self, error, node))?);
                     continue;
@@ -561,7 +561,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
                     let mut elements = self.pairs.elements(node.datum(self.mc));
                     let items: Vec<_> = elements.by_ref().collect();
                     let rest = elements.rest();
-                    let dotted = rest != Value::NIL;
+                    let dotted = rest != Value::NULL;
                     todo.push(Task::List(items.len(), dotted, node));
                     if dotted {
                         todo.push(Task::Item(rest, node));
@@ -616,7 +616,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         }
         let mut elements = self.pairs.elements(node.datum(self.mc));
         let items = elements.by_ref().map(|value| self.syntax(value, node)).collect::<Result<_, _>>()?;
-        if elements.rest() != Value::NIL {
+        if elements.rest() != Value::NULL {
             return Err(self.error(LowerErrorKind::BadShape, node));
         }
         Ok(items)
