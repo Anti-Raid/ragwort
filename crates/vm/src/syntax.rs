@@ -60,11 +60,7 @@ pub(crate) fn to_datum<'gc>(mc: &Mutation<'gc>, value: Value<'gc>, fuel: &mut Fu
             todo[at..].reverse();
             walk.fit(todo.len())?;
         } else if let Some(vector) = AnyVector::of(node) {
-            let at = todo.len();
-            todo.extend((0..vector.len(mc)).filter_map(|i| vector.get(mc, i)).map(Step::Visit));
-            todo.push(Step::Vector(todo.len() - at));
-            todo[at..].reverse();
-            walk.fit(todo.len())?;
+            walk.elements(mc, &mut todo, vector)?;
         } else {
             walk.done.push(node);
         }
@@ -120,6 +116,17 @@ impl<'gc> Walk<'gc> {
         self.made(mc, list, meta)
     }
 
+    /// Pushes the steps that convert `vector` onto `todo`: the step that gathers its elements, and above it a visit for each element, the first on top. The room for them is charged before they are pushed.
+    fn elements(&mut self, mc: &Mutation<'gc>, todo: &mut Vec<Step<'gc>>, vector: AnyVector<'gc>) -> Result<(), Fault> {
+        let len = vector.len(mc);
+        self.fit(todo.len() + len + 1)?;
+        todo.push(Step::Vector(len));
+        for index in (0..len).rev() {
+            todo.push(Step::Visit(vector.get(mc, index).ok_or(Fault::Malformed)?));
+        }
+        Ok(())
+    }
+
     fn vector(&mut self, mc: &Mutation<'gc>, count: usize, meta: Option<(SyntaxSpan<'gc>, SyntaxMeta<'gc>)>) -> Result<(), Fault> {
         let items = self.done.split_off(self.done.len() - count);
         let vector = Vectors::new(mc).immutable_from_slice(&items)?.value(mc);
@@ -151,9 +158,8 @@ pub(crate) fn to_syntax<'gc>(mc: &Mutation<'gc>, context: Value<'gc>, datum: Val
         None if context == Value::FALSE => (None, SyntaxSpan::default()),
         None => return Err(Fault::WrongType),
     };
-    let meta = |kind| SyntaxMeta::new(mc, kind, scopes, None);
     let named = Syntax::of(context).filter(|_| is_identifier(mc, context)).and_then(|syntax| Some((syntax.datum(mc), syntax.binding(mc)?)));
-    let (id, list, vector) = (meta(SyntaxKind::Identifier)?, meta(SyntaxKind::List)?, meta(SyntaxKind::Vector)?);
+    let (id, list, vector) = (SyntaxMeta::new(mc, SyntaxKind::Identifier, scopes, None)?, SyntaxMeta::new(mc, SyntaxKind::List, scopes, None)?, SyntaxMeta::new(mc, SyntaxKind::Vector, scopes, None)?);
     let mut walk = Walk::new(mc, *fuel);
     let mut todo = vec![Step::Visit(datum)];
     while let Some(step) = todo.pop() {
@@ -190,12 +196,8 @@ pub(crate) fn to_syntax<'gc>(mc: &Mutation<'gc>, context: Value<'gc>, datum: Val
             todo.push(Step::List(count, tail));
             todo[at..].reverse();
             walk.fit(todo.len())?;
-        } else if let Some(items) = AnyVector::of(node) {
-            let at = todo.len();
-            todo.extend((0..items.len(mc)).filter_map(|i| items.get(mc, i)).map(Step::Visit));
-            todo.push(Step::Vector(todo.len() - at));
-            todo[at..].reverse();
-            walk.fit(todo.len())?;
+        } else if let Some(vector) = AnyVector::of(node) {
+            walk.elements(mc, &mut todo, vector)?;
         } else {
             walk.done.push(Syntax::new(mc, node, span, None)?.value(mc));
         }
@@ -206,6 +208,9 @@ pub(crate) fn to_syntax<'gc>(mc: &Mutation<'gc>, context: Value<'gc>, datum: Val
 /// Returns `true` if identifiers `left` and `right` have identical symbolic names and equivalent lexical scope sets,
 /// meaning a binding for one would capture or bind the other (implements `bound-identifier=?`).
 pub(crate) fn same_identifier<'gc>(mc: &Mutation<'gc>, left: Value<'gc>, right: Value<'gc>, fuel: &mut Fuel) -> Result<bool, Fault> {
+    fn scopes<'gc>(mc: &Mutation<'gc>, context: Option<SyntaxContext<'gc>>) -> Vec<SyntaxScope<'gc>> {
+        context.map(|context| context.scopes(mc).collect::<Vec<_>>()).unwrap_or_default()
+    }
     if !is_identifier(mc, left) || !is_identifier(mc, right) {
         return Err(Fault::WrongType);
     }
@@ -213,12 +218,11 @@ pub(crate) fn same_identifier<'gc>(mc: &Mutation<'gc>, left: Value<'gc>, right: 
     if left.datum(mc) != right.datum(mc) {
         return Ok(false);
     }
-    let scopes = |context: Option<SyntaxContext<'gc>>| context.map(|context| context.scopes(mc).collect::<Vec<_>>()).unwrap_or_default();
     let (left_context, right_context) = (left.context(mc), right.context(mc));
     if left_context == right_context {
         return Ok(true);
     }
-    let (left_scopes, right_scopes) = (scopes(left_context), scopes(right_context));
+    let (left_scopes, right_scopes) = (scopes(mc, left_context), scopes(mc, right_context));
     // Syntax contexts created independently may contain the same set of scopes stored in different orders.
     if left_scopes.len() != right_scopes.len() || left_scopes == right_scopes {
         return Ok(left_scopes == right_scopes);

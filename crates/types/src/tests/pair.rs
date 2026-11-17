@@ -29,7 +29,7 @@ fn pairs_know_the_length_of_their_list() {
     });
 }
 
-/// Pairs that end in something other than `()` aren't lists, nor is anything built on them.
+/// A chain of pairs that ends in something other than `()` is not a list. Neither is a pair whose tail is such a chain.
 #[test]
 fn improper_chains_have_no_length() {
     arena().mutate(|mc| {
@@ -125,7 +125,7 @@ fn long_lists_keep_their_length_through_collections() {
             list = p.cons(fix(i), list).unwrap().value(mc);
         }
         mc.set_root(0, list);
-        // Garbage between the pairs, so compaction has something to close up.
+        // Allocate garbage, so that compaction has gaps to close.
         p.list(&[fix(1); 100]).unwrap();
     });
     arena.collect_minor();

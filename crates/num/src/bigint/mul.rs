@@ -2,7 +2,7 @@
 
 use super::{Digit, Digits, RWDigits, digit_mul_add};
 
-/// `z = x * y` for a single digit `y`. `z` needs `x + 1` digits.
+/// Computes `z = x * y` for a single digit `y`. `z` needs one more digit than `x`.
 pub fn multiply_single(mut z: RWDigits<'_>, x: Digits<'_>, y: Digit) {
     let mut carry = 0;
     for i in 0..x.len() {
@@ -12,7 +12,7 @@ pub fn multiply_single(mut z: RWDigits<'_>, x: Digits<'_>, y: Digit) {
     z.offset(x.len() + 1).clear();
 }
 
-/// `z = z * factor + add` in place, returning the carry.
+/// Computes `z = z * factor + add` in place and returns the carry.
 pub fn multiply_add_in_place(mut z: RWDigits<'_>, factor: Digit, add: Digit) -> Digit {
     let mut carry = add;
     for i in 0..z.len() {
@@ -21,7 +21,7 @@ pub fn multiply_add_in_place(mut z: RWDigits<'_>, factor: Digit, add: Digit) -> 
     carry
 }
 
-/// `z = x * y`. `z` needs `x + y` digits and must not overlap them.
+/// Computes `z = x * y` by schoolbook multiplication. `z` needs `x.len() + y.len()` digits and must not overlap `x` or `y`.
 pub fn multiply_schoolbook(mut z: RWDigits<'_>, x: Digits<'_>, y: Digits<'_>) {
     let (x, y) = (x.normalize(), y.normalize());
     if x.is_empty() || y.is_empty() {
@@ -40,13 +40,13 @@ pub fn multiply_schoolbook(mut z: RWDigits<'_>, x: Digits<'_>, y: Digits<'_>) {
                 carry = z.put(i + j, digit_mul_add(xi, y.at(j), z.at(i + j), carry));
             }
         }
-        // The rows so far fit below digit `i + y.len()`, so the carry is all of it.
+        // The rows added so far fit below digit `i + y.len()`. So that digit is still unset, and the carry is its whole value.
         z.set(i + y.len(), carry);
     }
     z.offset(x.len() + y.len()).clear();
 }
 
-/// `z = x * y`. `z` needs `x + y` digits.
+/// Computes `z = x * y`. `z` needs `x.len() + y.len()` digits.
 pub fn multiply(z: RWDigits<'_>, x: Digits<'_>, y: Digits<'_>) {
     let (x, y) = (x.normalize(), y.normalize());
     if y.len() == 1 {
@@ -58,7 +58,7 @@ pub fn multiply(z: RWDigits<'_>, x: Digits<'_>, y: Digits<'_>) {
     multiply_schoolbook(z, x, y);
 }
 
-/// The work [`multiply`] does, in digit operations.
+/// Returns the cost of [`multiply`], in digit operations.
 pub fn multiply_cost(x: Digits<'_>, y: Digits<'_>) -> u64 {
     x.normalize().len() as u64 * y.normalize().len() as u64
 }

@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use crate::int::{self, NumError};
 use crate::rational::*;
-use crate::testing::{Oracle, ROUNDS, Rng, TestError, TestHost, TestRational, WIDTHS, hex_i64};
+use crate::testing::{Oracle, ROUNDS, Rng, TestError, TestHost, TestInt, TestRational, WIDTHS, hex_i64};
 
 type Op = fn(&TestHost, TestRational, TestRational) -> Result<TestRational, TestError>;
 
@@ -95,8 +95,8 @@ fn halves_round_to_even() {
     }
 }
 
-/// A ratio whose parts are up to `max_len` digits each, so its exponent can be far outside
-/// what doubles hold.
+/// Returns a ratio whose parts have up to `max_len` digits each. Its magnitude can be far outside
+/// the range of `f64`.
 fn spread(h: &TestHost, rng: &mut Rng, max_len: usize) -> TestRational {
     let num = int::from_digits(h, rng.bool(), crate::bigint::Digits::new(&rng.nonzero(max_len))).unwrap();
     let den = int::from_digits(h, false, crate::bigint::Digits::new(&rng.nonzero(max_len))).unwrap();
@@ -115,11 +115,10 @@ fn conversion_to_doubles_rounds_once() {
         let h = TestHost::new(bits);
         let mut cases: Vec<TestRational> = (0..ROUNDS / WIDTHS.len()).map(|_| spread(&h, &mut rng, 20)).collect();
         cases.extend((0..ROUNDS / WIDTHS.len()).map(|_| h.random_rational(&mut rng, 2)));
-        // Around the smallest subnormal, ties in the subnormal range, and the overflow edge.
-        let k = |odd: i64, e: i64| mul(&h, from_parts(&h, int::from_i64(&h, odd).unwrap(), int::from_i64(&h, 1).unwrap()).unwrap(), power_of_two(&h, e)).unwrap();
+        // Values around the smallest subnormal, ties in the subnormal range, and values at the overflow threshold.
         for e in [-1076, -1075, -1074, -1073, -1060, -1023, -1022, -1021, 1022, 1023, 1024] {
             for odd in [1, 3, 5, -1, -3, 2049, 4095, (1 << 53) - 1, (1 << 54) - 1, (1 << 54) + 1] {
-                cases.push(k(odd, e));
+                cases.push(mul(&h, from_parts(&h, int::from_i64(&h, odd).unwrap(), int::from_i64(&h, 1).unwrap()).unwrap(), power_of_two(&h, e)).unwrap());
             }
         }
         for x in cases {
@@ -153,22 +152,23 @@ fn doubles_convert_exactly() {
 fn equal_rationals_hash_the_same_however_they_are_held() {
     let mut rng = Rng(39);
     let hosts = WIDTHS.map(TestHost::new);
-    let hash_of = |h: &TestHost, x| {
+    fn hash_of(h: &TestHost, x: TestRational) -> u64 {
         let mut state = std::hash::DefaultHasher::new();
         hash(h, x, &mut state);
         std::hash::Hasher::finish(&state)
-    };
+    }
+    /// Rebuilds the integer `n` of host `from` in host `to`.
+    fn rebuild(from: &TestHost, to: &TestHost, n: TestInt) -> TestInt {
+        let text = int::to_string(from, n, 16).unwrap();
+        let (negative, digits) = text.strip_prefix('-').map_or((false, text.as_str()), |rest| (true, rest));
+        int::parse(to, digits.as_bytes(), 16, negative).unwrap().unwrap()
+    }
     for _ in 0..ROUNDS / 4 {
         let x = hosts[0].random_rational(&mut rng, 3);
         let (num, den) = (numerator(&hosts[0], x), denominator(&hosts[0], x).unwrap());
         let want = hash_of(&hosts[0], x);
         for h in &hosts[1..] {
-            let rebuild = |n| {
-                let text = int::to_string(&hosts[0], n, 16).unwrap();
-                let (negative, digits) = text.strip_prefix('-').map_or((false, text.as_str()), |rest| (true, rest));
-                int::parse(h, digits.as_bytes(), 16, negative).unwrap().unwrap()
-            };
-            let same = from_parts(h, rebuild(num), rebuild(den)).unwrap();
+            let same = from_parts(h, rebuild(&hosts[0], h, num), rebuild(&hosts[0], h, den)).unwrap();
             assert_eq!(hash_of(h, same), want);
         }
     }

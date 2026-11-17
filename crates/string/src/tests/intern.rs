@@ -6,12 +6,12 @@ use crate::testing::*;
 use crate::{ExternalText, concat, display, is_flat};
 
 thread_local! {
-    /// The bits of a hash [`probe_hash`] keeps.
+    /// The mask of hash bits that [`probe_hash`] keeps.
     pub(super) static KEY_BITS: Cell<u64> = const { Cell::new(u64::MAX) };
 }
 
-/// Symbols are indexes into `symbols`, and die when killed. Entries are found by a scan, which
-/// is all interning needs of a table: probing is the host's.
+/// A test table. A symbol is an index into `symbols`, and `kill` marks a symbol dead. Entries are found by a linear scan.
+/// Interning needs no more from a table, because probing is the host's job.
 struct TestTable {
     seed: u64,
     entries: RefCell<Vec<(u64, usize)>>,
@@ -73,8 +73,8 @@ fn names(n: usize) -> Vec<String> {
     (0..n).map(|i| format!("name {i} {}", ["", "é", "日本", "😀"][i % 4])).collect()
 }
 
-/// However its name is held, a name has one symbol, made with a flat copy of the name and
-/// its hash.
+/// A name has one symbol, whatever representation the name string has. The symbol is created with a flat copy
+/// of the name and with the hash of the name.
 #[test]
 fn one_symbol_per_name() {
     let h = TestHost::new();
@@ -95,8 +95,8 @@ fn one_symbol_per_name() {
     assert_eq!(all.iter().collect::<HashSet<_>>().len(), all.len());
 }
 
-/// Names whose keys are the same are told apart by their characters, a live symbol is found
-/// past dead ones with its key, and a dead one's name gets a new symbol.
+/// Names with the same probe key are distinguished by their characters. A live symbol is found
+/// past dead symbols that share its key. The name of a dead symbol gets a new symbol.
 #[test]
 fn names_sharing_a_key_stay_apart() {
     for bits in [0, 0b110, 0xFF, u64::MAX] {

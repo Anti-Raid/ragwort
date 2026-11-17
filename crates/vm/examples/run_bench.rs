@@ -1,16 +1,18 @@
-//! Times the run loop: a tail-recursive countdown (calls and jumps in one frame), which finds
-//! itself in a register or a module variable, checked or not, a deep
-//! non-tail sum (frames, segment overflow and underflow), and a countdown that calls a closure
-//! each time round, against one calling a host function, and one deferring to the host, which
-//! replies at once.
+//! Benchmarks the run loop with these programs:
+//!
+//! - A tail-recursive countdown, which exercises calls and jumps in one frame. It reads itself from
+//!   a register, from a module variable, or from a module variable with a check that it is defined.
+//! - A deep non-tail sum, which exercises frames, segment overflow and underflow.
+//! - A countdown that calls a closure on each iteration, compared with one that calls a host
+//!   function and one that defers to the host. The host replies to each deferred call immediately.
 
 use std::hint::black_box;
 use std::time::Instant;
 
-use ragwort_types::gc::{Arena, Value};
+use ragwort_types::gc::{Arena, Gc, Mutation, Value};
 use ragwort_types::vector::Vectors;
 use ragwort_vm::Intrinsic::{Add, Eq};
-use ragwort_vm::objects::{Bytecode, Closure, ModuleFields};
+use ragwort_vm::objects::{Bytecode, Closure, Module, ModuleFields};
 use ragwort_vm::{Fault, HostArgs, HostContext, HostDef, Machine, Op, Outcome, Purity, Reply, SEGMENT, module};
 
 /// `(define (count n) (if (eq? 0 n) 0 (count (+ n -1))))`
@@ -68,7 +70,7 @@ const CALLS: &[Op] = &[
     Op::TailCall { base: 6, args: 1 },
 ];
 
-/// [`CALLS`], with `f` a host function.
+/// The same as [`CALLS`], with a host function as `f`.
 const HOST_CALLS: &[Op] = &[
     Op::LoadConst { dst: 3, index: 0 },
     Op::Move { dst: 4, src: 1 },
@@ -86,7 +88,7 @@ const HOST_CALLS: &[Op] = &[
     Op::TailCall { base: 6, args: 1 },
 ];
 
-/// [`COUNT`], calling itself through variable 0 of its module, as its own definition does.
+/// The same as [`COUNT`], except that it reads itself from variable 0 of its module, as a procedure defined at top level does.
 const SLOT_COUNT: &[Op] = &[
     Op::LoadConst { dst: 3, index: 0 },
     Op::Move { dst: 4, src: 1 },
@@ -102,7 +104,7 @@ const SLOT_COUNT: &[Op] = &[
     Op::TailCall { base: 6, args: 1 },
 ];
 
-/// [`SLOT_COUNT`], checking the variable is defined.
+/// The same as [`SLOT_COUNT`], except that it checks that the variable is defined.
 const CHECKED_COUNT: &[Op] = &[
     Op::LoadConst { dst: 3, index: 0 },
     Op::Move { dst: 4, src: 1 },
@@ -132,7 +134,7 @@ fn defer<'s, 'gc>(_: &mut HostContext<'s, 'gc>, _: HostArgs<'s, 'gc>) -> Result<
 static IDENTITY_HOST: [HostDef; 1] = [ragwort_vm::host!("identity", 1, Purity::Impure, identity)];
 static DEFER_HOST: [HostDef; 1] = [ragwort_vm::host!("defer", 1, Purity::Impure, defer)];
 
-/// What [`CALLS`] or [`HOST_CALLS`] calls, or where a countdown finds itself.
+/// The kind of procedure that [`CALLS`] or [`HOST_CALLS`] calls. `Slot` marks a countdown that reads itself from a module variable.
 #[derive(Clone, Copy)]
 enum Callee {
     None,
@@ -141,33 +143,35 @@ enum Callee {
     Slot,
 }
 
-/// Best time per call of `ops` with `n`, over a few runs, replying to each deferred call with
-/// void.
+/// Prints the best time per call when running `ops` with argument `n`, over `runs` runs. Replies to
+/// each deferred host call with void.
 fn time(name: &str, ops: &'static [Op], callee: Callee, n: i64, runs: usize) {
+    fn fix<'gc>(number: i64) -> Value<'gc> {
+        Value::fixnum(number).expect("fixnum")
+    }
+    fn closure<'gc>(mc: &Mutation<'gc>, owner: Gc<'gc, Module>, ops: &'static [Op], constants: Value<'gc>) -> Value<'gc> {
+        let captures = mc.frozen(Box::from([])).expect("alloc");
+        let code = Bytecode::new(mc, mc.frozen(Box::from(ops)).expect("alloc"), constants, captures, 1, Some(owner), Value::FALSE, Value::FALSE, 0, Value::FALSE, 0, 0, None).expect("alloc");
+        Value::object(mc, Closure::new(mc, Some(code), 0, Value::VOID).expect("alloc"))
+    }
     let mut arena = Arena::new(1 << 28, 0);
     let mut best = f64::MAX;
     for _ in 0..runs {
         arena.collect();
         let mut machine = arena.mutate(|mc| {
-            let fix = |n| Value::fixnum(n).expect("fixnum");
             let empty = Vectors::new(mc).immutable_from_slice(&[]).expect("alloc").value(mc);
             let hosts = match callee {
                 Callee::Host(hosts) => hosts,
                 _ => &[],
             };
             let owner = module::new(mc, Value::FALSE, &[fix(0)], hosts).expect("alloc");
-            let closure = |ops: &'static [Op], constants| {
-                let captures = mc.frozen(Box::from([])).expect("alloc");
-                let code = Bytecode::new(mc, mc.frozen(Box::from(ops)).expect("alloc"), constants, captures, 1, Some(owner), Value::FALSE, Value::FALSE, 0, Value::FALSE, 0, 0).expect("alloc");
-                Value::object(mc, Closure::new(mc, Some(code), 0, Value::VOID).expect("alloc"))
-            };
             let f = match callee {
                 Callee::None => Value::VOID,
-                Callee::Closure => closure(IDENTITY, empty),
+                Callee::Closure => closure(mc, owner, IDENTITY, empty),
                 Callee::Host(_) | Callee::Slot => Value::VOID,
             };
             let constants = Vectors::new(mc).immutable_from_slice(&[fix(0), fix(-1), f]).expect("alloc");
-            let count = closure(ops, constants.value(mc));
+            let count = closure(mc, owner, ops, constants.value(mc));
             owner.items(mc).set(mc, 0, count);
             Machine::new(mc, SEGMENT, count, &[fix(n)]).expect("start")
         });

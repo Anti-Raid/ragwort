@@ -1,9 +1,9 @@
-//! The memory a word heap lives in: zeroed `u64` words, committed as they're first touched,
-//! whose pages can be given back to the system.
+//! The memory region that backs a word heap. It is an array of zeroed `u64` words. A page is
+//! committed when it is first touched, and pages can be returned to the system.
 //!
-//! With the `mmap` feature on Unix, it's an anonymous mapping and [`Region::release`] gives
-//! pages back: with `madvise` on Linux, and elsewhere by mapping fresh pages over them.
-//! Otherwise it's a plain allocation and release does nothing.
+//! With the `mmap` feature on Unix, the region is an anonymous mapping, and [`Region::release`]
+//! returns pages to the system. It uses `madvise` on Linux, and maps fresh pages over the old
+//! pages elsewhere. Otherwise the region is a plain allocation, and `release` does nothing.
 
 use std::cell::Cell;
 use std::ops::Range;
@@ -21,7 +21,7 @@ use boxed::Backing;
 pub struct Region(Backing);
 
 impl Region {
-    /// `len` zeroed words, or `None` if the system won't reserve them.
+    /// Returns a region of `len` zeroed words, or `None` if the system cannot reserve the memory.
     pub fn new(len: usize) -> Option<Self> {
         Backing::new(len).map(Self)
     }
@@ -34,20 +34,21 @@ impl Region {
         self.len() == 0
     }
 
-    /// The words, as cells so they can be written through shared references.
+    /// Returns the words. They are `Cell`s, so they can be written through a shared reference.
     #[inline]
     pub fn words(&mut self) -> &[Cell<u64>] {
         self.0.words()
     }
 
-    /// Lets the system take back the memory under `range`, rounded inward to whole OS pages.
-    /// The words stay usable: afterwards they read as zero, or as what they held. Returns the
-    /// words given back, empty if none were, so a caller counts only memory that's gone.
+    /// Returns the memory of the words in `range` to the system. The range is rounded inward to
+    /// whole OS pages. The words stay usable. Afterwards each word reads as zero or as its
+    /// previous value. Returns the range of words that was released, which is empty if none were.
+    /// So a caller can count only the memory that was actually released.
     pub fn release(&mut self, range: Range<usize>) -> Range<usize> {
         self.0.release(range)
     }
 
-    /// Whether [`Region::release`] gives memory back at all.
+    /// Returns whether [`Region::release`] can return memory to the system at all.
     pub fn releases() -> bool {
         Backing::releases()
     }

@@ -30,7 +30,7 @@ impl Rng {
         char::from_u32(lo + self.below((hi - lo) as usize) as u32).expect("no surrogates")
     }
 
-    /// Mostly short, sometimes long, each mostly ASCII with some characters up to a random width.
+    /// Returns random text. Most texts are short and some are long. About half of the characters are ASCII, and the rest go up to a randomly chosen width.
     pub fn text(&mut self) -> Vec<char> {
         let len = match self.below(10) {
             0 => 0,
@@ -70,7 +70,7 @@ enum Node {
 pub struct TestHost {
     nodes: Box<[OnceCell<Node>]>,
     used: Cell<usize>,
-    /// Flat strings made: of each three, one packed, one inline if it fits, one in slices.
+    /// The number of flat strings created. It selects the layout: of every three flat strings, one is packed, one is inline if it fits, and one is stored in slices.
     flats: Cell<usize>,
 }
 
@@ -95,8 +95,8 @@ impl TestHost {
         Ok(self.push(Node::External(Box::new(chars))))
     }
 
-    /// Asserts every flat string in `s` has its narrowest width, and every rope node sums up its
-    /// children, has no empty one, is balanced, and has the same characters as its flat copy.
+    /// Asserts that every flat string in `s` has its narrowest width. Also asserts that every rope node has an `Info` that matches
+    /// its children, has no empty child, is balanced, and has the same characters as its flat copy.
     pub fn check(&self, s: TestStr) {
         let mut seen = HashSet::new();
         self.check_node(s, &mut seen);
@@ -132,7 +132,7 @@ impl TestHost {
         matches!(self.nodes[s.0].get(), Some(Node::Rope { flat, .. }) if flat.get().is_some())
     }
 
-    /// Flat strings in `s`, counting shared ones each time.
+    /// Returns the number of flat strings in `s`. A shared flat string is counted once per occurrence.
     pub fn leaves(&self, s: TestStr) -> usize {
         match self.view(s) {
             StrView::Flat(_) => 1,
@@ -165,7 +165,7 @@ impl Host for TestHost {
         if self.flats.get().is_multiple_of(3) {
             let words: Box<[Cell<u64>]> = (0..len.div_ceil(width.per_word())).map(|_| Cell::new(0)).collect();
             init(UnitsMut::Packed(PackedMut::new(&words, len, width)));
-            // What's past the end must be ignored.
+            // Set the bits past the last unit, to check that readers ignore them.
             let used = len % width.per_word() * width.bytes() * 8;
             if let Some(last) = words.last().filter(|_| used > 0) {
                 last.set(last.get() | u64::MAX << used);
@@ -208,15 +208,17 @@ impl Host for TestHost {
     }
 }
 
-/// `text` flat, external, and, if it has two characters or more, as a rope of two flat strings
-/// cut at `cut` and as such a rope flattened.
+/// Returns `text` in several representations: flat, external, and, if it has two or more characters, as a rope of two flat strings
+/// cut at `cut` and as the same kind of rope with a flat copy.
 pub fn shapes(h: &TestHost, text: &[char], cut: usize) -> Vec<TestStr> {
-    let make = |t: &[char]| from_chars(h, t.iter().copied()).unwrap();
-    let mut out = vec![make(text), h.external(ExternalText::new(text.iter().collect::<String>())).unwrap()];
+    fn make(h: &TestHost, text: &[char]) -> TestStr {
+        from_chars(h, text.iter().copied()).unwrap()
+    }
+    let mut out = vec![make(h, text), h.external(ExternalText::new(text.iter().collect::<String>())).unwrap()];
     if text.len() >= 2 {
         let cut = cut.clamp(1, text.len() - 1);
         for flattened in [false, true] {
-            let (l, r) = (make(&text[..cut]), make(&text[cut..]));
+            let (l, r) = (make(h, &text[..cut]), make(h, &text[cut..]));
             let (il, ir) = (crate::info(h, l), crate::info(h, r));
             let rope = h.rope(l, r, Info { len: il.len + ir.len, width: il.width.max(ir.width), depth: 1 }).unwrap();
             if flattened {

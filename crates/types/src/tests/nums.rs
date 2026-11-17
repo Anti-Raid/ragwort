@@ -56,7 +56,7 @@ fn bignums_survive_collections_that_move_them() {
             .map(|i| {
                 let k = int::from_i64(&h, 1_000_003 * i + 7).unwrap();
                 x = int::add(&h, int::mul(&h, x, k).unwrap(), k).unwrap();
-                // Garbage between the survivors.
+                // Allocate garbage between the values that survive.
                 int::expt(&h, k, 9).unwrap();
                 root.push(mc, x.value()).unwrap();
                 int::to_string(&h, x, 10).unwrap()
@@ -133,11 +133,13 @@ fn exact<'gc>(h: &Nums<'_, 'gc>, n: i64) -> Number<'gc> {
 }
 
 fn parts<'gc>(h: &Nums<'_, 'gc>, z: Number<'gc>) -> (String, String) {
-    let show = |x: Real<'gc>| match h.real_view(x) {
-        RealView::Exact(r) => rational::to_string(h, r, 10).unwrap(),
-        RealView::Flonum(f) => format!("{f:?}"),
-    };
-    (show(complex::real_part(h, z)), show(complex::imag_part(h, z).unwrap()))
+    fn show<'gc>(h: &Nums<'_, 'gc>, x: Real<'gc>) -> String {
+        match h.real_view(x) {
+            RealView::Exact(r) => rational::to_string(h, r, 10).unwrap(),
+            RealView::Flonum(f) => format!("{f:?}"),
+        }
+    }
+    (show(h, complex::real_part(h, z)), show(h, complex::imag_part(h, z).unwrap()))
 }
 
 #[test]
@@ -153,7 +155,7 @@ fn flonums_and_complex_numbers_live_in_the_arena() {
         assert_eq!(parts(&h, two_i), ("0".into(), "2".into()));
         let squared = complex::mul(&h, two_i, two_i).unwrap();
         assert!(squared.value().is_fixnum(), "(* +2i +2i) is the fixnum -4");
-        // 1e300 doesn't fit in the word, so its part is boxed.
+        // 1e300 does not fit in the value word, so the real part is a boxed flonum.
         let huge = number(&h, 1e300, -0.5);
         let ComplexView::Complex { re, .. } = h.complex_view(huge) else { panic!() };
         assert!(Value::inline_flonum(1e300).is_none() && re.value().is_flonum());

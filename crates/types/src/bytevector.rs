@@ -30,7 +30,7 @@ fn words(len: usize) -> usize {
     len.div_ceil(8)
 }
 
-/// A bytevector that can be written to, its bytes in the arena or outside it.
+/// A writable bytevector. Its bytes are stored in the arena, or outside it in a buffer that the host handed over.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Bytevector<'gc>(Kept<'gc>);
 
@@ -40,7 +40,7 @@ enum Kept<'gc> {
     Outside(Gc<'gc, objects::ExternMutBytevector>),
 }
 
-/// The bytes of `bytevector`'s buffer, for one read or write: as many as it had when `bytevector` was made.
+/// Borrows the bytes of `bytevector`'s buffer for one read or write. The slice is limited to the length the buffer had when `bytevector` was created.
 fn outside<'gc>(mc: &Mutation<'gc>, bytevector: Gc<'gc, objects::ExternMutBytevector>) -> Option<RefMut<'gc, [u8]>> {
     let len = bytevector.bytes(mc) as usize;
     Some(RefMut::map(bytevector.buffer(mc)?.borrow_mut(), |buffer| {
@@ -50,7 +50,7 @@ fn outside<'gc>(mc: &Mutation<'gc>, bytevector: Gc<'gc, objects::ExternMutByteve
     }))
 }
 
-/// The word of the eight bytes from `index * 8` that `byte` reads, zeros past the last.
+/// Returns word `index` of `len` bytes: the eight bytes from `index * 8`, each read by calling `byte`, with the first byte in the lowest bits. Bytes past `len` are zero.
 fn word_of(len: usize, index: usize, byte: impl Fn(usize) -> u8) -> u64 {
     let mut word = [0; 8];
     for (i, out) in word.iter_mut().enumerate().take(len.saturating_sub(index * 8)) {
@@ -67,7 +67,7 @@ impl<'gc> Bytevector<'gc> {
         }
     }
 
-    /// Sets the byte at `index`, or returns `false` if there's none.
+    /// Sets the byte at `index`. Returns `false` if `index` is out of range.
     pub fn set(self, mc: &Mutation<'gc>, index: usize, byte: u8) -> bool {
         let bytevector = match self.0 {
             Kept::Inside(bytevector) => bytevector,
@@ -83,8 +83,8 @@ impl<'gc> Bytevector<'gc> {
         true
     }
 
-    /// Sets the `size` bytes from `index`, 1 to 8, to `value`'s low ones, least significant
-    /// first, or returns `false` if they're not all there.
+    /// Sets the `size` bytes from `index` to the low `size` bytes of `value`, least significant
+    /// first. `size` is 1 to 8. Returns `false` if the bytes are not all within the bytevector.
     pub fn set_uint(self, mc: &Mutation<'gc>, index: usize, size: usize, value: u64) -> bool {
         let bytevector = match self.0 {
             Kept::Inside(bytevector) => bytevector,
@@ -157,14 +157,14 @@ impl ExternalBufferMut for Vec<u8> {}
 impl ExternalBufferMut for Box<[u8]> {}
 impl<const N: usize> ExternalBufferMut for [u8; N] {}
 
-/// Fewer external bytes are copied: keeping them outside costs more than they do.
+/// External buffers of fewer bytes than this are copied into the arena. Keeping them outside would cost more than the bytes.
 const COPY_EXTERNAL: usize = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ExternalBytevector<'gc>(Gc<'gc, objects::ExternBytevector>);
 
 impl<'gc> ExternalBytevector<'gc> {
-    /// Its bytes: as many as there were when it was made.
+    /// Returns the bytes, limited to the length they had when the bytevector was created.
     fn bytes(self, mc: &Mutation<'gc>) -> &'gc [u8] {
         let bytes = self.0.owner(mc).map_or(&[][..], |owner| (**owner).as_ref());
         &bytes[..bytes.len().min(self.0.bytes(mc) as usize)]
@@ -199,7 +199,7 @@ impl<'gc> AnyBytevector<'gc> {
         }
     }
 
-    /// Whether its bytes are kept outside the arena.
+    /// Returns whether the bytes are stored outside the arena.
     pub fn is_external(self) -> bool {
         matches!(self, Self::External(_) | Self::Mutable(Bytevector(Kept::Outside(_))))
     }
@@ -233,7 +233,7 @@ impl<'gc> AnyBytevector<'gc> {
         }
     }
 
-    /// How many bytes there are and the words they're packed in, if they're in the arena.
+    /// Returns the number of bytes and the words that they are packed in, or `None` if the bytes are not stored in the arena.
     #[inline(always)]
     fn inside(self, mc: &Mutation<'gc>) -> Option<(usize, Slots<'gc, slot::u64>)> {
         match self {
@@ -243,8 +243,8 @@ impl<'gc> AnyBytevector<'gc> {
         }
     }
 
-    /// What `read` makes of the bytes, which are kept outside the arena. It's out of line so that
-    /// reading the ones in the arena stays short.
+    /// Calls `read` with the bytes, which are stored outside the arena, and returns its result. It
+    /// is kept out of line so that the code for reading bytes in the arena stays small.
     #[inline(never)]
     fn outside<R>(self, mc: &Mutation<'gc>, read: impl FnOnce(&[u8]) -> R) -> R {
         match self {
@@ -263,13 +263,13 @@ impl<'gc> AnyBytevector<'gc> {
         (index < len).then(|| (words.get(index / 8) >> (index % 8 * 8)) as u8)
     }
 
-    /// The `size` bytes from `index`, 1 to 8, least significant first, if they're all there.
+    /// Returns the `size` bytes from `index` as an integer, least significant first. `size` is 1 to 8. Returns `None` if the bytes are not all within the bytevector.
     #[inline]
     pub fn get_uint(self, mc: &Mutation<'gc>, index: usize, size: usize) -> Option<u64> {
         let Some((len, words)) = self.inside(mc) else {
             return self.outside(mc, |bytes| {
                 let part = bytes.get(index..index.checked_add(size)?)?;
-                // Eight bytes are read at once where there are that many.
+                // Read eight bytes at once if that many are left from `index`.
                 Some(match bytes.get(index..index + 8).and_then(|eight| <[u8; 8]>::try_from(eight).ok()) {
                     Some(eight) => u64::from_le_bytes(eight) & low_bytes(size),
                     None => part.iter().rev().fold(0, |value, &byte| value << 8 | u64::from(byte)),
@@ -291,8 +291,8 @@ impl<'gc> AnyBytevector<'gc> {
         self.bytes(mc, 0, self.len(mc)).into_owned()
     }
 
-    /// The bytes from `start` up to `end`, which are in it: an external one's as they are, and
-    /// the others' copied out.
+    /// Returns the bytes from `start` up to `end`, which must be within the bytevector. The bytes
+    /// of a read-only external bytevector are borrowed. The bytes of any other kind are copied.
     pub fn bytes(self, mc: &Mutation<'gc>, start: usize, end: usize) -> Cow<'gc, [u8]> {
         match self {
             Self::External(bytevector) => return Cow::Borrowed(&bytevector.bytes(mc)[start..end]),
@@ -305,10 +305,17 @@ impl<'gc> AnyBytevector<'gc> {
         Cow::Owned(bytes)
     }
 
-    /// Whether the two hold the same bytes, a word at a time.
+    /// Returns whether the two bytevectors hold the same bytes. Bytes in the arena are compared a word at a time.
     pub fn same_bytes(self, mc: &Mutation<'gc>, other: Self) -> bool {
         let len = self.len(mc);
-        len == other.len(mc) && (0..words(len)).all(|i| self.word(mc, i) == other.word(mc, i))
+        if len != other.len(mc) {
+            return false;
+        }
+        // Reading host-owned bytes word by word would go through the host for every word. So they are read once, as a slice.
+        if self.is_external() || other.is_external() {
+            return self.bytes(mc, 0, len) == other.bytes(mc, 0, len);
+        }
+        (0..words(len)).all(|i| self.word(mc, i) == other.word(mc, i))
     }
 }
 
@@ -327,7 +334,7 @@ impl<'a, 'gc> Bytevectors<'a, 'gc> {
         AnyBytevector::of(value)
     }
 
-    /// `value` if it's a bytevector that can be written to.
+    /// Returns `value` as a writable bytevector, or `None` if it is not one.
     pub fn mutable(&self, value: Value<'gc>) -> Option<Bytevector<'gc>> {
         match AnyBytevector::of(value) {
             Some(AnyBytevector::Mutable(bytevector)) => Some(bytevector),
@@ -335,7 +342,7 @@ impl<'a, 'gc> Bytevectors<'a, 'gc> {
         }
     }
 
-    /// A bytevector of `len` copies of `fill`.
+    /// Returns a bytevector of `len` copies of `fill`.
     pub fn make(&self, len: usize, fill: u8) -> Result<Bytevector<'gc>, OutOfMemory> {
         let word = u64::from_le_bytes([fill; 8]);
         let bytevector = objects::Bytevector::new(self.mc, len as u64, words(len), word)?;
@@ -385,7 +392,7 @@ impl<'a, 'gc> Bytevectors<'a, 'gc> {
     }
 }
 
-/// A mask of the low `size` bytes of a word, `size` 1 to 8.
+/// Returns a mask of the low `size` bytes of a word. `size` is 1 to 8.
 fn low_bytes(size: usize) -> u64 {
     u64::MAX >> (64 - size * 8)
 }
@@ -399,8 +406,8 @@ fn pack<'gc>(mc: &Mutation<'gc>, words: Slots<'gc, slot::u64>, bytes: &[u8]) {
     }
 }
 
-/// Zeroes the bytes past `len` in the last of `words`, each a `fill`, so equal bytevectors have
-/// equal words.
+/// Zeroes the bytes past `len` in the last word of `words`. Every word was initialized to
+/// `fill`. Equal bytevectors then have equal words.
 fn clear_slack<'gc>(mc: &Mutation<'gc>, words: Slots<'gc, slot::u64>, len: usize, fill: u64) {
     if !len.is_multiple_of(8) {
         words.set(mc, len / 8, fill & (u64::MAX >> (64 - len % 8 * 8)));

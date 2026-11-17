@@ -1,17 +1,17 @@
-//! External references: values of the host's own types that the arena holds for it.
+//! External references: values of the host's own types that the arena holds on the host's behalf.
 //!
 //! An [`ExternalRef`] wraps one value of a host type. A program can pass it around, store it and
-//! hand it back to the host's functions, but cannot look inside. The arena drops the value once
-//! nothing reaches the reference.
+//! hand it back to the host's functions, but cannot inspect it. The arena drops the value once
+//! the reference is unreachable.
 //!
 //! # Kinds
 //!
 //! The host describes each of its types once, in a static [`ExternalKind`]:
 //!
-//! - A name, which the printer shows: a reference of the kind named `user-id` is written
+//! - A name, which the printer shows. A reference of the kind named `user-id` is printed as
 //!   `#<user-id>`.
-//! - How two values of the type are compared and hashed. Without that, a reference is equal
-//!   only to itself.
+//! - How two values of the type are compared and hashed. Without these functions, a reference
+//!   is equal only to itself.
 //!
 //! ```
 //! use ragwort_types::external::{ExternalKind, ExternalRefs};
@@ -34,22 +34,24 @@
 //!
 //! # What uses a kind's equality
 //!
-//! - `equal?` compares two references of a kind by its `equal`.
-//! - A table takes such a reference as a key by its value: two references that are equal are
-//!   one key.
-//! - `eq?` and `eqv?` do not: for them a reference is the same as itself and nothing else.
+//! - `equal?` compares two references of a kind with the kind's `equal`.
+//! - A table compares such a reference as a key by value: two references that are equal are
+//!   the same key.
+//! - `eq?` and `eqv?` do not use it. For them, a reference is the same as itself and nothing else.
 //!
 //! # What the host promises
 //!
-//! The arena relies on these and cannot check them:
+//! The arena relies on these promises and cannot check them:
 //!
-//! - `equal` is an equivalence: a value equals itself, and the order of the two does not matter.
-//! - Values that are equal hash the same.
-//! - Neither answer changes while the value lives.
-//! - There is one kind for each type. References of two kinds are never equal.
+//! - `equal` is an equivalence relation: a value equals itself, and the order of the two
+//!   arguments does not matter.
+//! - Values that are equal have the same hash.
+//! - Neither result changes while the value is alive.
+//! - Two kinds of one type have different names. References of kinds with different names are
+//!   never equal.
 //!
-//! Both functions see only the two values. They cannot reach the arena or run a program. A
-//! broken promise makes a table lose a key or `equal?` give a wrong answer. It cannot cause
+//! Both functions receive only the two values. They cannot access the arena or run a program. A
+//! broken promise makes a table lose a key or `equal?` return a wrong answer. It cannot cause
 //! memory unsafety.
 
 use std::any::Any;
@@ -61,7 +63,7 @@ use crate::objects::{self, Data, ExternalFields};
 #[path = "tests/external.rs"]
 mod tests;
 
-/// What the host says of every value of type `T` it hands to the arena. See the
+/// The host's description of a type `T` whose values it hands to the arena. See the
 /// [module docs](self).
 pub struct ExternalKind<T: 'static> {
     /// The name the printer shows for a reference of the kind.
@@ -70,32 +72,32 @@ pub struct ExternalKind<T: 'static> {
     pub by_value: Option<ByValue<T>>,
 }
 
-/// How values of type `T` are compared and hashed. The two functions come together, because
-/// a table needs both and they have to agree.
+/// The equality and hash functions for values of type `T`. They are supplied together, because
+/// a table needs both and they must agree.
 pub struct ByValue<T: 'static> {
     pub equal: fn(&T, &T) -> bool,
     pub hash: fn(&T) -> u64,
 }
 
 impl<T: 'static> ExternalKind<T> {
-    /// A kind whose references are each equal only to themselves.
+    /// Creates a kind in which each reference is equal only to itself.
     pub const fn by_identity(name: &'static str) -> Self {
         Self { name, by_value: None }
     }
 
-    /// A kind whose references are equal when `equal` says their values are.
+    /// Creates a kind whose references are equal when `equal` returns `true` for their values.
     pub const fn by_value(name: &'static str, equal: fn(&T, &T) -> bool, hash: fn(&T) -> u64) -> Self {
         Self { name, by_value: Some(ByValue { equal, hash }) }
     }
 }
 
-/// A kind with its type forgotten, as a reference keeps it.
+/// A type-erased [`ExternalKind`], as stored in a reference.
 trait Kind: 'static {
     fn name(&self) -> &'static str;
-    /// Whether the kind compares by value and says the two are equal. `false` if either is not
-    /// a value of the kind's type.
+    /// Returns whether the kind compares by value and its `equal` function returns `true` for the
+    /// two values. Returns `false` if either is not a value of the kind's type.
     fn equal(&self, first: &dyn Any, second: &dyn Any) -> bool;
-    /// The hash of `value`, or `None` if the kind compares by identity.
+    /// Returns the hash of `value`, or `None` if the kind compares by identity.
     fn hash(&self, value: &dyn Any) -> Option<u64>;
 }
 
@@ -116,7 +118,7 @@ impl<T: 'static> Kind for ExternalKind<T> {
     }
 }
 
-/// What a reference keeps outside the arena: the host's value and its kind.
+/// The data that a reference stores outside the arena: the host's value and its kind.
 pub(crate) struct Held {
     kind: &'static dyn Kind,
     data: Box<dyn Any>,
@@ -139,34 +141,34 @@ impl<'gc> ExternalRef<'gc> {
         Value::object(mc, self.0)
     }
 
-    /// The name of the reference's kind.
+    /// Returns the name of the reference's kind.
     pub fn name(self, mc: &Mutation<'gc>) -> &'static str {
         self.0.payload(mc).map_or("external", |held| held.kind.name())
     }
 
-    /// The host's value, if it is a `T`.
+    /// Returns the host's value, or `None` if it is not a `T`.
     pub fn data<T: Any>(self, mc: &Mutation<'gc>) -> Option<&'gc T> {
         self.0.payload(mc)?.data.downcast_ref()
     }
 
-    /// The value the reference keeps alive in the arena.
+    /// Returns the arena value that the reference keeps alive.
     pub fn kept(self, mc: &Mutation<'gc>) -> Value<'gc> {
         self.0.kept(mc)
     }
 
-    /// Whether the two are the same reference, or references of one kind that the kind says
-    /// are equal.
+    /// Returns whether the two are the same reference, or are references of one kind whose
+    /// `equal` function returns `true` for their values.
     pub fn same(self, mc: &Mutation<'gc>, other: Self) -> bool {
         if self == other {
             return true;
         }
         match (self.0.payload(mc), other.0.payload(mc)) {
-            (Some(first), Some(second)) => first.kind.equal(&*first.data, &*second.data),
+            (Some(first), Some(second)) => first.kind.name() == second.kind.name() && first.kind.equal(&*first.data, &*second.data),
             _ => false,
         }
     }
 
-    /// The hash the kind gives the value, or `None` if the kind compares by identity.
+    /// Returns the hash that the kind computes for the value, or `None` if the kind compares by identity.
     pub fn hash(self, mc: &Mutation<'gc>) -> Option<u64> {
         let held = self.0.payload(mc)?;
         held.kind.hash(&*held.data)
@@ -188,12 +190,12 @@ impl<'a, 'gc> ExternalRefs<'a, 'gc> {
         ExternalRef::of(value)
     }
 
-    /// A reference to `data`, of the kind `kind`.
+    /// Creates a reference to `data`, of kind `kind`.
     ///
-    /// - `bytes` is charged to the arena's budget for what `data` owns outside it, until the
-    ///   reference is collected.
-    /// - `kept` is a value of the arena that stays alive as long as the reference does, for data
-    ///   that goes with the host's value. Pass [`Value::NULL`] for none.
+    /// - `bytes` is the size of the memory that `data` owns outside the arena. It is charged to
+    ///   the arena's budget until the reference is collected.
+    /// - `kept` is an arena value that stays alive as long as the reference does. Use it for
+    ///   arena data that belongs with the host's value. Pass [`Value::NULL`] for none.
     pub fn make<T: Any>(&self, kind: &'static ExternalKind<T>, data: T, bytes: usize, kept: Value<'gc>) -> Result<ExternalRef<'gc>, OutOfMemory> {
         let held = Held { kind, data: Box::new(data) };
         Ok(ExternalRef(objects::External::new(self.mc, kept, self.mc.frozen_owning(held, bytes)?)?))

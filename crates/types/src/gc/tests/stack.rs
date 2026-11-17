@@ -2,7 +2,7 @@ use super::*;
 
 objects! {
     kind Kind;
-    /// A boxed number, so whether it's alive can be seen.
+    /// An object that holds a number, so that a test can check whether the object is still alive.
     struct Num { n: i64 }
     struct Pair { car: Value, cdr: Value }
 }
@@ -19,7 +19,7 @@ fn read<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> Option<i64> {
     Some(v.downcast::<Num>(mc)?.n(mc))
 }
 
-/// Objects alive after the last sweep.
+/// Returns the number of objects in the heap: every object allocated and not freed by a sweep.
 fn objects(arena: &Arena) -> usize {
     let m = &arena.meta;
     m.pages[..m.used.get()].iter().flat_map(|p| &p.starts).map(|w| w.get().count_ones() as usize).sum()
@@ -59,7 +59,7 @@ fn expected(n: u8, first: i64) -> Vec<Option<i64>> {
     (0..n as i64).map(|i| Some(first + i)).collect()
 }
 
-/// The values in `range` of the segment root 0 holds.
+/// Returns the values in `range` of the segment that root 0 holds.
 fn rooted_segment(arena: &mut Arena, range: Range<usize>) -> Vec<Option<i64>> {
     arena.mutate(|mc| {
         let slots = mc.root(0).downcast::<Segment>(mc).unwrap().slots(mc);
@@ -71,7 +71,7 @@ fn segment_index(arena: &mut Arena, stack: &Stack) -> u32 {
     arena.mutate(|mc| stack.segment(mc).index)
 }
 
-/// Overwrites freed memory, so a value wrongly freed reads back as something else.
+/// Overwrites freed memory, so that a value that was wrongly freed reads back as something else.
 fn churn(arena: &mut Arena) {
     arena.mutate(|mc| {
         for _ in 0..100_000 {
@@ -126,7 +126,7 @@ fn frame_writes_while_marking_are_traced_before_the_cycle_ends() {
         mc.set_root(0, Value::object(mc, pair));
     });
     arena.collect();
-    // The root is marked first and the segment last, so the segment is traced first.
+    // Root 0 is marked before the stack's segment, and the gray list is a stack. So the first slice traces the segment and leaves the pair untraced.
     arena.collect_slice(1);
     assert_eq!(arena.phase(), Phase::Marking);
     let pair = arena.mutate(|mc| mc.root(0).downcast::<Pair>(mc).unwrap().index);
@@ -206,8 +206,8 @@ fn captured_frames_are_taken_back_in_place() {
     assert_eq!(stack.base(), 0);
     assert_eq!(frame_values(&mut arena, &stack, 0, 8), expected(8, 50));
 
-    // Written in place again during a cycle, without the barrier, the frames are traced as
-    // the live part before it ends.
+    // The frames are written in place again during a cycle, without the barrier. They are traced as
+    // part of the live range before the cycle ends.
     arena.collect_slice(1);
     assert_eq!(arena.phase(), Phase::Marking);
     fill(&mut arena, &stack, 0, 8, 60);
@@ -321,7 +321,7 @@ fn moved_segments_keep_working() {
     assert_eq!(frame_values(&mut arena, &stack, 0, 16), expected(16, 80));
 }
 
-/// Frames written while marking, to objects being evacuated, are fixed when they move.
+/// A frame slot that is written while marking, with a reference to an object being evacuated, is updated when the object moves.
 #[test]
 fn frame_writes_while_marking_are_fixed_by_evacuation() {
     let mut arena = arena();
@@ -361,7 +361,7 @@ fn frames_check_their_bounds() {
     });
 }
 
-/// Copies between overlapping slots of the stack's own segment move them as `copy_within`
+/// A copy between overlapping slots of the stack's own segment behaves as `copy_within`
 /// does, in either direction.
 #[test]
 fn writes_from_overlapping_slots_move_them() {
@@ -425,7 +425,7 @@ fn segments_can_be_reused_once_free() {
     arena.mutate(|mc| first.switch(mc, first.segment(mc)));
     arena.mutate(|mc| first.switch(mc, Segment::new(mc, 300).unwrap()));
     let second = arena.mutate(|mc| mc.stack(mc.root(0).downcast::<Segment>(mc).unwrap()).unwrap());
-    // Dropped stacks free their segment at once, and their last trace doesn't void what the
+    // A dropped stack frees its segment at once. Its last trace does not reset the slots that the
     // segment's next stack wrote.
     fill(&mut arena, &second, 0, 8, 1);
     second.set_top(0);
@@ -478,8 +478,8 @@ impl Rng {
     }
 }
 
-/// Random frame writes, captures, switches and parks, with a collection slice after every
-/// step, checked against a model of what each slot should hold.
+/// Runs random frame writes, captures, switches and parks, with a collection slice after every
+/// step. The slots are checked against a model of the value that each slot should hold.
 #[test]
 fn random_stack_traffic_under_stress() {
     const LEN: usize = 600;
@@ -489,8 +489,8 @@ fn random_stack_traffic_under_stress() {
         arena.set_stress(Some(2048));
         arena.set_evacuate_all(evacuate);
         let mut rng = Rng(seed);
-        // The live slots of the current segment, and the captured ranges of every segment,
-        // which the root keeps as a list, newest first.
+        // The model. `live` holds the live slots of the current segment. `captured` holds the captured range of every segment.
+        // Root 0 keeps the segments as a list, newest first.
         let mut live = vec![None; LEN];
         let mut captured: Vec<Vec<Option<i64>>> = vec![Vec::new()];
         let mut next = 0;
@@ -518,7 +518,7 @@ fn random_stack_traffic_under_stress() {
                         if let Some(frame) = stack.frame(mc, fp) {
                             for _ in 0..rng.below(8) {
                                 let r = rng.below(WINDOW) as u8;
-                                // Slots from `top` up are dead, so collections void them.
+                                // Slots from `top` up are dead, and collections reset them to void. So the test does not write them.
                                 if fp + r as usize >= top {
                                     continue;
                                 }
@@ -575,8 +575,8 @@ fn stack_allocation_obeys_failure_injection_without_attaching() {
     assert_eq!(frame_values(&mut arena, &stack, 0, 1), [Some(7)]);
 }
 
-/// Slots written while marking and left above `top` before the segment is popped from the gray
-/// stack are not traced by incremental `drain`.
+/// A slot is written while marking, and is left above `top` before the segment is popped from the gray
+/// stack. The incremental `drain` must not trace that slot.
 #[test]
 fn dead_slots_written_while_marking_are_not_traced_by_drain() {
     let mut arena = arena();
@@ -588,8 +588,8 @@ fn dead_slots_written_while_marking_are_not_traced_by_drain() {
         Root::new(mc, outer).unwrap()
     });
     arena.collect();
-    // Root handles are marked after stacks, so a 1-byte slice pops `outer` (marking `inner`,
-    // without tracing `inner` yet) and leaves both `inner` and the segment on `work.gray`.
+    // Root handles are marked after stacks. So a 1-byte slice pops `outer` and marks `inner`,
+    // without tracing `inner` yet. Both `inner` and the segment are left on `work.gray`.
     arena.collect_slice(1);
     assert_eq!(arena.phase(), Phase::Marking);
     let seg = segment_index(&mut arena, &stack);
@@ -609,8 +609,8 @@ fn dead_slots_written_while_marking_are_not_traced_by_drain() {
     assert!(!is_marked(&mut arena, target), "drain traced a dead slot above top");
 }
 
-/// Leaving a segment, collecting on another segment with a low `top`, and resuming the first
-/// segment still voids its old frames when `top` drops below where it was retired.
+/// The stack leaves a segment, a collection runs while the stack is on another segment with a low `top`, and the stack then resumes the first
+/// segment. A collection must still reset the old frames of the first segment to void when `top` drops below the value it had when the segment was retired.
 #[test]
 fn resuming_a_segment_keeps_its_retired_written_bound() {
     let mut arena = arena();

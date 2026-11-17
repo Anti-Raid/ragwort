@@ -1,7 +1,7 @@
-//! Decimal digits, of every script Unicode 17 has them in.
+//! Decimal digits in every script that has them in Unicode 17.
 
-/// The zero of each run of ten decimal digits (`Numeric_Type=Decimal`), in order. Each run is
-/// its zero and the nine after it.
+/// The code point of the digit zero in each run of ten decimal digits (`Numeric_Type=Decimal`), in ascending order.
+/// A run is the zero and the nine code points after it.
 const ZEROS: [u32; 77] = [
     0x30, 0x660, 0x6F0, 0x7C0, 0x966, 0x9E6, 0xA66, 0xAE6, 0xB66, 0xBE6, 0xC66, 0xCE6, 0xD66, 0xDE6, 0xE50, 0xED0, 0xF20,
     0x1040, 0x1090, 0x17E0, 0x1810, 0x1946, 0x19D0, 0x1A80, 0x1A90, 0x1B50, 0x1BB0, 0x1C40, 0x1C50, 0xA620, 0xA8D0, 0xA900,
@@ -11,7 +11,7 @@ const ZEROS: [u32; 77] = [
     0x1E2F0, 0x1E4F0, 0x1E5F1, 0x1E950, 0x1FBF0,
 ];
 
-/// The value of `character` if it's a decimal digit, of any script.
+/// Returns the value of `character` if it is a decimal digit in any script, or `None` otherwise.
 pub fn digit_value(character: char) -> Option<u32> {
     let code = u32::from(character);
     if code < 0x80 {

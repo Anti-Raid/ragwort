@@ -1,8 +1,8 @@
-//! Immutable strings over any heap. A string is flat, its characters in one array at the
-//! narrowest width that holds them all, one, two or four bytes each, or a rope: a balanced
-//! tree of strings that [`concat()`] builds when copying would cost more than it saves. The heap
-//! implements [`Host`] and the library does the rest, without allocating anywhere else. A
-//! flat string's characters can also live outside the heap, as an [`External`].
+//! Immutable strings over any heap. A string is either flat or a rope. A flat string stores its
+//! characters in one array of one-, two- or four-byte units, at the narrowest width that holds every character.
+//! A rope is a balanced binary tree of strings. [`concat()`] builds a rope when the result is too long to copy cheaply.
+//! The heap implements [`Host`], and the library allocates only through it.
+//! A flat string's characters can also live outside the heap, as an [`External`].
 
 mod case;
 mod digit;
@@ -35,33 +35,33 @@ pub use rope::{concat, concat_all, flatten, substring};
 pub use search::{Split, SplitWhitespace, ends_with, find, rfind, split, split_whitespace, splitn, starts_with, trim, trim_end, trim_start};
 pub use units::{Inline, Packed, PackedMut, Units, UnitsMut, Width};
 
-/// The longest string: a rope can share one string many times over, so length isn't bounded
-/// by memory.
+/// The maximum length of a string, in characters. A rope can share the same string many times,
+/// so memory does not bound the length.
 pub const MAX_LEN: usize = (1 << 48) - 1;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StrError {
     OutOfRange,
     TooLong,
-    /// External characters stored wider than they need.
+    /// The units of an external string are wider than its characters need.
     NotNarrowest,
-    /// Bytes that aren't UTF-8, read as text.
+    /// Bytes that were read as text are not valid UTF-8.
     NotUtf8,
 }
 
-/// What a rope node knows of its characters, which its host stores with it.
+/// Summary of a rope node's characters. The host stores it in the node.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Info {
     pub len: usize,
-    /// The widest of its flat strings.
+    /// The widest [`Width`] among the rope's flat strings.
     pub width: Width,
-    /// Edges to its deepest flat string. Ropes stay balanced, so this is about `log2` of the
-    /// number of flat strings at most.
+    /// The number of edges from this node to its deepest flat string. Ropes stay balanced, so
+    /// the depth is at most about `log2` of the number of flat strings.
     pub depth: u8,
 }
 
 impl Info {
-    /// The length in the low 48 bits, then the width and the depth.
+    /// Packs the fields into one word: `len` in the low 48 bits, `width` in bits 48 to 55 and `depth` in bits 56 to 63.
     pub fn to_bits(self) -> u64 {
         self.len as u64 | (self.width as u64) << 48 | (self.depth as u64) << 56
     }
@@ -74,40 +74,40 @@ impl Info {
 
 pub enum StrView<'a, S> {
     Flat(Units<'a>),
-    /// `flat` is the copy [`Host::flattened`] gave the rope, if any: the same characters.
+    /// `flat` is the flat copy that [`Host::flattened`] stored for the rope, if any. It holds the same characters as the rope.
     Rope { left: S, right: S, info: Info, flat: Option<S> },
 }
 
-/// Where strings live. The library reads them through [`Host::view`] and makes them with
-/// [`Host::flat`] and [`Host::rope`].
+/// The heap that stores strings. The library reads strings through [`Host::view`] and creates
+/// them with [`Host::flat`] and [`Host::rope`].
 pub trait Host {
-    /// Equal handles are the same string.
+    /// A handle to a string. Equal handles refer to the same string.
     type Str: Copy + Eq;
     type Error: From<StrError>;
 
     fn view(&self, string: Self::Str) -> StrView<'_, Self::Str>;
 
-    /// A flat string of `len` characters at `width`, zeroed for `init` to fill in. Views of
-    /// other strings stay valid while it runs.
+    /// Allocates a flat string of `len` characters at `width`. The units start zeroed, and `init` fills them in.
+    /// Views of other strings stay valid while `init` runs.
     fn flat(&self, width: Width, len: usize, init: impl FnOnce(UnitsMut<'_>)) -> Result<Self::Str, Self::Error>;
 
-    /// A rope of `left` then `right`, both nonempty, which `info` sums up.
+    /// Allocates a rope node of `left` followed by `right`. Both are nonempty, and `info` describes the new node.
     fn rope(&self, left: Self::Str, right: Self::Str, info: Info) -> Result<Self::Str, Self::Error>;
 
-    /// Keeps `flat`, a flat copy of `rope`'s characters, for [`StrView::Rope`] to hand back.
-    /// A host whose ropes can't change leaves this out.
+    /// Stores `flat`, a flat copy of `rope`'s characters, so that later views of `rope` return it in [`StrView::Rope`].
+    /// A host whose ropes cannot be modified keeps the default, which does nothing.
     fn flattened(&self, rope: Self::Str, flat: Self::Str) {
         let _ = (rope, flat);
     }
 
-    /// Counts a read of `rope` by position, and returns how many it has had. Ropes read often
-    /// enough get flattened; a host that leaves this out keeps them as they are.
+    /// Records one read of `rope` by character index and returns the total number of such reads. The library flattens a rope
+    /// that has been read often enough. With the default, which returns 0, reads never flatten a rope.
     fn count_read(&self, rope: Self::Str) -> u64 {
         let _ = rope;
         0
     }
 
-    /// Called before about `work` character operations.
+    /// Called before the library performs about `work` character operations. Returning an error aborts the operation.
     #[inline]
     fn charge(&self, work: u64) -> Result<(), Self::Error> {
         let _ = work;
@@ -136,7 +136,7 @@ pub fn from_str<H: Host>(h: &H, string: &str) -> Res<H> {
     from_chars(h, string.chars())
 }
 
-/// A string of the characters `chars` yields, which it must yield the same each time.
+/// Returns a string of the characters that `chars` yields. `chars` is iterated twice, and both passes must yield the same characters.
 pub fn from_chars<H: Host>(h: &H, chars: impl Iterator<Item = char> + Clone) -> Res<H> {
     let (len, width) = chars.clone().fold((0, Width::One), |(n, widest), character| (n + 1, widest.max(Width::of(character))));
     if len > MAX_LEN {
@@ -150,7 +150,7 @@ pub fn from_chars<H: Host>(h: &H, chars: impl Iterator<Item = char> + Clone) -> 
     })
 }
 
-/// `n` copies of `character`.
+/// Returns a string of `n` copies of `character`.
 pub fn repeat<H: Host>(h: &H, character: char, n: usize) -> Res<H> {
     if n > MAX_LEN {
         return Err(StrError::TooLong.into());
@@ -175,8 +175,8 @@ pub fn is_flat<H: Host>(h: &H, string: H::Str) -> bool {
     matches!(h.view(string), StrView::Flat(_))
 }
 
-/// The character at `i`, in time proportional to the rope's depth. A rope read this way often
-/// enough is flattened, after which reads take constant time.
+/// Returns the character at index `i`. On a rope, the read takes time proportional to the rope's depth.
+/// A rope that is read this way often enough is flattened, and later reads take constant time.
 #[inline]
 pub fn char_at<H: Host>(h: &H, string: H::Str, i: usize) -> Result<char, H::Error> {
     match flat(h, string) {
@@ -185,7 +185,7 @@ pub fn char_at<H: Host>(h: &H, string: H::Str, i: usize) -> Result<char, H::Erro
     }
 }
 
-/// Kept out of line, as are the other rope cases, so the flat ones inline small.
+/// The rope case of [`char_at`]. This and the other rope cases are kept out of line, so that the flat cases stay small when inlined.
 #[inline(never)]
 fn rope_char_at<H: Host>(h: &H, mut string: H::Str, mut i: usize) -> Result<char, H::Error> {
     match h.view(string) {
@@ -218,7 +218,7 @@ pub fn chars<H: Host>(h: &H, string: H::Str) -> Chars<'_, H> {
     Chars::new(chunks(h, string))
 }
 
-/// Orders by code point, then by length.
+/// Compares `a` and `b` lexicographically by code point. If one string is a prefix of the other, the shorter string orders first.
 #[inline]
 pub fn compare<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<Ordering, H::Error> {
     if a == b {
@@ -248,7 +248,7 @@ fn compare_chunks<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<Ordering, H::E
     Ok(compare_runs(chunks(h, a), chunks(h, b)).then(len(h, a).cmp(&len(h, b))))
 }
 
-/// Orders the characters of two runs of chunks by code point, as far as the shorter goes.
+/// Compares the characters of two chunk sequences by code point, up to the length of the shorter sequence. Returns `Equal` if they agree over that length.
 pub(crate) fn compare_runs<'a>(mut ca: impl Iterator<Item = Units<'a>>, mut cb: impl Iterator<Item = Units<'a>>) -> Ordering {
     let (mut run_a, mut run_b) = (Units::One(&[]), Units::One(&[]));
     loop {
@@ -297,7 +297,7 @@ fn rope_equal<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<bool, H::Error> {
     Ok(compare_chunks(h, a, b)? == Ordering::Equal)
 }
 
-/// Whether `string` holds the characters of `text`.
+/// Returns whether `string` has the same characters as `text`.
 #[inline]
 pub fn equal_str<H: Host>(h: &H, string: H::Str, text: &str) -> Result<bool, H::Error> {
     match flat(h, string) {
@@ -321,9 +321,9 @@ fn rope_equal_str<H: Host>(h: &H, string: H::Str, text: &str) -> Result<bool, H:
 
 #[inline]
 fn units_equal_str<H: Host>(h: &H, units: Units<'_>, text: &str) -> Result<bool, H::Error> {
-    // As many characters as `text` has bytes match only if `text` is ASCII: Latin-1 isn't UTF-8 past
-    // it. A test for each kind rather than a match: names mix kinds, and a jump table guesses
-    // worse.
+    // One-byte units that are as many as the bytes of `text` can equal `text` only if `text` is ASCII.
+    // A Latin-1 character above U+007F takes two bytes in UTF-8. Each representation gets its own `if` instead of one `match`.
+    // Names mix representations, and the indirect jump of a jump table is predicted worse than these branches.
     if let Units::Inline(inline) = units
         && inline.len() == text.len()
     {
@@ -349,7 +349,7 @@ fn units_equal_str<H: Host>(h: &H, units: Units<'_>, text: &str) -> Result<bool,
     Ok(units.chars().eq(text.chars()))
 }
 
-/// The characters of `string`, if it's flat.
+/// Returns the units of `string` if it is flat, or `None` if it is a rope.
 #[inline]
 fn flat<H: Host>(h: &H, string: H::Str) -> Option<Units<'_>> {
     match h.view(string) {
@@ -358,8 +358,8 @@ fn flat<H: Host>(h: &H, string: H::Str) -> Option<Units<'_>> {
     }
 }
 
-/// What [`info`] says of `string`, and the characters of a flat string or of a rope's flat copy,
-/// from one view.
+/// Returns the [`Info`] of `string` and, if `string` is flat or is a rope with a flat copy, its units.
+/// It views `string` only once.
 fn summary<H: Host>(h: &H, string: H::Str) -> (Info, Option<Units<'_>>) {
     match h.view(string) {
         StrView::Flat(units) => (Info { len: units.len(), width: units.width(), depth: 0 }, Some(units)),
@@ -380,7 +380,7 @@ pub fn utf8_len<H: Host>(h: &H, string: H::Str) -> Result<usize, H::Error> {
     Ok(chunks(h, string).map(Units::utf8_len).sum())
 }
 
-/// Writes `string` as UTF-8, with `write!` or `to_string`.
+/// Returns a value that formats `string` as UTF-8, for use with `write!` or `to_string`.
 pub fn display<H: Host>(h: &H, string: H::Str) -> Display<'_, H> {
     Display { h, s: string }
 }
@@ -405,7 +405,7 @@ impl<H: Host> fmt::Display for Display<'_, H> {
     }
 }
 
-/// Characters encoded for a formatter, gathered so they're written a block at a time.
+/// A buffer of UTF-8 bytes in front of a formatter. Encoded characters collect in `buf` and are written a block at a time.
 struct Utf8<'a, 'f> {
     f: &'a mut fmt::Formatter<'f>,
     buf: [u8; 256],
@@ -418,7 +418,7 @@ impl Utf8<'_, '_> {
         self.f.write_str(std::str::from_utf8(&self.buf[..n]).expect("whole characters"))
     }
 
-    /// Latin-1 bytes encoded into the buffer, which has room for them.
+    /// Encodes the Latin-1 `bytes` as UTF-8 into the buffer. The caller ensures that the buffer has room for two bytes per input byte.
     #[inline]
     fn latin1(&mut self, bytes: &[u8]) {
         for &byte in bytes {
@@ -438,7 +438,7 @@ impl Utf8<'_, '_> {
                 self.flush()?;
                 self.f.write_str(std::str::from_utf8(bytes).expect("ASCII"))
             }
-            // A block at a time: ASCII straight into the buffer, the rest encoded.
+            // Handle 64 units at a time. ASCII units are copied straight into the buffer, and other Latin-1 units are encoded.
             Units::Packed(packed) if packed.width() == Width::One => {
                 let ascii = packed.is_ascii();
                 for from in (0..packed.len()).step_by(64) {
@@ -467,8 +467,12 @@ impl Utf8<'_, '_> {
             _ => {
                 let mut written = Ok(());
                 units.each_char(|character| {
+                    // Once a write has failed, the rest of the characters are skipped.
+                    if written.is_err() {
+                        return;
+                    }
                     if self.n + 4 > self.buf.len() {
-                        written = written.and(self.flush());
+                        written = self.flush();
                     }
                     self.n += character.encode_utf8(&mut self.buf[self.n..]).len();
                 });

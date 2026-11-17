@@ -31,6 +31,10 @@ pub(crate) fn fix_letrec<'s, 'id, 'gc>(mc: &Mutation<'gc>, from: &L1<'s, 'gc>, r
         Keep,
         Make(l1::Id<'s>),
     }
+    /// Removes the last `count` lowered nodes from `vals` and returns them in order.
+    fn last<'id>(vals: &mut Vec<Id<'id>>, count: usize) -> Vec<Id<'id>> {
+        vals.split_off(vals.len() - count)
+    }
     let mut cx = Cx { mc, tree, supply: &mut supply };
     let mut usages = vec![Usage::default()];
     let mut vals: Vec<Id<'id>> = Vec::new();
@@ -73,22 +77,21 @@ pub(crate) fn fix_letrec<'s, 'id, 'gc>(mc: &Mutation<'gc>, from: &L1<'s, 'gc>, r
             }
             Task::Make(id) => {
                 cx.tree.at(from.site(id));
-                let mut last = |count: usize| vals.split_off(vals.len() - count);
                 let node = match from[id] {
                     l1::Node::If(..) => {
-                        let [test, consequent, other] = last(3)[..] else { unreachable!() };
+                        let [test, consequent, other] = last(&mut vals, 3)[..] else { unreachable!() };
                         Node::If(test, consequent, other)
                     }
-                    l1::Node::Set(var, _) => Node::Set(var, last(1)[0]),
+                    l1::Node::Set(var, _) => Node::Set(var, last(&mut vals, 1)[0]),
                     l1::Node::App(_, args) => {
-                        let mut all = last(from[args].len() + 1);
+                        let mut all = last(&mut vals, from[args].len() + 1);
                         let args = all.split_off(1);
                         Node::App(all[0], cx.tree.list(args))
                     }
-                    l1::Node::Intrinsic(prim, args) => Node::Intrinsic(prim, cx.tree.list(last(from[args].len()))),
-                    l1::Node::ApplyIntrinsic(prim, args) => Node::ApplyIntrinsic(prim, cx.tree.list(last(from[args].len()))),
+                    l1::Node::Intrinsic(prim, args) => Node::Intrinsic(prim, cx.tree.list(last(&mut vals, from[args].len()))),
+                    l1::Node::ApplyIntrinsic(prim, args) => Node::ApplyIntrinsic(prim, cx.tree.list(last(&mut vals, from[args].len()))),
                     l1::Node::Lambda(fun) => {
-                        let body = last(1)[0];
+                        let body = last(&mut vals, 1)[0];
                         let inner = usages.pop().expect("opened");
                         let function = from[fun];
                         let params = &from[function.params];
@@ -97,7 +100,7 @@ pub(crate) fn fix_letrec<'s, 'id, 'gc>(mc: &Mutation<'gc>, from: &L1<'s, 'gc>, r
                         Node::Lambda(cx.tree.function(l2::Function { id: function.id, optional: function.optional, params, rest: function.rest, body }))
                     }
                     l1::Node::Let(binds, _) | l1::Node::Letrec(binds, _) => {
-                        let body = last(1)[0];
+                        let body = last(&mut vals, 1)[0];
                         let body_usage = usages.pop().expect("opened");
                         let fixed = inits.split_off(inits.len() - from[binds].len());
                         let binds: Vec<(Var, Id<'id>, Usage)> = from[binds].iter().zip(fixed).map(|(&(var, _), (init, init_usage))| (var, init, init_usage)).collect();
@@ -162,14 +165,14 @@ impl Usage {
 
     /// Computes the intersection of `self`'s used and assigned variables with `vars`, returning `(used_in_vars, assigned_in_vars)`.
     fn among(&self, vars: &HashSet<Var>) -> (HashSet<Var>, HashSet<Var>) {
-        let among = |set: &HashSet<Var>| -> HashSet<Var> {
+        fn among(set: &HashSet<Var>, vars: &HashSet<Var>) -> HashSet<Var> {
             if set.len() < vars.len() {
                 set.iter().copied().filter(|var| vars.contains(var)).collect()
             } else {
                 vars.iter().copied().filter(|var| set.contains(var)).collect()
             }
-        };
-        (among(&self.used), among(&self.assigned))
+        }
+        (among(&self.used, vars), among(&self.assigned, vars))
     }
 }
 

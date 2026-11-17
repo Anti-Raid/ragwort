@@ -106,7 +106,7 @@ named! {
         Close = "co/close",
         /// `(co/reset co thunk)`: closes `co` as `co/close` does, then makes it pending again with
         /// procedure `thunk` as its body. Returns `co`. If an `after` thunk raises with no handler, the
-        /// value is raised at the call site, and `co` is pending with the new body all the same.
+        /// value is raised at the call site, and `co` is still made pending with the new body.
         Reset = "co/reset",
         /// `(keyword-apply f kws vals arg ... list)`: calls `f` with keyword arguments defined by sorted symbol
         /// list `kws` and matching value list `vals`, followed by positional arguments `arg ...` and the
@@ -142,60 +142,59 @@ impl Request {
         }
     }
 
-    /// Executes the request with `args`, which must satisfy [takes](Request::takes). `base` and `tail` say where the request was made, as [`Outer::keep`] takes them.
+    /// Executes the request with `args`, which must satisfy [takes](Request::takes). `base` and `tail` give the position of the request, as for [`Outer::keep`].
     pub(crate) fn run<'gc>(self, outer: &mut Outer<'_, 'gc>, args: Passed<'gc>, base: u8, tail: bool) -> Result<Then<'gc>, Fault> {
         let (mc, task) = (outer.mc(), outer.task());
-        let arg = |index| args.get(mc, index);
         Ok(match self {
-            Request::Apply => Then::Call(arg(0)?, args.skip(mc, 1)?.spread_last(mc)?),
+            Request::Apply => Then::Call(args.get(mc, 0)?, args.skip(mc, 1)?.spread_last(mc)?),
             Request::Receive => {
-                outer.push(Kind::Receive, arg(0)?, Value::VOID)?;
-                Then::Call(arg(1)?, args.skip(mc, 2)?)
+                outer.push(Kind::Receive, args.get(mc, 0)?, Value::VOID)?;
+                Then::Call(args.get(mc, 1)?, args.skip(mc, 2)?)
             }
             Request::Collect => {
                 outer.push(Kind::Collect, Value::VOID, Value::VOID)?;
-                Then::Call(arg(0)?, args.skip(mc, 1)?)
+                Then::Call(args.get(mc, 0)?, args.skip(mc, 1)?)
             }
             Request::WithMark => {
-                outer.segments.set_mark(arg(0)?, arg(1)?)?;
-                Then::Call(arg(2)?, args.skip(mc, 3)?)
+                outer.segments.set_mark(args.get(mc, 0)?, args.get(mc, 1)?)?;
+                Then::Call(args.get(mc, 2)?, args.skip(mc, 3)?)
             }
             Request::CallWithPrompt => {
-                prompts::push(mc, task, tag_of(mc, arg(0)?)?, arg(1)?)?;
-                Then::Call(arg(2)?, args.skip(mc, 3)?)
+                prompts::push(mc, task, tag_of(mc, args.get(mc, 0)?)?, args.get(mc, 1)?)?;
+                Then::Call(args.get(mc, 2)?, args.skip(mc, 3)?)
             }
-            Request::Abort => outer.abort(arg(0)?, args.skip(mc, 1)?, base, tail)?,
+            Request::Abort => outer.abort(args.get(mc, 0)?, args.skip(mc, 1)?, base, tail)?,
             Request::Capture => {
-                let continuation = prompts::capture(mc, task, tag_of(mc, arg(0)?)?, false)?;
-                Then::Call(arg(1)?, outer.pass(&[continuation])?)
+                let continuation = prompts::capture(mc, task, tag_of(mc, args.get(mc, 0)?)?, false)?;
+                Then::Call(args.get(mc, 1)?, outer.pass(&[continuation])?)
             }
             Request::CallCc => {
                 let continuation = prompts::capture(mc, task, prompts::default_tag(), true)?;
-                Then::Call(arg(0)?, outer.pass(&[continuation])?)
+                Then::Call(args.get(mc, 0)?, outer.pass(&[continuation])?)
             }
             Request::Compose => {
-                prompts::compose(mc, task, arg(0)?.downcast::<Continuation>(mc).ok_or(Fault::WrongType)?)?;
+                prompts::compose(mc, task, args.get(mc, 0)?.downcast::<Continuation>(mc).ok_or(Fault::WrongType)?)?;
                 args.skip(mc, 1)?.returned(mc)?
             }
-            Request::WithHandler => outer.with_handler(arg(0)?, arg(1)?)?,
-            Request::Raise => Then::Raise(arg(0)?, false),
-            Request::RaiseContinuable => Then::Raise(arg(0)?, true),
+            Request::WithHandler => outer.with_handler(args.get(mc, 0)?, args.get(mc, 1)?)?,
+            Request::Raise => Then::Raise(args.get(mc, 0)?, false),
+            Request::RaiseContinuable => Then::Raise(args.get(mc, 0)?, true),
             Request::Guard | Request::GuardQuiet => {
-                outer.guard(arg(1)?, false, self == Request::Guard)?;
-                Then::Call(arg(0)?, Passed::none())
+                outer.guard(args.get(mc, 1)?, false, self == Request::Guard)?;
+                Then::Call(args.get(mc, 0)?, Passed::none())
             }
-            // `Outer::request` makes these switches itself.
+            // `Outer::request` performs these coroutine switches itself, so they never reach this function.
             Request::Resume | Request::TryResume | Request::Yield => return Err(Fault::Malformed),
-            Request::ResumeError => Then::ResumeError(arg(0)?, arg(1)?),
-            Request::Close => Then::Close(arg(0)?, Value::FALSE),
+            Request::ResumeError => Then::ResumeError(args.get(mc, 0)?, args.get(mc, 1)?),
+            Request::Close => Then::Close(args.get(mc, 0)?, Value::FALSE),
             Request::Reset => {
-                let thunk = arg(1)?;
+                let thunk = args.get(mc, 1)?;
                 if !crate::intrinsic::is_procedure(mc, thunk) {
                     return Err(Fault::WrongType);
                 }
-                Then::Close(arg(0)?, thunk)
+                Then::Close(args.get(mc, 0)?, thunk)
             }
-            Request::KeywordApply => crate::keyword::apply(mc, arg(0)?, arg(1)?, arg(2)?, args.skip(mc, 3)?.spread_last(mc)?)?,
+            Request::KeywordApply => crate::keyword::apply(mc, args.get(mc, 0)?, args.get(mc, 1)?, args.get(mc, 2)?, args.skip(mc, 3)?.spread_last(mc)?)?,
         })
     }
 }

@@ -1,5 +1,5 @@
-//! Reader throughput on bot-like source: nested lists of a few hundred names, quotes and
-//! dotted tails, or the file named by the first argument. Run with `--release`.
+//! Measures reader throughput. The input is generated source that resembles bot code: nested lists
+//! of names, quotes and dotted tails. If a first argument is given, the input is that file instead. Run with `--release`.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -9,17 +9,17 @@ use ragwort_types::gc::Arena;
 use ragwort_types::symbol::Symbols;
 use ragwort_types::syntax::SyntaxSession;
 
-/// Roughly `bytes` of source, the same every run.
+/// Generates roughly `bytes` bytes of source. The output is the same on every run.
 fn source(bytes: usize) -> String {
     const NAMES: &[&str] = &["define", "lambda", "let", "if", "cond", "else", "car", "cdr", "cons", "list", "null?",
         "message", "guild", "user", "channel", "role", "send-message!", "get-member", "x", "acc", "rest", "loop"];
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
-    let mut next = || {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        state as usize
-    };
+    fn next(state: &mut u64) -> usize {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state as usize
+    }
     let mut out = String::new();
     while out.len() < bytes {
         out.push_str("(define (handler msg . rest)");
@@ -27,8 +27,8 @@ fn source(bytes: usize) -> String {
         for _ in 0..6 {
             out.push_str("\n  (");
             open.push(')');
-            for _ in 0..1 + next() % 5 {
-                match next() % 8 {
+            for _ in 0..1 + next(&mut state) % 5 {
+                match next(&mut state) % 8 {
                     0 => {
                         out.push_str("'(");
                         open.push(')');
@@ -39,10 +39,10 @@ fn source(bytes: usize) -> String {
                     }
                     _ => {}
                 }
-                out.push_str(NAMES[next() % NAMES.len()]);
+                out.push_str(NAMES[next(&mut state) % NAMES.len()]);
                 out.push(' ');
             }
-            out.push_str(NAMES[next() % NAMES.len()]);
+            out.push_str(NAMES[next(&mut state) % NAMES.len()]);
             while open.len() > 1 {
                 out.extend(open.pop());
             }

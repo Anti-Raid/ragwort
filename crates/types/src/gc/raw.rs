@@ -3,50 +3,50 @@ use std::marker::PhantomData;
 use super::{AnyHostRef, Fields, Gc, Item, Mutation, Object, Phase, Slots, Value, WORDS, field_slot, host_parts, items_start, mask};
 
 pub trait Raw<'gc>: Copy {
-    /// The word a field declared in `Desc::members` holds.
+    /// Returns the word that a field declared in `Desc::members` holds for this object: the object's index.
     fn to_word(self) -> u64;
 
-    /// Indexes a view of the words shifted by the field, so for a constant field the masked
-    /// index is the whole address computation, as a list walk's chain of loads wants.
+    /// Returns the word of field `field`. It indexes a view of the region that is shifted by `1 + field` words. So for a constant field, the masked
+    /// index is the whole address computation. A chain of loads, as in a list walk, benefits from this.
     fn word(self, mc: &Mutation<'gc>, field: usize) -> u64;
 
-    /// For fields that hold no reference: no barrier.
+    /// Sets the word of field `field`, with no barrier. For fields that hold no reference.
     fn set_word(self, mc: &Mutation<'gc>, field: usize, word: u64);
 
     fn value(self, mc: &Mutation<'gc>, field: usize) -> Value<'gc>;
 
     fn set_value(self, mc: &Mutation<'gc>, field: usize, value: Value<'gc>);
 
-    /// Unchecked: the word is taken to be a `U`.
+    /// Returns the object in member field `field`, or `None` for index 0. The type is not checked: the target is assumed to be a `U`.
     fn member<U: Object>(self, mc: &Mutation<'gc>, field: usize) -> Option<Gc<'gc, U>>;
 
     fn set_member<U: Object>(self, mc: &Mutation<'gc>, field: usize, member: Option<Gc<'gc, U>>);
 
-    /// The target of a weak field, or `None` once it has died.
+    /// Returns the target of weak field `field`, or `None` once the target has died.
     fn weak<U: Object>(self, mc: &Mutation<'gc>, field: usize) -> Option<Gc<'gc, U>>;
 
-    /// Dirties the card, for minor collections to clear the field, but doesn't shade the target.
+    /// Sets weak field `field` to `target`. Marks the card dirty, so that a minor collection can clear the field, but does not shade the target.
     fn set_weak<U: Object>(self, mc: &Mutation<'gc>, field: usize, target: Option<Gc<'gc, U>>);
 
     fn host(self, mc: &Mutation<'gc>, field: usize) -> Option<AnyHostRef<'gc>>;
 
     fn set_host(self, mc: &Mutation<'gc>, field: usize, host: AnyHostRef<'gc>);
 
-    /// The object's first `N` fields. `N` past the declared fields doesn't compile.
+    /// Returns the object's first `N` fields. An `N` larger than the number of declared fields does not compile.
     fn fields<const N: usize>(self, mc: &Mutation<'gc>) -> Option<Fields<'gc, N>>;
 
-    /// The key and value of the ephemeron at `field`, one in `Desc::ephemerons`, or `None` once
-    /// its key has died.
+    /// Returns the key and value of the ephemeron at `field`, which must be a field in `Desc::ephemerons`. Returns `None` once
+    /// the key has died.
     fn ephemeron(self, mc: &Mutation<'gc>, field: usize) -> Option<(Value<'gc>, Value<'gc>)>;
 
-    /// Neither part is shaded while marking: the value is traced once the key is found live.
-    /// The cards are dirtied, so a minor collection sees both.
+    /// Sets the key and value of the ephemeron at `field`. Neither is shaded while marking, because the value is traced once the key is found live.
+    /// Both cards are marked dirty, so a minor collection sees both words.
     fn set_ephemeron(self, mc: &Mutation<'gc>, field: usize, key: Value<'gc>, value: Value<'gc>);
 
-    /// The items as values, whatever the type declares them as.
+    /// Returns the items as values, whatever kind the type declares for them.
     fn slots(self, mc: &Mutation<'gc>) -> Slots<'gc>;
 
-    /// The items as `S`.
+    /// Returns the items as slots of kind `S`.
     fn item_slots<S: Item>(self, mc: &Mutation<'gc>) -> Slots<'gc, S>;
 }
 

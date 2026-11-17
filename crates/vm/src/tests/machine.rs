@@ -32,7 +32,7 @@ fn module_in<'gc>(mc: &Mutation<'gc>, owner: Option<Gc<'gc, Module>>, constants:
         .iter()
         .map(|&(arity, captures, ops)| {
             let (ops, captures) = (mc.frozen(Box::from(ops)).unwrap(), mc.frozen(Box::from(captures)).unwrap());
-            Bytecode::new(mc, ops, Value::VOID, captures, arity, owner, Value::FALSE, Value::FALSE, 0, Value::FALSE, 0, 0).unwrap()
+            Bytecode::new(mc, ops, Value::VOID, captures, arity, owner, Value::FALSE, Value::FALSE, 0, Value::FALSE, 0, 0, None).unwrap()
         })
         .collect();
     let mut table = constants.to_vec();
@@ -79,7 +79,7 @@ fn spread<'gc>(mc: &Mutation<'gc>, list: Value<'gc>) -> Vec<Value<'gc>> {
     Pairs::new(mc).elements(list).collect()
 }
 
-/// Creates a machine that calls `procedure` with `args` and finishes with the list of all the values it returned. A machine finishes with one value, so this is how a test sees several.
+/// Creates a machine that calls `procedure` with `args` and finishes with the list of all the values it returned. A machine finishes with one value, so a test uses this function to observe several values.
 fn collecting<'gc>(mc: &Mutation<'gc>, procedure: Value<'gc>, args: &[Value<'gc>]) -> Result<Machine, Fault> {
     // `(lambda (f . args) (receive (lambda all all) f . args))`
     let all: Func<'_> = (-1, &[], &[Op::Return { src: 1 }]);
@@ -116,8 +116,7 @@ fn run<'gc>(mc: &Mutation<'gc>, code: Gc<'gc, Bytecode>, args: &[Value<'gc>]) ->
         Outcome::Raised(raised) => return Err(fault(mc, raised)),
         Outcome::Paused | Outcome::Yielded(_) | Outcome::Deferred(_) => unreachable!(),
     };
-    let digits = |v: Value<'gc>| items(mc, v).iter().fold(0, |a, &n| a * 10 + n);
-    Ok(values.iter().map(|&v| if Pair::of(v).is_some() { digits(v) } else { v.as_fixnum().unwrap() }).collect())
+    Ok(values.iter().map(|&v| if Pair::of(v).is_some() { items(mc, v).iter().fold(0, |a, &n| a * 10 + n) } else { v.as_fixnum().unwrap() }).collect())
 }
 
 /// Steps the machine to completion across arena collection boundaries, allowing incremental GC between execution steps. Returns the final values as fixnums and the total number of execution steps required.
@@ -301,12 +300,11 @@ fn several_values_are_returned_but_not_loaded() {
             Op::ReturnValues { src: 2, count: 3 },
         ],
     );
-    let funcs = |main: &'static [Op]| -> [Func<'static>; 2] { [(0, &[], main), three] };
     let constants = [1, 2, 3, 0];
 
     // Returning multiple values directly from a task succeeds and unpacks them; attempting to pass them to a single-value operation like `(+ 1 (three))` raises a value-count error.
     let tail = &[Op::NewClosure { dst: 3, count: 1, code: 5 }, Op::TailCall { base: 3, args: 0 }];
-    assert_eq!(call(&constants, &funcs(tail), &[]), Ok(vec![1, 2, 3]));
+    assert_eq!(call(&constants, &[(0, &[], tail), three], &[]), Ok(vec![1, 2, 3]));
     let add = &[
         Op::NewClosure { dst: 5, count: 1, code: 5 },
         Op::Call { base: 5, args: 0 },
@@ -316,54 +314,57 @@ fn several_values_are_returned_but_not_loaded() {
         Op::LoadAcc { dst: 2 },
         Op::Return { src: 2 },
     ];
-    assert_eq!(call(&constants, &funcs(add), &[]), Err(Fault::ValueCount));
-    // A call's result is returned as it is, so the values pass through `(define (again) (three))` when it is not a tail call.
+    assert_eq!(call(&constants, &[(0, &[], add), three], &[]), Err(Fault::ValueCount));
+    // `ReturnReceived` returns a call's result unchanged. So `(define (again) (three))` passes the three values on even when it calls `three` with a non-tail call.
     let again = &[Op::NewClosure { dst: 5, count: 1, code: 5 }, Op::Call { base: 5, args: 0 }, Op::ReturnReceived];
-    assert_eq!(call(&constants, &funcs(again), &[]), Ok(vec![1, 2, 3]));
+    assert_eq!(call(&constants, &[(0, &[], again), three], &[]), Ok(vec![1, 2, 3]));
 
-    // Returning no values at all leaves a receiver nothing.
+    // A return of zero values gives the receiver an empty list of values.
     let none = &[Op::ReturnValues { src: 2, count: 0 }];
-    assert_eq!(call(&constants, &funcs(none), &[]), Ok(vec![]));
+    assert_eq!(call(&constants, &[(0, &[], none), three], &[]), Ok(vec![]));
 }
 
 #[test]
 fn a_consumer_receives_what_a_producer_returns() {
-    // `(define (three) (values 1 2 3))`, `(define (one) 7)` and `(define (sum . xs) (apply + xs))`.
-    let three: Func<'_> = (
-        0,
-        &[],
-        &[
-            Op::LoadConst { dst: 2, index: 0 },
-            Op::LoadConst { dst: 3, index: 1 },
-            Op::LoadConst { dst: 4, index: 2 },
-            Op::ReturnValues { src: 2, count: 3 },
-        ],
-    );
-    let one: Func<'_> = (0, &[], &[Op::LoadConst { dst: 2, index: 3 }, Op::Return { src: 2 }]);
-    let sum: Func<'_> = (-1, &[], &[Op::ApplyIntrinsic { base: 1, args: 1, intrinsic: Add }, Op::LoadAcc { dst: 3 }, Op::Return { src: 3 }]);
-    let constants = [1, 2, 3, 7];
-    // Function 0 is the entry. `producer` and `consumer` are the constant indexes of the other three.
-    let (three_code, one_code, sum_code) = (5, 6, 7);
-    let run = |producer: u32, consumer: u32, receive: &[Op]| {
+    fn run(producer: u32, consumer: u32, receive: &[Op]) -> Result<Vec<i64>, Fault> {
+        // `(define (three) (values 1 2 3))`, `(define (one) 7)` and `(define (sum . xs) (apply + xs))`.
+        let three: Func<'_> = (
+            0,
+            &[],
+            &[
+                Op::LoadConst { dst: 2, index: 0 },
+                Op::LoadConst { dst: 3, index: 1 },
+                Op::LoadConst { dst: 4, index: 2 },
+                Op::ReturnValues { src: 2, count: 3 },
+            ],
+        );
+        let one: Func<'_> = (0, &[], &[Op::LoadConst { dst: 2, index: 3 }, Op::Return { src: 2 }]);
+        let sum: Func<'_> = (-1, &[], &[Op::ApplyIntrinsic { base: 1, args: 1, intrinsic: Add }, Op::LoadAcc { dst: 3 }, Op::Return { src: 3 }]);
+        let constants = [1, 2, 3, 7];
         let mut main = vec![Op::NewClosure { dst: 5, count: 1, code: consumer }, Op::NewClosure { dst: 6, count: 1, code: producer }];
         main.extend_from_slice(receive);
         call(&constants, &[(0, &[], &main), three, one, sum], &[])
-    };
+    }
+    fn with_arguments(receive: &[Op]) -> Vec<Op> {
+        [&[Op::LoadConst { dst: 7, index: 0 }, Op::LoadConst { dst: 8, index: 3 }][..], receive].concat()
+    }
+    // Function 0 is the entry point. `producer` and `consumer` are the constant indexes of two of the other three functions.
+    let (three_code, one_code, sum_code) = (5, 6, 7);
     let back = [Op::LoadAcc { dst: 2 }, Op::Return { src: 2 }];
-    // The instructions the compiler emits: a call to the producer, then a call that receives.
+    // These are the instructions the compiler emits: a call to the producer, then a receiving call to the consumer.
     let called = [&[Op::Call { base: 6, args: 0 }, Op::CallReceived { base: 5 }][..], &back].concat();
     let tail_called = [Op::Call { base: 6, args: 0 }, Op::TailCallReceived { base: 5 }];
-    // The request, which pushes a record that receives when the producer returns.
+    // This is the `receive` request. It pushes a record that calls the consumer when the producer returns.
     let requested = [&[Op::CallRequest { base: 5, args: 2, request: Request::Receive }][..], &back].concat();
     let tail_requested = [Op::TailCallRequest { base: 5, args: 2, request: Request::Receive }];
     for receive in [&called[..], &tail_called, &requested, &tail_requested] {
         assert_eq!(run(three_code, sum_code, receive), Ok(vec![6]), "{receive:?}");
         assert_eq!(run(one_code, sum_code, receive), Ok(vec![7]), "{receive:?}");
-        // A consumer that takes no arguments is given three, or one.
+        // `one` takes no arguments, so it fails as the consumer of three values and of one value.
         assert_eq!(run(three_code, one_code, receive), Err(Fault::Arity), "{receive:?}");
         assert_eq!(run(one_code, one_code, receive), Err(Fault::Arity), "{receive:?}");
     }
-    // A collecting call loads the values as one list, which `sum` then takes spread.
+    // A collecting call loads the values as one list. `apply` then spreads the list as the arguments of `sum`.
     let collected = [&[Op::Call { base: 6, args: 0 }, Op::LoadValues { dst: 6 }, Op::TailCallRequest { base: 5, args: 2, request: Request::Apply }][..]].concat();
     let collect_requested = [
         Op::Move { dst: 8, src: 6 },
@@ -375,8 +376,7 @@ fn a_consumer_receives_what_a_producer_returns() {
         assert_eq!(run(three_code, sum_code, collect), Ok(vec![6]), "{collect:?}");
         assert_eq!(run(one_code, sum_code, collect), Ok(vec![7]), "{collect:?}");
     }
-    // The producer's own arguments follow it. Here `sum` is both procedures, and it is called with 1 and 7.
-    let with_arguments = |receive: &[Op]| [&[Op::LoadConst { dst: 7, index: 0 }, Op::LoadConst { dst: 8, index: 3 }][..], receive].concat();
+    // The producer's own arguments follow the producer. Here `sum` is both the producer and the consumer, and the producer is called with 1 and 7.
     let called = with_arguments(&[Op::Call { base: 6, args: 2 }, Op::TailCallReceived { base: 5 }]);
     let requested = with_arguments(&[Op::TailCallRequest { base: 5, args: 4, request: Request::Receive }]);
     for receive in [called, requested] {
@@ -394,6 +394,9 @@ const RAISE: u32 = 3;
 /// implements `call/cc` via delimited capture and abort, and wraps exception-handling requests.
 /// Returns `(run, upvalues)` where `run` evaluates a thunk under the prompt.
 fn prelude<'gc>(mc: &Mutation<'gc>) -> (Value<'gc>, Vec<Value<'gc>>) {
+    fn raising(request: Request) -> [Op; 2] {
+        [Op::Move { dst: 3, src: 1 }, Op::TailCallRequest { base: 3, args: 1, request }]
+    }
     let tag = Value::object(mc, Tag::new(mc, Value::VOID).unwrap());
     // In the prelude constant table, index 0 is reserved for the prompt tag; functions are indexed at `1 + i`.
     let default_handler = [
@@ -427,7 +430,6 @@ fn prelude<'gc>(mc: &Mutation<'gc>) -> (Value<'gc>, Vec<Value<'gc>>) {
         Op::Move { dst: 5, src: 2 },
         Op::TailCallRequest { base: 4, args: 2, request: Request::WithHandler },
     ];
-    let raising = |request| [Op::Move { dst: 3, src: 1 }, Op::TailCallRequest { base: 3, args: 1, request }];
     let (raise_continuable, raise) = (raising(Request::RaiseContinuable), raising(Request::Raise));
     use Capture::{Register, Upvalue};
     let funcs: [Func<'_>; 9] = [
@@ -442,8 +444,7 @@ fn prelude<'gc>(mc: &Mutation<'gc>) -> (Value<'gc>, Vec<Value<'gc>>) {
         (1, &[], &raise),
     ];
     let codes = module(mc, &[tag], &funcs);
-    let close = |i: usize| closure(mc, codes[i]);
-    (close(1), vec![close(2), close(6), close(7), close(8), tag])
+    (closure(mc, codes[1]), vec![closure(mc, codes[2]), closure(mc, codes[6]), closure(mc, codes[7]), closure(mc, codes[8]), tag])
 }
 
 /// Executes `thunk` with `handler` installed as the exception handler for raises.
@@ -491,6 +492,9 @@ fn prelude_call(constants: &[i64], funcs: &[Func<'_>]) -> Vec<i64> {
 
 #[test]
 fn prompts_take_aborts() {
+    fn with(constants: &[i64], main: &[Op], handler: &[Op], thunk: &[Op]) -> Result<Vec<i64>, Fault> {
+        call(constants, &[(0, &[], main), (2, &[], handler), (0, &[], thunk)], &[])
+    }
     // Tests aborting to a prompt handler with multiple arguments:
     // `(+ 1000 (call-with-prompt tag (lambda (a b) (+ a b)) (lambda () (+ 1 (abort tag 5 2)))))` evaluates to 1007.
     let main = [
@@ -516,11 +520,10 @@ fn prompts_take_aborts() {
         Op::Return { src: 2 },
     ];
     let constants = [TAG, 1000, 5, 2, 1];
-    let with = |thunk: &[Op]| call(&constants, &[(0, &[], &main), (2, &[], &handler), (0, &[], thunk)], &[]);
-    assert_eq!(with(&thunk), Ok(vec![1007]));
+    assert_eq!(with(&constants, &main, &handler, &thunk), Ok(vec![1007]));
 
     // When a thunk enclosed in a prompt returns normally without aborting, its return value passes directly through the prompt.
-    assert_eq!(with(&[Op::LoadConst { dst: 2, index: 4 }, Op::Return { src: 2 }]), Ok(vec![1001]));
+    assert_eq!(with(&constants, &main, &handler, &[Op::LoadConst { dst: 2, index: 4 }, Op::Return { src: 2 }]), Ok(vec![1001]));
 
     // Verifies that aborting to a tag without an active prompt or aborting to a non-tag value results in an appropriate fault.
     let fresh = [
@@ -528,8 +531,8 @@ fn prompts_take_aborts() {
         Op::LoadAcc { dst: 3 },
         Op::CallRequest { base: 3, args: 1, request: Request::Abort },
     ];
-    assert_eq!(with(&fresh), Err(Fault::NoPrompt));
-    assert_eq!(with(&[Op::LoadConst { dst: 3, index: 1 }, Op::CallRequest { base: 3, args: 1, request: Request::Abort }]), Err(Fault::WrongType));
+    assert_eq!(with(&constants, &main, &handler, &fresh), Err(Fault::NoPrompt));
+    assert_eq!(with(&constants, &main, &handler, &[Op::LoadConst { dst: 3, index: 1 }, Op::CallRequest { base: 3, args: 1, request: Request::Abort }]), Err(Fault::WrongType));
 }
 
 #[test]
@@ -571,10 +574,9 @@ fn composable_continuations_go_on_where_theyre_called() {
         Op::Return { src: 3 },
     ];
     let constants = [TAG, 1000, 1, 2, 10, 0];
-    let with = |f: &[Op]| call(&constants, &[(0, &[], &main), (-1, &[], &handler), (0, &[], &thunk), (1, &[], f)], &[]);
-    assert_eq!(with(&twice), Ok(vec![1006]));
+    assert_eq!(call(&constants, &[(0, &[], &main), (-1, &[], &handler), (0, &[], &thunk), (1, &[], &twice)], &[]), Ok(vec![1006]));
     // Invokes captured continuation `(k 10)` in tail position.
-    assert_eq!(with(&[Op::Move { dst: 3, src: 1 }, Op::LoadConst { dst: 4, index: 4 }, Op::TailCall { base: 3, args: 1 }]), Ok(vec![1012]));
+    assert_eq!(call(&constants, &[(0, &[], &main), (-1, &[], &handler), (0, &[], &thunk), (1, &[], &[Op::Move { dst: 3, src: 1 }, Op::LoadConst { dst: 4, index: 4 }, Op::TailCall { base: 3, args: 1 }])], &[]), Ok(vec![1012]));
 
     // Tests escaping and resuming a delimited continuation outside the lifetime of its original prompt:
     // `(let ((kb (box 0))) (+ (call-with-prompt tag h (lambda () (+ 1 (capture tag (lambda (k) (set-box! kb k) 0))))) ((unbox kb) 10)))`.
@@ -1003,25 +1005,23 @@ fn equal_spends_fuel_as_it_goes() {
     arena.mutate(|mc| {
         let vectors = Vectors::new(mc);
         let items: Vec<_> = (0..10_240).map(fix).collect();
-        let vector = || vectors.from_slice(&items).unwrap().value(mc);
-        let codes = module(mc, &[vector(), vector()], &[(0, &[], &main)]);
-        let start = || Machine::new(mc, MIN_SEGMENT, closure(mc, codes[0]), &[]).unwrap();
+        let codes = module(mc, &[vectors.from_slice(&items).unwrap().value(mc), vectors.from_slice(&items).unwrap().value(mc)], &[(0, &[], &main)]);
         // The compared vector structures contain 10,241 total elements, which consumes 10 fuel units (1 unit per 1,024 elements), plus 1 fuel unit for the jump instruction (11 fuel units total).
-        let mut machine = start();
+        let mut machine = Machine::new(mc, MIN_SEGMENT, closure(mc, codes[0]), &[]).unwrap();
         assert_eq!(to_end(mc, &mut machine).unwrap(), Outcome::Done(Value::TRUE));
         assert_eq!(machine.fuel(), u64::MAX - 11);
 
         // With less than 11 fuel units allocated (e.g. 9), comparison halts mid-execution with `Fault::OutOfFuel`, transitioning the task to finished so further runs return `Fault::Finished`.
-        let mut machine = start();
+        let mut machine = Machine::new(mc, MIN_SEGMENT, closure(mc, codes[0]), &[]).unwrap();
         machine.set_fuel(9);
         assert_eq!(to_end(mc, &mut machine), Err(Fault::OutOfFuel));
         assert_eq!(machine.run(mc), Err(Fault::Finished));
 
-        // Providing exactly 11 fuel units supplies the exact amount required for the full comparison and the subsequent jump instruction to complete successfully.
-        let mut machine = start();
-        machine.set_fuel(11);
+        // The comparison and the jump spend 11 units. A collection step is due here, so the machine pauses at the jump. A machine that pauses must have fuel left to continue. With 12 units it finishes with one unit left.
+        let mut machine = Machine::new(mc, MIN_SEGMENT, closure(mc, codes[0]), &[]).unwrap();
+        machine.set_fuel(12);
         assert_eq!(to_end(mc, &mut machine).unwrap(), Outcome::Done(Value::TRUE));
-        assert_eq!(machine.fuel(), 0);
+        assert_eq!(machine.fuel(), 1);
     });
 }
 
@@ -1142,7 +1142,7 @@ fn marker_host<'s, 'gc>(_: &mut HostContext<'s, 'gc>, _: HostArgs<'s, 'gc>) -> R
 
 static MARKER: [HostDef; 1] = [crate::host!("marker", 0, Purity::Impure, marker_host)];
 
-/// The marker the accumulator holds for several values is not a value. A host cannot return it or pass it in.
+/// `Value::VALUES`, the marker the accumulator holds for several values, is not a value. A host cannot return it or pass it to a machine.
 #[test]
 fn the_values_marker_is_not_a_value_a_host_can_pass() {
     let mut arena = Arena::new(1 << 24, 0);
@@ -1254,9 +1254,11 @@ fn deferred_host_calls_wait_for_the_host() {
 
 #[test]
 fn host_functions_spend_the_machines_fuel() {
+    fn call(index: u32) -> [Op; 2] {
+        [Op::LoadConst { dst: 2, index }, Op::TailCallHost { base: 2, args: 1, host: BURN }]
+    }
     let mut arena = Arena::new(1 << 24, 0);
     arena.mutate(|mc| {
-        let call = |index| [Op::LoadConst { dst: 2, index }, Op::TailCallHost { base: 2, args: 1, host: BURN }];
         let (fifty, five_hundred) = (call(0), call(1));
         let codes = module_calling(mc, &[fix(50), fix(500)], &HOSTS, &[(0, &[], &fifty), (0, &[], &five_hundred)]);
         for (code, left) in [(codes[0], Some(50)), (codes[1], None)] {
@@ -1276,29 +1278,35 @@ fn apply<'gc>(mc: &Mutation<'gc>, intrinsic: crate::Intrinsic, args: &[Value<'gc
     intrinsic.run(mc, args, &mut crate::Fuel { run: u64::MAX, rest: 0 })
 }
 
-/// `equal?` and tables compare external references as their kind says. `eq?` and `eqv?` compare them by identity.
+/// `equal?` and table lookups compare external references with the equality function of their kind. `eq?` and `eqv?` compare them by identity.
 #[test]
 fn external_references_are_equal_as_their_kind_says() {
     struct UserId(u64);
     static USER_ID: ExternalKind<UserId> = ExternalKind::by_value("user-id", |first, second| first.0 == second.0, |id| id.0);
     static HANDLE: ExternalKind<u64> = ExternalKind::by_identity("handle");
+    fn user<'gc>(mc: &Mutation<'gc>, externals: ExternalRefs<'_, 'gc>, id: u64) -> Value<'gc> {
+        externals.make(&USER_ID, UserId(id), 0, Value::NULL).unwrap().value(mc)
+    }
+    fn handle<'gc>(mc: &Mutation<'gc>, externals: ExternalRefs<'_, 'gc>, number: u64) -> Value<'gc> {
+        externals.make(&HANDLE, number, 0, Value::NULL).unwrap().value(mc)
+    }
+    fn truth<'gc>(flag: bool) -> Value<'gc> {
+        if flag { Value::TRUE } else { Value::FALSE }
+    }
     Arena::new(1 << 24, 0).mutate(|mc| {
         let externals = ExternalRefs::new(mc);
-        let user = |id| externals.make(&USER_ID, UserId(id), 0, Value::NULL).unwrap().value(mc);
-        let handle = |number| externals.make(&HANDLE, number, 0, Value::NULL).unwrap().value(mc);
-        let (ann, again, bo) = (user(7), user(7), user(8));
-        let truth = |flag| if flag { Value::TRUE } else { Value::FALSE };
-        for (first, second, equal) in [(ann, again, true), (ann, ann, true), (ann, bo, false), (ann, handle(7), false), (handle(7), handle(7), false), (ann, fix(7), false)] {
+        let (ann, again, bo) = (user(mc, externals, 7), user(mc, externals, 7), user(mc, externals, 8));
+        for (first, second, equal) in [(ann, again, true), (ann, ann, true), (ann, bo, false), (ann, handle(mc, externals, 7), false), (handle(mc, externals, 7), handle(mc, externals, 7), false), (ann, fix(7), false)] {
             assert_eq!(apply(mc, crate::Intrinsic::Equal, &[first, second]), Ok(truth(equal)));
             assert_eq!(apply(mc, crate::Intrinsic::Eqv, &[first, second]), Ok(truth(first == second)));
             assert_eq!(apply(mc, crate::Intrinsic::Eq, &[first, second]), Ok(truth(first == second)));
         }
-        // Inside other data too: lists of equal references are equal, and a table finds a key by an equal reference.
-        let (one, other) = (Pairs::new(mc).list(&[ann, bo]).unwrap(), Pairs::new(mc).list(&[again, user(8)]).unwrap());
+        // The same holds inside other data. Lists of equal references are equal, and a table finds a key when given an equal reference.
+        let (one, other) = (Pairs::new(mc).list(&[ann, bo]).unwrap(), Pairs::new(mc).list(&[again, user(mc, externals, 8)]).unwrap());
         assert_eq!(apply(mc, crate::Intrinsic::Equal, &[one, other]), Ok(Value::TRUE));
-        let table = apply(mc, crate::Intrinsic::MakeTableOf, &[ann, fix(1), handle(7), fix(2)]).unwrap();
+        let table = apply(mc, crate::Intrinsic::MakeTableOf, &[ann, fix(1), handle(mc, externals, 7), fix(2)]).unwrap();
         assert_eq!(apply(mc, crate::Intrinsic::TableRef, &[table, again, Value::FALSE]), Ok(fix(1)));
-        assert_eq!(apply(mc, crate::Intrinsic::TableRef, &[table, handle(7), Value::FALSE]), Ok(Value::FALSE));
+        assert_eq!(apply(mc, crate::Intrinsic::TableRef, &[table, handle(mc, externals, 7), Value::FALSE]), Ok(Value::FALSE));
         assert_eq!(apply(mc, crate::Intrinsic::TableHas, &[table, bo]), Ok(Value::FALSE));
         let same_entries = apply(mc, crate::Intrinsic::MakeTableOf, &[fix(0), again]).unwrap();
         assert_eq!(apply(mc, crate::Intrinsic::Equal, &[apply(mc, crate::Intrinsic::MakeTableOf, &[fix(0), ann]).unwrap(), same_entries]), Ok(Value::TRUE));
@@ -1320,6 +1328,9 @@ fn external_refs_hold_the_hosts_data_and_trace_their_value() {
         Ok(Reply::Value(fix(n.get())))
     }
     static COUNT: [HostDef; 1] = [crate::host!("count", 1, Purity::Impure, count)];
+    fn call(index: u32) -> [Op; 2] {
+        [Op::LoadConst { dst: 2, index }, Op::TailCallHost { base: 2, args: 1, host: 0 }]
+    }
     let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
     let mut arena = Arena::new(1 << 24, 1);
     arena.mutate(|mc| {
@@ -1332,7 +1343,6 @@ fn external_refs_hold_the_hosts_data_and_trace_their_value() {
     arena.collect();
     arena.mutate(|mc| {
         let external = mc.root(0);
-        let call = |index| [Op::LoadConst { dst: 2, index }, Op::TailCallHost { base: 2, args: 1, host: 0 }];
         let (counted, wrong) = (call(0), call(1));
         let codes = module_calling(mc, &[external, fix(3)], &COUNT, &[(0, &[], &counted), (0, &[], &wrong)]);
         assert_eq!((run(mc, codes[0], &[]), run(mc, codes[0], &[])), (Ok(vec![1]), Ok(vec![2])));
@@ -1347,7 +1357,7 @@ fn external_refs_hold_the_hosts_data_and_trace_their_value() {
     assert!(dropped.get());
 }
 
-/// A machine that waits for its host does not go on while a collection step is due. The answer it was given is kept, and the next run delivers it.
+/// A machine that is waiting for its host does not resume while a collection step is due. The answer it was given is kept, and the next run delivers it.
 #[test]
 fn a_waiting_machine_pauses_for_the_collector_and_keeps_its_answer() {
     let mut arena = Arena::new(1 << 24, 0);
@@ -1366,7 +1376,7 @@ fn a_waiting_machine_pauses_for_the_collector_and_keeps_its_answer() {
             assert!(matches!(to_end(mc, &mut machine), Ok(Outcome::Deferred(_))));
             machine
         });
-        // Allocate until the step owes the collector work.
+        // Allocate until a collection step is due.
         let mut made = Value::NULL;
         while !mc.step_due() {
             made = Pairs::new(mc).cons(Value::TRUE, made).unwrap().value(mc);
@@ -1376,7 +1386,7 @@ fn a_waiting_machine_pauses_for_the_collector_and_keeps_its_answer() {
         assert_eq!(replied.run(mc), Ok(Outcome::Done(fix(42))));
         assert_eq!(raised.raise(mc, fix(7)), Ok(Outcome::Paused));
         assert_eq!(raised.run(mc), Ok(Outcome::Raised(fix(7))));
-        // The host may also make the same call again. The second one goes on, though the step is still due.
+        // The host may also make the same call again. The second call resumes the machine, although the step is still due.
         assert_eq!(asked_twice.raise(mc, fix(7)), Ok(Outcome::Paused));
         assert_eq!(asked_twice.raise(mc, fix(8)), Ok(Outcome::Raised(fix(8))));
     });
@@ -1384,9 +1394,11 @@ fn a_waiting_machine_pauses_for_the_collector_and_keeps_its_answer() {
 
 #[test]
 fn what_the_host_raises_goes_to_the_raise_handler() {
+    fn call(host: u32) -> [Op; 3] {
+        [Op::LoadConst { dst: 2, index: 0 }, Op::CallHost { base: 2, args: 1, host }, Op::Return { src: 2 }]
+    }
     let mut arena = Arena::new(1 << 24, 0);
     arena.mutate(|mc| {
-        let call = |host| [Op::LoadConst { dst: 2, index: 0 }, Op::CallHost { base: 2, args: 1, host }, Op::Return { src: 2 }];
         let (raising, deferring) = (call(2), call(DEFER));
         let handler = [Op::Return { src: 1 }];
         let codes = module_calling(mc, &[fix(1)], &HOSTS, &[(0, &[], &raising), (0, &[], &deferring), (1, &[], &handler)]);
@@ -1403,5 +1415,112 @@ fn what_the_host_raises_goes_to_the_raise_handler() {
             let irritants = value.downcast::<Condition>(mc).unwrap().irritants(mc);
             assert_eq!(Pair::of(irritants).unwrap().head(mc), raised);
         }
+    });
+}
+
+/// Creates the bytecode of a function of no arguments from `ops` and `constants`. If `hints` is `Some(count)`, the code has `count` hint words.
+fn hinted<'gc>(mc: &Mutation<'gc>, constants: &[Value<'gc>], ops: &[Op], hints: Option<usize>) -> Gc<'gc, Bytecode> {
+    let frozen_ops = mc.frozen(Box::from(ops)).unwrap();
+    let captures = mc.frozen(Box::<[Capture]>::from([])).unwrap();
+    let hints = hints.map(|count| crate::objects::Hints::new(mc, count, 0).unwrap());
+    let code = Bytecode::new(mc, frozen_ops, Value::VOID, captures, 0, None, Value::FALSE, Value::FALSE, 0, Value::FALSE, 0, 0, hints).unwrap();
+    code.set_constants(mc, Vectors::new(mc).immutable_from_slice(constants).unwrap().value(mc));
+    code
+}
+
+fn ended<'gc>(mc: &Mutation<'gc>, code: Gc<'gc, Bytecode>) -> Result<Outcome<'gc>, Fault> {
+    let mut machine = Machine::new(mc, MIN_SEGMENT, closure(mc, code), &[]).unwrap();
+    to_end(mc, &mut machine)
+}
+
+/// Runs `code` and returns the fault it ends with. The fault is either raised in the program as a condition or returned as the machine's error.
+fn failed<'gc>(mc: &Mutation<'gc>, code: Gc<'gc, Bytecode>) -> Fault {
+    match ended(mc, code) {
+        Ok(Outcome::Raised(condition)) => fault(mc, condition),
+        Err(stopped) => stopped,
+        outcome => panic!("{outcome:?}"),
+    }
+}
+
+/// A hinted table instruction searches for its key the first time and writes the entry position into its hint word. Code that refers to a hint word it does not have is malformed.
+#[test]
+fn hinted_table_instructions_keep_where_a_key_was_found() {
+    fn read(key: u32, hint: u16) -> [Op; 5] {
+        [
+            Op::LoadConst { dst: 2, index: 0 },
+            Op::LoadConst { dst: 3, index: key },
+            Op::LoadConst { dst: 4, index: 3 },
+            Op::TableRefHinted { dst: 5, table: 2, key: 3, default: 4, hint },
+            Op::Return { src: 5 },
+        ]
+    }
+    fn word<'gc>(mc: &Mutation<'gc>, code: Gc<'gc, Bytecode>, hint: usize) -> u64 {
+        crate::objects::HintsFields::items(code.hints(mc).unwrap(), mc).get(hint)
+    }
+    let write = [
+        Op::LoadConst { dst: 2, index: 0 },
+        Op::LoadConst { dst: 3, index: 1 },
+        Op::LoadConst { dst: 4, index: 3 },
+        Op::TableSetHinted { dst: 5, table: 2, key: 3, value: 4, hint: 1 },
+        Op::TableRefHinted { dst: 6, table: 2, key: 3, default: 3, hint: 0 },
+        Op::Return { src: 6 },
+    ];
+    let mut arena = Arena::new(1 << 22, 0);
+    arena.mutate(|mc| {
+        let table = ragwort_types::table::Tables::new(mc).make().unwrap();
+        for key in 0..8 {
+            table.set(mc, fix(key), fix(key * 10)).unwrap();
+        }
+        // Constant 1 is a key that the table has at position 7. Constant 2 is a key that the table does not have.
+        let constants = [table.value(mc), fix(7), fix(99), fix(-1)];
+        let found = hinted(mc, &constants, &read(1, 0), Some(1));
+        assert_eq!((word(mc, found, 0), ended(mc, found), word(mc, found, 0)), (0, Ok(Outcome::Done(fix(70))), 7));
+        // The second run reads the entry at the hinted position.
+        assert_eq!((ended(mc, found), word(mc, found, 0)), (Ok(Outcome::Done(fix(70))), 7));
+        // A read of a key that the table does not have returns the default and leaves the hint word unchanged.
+        let missing = hinted(mc, &constants, &read(2, 1), Some(2));
+        assert_eq!((ended(mc, missing), word(mc, missing, 1)), (Ok(Outcome::Done(fix(-1))), 0));
+        // A write sets the entry's value and keeps its position. A read of the same key through another hint word returns the new value.
+        let written = hinted(mc, &constants, &write, Some(2));
+        assert_eq!((ended(mc, written), word(mc, written, 1), word(mc, written, 0), table.get(mc, fix(7))), (Ok(Outcome::Done(fix(-1))), 7, 7, Ok(Some(fix(-1)))));
+        // An operand that is not a table is a type error. It is detected before the hint is read.
+        let not_a_table = hinted(mc, &[fix(1), fix(7), fix(99), fix(-1)], &read(1, 0), Some(1));
+        assert_eq!(failed(mc, not_a_table), Fault::WrongType);
+        // Code with no hint words, or with too few, is malformed.
+        assert_eq!(failed(mc, hinted(mc, &constants, &read(1, 0), None)), Fault::Malformed);
+        assert_eq!(failed(mc, hinted(mc, &constants, &read(1, 1), Some(1))), Fault::Malformed);
+        assert_eq!(failed(mc, hinted(mc, &constants, &write, Some(1))), Fault::Malformed);
+    });
+}
+
+/// Comparing two tables looks up each key of the first table in the second. Hashing and comparing a string key reads all its characters, and `equal?` spends fuel for that work.
+#[test]
+fn equal_spends_fuel_for_the_string_keys_of_tables() {
+    let main = [
+        Op::LoadConst { dst: 2, index: 0 },
+        Op::LoadConst { dst: 3, index: 1 },
+        Op::CallIntrinsic { base: 2, args: 2, intrinsic: crate::Intrinsic::Equal },
+        Op::LoadAcc { dst: 4 },
+        Op::Jump { offset: 0 },
+        Op::Return { src: 4 },
+    ];
+    let mut arena = Arena::new(1 << 24, 0);
+    arena.mutate(|mc| {
+        let long = "k".repeat(1 << 20);
+        let mut tables = Vec::new();
+        for _ in 0..2 {
+            let table = ragwort_types::table::Tables::new(mc).make().unwrap();
+            let key = ragwort_types::string::from_str(&ragwort_types::string::Strings::new(mc), &long).unwrap().value();
+            table.set(mc, key, fix(1)).unwrap();
+            tables.push(table.value(mc));
+        }
+        let codes = module(mc, &tables, &[(0, &[], &main)]);
+        // The comparisons are: the two tables (1), a key of 2^20 characters counted as one comparison for every 8 characters (131,072), and the key's value (1). These 131,074 comparisons cost 128 units of fuel. The jump costs one more unit.
+        let mut machine = Machine::new(mc, MIN_SEGMENT, closure(mc, codes[0]), &[]).unwrap();
+        assert_eq!(to_end(mc, &mut machine).unwrap(), Outcome::Done(Value::TRUE));
+        assert_eq!(machine.fuel(), u64::MAX - 129);
+        let mut machine = Machine::new(mc, MIN_SEGMENT, closure(mc, codes[0]), &[]).unwrap();
+        machine.set_fuel(100);
+        assert_eq!(to_end(mc, &mut machine), Err(Fault::OutOfFuel));
     });
 }

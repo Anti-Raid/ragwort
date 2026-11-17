@@ -180,13 +180,13 @@ macro_rules! language {
                 id
             }
 
-            /// Sets the source site that nodes added from now on receive. A pass calls this with the site of the node it is translating, so that the nodes it builds for that node report the same source position.
+            /// Sets the source site for nodes added from now on. A pass calls this with the site of the node it is translating, so that the nodes it builds for that node report the same source position.
             #[allow(dead_code)]
             pub(crate) fn at(&mut self, site: u32) {
                 self.current = site;
             }
 
-            /// Returns the source site that nodes added now receive.
+            /// Returns the source site that newly added nodes receive.
             #[allow(dead_code)]
             pub(crate) fn current(&self) -> u32 {
                 self.current

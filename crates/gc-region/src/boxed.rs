@@ -5,10 +5,11 @@ pub(crate) struct Backing(Box<[u64]>);
 
 impl Backing {
     pub(crate) fn new(len: usize) -> Option<Self> {
-        // Safe Rust has no fallible zeroed allocation, and filling a reserved one would commit
-        // all of it. So it checks the allocation can be made, then makes it zeroed, which
-        // comes from the system untouched and commits lazily. Another thread taking the memory
-        // in between can still abort it.
+        // Safe Rust has no fallible zeroed allocation, and zero-filling a reserved allocation
+        // would commit all of its pages. So this first checks that an allocation of this size
+        // succeeds, and then makes a zeroed allocation. The system supplies zeroed memory
+        // untouched and commits it lazily. If another thread takes the memory between the two
+        // steps, the second allocation can still abort the process.
         Vec::<u64>::new().try_reserve_exact(len).ok()?;
         Some(Self(vec![0; len].into_boxed_slice()))
     }

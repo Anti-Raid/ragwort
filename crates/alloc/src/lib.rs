@@ -1,7 +1,7 @@
-//! Boxes and vectors for data that all goes at once, as a compiler's trees for one form do.
+//! Boxes and vectors for data that is all freed at once, such as the trees that a compiler builds for one form.
 //!
-//! With the `bumpalo` feature, they're in an [`Arena`], and what they take is freed when it goes;
-//! without it, they're the standard ones and an arena is nothing. Code is the same either way.
+//! With the `bumpalo` feature, they are allocated in an [`Arena`], and their memory is freed when the arena is dropped.
+//! Without the feature, they are the standard box and vector, and an arena holds nothing. Code that uses them is the same either way.
 
 #[cfg(test)]
 #[path = "tests/lib.rs"]
@@ -12,7 +12,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut, RangeBounds};
 
-/// Where [`Box`]es and [`Vec`]s made in it are.
+/// An arena that [`Box`]es and [`Vec`]s are allocated in.
 #[derive(Default)]
 pub struct Arena {
     #[cfg(feature = "bumpalo")]
@@ -24,22 +24,22 @@ impl Arena {
         Self::default()
     }
 
-    /// `value` in a box in the arena.
+    /// Moves `value` into a box in the arena.
     pub fn boxed<T>(&self, value: T) -> Box<'_, T> {
         Box::new_in(value, self)
     }
 
-    /// An empty vector in the arena.
+    /// Returns an empty vector in the arena.
     pub fn vec<T>(&self) -> Vec<'_, T> {
         Vec::new_in(self)
     }
 
-    /// A vector in the arena of `count` copies of `value`.
+    /// Returns a vector in the arena that holds `count` copies of `value`.
     pub fn vec_of<T: Clone>(&self, value: T, count: usize) -> Vec<'_, T> {
         Vec::from_iter_in(std::iter::repeat_n(value, count), self)
     }
 
-    /// How many bytes it has taken for what's in it.
+    /// Returns the number of bytes that the arena has allocated. Without the `bumpalo` feature, this is always 0.
     pub fn allocated(&self) -> usize {
         #[cfg(feature = "bumpalo")]
         let bytes = self.bump.allocated_bytes();
@@ -55,13 +55,13 @@ impl fmt::Debug for Arena {
     }
 }
 
-/// One `T`, in an arena.
+/// An owned `T` that is allocated in an arena.
 pub struct Box<'a, T> {
     #[cfg(feature = "bumpalo")]
     inner: bumpalo::boxed::Box<'a, T>,
     #[cfg(not(feature = "bumpalo"))]
     inner: std::boxed::Box<T>,
-    /// As an arena's box is, unchanging in `T`.
+    /// Ties the box to `'a` and makes it invariant in `T`, as the `bumpalo` box is.
     #[cfg(not(feature = "bumpalo"))]
     arena: PhantomData<&'a mut T>,
 }
@@ -78,7 +78,7 @@ impl<'a, T> Box<'a, T> {
         boxed
     }
 
-    /// The `T`, out of the box.
+    /// Moves the `T` out of the box and returns it.
     pub fn into_inner(boxed: Self) -> T {
         #[cfg(feature = "bumpalo")]
         let value = bumpalo::boxed::Box::into_inner(boxed.inner);
@@ -128,7 +128,7 @@ impl<T: PartialEq> PartialEq for Box<'_, T> {
 
 impl<T: Eq> Eq for Box<'_, T> {}
 
-/// A vector, in an arena.
+/// A growable vector that is allocated in an arena.
 pub struct Vec<'a, T> {
     #[cfg(feature = "bumpalo")]
     inner: bumpalo::collections::Vec<'a, T>,
@@ -209,7 +209,7 @@ impl<'a, T> Vec<'a, T> {
         self.inner.drain(range)
     }
 
-    /// The elements from `at` on, which it no longer has.
+    /// Removes the elements from index `at` onward and returns them in a new vector.
     pub fn split_off(&mut self, at: usize) -> Self {
         Vec {
             inner: self.inner.split_off(at),
@@ -224,7 +224,7 @@ impl<T: Clone> Vec<'_, T> {
         self.inner.extend_from_slice(xs);
     }
 
-    /// Grows or shrinks to `len`, with copies of `value` at the end if it grows.
+    /// Resizes the vector to `len` elements. If the vector grows, the new elements are copies of `value`.
     pub fn resize(&mut self, len: usize, value: T) {
         self.inner.resize(len, value);
     }
@@ -286,7 +286,7 @@ impl<T: PartialEq> PartialEq for Vec<'_, T> {
 
 impl<T: Eq> Eq for Vec<'_, T> {}
 
-/// A [`Vec`]'s elements, taken out of it.
+/// An iterator that moves the elements out of a [`Vec`].
 pub struct IntoIter<'a, T> {
     #[cfg(feature = "bumpalo")]
     inner: bumpalo::collections::vec::IntoIter<'a, T>,
@@ -347,13 +347,13 @@ impl<'v, T> IntoIterator for &'v mut Vec<'_, T> {
     }
 }
 
-/// Collecting an iterator into a [`Vec`] in an arena.
+/// Methods that collect an iterator into a [`Vec`] in an arena.
 pub trait CollectIn: Iterator + Sized {
     fn collect_in(self, arena: &Arena) -> Vec<'_, Self::Item> {
         Vec::from_iter_in(self, arena)
     }
 
-    /// The `Ok`s, in a [`Vec`], unless there's an `Err`, which it stops at.
+    /// Collects the `Ok` values into a [`Vec`]. Stops at the first `Err` and returns it.
     fn try_collect_in<T, E>(self, arena: &Arena) -> Result<Vec<'_, T>, E>
     where
         Self: Iterator<Item = Result<T, E>>,
@@ -368,7 +368,7 @@ pub trait CollectIn: Iterator + Sized {
 
 impl<I: Iterator> CollectIn for I {}
 
-/// A [`Vec`] in `arena` of the elements given: `vec_in![arena; a, b, c]`.
+/// Creates a [`Vec`] in `arena` that holds the given elements: `vec_in![arena; a, b, c]`.
 #[macro_export]
 macro_rules! vec_in {
     ($arena:expr; $($x:expr),* $(,)?) => {

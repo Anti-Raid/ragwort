@@ -1,26 +1,26 @@
-//! Building strings. Concatenation copies when the result is small, and otherwise joins the
-//! two into a rope that stays balanced like an AVL tree: no node's sides differ in depth by
-//! more than one. Where a short string meets a short flat string at the edge of a rope, they
-//! merge into one, so building a string a piece at a time gives flat strings of about
-//! [`LEAF`] bytes instead of a node per piece.
+//! Building strings. Concatenation copies both strings when the result is small. Otherwise it joins
+//! them into a rope, which stays balanced like an AVL tree: the depths of a node's two children differ by
+//! at most one. When a short string is joined next to a short flat string at the edge of a rope, the two
+//! are merged into one flat string. So building a string a piece at a time gives flat strings of about
+//! [`LEAF`] bytes instead of one node per piece.
 
 use crate::iter::MAX_DEPTH;
 use crate::units::RunWriter;
 use crate::{Chunks, Host, Info, MAX_LEN, Res, StrError, StrView, Units, Width, info, len};
 
-/// The most bytes concatenation copies rather than sharing.
+/// The maximum size, in bytes, of a result that concatenation copies instead of sharing its parts.
 const LEAF: usize = 512;
 
-/// A rope is flattened once it's been read by position once for every this many of its
-/// characters: by then the walks down to a leaf, about 100ns each, have cost about what
-/// copying it does, about 0.4ns a character.
+/// A rope is flattened once it has been read by index once per `CHARS_PER_READ` of its
+/// characters. By then the walks down to a leaf, at about 100ns each, have cost about as much as
+/// copying the rope, at about 0.4ns per character.
 pub(crate) const CHARS_PER_READ: u64 = 256;
 
 fn fits(len: usize, width: Width) -> bool {
     len * width.bytes() <= LEAF
 }
 
-/// `a` then `b`.
+/// Returns `a` followed by `b`.
 pub fn concat<H: Host>(h: &H, a: H::Str, b: H::Str) -> Res<H> {
     let (ia, ib) = (info(h, a), info(h, b));
     if ia.len == 0 {
@@ -39,7 +39,7 @@ pub fn concat<H: Host>(h: &H, a: H::Str, b: H::Str) -> Res<H> {
     join(h, a, b)
 }
 
-/// All of `parts` in order.
+/// Returns all of `parts` joined in order.
 pub fn concat_all<H: Host>(h: &H, parts: &[H::Str]) -> Res<H> {
     if let [string] = parts {
         return Ok(*string);
@@ -61,7 +61,7 @@ pub fn concat_all<H: Host>(h: &H, parts: &[H::Str]) -> Res<H> {
     concat(h, left, concat_all(h, right)?)
 }
 
-/// The characters from `start` up to `end`. Shares what it can of a rope, and copies the rest.
+/// Returns the characters of `string` from index `start` up to, but not including, `end`. Shares the parts of a rope that it can and copies the rest.
 pub fn substring<H: Host>(h: &H, string: H::Str, start: usize, end: usize) -> Res<H> {
     if start > end || end > len(h, string) {
         return Err(StrError::OutOfRange.into());
@@ -92,7 +92,7 @@ fn sub<H: Host>(h: &H, string: H::Str, start: usize, end: usize) -> Res<H> {
     }
 }
 
-/// `string` as one flat string, which a rope then keeps for reading from.
+/// Returns `string` as one flat string. A new flat copy of a rope is passed to [`Host::flattened`], so that the rope can keep it for later reads.
 pub fn flatten<H: Host>(h: &H, string: H::Str) -> Res<H> {
     match h.view(string) {
         StrView::Flat(_) => Ok(string),
@@ -105,7 +105,7 @@ pub fn flatten<H: Host>(h: &H, string: H::Str) -> Res<H> {
     }
 }
 
-/// A flat copy of part of `string`, at the narrowest width that holds it.
+/// Returns a flat copy of the characters of `string` from `start` to `end`, at the narrowest width that holds them.
 fn copy_range<H: Host>(h: &H, string: H::Str, start: usize, end: usize) -> Res<H> {
     let n = end - start;
     h.charge(n as u64)?;
@@ -124,13 +124,13 @@ fn copy_range<H: Host>(h: &H, string: H::Str, start: usize, end: usize) -> Res<H
     })
 }
 
-/// A flat copy of `units`, at the narrowest width that holds them.
+/// Returns a flat copy of `units`, at the narrowest width that holds them.
 fn copy_units<H: Host>(h: &H, units: Units<'_>) -> Res<H> {
     h.charge(units.len() as u64)?;
     h.flat(units.narrowest(), units.len(), |mut out| out.write(0, units))
 }
 
-/// `parts` in one flat string.
+/// Returns `parts` joined into one flat string.
 fn copy<H: Host>(h: &H, parts: &[H::Str]) -> Res<H> {
     let (mut n, mut width) = (0, Width::One);
     for &part in parts {
@@ -140,7 +140,7 @@ fn copy<H: Host>(h: &H, parts: &[H::Str]) -> Res<H> {
     }
     h.charge(n as u64)?;
     if width == Width::One && n <= 8 {
-        // Short and narrow, as much text is: the parts shift into one word.
+        // The result is at most eight one-byte units, which is common. Shift the parts into one word.
         let (mut word, mut at) = (0, 0);
         for &part in parts {
             let StrView::Flat(units) = h.view(part) else { break };
@@ -183,8 +183,8 @@ fn node<H: Host>(h: &H, left: H::Str, right: H::Str) -> Res<H> {
     h.rope(left, right, Info { len: left_info.len + right_info.len, width: left_info.width.max(right_info.width), depth })
 }
 
-/// `a` then `b`, both nonempty and balanced, as a balanced rope. Its depth is at most one
-/// more than the deeper of the two.
+/// Returns `a` followed by `b` as a balanced rope. `a` and `b` must be nonempty and balanced. The depth of the result
+/// is at most one more than the depth of the deeper of the two.
 fn join<H: Host>(h: &H, a: H::Str, b: H::Str) -> Res<H> {
     let (da, db) = (depth(h, a), depth(h, b));
     if da > db + 1 {
@@ -221,16 +221,19 @@ fn join<H: Host>(h: &H, a: H::Str, b: H::Str) -> Res<H> {
     pair(h, a, b)
 }
 
-/// `a` then `b`, whose depths differ by one at most, merging flat strings that meet where
-/// both are short.
+/// Returns `a` followed by `b`, whose depths differ by at most one. Where a flat string of `a` and a flat string of `b`
+/// are adjacent and both are short, they are merged into one flat string.
 fn pair<H: Host>(h: &H, a: H::Str, b: H::Str) -> Res<H> {
+    #[inline(always)]
+    fn merge(first: Info, second: Info) -> bool {
+        fits(first.len + second.len, first.width.max(second.width))
+    }
     let (ia, ib) = (info(h, a), info(h, b));
-    let merge = |first: Info, second: Info| fits(first.len + second.len, first.width.max(second.width));
     if ia.depth == 0 && ib.depth == 0 && merge(ia, ib) {
         return copy(h, &[a, b]);
     }
-    // A flat string beside a flat child sits next to a node at most two deep, whose other
-    // child is at most one deep, so merging keeps the node's depth.
+    // Here one side is a flat string and the other side is a rope whose adjacent child is flat. The merged string is flat,
+    // like the child that it replaces, so the depth of the node does not change.
     if ib.depth == 0
         && let StrView::Rope { left, right, .. } = h.view(a)
         && depth(h, right) == 0

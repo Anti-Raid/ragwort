@@ -1,4 +1,4 @@
-//! The bytecode of a module, as text, for `ragwort compile`.
+//! Formats the bytecode of a module as text, for `ragwort compile`.
 //!
 //! ```text
 //! module lib/text
@@ -7,8 +7,8 @@
 //!       0  LoadConst { dst: 2, value: closure(fn1) }
 //! ```
 //!
-//! Each top-level form with code is a function of no arguments. The functions it makes are
-//! numbered after it, in the order the code first refers to them.
+//! Each top-level form that has code is a function with no arguments, listed as `fn0`. The functions that
+//! it creates are numbered after it, in the order in which the code first refers to them.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write;
@@ -19,10 +19,10 @@ use ragwort_types::gc::{Gc, Mutation, Value};
 use ragwort_vm::Op;
 use ragwort_vm::objects::{Bytecode, BytecodeFields, Closure, ClosureFields};
 
-/// The most characters a constant is shown in.
+/// The maximum length, in bytes, of the text shown for a constant.
 const LIMIT: usize = 200;
 
-/// The functions of one form, numbered as they're first referred to, and those still to list.
+/// The functions of one form. `numbers` gives each function its number, assigned when the function is first referred to. `queue` holds the functions that are not listed yet.
 #[derive(Default)]
 struct Functions<'gc> {
     numbers: HashMap<u64, usize>,
@@ -39,7 +39,7 @@ impl<'gc> Functions<'gc> {
         number
     }
 
-    /// The constant `value`, as an instruction that loads it shows it.
+    /// Returns the text that an instruction shows for the constant `value` that it loads.
     fn constant(&mut self, mc: &Mutation<'gc>, value: Value<'gc>) -> String {
         if let Some(code) = value.downcast::<Bytecode>(mc) {
             return format!("fn{}", self.number(mc, code));
@@ -51,7 +51,7 @@ impl<'gc> Functions<'gc> {
     }
 }
 
-/// Adds to `out` the bytecode of the module `name`, whose forms with code are `thunks`.
+/// Appends the bytecode listing of the module `name` to `out`. `thunks` are the module's forms that have code.
 pub fn list<'gc>(mc: &Mutation<'gc>, name: &str, thunks: &[Value<'gc>], out: &mut String) {
     let _ = writeln!(out, "module {name}");
     for (i, thunk) in thunks.iter().enumerate() {
@@ -68,17 +68,19 @@ pub fn list<'gc>(mc: &Mutation<'gc>, name: &str, thunks: &[Value<'gc>], out: &mu
 fn function<'gc>(mc: &Mutation<'gc>, number: usize, code: Gc<'gc, Bytecode>, functions: &mut Functions<'gc>, out: &mut String) {
     let captured = code.captures(mc).map_or(0, |captures| captures.len());
     let _ = writeln!(out, "    fn{number}: arity {}, {captured} captured", code.arity(mc));
+    fn constant<'gc>(mc: &Mutation<'gc>, constants: Option<Constants<'gc>>, functions: &mut Functions<'gc>, index: u32) -> String {
+        match constants.and_then(|constants| constants.get(mc, index)) {
+            Some(value) => functions.constant(mc, value),
+            None => format!("constant {index}"),
+        }
+    }
     let constants = Constants::of(code.constants(mc));
-    let mut constant = |index: u32| match constants.and_then(|constants| constants.get(mc, index)) {
-        Some(value) => functions.constant(mc, value),
-        None => format!("constant {index}"),
-    };
     let Some(ops) = code.ops(mc) else { return };
     for (at, op) in ops.iter().enumerate() {
         let text = match *op {
-            Op::LoadConst { dst, index } => format!("LoadConst {{ dst: {dst}, value: {} }}", constant(index)),
+            Op::LoadConst { dst, index } => format!("LoadConst {{ dst: {dst}, value: {} }}", constant(mc, constants, functions, index)),
             Op::NewClosure { dst, count, code } => {
-                let codes: Vec<String> = (0..u32::from(count)).map(|offset| constant(code + offset)).collect();
+                let codes: Vec<String> = (0..u32::from(count)).map(|offset| constant(mc, constants, functions, code + offset)).collect();
                 format!("NewClosure {{ dst: {dst}, codes: [{}] }}", codes.join(", "))
             }
             ref op => format!("{op:?}"),

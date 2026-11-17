@@ -1,5 +1,5 @@
-//! Test helpers. Answers are checked against Python's integers: each test runs its cases, then
-//! has `oracle.py` answer all of them in one batch. Under Miri the cases still run, unchecked.
+//! Test helpers. Results are checked against Python. Each test runs its cases and then
+//! has `oracle.py` compute the expected results for all of them in one batch. Under Miri the cases still run, but the results are not checked.
 
 use std::cell::{Cell, OnceCell};
 use std::fmt::Write as _;
@@ -11,7 +11,7 @@ use crate::int::*;
 
 pub const ROUNDS: usize = if cfg!(miri) { 30 } else { 4000 };
 
-/// splitmix64
+/// A SplitMix64 random number generator.
 pub struct Rng(pub u64);
 
 impl Rng {
@@ -31,7 +31,7 @@ impl Rng {
         self.u64() & 1 == 1
     }
 
-    /// Up to `max_len` digits that often sit at the edges: all ones, zero, a lone top bit.
+    /// Returns up to `max_len` random digits. Many digits are edge values: zero, all ones, or only the top bit set. The top digit is never zero.
     pub fn digits(&mut self, max_len: usize) -> Vec<Cell<Digit>> {
         let len = self.below(max_len as u64 + 1) as usize;
         let mut x: Vec<Digit> = (0..len)
@@ -61,7 +61,7 @@ impl Rng {
     }
 }
 
-/// `x` as cells, for [`Digits::new`].
+/// Returns `x` as cells, for use with [`Digits::new`].
 pub fn cells(x: &[Digit]) -> Vec<Cell<Digit>> {
     x.iter().copied().map(Cell::new).collect()
 }
@@ -135,17 +135,17 @@ impl From<NumError> for TestError {
     }
 }
 
-/// Digits as a host lends them to be written.
+/// Digits in cells, in the form that a host lends out for writing.
 type Cells = Box<[Cell<Digit>]>;
 
-/// Holds small integers in `bits` bits, so narrow hosts take the big paths more often. Big
-/// ones are written in place, as an arena's are, into cells that are set once, so views can
-/// borrow them while more are added.
+/// A test host. It holds small integers in `bits` bits, so a narrow host takes the big-integer paths more often. Big
+/// integers are written in place, as in an arena. Each one is stored in a cell that is set once, so views can
+/// borrow existing integers while new ones are added.
 pub struct TestHost {
     bits: u32,
-    /// Each big integer's digits, all it was made from.
+    /// The digits of each big integer, including the digits that were allocated but not kept.
     bigs: Box<[OnceCell<Cells>]>,
-    /// How many of them each kept.
+    /// The number of digits that each big integer kept.
     kept: Box<[Cell<usize>]>,
     used: Cell<usize>,
 }
@@ -201,8 +201,8 @@ pub fn hex_i64(n: i64) -> String {
 }
 
 impl TestHost {
-    /// Asserts the result is normalized, was made from no more than twice its digits, all zero
-    /// past them, and shows it as Python reads it.
+    /// Asserts that `x` is normalized, that its allocation holds at most twice the digits it kept, and that the digits
+    /// past the kept ones are zero. Returns `x` as hexadecimal text, which the oracle reads.
     pub fn show(&self, x: TestInt) -> String {
         if let TestInt::Big { negative, at } = x {
             let digits = self.digits(at);
@@ -217,7 +217,7 @@ impl TestHost {
         to_string(self, x, 16).unwrap()
     }
 
-    /// A random integer, often near the edges of the small range and of digits.
+    /// Returns a random integer. Many results are near the limits of the small range or near digit boundaries.
     pub fn random(&self, rng: &mut Rng, max_len: usize) -> TestInt {
         let edges = [0, 1, -1, i64::MAX, i64::MIN, 1 << 62, -(1 << 62), (1 << 62) - 1, 255, 256, -256, -257, 2, -2];
         match rng.below(4) {
@@ -262,7 +262,7 @@ impl crate::RationalHost for TestHost {
 }
 
 impl TestHost {
-    /// Shows a rational as the oracle reads it, checking its parts.
+    /// Returns a rational as text that the oracle reads. Each part is checked by `show`.
     pub fn show_rational(&self, x: TestRational) -> String {
         match x {
             TestRational::Int(n) => self.show(n),
@@ -339,8 +339,8 @@ impl crate::ComplexHost for TestHost {
     }
 }
 
-/// Doubles that sit on the edges: zeros, infinities, NaN, the ends of the range, powers of
-/// two around where integers stop being exact, and fractions that are exact in binary.
+/// Edge-case `f64` values: zeros, infinities, NaN, the ends of the range, values near the powers of
+/// two where integers stop being exact, and fractions that are exact in binary.
 const FLONUM_EDGES: [f64; 22] = [
     0.0,
     -0.0,
@@ -387,7 +387,7 @@ impl TestHost {
         match rng.below(4) {
             0 => FLONUM_EDGES[rng.below(FLONUM_EDGES.len() as u64) as usize],
             1 => f64::from_bits(rng.u64()),
-            // Small integers and halves, which meet exact numbers and each other often.
+            // Small integers and half-integers. These often equal exact numbers and each other.
             2 => (rng.below(41) as f64 - 20.0) / if rng.bool() { 1.0 } else { 2.0 },
             _ => (rng.u64() as i64 >> rng.below(64)) as f64 * if rng.bool() { 1.0 } else { 1e-3 },
         }
@@ -396,7 +396,7 @@ impl TestHost {
     pub fn random_real(&self, rng: &mut Rng, max_len: usize) -> TestReal {
         match rng.below(3) {
             0 => TestReal::Flonum(self.random_flonum(rng)),
-            // The double nearest an exact number, so the two compare closely.
+            // The `f64` nearest to an exact number, which makes comparisons between flonums and exact numbers close.
             1 if rng.bool() => {
                 let fraction = self.random_rational(rng, max_len);
                 TestReal::Flonum(crate::rational::to_f64(self, fraction).unwrap())
@@ -405,21 +405,19 @@ impl TestHost {
         }
     }
 
-    /// Reals, and complex numbers of each shape Racket has.
+    /// Returns a random number: a real, or a complex number in one of the three forms that Racket allows.
     pub fn random_number(&self, rng: &mut Rng, max_len: usize) -> TestNumber {
-        let exact = |rng: &mut Rng| TestReal::Exact(self.random_rational(rng, max_len));
-        let flonum = |rng: &mut Rng| TestReal::Flonum(self.random_flonum(rng));
         let (re, im) = match rng.below(4) {
             0 => return TestNumber::Real(self.random_real(rng, max_len)),
-            1 => (exact(rng), exact(rng)),
-            2 => (flonum(rng), flonum(rng)),
-            _ => (TestReal::Exact(TestRational::Int(TestInt::Small(0))), flonum(rng)),
+            1 => (TestReal::Exact(self.random_rational(rng, max_len)), TestReal::Exact(self.random_rational(rng, max_len))),
+            2 => (TestReal::Flonum(self.random_flonum(rng)), TestReal::Flonum(self.random_flonum(rng))),
+            _ => (TestReal::Exact(TestRational::Int(TestInt::Small(0))), TestReal::Flonum(self.random_flonum(rng))),
         };
         crate::complex::rectangular(self, re, im).unwrap()
     }
 }
 
-/// An error as the oracle names it.
+/// Returns the oracle's name for `error`.
 pub fn error_token(error: TestError) -> String {
     match error {
         TestError::Num(NumError::DivideByZero) => "div0",

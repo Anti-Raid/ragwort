@@ -36,7 +36,7 @@ pub(crate) fn closure_convert<'s, 'id, 'gc>(tree: &mut L4<'id, 'gc>, from: &L3<'
 /// or an action to assemble previously converted child expressions into an L4 node.
 enum Task<'s> {
     Expr(l3::Id<'s>),
-    /// Sets the source site that the nodes built by the following task receive.
+    /// Sets the source site for the nodes that the next task builds.
     At(u32),
     If,
     Seq,
@@ -234,7 +234,9 @@ impl<'s, 'id, 'gc> Convert<'_, 's, 'id, 'gc> {
     fn expr(&mut self, id: l3::Id<'s>, todo: &mut Vec<Task<'s>>) {
         let from = self.from;
         let at = todo.len();
-        let all = |args: l3::Span<'s, l3::Id<'s>>, todo: &mut Vec<Task<'s>>| todo.extend(from[args].iter().map(|&arg| Task::Expr(arg)));
+        fn all<'s>(from: &L3<'s, '_>, args: l3::Span<'s, l3::Id<'s>>, todo: &mut Vec<Task<'s>>) {
+            todo.extend(from[args].iter().map(|&arg| Task::Expr(arg)));
+        }
         let site = from.site(id);
         self.tree.at(site);
         match from[id] {
@@ -253,19 +255,19 @@ impl<'s, 'id, 'gc> Convert<'_, 's, 'id, 'gc> {
             }
             l3::Node::App(function, args) => {
                 todo.push(Task::Expr(function));
-                all(args, todo);
+                all(from, args, todo);
                 todo.extend([Task::At(site), Task::App(from[args].len())]);
             }
             l3::Node::Jump(join, args) => {
-                all(args, todo);
+                all(from, args, todo);
                 todo.extend([Task::At(site), Task::Jump(join, from[args].len())]);
             }
             l3::Node::Intrinsic(prim, args) => {
-                all(args, todo);
+                all(from, args, todo);
                 todo.extend([Task::At(site), Task::Intrinsic(prim, from[args].len())]);
             }
             l3::Node::ApplyIntrinsic(prim, args) => {
-                all(args, todo);
+                all(from, args, todo);
                 todo.extend([Task::At(site), Task::ApplyIntrinsic(prim, from[args].len())]);
             }
             l3::Node::Lambda(fun) => todo.extend([Task::Enter(fun, None), Task::Expr(from[fun].body), Task::Leave(fun), Task::Lambda]),

@@ -48,7 +48,7 @@ pub(crate) fn lower<'id, 'gc>(
         keyword_cores: HashSet::default(),
     };
     let mut vals = Vec::new();
-    // Each task carries the source site of the expression it belongs to, which the nodes it adds receive.
+    // Each task carries the source site of the expression it belongs to. The nodes that the task adds are recorded with that site.
     let mut todo = vec![(Task::Expr(core), 0)];
     let mut then = Vec::new();
     while let Some((task, mut site)) = todo.pop() {
@@ -134,7 +134,7 @@ enum Task<'c, 'gc> {
     Make(&'c Core<'gc>),
 }
 
-/// What the callee expression of a call refers to at module level.
+/// The module-level meaning of the callee expression of a call.
 #[derive(Clone, Copy)]
 enum Callee<'gc> {
     /// A variable of this module, by slot.
@@ -192,7 +192,9 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
     /// Validates `core` upon initial visit. If `core` is a leaf expression, lowers it immediately;
     /// otherwise, pushes tasks onto `then` to lower its subexpressions followed by a task to assemble the parent node.
     fn enter<'c>(&mut self, core: &'c Core<'gc>, then: &mut Vec<Task<'c, 'gc>>) -> Result<Option<Node<'id, 'gc>>, CompileError> {
-        let all = |args: &'c [Core<'gc>], then: &mut Vec<Task<'c, 'gc>>| then.extend(args.iter().map(Task::Expr));
+        fn all<'c, 'gc>(args: &'c [Core<'gc>], then: &mut Vec<Task<'c, 'gc>>) {
+            then.extend(args.iter().map(Task::Expr));
+        }
         match core {
             Core::Quote(value) => return Ok(Some(Node::Quote(*value))),
             Core::Ref(Place::Local(var)) => {
@@ -377,14 +379,16 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
     /// Constructs the lowered L1 node for `core` by popping its lowered child IDs from `vals`, and
     /// removes any variables introduced by this binding form from the active lexical scope.
     fn make(&mut self, core: &Core<'gc>, vals: &mut Vec<Id<'id>>) -> Result<Node<'id, 'gc>, CompileError> {
-        let mut last = |count: usize| vals.split_off(vals.len() - count);
+        fn last<'id>(vals: &mut Vec<Id<'id>>, count: usize) -> Vec<Id<'id>> {
+            vals.split_off(vals.len() - count)
+        }
         Ok(match core {
             Core::If(..) => {
-                let [test, consequent, other] = last(3)[..] else { unreachable!("an if has three parts") };
+                let [test, consequent, other] = last(vals, 3)[..] else { unreachable!("an if has three parts") };
                 Node::If(test, consequent, other)
             }
             Core::Let(binds, _) | Core::Letrec(binds, _) => {
-                let mut ids = last(binds.len() + 1);
+                let mut ids = last(vals, binds.len() + 1);
                 let body = ids.pop().expect("a body");
                 let mut made = Vec::with_capacity(binds.len());
                 for ((var, init), id) in binds.iter().zip(ids) {
@@ -416,7 +420,7 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
                 let binds = self.tree.list(made);
                 if matches!(core, Core::Let(..)) { Node::Let(binds, body) } else { Node::Letrec(binds, body) }
             }
-            Core::Set(Place::Local(var), _) => Node::Set(*var, last(1)[0]),
+            Core::Set(Place::Local(var), _) => Node::Set(*var, last(vals, 1)[0]),
             Core::Set(Place::Slot { slot, checked }, value) => {
                 // An unnamed lambda takes the name of the module variable that it defines.
                 let unnamed = match &**value {
@@ -430,16 +434,16 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
                     self.names.name(id, name);
                 }
                 let op = if *checked { SlotOp::StoreChecked } else { SlotOp::Store };
-                let value = last(1);
+                let value = last(vals, 1);
                 Node::Intrinsic(Prim::Slot(op, *slot), self.tree.list(value))
             }
             Core::App(_, args, _) => {
-                let mut ids = last(args.len() + 1);
+                let mut ids = last(vals, args.len() + 1);
                 let args = self.tree.list(ids.drain(1..));
                 Node::App(ids[0], args)
             }
             Core::Lambda(lambda) => {
-                let body = last(1)[0];
+                let body = last(vals, 1)[0];
                 for &var in lambda.params.iter().chain(&lambda.rest) {
                     self.scope.remove(&var);
                 }
@@ -447,13 +451,13 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
                 self.names.describe(lambda.id, lambda.name, lambda.at);
                 Node::Lambda(self.tree.function(Function { id: lambda.id, params, optional: lambda.optional, rest: lambda.rest, body }))
             }
-            Core::Intrinsic(prim, args, _) => Node::Intrinsic(*prim, self.tree.list(last(args.len()))),
-            Core::ApplyIntrinsic(prim, args, _) => Node::ApplyIntrinsic(*prim, self.tree.list(last(args.len()))),
+            Core::Intrinsic(prim, args, _) => Node::Intrinsic(*prim, self.tree.list(last(vals, args.len()))),
+            Core::ApplyIntrinsic(prim, args, _) => Node::ApplyIntrinsic(*prim, self.tree.list(last(vals, args.len()))),
             Core::SetGlobal(name, ..) => {
                 let (Some(unit), Some(Binding::Slot(slot))) = (self.unit, self.unit.and_then(|unit| unit.binding(*name))) else { unreachable!("an assigned name is a variable of the module") };
                 let Place::Slot { slot, checked } = unit.place(slot) else { unreachable!("a module variable has a slot") };
                 let op = if checked { SlotOp::StoreChecked } else { SlotOp::Store };
-                let value = last(1);
+                let value = last(vals, 1);
                 Node::Intrinsic(Prim::Slot(op, slot), self.tree.list(value))
             }
             Core::Quote(_) | Core::Ref(_) | Core::Import(_) | Core::Global(..) => unreachable!("leaves are lowered as they're reached"),
@@ -493,7 +497,7 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
         self.unit.and_then(|unit| unit.binding(name)).ok_or_else(|| global_error(GlobalError::Unbound, span))
     }
 
-    /// Returns what `function`, the callee expression of a call, refers to at module level.
+    /// Classifies `function`, the callee expression of a call: a variable of this module, an import, or anything else.
     fn callee(&self, function: &Core<'gc>) -> Result<Callee<'gc>, CompileError> {
         Ok(match function {
             Core::Ref(Place::Slot { slot, .. }) => Callee::Slot(*slot),
@@ -506,7 +510,7 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
         })
     }
 
-    /// Returns the keyword procedure that `function` is known to be, if any. `callee` is what `function` refers to at module level.
+    /// Returns the keyword procedure that `function` is known to be, if any. `callee` is the module-level classification of `function`.
     fn known(&self, function: &Core<'gc>, callee: Callee<'gc>) -> Option<Direct<'gc>> {
         match (function, callee) {
             (Core::Ref(Place::Local(var)), _) if !self.keyword_procedures.is_empty() => {
@@ -687,7 +691,7 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
         self.names.describe(lambda.id, lambda.name, lambda.at);
         let fun = self.tree.function(Function { id: lambda.id, params, optional, rest: lambda.rest, body });
         let plain = self.tree.add(Node::Lambda(fun));
-        // Without keywords, the lambda is the whole procedure. With keywords, it is the core: a `letrec` that binds the procedure builds the keyword procedure itself.
+        // Without keywords, the lambda is the whole procedure. With keywords, the lambda is the core. If the lambda is in `keyword_cores`, only the core is returned: the `letrec` or the module definition that binds the procedure builds the keyword procedure around it.
         if shape.keywords.is_empty() || self.keyword_cores.contains(&lambda.id) {
             return Ok(plain);
         }
@@ -901,7 +905,7 @@ fn described<'gc>(lambda: &OptionalLambda<'gc>) -> Vec<keyword::Param<'gc>> {
     lambda.params.iter().map(|formal| keyword::Param { keyword: formal.keyword, optional: formal.default.is_some() }).collect()
 }
 
-/// What a read of a module variable in an inline template expands to.
+/// The expansion of a module-variable read in an inline template.
 enum Slots<'gc> {
     /// The current value of the variable in the module that exports the import.
     Of(Import<'gc>),

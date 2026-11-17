@@ -238,8 +238,7 @@ impl<'gc> Import<'gc> {
     /// A variable can be undefined if its module stopped early. This happens in the REPL when an input raises an error partway through.
     pub(crate) fn inlined(self, mc: &Mutation<'gc>, args: usize) -> Option<&'gc Inline> {
         let inline = self.export.inline.as_ref()?;
-        let defined = |slot: u32| self.variable(mc, slot).is_some();
-        let fits = inline.inlines(args) && defined(self.export.slot) && inline.slots().all(defined);
+        let fits = inline.inlines(args) && self.variable(mc, self.export.slot).is_some() && inline.slots().all(|slot| self.variable(mc, slot).is_some());
         fits.then_some(inline)
     }
 
@@ -335,7 +334,9 @@ pub enum SpecError<L> {
 impl<L: Copy> RequireSpec<L> {
     /// Resolves and filters the module imports for a requiring module named `from` using `resolver`.
     pub fn imports<'gc>(&self, mc: &Mutation<'gc>, resolver: &mut dyn Resolver<'gc>, from: Value<'gc>) -> Result<Imports<'gc>, SpecError<L>> {
-        let at = |names: &[(String, L)], missing: String| names.iter().find(|(name, _)| *name == missing).map(|&(_, at)| SpecError::NotProvided(at));
+        fn at<L: Copy>(names: &[(String, L)], missing: String) -> Option<SpecError<L>> {
+            names.iter().find(|(name, _)| *name == missing).map(|&(_, at)| SpecError::NotProvided(at))
+        }
         let module = resolver.resolve(mc, &self.module, from).ok_or(SpecError::Resolve(self.at))?;
         let mut imports = Imports::all(mc, module).ok_or(SpecError::Resolve(self.at))?;
         for filter in &self.filters {
@@ -407,11 +408,13 @@ struct Lines<'x, 'gc> {
 impl Lines<'_, '_> {
     /// Returns the line of the code at `site`, or 0 if the line is unknown. The line is unknown for code that has no position, and for code from another source: code written by a macro, or code expanded from another procedure's template.
     fn of(&self, site: u32) -> u32 {
-        let line = || {
-            let site = self.sites.get(site).filter(|site| site.inlined == 0 && Some(site.at.source) == self.source)?;
-            Some(SyntaxSource::of(site.at.source)?.location(self.mc, site.at.offset)?.line)
-        };
-        line().unwrap_or(0)
+        self.known(site).unwrap_or(0)
+    }
+
+    /// Returns the line of the code at `site`, or `None` if the line is unknown.
+    fn known(&self, site: u32) -> Option<u32> {
+        let site = self.sites.get(site).filter(|site| site.inlined == 0 && Some(site.at.source) == self.source)?;
+        Some(SyntaxSource::of(site.at.source)?.location(self.mc, site.at.offset)?.line)
     }
 }
 
@@ -497,7 +500,9 @@ impl Inline {
     /// - A single built-in operation on parameters and constants. The prelude's thin wrappers around intrinsics have this shape.
     /// - A procedure whose outermost operation raises its argument, such as `error`. The error belongs to the caller.
     pub(crate) fn is_wrapper(&self) -> bool {
-        let simple = |part: &Template| matches!(part, Template::Param(_) | Template::Immediate(_) | Template::Slot(_));
+        fn simple(part: &Template) -> bool {
+            matches!(part, Template::Param(_) | Template::Immediate(_) | Template::Slot(_))
+        }
         match &self.body {
             Template::Prim(Prim::Request(Request::Raise | Request::RaiseContinuable), ..) => true,
             Template::Prim(_, args, _) | Template::Apply(_, args, _) => args.iter().all(simple),
@@ -507,11 +512,13 @@ impl Inline {
 
     /// Constructs an [`Inline`] template for a procedure with `params` parameters that delegates directly to `intrinsic` with `operands` (e.g. struct getters/setters/constructors).
     pub fn of_call(intrinsic: Intrinsic, params: u32, operands: &[Operand]) -> Self {
-        let operand = |operand: &Operand| match *operand {
-            Operand::Param(param) => Template::Param(param),
-            Operand::Slot(slot) => Template::Slot(slot),
-            Operand::Index(index) => Template::Immediate(Value::fixnum(i64::from(index)).and_then(Value::immediate).expect("an index is a fixnum")),
-        };
+        fn operand(operand: &Operand) -> Template {
+            match *operand {
+                Operand::Param(param) => Template::Param(param),
+                Operand::Slot(slot) => Template::Slot(slot),
+                Operand::Index(index) => Template::Immediate(Value::fixnum(i64::from(index)).and_then(Value::immediate).expect("an index is a fixnum")),
+            }
+        }
         Self::new(params, 0, false, 0, Template::Prim(Prim::Intrinsic(intrinsic), operands.iter().map(operand).collect(), 0))
     }
 
@@ -632,8 +639,9 @@ impl Template {
     fn of<'id, 'gc>(tree: &L1<'id, 'gc>, id: Id<'id>, params: &[Var], locals: &mut Vec<Var>, left: &mut usize, lines: &Lines<'_, 'gc>) -> Option<Self> {
         *left = left.checked_sub(1)?;
         // Host functions are transitively propagated into the host table of any requiring module, so they may be safely inlined.
-        let closed = |prim: Prim| !matches!(prim, Prim::Slot(..));
-        let mut all = |ids: Span<'id, Id<'id>>, locals: &mut Vec<Var>| tree[ids].iter().map(|&id| Self::of(tree, id, params, locals, left, lines)).collect::<Option<Vec<_>>>();
+        fn closed(prim: Prim) -> bool {
+            !matches!(prim, Prim::Slot(..))
+        }
         let line = lines.of(tree.site(id));
         Some(match tree[id] {
             Node::Ref(var) => match params.iter().position(|&param| param == var) {
@@ -655,8 +663,8 @@ impl Template {
                 let (test, consequent) = (Self::of(tree, test, params, locals, left, lines)?, Self::of(tree, consequent, params, locals, left, lines)?);
                 Self::If(Box::new([test, consequent, Self::of(tree, other, params, locals, left, lines)?]))
             }
-            Node::Intrinsic(prim, args) if closed(prim) => Self::Prim(prim, all(args, locals)?, line),
-            Node::ApplyIntrinsic(prim, args) if closed(prim) => Self::Apply(prim, all(args, locals)?, line),
+            Node::Intrinsic(prim, args) if closed(prim) => Self::Prim(prim, Self::of_all(tree, args, params, locals, left, lines)?, line),
+            Node::ApplyIntrinsic(prim, args) if closed(prim) => Self::Apply(prim, Self::of_all(tree, args, params, locals, left, lines)?, line),
             Node::Let(binds, body) => {
                 let mut values = Vec::with_capacity(tree[binds].len());
                 for &(_, value) in &tree[binds] {
@@ -668,6 +676,15 @@ impl Template {
             }
             _ => return None,
         })
+    }
+
+    /// Converts each node of `ids` into a `Template`, as [`Template::of`] does. Returns `None` if any of them cannot be converted.
+    fn of_all<'id, 'gc>(tree: &L1<'id, 'gc>, ids: Span<'id, Id<'id>>, params: &[Var], locals: &mut Vec<Var>, left: &mut usize, lines: &Lines<'_, 'gc>) -> Option<Vec<Self>> {
+        let mut parts = Vec::with_capacity(tree[ids].len());
+        for &id in &tree[ids] {
+            parts.push(Self::of(tree, id, params, locals, left, lines)?);
+        }
+        Some(parts)
     }
 
     /// Records the sequence of parameter references and effectful operations performed by the template. Conditional branches are marked as non-linear operations following the test expression.
@@ -716,16 +733,18 @@ impl Template {
 
     /// Counts the number of occurrences where the rest parameter `rest` is used as a materialized list when called with `count` excess arguments.
     fn list_uses(&self, rest: u32, count: usize) -> usize {
-        let of = |parts: &[Template]| parts.iter().map(|part| part.list_uses(rest, count)).sum::<usize>();
+        fn of(parts: &[Template], rest: u32, count: usize) -> usize {
+            parts.iter().map(|part| part.list_uses(rest, count)).sum::<usize>()
+        }
         match self {
             Self::Param(param) => usize::from(*param == rest),
             Self::Immediate(_) | Self::Local(_) | Self::Slot(_) => 0,
-            Self::Let(_, values, body) => of(values) + body.list_uses(rest, count),
-            Self::If(parts) => of(&parts[..]),
-            Self::Prim(_, args, _) | Self::Call(args, _) => of(args),
+            Self::Let(_, values, body) => of(values, rest, count) + body.list_uses(rest, count),
+            Self::If(parts) => of(&parts[..], rest, count),
+            Self::Prim(_, args, _) | Self::Call(args, _) => of(args, rest, count),
             Self::Apply(prim, args, _) => match args.split_last() {
-                Some((Self::Param(param), fixed)) if *param == rest => usize::from(!takes(*prim, fixed.len() + count)) + of(fixed),
-                _ => of(args),
+                Some((Self::Param(param), fixed)) if *param == rest => usize::from(!takes(*prim, fixed.len() + count)) + of(fixed, rest, count),
+                _ => of(args, rest, count),
             },
         }
     }
@@ -798,7 +817,7 @@ pub enum ModuleError {
     Conflict,
     /// Attempted to export an identifier that is not defined in the module.
     NotDefined,
-    /// Attempted to mutate an immutable definition, such as a keyword procedure core or a struct type descriptor.
+    /// Attempted to mutate an immutable definition, such as a keyword procedure or a struct type descriptor.
     Immutable,
     /// A required module could not be found.
     Resolve,
@@ -806,7 +825,7 @@ pub enum ModuleError {
     NotProvided,
     /// The supertype named by a struct declaration is not a struct type that can be extended.
     Supertype,
-    /// A struct declaration whose type cannot be made, for example because it has too many fields.
+    /// The type of a struct declaration cannot be created, for example because it has too many fields.
     Struct,
     OutOfMemory,
 }
@@ -965,7 +984,9 @@ impl<'gc> Description<'gc> {
     pub fn build(self, mc: &Mutation<'gc>, resolver: &mut dyn Resolver<'gc>) -> Result<Loaded<'gc>, BuildError<'gc>> {
         let mut builder = ModuleBuilder::new(self.name, self.hosts);
         builder.locals = self.locals;
-        let index = |position: usize| u32::try_from(position).map_err(|_| CompileError::OutOfMemory);
+        fn index(position: usize) -> Result<u32, CompileError> {
+            u32::try_from(position).map_err(|_| CompileError::OutOfMemory)
+        }
         for (i, item) in self.items.iter().enumerate() {
             builder.declare(mc, resolver, index(i)?, item)?;
         }
@@ -996,7 +1017,7 @@ impl<'gc> Unit<'_, 'gc> {
         Some((self.builder.place(core, self.form, self.defining), shape))
     }
 
-    /// Returns what the definition of keyword procedure `slot` needs: the slot of the core procedure, the place to read the core from, and the call shape. Returns `None` if `slot` was not declared as a keyword procedure.
+    /// Returns the data needed to define keyword procedure `slot`: the slot of the core procedure, the place to read the core from, and the call shape. Returns `None` if `slot` was not declared as a keyword procedure.
     pub(crate) fn keyword_definition(&self, slot: u32) -> Option<(u32, Place, &CallShape<'gc>)> {
         let (core, shape) = self.builder.keyword_def(slot)?;
         Some((core, self.builder.place(core, self.form, self.defining), shape))
@@ -1283,7 +1304,7 @@ impl<'gc> ModuleBuilder<'gc> {
         self.defined_by.get(slot as usize).is_some_and(|&by| by < form).then_some(*kind)
     }
 
-    /// Marks variable `slot` as mutated. Returns an error if `slot` represents an immutable keyword procedure core or struct procedure.
+    /// Marks variable `slot` as mutated. Returns an error if the variable is immutable: a keyword procedure, or a binding of a struct declaration.
     pub fn assign(&mut self, slot: u32) -> Result<(), ModuleError> {
         if !self.assignable(slot) {
             return Err(ModuleError::Immutable);
@@ -1394,33 +1415,34 @@ impl<'gc> ModuleBuilder<'gc> {
         Ok(thunk)
     }
 
+    /// Returns the export of variable `slot`. The `core` field is left as `None`, even for a keyword procedure.
+    fn export(&self, slot: u32) -> Export {
+        let mutable = self.assigned.contains(&slot);
+        // Do not inline procedures that read mutated module slots; otherwise callers would observe stale values captured at import time.
+        let inline = if mutable { None } else { self.procedures.get(&slot).map(|(inline, _)| inline).or(self.inlines.get(&slot)).filter(|inline| inline.slots().all(|read| !self.assigned.contains(&read))).cloned() };
+        Export { slot, mutable, inline, core: None, structure: self.structs.get(&slot).cloned().map(Box::new) }
+    }
+
     /// Finalizes the module after all top-level forms are compiled, publishing its [`Interface`] and returning the module instance.
     pub fn finish(mut self, mc: &Mutation<'gc>) -> Result<Gc<'gc, Module>, OutOfMemory> {
         let module = match self.module {
             Some(module) => module,
             None => self.start(mc)?,
         };
-        let export = |slot: u32| {
-            let mutable = self.assigned.contains(&slot);
-            // Do not inline procedures that read mutated module slots; otherwise callers would observe stale values captured at import time.
-            let fixed = |inline: &&Inline| inline.slots().all(|read| !self.assigned.contains(&read));
-            let inline = if mutable { None } else { self.procedures.get(&slot).map(|(inline, _)| inline).or(self.inlines.get(&slot)).filter(fixed).cloned() };
-            Export { slot, mutable, inline, core: None, structure: self.structs.get(&slot).cloned().map(Box::new) }
-        };
         let mut exports = HashMap::default();
         for &(ref name, provided) in &self.exports {
             let out = match provided {
                 Provided::Variable(slot) => {
-                    let mut out = export(slot);
+                    let mut out = self.export(slot);
                     if !out.mutable {
-                        out.core = self.cores.get(&slot).map(|&(core, _)| Box::new(export(core)));
+                        out.core = self.cores.get(&slot).map(|&(core, _)| Box::new(self.export(core)));
                     }
                     out
                 }
                 // Bind the export to the struct type descriptor slot rather than the constructor, restricting use to pattern matching.
                 Provided::Matching(constructor) => {
                     let def = self.structs.get(&constructor).expect("a struct's constructor").clone();
-                    let mut out = export(def.kind);
+                    let mut out = self.export(def.kind);
                     out.structure = Some(Box::new(StructDef { sealed: true, match_only: true, ..def }));
                     out
                 }

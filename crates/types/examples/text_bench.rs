@@ -1,5 +1,5 @@
-//! Strings and bignums on this arena, with characters packed into words and digits in items. The same workloads
-//! run on `ragwort-types`, where they're inline, as its `text_bench` example.
+//! Benchmarks strings and bignums in the arena. Characters are packed into words, and bignum digits are
+//! stored in items. The workloads are in `common/text_work.rs`.
 
 #[path = "common/text_work.rs"]
 mod work;

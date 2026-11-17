@@ -1,7 +1,7 @@
-//! Ragwort's data in the arena: the collector, in [`gc`], and the types it holds: numbers,
-//! strings, symbols, pairs, vectors, tables, external references and syntax, and the compiler's
-//! constant pools. Pairs, symbols, vectors, tables, external references and syntax are views of
-//! objects only this crate can change.
+//! Ragwort's data in the arena. The collector is in [`gc`]. The other modules define the types
+//! that the arena holds: numbers, strings, symbols, pairs, vectors, tables, external references
+//! and syntax, and the compiler's constant pools. Pairs, symbols, vectors, tables, external
+//! references and syntax are views of objects that only this crate can modify.
 
 extern crate self as ragwort_types;
 
@@ -9,7 +9,7 @@ pub use gc::Error;
 pub use ragwort_derive::{Wire, named};
 pub use wire::Wire;
 
-/// A name none of an enum's variants has, from the `FromStr` that [`named!`] writes.
+/// The error for a name that no variant of an enum has. The `FromStr` implementation that [`named!`] generates returns it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnknownName;
 

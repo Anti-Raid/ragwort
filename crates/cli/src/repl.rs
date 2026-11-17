@@ -1,4 +1,4 @@
-//! The REPL: reads what's typed until it's whole, runs it, and writes each form's value.
+//! The REPL. It reads input until the input is complete, runs it, and writes the value of each form.
 
 use std::io::{BufRead, IsTerminal};
 use std::process::ExitCode;
@@ -6,8 +6,8 @@ use std::process::ExitCode;
 use crate::hosts::{flush, put};
 use crate::program::Program;
 
-/// Runs what the standard input has, an input at a time, till it ends. It prompts if a person
-/// is typing.
+/// Reads the standard input and runs it one input at a time, until the standard input ends. Prompts are shown if the standard input
+/// is a terminal.
 pub fn run(program: &mut Program) -> ExitCode {
     let stdin = std::io::stdin();
     let prompts = stdin.is_terminal();

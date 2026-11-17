@@ -111,20 +111,21 @@ use ragwort_compiler::structs::{self, Declaration, Declared, Named, Supertype};
 use ragwort_compiler::Core;
 use ragwort_types::gc::{OutOfMemory, Value};
 use ragwort_types::string::chars;
+use ragwort_types::syntax::SyntaxSpan;
 use ragwort_vm::structs::TypeFlags;
 
 use crate::expand::{Binding, Expander};
 use crate::tree::{Stx, View};
 use crate::{ExpandError, ExpandErrorKind};
 
-/// A field as a struct form writes it.
+/// A field declaration of a `struct` form.
 struct FieldSpec {
     id: Stx,
     mutable: bool,
 }
 
-/// A struct form's parts: its fields, the names of its constructors besides its own, and the
-/// flags its options set.
+/// The parsed parts of a `struct` form. `constructors` holds the names of the extra constructors, and
+/// `flags` holds the flags that the options set.
 struct Form {
     name: Stx,
     parent: Option<Stx>,
@@ -133,32 +134,32 @@ struct Form {
     flags: TypeFlags,
 }
 
-/// A struct type, as the name of its constructor stands for it: its fields are all of them, its
-/// supertype's first.
+/// A struct type, as known through the name of its constructor. `fields` holds all fields, with the
+/// supertype's fields first.
 #[derive(Clone, Debug)]
 pub(crate) struct Info<'gc> {
     pub(crate) kind: Value<'gc>,
     pub(crate) fields: Vec<Field>,
     sealed: bool,
-    /// Whether its module provides it without its constructor, so the name is only for `match`.
+    /// Whether the struct's module provides it without its constructor. The name is then valid only in a `match` pattern.
     match_only: bool,
 }
 
 impl<'a, 'gc> Expander<'a, 'gc> {
-    /// The name of the keyword `stx` is, if it's one.
+    /// Returns the name of `stx` if it is a keyword. The name does not include the `#:` prefix.
     pub(crate) fn keyword_name(&self, stx: Stx) -> Option<String> {
         let keyword = self.tree.keyword(stx)?;
         Some(chars(&self.strings, keyword.symbol(self.mc).name(self.mc)).collect())
     }
 
-    /// An identifier named `name`, in the scopes of `from`, where it is: what a form that binds
-    /// `from` binds besides.
+    /// Creates an identifier named `name` with the scopes and the span of `from`. A form that binds
+    /// `from` uses it for a derived name that the form also binds, such as `point?` for `point`.
     fn named_after(&mut self, from: Stx, name: &str) -> Result<Stx, ExpandError> {
         let (symbol, scopes) = (self.symbol(name)?, self.tree.scopes_of(from)?);
         Ok(self.tree.id(symbol, scopes, self.tree.span(from))?)
     }
 
-    /// The parts of `form`, a `struct` form.
+    /// Parses `form`, a `struct` form.
     fn struct_form(&mut self, form: Stx) -> Result<Form, ExpandError> {
         let bad = ExpandErrorKind::BadSyntax;
         let items = self.proper(form)?;
@@ -211,34 +212,40 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         Ok(Form { name, parent, fields, constructors, flags })
     }
 
-    /// The struct type `id` stands for, if it's the name of one's constructor.
+    /// Returns the struct type that `id` names, if `id` is an identifier bound to the constructor of a struct.
     pub(crate) fn struct_info(&mut self, id: Stx) -> Result<Option<Info<'gc>>, ExpandError> {
         if !self.is_id(id) {
             return Ok(None);
         }
-        let of = |def: &StructDef, kind: Value<'gc>| Info { kind, fields: def.fields.to_vec(), sealed: def.sealed, match_only: def.match_only };
+        fn info<'gc>(def: &StructDef, kind: Value<'gc>) -> Info<'gc> {
+            Info { kind, fields: def.fields.to_vec(), sealed: def.sealed, match_only: def.match_only }
+        }
         Ok(match self.resolve(id)? {
-            Binding::Slot(slot) => self.builder.struct_def(slot).map(|(def, kind)| of(def, kind)),
-            Binding::Import(import) => import.struct_def(self.mc).map(|(def, kind)| of(def, kind)),
+            Binding::Slot(slot) => self.builder.struct_def(slot).map(|(def, kind)| info(def, kind)),
+            Binding::Import(import) => import.struct_def(self.mc).map(|(def, kind)| info(def, kind)),
             _ => None,
         })
     }
 
     /// Converts the parsed `form` into the compiler's struct declaration. `whole` is the syntax of the entire form. Names become symbols with their spans.
     fn struct_item(&self, form: &Form, whole: Stx) -> structs::Form<'gc> {
-        let named = |id: Stx| (self.tree.symbol(id).expect("an identifier").value(self.mc), self.tree.span(id));
         structs::Form {
-            name: named(form.name),
+            name: self.symbol_and_span(form.name),
             span: self.tree.span(whole),
-            parent: form.parent.map(named),
-            fields: form.fields.iter().map(|field| Declaration { name: named(field.id).0, mutable: field.mutable }).collect(),
+            parent: form.parent.map(|parent| self.symbol_and_span(parent)),
+            fields: form.fields.iter().map(|field| Declaration { name: self.symbol_and_span(field.id).0, mutable: field.mutable }).collect(),
             flags: form.flags,
-            constructors: form.constructors.iter().map(|&id| named(id)).collect(),
+            constructors: form.constructors.iter().map(|&id| self.symbol_and_span(id)).collect(),
         }
     }
 
-    /// Declares what `form`, a struct form that's the module's top-level form `index`, defines,
-    /// and makes its type, which the module's code has as a constant.
+    /// Returns the symbol of the identifier `id` and its span.
+    fn symbol_and_span(&self, id: Stx) -> (Value<'gc>, SyntaxSpan<'gc>) {
+        (self.tree.symbol(id).expect("an identifier").value(self.mc), self.tree.span(id))
+    }
+
+    /// Declares the bindings of `form`, a `struct` form that is the module's top-level form `index`.
+    /// Also creates the struct type, which the module's code refers to as a constant.
     ///
     /// The compiler plans the declaration: it creates the type and lists the bindings. This method does the two steps that depend on scopes:
     /// - It resolves the supertype's identifier.
@@ -268,21 +275,21 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         Ok(planned.declare(&mut self.builder, slots))
     }
 
-    /// The code of a struct form at the top level, which defines each of the form's variables.
+    /// Returns the code of a declared `struct` form. The code defines each of the form's variables.
     pub(crate) fn lower_struct(&mut self, declared: Declared) -> Core<'gc> {
         let (_, kind) = self.builder.struct_def(declared.constructor()).expect("a declared struct");
         declared.define(kind, self.builder.locals())
     }
 
-    /// An expression for the type of `info`, at `at`.
+    /// Returns an expression for the struct type of `info`, with the span of `at`.
     pub(crate) fn struct_type(&mut self, info: &Info<'gc>, at: Stx) -> Result<Stx, ExpandError> {
         let kind = self.value(info.kind, at)?;
         self.quoted(kind, at)
     }
 
-    /// `(struct-copy name expr [field value] ...)`: `(let ((t expr)) (let ((v value)) ... (name field
-    /// ...)))`, a call of the struct's constructor, each field its `v` or a read of that field
-    /// of `t`, which checks that `t` is of the type.
+    /// Expands `(struct-copy name expr [field value] ...)` to `(let ((t expr)) (let ((v value)) ... (name field
+    /// ...)))`. The body calls the struct's constructor. Each argument is the `v` given for the field, or a read of that field
+    /// from `t`. A field read checks that `t` is an instance of the type.
     pub(crate) fn struct_copy(&mut self, stx: Stx, name: Stx, expr: Stx, updates: &[Stx]) -> Result<Stx, ExpandError> {
         let bad = ExpandErrorKind::BadSyntax;
         let Some(info) = self.struct_info(name)? else { return Err(self.error(bad, name)) };
@@ -297,7 +304,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         for (i, &update) in updates.iter().enumerate() {
             let &[field, value] = self.proper(update)?.as_slice() else { return Err(self.error(bad, update)) };
             let named = if self.is_id(field) { self.text(field) } else { None };
-            // A subtype's field of a name is the one meant, over its supertype's.
+            // If several types in the supertype chain have a field of this name, the name refers to the field of the most derived type.
             let Some(index) = named.and_then(|named| info.fields.iter().rposition(|candidate| *candidate.name == *named)) else { return Err(self.error(bad, field)) };
             if given[index].is_some() {
                 return Err(self.error(ExpandErrorKind::Duplicate, field));
@@ -318,7 +325,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             });
         }
         let mut body = self.list(&[&[name], fields.as_slice()].concat(), stx)?;
-        // Nothing has read a field of the source, to find it's not of the type.
+        // Every field is given, so no field read has checked the type of the source. Test it here. If the test fails, read field 0, which raises the type error.
         if all_given {
             let zero = self.value(Value::fixnum(0).expect("zero is a fixnum"), stx)?;
             let (test, not_one) = (self.build(stx, is, &[&[source, kind]])?, self.list(&[get, source, kind, zero], stx)?);

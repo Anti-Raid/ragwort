@@ -10,6 +10,10 @@ fn root<'gc>(mc: &Mutation<'gc>) -> GcVec<'gc> {
     GcVec::of(mc.root(0).downcast(mc).unwrap())
 }
 
+fn string<'gc>(h: &Strings<'_, 'gc>, text: &str) -> Str<'gc> {
+    from_str(h, text).unwrap()
+}
+
 fn arena(limit: usize) -> Arena {
     let mut arena = Arena::new(limit, 1);
     arena.mutate(|mc| {
@@ -64,8 +68,8 @@ fn strings_live_in_the_arena() {
     });
 }
 
-/// What a bot does to a message, on an external string and a rope over it, and what that makes
-/// survives collections that move it.
+/// Runs the operations that a bot performs on a message, on an external string and on a rope over
+/// it. The results survive collections that move them.
 #[test]
 fn text_operations_work_on_every_kind_of_string() {
     let mut arena = arena(8 << 20);
@@ -74,20 +78,19 @@ fn text_operations_work_on_every_kind_of_string() {
     let command = message.trim();
     arena.mutate(|mc| {
         let h = Strings::new(mc);
-        let s = |t: &str| from_str(&h, t).unwrap();
         let external = h.external(ExternalText::new(message.clone())).unwrap();
-        let rope = concat(&h, s(&"x".repeat(600)), external).unwrap();
+        let rope = concat(&h, string(&h, &"x".repeat(600)), external).unwrap();
         assert!(h.is_external(external) && !is_flat(&h, rope));
         let trimmed = trim(&h, external).unwrap();
         assert_eq!(display(&h, trimmed).to_string(), command);
         let words: Vec<_> = split_whitespace(&h, external).map(Result::unwrap).collect();
         assert_eq!(words.len(), command.split_whitespace().count());
-        assert_eq!(compare_ci(&h, words[0], s("!BAN")), Ok(Ordering::Equal));
-        assert_eq!(starts_with(&h, words[1], s("@")), Ok(true));
-        assert_eq!(find(&h, rope, s("rude"), 0), Ok(command.find("rude").map(|i| i + 600 + 2)));
-        assert_eq!(split(&h, rope, s("rude")).count(), 11);
+        assert_eq!(compare_ci(&h, words[0], string(&h, "!BAN")), Ok(Ordering::Equal));
+        assert_eq!(starts_with(&h, words[1], string(&h, "@")), Ok(true));
+        assert_eq!(find(&h, rope, string(&h, "rude"), 0), Ok(command.find("rude").map(|i| i + 600 + 2)));
+        assert_eq!(split(&h, rope, string(&h, "rude")).count(), 11);
         let loud = upcase(&h, rope).unwrap();
-        assert_eq!(ends_with(&h, loud, s("RUDE ")), Ok(true));
+        assert_eq!(ends_with(&h, loud, string(&h, "RUDE ")), Ok(true));
         assert_eq!(equal(&h, foldcase(&h, loud).unwrap(), downcase(&h, rope).unwrap()), Ok(true));
         for kept in [trimmed, words[1], loud] {
             root(mc).push(mc, kept.value()).unwrap();
@@ -102,8 +105,8 @@ fn text_operations_work_on_every_kind_of_string() {
     });
 }
 
-/// Latin-1 strings of up to seven characters are values, not objects: making one allocates
-/// nothing, equal ones are the same value, and they read as any other flat string does.
+/// A Latin-1 string of up to seven characters is an immediate value, not an object. Creating one
+/// allocates nothing, equal ones are the same value, and it reads like any other flat string.
 #[test]
 fn short_strings_live_in_the_word() {
     let mut arena = arena(8 << 20);
@@ -125,35 +128,34 @@ fn short_strings_live_in_the_word() {
     arena.fail_after(None);
     arena.mutate(|mc| {
         let h = Strings::new(mc);
-        let s = |t: &str| from_str(&h, t).unwrap();
         for &t in &texts {
-            root(mc).push(mc, s(t).value()).unwrap();
+            root(mc).push(mc, string(&h, t).value()).unwrap();
         }
         for t in ["12345678", "Ā", "日本"] {
-            assert!(s(t).value().immediate().is_none(), "{t:?}");
+            assert!(string(&h, t).value().immediate().is_none(), "{t:?}");
         }
-        let long = s(&format!("!ban user42 7d spam {}", "and links ".repeat(300)));
-        let words: Vec<_> = split(&h, long, s(" ")).take(4).map(Result::unwrap).collect();
-        assert_eq!(words, ["!ban", "user42", "7d", "spam"].map(s), "pieces of a longer string");
-        assert_eq!(substring(&h, long, 5, 11), Ok(s("user42")));
-        assert_eq!(concat(&h, s("ab"), s("cd")), Ok(s("abcd")));
-        assert!(concat(&h, s("abcd"), s("efgh")).unwrap().value().immediate().is_none());
-        assert_eq!(find(&h, long, s("links"), 0), Ok(Some(24)));
-        assert_eq!(find(&h, s("!ping"), s("in"), 0), Ok(Some(2)));
-        assert_eq!(rfind(&h, s("abcabc"), s("b"), 6), Ok(Some(4)));
-        assert_eq!(starts_with(&h, long, s("!ban u")), Ok(true));
-        assert_eq!(upcase(&h, s("café")), Ok(s("CAFÉ")));
-        assert_eq!(compare_ci(&h, s("!BAN"), words[0]), Ok(Ordering::Equal));
-        assert_eq!(compare(&h, s("abc"), substring(&h, long, 5, 9).unwrap()), Ok(Ordering::Less));
-        assert_eq!(equal_str(&h, s("café"), "café"), Ok(true));
-        assert_eq!(char_at(&h, s("café"), 3), Ok('é'));
-        let rope = concat(&h, long, s("!")).unwrap();
+        let long = string(&h, &format!("!ban user42 7d spam {}", "and links ".repeat(300)));
+        let words: Vec<_> = split(&h, long, string(&h, " ")).take(4).map(Result::unwrap).collect();
+        assert_eq!(words, ["!ban", "user42", "7d", "spam"].map(|text| string(&h, text)), "pieces of a longer string");
+        assert_eq!(substring(&h, long, 5, 11), Ok(string(&h, "user42")));
+        assert_eq!(concat(&h, string(&h, "ab"), string(&h, "cd")), Ok(string(&h, "abcd")));
+        assert!(concat(&h, string(&h, "abcd"), string(&h, "efgh")).unwrap().value().immediate().is_none());
+        assert_eq!(find(&h, long, string(&h, "links"), 0), Ok(Some(24)));
+        assert_eq!(find(&h, string(&h, "!ping"), string(&h, "in"), 0), Ok(Some(2)));
+        assert_eq!(rfind(&h, string(&h, "abcabc"), string(&h, "b"), 6), Ok(Some(4)));
+        assert_eq!(starts_with(&h, long, string(&h, "!ban u")), Ok(true));
+        assert_eq!(upcase(&h, string(&h, "café")), Ok(string(&h, "CAFÉ")));
+        assert_eq!(compare_ci(&h, string(&h, "!BAN"), words[0]), Ok(Ordering::Equal));
+        assert_eq!(compare(&h, string(&h, "abc"), substring(&h, long, 5, 9).unwrap()), Ok(Ordering::Less));
+        assert_eq!(equal_str(&h, string(&h, "café"), "café"), Ok(true));
+        assert_eq!(char_at(&h, string(&h, "café"), 3), Ok('é'));
+        let rope = concat(&h, long, string(&h, "!")).unwrap();
         let text = format!("{}!", display(&h, long));
         assert!(!is_flat(&h, rope));
         assert_eq!(display(&h, rope).to_string(), text);
         assert_eq!(hash(&h, rope, 3), Ok(hash_str(&text, 3)));
         assert_eq!(equal(&h, rope, flatten(&h, rope).unwrap()), Ok(true));
-        assert_eq!(ends_with(&h, rope, s("links !")), Ok(true));
+        assert_eq!(ends_with(&h, rope, string(&h, "links !")), Ok(true));
         root(mc).push(mc, rope.value()).unwrap();
     });
     arena.collect();
@@ -168,26 +170,23 @@ fn short_strings_live_in_the_word() {
     });
 }
 
-/// Strings made and dropped in the young generation go at the next minor collection, and the
-/// kept ones keep their characters.
 #[test]
 fn parts_join_a_word_at_a_time() {
     arena(8 << 20).mutate(|mc| {
         let h = Strings::new(mc);
-        let s = |t: &str| from_str(&h, t).unwrap();
-        let long = s("0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz");
+        let long = string(&h, "0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz");
         let external = h.external(ExternalText::new("an external string, long enough to stay outside")).unwrap();
         let outside = h.external(ExternalText::new("an external string that's long enough to be kept outside the arena")).unwrap();
         assert!(h.is_external(outside));
         let cases = [
-            (vec![s("<@"), s("user"), s(">")], "<@user>"),
-            (vec![s("ab"), s(""), s("cde"), s("fgh")], "abcdefgh"),
-            (vec![s("caf"), s("é!")], "café!"),
-            (vec![s("a"), s("🦀")], "a🦀"),
-            (vec![s("ab"), substring(&h, long, 3, 6).unwrap(), s("z")], "ab345z"),
-            (vec![s("x"), substring(&h, external, 3, 6).unwrap()], "xext"),
-            (vec![s("x"), concat(&h, long, long).unwrap()], &*format!("x{0}{0}", display(&h, long))),
-            (vec![s("abc"), long, s("de"), outside, s("é")], &*format!("abc{}de{}é", display(&h, long), display(&h, outside))),
+            (vec![string(&h, "<@"), string(&h, "user"), string(&h, ">")], "<@user>"),
+            (vec![string(&h, "ab"), string(&h, ""), string(&h, "cde"), string(&h, "fgh")], "abcdefgh"),
+            (vec![string(&h, "caf"), string(&h, "é!")], "café!"),
+            (vec![string(&h, "a"), string(&h, "🦀")], "a🦀"),
+            (vec![string(&h, "ab"), substring(&h, long, 3, 6).unwrap(), string(&h, "z")], "ab345z"),
+            (vec![string(&h, "x"), substring(&h, external, 3, 6).unwrap()], "xext"),
+            (vec![string(&h, "x"), concat(&h, long, long).unwrap()], &*format!("x{0}{0}", display(&h, long))),
+            (vec![string(&h, "abc"), long, string(&h, "de"), outside, string(&h, "é")], &*format!("abc{}de{}é", display(&h, long), display(&h, outside))),
         ];
         for (parts, want) in cases {
             let joined = concat_all(&h, &parts).unwrap();
@@ -197,6 +196,8 @@ fn parts_join_a_word_at_a_time() {
     });
 }
 
+/// Strings that are created and dropped in the young generation are freed by the next minor
+/// collection. The strings that are kept keep their characters.
 #[test]
 fn young_strings_free_their_characters() {
     let mut arena = arena(8 << 20);
@@ -227,8 +228,8 @@ fn errors_come_back_as_the_crate_error() {
         let s = from_str(&h, "abc").unwrap();
         assert_eq!(char_at(&h, s, 3), Err(Error::Str(StrError::OutOfRange)));
         assert_eq!(repeat(&h, 'x', 4 << 20), Err(Error::OutOfMemory));
-        // A rope that shares one string many times, too long to flatten here: searching and
-        // splitting it need a flat copy.
+        // Build a rope that shares one string many times and is too long to flatten in this arena.
+        // Searching it and splitting it both need a flat copy.
         let mut big = from_str(&h, "word word ").unwrap();
         for _ in 0..17 {
             big = concat(&h, big, big).unwrap();
@@ -240,7 +241,7 @@ fn errors_come_back_as_the_crate_error() {
     });
 }
 
-/// External characters that say when they're dropped.
+/// External characters that record when they are dropped.
 struct Watched(ExternalText<Arc<str>>, Rc<Cell<bool>>);
 
 impl External for Watched {
@@ -256,7 +257,7 @@ impl Drop for Watched {
 }
 
 /// External characters stay outside the arena while the string is reachable, through moving
-/// collections, and their owner is dropped once it isn't.
+/// collections. Their owner is dropped once the string is unreachable.
 #[test]
 fn external_strings_keep_their_owner_while_reachable() {
     let mut arena = arena(8 << 20);

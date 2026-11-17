@@ -161,7 +161,7 @@ fn closures_share_boxes() {
     }
     assert_eq!(number(|_| app(get(), vec![q(0)])), Ok(42));
 
-    // ((((lambda (x) (lambda () (lambda () x))) 7))): an upvalue's upvalue.
+    // ((((lambda (x) (lambda () (lambda () x))) 7))): the innermost lambda captures `x` from an upvalue of the lambda around it.
     fn nested<'gc>() -> Core<'gc> {
         lambda(&[0], None, lambda(&[], None, lambda(&[], None, var(0))))
     }
@@ -215,7 +215,9 @@ fn lambdas_only_called_in_tail_position_are_jumps() {
     fn check(name: &str, body: impl for<'gc> Fn(&Mutation<'gc>) -> Core<'gc>, expect: i64, closures: usize) {
         let mut arena = Arena::new(1 << 24, 0);
         arena.mutate(|mc| {
-            let call = |n| app(var(9), vec![q(n)]);
+            fn call<'gc>(argument: i64) -> Core<'gc> {
+                app(var(9), vec![q(argument)])
+            }
             let all = add(prim(Intrinsic::Mul, vec![call(0), q(1_000_000)]), add(prim(Intrinsic::Mul, vec![call(1), q(1000)]), call(2)));
             let thunk = compile(mc, None, &letrec(vec![(9, lambda(&[0], None, body(mc)))], all)).unwrap();
             let ops = all_ops(mc, thunk);
@@ -234,7 +236,7 @@ fn lambdas_only_called_in_tail_position_are_jumps() {
     // The calls are in tail position relative to the `let`, not the enclosing function.
     check("in an argument", |_| add(q(100), branches(big(2), q(5))), 103_109_105, 0);
     // `(let loop ((n x)) (let ((k (lambda (m) (if (eq? m 0) 7 (loop (+ m -1)))))) (if (eq? n 0)
-    // (k 0) (k n))))`: a loop's body jumps to a join, and the join to the loop.
+    // (k 0) (k n))))`: the loop's body jumps to a join, and the join jumps back to the loop.
     check(
         "with a loop",
         |_| {
@@ -262,7 +264,7 @@ fn lambdas_only_called_in_tail_position_are_jumps() {
     // Calls in separate arguments have different return destinations.
     check("in two arguments", |_| let_(vec![(1, big(2))], add(app(var(1), vec![q(1)]), app(var(1), vec![q(2)]))), 9_015_021, 1);
     // `(let ((k big)) (let ((g (lambda (z) (if (eq? z c) (k 1) (k 2)))) (h 0)) (set! h g) (+ (h 0)
-    // (* 10 (h 1)))))`: `k`'s code can go in `g`, which then captures what it uses instead.
+    // (* 10 (h 1)))))`: `k` can be placed as a join inside `g`. `g` then captures the variables that `k` uses, instead of `k` itself.
     fn inside<'gc>(k: Core<'gc>, c: Core<'gc>) -> Core<'gc> {
         let g = lambda(&[4], None, when(eq(var(4), c), app(var(1), vec![q(1)]), app(var(1), vec![q(2)])));
         let calls = add(app(var(6), vec![q(0)]), prim(Intrinsic::Mul, vec![app(var(6), vec![q(1)]), q(10)]));
@@ -319,8 +321,8 @@ fn letrec_groups_only_called_in_tail_position_are_jumps() {
     // is b.
     check("three states", |_| letrec(vec![(0, state(3, 1, 1)), (1, state(4, 2, 2)), (2, state(5, 3, 0))], app(var(0), vec![q(1_000_000)])), 2, 0, false);
     // `(+ 100 (letrec ((lp (lambda (n acc) (if (eq? n 0) (+ acc x) ...)))) (if (eq? x 1) (lp 10 0)
-    // (lp 3 0))))`, a loop started from two places, for x of 1 and of 0. It captures `x`, so it'd
-    // be a closure made each time if it weren't a join.
+    // (lp 3 0))))`. The loop is started from two call sites. The test runs it with `x` = 1 and with `x` = 0.
+    // The loop captures `x`. Unless it becomes a join, each run allocates a closure for it.
     check(
         "a loop started twice",
         |_| {
@@ -335,11 +337,11 @@ fn letrec_groups_only_called_in_tail_position_are_jumps() {
     );
     // `(let loop ((x 0)) (if (eq? x 10) x (let ((w (lambda (y) (let ((u (lambda (z) (loop (+ z
     // 1))))) (if (eq? y 3) (u (+ y 1)) (u y)))))) (if (eq? x 5) (w (+ x 1)) (w x)))))`: the loop is
-    // called in `u`'s code, which goes in `w`'s, which goes in the loop's.
+    // called from `u`. `u` becomes a join inside `w`, and `w` becomes a join inside the loop.
     check(
         "a loop called from a join in a join",
         |_| {
-            // `(+ (+ z z) (+ z 1) (* (+ z z) -1))`, `(+ z 1)` too big to inline.
+            // `(+ (+ z z) (+ z 1) (* (+ z z) -1))` computes `(+ z 1)`, but is too big to inline.
             let next = add(add(add(var(6), var(6)), add(var(6), q(1))), prim(Intrinsic::Mul, vec![add(var(6), var(6)), q(-1)]));
             let u = lambda(&[6], None, app(var(1), vec![next]));
             let w = lambda(&[4], None, let_(vec![(5, u)], when(eq(var(4), q(3)), app(var(5), vec![add(var(4), q(1))]), app(var(5), vec![var(4)]))));
@@ -378,8 +380,8 @@ fn rest_parameters() {
 
 #[test]
 fn optional_parameters_are_unsupplied_when_left_out() {
-    // (lambda (a [b] . rest) (if (eq? b #<unsupplied>) (+ a 100) (+ a b))), called on `args`
-    // where cp0 sees the lambda, and through `apply`, where the VM binds them.
+    // (lambda (a [b] . rest) (if (eq? b #<unsupplied>) (+ a 100) (+ a b))). The lambda is called on `args`
+    // in two ways: directly, where cp0 sees the lambda, and through `apply`, where the VM binds the parameters.
     fn f<'gc>(rest: bool) -> Core<'gc> {
         let missing = eq(var(1), Core::Quote(Value::UNSUPPLIED));
         optional_lambda(&[0, 1], 1, rest.then_some(2), when(missing, add(var(0), q(100)), add(var(0), var(1))))
@@ -408,8 +410,10 @@ fn keyword<'gc>(mc: &Mutation<'gc>, name: &str) -> Keyword<'gc> {
 /// Builds `(lambda (v0 [v1 (+ v0 10)] #:b v2 #:a [v3 (+ v1 100)]) (cons v0 (cons v1 (cons v2 (cons v3 '())))))`.
 fn keyword_lambda<'gc>(mc: &Mutation<'gc>) -> Core<'gc> {
     static NEXT: AtomicU32 = AtomicU32::new(1 << 20);
-    let formal = |var, keyword: Option<&str>, default| Formal { var: Var(var), keyword: keyword.map(|name| self::keyword(mc, name)), default };
-    let params = vec![formal(0, None, None), formal(1, None, Some(add(var(0), q(10)))), formal(2, Some("b"), None), formal(3, Some("a"), Some(add(var(1), q(100))))];
+    fn formal<'gc>(mc: &Mutation<'gc>, var: u32, keyword: Option<&str>, default: Option<Core<'gc>>) -> Formal<'gc> {
+        Formal { var: Var(var), keyword: keyword.map(|name| self::keyword(mc, name)), default }
+    }
+    let params = vec![formal(mc, 0, None, None), formal(mc, 1, None, Some(add(var(0), q(10)))), formal(mc, 2, Some("b"), None), formal(mc, 3, Some("a"), Some(add(var(1), q(100))))];
     let body = [3, 2, 1, 0].into_iter().fold(Core::Quote(Value::NULL), |rest, v| prim(Cons, vec![var(v), rest]));
     Core::OptionalLambda(OptionalLambda { id: NEXT.fetch_add(1, Ordering::Relaxed), params, rest: None, body: Box::new(body), name: None, at: None })
 }
@@ -425,7 +429,9 @@ fn optional_lambdas_evaluate_defaults_in_order() {
     // (lambda (a [b (+ a 1)] [c (+ a b)]) (cons a (cons b (cons c '())))): a default sees the parameters before it.
     fn f<'gc>() -> Core<'gc> {
         static NEXT: AtomicU32 = AtomicU32::new(1 << 21);
-        let formal = |var, default| Formal { var: Var(var), keyword: None, default };
+        fn formal<'gc>(var: u32, default: Option<Core<'gc>>) -> Formal<'gc> {
+            Formal { var: Var(var), keyword: None, default }
+        }
         let params = vec![formal(0, None), formal(1, Some(add(var(0), q(1)))), formal(2, Some(add(var(0), var(1))))];
         let body = [2, 1, 0].into_iter().fold(Core::Quote(Value::NULL), |rest, v| prim(Cons, vec![var(v), rest]));
         Core::OptionalLambda(OptionalLambda { id: NEXT.fetch_add(1, Ordering::Relaxed), params, rest: None, body: Box::new(body), name: None, at: None })
@@ -446,7 +452,7 @@ fn keyword_calls_reach_the_core_or_match_at_run_time() {
         (vec![(Some("b"), 2)], Err(Fault::Arity)),
     ];
     for (args, expect) in cases {
-        // Called where the lambda is written, where a `letrec` binds it and the call goes straight to its core, and through a variable that is assigned, where the keywords are matched as the call runs.
+        // Each case is called in three ways. First, the callee is the lambda expression itself. Second, a `letrec` binds the lambda, and the call goes directly to its core. Third, the call goes through a variable that is assigned, so the keywords are matched when the call runs.
         eval(|mc| keyword_app(mc, keyword_lambda(mc), &args), |mc, result| assert_eq!(result.map(|v| items(mc, v)), expect, "written {args:?}"));
         eval(|mc| letrec(vec![(10, keyword_lambda(mc))], keyword_app(mc, var(10), &args)), |mc, result| assert_eq!(result.map(|v| items(mc, v)), expect, "bound {args:?}"));
         eval(
@@ -454,7 +460,7 @@ fn keyword_calls_reach_the_core_or_match_at_run_time() {
             |mc, result| assert_eq!(result.map(|v| items(mc, v)), expect, "assigned {args:?}"),
         );
     }
-    // A plain call of a procedure whose keywords all have defaults leaves them out.
+    // If every keyword of a procedure has a default, a plain call can omit the keywords.
     fn defaulted<'gc>(mc: &Mutation<'gc>) -> Core<'gc> {
         static NEXT: AtomicU32 = AtomicU32::new(1 << 22);
         let params = vec![Formal { var: Var(0), keyword: None, default: None }, Formal { var: Var(1), keyword: Some(keyword(mc, "k")), default: Some(q(40)) }];
@@ -494,10 +500,14 @@ fn keyword_call_arguments_are_evaluated_as_written() {
     }
     eval(
         |mc| {
-            let formal = |var, name: Option<&str>| Formal { var: Var(var), keyword: name.map(|name| keyword(mc, name)), default: None };
-            let f = OptionalLambda { id: 1 << 23, params: vec![formal(0, Some("a")), formal(1, Some("b")), formal(2, None)], rest: None, body: Box::new(q(0)), name: None, at: None };
-            let arg = |name: Option<&str>, n| Arg { keyword: name.map(|name| keyword(mc, name)), value: noted(n) };
-            let call = Core::KeywordApp(Box::new(var(10)), vec![arg(Some("b"), 1), arg(None, 2), arg(Some("a"), 3)], None);
+            fn formal<'gc>(mc: &Mutation<'gc>, var: u32, name: Option<&str>) -> Formal<'gc> {
+                Formal { var: Var(var), keyword: name.map(|name| keyword(mc, name)), default: None }
+            }
+            let f = OptionalLambda { id: 1 << 23, params: vec![formal(mc, 0, Some("a")), formal(mc, 1, Some("b")), formal(mc, 2, None)], rest: None, body: Box::new(q(0)), name: None, at: None };
+            fn arg<'gc>(mc: &Mutation<'gc>, name: Option<&str>, number: i64) -> Arg<'gc> {
+                Arg { keyword: name.map(|name| keyword(mc, name)), value: noted(number) }
+            }
+            let call = Core::KeywordApp(Box::new(var(10)), vec![arg(mc, Some("b"), 1), arg(mc, None, 2), arg(mc, Some("a"), 3)], None);
             letrec(vec![(10, Core::OptionalLambda(f))], let_(vec![(20, prim(MakeBox, vec![Core::Quote(Value::NULL)]))], seq(21, call, prim(Unbox, vec![var(20)]))))
         },
         |mc, result| assert_eq!(result.map(|v| items(mc, v)), Ok(vec![3, 2, 1])),
@@ -642,10 +652,12 @@ fn lambdas_take_more_parameters_than_registers() {
     let max = u32::from(MAX_PARAMS);
     for n in [max - 1, max, max + 1, 100, 300] {
         let (mid, last) = (n / 2, n - 1);
-        let sum = move |args: i64| number(move |_| app(lambda(&ids(n), None, prim(Add, vec![var(0), var(mid), var(last)])), nums(args)));
-        assert_eq!(sum(i64::from(n)), Ok(i64::from(mid + last)), "{n} parameters");
-        assert_eq!(sum(i64::from(n) - 1), Err(Fault::Arity), "{n} parameters");
-        assert_eq!(sum(i64::from(n) + 1), Err(Fault::Arity), "{n} parameters");
+        fn sum(params: u32, mid: u32, last: u32, args: i64) -> Result<i64, Fault> {
+            number(move |_| app(lambda(&ids(params), None, prim(Add, vec![var(0), var(mid), var(last)])), nums(args)))
+        }
+        assert_eq!(sum(n, mid, last, i64::from(n)), Ok(i64::from(mid + last)), "{n} parameters");
+        assert_eq!(sum(n, mid, last, i64::from(n) - 1), Err(Fault::Arity), "{n} parameters");
+        assert_eq!(sum(n, mid, last, i64::from(n) + 1), Err(Fault::Arity), "{n} parameters");
         // (lambda (p0 ... . r) r), with 5 more arguments, and with none.
         for more in [0, 5] {
             let args = i64::from(n) + more;
@@ -737,18 +749,18 @@ fn assigned_variables_stay_in_registers_where_nothing_else_sees_them() {
     assert_eq!(number(summed), Ok(55));
     let ops = ops_of(summed);
     assert!(!has_box_op(&ops) && !ops.iter().any(|op| matches!(op, Op::NewClosure { .. })), "{ops:?}");
-    // (let ((n 0)) (set! n 1) (f) n): assigned only before the call.
+    // (let ((n 0)) (set! n 1) (f) n): `n` is assigned only before the call, so it is not boxed.
     assert!(!has_box_op(&ops_of(|_| let_(vec![(0, q(0))], seq(1, set(0, q(1)), seq(2, call(), var(0)))))));
-    // (let ((n 0)) (f) (set! n 1) n): a continuation the call captures holds n as it was.
+    // (let ((n 0)) (f) (set! n 1) n): `n` is assigned after the call. A continuation captured by the call holds the old value of `n`, so `n` is boxed.
     assert!(has_box_op(&ops_of(|_| let_(vec![(0, q(0))], seq(1, call(), seq(2, set(0, q(1)), var(0)))))));
     // (let ((n 0)) (let loop ((i 3)) (if (eq? i 0) n (begin (set! n (+ n 1)) (f) (loop (+ i -1)))))):
-    // assigned before the call, but again after it, round the loop.
+    // `n` is assigned before the call, but the next iteration of the loop assigns it again after the call. So `n` is boxed.
     fn around<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
         let step = seq(3, set(0, add(var(0), q(1))), seq(4, call(), app(var(1), vec![add(var(2), q(-1))])));
         let_(vec![(0, q(0))], letrec(vec![(1, lambda(&[2], None, when(eq(var(2), q(0)), var(0), step)))], app(var(1), vec![q(3)])))
     }
     assert!(has_box_op(&ops_of(around)));
-    // (let ((x 1)) (cons x (begin (set! x 2) x))): an argument read before a later one assigns it.
+    // (let ((x 1)) (cons x (begin (set! x 2) x))): the first argument reads `x`, and the second argument assigns it. So `x` is boxed.
     fn argument<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
         let_(vec![(0, q(1))], prim(Cons, vec![var(0), seq(1, set(0, q(2)), var(0))]))
     }
@@ -757,7 +769,7 @@ fn assigned_variables_stay_in_registers_where_nothing_else_sees_them() {
         assert_eq!((pair.head(mc), pair.tail(mc)), (fix(1), fix(2)));
     });
     assert!(has_box_op(&ops_of(argument)));
-    // (let ((v0 0) ... (v299 299)) (set! v299 (+ v299 v0 1)) (set! v299 (+ v299 1)) v299), in a spill slot.
+    // (let ((v0 0) ... (v299 299)) (set! v299 (+ v299 v0 1)) (set! v299 (+ v299 1)) v299): `v299` is in a spill slot.
     fn spilled<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
         let body = seq(300, set(299, prim(Add, vec![var(299), var(0), q(1)])), seq(301, set(299, add(var(299), q(1))), var(299)));
         let_(many(300), body)
@@ -768,7 +780,7 @@ fn assigned_variables_stay_in_registers_where_nothing_else_sees_them() {
 
 #[test]
 fn long_sequences_compile_without_deep_recursion() {
-    // (lambda (f) (f) (f) ... 0), as a body of many forms is: one wide `let` of results unused.
+    // (lambda (f) (f) (f) ... 0). A body of many forms has this shape: one wide `let` whose variables are unused.
     let mut arena = Arena::new(1 << 26, 0);
     arena.mutate(|mc| {
         let calls = (1..100_000).map(|i| (i, app(var(0), vec![]))).collect();
@@ -778,13 +790,13 @@ fn long_sequences_compile_without_deep_recursion() {
 
 #[test]
 fn many_effects_fold_without_deep_recursion() {
-    // (let ((n 0)) (void (set! n (+ n 1)) ...) n): the effects of `void`'s arguments stay flat.
+    // (let ((n 0)) (void (set! n (+ n 1)) ...) n): the effects of the arguments of `void` are kept as one flat sequence, not a deeply nested one.
     let n = number(|_| {
         let effects = (0..10_000).map(|_| set(0, add(var(0), q(1)))).collect();
         let_(vec![(0, q(0))], seq(1, prim(Intrinsic::Void, effects), var(0)))
     });
     assert_eq!(n, Ok(10_000));
-    // (let ((n 0)) (vector (set! n (+ n 1)) ...) n): a vector unused is only its elements' effects.
+    // (let ((n 0)) (vector (set! n (+ n 1)) ...) n): the vector is unused, so only the effects of its elements remain.
     let n = number(|_| {
         let effects = (0..10_000).map(|_| set(0, add(var(0), q(1)))).collect();
         let_(vec![(0, q(0))], seq(1, prim(Intrinsic::MakeVectorOf, effects), var(0)))
@@ -803,18 +815,18 @@ fn deep_expressions_compile_on_a_small_stack() {
     fn ifs<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
         app(lambda(&[0], None, (0..N).fold(q(7), |e, _| when(eq(var(0), q(0)), e, q(1)))), vec![q(0)])
     }
-    // (lambda () (lambda () ... (lambda () 0))), each its own closure.
+    // (lambda () (lambda () ... (lambda () 0))): each lambda is a separate closure.
     fn lambdas<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
         (0..10_000).fold(q(0), |e, _| lambda(&[], None, e))
     }
-    let run = || {
+    fn run() {
         let mut arena = Arena::new(1 << 26, 0);
         arena.mutate(|mc| {
             for core in [sum(mc), ifs(mc), lambdas(mc)] {
                 compile(mc, None, &core).unwrap();
             }
         });
-    };
+    }
     std::thread::Builder::new().stack_size(256 << 10).spawn(run).expect("spawned").join().expect("ran");
     assert_eq!(number(sum), Ok(N));
     assert_eq!(number(ifs), Ok(7));
@@ -822,23 +834,25 @@ fn deep_expressions_compile_on_a_small_stack() {
 
 #[test]
 fn long_chains_of_definitions_compile_without_deep_recursion() {
-    // (letrec ((f0 (lambda (x) (f1 x))) (f1 (lambda (x) (f2 x))) ... (fn (lambda (x) x))) f0),
-    // as a body's definitions are, each referring to the next.
+    // (letrec ((f0 (lambda (x) (f1 x))) (f1 (lambda (x) (f2 x))) ... (fn (lambda (x) x))) f0).
+    // The definitions of a body have this shape when each definition refers to the next.
+    // Returns the variable of the parameter `x` of function `i`, in a chain of `count` functions.
+    fn x_var(count: u32, i: u32) -> u32 {
+        count + 1 + i
+    }
     let n = 20_000;
     let mut arena = Arena::new(1 << 26, 0);
     arena.mutate(|mc| {
-        let x = |i: u32| n + 1 + i;
-        let mut binds: Vec<_> = (0..n).map(|i| (i, lambda(&[x(i)], None, app(var(i + 1), vec![var(x(i))])))).collect();
-        binds.push((n, lambda(&[x(n)], None, var(x(n)))));
+        let mut binds: Vec<_> = (0..n).map(|i| (i, lambda(&[x_var(n, i)], None, app(var(i + 1), vec![var(x_var(n, i))])))).collect();
+        binds.push((n, lambda(&[x_var(n, n)], None, var(x_var(n, n)))));
         compile(mc, None, &letrec(binds, var(0))).unwrap();
     });
     // (letrec ((f0 (lambda (x) (+ 1 (f1 x)))) ... (fn (lambda (x) x))) (f0 0)): inlining each
-    // function into the one before would nest as deep as the chain is long.
+    // function into its caller nests the result as deep as the chain is long.
     let n = 10_000;
-    let x = |i: u32| n + 1 + i;
     let chain = number(move |_| {
-        let mut binds: Vec<_> = (0..n).map(|i| (i, lambda(&[x(i)], None, add(q(1), app(var(i + 1), vec![var(x(i))]))))).collect();
-        binds.push((n, lambda(&[x(n)], None, var(x(n)))));
+        let mut binds: Vec<_> = (0..n).map(|i| (i, lambda(&[x_var(n, i)], None, add(q(1), app(var(i + 1), vec![var(x_var(n, i))]))))).collect();
+        binds.push((n, lambda(&[x_var(n, n)], None, var(x_var(n, n)))));
         letrec(binds, app(var(0), vec![q(0)]))
     });
     assert_eq!(chain, Ok(i64::from(n)));
@@ -846,22 +860,30 @@ fn long_chains_of_definitions_compile_without_deep_recursion() {
     // resulting nesting depth.
     let mut arena = Arena::new(1 << 26, 0);
     arena.mutate(|mc| {
-        let mut binds: Vec<_> = (0..n).map(|i| (i, lambda(&[x(i)], None, add(q(1), app(var(i + 1), vec![var(x(i))]))))).collect();
-        binds.push((n, lambda(&[x(n)], None, var(x(n)))));
+        let mut binds: Vec<_> = (0..n).map(|i| (i, lambda(&[x_var(n, i)], None, add(q(1), app(var(i + 1), vec![var(x_var(n, i))]))))).collect();
+        binds.push((n, lambda(&[x_var(n, n)], None, var(x_var(n, n)))));
         let ops = all_ops(mc, compile(mc, None, &letrec(binds, app(var(0), vec![q(0)]))).unwrap());
         assert!(matches!(ops[..], [Op::LoadConst { .. }, Op::Return { .. }]), "{} ops", ops.len());
     });
     // (letrec ((a0 0) (g0 (lambda (k) (if (eq? k 0) (+ a0 1) (g0 (+ k -1))))) (a1 (g0 1)) (g1 ...)
-    // ... (an (g(n-1) 1))) an): values and loops defined in turn, each loop a join.
-    let (a, g, k) = (|i: u32| 3 * i, |i: u32| 3 * i + 1, |i: u32| 3 * i + 2);
+    // ... (an (g(n-1) 1))) an): values and loops are defined alternately, and each loop becomes a join.
+    fn a_var(i: u32) -> u32 {
+        3 * i
+    }
+    fn g_var(i: u32) -> u32 {
+        3 * i + 1
+    }
+    fn k_var(i: u32) -> u32 {
+        3 * i + 2
+    }
     let interleaved = number(move |_| {
-        let mut binds = vec![(a(0), q(0))];
+        let mut binds = vec![(a_var(0), q(0))];
         for i in 0..n {
-            let again = app(var(g(i)), vec![add(var(k(i)), q(-1))]);
-            binds.push((g(i), lambda(&[k(i)], None, when(eq(var(k(i)), q(0)), add(var(a(i)), q(1)), again))));
-            binds.push((a(i + 1), app(var(g(i)), vec![q(1)])));
+            let again = app(var(g_var(i)), vec![add(var(k_var(i)), q(-1))]);
+            binds.push((g_var(i), lambda(&[k_var(i)], None, when(eq(var(k_var(i)), q(0)), add(var(a_var(i)), q(1)), again))));
+            binds.push((a_var(i + 1), app(var(g_var(i)), vec![q(1)])));
         }
-        letrec(binds, var(a(n)))
+        letrec(binds, var(a_var(n)))
     });
     assert_eq!(interleaved, Ok(i64::from(n)));
 }
@@ -869,7 +891,7 @@ fn long_chains_of_definitions_compile_without_deep_recursion() {
 #[test]
 fn deeply_nested_loops_compile_quickly() {
     // (let ((x 0)) (let l0 ((k0 1)) (if (eq? k0 0) (let l1 ((k1 1)) ... (begin (set! x (+ x 1)) x) ...)
-    // (l0 (+ k0 -1))))): each loop a join in the one around it's code.`
+    // (l0 (+ k0 -1)))))
     // Each nested loop becomes a join inside the enclosing loop's code.
     let x = number(|_| {
         let mut inner = seq(1000, set(0, add(var(0), q(1))), var(0));
@@ -886,9 +908,8 @@ fn deeply_nested_loops_compile_quickly() {
 #[test]
 fn joins_go_where_they_are_called_however_deep() {
     // (let ((x 1)) (set! x 2) (let ((k (lambda (a) (+ x (+ x ... (+ x a)))))) (if (eq? x -1) -1 (if
-    // (eq? x -2) -2 ... (if (eq? x 0) (k 1) (k 2)))))): the ifs and k's code each nearly as deep as the
-    // front end takes, so k's code is deeper still where it goes, as a join.`
-    // Placing `k` as a join combines a deep conditional chain with a deep function body.
+    // (eq? x -2) -2 ... (if (eq? x 0) (k 1) (k 2))))))
+    // The chain of `if`s and the body of `k` are both deep. Placing `k` as a join puts its body under the `if`s, so the combined code is deeper than either.
     let (ifs, height) = (200, 150);
     let mut arena = Arena::new(1 << 24, 0);
     arena.mutate(|mc| {
@@ -916,14 +937,18 @@ fn values_are_made_where_they_go() {
         let mut arena = Arena::new(1 << 24, 0);
         arena.mutate(|mc| all_ops(mc, compile(mc, None, &build(mc)).unwrap()))
     }
-    let moves = |ops: &[Op]| ops.iter().filter(|op| matches!(op, Op::Move { .. } | Op::Move2 { .. })).count();
-    // (lambda (x) (car x)): the argument is already where the intrinsic takes it.
+    fn moves(ops: &[Op]) -> usize {
+        ops.iter().filter(|op| matches!(op, Op::Move { .. } | Op::Move2 { .. })).count()
+    }
+    // (lambda (x) (car x)): the argument is already in the register that the intrinsic reads.
     let ops = ops_of(|_| lambda(&[0], None, prim(Car, vec![var(0)])));
     assert!(moves(&ops) == 0 && ops.contains(&Op::TailCallIntrinsic { base: ARGS, args: 1, intrinsic: Car }), "{ops:?}");
     // (let loop ((xs '(1 2 3)) (acc '())) (if (null? xs) acc (loop (cdr xs) (cons (car xs) acc)))):
     // reuse each parameter's register for its next value only after all reads of the old value.
     fn reverse<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
-        let nil = || Core::Quote(Value::NULL);
+        fn nil<'gc>() -> Core<'gc> {
+            Core::Quote(Value::NULL)
+        }
         let list = prim(Cons, vec![q(1), prim(Cons, vec![q(2), prim(Cons, vec![q(3), nil()])])]);
         let step = app(var(0), vec![prim(Intrinsic::Cdr, vec![var(1)]), prim(Cons, vec![prim(Car, vec![var(1)]), var(2)])]);
         let body = when(prim(Intrinsic::IsNull, vec![var(1)]), var(2), step);
@@ -948,14 +973,14 @@ fn forwarded_pairs_mean_what_they_did() {
         app(lambda(&[0], None, car), vec![lambda(&[], None, q(5))])
     }
     assert_eq!(number(|_| in_let()), Ok(5));
-    // ((lambda (f) (let ((p (cons (f) 1))) (car p))) (lambda () 7)): a part that isn't a constant
-    // or a variable stays where it's evaluated.
+    // ((lambda (f) (let ((p (cons (f) 1))) (car p))) (lambda () 7)): a part of the pair that is not a constant
+    // or a variable is not forwarded. It stays where it is evaluated.
     fn called<'gc>() -> Core<'gc> {
         let body = let_(vec![(1, prim(Intrinsic::Cons, vec![app(var(0), vec![]), q(1)]))], prim(Intrinsic::Car, vec![var(1)]));
         app(lambda(&[0], None, body), vec![lambda(&[], None, q(7))])
     }
     assert_eq!(number(|_| called()), Ok(7));
-    // ((lambda (a) (let ((p (cons a 0))) (set! a 9) (car p))) 1): a part that's assigned after.
+    // ((lambda (a) (let ((p (cons a 0))) (set! a 9) (car p))) 1): a part that is assigned later is not forwarded.
     fn assigned<'gc>() -> Core<'gc> {
         let set = Core::Set(Place::Local(Var(0)), Box::new(q(9)));
         let body = let_(vec![(1, prim(Intrinsic::Cons, vec![var(0), q(0)]))], seq(2, set, prim(Intrinsic::Car, vec![var(1)])));
@@ -982,9 +1007,9 @@ fn micropass_optimizations() {
 
         // 2. Mutually recursive `letrec` lambdas that escape compile to a single
         //    `Op::NewClosure { count: 2 }` with zero heap boxes (`letrec` fixing pass).
-        let even = || lambda(&[2], None, when(eq(var(2), q(0)), Core::Quote(Value::TRUE), app(var(1), vec![add(var(2), q(-1))])));
-        let odd = || lambda(&[3], None, when(eq(var(3), q(0)), Core::Quote(Value::FALSE), app(var(0), vec![add(var(3), q(-1))])));
-        let mutual = letrec(vec![(0, even()), (1, odd())], prim(Cons, vec![var(0), var(1)]));
+        let even = lambda(&[2], None, when(eq(var(2), q(0)), Core::Quote(Value::TRUE), app(var(1), vec![add(var(2), q(-1))])));
+        let odd = lambda(&[3], None, when(eq(var(3), q(0)), Core::Quote(Value::FALSE), app(var(0), vec![add(var(3), q(-1))])));
+        let mutual = letrec(vec![(0, even), (1, odd)], prim(Cons, vec![var(0), var(1)]));
         let thunk = compile(mc, None, &mutual).unwrap();
         let ops = all_ops(mc, thunk);
         assert!(!has_box_op(&ops), "mutually recursive lambdas should not be boxed: {ops:?}");
@@ -1091,7 +1116,7 @@ fn micropass_optimizations() {
             )),
             "expected (cadr (cons x (cons y '()))) to forward without Cons/Cadr: {ops:?}"
         );
-        let conses = |ops: &[Op]| {
+        fn conses(ops: &[Op]) -> usize {
             ops.iter()
                 .filter(|op| {
                     matches!(
@@ -1103,11 +1128,11 @@ fn micropass_optimizations() {
                     )
                 })
                 .count()
-        };
+        }
         // Forward fields from a pair bound to a variable, then remove the allocation when no uses remain:
         // (lambda (x y) (let ((p (cons x y))) (+ (car p) (cdr p)))) -> (lambda (x y) (+ x y))
-        let parts = |p: u32| add(prim(Intrinsic::Car, vec![var(p)]), prim(Intrinsic::Cdr, vec![var(p)]));
-        let bound = lambda(&[0, 1], None, let_(vec![(2, prim(Cons, vec![var(0), var(1)]))], parts(2)));
+        let parts = add(prim(Intrinsic::Car, vec![var(2)]), prim(Intrinsic::Cdr, vec![var(2)]));
+        let bound = lambda(&[0, 1], None, let_(vec![(2, prim(Cons, vec![var(0), var(1)]))], parts));
         let ops = all_ops(mc, compile(mc, None, &bound).unwrap());
         assert_eq!(conses(&ops), 0, "expected the bound pair to go: {ops:?}");
         // Forward through a `let` left by inlining:
@@ -1397,9 +1422,13 @@ fn items_refer_to_the_module_by_name() {
     let mut arena = Arena::new(1 << 24, 0);
     arena.mutate(|mc| {
         let symbols = Symbols::of_arena(mc).unwrap();
-        let name = |text: &str| symbols.intern_str(&Strings::new(mc), text).unwrap().value(mc);
-        let (f, g, x, plus) = (name("f"), name("g"), name("x"), name("plus"));
-        let global = |name| Core::Global(name, SyntaxSpan::default());
+        fn name<'gc>(mc: &Mutation<'gc>, symbols: Symbols<'gc>, text: &str) -> Value<'gc> {
+            symbols.intern_str(&Strings::new(mc), text).unwrap().value(mc)
+        }
+        let (f, g, x, plus) = (name(mc, symbols, "f"), name(mc, symbols, "g"), name(mc, symbols, "x"), name(mc, symbols, "plus"));
+        fn global<'gc>(name: Value<'gc>) -> Core<'gc> {
+            Core::Global(name, SyntaxSpan::default())
+        }
         let lib = exporting_with(mc, &[], &[], vec![("plus", lambda(&[0, 1], None, add(var(0), var(1))), false)]);
         // (define g (lambda () (f 1 #:k 2))), which calls the core of `f` although `f` is defined later.
         // (define f (lambda (a #:k [k 10]) (plus a k)))
@@ -1411,7 +1440,9 @@ fn items_refer_to_the_module_by_name() {
         let body = app(global(plus), vec![var(0), var(1)]);
         let made = Core::OptionalLambda(OptionalLambda { id: 0, params, rest: None, body: Box::new(body), name: None, at: None });
         let assign = Core::SetGlobal(x, Box::new(app(global(plus), vec![global(x), app(global(f), vec![q(5)])])), SyntaxSpan::default());
-        let define = |name, value| Item::Define(name, SyntaxSpan::default(), value);
+        fn define<'gc>(name: Value<'gc>, value: Core<'gc>) -> Item<'gc> {
+            Item::Define(name, SyntaxSpan::default(), value)
+        }
         let items = vec![define(g, lambda(&[], None, call)), define(f, made), define(x, app(global(g), vec![])), Item::Expr(assign), Item::Expr(global(x))];
         let mut builder = ModuleBuilder::new(Value::FALSE, &[]);
         builder.import(plus, imported(mc, lib, "plus")).unwrap();
@@ -1428,14 +1459,16 @@ fn items_refer_to_the_module_by_name() {
         }
         assert_eq!(last, fix(3 + 15));
 
-        // A name that nothing binds, and an assignment of an import or of a keyword procedure, are errors at the name.
+        // An unbound name is an error located at the name. So is an assignment to an import or to a keyword procedure.
         let span = SyntaxSpan::default();
-        let misuse = |kind| CompileError::Global { kind, start: span.start(), end: span.end() };
-        assert_eq!(builder.compile_item(mc, 5, Item::Expr(global(name("nothing")))).unwrap_err(), misuse(GlobalError::Unbound));
-        assert_eq!(builder.compile_item(mc, 5, Item::Expr(app(global(name("nothing")), vec![]))).unwrap_err(), misuse(GlobalError::Unbound));
-        assert_eq!(builder.compile_item(mc, 5, Item::Expr(Core::SetGlobal(plus, Box::new(q(1)), span))).unwrap_err(), misuse(GlobalError::Immutable));
-        assert_eq!(builder.compile_item(mc, 5, Item::Expr(Core::SetGlobal(f, Box::new(q(1)), span))).unwrap_err(), misuse(GlobalError::Immutable));
-        assert_eq!(compile(mc, None, &global(x)).unwrap_err(), misuse(GlobalError::Unbound));
+        fn misuse(span: SyntaxSpan<'_>, kind: GlobalError) -> CompileError {
+            CompileError::Global { kind, start: span.start(), end: span.end() }
+        }
+        assert_eq!(builder.compile_item(mc, 5, Item::Expr(global(name(mc, symbols, "nothing")))).unwrap_err(), misuse(span, GlobalError::Unbound));
+        assert_eq!(builder.compile_item(mc, 5, Item::Expr(app(global(name(mc, symbols, "nothing")), vec![]))).unwrap_err(), misuse(span, GlobalError::Unbound));
+        assert_eq!(builder.compile_item(mc, 5, Item::Expr(Core::SetGlobal(plus, Box::new(q(1)), span))).unwrap_err(), misuse(span, GlobalError::Immutable));
+        assert_eq!(builder.compile_item(mc, 5, Item::Expr(Core::SetGlobal(f, Box::new(q(1)), span))).unwrap_err(), misuse(span, GlobalError::Immutable));
+        assert_eq!(compile(mc, None, &global(x)).unwrap_err(), misuse(span, GlobalError::Unbound));
     });
 }
 
@@ -1453,47 +1486,55 @@ fn a_description_builds_a_whole_module() {
     let mut arena = Arena::new(1 << 24, 0);
     arena.mutate(|mc| {
         let symbols = Symbols::of_arena(mc).unwrap();
-        let name = |text: &str| symbols.intern_str(&Strings::new(mc), text).unwrap().value(mc);
+        fn name<'gc>(mc: &Mutation<'gc>, symbols: Symbols<'gc>, text: &str) -> Value<'gc> {
+            symbols.intern_str(&Strings::new(mc), text).unwrap().value(mc)
+        }
         let span = SyntaxSpan::default();
-        let global = |text: &str| Core::Global(name(text), span);
+        fn global<'gc>(mc: &Mutation<'gc>, symbols: Symbols<'gc>, span: SyntaxSpan<'gc>, text: &str) -> Core<'gc> {
+            Core::Global(name(mc, symbols, text), span)
+        }
         let lib = exporting_with(mc, &[], &[], vec![("plus", lambda(&[0, 1], None, add(var(0), var(1))), false), ("minus", lambda(&[0], None, var(0)), false)]);
-        let require = |filters| Item::Require(vec![Require { spec: RequireSpec { module: "lib".into(), at: span, filters }, span }]);
-        let point = |parent: Option<&str>| structs::Form {
-            name: (name("point"), span),
-            span,
-            parent: parent.map(|parent| (name(parent), span)),
-            fields: vec![structs::Declaration { name: name("x"), mutable: false }, structs::Declaration { name: name("y"), mutable: true }],
-            flags: ragwort_vm::structs::TypeFlags::empty(),
-            constructors: Vec::new(),
-        };
+        fn require<'gc>(span: SyntaxSpan<'gc>, filters: Vec<Filter<SyntaxSpan<'gc>>>) -> Item<'gc> {
+            Item::Require(vec![Require { spec: RequireSpec { module: "lib".into(), at: span, filters }, span }])
+        }
+        fn point<'gc>(mc: &Mutation<'gc>, symbols: Symbols<'gc>, span: SyntaxSpan<'gc>, parent: Option<&str>) -> structs::Form<'gc> {
+            structs::Form {
+                name: (name(mc, symbols, "point"), span),
+                span,
+                parent: parent.map(|parent| (name(mc, symbols, parent), span)),
+                fields: vec![structs::Declaration { name: name(mc, symbols, "x"), mutable: false }, structs::Declaration { name: name(mc, symbols, "y"), mutable: true }],
+                flags: ragwort_vm::structs::TypeFlags::empty(),
+                constructors: Vec::new(),
+            }
+        }
         // (provide total (rename-out (sum add)) (struct-out point))
         // (require (only-in lib plus))
         // (struct point (x [y #:mutable]))
         // (define (sum p) (plus (point-x p) (point-y p)))
         // (define total (let ([p (point 1 2)]) (set-point-y! p 40) (sum p)))
         // total
-        let items = |provided: &str, parent: Option<&str>| {
+        fn items<'gc>(mc: &Mutation<'gc>, symbols: Symbols<'gc>, span: SyntaxSpan<'gc>, provided: &str, parent: Option<&str>) -> Description<'gc> {
             let mut locals = Locals::default();
             let (p, made, unused) = (locals.fresh(), locals.fresh(), locals.fresh());
-            let sum = Core::Lambda(Lambda { id: locals.lambda(), optional: 0, params: vec![p], rest: None, body: Box::new(app(global("plus"), vec![app(global("point-x"), vec![Core::Ref(Place::Local(p))]), app(global("point-y"), vec![Core::Ref(Place::Local(p))])])), name: None, at: None });
-            let set = app(global("set-point-y!"), vec![Core::Ref(Place::Local(made)), q(40)]);
-            let total = Core::Let(vec![(made, app(global("point"), vec![q(1), q(2)]))], Box::new(Core::Let(vec![(unused, set)], Box::new(app(global("sum"), vec![Core::Ref(Place::Local(made))])))));
+            let sum = Core::Lambda(Lambda { id: locals.lambda(), optional: 0, params: vec![p], rest: None, body: Box::new(app(global(mc, symbols, span, "plus"), vec![app(global(mc, symbols, span, "point-x"), vec![Core::Ref(Place::Local(p))]), app(global(mc, symbols, span, "point-y"), vec![Core::Ref(Place::Local(p))])])), name: None, at: None });
+            let set = app(global(mc, symbols, span, "set-point-y!"), vec![Core::Ref(Place::Local(made)), q(40)]);
+            let total = Core::Let(vec![(made, app(global(mc, symbols, span, "point"), vec![q(1), q(2)]))], Box::new(Core::Let(vec![(unused, set)], Box::new(app(global(mc, symbols, span, "sum"), vec![Core::Ref(Place::Local(made))])))));
             let provides = vec![
-                Provide::Variable { name: name(provided), external: provided.into(), span },
-                Provide::Variable { name: name("sum"), external: "add".into(), span },
-                Provide::Struct { name: name("point"), constructors: true, span },
+                Provide::Variable { name: name(mc, symbols, provided), external: provided.into(), span },
+                Provide::Variable { name: name(mc, symbols, "sum"), external: "add".into(), span },
+                Provide::Struct { name: name(mc, symbols, "point"), constructors: true, span },
             ];
             let items = vec![
                 Item::Provide(provides),
-                require(vec![Filter::Only(vec![("plus".into(), span)])]),
-                Item::Struct(point(parent)),
-                Item::Define(name("sum"), span, sum),
-                Item::Define(name("total"), span, total),
-                Item::Expr(global("total")),
+                require(span, vec![Filter::Only(vec![("plus".into(), span)])]),
+                Item::Struct(point(mc, symbols, span, parent)),
+                Item::Define(name(mc, symbols, "sum"), span, sum),
+                Item::Define(name(mc, symbols, "total"), span, total),
+                Item::Expr(global(mc, symbols, span, "total")),
             ];
-            Description { name: name("made"), hosts: &[], locals, items }
-        };
-        let built = items("total", None).build(mc, &mut OnlyLib(lib)).unwrap();
+            Description { name: name(mc, symbols, "made"), hosts: &[], locals, items }
+        }
+        let built = items(mc, symbols, span, "total", None).build(mc, &mut OnlyLib(lib)).unwrap();
         let mut last = Value::VOID;
         for &thunk in &built.thunks {
             last = run_to_end(mc, thunk).unwrap();
@@ -1505,13 +1546,13 @@ fn a_description_builds_a_whole_module() {
         assert_eq!(exported, ["add", "point", "point-x", "point-y", "point?", "set-point-y!", "struct:point", "total"]);
 
         // Each mistake in a declaration is reported with its span.
-        assert_eq!(items("missing", None).build(mc, &mut OnlyLib(lib)).unwrap_err(), BuildError::Declare(ModuleError::NotDefined, span));
-        assert_eq!(items("total", Some("plus")).build(mc, &mut OnlyLib(lib)).unwrap_err(), BuildError::Declare(ModuleError::Supertype, span));
-        assert_eq!(items("total", None).build(mc, &mut NoModules).unwrap_err(), BuildError::Declare(ModuleError::Resolve, span));
-        let unprovided = Description { name: name("made"), hosts: &[], locals: Locals::default(), items: vec![require(vec![Filter::Only(vec![("times".into(), span)])])] };
+        assert_eq!(items(mc, symbols, span, "missing", None).build(mc, &mut OnlyLib(lib)).unwrap_err(), BuildError::Declare(ModuleError::NotDefined, span));
+        assert_eq!(items(mc, symbols, span, "total", Some("plus")).build(mc, &mut OnlyLib(lib)).unwrap_err(), BuildError::Declare(ModuleError::Supertype, span));
+        assert_eq!(items(mc, symbols, span, "total", None).build(mc, &mut NoModules).unwrap_err(), BuildError::Declare(ModuleError::Resolve, span));
+        let unprovided = Description { name: name(mc, symbols, "made"), hosts: &[], locals: Locals::default(), items: vec![require(span, vec![Filter::Only(vec![("times".into(), span)])])] };
         assert_eq!(unprovided.build(mc, &mut OnlyLib(lib)).unwrap_err(), BuildError::Declare(ModuleError::NotProvided, span));
         // The require leaves out `minus`, so the name is unbound.
-        let unbound = Description { name: name("made"), hosts: &[], locals: Locals::default(), items: vec![require(vec![Filter::Only(vec![("plus".into(), span)])]), Item::Expr(global("minus"))] };
+        let unbound = Description { name: name(mc, symbols, "made"), hosts: &[], locals: Locals::default(), items: vec![require(span, vec![Filter::Only(vec![("plus".into(), span)])]), Item::Expr(global(mc, symbols, span, "minus"))] };
         assert_eq!(unbound.build(mc, &mut OnlyLib(lib)).unwrap_err(), BuildError::Compile(CompileError::Global { kind: GlobalError::Unbound, start: span.start(), end: span.end() }));
     });
 }
@@ -1537,7 +1578,9 @@ fn run_to_end<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Result<Value<'gc>, 
 fn modules_export_what_code_that_requires_them_needs() {
     let mut arena = Arena::new(1 << 24, 0);
     arena.mutate(|mc| {
-        let spread = |i| Core::ApplyIntrinsic(Prim::Intrinsic(i), vec![var(0)], None);
+        fn spread<'gc>(intrinsic: Intrinsic) -> Core<'gc> {
+            Core::ApplyIntrinsic(Prim::Intrinsic(intrinsic), vec![var(0)], None)
+        }
         let lib = exporting(mc, vec![
             ("sum", lambda(&[], Some(0), spread(Add)), false),
             ("sum-not", lambda(&[], Some(0), prim(Not, vec![spread(Add)])), false),
@@ -1566,7 +1609,7 @@ fn modules_export_what_code_that_requires_them_needs() {
             let call = call(imported(mc, lib, name), vec![q(3), q(4)].into_iter().take(if name == "first" { 1 } else { 2 }).collect());
             assert_eq!(run_to_end(mc, compile(mc, None, &call).unwrap()), Ok(want), "{name}");
         }
-        // Immutable exports are their values; mutable ones are read with module-ref.
+        // A reference to an immutable export is its value. A reference to a mutable export is a `module-ref` read.
         assert_eq!(imported(mc, lib, "five").reference(mc), Ok(Core::Quote(fix(5))));
         let counter = imported(mc, lib, "counter").reference(mc).unwrap();
         assert!(matches!(counter, Core::Intrinsic(Prim::Intrinsic(ModuleRef), _, None)), "{counter:?}");
@@ -1621,8 +1664,7 @@ fn host_calls_inline_into_the_modules_that_require_them() {
     arena.mutate(|mc| {
         // Test transitive host-function imports: the first module exports a host-call wrapper, the second
         // inlines that wrapper, and the third imports only the second with no host functions of its own.
-        let host = |args| Core::Intrinsic(Prim::Host(ADD_HOST), args, None);
-        let lib = exporting_with(mc, &HOSTS, &[], vec![("plus", lambda(&[0, 1], None, host(vec![var(0), var(1)])), false)]);
+        let lib = exporting_with(mc, &HOSTS, &[], vec![("plus", lambda(&[0, 1], None, host(ADD_HOST, vec![var(0), var(1)])), false)]);
         let plus = imported(mc, lib, "plus");
         let body = call(plus, vec![var(0), q(10)]);
         let mid = exporting_with(mc, &[], &[("plus", plus)], vec![("add10", lambda(&[0], None, body), false)]);
@@ -1671,8 +1713,12 @@ fn module_builders_check_names_and_where_variables_are_defined() {
         assert_eq!(builder.place(1, 1, Some(0)), Place::Slot { slot: 1, checked: true });
         // Test require-spec selection and renaming.
         let all = Imports::all(mc, lib).unwrap();
-        let names = |imports: Imports<'_>| imports.0.into_iter().map(|(n, _)| n).collect::<Vec<_>>();
-        let strings = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        fn names(imports: Imports<'_>) -> Vec<String> {
+            imports.0.into_iter().map(|(name, _)| name).collect::<Vec<_>>()
+        }
+        fn strings(names: &[&str]) -> Vec<String> {
+            names.iter().map(|name| name.to_string()).collect::<Vec<_>>()
+        }
         assert_eq!(names(all.clone()), ["a", "b"]);
         assert_eq!(names(all.clone().only(&strings(&["b"])).unwrap()), ["b"]);
         assert_eq!(names(all.clone().except(&strings(&["b"])).unwrap()), ["a"]);
@@ -1737,7 +1783,9 @@ fn reads_of_constant_vectors_fold() {
 
         // Under `(pair? x)`, `(vector? x)` is false, and under `(vector? x)`, it's true:
         // (lambda (x) (if (pair? x) (vector? x) (if (vector? x) (vector? x) 0))) has one test left.
-        let is = |i: Intrinsic| prim(i, vec![var(0)]);
+        fn is<'gc>(intrinsic: Intrinsic) -> Core<'gc> {
+            prim(intrinsic, vec![var(0)])
+        }
         let tests = when(is(IsPair), is(IsVector), when(is(IsVector), is(IsVector), q(0)));
         let ops = all_ops(mc, compile(mc, None, &lambda(&[0], None, tests)).unwrap());
         assert_eq!(calls(&ops, IsVector), 1, "{ops:?}");
@@ -1783,22 +1831,21 @@ fn ops<'gc>(mc: &Mutation<'gc>, core: Core<'gc>) -> Vec<Op> {
 fn intrinsics_on_the_task_get_register_forms_and_unused_ones_go() {
     let mut arena = Arena::new(1 << 22, 0);
     arena.mutate(|mc| {
-        let ops = |core| ops(mc, core);
-        let tail = ops(lambda(&[0], None, prim(MarkValue, vec![var(0), q(0)])));
+        let tail = ops(mc, lambda(&[0], None, prim(MarkValue, vec![var(0), q(0)])));
         assert!(tail.iter().any(|op| matches!(op, Op::TailCallIntrinsic { args: 2, intrinsic: MarkValue, .. })), "{tail:?}");
-        let used = ops(lambda(&[0], None, prim(Cons, vec![prim(MarkValue, vec![var(0), q(0)]), prim(Running, vec![])])));
+        let used = ops(mc, lambda(&[0], None, prim(Cons, vec![prim(MarkValue, vec![var(0), q(0)]), prim(Running, vec![])])));
         assert!(used.iter().any(|op| matches!(op, Op::CallIntrinsic2 { intrinsic: MarkValue, .. })), "{used:?}");
         assert!(used.iter().any(|op| matches!(op, Op::CallIntrinsic { args: 0, intrinsic: Running, .. })), "{used:?}");
-        let unused = ops(lambda(&[0], None, let_(vec![(1, prim(MarkValue, vec![var(0), q(0)]))], q(1))));
+        let unused = ops(mc, lambda(&[0], None, let_(vec![(1, prim(MarkValue, vec![var(0), q(0)]))], q(1))));
         assert!(!unused.iter().any(|op| matches!(op, Op::CallIntrinsic2 { .. } | Op::CallIntrinsic { .. })), "{unused:?}");
         // Retain faulting `FrameMarks` and effectful `SetWinders` operations even when their results are
         // unused.
-        let faulting = ops(lambda(&[0], None, let_(vec![(1, prim(FrameMarks, vec![var(0), q(0), var(0)]))], q(1))));
+        let faulting = ops(mc, lambda(&[0], None, let_(vec![(1, prim(FrameMarks, vec![var(0), q(0), var(0)]))], q(1))));
         assert!(faulting.iter().any(|op| matches!(op, Op::CallIntrinsic3 { intrinsic: FrameMarks, .. })), "{faulting:?}");
-        let setting = ops(lambda(&[0], None, let_(vec![(1, prim(SetWinders, vec![var(0)]))], q(1))));
+        let setting = ops(mc, lambda(&[0], None, let_(vec![(1, prim(SetWinders, vec![var(0)]))], q(1))));
         assert!(setting.iter().any(|op| matches!(op, Op::CallIntrinsic1 { intrinsic: SetWinders, .. })), "{setting:?}");
         // Do not fold `MarkValue` even with constant arguments: its result depends on the runtime task.
-        let constant = ops(lambda(&[], None, prim(MarkValue, vec![q(1), q(2)])));
+        let constant = ops(mc, lambda(&[], None, prim(MarkValue, vec![q(1), q(2)])));
         assert!(constant.iter().any(|op| matches!(op, Op::TailCallIntrinsic { intrinsic: MarkValue, .. })), "{constant:?}");
     });
     assert_eq!(error(|_| prim(MarkValue, vec![q(1)])), CompileError::Arity(Prim::Intrinsic(MarkValue)));
@@ -1872,9 +1919,11 @@ fn module_variables_are_slots() {
     arena.mutate(|mc| {
         assert_eq!(compile(mc, None, &slot(0)), Err(CompileError::UnknownSlot(0)));
         // Remove unused unchecked loads, but preserve checked loads because they may fault.
-        let unused = |load| ops(mc, lambda(&[0], None, seq(1, load, q(1))));
-        assert!(!unused(slot(0)).iter().any(|op| matches!(op, Op::LoadSlot { .. })));
-        assert!(unused(checked(0)).iter().any(|op| matches!(op, Op::LoadSlotChecked { slot: 0, .. })));
+        fn unused<'gc>(mc: &Mutation<'gc>, load: Core<'gc>) -> Vec<Op> {
+            ops(mc, lambda(&[0], None, seq(1, load, q(1))))
+        }
+        assert!(!unused(mc, slot(0)).iter().any(|op| matches!(op, Op::LoadSlot { .. })));
+        assert!(unused(mc, checked(0)).iter().any(|op| matches!(op, Op::LoadSlotChecked { slot: 0, .. })));
         let tail = ops(mc, lambda(&[0], None, slot(1)));
         assert!(tail.windows(2).any(|w| matches!(w, [Op::LoadSlot { dst, slot: 1 }, Op::Return { src }] if dst == src)), "{tail:?}");
         let stored = ops(mc, lambda(&[0], None, define(2, var(0))));
@@ -1920,9 +1969,11 @@ fn host_functions_are_called_in_the_loop() {
         let tail = ops(mc, lambda(&[0], None, host(ADD_HOST, vec![var(0)])));
         assert!(tail.iter().any(|op| matches!(op, Op::TailCallHost { args: 1, .. })), "{tail:?}");
         // Remove an unused host call only when its metadata permits discarding it.
-        let unused = |def: &'static HostDef| ops(mc, lambda(&[0], None, let_(vec![(1, host(def, vec![var(0)]))], q(1))));
-        assert!(unused(ADD_HOST).iter().any(|op| matches!(op, Op::CallHost { .. })));
-        assert!(!unused(ADD_DISCARDABLE).iter().any(|op| matches!(op, Op::CallHost { .. })));
+        fn unused(mc: &Mutation<'_>, def: &'static HostDef) -> Vec<Op> {
+            ops(mc, lambda(&[0], None, let_(vec![(1, host(def, vec![var(0)]))], q(1))))
+        }
+        assert!(unused(mc, ADD_HOST).iter().any(|op| matches!(op, Op::CallHost { .. })));
+        assert!(!unused(mc, ADD_DISCARDABLE).iter().any(|op| matches!(op, Op::CallHost { .. })));
     });
 }
 

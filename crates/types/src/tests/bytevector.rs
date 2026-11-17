@@ -56,7 +56,7 @@ fn integers_of_up_to_8_bytes_read_and_write_at_any_offset() {
     });
 }
 
-/// Bytes that say when they're dropped.
+/// Bytes that record when they are dropped.
 struct Watched(Vec<u8>, std::rc::Rc<std::cell::Cell<bool>>);
 
 impl AsRef<[u8]> for Watched {
@@ -71,8 +71,8 @@ impl Drop for Watched {
     }
 }
 
-/// External bytes read like any others, stay outside the arena while the bytevector is
-/// reachable, through moving collections, and their owner is dropped once it isn't.
+/// External bytes are read like any other bytes. They stay outside the arena while the bytevector
+/// is reachable, through moving collections. Their owner is dropped once the bytevector is unreachable.
 #[test]
 fn external_bytevectors_keep_their_owner_while_reachable() {
     let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -123,8 +123,8 @@ impl AsMut<[u8]> for Watched {
     }
 }
 
-/// A buffer the host gives the arena is written through a bytevector like any other's bytes,
-/// stays outside the arena however short it is, and is dropped once nothing reaches it.
+/// A buffer that the host hands to the arena is written through a bytevector like any other bytes.
+/// It stays outside the arena however short it is, and is dropped once the bytevector is unreachable.
 #[test]
 fn external_mutable_bytevectors_write_their_buffer() {
     let dropped = std::rc::Rc::new(std::cell::Cell::new(false));

@@ -5,13 +5,14 @@
 use std::convert::Infallible;
 
 use ragwort_types::constant::Constants;
-use ragwort_types::gc::{Frame, Gc, Mutation, Stack, Value, WINDOW};
+use ragwort_types::gc::{Frame, Gc, Mutation, Slots, Stack, Value, WINDOW, slot};
+use ragwort_types::table::Table;
 use ragwort_types::pair::{Pair, Pairs};
 
 use crate::frame::{self, ARGS, CLOSURE, Kept, Link, MAX_PARAMS, SAVED_MARKS, Shape};
 use crate::op::Fuel;
 use crate::module::{Deferred, HostArgs, HostContext, HostDef, Reply};
-use crate::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Guard, KeywordProcedure, KeywordProcedureFields, ModuleFields, Task, TaskFields};
+use crate::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Guard, HintsFields, KeywordProcedure, KeywordProcedureFields, ModuleFields, Task, TaskFields};
 use crate::prompts::{self, handler_key};
 use crate::segments;
 use crate::{Context, Control, Fault, Op, Request, coroutine};
@@ -33,7 +34,7 @@ pub(crate) struct Regs<'gc> {
 }
 
 impl<'gc> Regs<'gc> {
-    /// Puts the values in the proper list `list` into the accumulator. A list of one element puts that element there as one value.
+    /// Stores the values in the proper list `list` in the accumulator. A list of one element is stored as that single value.
     pub(crate) fn set_values(&mut self, mc: &Mutation<'gc>, list: Value<'gc>) {
         match Pair::of(list) {
             Some(cell) if cell.tail(mc) == Value::NULL => self.acc = cell.head(mc),
@@ -58,10 +59,10 @@ impl<'gc> Regs<'gc> {
     }
 }
 
-/// The most leading arguments of a first-class `apply` for it to be laid out as a call inside the inner loop.
+/// The maximum number of leading arguments for which the inner loop lays out a first-class `apply` as a call.
 const LEADING: usize = 4;
 
-/// The most keywords a procedure can accept for a `keyword-apply` to be laid out as a call inside the inner loop.
+/// The maximum number of keywords a procedure can accept for the inner loop to lay out a `keyword-apply` to it as a call.
 const KEYWORDS: usize = 8;
 
 /// The reason the inner execution loop suspended or exited.
@@ -211,6 +212,8 @@ impl<'s, 'gc> Run<'s, 'gc> {
                     self.charge()?;
                     self.host(base, args, host, tail)?;
                 }
+                Control::TableRef { dst, table, key, default, hint } => self.table_ref(dst, table, key, default, hint)?,
+                Control::TableSet { dst, table, key, value, hint } => self.table_set(dst, table, key, value, hint)?,
             }
         }
     }
@@ -361,7 +364,7 @@ impl<'s, 'gc> Run<'s, 'gc> {
             self.cx.fuel.pause();
         }
         match reply {
-            // The marker is not a value. A host that returned it would make the accumulator claim a list it does not have.
+            // `Value::VALUES` is the multiple-values marker, not a value. If a host returned it, the accumulator would claim a list of values that does not exist.
             Reply::Value(Value::VALUES) => Err(Fault::WrongType.into()),
             Reply::Value(value) => {
                 self.cx.acc = value;
@@ -381,10 +384,15 @@ impl<'s, 'gc> Run<'s, 'gc> {
         }
     }
 
-    /// Optimizes `apply` directly into a call by spreading the final list. Non-tail invocations of `with-mark`, `with-exception-handler`, or `guard` set
-    /// continuation marks in the callee's frame window (preserving previous marks beneath it for return
-    /// restoration). A close or reset of a coroutine that has ended finishes here too. All other requests
-    /// exit to the outer loop.
+    /// Handles the requests that the inner loop can complete by itself. Every other request exits to
+    /// the outer loop.
+    ///
+    /// - `apply` and `keyword-apply` are laid out as a direct call.
+    /// - A non-tail `with-mark`, `with-exception-handler` or `guard` sets its continuation mark and
+    ///   calls its procedure in a frame above the saved marks. The return restores the saved marks.
+    /// - A `with-mark` or `with-exception-handler` in tail position sets its mark on the current
+    ///   frame, if that frame can hold marks.
+    /// - A close or reset of a coroutine that has ended completes here.
     ///
     /// Kept out of line. Inlined into the instruction loop, it made every plain call measurably slower.
     #[inline(never)]
@@ -423,9 +431,72 @@ impl<'s, 'gc> Run<'s, 'gc> {
         if tail { self.tail_call(call) } else { self.call(call, false) }
     }
 
+    /// Returns the hint words of the running code and the index of word `hint` in them. Fails with [`Fault::Malformed`] if the code has no such word.
+    fn hints(&self, hint: u16) -> Result<(Slots<'gc, slot::u64>, usize), Fault> {
+        let hints = self.code.hints(self.cx.mc).ok_or(Fault::Malformed)?.items(self.cx.mc);
+        if usize::from(hint) < hints.len() { Ok((hints, usize::from(hint))) } else { Err(Fault::Malformed) }
+    }
+
+    /// Reads a table entry for [`Op::TableRefHinted`]. The entry position stored in the hint word is
+    /// tried first. If the key is not at that position, the table is searched, and the hint word is
+    /// set to the position where the key was found.
+    #[inline(never)]
+    fn table_ref(&mut self, dst: u8, table: u8, key: u8, default: u8, hint: u16) -> Result<(), Fault> {
+        let (mc, frame) = (self.cx.mc, self.cx.frame);
+        let (table, key) = (Table::of(frame.get(table)).ok_or(Fault::WrongType)?, frame.get(key));
+        let (hints, slot) = self.hints(hint)?;
+        if let Some(value) = table.get_at(mc, key, hints.get(slot) as usize) {
+            frame.set(dst, value);
+            return Ok(());
+        }
+        self.charge_rebuild(table)?;
+        let value = match table.find(mc, key)? {
+            Some((position, value)) => {
+                hints.set(mc, slot, position as u64);
+                value
+            }
+            None => frame.get(default),
+        };
+        // The search can allocate. A table rebuilds a stale index, and an external table caches each value it reads from its host.
+        if mc.step_due() {
+            self.cx.fuel.pause();
+        }
+        frame.set(dst, value);
+        Ok(())
+    }
+
+    /// Writes a table entry for [`Op::TableSetHinted`]. The hint word is used as in [`Run::table_ref`].
+    #[inline(never)]
+    fn table_set(&mut self, dst: u8, table: u8, key: u8, value: u8, hint: u16) -> Result<(), Fault> {
+        let (mc, frame) = (self.cx.mc, self.cx.frame);
+        let (table, key, value) = (Table::of(frame.get(table)).ok_or(Fault::WrongType)?, frame.get(key), frame.get(value));
+        let (hints, slot) = self.hints(hint)?;
+        if !table.set_at(mc, key, hints.get(slot) as usize, value) {
+            self.charge_rebuild(table)?;
+            // A table in the arena keeps each entry at a fixed position, so the next write finds this entry through the hint. An external table returns no position.
+            if let Some(position) = table.set_finding(mc, key, value)? {
+                hints.set(mc, slot, position as u64);
+            }
+            if mc.step_due() {
+                self.cx.fuel.pause();
+            }
+        }
+        frame.set(dst, Value::VOID);
+        Ok(())
+    }
+
+    /// Spends the fuel for rebuilding the index of `table`, if the next access will rebuild it. See `Table::is_stale`.
+    fn charge_rebuild(&mut self, table: Table<'gc>) -> Result<(), Fault> {
+        if table.is_stale(self.cx.mc) {
+            self.cx.fuel.spend(table.len(self.cx.mc) as u64 / crate::equal::PER_FUEL)?;
+        }
+        Ok(())
+    }
+
     /// Closes or resets the coroutine in register `base` if it has ended. Such a coroutine holds nothing,
-    /// so there is nothing to unwind and no task to switch to. Returns what the request returns: void
-    /// for a close, the coroutine for a reset. Returns `None` if the outer loop has to make the request.
+    /// so there is nothing to unwind and no task to switch to. Returns the result of the request, which
+    /// is void for a close and the coroutine for a reset. Returns `None` if the outer loop has to
+    /// handle the request.
     #[inline(never)]
     fn ended(&mut self, base: u8, args: u8, request: Request) -> Option<Value<'gc>> {
         let (mc, frame) = (self.cx.mc, self.cx.frame);
@@ -446,8 +517,8 @@ impl<'s, 'gc> Run<'s, 'gc> {
     }
 
     /// Calls the procedure in register `base` with the values in the accumulator, which the last call
-    /// returned. One value is moved into the argument register. A list of values is the call's rest
-    /// list, which binding spreads.
+    /// returned. One value is moved into the first argument register. A list of values becomes the
+    /// call's rest list, and argument binding spreads it.
     #[inline(never)]
     fn received(&mut self, base: u8, tail: bool) -> Result<(), Exit<'gc>> {
         let acc = self.cx.acc;
@@ -462,9 +533,14 @@ impl<'s, 'gc> Run<'s, 'gc> {
         if tail { self.tail_call(call) } else { self.call(call, false) }
     }
 
-    /// Sets the mark of a `with-mark` or `with-exception-handler` in tail position on the current frame, and returns the call to make in its place.
+    /// Sets the mark of a `with-mark` or `with-exception-handler` in tail position on the current frame. Returns the call that replaces the request.
     ///
-    /// The frame must be able to hold marks of its own: either it is the bottom frame, whose caller's marks are those of the chain, or its link has `marks` set, so its caller's marks are saved below it. Returns `None` for any other frame. The outer loop then saves the caller's frames, which makes this frame the bottom one.
+    /// The frame must be able to hold marks of its own. Two kinds of frame can:
+    ///
+    /// - The bottom frame. Its caller's marks are the marks that the head record of the chain restores.
+    /// - A frame whose link has `marks` set. Its caller's marks are saved below it.
+    ///
+    /// Returns `None` for any other frame. The outer loop then saves the caller's frames, which makes this frame the bottom frame.
     #[inline(never)]
     fn tail_mark(&mut self, base: u8, args: u8, request: Request) -> Result<Option<Call<'gc>>, Fault> {
         let (mc, frame, task) = (self.cx.mc, self.cx.frame, self.cx.task);
@@ -479,11 +555,7 @@ impl<'s, 'gc> Run<'s, 'gc> {
         };
         let (key, value, call) = match request {
             Request::WithMark => (frame.get(base), frame.get(base + 1), Call { base: base + 2, argc: args - 3, rest: Value::NULL }),
-            _ => {
-                let handlers = prompts::mark(mc, task, handler_key(), Value::NULL)?;
-                let handlers = Pairs::new(mc).cons(frame.get(base), handlers)?.value(mc);
-                (handler_key(), handlers, Call { base: base + 1, argc: 0, rest: Value::NULL })
-            }
+            _ => (handler_key(), prompts::handlers_with(mc, task, frame.get(base))?, Call { base: base + 1, argc: 0, rest: Value::NULL }),
         };
         task.set_attachments(mc, segments::marked(mc, task.attachments(mc), under, key, value)?);
         if mc.step_due() {
@@ -492,11 +564,18 @@ impl<'s, 'gc> Run<'s, 'gc> {
         Ok(Some(call))
     }
 
-    /// Lays out a `keyword-apply` in registers `base..base + args` as a call to the core of its keyword procedure, and returns that call.
+    /// Lays out a `keyword-apply` in registers `base..base + args` as a call to the core of its keyword procedure. Returns that call.
     ///
-    /// The core takes one argument for each keyword the procedure accepts, in the procedure's order, and then the positional arguments. An accepted keyword that the call does not give is passed as [`Value::UNSUPPLIED`].
+    /// The core takes one argument for each keyword the procedure accepts, in the procedure's order, and then the positional arguments. An accepted keyword that the call does not supply is passed as [`Value::UNSUPPLIED`].
     ///
-    /// Returns `None`, with the registers untouched, for a call this does not handle: a procedure that takes no keywords, a keyword the procedure does not accept, a required keyword that is missing, keywords out of order, or more keywords than [`KEYWORDS`]. The outer loop then runs the request and reports any error.
+    /// Returns `None` and leaves the registers unchanged for a call that this function does not handle. The outer loop then runs the request and reports any error. The cases are:
+    ///
+    /// - The callee is not a keyword procedure, or its core is not a closure.
+    /// - The call supplies a keyword that the procedure does not accept.
+    /// - A required keyword is missing.
+    /// - The keywords are out of order.
+    /// - The procedure accepts more than [`KEYWORDS`] keywords.
+    /// - The laid-out call does not fit in the frame window.
     #[inline(never)]
     fn keyword_call(&mut self, base: u8, args: u8) -> Option<Call<'gc>> {
         let (mc, frame) = (self.cx.mc, self.cx.frame);
@@ -528,7 +607,7 @@ impl<'s, 'gc> Run<'s, 'gc> {
         // The positional arguments are in the registers after the three operands, and the last register holds the list of the rest.
         let positional = usize::from(args) - 4;
         let rest = frame.get(base + args - 1);
-        // The core goes right below its first argument. Up to two keyword values fit in the registers of the operands. More of them move the positional arguments up.
+        // The core is placed in the register just below its first argument. Up to two keyword values fit in the registers of the `keyword-apply` operands. Each further keyword value shifts the positional arguments up by one register.
         let shift = count.saturating_sub(2);
         let core_at = usize::from(base) + 2 + shift - count;
         if core_at + 1 + count + positional > WINDOW {
@@ -604,9 +683,8 @@ impl<'s, 'gc> Run<'s, 'gc> {
                 } else {
                     frame.get(base)
                 };
-                let handlers = prompts::mark(mc, task, handler_key(), Value::NULL)?;
                 let guard = guarding.then_some(handler);
-                (handler_key(), pairs.cons(handler, handlers).map_err(Fault::from)?.value(mc), guard)
+                (handler_key(), prompts::handlers_with(mc, task, handler)?, guard)
             }
         };
         let mark = pairs.cons(key, value).map_err(Fault::from)?.value(mc);
@@ -680,10 +758,12 @@ fn bind_slow<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, mut arg
         argc += 1;
     }
     if !shape.rest {
-        return match () {
-            () if argc > fixed || Pair::of(rest).is_some() => Err(Fault::Arity),
-            () if rest != Value::NULL => Err(Fault::WrongType),
-            () => Ok(()),
+        return if argc > fixed || Pair::of(rest).is_some() {
+            Err(Fault::Arity)
+        } else if rest != Value::NULL {
+            Err(Fault::WrongType)
+        } else {
+            Ok(())
         };
     }
     // The remaining arguments become the tail of the rest parameter, so they must form a proper list. A pair stores whether it starts a proper list, so this check does not walk the list.

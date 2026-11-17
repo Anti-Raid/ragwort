@@ -109,7 +109,7 @@ fn closures_capture_and_use_what_they_have() {
 /// Checks, walks, and drops a tree one million nodes deep on a small machine stack.
 #[test]
 fn deep_trees_need_no_stack() {
-    let run = || {
+    fn run() {
         scope(|mut t| {
             let mut e = void(&mut t);
             for _ in 0..1_000_000 {
@@ -119,6 +119,6 @@ fn deep_trees_need_no_stack() {
             assert_eq!(t.verify(e), Ok(()));
             assert_eq!(t.frame(e).count(), 2_000_001);
         });
-    };
+    }
     thread::Builder::new().stack_size(64 << 10).spawn(run).expect("spawned").join().expect("ran");
 }

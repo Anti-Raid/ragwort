@@ -79,7 +79,6 @@ pub(crate) fn optimize<'s, 'd, 'gc>(mc: &Mutation<'gc>, src: &mut L2<'s, 'gc>, r
         pred_facts: HashMap::default(),
         single_use: HashMap::default(),
         small_bodies: Vec::new(),
-        next_small: false,
         small_funcs: HashMap::default(),
         lone_funcs: HashMap::default(),
         known_pairs: HashMap::default(),
@@ -154,7 +153,9 @@ struct LetFrame<'s, 'd> {
 /// A worklist task: either a source expression to optimize, or an action to assemble previously optimized expressions into a target node.
 enum Task<'s, 'd, 'gc> {
     Expr(Id<'s>),
-    /// Sets the source site that the nodes built by the following task receive.
+    /// Optimizes a source lambda expression as a small function that is cloned at its call sites. See `small_bodies`.
+    Small(Id<'s>),
+    /// Sets the source site for the nodes that the next task builds.
     At(u32),
     Arm(usize),
     /// Evaluates the branches of an `if` once its test expression has been constructed.
@@ -165,7 +166,7 @@ enum Task<'s, 'd, 'gc> {
     Within(Span<'d, Bind<'d>>),
     Seq,
     Set(Var),
-    /// Handles the `else` branch of `(if v ...)`, assuming `v` is `#f`, after finishing the `then` branch where `v` was truthy.
+    /// Handles the `else` branch of `(if v ...)`, where `v` is known to be false (`#f`, `#nil` or `#none`), after finishing the `then` branch where `v` was truthy.
     VarElse { v: Var, newly: bool, other: usize, test: Id<'d> },
     VarDone { v: Var, newly: bool, test: Id<'d> },
     /// Handles the `else` branch of `(if (pred v) ...)`, assuming the predicate is false, after finishing the `then` branch where it held true.
@@ -230,11 +231,9 @@ struct Cp0<'m, 't, 's, 'd, 'gc> {
     /// Stack tracking whether currently enclosing function bodies are candidates for multi-call inlining.
     /// To keep these functions small enough for cloning at their call sites, neither single-use lambdas nor other small functions are inlined into them.
     small_bodies: Vec<bool>,
-    /// Flag indicating whether the upcoming lambda to be optimized qualifies as a small multi-use function.
-    next_small: bool,
     /// Small, unassigned, leaf lambdas (containing no nested lambdas) eligible for inlining via cloning at call sites.
     small_funcs: HashMap<Var, Fun<'d>>,
-    /// Unassigned variables bound to a lambda and referenced exactly once, each with its function and the index of the `let` frame that holds its binding. A rule that takes the function's body removes the binding.
+    /// Unassigned variables bound to a lambda and referenced exactly once, each with its function and the index of the `let` frame that holds its binding. A rule that moves the function's body into another expression removes the binding. See `taken`.
     lone_funcs: HashMap<Var, (Fun<'d>, usize)>,
     /// Unassigned variables bound to `(cons a b)` where `a` and `b` are constants or unassigned variables.
     /// Because pairs are immutable, car and cdr accesses throughout the variable's scope resolve directly to `a` and `b`.
@@ -283,7 +282,8 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
 
     fn run(&mut self, task: Task<'s, 'd, 'gc>, then: &mut Vec<Task<'s, 'd, 'gc>>) {
         let made = match task {
-            Task::Expr(id) => return self.expr(id, then),
+            Task::Expr(id) => return self.expr(id, false, then),
+            Task::Small(id) => return self.expr(id, true, then),
             Task::At(site) => return self.at(site),
             Task::Arm(arm) => {
                 let mark = self.learned.len();
@@ -378,7 +378,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                 if newly {
                     self.truthy_vars.remove(&var);
                 }
-                if pred == Intrinsic::IsNull {
+                if pred.sole_value().is_some() {
                     self.restore(var, prev_subst);
                 }
                 self.pred_facts.insert((pred, var), false);
@@ -464,7 +464,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         }
     }
 
-    /// As [`Cp0::inlined_src`], for a body that is already in the output table.
+    /// Does the same as [`Cp0::inlined_src`] for a body that is already in the output table.
     fn inlined_out(&mut self, lambda: u32, body: Id<'d>, site: u32) {
         let Some(name) = self.names.get(lambda).name else { return };
         let inlined = self.names.sites.inline(name, site);
@@ -475,13 +475,13 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         }
     }
 
-    /// Sets the source site that nodes added to either table receive.
+    /// Sets the source site for nodes added to either table from now on.
     fn at(&mut self, site: u32) {
         self.src.at(site);
         self.out.at(site);
     }
 
-    fn expr(&mut self, id: Id<'s>, then: &mut Vec<Task<'s, 'd, 'gc>>) {
+    fn expr(&mut self, id: Id<'s>, small: bool, then: &mut Vec<Task<'s, 'd, 'gc>>) {
         let node = self.src[id];
         let site = self.src.site(id);
         self.at(site);
@@ -509,10 +509,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             }
             Node::Set(var, value) => return then.extend([Task::Expr(value), Task::Set(var)]),
             Node::App(function, args) => return self.app(function, args, site, then),
-            Node::Lambda(fun) => {
-                let small = std::mem::take(&mut self.next_small);
-                return then.extend(self.body_tasks(fun, small).into_iter().chain([Task::Function(fun)]));
-            }
+            Node::Lambda(fun) => return then.extend(self.body_tasks(fun, small).into_iter().chain([Task::Function(fun)])),
             Node::Intrinsic(prim, args) => {
                 then.extend(self.src[args].iter().map(|&arg| Task::Expr(arg)));
                 return then.extend([Task::At(site), Task::Intrinsic(prim, self.src[args].len())]);
@@ -605,7 +602,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                 }
                 // Normalizes short-circuit conjunction in test position:
                 // `(if (if a b <false>) then other) -> (if a (if b then other) other)` when `other` is a duplicate-safe expression (constant or variable).
-                // `<false>` is a false constant, or `a` itself when `a` is a variable, which is false where the inner `if` gives it.
+                // `<false>` is a false constant, or `a` itself when `a` is an unassigned variable. In the else branch of the inner `if`, `a` is known to be false.
                 Node::If(inner_test, inner_then, inner_else)
                     if (matches!(self.out[inner_else], Node::Quote(value) if value.is_false())
                         || matches!((self.out[inner_test], self.out[inner_else]), (Node::Ref(tested), Node::Ref(given)) if tested == given && !self.assigned.contains(&tested)))
@@ -619,7 +616,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                     test = inner_test;
                     continue;
                 }
-                // Records dominating variable truthiness: `v` is known truthy in `then`, and false in `other`. Which of the false values it is there is not known, so its uses in `other` stay as they are.
+                // Records dominating variable truthiness: `v` is known truthy in `then`, and false in `other`. The fact does not say which false value `v` holds in `other`, so uses of `v` in `other` are not replaced by a constant.
                 Node::Ref(var) if !self.assigned.contains(&var) => {
                     let newly = self.truthy_vars.insert(var);
                     then.extend([Task::Arm(consequent), Task::VarElse { v: var, newly, other, test }]);
@@ -645,7 +642,10 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                     let Node::Ref(var) = self.out[self.out[args][0]] else { unreachable!() };
                     let prev_fact = self.pred_facts.insert((pred, var), true);
                     let newly = !matches!(pred, Intrinsic::IsBoolean | Intrinsic::IsNil | Intrinsic::IsNone) && self.truthy_vars.insert(var);
-                    let prev_subst = if pred == Intrinsic::IsNull { self.subst.insert(var, Subst::Quote(Value::NULL)) } else { None };
+                    let prev_subst = match pred.sole_value() {
+                        Some(value) => self.subst.insert(var, Subst::Quote(value)),
+                        None => None,
+                    };
                     then.extend([Task::Arm(consequent), Task::PredElse { pred, v: var, newly, prev_subst, prev_fact, other, test }]);
                 }
                 _ => then.extend([Task::Arm(consequent), Task::Arm(other), Task::If(test)]),
@@ -673,6 +673,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                 return then.push(Task::Fix(group));
             }
         };
+        let mut small = false;
         // Eliminates unused source lambdas. Single-call lambdas remain unoptimized in source form until inlined at their call site, avoiding redundant optimization passes. Compiler-generated variables are uncounted and bypassed.
         if !self.assigned.contains(&var)
             && let Init::Src(expr) = init
@@ -686,11 +687,11 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                 self.single_use.insert(var, (fun, self.lets.len() - 1));
                 return;
             }
-            // Functions referenced only in call position across multiple call sites and small enough in source form are designated small to preserve eligibility for call-site cloning.
-            self.next_small = stats.valid_calls == stats.total && self.small_as_written(fun);
+            // A function is designated small if every reference to it is a call and its source form is small enough. This preserves its eligibility for call-site cloning.
+            small = stats.valid_calls == stats.total && self.small_as_written(fun);
         }
         match init {
-            Init::Src(expr) => then.extend([Task::Expr(expr), Task::Val(var)]),
+            Init::Src(expr) => then.extend([if small { Task::Small(expr) } else { Task::Expr(expr) }, Task::Val(var)]),
             Init::Done(init) => self.bound(var, init),
         }
     }
@@ -879,23 +880,42 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         params.into_iter().zip(args).chain(rest).collect()
     }
 
+    /// Strips the `Seq` prefixes and `Let` bindings that wrap output expression `expr`, and returns the expression inside them. A [`Task::Then`] or [`Task::Within`] is pushed onto `wraps` for each form stripped, the outermost first.
+    fn peel(&self, mut expr: Id<'d>, wraps: &mut Vec<Task<'s, 'd, 'gc>>) -> Id<'d> {
+        loop {
+            match self.out[expr] {
+                Node::Seq(prefix, inner) => {
+                    wraps.push(Task::Then(prefix));
+                    expr = inner;
+                }
+                Node::Let(binds, inner) => {
+                    wraps.push(Task::Within(binds));
+                    expr = inner;
+                }
+                _ => return expr,
+            }
+        }
+    }
+
+    /// Wraps `made` in the forms that [`Cp0::peel`] stripped, the innermost first. A `Let` that has lost all its bindings is dropped.
+    fn rewrap(&mut self, wraps: Vec<Task<'s, 'd, 'gc>>, mut made: Id<'d>) -> Id<'d> {
+        for wrap in wraps.into_iter().rev() {
+            made = match wrap {
+                Task::Then(prefix) => self.seq(prefix, made),
+                Task::Within(binds) => {
+                    if self.out[binds].is_empty() { made } else { self.out.add(Node::Let(binds, made)) }
+                }
+                _ => unreachable!("only binding forms float out"),
+            };
+        }
+        made
+    }
+
     /// Optimizes an application where both the callee operator and all argument expressions have already been lowered.
     fn opt_app(&mut self, mut function: Id<'d>, args: Vec<Id<'d>>, then: &mut Vec<Task<'s, 'd, 'gc>>) {
         // Hoists any `Let` bindings or `Seq` expressions out of the operator expression, matching `app`.
         let mut wraps = Vec::new();
-        loop {
-            match self.out[function] {
-                Node::Seq(prefix, inner) => {
-                    wraps.push(Task::Then(prefix));
-                    function = inner;
-                }
-                Node::Let(binds, body) => {
-                    wraps.push(Task::Within(binds));
-                    function = body;
-                }
-                _ => break,
-            }
-        }
+        function = self.peel(function, &mut wraps);
         // Resolves small dispatcher functions that immediately delegate to another procedure based on known facts, iteratively resolving chains of dispatchers.
         while args.is_empty()
             && let Node::Ref(var) = self.out[function]
@@ -942,9 +962,9 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         then.extend(wraps.into_iter().rev());
     }
 
-    /// Optimizes `(receive consumer producer)` when the producer is a lambda of no parameters whose body shows what it returns.
+    /// Optimizes `(receive consumer producer)` when the producer is a lambda with no parameters and the end of its body has a known form.
     ///
-    /// - A body `(values e ...)`, and a body that returns exactly one value, pass those values to the consumer directly: `(consumer e ...)`.
+    /// - If the body is `(values e ...)`, the consumer is called on the values directly: `(consumer e ...)`. A body that returns exactly one value is handled the same way, with that value as the only argument.
     /// - A body that is a call `(f a ...)` becomes `(receive consumer f a ...)`, which calls `f` without creating the producer.
     ///
     /// Bindings and effects around the end of the body move outside the new expression. The consumer must be a lambda, a variable or a constant, so that evaluating it later is not observable.
@@ -957,7 +977,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             }),
             _ => None,
         };
-        // The rules below take the producer's body. They apply only to a body whose end is one of the forms they know.
+        // The rules below move the producer's body into the new expression. They apply only if the end of the body is one of the forms matched by `known`.
         let end = direct.map(|(_, _, mut end)| {
             while let Node::Seq(_, inner) | Node::Let(_, inner) = self.out[end] {
                 end = inner;
@@ -972,20 +992,8 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         };
         self.taken(producer);
         let mut wraps = Vec::new();
-        loop {
-            match self.out[body] {
-                Node::Seq(prefix, inner) => {
-                    wraps.push(Task::Then(prefix));
-                    body = inner;
-                }
-                Node::Let(binds, inner) => {
-                    wraps.push(Task::Within(binds));
-                    body = inner;
-                }
-                _ => break,
-            }
-        }
-        let mut made = match self.out[body] {
+        body = self.peel(body, &mut wraps);
+        let made = match self.out[body] {
             Node::Intrinsic(Prim::Intrinsic(Intrinsic::Values), values) => {
                 let values = self.out[values].to_vec();
                 self.pass(consumer, values)
@@ -1000,19 +1008,10 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             }
             _ => unreachable!("the end of the body was checked"),
         };
-        for wrap in wraps.into_iter().rev() {
-            made = match wrap {
-                Task::Then(prefix) => self.seq(prefix, made),
-                Task::Within(binds) => {
-                    if self.out[binds].is_empty() { made } else { self.out.add(Node::Let(binds, made)) }
-                }
-                _ => unreachable!("only binding forms float out"),
-            };
-        }
-        made
+        self.rewrap(wraps, made)
     }
 
-    /// Returns the function of `expr` if it is a lambda, or a variable that is bound to a lambda and referenced only here.
+    /// Returns the function of `expr` if `expr` is a lambda. Also returns the function if `expr` is a variable in `lone_funcs`: a variable bound to a lambda and referenced exactly once.
     fn lambda(&self, expr: Id<'d>) -> Option<Fun<'d>> {
         match self.out[expr] {
             Node::Lambda(fun) => Some(fun),
@@ -1021,7 +1020,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         }
     }
 
-    /// Records that a rule took the body of the function [`lambda`](Self::lambda) found for `expr`. If `expr` is a variable, its binding goes, because the body now has another place.
+    /// Records that a rule moved the body of the function that [`lambda`](Self::lambda) found for `expr` into another expression. If `expr` is a variable, this removes the variable's binding from its `let` frame. The binding is no longer needed, because `expr` was the only reference to the variable.
     fn taken(&mut self, expr: Id<'d>) {
         let Node::Ref(var) = self.out[expr] else { return };
         let Some((_, frame)) = self.lone_funcs.remove(&var) else { return };
@@ -1029,7 +1028,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         self.lets[frame].kept.retain(|bind| !matches!(bind, Bind::Val(bound, _) if *bound == var));
     }
 
-    /// Builds the call of `consumer` on `values`. A consumer that is a lambda of exactly that many parameters is not called: its parameters are bound to the values around its body.
+    /// Builds a call of `consumer` with the arguments `values`. If the consumer is a lambda with exactly `values.len()` required parameters and no optional or rest parameter, no call is built. Instead, a `Let` around the lambda's body binds the parameters to the values.
     fn pass(&mut self, consumer: Id<'d>, values: Vec<Id<'d>>) -> Id<'d> {
         if let Some(fun) = self.lambda(consumer) {
             let function = self.out[fun];
@@ -1062,30 +1061,11 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         // Because let-bound variables are globally unique, later arguments cannot capture them:
         // e.g. `(car (let ((x (f))) (cons x 1))) -> (let ((x (f))) x)`.
         let mut wraps = Vec::new();
-        while let Some(&first) = args.first() {
-            match self.out[first] {
-                Node::Seq(prefix, inner) => {
-                    wraps.push(Task::Then(prefix));
-                    args[0] = inner;
-                }
-                Node::Let(binds, inner) => {
-                    wraps.push(Task::Within(binds));
-                    args[0] = inner;
-                }
-                _ => break,
-            }
+        if let Some(first) = args.first_mut() {
+            *first = self.peel(*first, &mut wraps);
         }
-        let mut made = self.rules(prim, intrinsic, args);
-        for wrap in wraps.into_iter().rev() {
-            made = match wrap {
-                Task::Then(prefix) => self.seq(prefix, made),
-                Task::Within(binds) => {
-                    if self.out[binds].is_empty() { made } else { self.out.add(Node::Let(binds, made)) }
-                }
-                _ => unreachable!("only binding forms float out"),
-            };
-        }
-        made
+        let made = self.rules(prim, intrinsic, args);
+        self.rewrap(wraps, made)
     }
 
     fn make(&mut self, prim: Prim, args: Vec<Id<'d>>) -> Id<'d> {
@@ -1125,10 +1105,12 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         // The constant operand has no side effects, so reordering preserves evaluation semantics.
         // `(- x 0)` is preserved to distinguish `-0.0` from `0.0`.
         if matches!(intrinsic, Intrinsic::Add | Intrinsic::Sub) && args.len() == 2 {
-            let constant = |node: Node<'d, 'gc>| match node {
-                Node::Quote(value) => value.as_fixnum(),
-                _ => None,
-            };
+            fn constant(node: Node<'_, '_>) -> Option<i64> {
+                match node {
+                    Node::Quote(value) => value.as_fixnum(),
+                    _ => None,
+                }
+            }
             if intrinsic == Intrinsic::Add && constant(self.out[args[0]]).is_some() && constant(self.out[args[1]]).is_none() {
                 args.swap(0, 1);
                 return self.make(prim, args);
@@ -1239,7 +1221,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         //    - Reflexive identity: `(eq? x x) -> #t`
         //    - Canonicalize empty list check: `(eq? x '()) -> (null? x)` (avoids loading `'()` literal)
         //    - Canonicalize the checks for `#nil` and `#none` the same way: `(eq? x #nil) -> (nil? x)`, `(eq? x #none) -> (none? x)`
-        //    A check for `#f` stays as it is: `(not x)` also holds for `#nil` and `#none`.
+        //    A check for `#f` is not rewritten to `(not x)`, because `(not x)` is also true for `#nil` and `#none`.
         if matches!(intrinsic, Intrinsic::Eq | Intrinsic::Eqv | Intrinsic::Equal) && args.len() == 2 {
             if let (Node::Ref(left), Node::Ref(right)) = (self.out[args[0]], self.out[args[1]])
                 && left == right
@@ -1247,23 +1229,17 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             {
                 return self.truth(true);
             }
-            if matches!(self.out[args[1]], Node::Quote(Value::NULL)) {
+            if let Node::Quote(constant) = self.out[args[1]]
+                && let Some(predicate) = Intrinsic::predicate_of(constant)
+            {
                 let operand = args.swap_remove(0);
-                return self.opt_intrinsic(Prim::Intrinsic(Intrinsic::IsNull), vec![operand]);
+                return self.opt_intrinsic(Prim::Intrinsic(predicate), vec![operand]);
             }
-            if matches!(self.out[args[0]], Node::Quote(Value::NULL)) {
+            if let Node::Quote(constant) = self.out[args[0]]
+                && let Some(predicate) = Intrinsic::predicate_of(constant)
+            {
                 let operand = args.pop().expect("checked 2 eq args");
-                return self.opt_intrinsic(Prim::Intrinsic(Intrinsic::IsNull), vec![operand]);
-            }
-            for (constant, predicate) in [(Value::NIL, Intrinsic::IsNil), (Value::NONE, Intrinsic::IsNone)] {
-                if matches!(self.out[args[1]], Node::Quote(value) if value == constant) {
-                    let operand = args.swap_remove(0);
-                    return self.opt_intrinsic(Prim::Intrinsic(predicate), vec![operand]);
-                }
-                if matches!(self.out[args[0]], Node::Quote(value) if value == constant) {
-                    let operand = args.pop().expect("checked 2 eq args");
-                    return self.opt_intrinsic(Prim::Intrinsic(predicate), vec![operand]);
-                }
+                return self.opt_intrinsic(Prim::Intrinsic(predicate), vec![operand]);
             }
         }
 
@@ -1297,11 +1273,10 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         }
         // Deduces predicate outcome from known predicate facts using implications:
         // if `P` implies `Q` and `P` holds, `Q` is true; if `Q` implies `P` and `P` is false, `Q` is false; if `P` and `Q` are disjoint and `P` holds, `Q` is false.
-        let known = |holds: bool, tells: &dyn Fn(Intrinsic) -> bool| self.pred_facts.iter().any(|(&(other, fact_var), &val)| fact_var == var && val == holds && tells(other));
-        if known(true, &|other| other.implies(pred)) {
+        if self.pred_facts.iter().any(|(&(other, fact_var), &val)| fact_var == var && val && other.implies(pred)) {
             return Some(true);
         }
-        if known(false, &|other| pred.implies(other)) || known(true, &|other| pred.is_disjoint_predicate(other)) {
+        if self.pred_facts.iter().any(|(&(other, fact_var), &val)| fact_var == var && !val && pred.implies(other)) || self.pred_facts.iter().any(|(&(other, fact_var), &val)| fact_var == var && val && pred.is_disjoint_predicate(other)) {
             return Some(false);
         }
         None
@@ -1417,13 +1392,17 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         })
     }
 
+    /// Returns the field index that `expr` holds, if it is a constant index.
+    fn index(&self, expr: Id<'d>) -> Option<usize> {
+        match self.out[expr] {
+            Node::Quote(value) => value.as_fixnum().and_then(|number| usize::try_from(number).ok()),
+            _ => None,
+        }
+    }
+
     /// Simplifies struct-related intrinsic operations on `args` (type checks or field accesses) using known struct facts and constructor arguments.
     fn struct_rules(&mut self, intrinsic: Intrinsic, args: &[Id<'d>]) -> Option<Id<'d>> {
         let mc = self.mc;
-        let index = |this: &Self, expr: Id<'d>| match this.out[expr] {
-            Node::Quote(value) => value.as_fixnum().and_then(|number| usize::try_from(number).ok()),
-            _ => None,
-        };
         match (intrinsic, args) {
             (Intrinsic::IsStructDerivedFrom, &[tested, kind]) => {
                 let kind = self.struct_type(kind)?;
@@ -1436,7 +1415,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             }
             // An immutable field read on a variable bound to a newly constructed struct resolves directly to the field value supplied at construction.
             (Intrinsic::StructField | Intrinsic::StructFixedField, &[read, at]) => {
-                let (Node::Ref(var), position) = (self.out[read], index(self, at)?) else { return None };
+                let (Node::Ref(var), position) = (self.out[read], self.index(at)?) else { return None };
                 let (made_as, parts) = self.known_structs.get(&var)?;
                 if structs::is_mutable(mc, *made_as, position) {
                     return None;
@@ -1445,7 +1424,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                 Some(self.out.add(part))
             }
             (Intrinsic::StructRef, &[read, kind, at]) => {
-                let (kind, position) = (self.struct_type(kind)?, index(self, at)?);
+                let (kind, position) = (self.struct_type(kind)?, self.index(at)?);
                 if position >= kind.fields(mc) as usize {
                     return None;
                 }

@@ -1,6 +1,6 @@
-//! Bigint algorithms on digit views, after V8's `src/bigint`. A number is a magnitude: a
-//! little-endian run of digits. Functions write their result into an [`RWDigits`] the caller
-//! sizes, fill the rest of it with zeros, and never allocate: scratch space is passed in.
+//! Big-integer algorithms on digit views, modelled on V8's `src/bigint`. A number is a magnitude, stored as a
+//! little-endian sequence of digits. A function writes its result into an [`RWDigits`] that the caller
+//! sizes, and fills the unused digits with zeros. The functions never allocate. The caller passes in any scratch space.
 
 mod bitwise;
 mod div;
@@ -21,32 +21,32 @@ pub use vector::*;
 use std::cell::Cell;
 
 pub type Digit = u64;
-/// Holds the product of two digits plus two more.
+/// A double-width digit. It holds the product of two digits plus two more digits without overflow.
 pub type TwoDigits = u128;
 pub const DIGIT_BITS: usize = Digit::BITS as usize;
 
-/// `a + b + carry`, and the new carry.
+/// Returns the low digit of `a + b + carry`, and the new carry.
 #[inline]
 pub fn digit_add(a: Digit, b: Digit, carry: Digit) -> (Digit, Digit) {
     let sum = a as TwoDigits + b as TwoDigits + carry as TwoDigits;
     (sum as Digit, (sum >> DIGIT_BITS) as Digit)
 }
 
-/// `a - b - borrow`, and the new borrow.
+/// Returns the low digit of `a - b - borrow`, and the new borrow.
 #[inline]
 pub fn digit_sub(a: Digit, b: Digit, borrow: Digit) -> (Digit, Digit) {
     let diff = (a as TwoDigits).wrapping_sub(b as TwoDigits).wrapping_sub(borrow as TwoDigits);
     (diff as Digit, (diff >> (2 * DIGIT_BITS - 1)) as Digit)
 }
 
-/// `a * b + add + carry`, low digit and high digit.
+/// Returns `a * b + add + carry` as a low digit and a high digit.
 #[inline]
 pub fn digit_mul_add(a: Digit, b: Digit, add: Digit, carry: Digit) -> (Digit, Digit) {
     let total = a as TwoDigits * b as TwoDigits + add as TwoDigits + carry as TwoDigits;
     (total as Digit, (total >> DIGIT_BITS) as Digit)
 }
 
-/// A read-only view of digits, in cells so a host can lend the words it keeps them in.
+/// A read-only view of digits. The digits are in cells, so that a host can lend the words in which it stores them.
 #[derive(Clone, Copy, Debug)]
 pub struct Digits<'a> {
     digits: &'a [Cell<Digit>],
@@ -58,7 +58,7 @@ impl<'a> Digits<'a> {
         Self { digits }
     }
 
-    /// A view of digits this borrows mutably, so nothing else changes them meanwhile.
+    /// Returns a view of `digits`. The view borrows `digits` mutably, so nothing else can change them while it lives.
     #[inline]
     pub fn of_mut(digits: &'a mut [Digit]) -> Self {
         Self { digits: Cell::from_mut(digits).as_slice_of_cells() }
@@ -74,7 +74,7 @@ impl<'a> Digits<'a> {
         self.digits.is_empty()
     }
 
-    /// Without high zero digits.
+    /// Returns the view without its high-order zero digits.
     #[inline]
     pub fn normalize(self) -> Self {
         let len = self.digits.iter().rposition(|digit| digit.get() != 0).map_or(0, |i| i + 1);
@@ -86,25 +86,25 @@ impl<'a> Digits<'a> {
         self.digits.iter().all(|digit| digit.get() == 0)
     }
 
-    /// The most significant digit, or 0 if there are none.
+    /// Returns the most significant digit, or 0 if there are no digits.
     #[inline]
     pub fn msd(self) -> Digit {
         self.digits.last().map_or(0, Cell::get)
     }
 
-    /// Digit `i`, or 0 past the end.
+    /// Returns digit `i`, or 0 if `i` is past the end.
     #[inline]
     pub fn get(self, i: usize) -> Digit {
         self.digits.get(i).map_or(0, Cell::get)
     }
 
-    /// Digit `i`, which must be there.
+    /// Returns digit `i`. Panics if `i` is past the end.
     #[inline]
     pub fn at(self, i: usize) -> Digit {
         self.digits[i].get()
     }
 
-    /// Up to `len` digits from `offset`, as many as there are.
+    /// Returns up to `len` digits starting at `offset`. The range is clamped to the digits that exist.
     #[inline]
     pub fn slice(self, offset: usize, len: usize) -> Self {
         let start = offset.min(self.len());
@@ -123,8 +123,8 @@ impl<'a> Digits<'a> {
     }
 }
 
-/// A writable view of digits, in cells so a host can lend the words it keeps them in. Like a
-/// `&mut`, it's the only view of its digits while it lives.
+/// A writable view of digits. The digits are in cells, so that a host can lend the words in which it stores them. Like a
+/// `&mut`, it is the only view of its digits while it lives.
 #[derive(Debug)]
 pub struct RWDigits<'a> {
     digits: &'a [Cell<Digit>],
@@ -136,7 +136,7 @@ impl<'a> RWDigits<'a> {
         Self { digits: Cell::from_mut(digits).as_slice_of_cells() }
     }
 
-    /// Digits a host keeps in cells, which nothing else may read or write while this lives.
+    /// Returns a writable view of digits that a host keeps in cells. Nothing else may read or write the digits while the view lives.
     #[inline]
     pub fn of_cells(digits: &'a [Cell<Digit>]) -> Self {
         Self { digits }
@@ -152,7 +152,7 @@ impl<'a> RWDigits<'a> {
         self.digits.is_empty()
     }
 
-    /// Digit `i`, which must be there.
+    /// Returns digit `i`. Panics if `i` is past the end.
     #[inline]
     pub fn at(&self, i: usize) -> Digit {
         self.digits[i].get()
@@ -163,8 +163,8 @@ impl<'a> RWDigits<'a> {
         self.digits[i].set(digit);
     }
 
-    /// Sets digit `i` to the first of `pair`, and returns the second: what a digit operation
-    /// carries or borrows.
+    /// Sets digit `i` to the first element of the pair and returns the second. The pair is the result of a digit operation,
+    /// so the second element is its carry or borrow.
     #[inline]
     pub fn put(&mut self, i: usize, (digit, carry): (Digit, Digit)) -> Digit {
         self.digits[i].set(digit);
@@ -181,7 +181,7 @@ impl<'a> RWDigits<'a> {
         RWDigits { digits: self.digits }
     }
 
-    /// Up to `len` digits from `offset`, as many as there are.
+    /// Returns up to `len` digits starting at `offset`. The range is clamped to the digits that exist.
     #[inline]
     pub fn slice(&mut self, offset: usize, len: usize) -> RWDigits<'_> {
         let start = offset.min(self.len());
@@ -195,14 +195,14 @@ impl<'a> RWDigits<'a> {
         RWDigits { digits: &self.digits[start..] }
     }
 
-    /// The first `len` digits, keeping the borrow.
+    /// Returns the first `len` digits. The result keeps the lifetime of the original borrow.
     #[inline]
     pub fn truncate(self, len: usize) -> RWDigits<'a> {
         let len = len.min(self.digits.len());
         RWDigits { digits: &self.digits[..len] }
     }
 
-    /// Splits into the first `mid` digits and the rest.
+    /// Splits the view into the first `mid` digits and the rest.
     #[inline]
     pub fn split(self, mid: usize) -> (RWDigits<'a>, RWDigits<'a>) {
         let (first, rest) = self.digits.split_at(mid.min(self.digits.len()));

@@ -1,4 +1,9 @@
-//! Implements keyword procedures created by `lambda` forms with keyword parameters. Represented by [`KeywordProcedure`], which wraps two procedures: a `core` procedure (which takes arguments corresponding to all accepted keywords sorted lexicographically by name—substituting [`Value::UNSUPPLIED`] for omitted optional keywords—followed by positional arguments) and a `plain` procedure (called when no keywords are supplied, or `#f` if at least one keyword is required). The `keyword-apply` procedure dynamically binds a call's supplied keyword arguments to the core procedure's parameter list.
+//! Implements keyword procedures, which `lambda` forms with keyword parameters create. A keyword procedure is a [`KeywordProcedure`] object that wraps two procedures:
+//!
+//! - The `core` procedure takes one argument for each accepted keyword, sorted lexicographically by keyword name, followed by the positional arguments. An optional keyword that the call omits is passed as [`Value::UNSUPPLIED`].
+//! - The `plain` procedure is called when the call supplies no keywords. It is `#f` if at least one keyword is required.
+//!
+//! The `keyword-apply` procedure binds the keyword arguments that a call supplies to the parameters of the core procedure.
 
 use std::cmp::Ordering;
 
@@ -19,7 +24,7 @@ pub fn order<'gc>(mc: &Mutation<'gc>, left: Keyword<'gc>, right: Keyword<'gc>) -
     string::compare(&strings, left.symbol(mc).name(mc), right.symbol(mc).name(mc)).unwrap_or(Ordering::Equal)
 }
 
-/// Returns the signature of procedure `callee` if it is a [`KeywordProcedure`]: a sorted list of accepted keywords (each paired with a boolean indicating whether it is required) and the [`Shape`] of its positional parameters.
+/// Returns the signature of procedure `callee` if it is a [`KeywordProcedure`]. The signature is the sorted list of accepted keywords and the [`Shape`] of the positional parameters. Each keyword is paired with a boolean that tells whether it is required.
 pub fn signature<'gc>(mc: &Mutation<'gc>, callee: Value<'gc>) -> Option<(Vec<(Keyword<'gc>, bool)>, Shape)> {
     let callee = callee.downcast::<KeywordProcedure>(mc)?;
     let pairs = Pairs::new(mc);

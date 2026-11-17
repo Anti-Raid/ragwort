@@ -29,7 +29,7 @@ use ragwort_types::pair::{Pair, Pairs};
 use ragwort_types::string::{self, Strings};
 use ragwort_types::symbol::{Keyword, Symbol};
 use ragwort_types::table::Table;
-use ragwort_types::vector::AnyVector;
+use ragwort_types::vector::{AnyVector, EveryVector};
 
 use crate::op::{Context, Fuel};
 use crate::{Fault, equal, prompts};
@@ -236,10 +236,10 @@ named! {
         Cons = ("cons", takes(2, DISCARD | TRUTHY)),
         /// `(car lst)`: returns the head (first element) of pair `lst`.
         Car = ("car", takes(1, FOLD | REORDER)),
-        // The composite accessors `caar` through `cddddr` apply `car` and `cdr` operations in
-        // right-to-left order according to the characters in their names.
         /// `(cdr lst)`: returns the tail (second element) of pair `lst`.
         Cdr = ("cdr", takes(1, FOLD | REORDER)),
+        // The composite accessors `caar` through `cddddr` apply `car` and `cdr` operations in
+        // right-to-left order according to the characters in their names.
         Caar = ("caar", takes(1, FOLD | REORDER)),
         Cadr = ("cadr", takes(1, FOLD | REORDER)),
         Cdar = ("cdar", takes(1, FOLD | REORDER)),
@@ -604,7 +604,7 @@ named! {
         /// entries before it has to grow.
         MakeTable = ("make-table", any(TRUTHY)),
         /// `(table key value ...)`: allocates a table with an entry for each `key` and `value`, in that
-        /// order. A key given twice keeps its first place and its last value.
+        /// order. A key given twice keeps its first position and takes its last value.
         MakeTableOf = ("table", any(TRUTHY)),
         /// `(table-ref t key default)`: returns the value of `key` in table `t`, or `default` if `t` has
         /// no such key.
@@ -678,9 +678,9 @@ named! {
         /// `(error-object-kind c)`: returns the fault kind symbol corresponding to condition `c` from
         /// [`Fault::KINDS`].
         ErrorObjectKind = ("error-object-kind", takes(1, TRUTHY)),
-        /// `(error-object-traceback c)`: returns the calls in progress when condition `c` was first raised, innermost first, as a list of `(name file line)` entries. `name` is the procedure's symbol or `#f`; `file` and `line` say where the procedure is defined, and are `#f` when that is unknown.
+        /// `(error-object-traceback c)`: returns the calls in progress when condition `c` was first raised, innermost first, as a list of `(name file line)` entries. `name` is the procedure's symbol or `#f`. `file` and `line` give the position of the call or operation that was in progress in the procedure, or of the procedure's definition if its code records no positions. They are `#f` when unknown.
         ErrorObjectTraceback = ("error-object-traceback", takes(1, 0)),
-        /// `(error-object-who c)`: returns the name of the built-in operation or host function that raised condition `c` as a symbol, or `#f` if `c` was not raised by one.
+        /// `(error-object-who c)`: returns the name of the built-in operation or host function that raised condition `c` as a symbol, or `#f` if no such operation raised `c`.
         ErrorObjectWho = ("error-object-who", takes(1, 0)),
         /// `(syntax? x)`: returns `#t` if `x` is a syntax object, and `#f` otherwise.
         IsSyntax = ("syntax?", takes(1, FOLD | DISCARD | PREDICATE)),
@@ -840,6 +840,26 @@ impl Intrinsic {
     /// predicate that it does not [imply](Intrinsic::implies) is guaranteed to evaluate to false.
     pub const fn is_type_predicate(self) -> bool {
         self.has(PREDICATE)
+    }
+
+    /// The type predicates that hold for exactly one value, each paired with that value.
+    const fn singletons<'gc>() -> [(Self, Value<'gc>); 3] {
+        [(Intrinsic::IsNull, Value::NULL), (Intrinsic::IsNil, Value::NIL), (Intrinsic::IsNone, Value::NONE)]
+    }
+
+    /// Returns the only value for which type predicate `self` holds, or `None` if `self` holds for
+    /// several values or is not a type predicate. For example, `null?` holds only for the empty
+    /// list. A variable that passed such a test can be replaced by the value.
+    pub fn sole_value<'gc>(self) -> Option<Value<'gc>> {
+        Self::singletons().into_iter().find(|&(predicate, _)| predicate == self).map(|(_, value)| value)
+    }
+
+    /// Returns the type predicate that holds for `value` and for no other value, or `None` if
+    /// there is none. It is the inverse of [`Intrinsic::sole_value`]: `(eq? x '())` tests the same
+    /// thing as `(null? x)`. There is no such predicate for `#f`, because `not` also holds for
+    /// `#nil` and `#none`.
+    pub fn predicate_of(value: Value<'_>) -> Option<Self> {
+        Self::singletons().into_iter().find(|&(_, sole)| sole == value).map(|(predicate, _)| predicate)
     }
 
     /// Returns whether the type predicate `self` subsumes `other`, meaning that any value
@@ -1063,10 +1083,12 @@ impl Intrinsic {
             Intrinsic::Eq => boolean(operands.get(0) == operands.get(1)),
             Intrinsic::Eqv => boolean(equal::eqv(mc, operands.get(0), operands.get(1))),
             Intrinsic::Equal => {
+                // `most` is the largest number of comparisons that the remaining fuel pays for. The cost is `compared / PER_FUEL` units, rounded down. So `fuel.left()` units pay for up to `(fuel.left() + 1) * PER_FUEL - 1` comparisons.
                 let most = fuel.left().saturating_add(1).saturating_mul(equal::PER_FUEL) - 1;
                 let (same, compared) = equal::equal(mc, operands.get(0), operands.get(1), most)?;
                 fuel.spend(compared / equal::PER_FUEL)?;
-                boolean(same)
+                // The comparison can allocate. An external table or vector caches the values it reads from its host.
+                made(mc, fuel, boolean(same))
             }
             Intrinsic::IsNull => boolean(operands.get(0) == Value::NULL),
             Intrinsic::IsPair => boolean(Pair::of(operands.get(0)).is_some()),
@@ -1290,25 +1312,32 @@ impl Intrinsic {
             | Intrinsic::TableLength
             | Intrinsic::TableClear
             | Intrinsic::TableToVector => self.table(mc, operands, fuel)?,
-            Intrinsic::IsVector => boolean(AnyVector::of(operands.get(0)).is_some()),
+            Intrinsic::IsVector => boolean(EveryVector::of(operands.get(0)).is_some()),
             Intrinsic::MakeVector
             | Intrinsic::MakeVectorOf
             | Intrinsic::VectorToList
             | Intrinsic::ListToVector => self.vector(mc, operands, fuel)?,
             Intrinsic::VectorLength => {
-                let len = AnyVector::of(operands.get(0)).ok_or(Fault::WrongType)?.len(mc);
+                let len = EveryVector::of(operands.get(0)).ok_or(Fault::WrongType)?.len(mc);
                 Value::fixnum(len as i64).expect("lengths are fixnums")
             }
-            Intrinsic::VectorRef => AnyVector::of(operands.get(0)).ok_or(Fault::WrongType)?.get(mc, index(operands.get(1))?).ok_or(Fault::OutOfRange)?,
-            Intrinsic::VectorSet => {
-                let AnyVector::Mutable(vector) = AnyVector::of(operands.get(0)).ok_or(Fault::WrongType)? else { return Err(Fault::Immutable) };
-                let (items, position) = (vector.items(mc), index(operands.get(1))?);
-                if position >= items.len() {
-                    return Err(Fault::OutOfRange);
+            // A vector in the arena is read and written inline. An external vector, whose elements are owned by the host, is handled by an out-of-line function.
+            Intrinsic::VectorRef => match AnyVector::of(operands.get(0)) {
+                Some(vector) => vector.get(mc, index(operands.get(1))?).ok_or(Fault::OutOfRange)?,
+                None => vectors::external_ref(mc, operands.get(0), operands.get(1), fuel)?,
+            },
+            Intrinsic::VectorSet => match AnyVector::of(operands.get(0)) {
+                Some(AnyVector::Mutable(vector)) => {
+                    let (items, position) = (vector.items(mc), index(operands.get(1))?);
+                    if position >= items.len() {
+                        return Err(Fault::OutOfRange);
+                    }
+                    items.set(mc, position, operands.get(2));
+                    Value::VOID
                 }
-                items.set(mc, position, operands.get(2));
-                Value::VOID
-            }
+                Some(AnyVector::Immutable(_)) => return Err(Fault::Immutable),
+                None => vectors::external_set(mc, operands.get(0), operands.get(1), operands.get(2), fuel)?,
+            },
             Intrinsic::MakeBox => made(mc, fuel, Value::object(mc, objects::Box::new(mc, operands.get(0))?)),
             Intrinsic::MakeWinder => made(mc, fuel, Value::object(mc, objects::Winder::new(mc, operands.get(0), operands.get(1))?)),
             Intrinsic::Unbox => operands.get(0).downcast::<objects::Box>(mc).ok_or(Fault::WrongType)?.value(mc),

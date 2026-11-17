@@ -1,6 +1,6 @@
-; The prelude: the base language's procedures, as the module ragwort/prelude, around the VM's
-; built-ins. Helpers are bound around the procedure that uses them, so they're made once and named
-; by none.
+; The prelude: the procedures of the base language, defined as the module ragwort/prelude. Most of
+; them wrap an intrinsic of the VM. A helper procedure is bound with %letrec around the procedure
+; that uses it. So the helper is created once, and it is not a definition that the module exports.
 
 (%provide (all-defined-out))
 
@@ -56,7 +56,8 @@
 (%define bytevector? (%lambda (x) (%intrinsic bytevector? x)))
 (%define make-bytevector (%lambda (k . fill) (%apply-intrinsic make-bytevector k fill)))
 (%define bytevector-length (%lambda (bv) (%intrinsic bytevector-length bv)))
-; The bytes from k as an integer of so many bytes, signed or not, little- or big-endian.
+; Each procedure below reads or writes an integer at byte index k. The last two arguments of the intrinsic
+; give the byte order (#t for big-endian) and the size in bytes (negative for a signed integer).
 (%define bytevector-u8-ref (%lambda (bv k) (%intrinsic bytevector-int-ref bv k #f 1)))
 (%define bytevector-u8-set! (%lambda (bv k n) (%intrinsic bytevector-int-set! bv k n #f 1)))
 (%define bytevector-s8-ref (%lambda (bv k) (%intrinsic bytevector-int-ref bv k #f -1)))
@@ -94,6 +95,57 @@
 (%define vector-set! (%lambda (v k x) (%intrinsic vector-set! v k x)))
 (%define vector->list (%lambda (v) (%intrinsic vector->list v)))
 (%define list->vector (%lambda (xs) (%intrinsic list->vector xs)))
+; `vector-for-each` and `vector-map` call `f` with the elements at each index in turn, from the first. With
+; several vectors, `f` takes one element of each, up to the length of the shortest. They read each
+; vector's length once, so they work the same on a vector the host holds.
+(%define vector-for-each
+  (%letrec ((each1 (%lambda (f v at end)
+                     (%if (%intrinsic = at end)
+                          (%intrinsic void)
+                          (%let ((_ (%app f (%intrinsic vector-ref v at))))
+                            (%app each1 f v (%intrinsic + at 1) end)))))
+            (shortest (%lambda (vs len)
+                        (%if (%intrinsic null? vs)
+                             len
+                             (%app shortest (%intrinsic cdr vs) (%intrinsic min len (%intrinsic vector-length (%intrinsic car vs)))))))
+            (refs (%lambda (vs at)
+                    (%if (%intrinsic null? vs)
+                         '()
+                         (%intrinsic cons (%intrinsic vector-ref (%intrinsic car vs) at) (%app refs (%intrinsic cdr vs) at)))))
+            (eachn (%lambda (f vs at end)
+                     (%if (%intrinsic = at end)
+                          (%intrinsic void)
+                          (%let ((_ (%intrinsic apply f (%app refs vs at))))
+                            (%app eachn f vs (%intrinsic + at 1) end))))))
+    (%lambda (f v . more)
+      (%if (%intrinsic null? more)
+           (%app each1 f v 0 (%intrinsic vector-length v))
+           (%app eachn f (%intrinsic cons v more) 0 (%app shortest more (%intrinsic vector-length v)))))))
+(%define vector-map
+  (%letrec ((map1 (%lambda (f v out at end)
+                    (%if (%intrinsic = at end)
+                         out
+                         (%let ((_ (%intrinsic vector-set! out at (%app f (%intrinsic vector-ref v at)))))
+                           (%app map1 f v out (%intrinsic + at 1) end)))))
+            (shortest (%lambda (vs len)
+                        (%if (%intrinsic null? vs)
+                             len
+                             (%app shortest (%intrinsic cdr vs) (%intrinsic min len (%intrinsic vector-length (%intrinsic car vs)))))))
+            (refs (%lambda (vs at)
+                    (%if (%intrinsic null? vs)
+                         '()
+                         (%intrinsic cons (%intrinsic vector-ref (%intrinsic car vs) at) (%app refs (%intrinsic cdr vs) at)))))
+            (mapn (%lambda (f vs out at end)
+                    (%if (%intrinsic = at end)
+                         out
+                         (%let ((_ (%intrinsic vector-set! out at (%intrinsic apply f (%app refs vs at)))))
+                           (%app mapn f vs out (%intrinsic + at 1) end))))))
+    (%lambda (f v . more)
+      (%if (%intrinsic null? more)
+           (%let ((end (%intrinsic vector-length v)))
+             (%app map1 f v (%intrinsic make-vector end) 0 end))
+           (%let ((end (%app shortest more (%intrinsic vector-length v))))
+             (%app mapn f (%intrinsic cons v more) (%intrinsic make-vector end) 0 end))))))
 
 ; Tables: maps that keep their entries in the order they were added. A string, a number, a symbol,
 ; a character or a boolean is a key by its value. Anything else is a key by identity. For a key
@@ -186,12 +238,18 @@
 (%define bit-count (%lambda (n) (%intrinsic bit-count n)))
 (%define bit-set? (%lambda (index n) (%intrinsic bit-set? index n)))
 (%define bit-field (%lambda (n start end) (%intrinsic bit-field n start end)))
-; `n` as a `width`-bit unsigned integer, shifted `count` bits with zeros shifted in.
+; Returns `n`, taken as a `width`-bit unsigned integer, shifted right by `count` bits. Zeros are shifted in.
+; A shift by `width` bits or more gives 0. That branch still calls `bit-field` twice, only to check the
+; arguments: the inner call checks `n` and `count`, and the outer call checks `width`. Each call extracts
+; an empty field, so the result is 0.
 (%define logical-shift-right
   (%lambda (n count width)
     (%if (%intrinsic >= count width)
          (%intrinsic bit-field (%intrinsic bit-field n count count) width width)
          (%intrinsic bit-field n count width))))
+; Returns `n`, taken as a `width`-bit unsigned integer, shifted left by `count` bits. Bits shifted past
+; `width` are dropped. A shift by `width` bits or more gives 0, with the same argument checks as above.
+; A negative `count` is passed to `bit-field`, which raises the range error.
 (%define logical-shift-left
   (%lambda (n count width)
     (%if (%intrinsic >= count width)
@@ -216,6 +274,8 @@
 
 (%define default-continuation-prompt-tag (%lambda () (%intrinsic default-continuation-prompt-tag)))
 (%define make-continuation-prompt-tag (%lambda args (%apply-intrinsic make-continuation-prompt-tag args)))
+; Takes `f` and an optional prompt tag. With more arguments than that, the procedure applies itself
+; to no arguments. That call raises an arity error that names this procedure.
 (%define call-with-composable-continuation
   (%lambda (f . more)
     (%if (%intrinsic null? more)
@@ -235,14 +295,16 @@
                   (%let ((h (%intrinsic car rest)) (args (%intrinsic cdr rest)))
                     (%apply-intrinsic call-with-prompt tag h proc args))))))))
 
-; dynamic-wind is Chez's: it sets the task's winders around the thunk, and a jump out of or into
-; their extent, which the VM runs, runs a winder's after or before. call/cc and exceptions are the
-; VM's, and VM faults are raised as error objects.
-; Marks, as Racket's continuation marks: `thunk` is called with `key` marked `value`, which a
-; call in tail position replaces, and `mark-value` is the nearest mark for `key`, or `default`.
+; Continuation marks, as in Racket. `call-with-mark` calls `thunk` with a mark that pairs `key` with `value`.
+; A `call-with-mark` in tail position replaces the mark for `key` of its frame. `mark-value` returns the
+; value of the nearest mark for `key`, or `default` if there is none.
 (%define call-with-mark (%lambda (key value thunk) (%intrinsic with-mark key value thunk)))
 (%define mark-value (%lambda (key default) (%intrinsic mark-value key default)))
 
+; dynamic-wind follows Chez Scheme. It calls `before`, adds a winder to the task's winders while `thunk`
+; runs, and then calls `after`. When control jumps out of or into the extent of `thunk`, the VM runs the
+; winder's `after` or `before`. call/cc and exceptions are implemented by the VM, and a VM fault is
+; raised as an error object.
 (%define dynamic-wind
   (%lambda (before thunk after)
     (%let* ((_ (%app before))
@@ -293,7 +355,9 @@
 (%define error-object-kind (%lambda (c) (%intrinsic error-object-kind c)))
 (%define error-object-traceback (%lambda (c) (%intrinsic error-object-traceback c)))
 (%define error-object-who (%lambda (c) (%intrinsic error-object-who c)))
-; What `guard` expands to: `thunk`, and if it raises, `handler` in its place, with what it raised.
+; The `guard` form expands to a call of `%guard`. `%guard` calls `thunk`. If `thunk` raises, `%guard` calls
+; `handler` with the raised value, in place of `thunk`. `%guard/no-traceback` does the same, except that a
+; condition it catches records no traceback when it is raised.
 (%define %guard (%lambda (thunk handler) (%intrinsic guard thunk handler)))
 (%define %guard/no-traceback (%lambda (thunk handler) (%intrinsic guard/no-traceback thunk handler)))
 
@@ -303,6 +367,9 @@
 (%define co/try-resume (%lambda (co . args) (%apply-intrinsic co/try-resume co args)))
 (%define co/yield (%lambda args (%apply-intrinsic co/yield args)))
 (%define co/running (%lambda () (%intrinsic co/running)))
+; Returns the status of `co` as a symbol. `coroutine-state` gives the state as an index into the vector:
+; 0 is pending, 1 is running, 2 is dead, 3 is failed (reported as `error`), and 4 is closing. A closing
+; coroutine is running its `after` thunks for `co/close` or `co/reset`. It is reported as `running`.
 (%define co/status
   (%lambda (co) (%intrinsic vector-ref #(pending running dead error running) (%intrinsic coroutine-state co))))
 (%define co/resume-error (%lambda (co obj) (%intrinsic co/resume-error co obj)))
@@ -347,8 +414,8 @@
            (%app each1 f xs)
            (%let ((_ (%intrinsic apply map f xs more))) (%intrinsic void))))))
 
-; Syntax objects, for macros' transformers and any other code: the expander says what each
-; identifier it makes refers to, so these need nothing of it.
+; Syntax objects, for macro transformers and for any other code. Each identifier that the expander
+; creates carries a value that identifies its binding. So these procedures do not need the expander.
 (%define syntax? (%lambda (x) (%intrinsic syntax? x)))
 (%define identifier? (%lambda (x) (%intrinsic identifier? x)))
 (%define syntax-e (%lambda (stx) (%intrinsic syntax-e stx)))
@@ -365,7 +432,7 @@
   (%lambda (who message form . subform)
     (%intrinsic raise (%apply-intrinsic make-syntax-error message form subform))))
 
-; Number related methods
+; Numeric procedures.
 (%define number? (%lambda (x) (%intrinsic number? x)))
 (%define complex? (%lambda (x) (%intrinsic number? x)))
 (%define real? (%lambda (x) (%intrinsic real? x)))
@@ -400,7 +467,7 @@
 (%define truncate-remainder (%lambda (n m) (%intrinsic remainder n m)))
 (%define truncate/ (%lambda (n m) (%intrinsic values (%intrinsic quotient n m) (%intrinsic remainder n m))))
 (%define integer-sqrt (%lambda (n) (%intrinsic integer-sqrt n)))
-; The root and what's left of n past its square.
+; Returns two values: the integer square root `s` of `n`, and the remainder `n - s*s`.
 (%define exact-integer-sqrt
   (%lambda (n)
     (%let ((s (%intrinsic integer-sqrt n)))
@@ -427,7 +494,7 @@
 (%define magnitude (%lambda (z) (%intrinsic magnitude z)))
 (%define angle (%lambda (z) (%intrinsic angle z)))
 
-; Characters and strings, past the basic ones.
+; More procedures on characters and strings, beyond the basic ones above.
 (%define char-alphabetic? (%lambda (c) (%intrinsic char-alphabetic? c)))
 (%define char-numeric? (%lambda (c) (%intrinsic char-numeric? c)))
 (%define char-whitespace? (%lambda (c) (%intrinsic char-whitespace? c)))
@@ -457,7 +524,7 @@
 (%define vector->string (%lambda (v . range) (%apply-intrinsic vector->string v range)))
 (%define string->utf8 (%lambda (s . range) (%apply-intrinsic string->utf8 s range)))
 (%define utf8->string (%lambda (bv . range) (%apply-intrinsic utf8->string bv range)))
-; The characters `f` makes of those of the strings, as `map` makes them of lists.
+; Returns the string of the characters that `f` returns for the characters of the strings. `f` is called as `map` calls it for lists.
 (%define string-map
   (%lambda (f s . more)
     (%if (%intrinsic null? more)
@@ -471,7 +538,7 @@
 (%define string-prefix? (%lambda (s prefix) (%intrinsic string-prefix? s prefix)))
 (%define string-suffix? (%lambda (s suffix) (%intrinsic string-suffix? s suffix)))
 (%define string-contains? (%lambda (s part) (%intrinsic string-contains? s part)))
-; As Racket's: `sep` is a string, or #f for whitespace.
+; `string-split` and `string-trim` work as in Racket. `sep` is a string, or #f to mean whitespace.
 (%define string-split
   (%lambda (s [sep #f] #:trim? [trim? #t] #:repeat? [repeat? #f])
     (%intrinsic string-split s sep trim? repeat?)))

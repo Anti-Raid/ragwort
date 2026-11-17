@@ -39,8 +39,9 @@ impl<'gc> CallShape<'gc> {
     pub fn of(mc: &Mutation<'gc>, params: &[Param<'gc>], rest: bool) -> Self {
         let mut keywords: Vec<_> = params.iter().filter_map(|param| Some((param.keyword?, !param.optional))).collect();
         keywords.sort_by(|left, right| keyword::order(mc, left.0, right.0));
-        let positional = || params.iter().filter(|param| param.keyword.is_none());
-        CallShape { keywords, required: positional().filter(|param| !param.optional).count(), optional: positional().filter(|param| param.optional).count(), rest }
+        let required = params.iter().filter(|param| param.keyword.is_none() && !param.optional).count();
+        let optional = params.iter().filter(|param| param.keyword.is_none() && param.optional).count();
+        CallShape { keywords, required, optional, rest }
     }
 
     /// Returns the imported keyword procedure's shape and core import, if the exporting module exposes

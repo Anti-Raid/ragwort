@@ -50,8 +50,8 @@ pub(crate) enum Kind {
     /// The producer of a `collect` request returned. Returns the list of the values it returned.
     Collect,
     /// The `after` winders of the coroutine that `co/close` or `co/reset` is closing have all run. Ends
-    /// the coroutine and returns to the task that closed it. The new body for a reset waits in the
-    /// task's `body`.
+    /// the coroutine and returns to the task that closed it. The new body for a reset is stored in
+    /// the task's `body` field.
     Closed,
 }
 
@@ -116,6 +116,8 @@ impl<'gc> Outer<'_, 'gc> {
                 let guard = first.downcast::<Guard>(mc).ok_or(Fault::Malformed)?;
                 let (part, Cut { chain, marks, free }, under) = self.back_to(first)?;
                 let stack = &mut self.segments.stack;
+                // `free` is set when the head record of the remaining chain is one-shot. The frames above the cut are discarded, so the stack takes back their slots from `at` up, if they are on its current segment.
+                // This is done only when the guard was in the task's own chain (`part == 0`). In one chain, every record above a one-shot record is also one-shot, so no continuation holds those slots. A record in an enclosing prompt's chain can be one-shot while a captured continuation still holds frames above it.
                 if let Some((segment, at)) = free
                     && part == 0
                     && segment == stack.segment(mc)
@@ -190,7 +192,7 @@ impl<'gc> Outer<'_, 'gc> {
     /// Runs all the `after` winders of the running task, which is a coroutine being closed, and then
     /// finishes the close. See [`Kind::Closed`].
     ///
-    /// An `after` thunk that raises with no handler takes the path of any uncaught error: the remaining
+    /// An `after` thunk that raises with no handler is treated as any uncaught error. The remaining
     /// winders run, the coroutine fails, and the value is raised in the task that closed it.
     pub(crate) fn unwind_closing(&mut self) -> Result<Then<'gc>, Fault> {
         let mc = self.mc();
@@ -202,8 +204,7 @@ impl<'gc> Outer<'_, 'gc> {
     /// continuation mark.
     pub(crate) fn with_handler(&mut self, handler: Value<'gc>, thunk: Value<'gc>) -> Result<Then<'gc>, Fault> {
         let (mc, task) = (self.mc(), self.task());
-        let handlers = prompts::mark(mc, task, handler_key(), Value::NULL)?;
-        self.segments.set_mark(handler_key(), Pairs::new(mc).cons(handler, handlers)?.value(mc))?;
+        self.segments.set_mark(handler_key(), prompts::handlers_with(mc, task, handler)?)?;
         Ok(Then::Call(thunk, Passed::none()))
     }
 
@@ -213,8 +214,8 @@ impl<'gc> Outer<'_, 'gc> {
         let (mc, task) = (self.mc(), self.task());
         let guard = Value::object(mc, Guard::new(mc, handler, task.winders(mc), traced)?);
         self.push(Kind::Guarded, guard, if tried { Value::TRUE } else { Value::FALSE })?;
-        let (pairs, handlers) = (Pairs::new(mc), prompts::mark(mc, task, handler_key(), Value::NULL)?);
-        let mark = pairs.cons(handler_key(), pairs.cons(guard, handlers)?.value(mc))?.value(mc);
+        let pairs = Pairs::new(mc);
+        let mark = pairs.cons(handler_key(), prompts::handlers_with(mc, task, guard)?)?.value(mc);
         task.set_attachments(mc, pairs.cons(mark, task.attachments(mc))?.value(mc));
         Ok(())
     }
@@ -238,10 +239,10 @@ impl<'gc> Outer<'_, 'gc> {
     /// Aborts to the nearest prompt matching `tag` with `args`, after unwinding all `after` winders up to
     /// that prompt.
     ///
-    /// `base` and `tail` say where the abort was requested, as [`Outer::keep`] takes them. An abort
+    /// `base` and `tail` give the position of the abort request, as for [`Outer::keep`]. An abort
     /// discards the frames up to the prompt, so the caller's frames are not saved first. They are
-    /// saved in two cases: when a winder has to run, because it runs on top of them, and when the
-    /// abort fails, so that the error's trace includes the caller.
+    /// saved in two cases. The first is when a winder has to run, because it runs on top of them.
+    /// The second is when the abort fails, so that the error's trace includes the caller.
     pub(crate) fn abort(&mut self, tag: Value<'gc>, args: Passed<'gc>, base: u8, tail: bool) -> Result<Then<'gc>, Fault> {
         let mc = self.mc();
         let winds = prompts::tag_of(mc, tag).and_then(|tag| prompts::winds(mc, self.task(), Some(tag)));

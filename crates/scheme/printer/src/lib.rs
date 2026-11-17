@@ -1,17 +1,23 @@
-//! Values as Scheme text, as R7RS's `write`, `write-shared` and `display` write them. What
-//! `write` writes reads back as what it was, but for procedures and the VM's other objects,
-//! written `#<...>`. Symbols that wouldn't read back as themselves are written in `|`, as the
-//! parser would read them.
+//! Writes values as Scheme text, as R7RS's `write`, `write-shared` and `display` do.
 //!
-//! A table is written as `#table((key . value) ...)`, its entries in the order they were added.
-//! That form does not read back.
+//! - The output of `write` reads back as the value that was written. The exceptions are values with no
+//!   read syntax: tables, structs, and procedures and other objects that are written as `#<...>`.
+//! - A symbol that would not read back as itself is written between `|`s, in the form that the parser reads.
+//! - A table is written as `#table((key . value) ...)`, with its entries in the order in which they were added.
+//!   That form does not read back.
 //!
-//! Pairs and the other data but mutable vectors, structs and tables can't change, so a cycle goes
-//! through a mutable vector, a struct or a table: those a cycle comes back to are labelled `#n=`, and with
-//! `write-shared`, every datum that's shared, so printing always ends. Without `write-shared`, data shared without a cycle
-//! are written out each time, which can be exponentially long, so output stops at a limit, and
-//! so does the walk that finds the cycles, which writes no more than it walks. Neither recurses
-//! on the native stack.
+//! Cycles, shared data and the output limit:
+//!
+//! - Pairs and immutable vectors cannot change after they are created. So every cycle goes through
+//!   a mutable vector, an external vector, a struct or a table.
+//! - `write` and `display` label each of those containers that a cycle leads back to. The first
+//!   occurrence is written as `#n=` and the datum, and each later occurrence as `#n#`. So printing always terminates.
+//! - `write-shared` labels every datum that is reached more than once, in the same way.
+//! - `write` and `display` write a datum that is shared without a cycle in full each time. That output
+//!   can be exponentially long, so printing fails with [`PrintError::TooLong`] once the output exceeds the caller's limit.
+//! - The walk that finds cycles or shared data stops at the same limit. Each datum that the walk visits adds
+//!   at least one byte to the output.
+//! - Neither the walk nor the printer recurses on the native stack.
 
 #[cfg(test)]
 #[path = "tests/printer.rs"]
@@ -32,18 +38,18 @@ use ragwort_types::string::{self, Strings};
 use ragwort_types::symbol::{Keyword, Symbol};
 use ragwort_types::syntax::{Abbreviation, Syntax, SyntaxKind};
 use ragwort_types::table::Table;
-use ragwort_types::vector::{AnyVector, Vector};
+use ragwort_types::vector::{EveryVector, ExternVector, Vector};
 use ragwort_vm::report::{Failure, Raised, Report};
 use ragwort_vm::objects::{Closure, Condition, ConditionFields, Continuation, KeywordProcedure, Tag, Task};
 use ragwort_vm::objects::{Struct, StructFields, StructType, StructTypeFields};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
-    /// As `write`: to be read back, with cycles labelled.
+    /// Writes as `write` does: the text can be read back, and cycles are labelled.
     Write,
-    /// As `write-shared`: as `write`, with everything shared labelled.
+    /// Writes as `write-shared` does: like `write`, but every shared datum is labelled.
     Shared,
-    /// As `display`: strings and characters as their text, symbols as their names.
+    /// Writes as `display` does: strings and characters are written as their text, and symbols as their names.
     Display,
 }
 
@@ -51,7 +57,7 @@ pub enum Mode {
 pub enum PrintError {
     /// The text grew past the limit.
     TooLong,
-    /// The arena couldn't do what writing a number took.
+    /// The arena reported an error while a number was being converted to text.
     Arena(Error),
 }
 
@@ -116,15 +122,15 @@ pub fn render<'gc>(mc: &Mutation<'gc>, report: &Report<'gc>, limit: usize) -> St
     text
 }
 
-/// `value` as text, in `mode`, of at most `limit` bytes.
+/// Returns `value` written as text in `mode`. Fails with [`PrintError::TooLong`] if the text is longer than `limit` bytes.
 pub fn to_string<'gc>(mc: &Mutation<'gc>, value: Value<'gc>, mode: Mode, limit: usize) -> Result<String, PrintError> {
     let mut out = String::new();
     print(mc, value, mode, limit, &mut out)?;
     Ok(out)
 }
 
-/// Appends `value` to `out` as text, in `mode`. Fails with [`PrintError::TooLong`] once it's
-/// appended more than `limit` bytes, leaving what it appended.
+/// Appends `value` to `out` as text in `mode`. Fails with [`PrintError::TooLong`] once it has
+/// appended more than `limit` bytes. The text appended up to then stays in `out`.
 pub fn print<'gc>(mc: &Mutation<'gc>, value: Value<'gc>, mode: Mode, limit: usize, out: &mut String) -> Result<(), PrintError> {
     let labels = match mode {
         _ if !is_container(mc, value) => Map::default(),
@@ -136,7 +142,7 @@ pub fn print<'gc>(mc: &Mutation<'gc>, value: Value<'gc>, mode: Mode, limit: usiz
     printer.run(value)
 }
 
-/// Value bits are object indexes, which a multiply mixes well enough.
+/// A hasher for the bits of a value. The keys are object indexes, and one multiplication mixes them well enough.
 #[derive(Default)]
 struct Fold(u64);
 
@@ -161,30 +167,31 @@ type Map<V> = HashMap<u64, V, BuildHasherDefault<Fold>>;
 
 #[derive(Clone, Copy)]
 enum Label {
-    /// To be labelled where it's first written.
+    /// The datum gets its label number when it is first written.
     Pending,
     Number(u64),
 }
 
-/// Whether `value` holds other values the printer writes.
+/// Returns whether `value` holds other values that the printer writes.
 fn is_container<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> bool {
     Pair::of(value).is_some()
-        || AnyVector::of(value).is_some()
+        || EveryVector::of(value).is_some()
         || Table::of(value).is_some()
         || Syntax::of(value).is_some()
         || value.downcast::<Condition>(mc).is_some()
         || value.downcast::<Struct>(mc).is_some()
 }
 
-/// The `i`th value `value` holds that's written, if it has one.
+/// Returns the `i`th of the values held by `value` that the printer writes, or `None` if there are no more.
 fn child<'gc>(mc: &Mutation<'gc>, value: Value<'gc>, i: usize) -> Option<Value<'gc>> {
     if let Some(pair) = Pair::of(value) {
         return [pair.head(mc), pair.tail(mc)].get(i).copied();
     }
-    if let Some(vector) = AnyVector::of(value) {
-        return vector.get(mc, i);
+    // An external vector reads its elements from the host as the walk reaches them. If an element cannot be read because allocation fails, the vector is treated as ending there.
+    if let Some(vector) = EveryVector::of(value) {
+        return vector.get(mc, i).ok().flatten();
     }
-    // The two places of a removed entry hold a constant, which is no container, so the walks pass over it.
+    // Both slots of a removed entry hold `Value::BROKEN`. It is not a container, so the walks skip it.
     if let Some(table) = Table::of(value) {
         return table.held(mc, i);
     }
@@ -199,18 +206,20 @@ fn child<'gc>(mc: &Mutation<'gc>, value: Value<'gc>, i: usize) -> Option<Value<'
     [condition.message(mc), condition.irritants(mc)].get(i).copied()
 }
 
-/// The mutable vectors, structs and tables in `root` that a cycle comes back to. What's walked is written at least
-/// as long, but for syntax, which is written as its datum, so the walk stops past `limit`.
+/// Returns the labels for the mutable vectors, external vectors, structs and tables in `root` that a cycle leads back to. Each container that the walk visits adds at least
+/// one byte to the output, so the walk fails once it has visited more than `limit` containers. Syntax objects are not counted, because nested syntax is written as its datum alone.
 fn cycles<'gc>(mc: &Mutation<'gc>, root: Value<'gc>, limit: usize) -> Result<Map<Label>, PrintError> {
     let (mut on_path, mut labels) = (Map::default(), Map::default());
-    let mutable = |value: Value<'gc>| Vector::of(value).is_some() || Table::of(value).is_some() || value.downcast::<Struct>(mc).is_some();
-    if mutable(root) {
+    fn mutable<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> bool {
+        Vector::of(value).is_some() || ExternVector::of(value).is_some() || Table::of(value).is_some() || value.downcast::<Struct>(mc).is_some()
+    }
+    if mutable(mc, root) {
         on_path.insert(root.to_bits(), ());
     }
     let (mut path, mut walked) = (vec![(root, 0)], 0usize);
     while let Some((parent, index)) = path.last_mut() {
         let Some(item) = child(mc, *parent, *index) else {
-            if mutable(*parent) {
+            if mutable(mc, *parent) {
                 on_path.remove(&parent.to_bits());
             }
             path.pop();
@@ -220,8 +229,8 @@ fn cycles<'gc>(mc: &Mutation<'gc>, root: Value<'gc>, limit: usize) -> Result<Map
         if !is_container(mc, item) {
             continue;
         }
-        if mutable(item) {
-            // One that's labelled is written in full once, and after as its label.
+        if mutable(mc, item) {
+            // A labelled container is written in full once and as its label after that, so it is not walked again.
             if on_path.contains_key(&item.to_bits()) || labels.contains_key(&item.to_bits()) {
                 labels.insert(item.to_bits(), Label::Pending);
                 continue;
@@ -237,8 +246,8 @@ fn cycles<'gc>(mc: &Mutation<'gc>, root: Value<'gc>, limit: usize) -> Result<Map
     Ok(labels)
 }
 
-/// What in `root` is reached more than once. Each datum is walked once and written at least as
-/// long, but for syntax, as in [`cycles`], so the walk stops past `limit`.
+/// Returns the labels for the containers in `root` that are reached more than once. Each container is walked once.
+/// The walk fails past `limit` containers for the same reason as in [`cycles`], and it does not count syntax objects either.
 fn shared<'gc>(mc: &Mutation<'gc>, root: Value<'gc>, limit: usize) -> Result<Map<Label>, PrintError> {
     let (mut seen, mut labels) = (Map::default(), Map::default());
     seen.insert(root.to_bits(), ());
@@ -265,17 +274,17 @@ fn shared<'gc>(mc: &Mutation<'gc>, root: Value<'gc>, limit: usize) -> Result<Map
     Ok(labels)
 }
 
-/// What's left to write, last first.
+/// A piece of output that is still to be written. The work stack is popped from its end, so pieces are pushed in reverse order.
 enum Work<'gc> {
     Value(Value<'gc>),
     Text(&'static str),
     /// The rest of a list, after an item.
     Tail(Value<'gc>),
-    /// The items of a vector or of multiple values from `at`.
+    /// The items of a vector or the fields of a struct, from index `at` on.
     Items(Value<'gc>, usize),
-    /// The entries of a table from entry number `at`. The flag says whether one was written before them.
+    /// The entries of a table from entry number `at` on. The flag is true if an entry was already written, so the next entry needs a space before it.
     Entries(Table<'gc>, usize, bool),
-    /// The end of a syntax object's datum.
+    /// Marks the end of the datum of the outermost syntax object.
     LeaveSyntax,
     /// Switches the printer to the given mode for the work that follows.
     Mode(Mode),
@@ -285,14 +294,14 @@ struct Printer<'a, 'gc> {
     mc: &'a Mutation<'gc>,
     mode: Mode,
     out: &'a mut String,
-    /// The length `out` can grow to.
+    /// The maximum length, in bytes, that `out` can grow to.
     limit: usize,
     strings: Strings<'a, 'gc>,
     nums: Nums<'a, 'gc>,
     labels: Map<Label>,
     next: u64,
-    /// How many syntax objects the value being written is in. Syntax in syntax is written as
-    /// its datum.
+    /// Nonzero while the value being written is inside a syntax object. A syntax object inside another is written as
+    /// its datum alone.
     in_syntax: usize,
 }
 
@@ -304,11 +313,10 @@ impl<'gc> Printer<'_, 'gc> {
                 Work::Value(value) => self.value(value, &mut work)?,
                 Work::Text(text) => self.out.push_str(text),
                 Work::Tail(rest) => {
-                    if rest == Value::NULL {
-                    } else if let Some(pair) = Pair::of(rest).filter(|_| !self.labels.contains_key(&rest.to_bits())) {
+                    if let Some(pair) = Pair::of(rest).filter(|_| !self.labels.contains_key(&rest.to_bits())) {
                         self.out.push(' ');
                         work.extend([Work::Tail(pair.tail(self.mc)), Work::Value(pair.head(self.mc))]);
-                    } else {
+                    } else if rest != Value::NULL {
                         self.out.push_str(" . ");
                         work.push(Work::Value(rest));
                     }
@@ -322,7 +330,7 @@ impl<'gc> Printer<'_, 'gc> {
                     }
                 }
                 Work::Entries(table, mut at, written) => {
-                    // A removed entry leaves both its places broken, and is passed over.
+                    // Both slots of a removed entry hold `Value::BROKEN`. Such an entry is skipped.
                     while table.held(self.mc, 2 * at) == Some(Value::BROKEN) {
                         at += 1;
                     }
@@ -358,7 +366,7 @@ impl<'gc> Printer<'_, 'gc> {
         if let Some(pair) = Pair::of(value) {
             self.out.push('(');
             work.extend([Work::Text(")"), Work::Tail(pair.tail(mc)), Work::Value(pair.head(mc))]);
-        } else if AnyVector::of(value).is_some() {
+        } else if EveryVector::of(value).is_some() {
             self.out.push_str("#(");
             work.extend([Work::Text(")"), Work::Items(value, 0)]);
         } else if let Some(table) = Table::of(value) {
@@ -385,7 +393,7 @@ impl<'gc> Printer<'_, 'gc> {
         Ok(())
     }
 
-    /// The name of a struct type, as it is.
+    /// Writes the name of a struct type as plain text, never between `|`s.
     fn type_name(&mut self, name: Option<Value<'gc>>) {
         if let Some(name) = name.and_then(Symbol::of) {
             let _ = write!(self.out, "{}", string::display(&self.strings, name.name(self.mc)));
@@ -502,6 +510,7 @@ impl<'gc> Printer<'_, 'gc> {
                 _ if value.downcast::<Closure>(mc).is_some() || value.downcast::<KeywordProcedure>(mc).is_some() => "#<procedure>",
                 _ if value.downcast::<Continuation>(mc).is_some() => "#<continuation>",
                 _ if value.downcast::<Task>(mc).is_some() => "#<coroutine>",
+                Value::DEFAULT_TAG => "#<prompt-tag>",
                 _ if value.downcast::<Tag>(mc).is_some() => "#<prompt-tag>",
                 _ => "#<object>",
             });
@@ -524,7 +533,7 @@ impl<'gc> Printer<'_, 'gc> {
         Ok(())
     }
 
-    /// Whether the parser would read `name` as other than the identifier it names.
+    /// Returns whether the parser would read `name` as something other than the identifier with that name.
     fn needs_bars(&self, name: &str) -> bool {
         name.is_empty()
             || name == "."
@@ -537,8 +546,9 @@ impl<'gc> Printer<'_, 'gc> {
 
     fn write_string(&mut self, text: ragwort_types::string::Str<'gc>, quote: char) {
         // Each character takes at least one byte of output. Take only as many characters as could still fit.
-        let chars: Vec<char> = string::chars(&self.strings, text).take(self.room().saturating_add(1)).collect();
-        self.write_text(chars.into_iter(), quote);
+        let strings = self.strings;
+        let most = self.room().saturating_add(1);
+        self.write_text(string::chars(&strings, text).take(most), quote);
     }
 
     /// Returns the number of bytes that can still be written before the output exceeds its limit.
@@ -546,7 +556,7 @@ impl<'gc> Printer<'_, 'gc> {
         self.limit.saturating_sub(self.out.len())
     }
 
-    /// `chars` between `quote`s, with escapes for what wouldn't read back.
+    /// Writes `chars` between two `quote` characters. A character that would not read back is written as an escape.
     fn write_text(&mut self, chars: impl Iterator<Item = char>, quote: char) {
         self.out.push(quote);
         for character in chars {
@@ -580,7 +590,7 @@ impl<'gc> Printer<'_, 'gc> {
             '\r' => "return",
             ' ' => "space",
             '\t' => "tab",
-            // Alone, what joins or varies emoji shows nothing either.
+            // A zero-width joiner or a variation selector shows nothing on its own either, so it is written by code point.
             _ if unseen(character) || character.is_whitespace() || character == '\u{200d}' || ('\u{fe00}'..='\u{fe0f}').contains(&character) => {
                 _ = write!(self.out, "#\\x{:x}", character as u32);
                 return;
@@ -596,9 +606,9 @@ impl<'gc> Printer<'_, 'gc> {
     }
 }
 
-/// Whether `character` shows nothing where it's written: controls, noncharacters, and the marks that
-/// only steer layout, such as zero-width spaces and direction marks. Joiners and variation
-/// selectors are left out, as emoji are made of them.
+/// Returns whether `character` is invisible when written. Such characters are control characters, noncharacters, and format characters that
+/// only affect layout, such as zero-width spaces and direction marks. The zero-width joiner and the variation
+/// selectors are excluded, because emoji sequences contain them.
 fn unseen(character: char) -> bool {
     let code = character as u32;
     character.is_control()
@@ -607,7 +617,7 @@ fn unseen(character: char) -> bool {
         || matches!(code, 0xAD | 0x200B | 0x200C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB)
 }
 
-/// What `abbreviation` is written as.
+/// Returns the text that `abbreviation` is written as.
 fn prefix(abbreviation: Abbreviation) -> &'static str {
     match abbreviation {
         Abbreviation::Quote => "'",

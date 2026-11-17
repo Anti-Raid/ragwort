@@ -1,4 +1,4 @@
-//! The generic integer layer against the same work written for the arena by hand.
+//! Compares the generic integer layer with the same operations written by hand for the arena.
 
 use std::cell::Cell;
 use std::hint::black_box;
@@ -8,7 +8,7 @@ use ragwort_types::gc::{Arena, Gc, Mutation, Value};
 use ragwort_types::num::bigint::{self, Digits, RWDigits};
 use ragwort_types::num::{Big, BigFields, Host, Integer, IntView, Numbers, Nums, int};
 
-/// Keeps each benchmark's best time, since runs interleave and noise only adds.
+/// Keeps the best time of each benchmark. The runs of the benchmarks are interleaved, and noise only adds time.
 #[derive(Default)]
 struct Best(Vec<(&'static str, f64)>);
 
@@ -33,7 +33,7 @@ fn generic_adds<'gc>(h: &Nums<'_, 'gc>, n: i64) -> Integer<'gc> {
     x
 }
 
-/// The JavaScript benchmark's loop: operands read from an array, the sum in a register.
+/// The loop of the JavaScript benchmark: the operands are read from an array, and the sum is kept in a register.
 #[inline(never)]
 fn array_adds<'gc>(h: &Nums<'_, 'gc>, n: i64) -> Integer<'gc> {
     let ops = black_box([int::from_i64(h, 0).expect("alloc"), int::from_i64(h, 1).expect("alloc")]);
@@ -44,7 +44,7 @@ fn array_adds<'gc>(h: &Nums<'_, 'gc>, n: i64) -> Integer<'gc> {
     x
 }
 
-/// Only the digit work of a 4x4 multiply, into a buffer on the stack.
+/// Runs only the digit arithmetic of a multiplication of two four-digit numbers, into a buffer on the stack.
 #[inline(never)]
 fn digit_muls(x: &[Cell<u64>], n: usize) {
     let mut z = [0u64; 8];
@@ -62,7 +62,7 @@ fn by_hand_adds<'gc>(h: &Nums<'_, 'gc>, n: i64) -> Value<'gc> {
     x
 }
 
-/// What a VM would write: the fixnum case inline, anything else out of line.
+/// Adds as a VM would: the fixnum case is inline, and every other case is out of line.
 fn by_hand_add<'gc>(h: &Nums<'_, 'gc>, x: Value<'gc>, y: Value<'gc>) -> Value<'gc> {
     match x.fixnum_add(y) {
         Some(z) => z,
@@ -81,8 +81,8 @@ fn generic_mul<'gc>(h: &Nums<'_, 'gc>, x: Integer<'gc>, y: Integer<'gc>) -> Inte
     int::mul(h, x, y).expect("mul")
 }
 
-/// What a VM would write for multiplying bignums: try fixnums, check both operands' types,
-/// multiply, and keep the result a fixnum if it fits.
+/// Multiplies bignums as a VM would. It tries the fixnum case, checks the types of both operands,
+/// multiplies, and returns a fixnum if the result fits in one.
 #[inline(never)]
 fn by_hand_mul<'gc>(mc: &Mutation<'gc>, x: Value<'gc>, y: Value<'gc>) -> Value<'gc> {
     if let Some(z) = x.fixnum_mul(y) {
@@ -90,12 +90,15 @@ fn by_hand_mul<'gc>(mc: &Mutation<'gc>, x: Value<'gc>, y: Value<'gc>) -> Value<'
     }
     let (Some(Numbers::Big(x)), Some(Numbers::Big(y))) = (Numbers::of(x), Numbers::of(y)) else { panic!("bignums") };
     let negative = x.negative(mc) != y.negative(mc);
-    let digits = |x: Gc<'gc, Big>| Digits::new(&x.items(mc).words()[..x.digits(mc) as usize]);
-    let (xd, yd) = (digits(x), digits(y));
+    #[inline(always)]
+    fn digits<'gc>(mc: &Mutation<'gc>, x: Gc<'gc, Big>) -> Digits<'gc> {
+        Digits::new(&x.items(mc).words()[..x.digits(mc) as usize])
+    }
+    let (xd, yd) = (digits(mc, x), digits(mc, y));
     let len = xd.len() + yd.len();
     let z = mc.alloc_zeroed::<Big, 2>([u64::from(negative), 0], len).expect("alloc");
     bigint::multiply(RWDigits::of_cells(z.items(mc).words()), xd, yd);
-    let kept = digits(z).normalize().len();
+    let kept = digits(mc, z).normalize().len();
     let low = z.items(mc).words()[0].get();
     if kept <= 1
         && let Some(small) = Value::fixnum(if negative { (low as i64).wrapping_neg() } else { low as i64 })
@@ -106,7 +109,7 @@ fn by_hand_mul<'gc>(mc: &Mutation<'gc>, x: Value<'gc>, y: Value<'gc>) -> Value<'
     Value::object(mc, z)
 }
 
-/// Four digits.
+/// Returns a bignum of four digits.
 fn operands<'gc>(h: &Nums<'_, 'gc>) -> Integer<'gc> {
     let x = int::parse(h, b"123456789012345678901234567890123456789012345678901234567890123456789012", 10, false);
     x.expect("alloc").expect("parse")

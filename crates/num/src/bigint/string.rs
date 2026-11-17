@@ -1,11 +1,11 @@
-//! Conversion to and from text in radixes 2 to 36. Both work a digit's worth of characters
-//! at a time, which is quadratic: callers charge for it, and cap literal sizes.
+//! Conversion to and from text in radixes 2 to 36. Both directions process one digit's worth of characters
+//! at a time, which takes quadratic time. Callers charge for the work and cap the size of literals.
 
 use super::{DIGIT_BITS, Digit, Digits, RWDigits, TwoDigits, multiply_add_in_place};
 
 const CHARS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 
-/// The largest power of `radix` that fits in a digit, and its exponent.
+/// Returns the largest power of `radix` that fits in a digit, and the exponent of that power.
 pub fn chunk(radix: u32) -> (Digit, usize) {
     let (mut power, mut chars) = (radix as Digit, 1);
     while let Some(next) = power.checked_mul(radix as Digit) {
@@ -19,13 +19,13 @@ fn bits_per_char_floor(radix: u32) -> usize {
     (u32::BITS - 1 - radix.leading_zeros()) as usize
 }
 
-/// Characters [`to_string`] may need, without a sign.
+/// Returns an upper bound on the number of characters that [`to_string`] writes, not counting a sign.
 pub fn to_string_len(x: Digits<'_>, radix: u32) -> usize {
     x.bit_len().div_ceil(bits_per_char_floor(radix)).max(1)
 }
 
-/// Writes `x` in `radix` at the end of `out`, which needs [`to_string_len`] bytes, and returns
-/// where it starts. `scratch` needs `x` digits.
+/// Writes `x` in `radix` at the end of `out` and returns the index where the text starts. `out` needs [`to_string_len`] bytes,
+/// and `scratch` needs as many digits as `x`.
 pub fn to_string(x: Digits<'_>, radix: u32, mut scratch: RWDigits<'_>, out: &mut [u8]) -> usize {
     assert!((2..=36).contains(&radix), "radix out of range");
     let x = x.normalize();
@@ -42,7 +42,7 @@ pub fn to_string(x: Digits<'_>, radix: u32, mut scratch: RWDigits<'_>, out: &mut
         while len > 0 && scratch.at(len - 1) == 0 {
             len -= 1;
         }
-        // Every chunk but the most significant has all its characters, leading zeros too.
+        // Every chunk except the most significant is written with all `chars` characters, including leading zeros.
         let full = len > 0;
         let mut written = 0;
         while rem != 0 || (full && written < chars) {
@@ -65,7 +65,7 @@ fn divide_in_place(mut z: RWDigits<'_>, divisor: Digit) -> Digit {
     rem
 }
 
-/// Digits [`from_string`] may need for `chars` characters.
+/// Returns an upper bound on the number of digits that [`from_string`] needs for `chars` characters.
 pub fn from_string_len(chars: usize, radix: u32) -> usize {
     let bits_per_char = bits_per_char_floor(radix) + usize::from(!radix.is_power_of_two());
     (chars * bits_per_char).div_ceil(DIGIT_BITS).max(1)
@@ -80,8 +80,8 @@ fn char_value(character: u8) -> Option<u32> {
     }
 }
 
-/// Reads unsigned digits in `radix` into `z`, which needs [`from_string_len`] digits. Returns
-/// `None` if a character isn't a digit in the radix.
+/// Parses `text` as unsigned digits in `radix` into `z`, which needs [`from_string_len`] digits. Returns
+/// `None` if a character is not a digit in `radix`.
 pub fn from_string(mut z: RWDigits<'_>, text: &[u8], radix: u32) -> Option<()> {
     assert!((2..=36).contains(&radix), "radix out of range");
     z.clear();

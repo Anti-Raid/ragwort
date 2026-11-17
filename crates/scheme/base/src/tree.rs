@@ -1,9 +1,9 @@
-//! Syntax as the expander works on it: a tree of nodes on the host, in storage charged to the
-//! arena's budget, each node with its scopes and the span of text it came from. A [`Stx`] is a
-//! node and the scope changes pending on it, which reach its parts as they're taken apart.
+//! The expander's representation of syntax: a tree of nodes stored on the host. The storage is
+//! charged to the arena's budget. Each node has a scope set and the source span it came from. A [`Stx`] is a
+//! node index with pending scope operations. `Tree::view` passes the operations on to the node's children.
 //!
-//! The nodes hold arena values untraced, so a tree must be used and dropped within the step
-//! that made it.
+//! The collector does not trace the arena values that the nodes hold. So a tree must be used and
+//! dropped within the step that created it.
 
 use ragwort_types::gc::{Mutation, OutOfMemory, ScratchVec, Value};
 use ragwort_types::pair::Pairs;
@@ -13,7 +13,7 @@ use ragwort_types::vector::Vectors;
 
 use crate::scope::{Op, Ops, Scope, Scopes, Set};
 
-/// Syntax: a node and the scope changes it has yet to pass on.
+/// A piece of syntax: the index of a node, and the scope operations pending on the node and its children.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Stx {
     node: u32,
@@ -24,7 +24,7 @@ pub(crate) struct Stx {
 enum Shape<'gc> {
     Id(Symbol<'gc>),
     Datum(Value<'gc>),
-    /// Items `kids[first..first + len]`, the last of them the tail if `dotted`.
+    /// The items are `kids[first..first + len]`. If `dotted`, the last item is the tail of an improper list.
     List { first: u32, len: u32, dotted: bool },
     Vector { first: u32, len: u32 },
 }
@@ -36,7 +36,7 @@ struct Node<'gc> {
     span: SyntaxSpan<'gc>,
 }
 
-/// A node's shape, with its parts as syntax.
+/// The shape of a node, with its children as [`Stx`] values. `List` holds the items and the tail of an improper list.
 pub(crate) enum View<'gc> {
     Id,
     Datum(Value<'gc>),
@@ -49,7 +49,7 @@ pub(crate) struct Tree<'a, 'gc> {
     nodes: ScratchVec<'gc, Node<'gc>>,
     kids: ScratchVec<'gc, Stx>,
     pub(crate) scopes: Scopes<'gc>,
-    /// The symbols each of the reader's abbreviations stands for, in order.
+    /// The symbol that each reader abbreviation stands for, indexed by the abbreviation's number.
     abbreviations: Vec<Symbol<'gc>>,
 }
 
@@ -99,13 +99,13 @@ impl<'a, 'gc> Tree<'a, 'gc> {
         self.node(stx).span
     }
 
-    /// `stx` with `scope` added, or flipped: removed if it has it, else added.
+    /// Returns `stx` with the operation `op` on `scope` pending. `Op::Flip` removes `scope` if the syntax has it, and adds it otherwise.
     pub(crate) fn with(&mut self, stx: Stx, scope: Scope, op: Op) -> Result<Stx, OutOfMemory> {
         let op = self.scopes.op(scope, op)?;
         Ok(Stx { node: stx.node, ops: self.scopes.compose(stx.ops, op)? })
     }
 
-    /// The scopes of `stx`, with its pending changes made.
+    /// Returns the scope set of `stx`, with its pending operations applied.
     pub(crate) fn scopes_of(&mut self, stx: Stx) -> Result<Set, OutOfMemory> {
         self.scopes.apply(self.node(stx).scopes, stx.ops)
     }
@@ -117,7 +117,7 @@ impl<'a, 'gc> Tree<'a, 'gc> {
         }
     }
 
-    /// The keyword `stx` is, if it's one, as `#:name` reads.
+    /// Returns the keyword if `stx` is a keyword datum, such as `#:name`.
     pub(crate) fn keyword(&self, stx: Stx) -> Option<Keyword<'gc>> {
         match self.node(stx).shape {
             Shape::Datum(value) => Keyword::of(value),
@@ -147,16 +147,18 @@ impl<'a, 'gc> Tree<'a, 'gc> {
         Ok(kids)
     }
 
-    /// The tree of what the reader read, its nodes in no scopes. Each node's parts are made
-    /// before it, from a stack of their own.
+    /// Converts `root`, a syntax object from the reader, into nodes with empty scope sets. The
+    /// traversal uses an explicit stack, and creates the children of a node before the node.
     pub(crate) fn read(&mut self, root: Syntax<'gc>) -> Result<Stx, OutOfMemory> {
         enum Task<'gc> {
             Visit(Syntax<'gc>),
-            /// A list or vector of the last parts made, after the tail if it's dotted.
+            /// Creates the list or vector of a reader node from the last `count` nodes created. If the list is dotted, the last of them is its tail.
             Make(Syntax<'gc>, usize, bool),
         }
         let mc = self.mc;
-        let part = |value: Value<'gc>| Task::Visit(Syntax::of(value).expect("the reader wraps every part"));
+        fn part<'gc>(value: Value<'gc>) -> Task<'gc> {
+            Task::Visit(Syntax::of(value).expect("the reader wraps every part"))
+        }
         let (mut todo, mut done) = (vec![Task::Visit(root)], Vec::new());
         while let Some(task) = todo.pop() {
             let node = match task {
@@ -196,7 +198,7 @@ impl<'a, 'gc> Tree<'a, 'gc> {
                 Some(SyntaxKind::Abbreviation(abbreviation)) => {
                     let name = self.abbreviations[abbreviation as usize];
                     done.push(self.id(name, Set::EMPTY, node.span(mc))?);
-                    // A list of the abbreviation's name, made already, and what it abbreviates.
+                    // An abbreviation becomes a list of two items: its name, which is created above, and the abbreviated datum.
                     todo.extend([part(node.datum(mc)), Task::Make(node, 2, false)]);
                 }
                 Some(SyntaxKind::Literal) | None => done.push(self.make(Shape::Datum(node.datum(mc)), Set::EMPTY, node.span(mc))?),
@@ -206,12 +208,12 @@ impl<'a, 'gc> Tree<'a, 'gc> {
         Ok(done.pop().expect("the root's made"))
     }
 
-    /// The datum `stx` stands for, without its scopes and spans. Each list or vector is made of
-    /// its items' data, from a stack of their own.
+    /// Returns the datum of `root`, without scopes and spans. The traversal uses an explicit
+    /// stack, and builds each list or vector from the data of its items.
     pub(crate) fn strip(&mut self, root: Stx) -> Result<Value<'gc>, OutOfMemory> {
         enum Task {
             Visit(Stx),
-            /// A list of the last items stripped, the last of them its tail if it's dotted.
+            /// Builds a list from the last `len` data produced. If the list is dotted, the last datum is its tail.
             List(u32, bool),
             Vector(u32),
         }

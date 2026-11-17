@@ -18,13 +18,19 @@ use crate::segments::promote;
 
 /// Returns the default continuation prompt tag used by root prompts and `call/cc`.
 pub(crate) const fn default_tag<'gc>() -> Value<'gc> {
-    Value::from_bits(4 << 32 | 0b1101)
+    Value::DEFAULT_TAG
 }
 
-/// Returns the continuation mark key used to store active exception handlers (or `#f` if none are
-/// installed).
+/// Returns the continuation mark key under which the list of active exception handlers is stored.
+/// The key is a constant. It does not depend on the handlers that are installed.
 pub(crate) const fn handler_key<'gc>() -> Value<'gc> {
-    Value::from_bits(5 << 32 | 0b1101)
+    Value::HANDLER_KEY
+}
+
+/// Returns the list of exception handlers installed for `task`, with `handler` added as the innermost.
+pub(crate) fn handlers_with<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, handler: Value<'gc>) -> Result<Value<'gc>, Fault> {
+    let handlers = mark(mc, task, handler_key(), Value::NULL)?;
+    Ok(Pairs::new(mc).cons(handler, handlers)?.value(mc))
 }
 
 /// Pushes a delimited prompt for `tag` with the specified abort `handler` onto the metacontinuation,

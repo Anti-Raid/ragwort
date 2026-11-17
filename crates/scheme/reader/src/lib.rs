@@ -1,19 +1,25 @@
-//! The reader: source text to [`Syntax`] nodes, from the tokens of `ragwort-parser-scheme`. It
-//! reads identifiers, `|`-quoted ones too, lists
-//! in `()` or `[]`, dotted tails as in `(a b . c)`, vectors as `#(a b)`, the `'`, `` ` ``, `,`
-//! and `,@` abbreviations, and as literals booleans, numbers (complex ones too), strings,
-//! characters and bytevectors as `#u8(1 2)`, as R7RS writes them, and keywords as `#:name`, as
-//! Racket does. `;` line comments, nested
-//! `#| |#` block comments and `#;` datum comments are skipped, and after `#!fold-case`,
-//! identifiers and character names are read in lower case until `#!no-fold-case`.
+//! The reader turns source text into [`Syntax`] nodes. It builds the nodes from the tokens of
+//! `ragwort-parser-scheme`.
 //!
-//! `#n=datum` labels a datum, and a later `#n#` in the same top-level datum is the same node.
-//! A label can't be used inside the datum it labels, as nothing after the reader takes cycles.
+//! The reader accepts the syntax of R7RS, and keywords as Racket writes them:
 //!
-//! Anything else is an [`ErrorKind::Unsupported`] error.
+//! - identifiers, including `|`-quoted identifiers
+//! - lists in `()` or `[]`, with dotted tails as in `(a b . c)`
+//! - vectors, written `#(a b)`
+//! - the abbreviations `'`, `` ` ``, `,` and `,@`, and the syntax abbreviations `#'`, `` #` ``, `#,` and `#,@`
+//! - literals: booleans, `#nil`, `#none`, numbers (including complex numbers), strings, characters,
+//!   bytevectors written `#u8(1 2)`, and keywords written `#:name`
 //!
-//! Open lists are kept in vectors rather than on the native stack, so deep nesting can't
-//! overflow it.
+//! `;` line comments, nested `#| |#` block comments and `#;` datum comments are skipped. After
+//! `#!fold-case`, identifiers, keywords and character names are read in lower case until `#!no-fold-case`.
+//!
+//! `#n=datum` labels a datum. A later `#n#` in the same top-level datum is the same node.
+//! A label cannot be referenced inside the datum that it labels, because no later stage accepts cyclic syntax.
+//!
+//! Any other syntax is an [`ErrorKind::Unsupported`] error.
+//!
+//! Open lists are kept in vectors, not on the native stack, so deep nesting cannot overflow
+//! the stack.
 
 mod error;
 
@@ -36,15 +42,15 @@ use ragwort_types::symbol::Symbols;
 use ragwort_types::syntax::{Abbreviation, Syntax, SyntaxKind, SyntaxMeta, SyntaxSession, SyntaxSource, SyntaxSpan};
 use ragwort_types::vector::Vectors;
 
-/// A list, vector or prefix still waiting for its end.
+/// A construct that is open and not complete yet. A list, vector or bytevector waits for its closing bracket. A prefix, datum comment or label waits for its datum.
 enum Open<'gc> {
-    /// `items[first..]` are the list's so far.
+    /// `items[first..]` holds the items read so far for this list.
     List { start: usize, close: Bracket, first: usize, tail: Tail<'gc>, shape: Shape },
     /// A quote or other abbreviation, which wraps the next datum.
     Prefix { start: usize, end: usize, meta: SyntaxMeta<'gc> },
-    /// A `#;` comment, which drops the next datum.
+    /// A `#;` comment, which discards the next datum.
     Skip { start: usize, end: usize },
-    /// A `#n=` label, which names the next datum.
+    /// A `#n=` label, which labels the next datum.
     Label { start: usize, end: usize, n: u64 },
 }
 
@@ -55,7 +61,7 @@ enum Shape {
     Bytevector,
 }
 
-/// Why a list's datum couldn't be made: an item it can't hold, or the arena.
+/// The reason the datum of a list, vector or bytevector could not be built. `Item` is a bytevector item that is not a byte. `Arena` is an error from the arena.
 enum Grow<'gc> {
     Item(Syntax<'gc>),
     Arena(ragwort_types::Error),
@@ -70,12 +76,12 @@ impl From<OutOfMemory> for Grow<'_> {
 #[derive(Clone, Copy)]
 enum Tail<'gc> {
     None,
-    /// A `.` at this byte, waiting for the tail.
+    /// A `.` was read at this byte offset, and the tail datum has not been read yet.
     Dot(usize),
     Datum(Value<'gc>),
 }
 
-/// Reads the data in a session's text one at a time, as an iterator. An error ends the text.
+/// Reads the data in a session's text one at a time. It is also an iterator. After an error, the reader returns no more data.
 pub struct Reader<'a, 'gc> {
     mc: &'a Mutation<'gc>,
     strings: Strings<'a, 'gc>,
@@ -84,37 +90,36 @@ pub struct Reader<'a, 'gc> {
     symbols: Symbols<'gc>,
     source: SyntaxSource<'gc>,
     lexer: Lexer<'gc>,
-    /// Where the token being read ends.
+    /// The byte offset where the current token ends.
     at: usize,
-    /// The nodes the reader makes have no context or origin, so each kind shares one.
+    /// Nodes built by the reader have no lexical context and no expansion origin. So all nodes of one kind share one [`SyntaxMeta`].
     identifier: SyntaxMeta<'gc>,
     literal: SyntaxMeta<'gc>,
     list: SyntaxMeta<'gc>,
     vector: SyntaxMeta<'gc>,
-    /// Each [`Abbreviation`]'s metadata, in order.
+    /// The metadata for each [`Abbreviation`], in the order of `Abbreviation::ALL`.
     abbreviations: Vec<SyntaxMeta<'gc>>,
-    /// Innermost last. Both count against the arena's budget, so deep nesting can't use
-    /// memory past it.
+    /// The open constructs, innermost last. `open` and `items` are both charged to the arena's budget, so deep nesting cannot use
+    /// more memory than the budget allows.
     open: ScratchVec<'gc, Open<'gc>>,
-    /// The items of every open list, each list's after those of the list around it.
+    /// The items of every open list. The items of an inner list follow the items of the list that encloses it.
     items: ScratchVec<'gc, Value<'gc>>,
-    /// The labelled data of the top-level datum being read, `None` while still being read.
+    /// The labelled data of the top-level datum being read, keyed by label number. An entry is `None` while its datum is still being read.
     labels: HashMap<u64, Option<Syntax<'gc>>>,
 }
 
 impl<'a, 'gc> Reader<'a, 'gc> {
-    /// A reader of `session`'s text that interns identifiers in `symbols`.
+    /// Creates a reader of `session`'s text. Identifiers are interned in `symbols`.
     pub fn new(mc: &'a Mutation<'gc>, symbols: Symbols<'gc>, session: &SyntaxSession) -> Result<Self, ReadError> {
-        let foreign = |_| ReadError::new(ErrorKind::ForeignSession, 0, 0);
-        let source = session.source(mc).map_err(foreign)?;
-        let bytes = session.text(mc).map_err(foreign)?.bytes(mc);
+        let source = session.source(mc).map_err(|_| ReadError::new(ErrorKind::ForeignSession, 0, 0))?;
+        let bytes = session.text(mc).map_err(|_| ReadError::new(ErrorKind::ForeignSession, 0, 0))?.bytes(mc);
         let text = std::str::from_utf8(bytes).map_err(|error| {
             let at = error.valid_up_to();
             ReadError::new(ErrorKind::InvalidUtf8, at, error.error_len().map_or(bytes.len(), |length| at + length))
         })?;
-        let oom = |error| ReadError::new(error, 0, 0);
-        let meta = |kind| SyntaxMeta::new(mc, kind, None, None).map_err(oom);
-        let abbreviation = |kind| meta(SyntaxKind::Abbreviation(kind));
+        fn meta<'gc>(mc: &Mutation<'gc>, kind: SyntaxKind) -> Result<SyntaxMeta<'gc>, ReadError> {
+            SyntaxMeta::new(mc, kind, None, None).map_err(|error| ReadError::new(error, 0, 0))
+        }
         Ok(Self {
             mc,
             strings: Strings::new(mc),
@@ -124,11 +129,11 @@ impl<'a, 'gc> Reader<'a, 'gc> {
             source,
             lexer: Lexer::new(text),
             at: 0,
-            identifier: meta(SyntaxKind::Identifier)?,
-            literal: meta(SyntaxKind::Literal)?,
-            list: meta(SyntaxKind::List)?,
-            vector: meta(SyntaxKind::Vector)?,
-            abbreviations: Abbreviation::ALL.iter().map(|&kind| abbreviation(kind)).collect::<Result<_, _>>()?,
+            identifier: meta(mc, SyntaxKind::Identifier)?,
+            literal: meta(mc, SyntaxKind::Literal)?,
+            list: meta(mc, SyntaxKind::List)?,
+            vector: meta(mc, SyntaxKind::Vector)?,
+            abbreviations: Abbreviation::ALL.iter().map(|&kind| meta(mc, SyntaxKind::Abbreviation(kind))).collect::<Result<_, _>>()?,
             open: ScratchVec::new(mc),
             items: ScratchVec::new(mc),
             labels: HashMap::new(),
@@ -139,7 +144,7 @@ impl<'a, 'gc> Reader<'a, 'gc> {
         self.source
     }
 
-    /// The next datum, or `None` once the text is read.
+    /// Returns the next datum, or `None` at the end of the text. After an error, every later call returns `None`.
     pub fn read(&mut self) -> Result<Option<Syntax<'gc>>, ReadError> {
         let read = self.read_datum();
         if read.is_err() {
@@ -207,9 +212,8 @@ impl<'a, 'gc> Reader<'a, 'gc> {
                 }
                 Token::Identifier(name) => self.identifier(&name, start)?,
                 Token::Keyword(name) => {
-                    let failed = |error| ReadError::new(error, start, self.at);
-                    let symbol = self.symbols.intern_str(&self.strings, &name).map_err(failed)?;
-                    let keyword = self.symbols.keyword(self.mc, symbol).map_err(|error| failed(error.into()))?;
+                    let symbol = self.symbols.intern_str(&self.strings, &name).map_err(|error| ReadError::new(error, start, self.at))?;
+                    let keyword = self.symbols.keyword(self.mc, symbol).map_err(|error| ReadError::new(error, start, self.at))?;
                     self.node(keyword.value(self.mc), self.literal, start)?
                 }
                 Token::Number(text) => {
@@ -256,7 +260,7 @@ impl<'a, 'gc> Reader<'a, 'gc> {
         Err(ReadError::new(ErrorKind::BadDot, at, at + 1))
     }
 
-    /// The list or vector a `bracket` at `start` closes.
+    /// Returns the node for the list, vector or bytevector that the closing `bracket` at `start` completes.
     fn close(&mut self, start: usize, bracket: Bracket) -> Result<Syntax<'gc>, ReadError> {
         match self.open.pop() {
             Some(Open::List { start: open, close, first, tail, shape }) if close == bracket => {
@@ -288,7 +292,8 @@ impl<'a, 'gc> Reader<'a, 'gc> {
         }
     }
 
-    /// Hands a datum to the prefixes and list it's in, or back if it's in none.
+    /// Delivers the finished datum `node` to the constructs that enclose it. Each enclosing prefix wraps it. An enclosing `#;` discards it, an enclosing label records it,
+    /// and an enclosing list takes it as an item or as its tail. Returns the datum if it is at the top level, and `None` otherwise.
     fn finish(&mut self, mut node: Syntax<'gc>) -> Result<Option<Syntax<'gc>>, ReadError> {
         loop {
             match self.open.last_mut() {
@@ -307,11 +312,10 @@ impl<'a, 'gc> Reader<'a, 'gc> {
                 Some(Open::List { tail, .. }) => {
                     let value = node.value(self.mc);
                     let span = node.span(self.mc);
-                    let at = |kind: ErrorKind| ReadError::new(kind, span.start() as usize, span.end() as usize);
                     match *tail {
-                        Tail::None => self.items.push(value).map_err(|error| at(error.into()))?,
+                        Tail::None => self.items.push(value).map_err(|error| ReadError::new(error, span.start() as usize, span.end() as usize))?,
                         Tail::Dot(_) => *tail = Tail::Datum(value),
-                        Tail::Datum(_) => return Err(at(ErrorKind::BadDot)),
+                        Tail::Datum(_) => return Err(ReadError::new(ErrorKind::BadDot, span.start() as usize, span.end() as usize)),
                     }
                     return Ok(None);
                 }
@@ -323,7 +327,7 @@ impl<'a, 'gc> Reader<'a, 'gc> {
         }
     }
 
-    /// The text ran out: an error inside a list or after a prefix.
+    /// Handles the end of the text. Returns `None` at the top level. Fails if a list is still open, or if a prefix, `#;` or label has no datum after it.
     fn end(&self) -> Result<Option<Syntax<'gc>>, ReadError> {
         match self.open.last() {
             None => Ok(None),
@@ -334,7 +338,7 @@ impl<'a, 'gc> Reader<'a, 'gc> {
         }
     }
 
-    /// The bytes a bytevector's `items` are, or the first that isn't an exact integer from 0
+    /// Returns the bytes of a bytevector whose items are `items`. Fails with the first item that is not an exact integer from 0
     /// to 255.
     fn bytes(&self, items: &[Value<'gc>]) -> Result<Vec<u8>, Grow<'gc>> {
         items
@@ -347,14 +351,14 @@ impl<'a, 'gc> Reader<'a, 'gc> {
             .collect()
     }
 
-    /// A node for `datum`, from `start` to the reader's position.
+    /// Creates a node for `datum` with the metadata `meta`. Its span runs from `start` to the end of the current token.
     fn node(&self, datum: Value<'gc>, meta: SyntaxMeta<'gc>, start: usize) -> Result<Syntax<'gc>, ReadError> {
         let span = SyntaxSpan::new(self.mc, self.source, start as u32, self.at as u32).expect("spans lie in the text");
         Syntax::new(self.mc, datum, span, Some(meta)).map_err(|error| ReadError::new(error, start, self.at))
     }
 }
 
-/// The abbreviation `prefix` writes.
+/// Returns the [`Abbreviation`] that the token `prefix` stands for.
 fn abbreviation(prefix: Prefix) -> Abbreviation {
     match prefix {
         Prefix::Quote => Abbreviation::Quote,
@@ -376,7 +380,7 @@ impl<'gc> Iterator for Reader<'_, 'gc> {
     }
 }
 
-/// Every datum in `session`'s text.
+/// Reads every datum in `session`'s text. Identifiers are interned in `symbols`.
 pub fn read_all<'gc>(mc: &Mutation<'gc>, symbols: Symbols<'gc>, session: &SyntaxSession) -> Result<Vec<Syntax<'gc>>, ReadError> {
     Reader::new(mc, symbols, session)?.collect()
 }

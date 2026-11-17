@@ -8,7 +8,7 @@ use ragwort_types::num::{Nums, complex};
 use ragwort_types::pair::Pair;
 use ragwort_types::string::{self, Strings};
 use ragwort_types::table::{Entries, Table};
-use ragwort_types::vector::{AnyVector, Vectors};
+use ragwort_types::vector::EveryVector;
 
 use crate::Fault;
 use crate::objects::{self, BoxFields, StructFields};
@@ -52,13 +52,13 @@ pub(crate) fn eqv<'gc>(mc: &Mutation<'gc>, left: Value<'gc>, right: Value<'gc>) 
 /// - Bytevectors with identical byte sequences;
 /// - Pairs, vectors, or boxes whose contents are recursively `equal?` (ignoring vector mutability, per Racket semantics);
 /// - Struct instances of the same struct type whose fields are pairwise `equal?`, provided the type is not an identity type.
-/// - Tables with the same keys, in any order, whose values are pairwise `equal?`. Keys are matched as tables match them.
-/// - External references of one kind that the kind says are equal. See [`ragwort_types::external`].
+/// - Tables with the same keys, in any order, whose values are pairwise `equal?`. Keys are compared as a table lookup compares them.
+/// - External references of the same kind that the kind's equality function reports as equal. See [`ragwort_types::external`].
 ///
 /// Tracks fuel consumption (counting strings/bytevectors as 1 plus 1 per 8 characters or bytes)
 /// and raises [`Fault::OutOfFuel`] if comparison steps exceed `most`.
 pub(crate) fn equal<'gc>(mc: &Mutation<'gc>, left: Value<'gc>, right: Value<'gc>, most: u64) -> Result<(bool, u64), Fault> {
-    let (strings, vectors) = (Strings::new(mc), Vectors::new(mc));
+    let strings = Strings::new(mc);
     let (mut next, mut todo, mut phases) = (Some((left, right)), ScratchVec::new(mc), Phases::new(mc));
     let mut compared = 0;
     loop {
@@ -69,7 +69,7 @@ pub(crate) fn equal<'gc>(mc: &Mutation<'gc>, left: Value<'gc>, right: Value<'gc>
                 if index + 1 < first.len(mc) {
                     todo.push(Work::Items(first, second, index + 1))?;
                 }
-                (first.get(mc, index).ok_or(Fault::Malformed)?, second.get(mc, index).ok_or(Fault::Malformed)?)
+                (first.get(mc, index)?.ok_or(Fault::Malformed)?, second.get(mc, index)?.ok_or(Fault::Malformed)?)
             }
             Some(Work::Fields(first, second, index)) => {
                 let (xs, ys) = (first.items(mc), second.items(mc));
@@ -81,7 +81,17 @@ pub(crate) fn equal<'gc>(mc: &Mutation<'gc>, left: Value<'gc>, right: Value<'gc>
             Some(Work::Entries(mut entries, second)) => {
                 let Some((key, value)) = entries.next() else { continue };
                 todo.push(Work::Entries(entries, second))?;
-                // The tables have as many entries as each other, so they have the same keys if the second has every key of the first.
+                // Finding a string key hashes and compares all its characters. A table with a stale index rebuilds it first, in time proportional to its entries.
+                if let Some(text) = strings.string(key) {
+                    compared = compared.saturating_add(string::len(&strings, text) as u64 / 8);
+                }
+                if second.is_stale(mc) {
+                    compared = compared.saturating_add(second.len(mc) as u64);
+                }
+                if compared > most {
+                    return Err(Fault::OutOfFuel);
+                }
+                // The two tables have the same number of entries. So they have the same keys if the second table has every key of the first.
                 let Some(other) = second.get(mc, key)? else { return Ok((false, compared)) };
                 (value, other)
             }
@@ -127,7 +137,7 @@ pub(crate) fn equal<'gc>(mc: &Mutation<'gc>, left: Value<'gc>, right: Value<'gc>
             }
             continue;
         }
-        let (Some(first), Some(second)) = (Compound::of(mc, &vectors, left), Compound::of(mc, &vectors, right)) else { return Ok((false, compared)) };
+        let (Some(first), Some(second)) = (Compound::of(mc, left), Compound::of(mc, right)) else { return Ok((false, compared)) };
         let same_shape = match (first, second) {
             (Compound::Vector(first), Compound::Vector(second)) => first.len(mc) == second.len(mc),
             (Compound::Pair(_), Compound::Pair(_)) | (Compound::Box(_), Compound::Box(_)) => true,
@@ -149,7 +159,16 @@ pub(crate) fn equal<'gc>(mc: &Mutation<'gc>, left: Value<'gc>, right: Value<'gc>
             (Compound::Vector(first), Compound::Vector(second)) if !first.is_empty(mc) => todo.push(Work::Items(first, second, 0))?,
             (Compound::Box(first), Compound::Box(second)) => next = Some((first.value(mc), second.value(mc))),
             (Compound::Struct(first), Compound::Struct(second)) if !first.items(mc).is_empty() => todo.push(Work::Fields(first, second, 0))?,
-            (Compound::Table(first), Compound::Table(second)) if !first.is_empty(mc) => todo.push(Work::Entries(first.entries(mc)?, second))?,
+            (Compound::Table(first), Compound::Table(second)) if !first.is_empty(mc) => {
+                // An external table reads every entry from its host here, even if the comparison stops before it has used them all.
+                if first.is_external() {
+                    compared = compared.saturating_add(first.len(mc) as u64);
+                    if compared > most {
+                        return Err(Fault::OutOfFuel);
+                    }
+                }
+                todo.push(Work::Entries(first.entries(mc)?, second))?;
+            }
             _ => {}
         }
     }
@@ -160,7 +179,7 @@ pub(crate) fn equal<'gc>(mc: &Mutation<'gc>, left: Value<'gc>, right: Value<'gc>
 /// or the entries of a table that are still to be looked up in another table.
 enum Work<'gc> {
     Values(Value<'gc>, Value<'gc>),
-    Items(AnyVector<'gc>, AnyVector<'gc>, usize),
+    Items(EveryVector<'gc>, EveryVector<'gc>, usize),
     Fields(Gc<'gc, objects::Struct>, Gc<'gc, objects::Struct>, usize),
     Entries(Entries<'gc>, Table<'gc>),
 }
@@ -169,18 +188,18 @@ enum Work<'gc> {
 #[derive(Clone, Copy)]
 enum Compound<'gc> {
     Pair(Pair<'gc>),
-    Vector(AnyVector<'gc>),
+    Vector(EveryVector<'gc>),
     Box(Gc<'gc, objects::Box>),
     Struct(Gc<'gc, objects::Struct>),
     Table(Table<'gc>),
 }
 
 impl<'gc> Compound<'gc> {
-    fn of(mc: &Mutation<'gc>, vectors: &Vectors<'_, 'gc>, value: Value<'gc>) -> Option<Self> {
+    fn of(mc: &Mutation<'gc>, value: Value<'gc>) -> Option<Self> {
         if let Some(pair) = Pair::of(value) {
             return Some(Compound::Pair(pair));
         }
-        if let Some(vector) = vectors.vector(value) {
+        if let Some(vector) = EveryVector::of(value) {
             return Some(Compound::Vector(vector));
         }
         if let Some(table) = Table::of(value) {

@@ -2,8 +2,8 @@ use proc_macro2::{TokenStream, TokenTree};
 use quote::{format_ident, quote, ToTokens};
 use syn::{Data, DeriveInput, Error, Fields, Index};
 
-/// Checks if a type expression contains a given identifier, used to break const evaluation
-/// cycles on recursive data structures.
+/// Returns whether the type `ty` mentions the identifier `ident`. This check breaks cycles in
+/// const evaluation on recursive data structures.
 fn contains_ident(ty: &syn::Type, ident: &syn::Ident) -> bool {
     contains_ident_stream(ty.to_token_stream(), ident)
 }
@@ -16,8 +16,8 @@ fn contains_ident_stream(stream: TokenStream, ident: &syn::Ident) -> bool {
     })
 }
 
-/// The code that writes `fields`, bound as `names`, and the code that reads them into what
-/// `make` makes of them.
+/// Returns three pieces of code for `fields`: a pattern that binds the fields, the code that
+/// writes the bound fields, and the code that reads the fields and builds a value with `make`.
 fn parts(fields: &Fields, make: TokenStream) -> (TokenStream, TokenStream, TokenStream) {
     let wire = quote!(::ragwort_types::wire);
     match fields {
@@ -40,7 +40,7 @@ fn parts(fields: &Fields, make: TokenStream) -> (TokenStream, TokenStream, Token
     }
 }
 
-/// The names and types of `fields`, as text, for the shape.
+/// Returns the names and types of `fields` as text, for the shape hash.
 fn text(fields: &Fields) -> String {
     let mut text = String::new();
     for field in fields {

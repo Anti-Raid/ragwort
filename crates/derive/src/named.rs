@@ -9,7 +9,7 @@ pub(crate) fn expand(input: TokenStream) -> Result<TokenStream, Error> {
     if !item.generics.params.is_empty() {
         return Err(Error::new_spanned(&item.generics, "a named enum can't be generic"));
     }
-    // `#[data(Type)]` on the enum: each variant is written with a value of the type too.
+    // With `#[data(Type)]` on the enum, each variant is also written with a value of that type.
     let mut data_type = None;
     if let Some(at) = item.attrs.iter().position(|attr| attr.path().is_ident("data")) {
         data_type = Some(item.attrs.remove(at).parse_args::<Type>()?);
@@ -49,7 +49,7 @@ pub(crate) fn expand(input: TokenStream) -> Result<TokenStream, Error> {
         #item
 
         impl #name {
-            /// What it's called.
+            /// Returns the name of the variant.
             pub fn name(&self) -> &'static str {
                 match self {
                     #(#patterns => #names,)*
@@ -67,7 +67,7 @@ pub(crate) fn expand(input: TokenStream) -> Result<TokenStream, Error> {
     let with_data = data_type.map(|data_type| {
         quote! {
             impl #name {
-                /// What it's written with, after its name.
+                /// Returns the value that the variant is declared with, after its name.
                 const fn data(&self) -> #data_type {
                     match self {
                         #(Self::#idents => #data,)*
@@ -81,7 +81,7 @@ pub(crate) fn expand(input: TokenStream) -> Result<TokenStream, Error> {
         #with_data
 
         impl #name {
-            /// Every one, in order.
+            /// Every variant, in the order of declaration.
             pub const ALL: &'static [#name] = &[#(#name::#idents),*];
         }
 

@@ -1,7 +1,7 @@
-//! Case mapping and caseless comparison, by the full mappings of each character that `char`
-//! knows, so a character may become several. There's no context: a final capital sigma
-//! lowercases to `σ`, not `ς`. Folding is Unicode's full case folding: the lowercase of the
-//! uppercase of the lowercase, except that dotless `ı` stays as it is and Cherokee folds to
+//! Case mapping and case-insensitive comparison. Both use the full Unicode mappings that `char`
+//! provides, so one character can map to several. The mappings ignore context: a final capital sigma
+//! lowercases to `σ`, not `ς`. Folding is Unicode full case folding. It is computed as the lowercase of the
+//! uppercase of the lowercase, with two exceptions: dotless `ı` stays as it is, and Cherokee folds to
 //! uppercase.
 
 use std::cell::Cell;
@@ -24,12 +24,12 @@ pub fn downcase<H: Host>(h: &H, string: H::Str) -> Res<H> {
     map_case(h, string, Case::Lower)
 }
 
-/// `string` folded, so strings that differ only in case fold alike.
+/// Returns `string` case-folded. Strings that differ only in case fold to the same characters.
 pub fn foldcase<H: Host>(h: &H, string: H::Str) -> Res<H> {
     map_case(h, string, Case::Fold)
 }
 
-/// `character` in upper case, if that's one character, or else `character`, as R7RS's `char-upcase` maps it.
+/// Returns the uppercase of `character` if the mapping is a single character. Otherwise returns `character` unchanged, as R7RS `char-upcase` does.
 pub fn upcase_char(character: char) -> char {
     single(Case::Upper.map(character), character)
 }
@@ -38,7 +38,7 @@ pub fn downcase_char(character: char) -> char {
     single(Case::Lower.map(character), character)
 }
 
-/// `character` folded, as [`foldcase`] folds it, if that's one character, or else `character`.
+/// Returns `character` folded as [`foldcase`] folds it, if the result is a single character. Otherwise returns `character` unchanged.
 pub fn foldcase_char(character: char) -> char {
     single(Case::Fold.map(character), character)
 }
@@ -50,7 +50,7 @@ fn single(mut mapped: Mapped, character: char) -> char {
     }
 }
 
-/// Orders `a` and `b` as their folds would be.
+/// Compares `a` and `b` as [`crate::compare`] would compare their case-folded forms.
 pub fn compare_ci<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<Ordering, H::Error> {
     if a == b {
         return Ok(Ordering::Equal);
@@ -63,11 +63,9 @@ pub fn compare_ci<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<Ordering, H::E
         && packed_b.is_ascii()
     {
         let n = packed_a.len().min(packed_b.len());
-        let fold = |word| Case::Fold.ascii(word);
-        return Ok(packed_a.slice(0..n).compare_by(packed_b.slice(0..n), fold).then(packed_a.len().cmp(&packed_b.len())));
+        return Ok(packed_a.slice(0..n).compare_by(packed_b.slice(0..n), |word| Case::Fold.ascii(word)).then(packed_a.len().cmp(&packed_b.len())));
     }
-    let fold = |character| Case::Fold.map(character);
-    Ok(chars(h, a).flat_map(fold).cmp(chars(h, b).flat_map(fold)))
+    Ok(chars(h, a).flat_map(|character| Case::Fold.map(character)).cmp(chars(h, b).flat_map(|character| Case::Fold.map(character))))
 }
 
 #[derive(Clone, Copy)]
@@ -79,7 +77,7 @@ enum Case {
 
 type Folded = FlatMap<FlatMap<ToLowercase, ToUppercase, fn(char) -> ToUppercase>, ToLowercase, fn(char) -> ToLowercase>;
 
-/// What a character maps to.
+/// Iterator over the characters that one character maps to.
 #[derive(Clone)]
 enum Mapped {
     Upper(ToUppercase),
@@ -112,8 +110,8 @@ impl Case {
         }
     }
 
-    /// Maps eight ASCII bytes at once: those from `lo` to `hi` flip their 0x20 bit. The bytes
-    /// are all below 0x80, so adding to them never carries from one to the next.
+    /// Maps eight ASCII bytes at once. Each byte in the range `lo` to `hi` has its 0x20 bit flipped. All the bytes
+    /// are below 0x80, so the additions never carry from one byte into the next.
     fn ascii(self, word: u64) -> u64 {
         let (lo, hi) = match self {
             Self::Upper => (b'a', b'z'),
@@ -125,7 +123,7 @@ impl Case {
     }
 }
 
-/// `string` mapped, or `string` itself if that changes nothing.
+/// Returns `string` mapped by `case`, or `string` itself if the mapping changes nothing.
 fn map_case<H: Host>(h: &H, string: H::Str, case: Case) -> Res<H> {
     h.charge(len(h, string) as u64)?;
     let cell = Cell::new(0);

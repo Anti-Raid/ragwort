@@ -15,7 +15,7 @@ fn hash_of(h: &TestHost, s: TestStr) -> u64 {
     hash(h, s, SEED).unwrap()
 }
 
-/// Checks everything readable of `s` against the characters it should hold.
+/// Checks every read operation on `s` against `want`, the characters that `s` should hold.
 fn agrees(h: &TestHost, rng: &mut Rng, s: TestStr, want: &[char]) {
     h.check(s);
     assert_eq!(len(h, s), want.len());
@@ -41,12 +41,14 @@ fn agrees(h: &TestHost, rng: &mut Rng, s: TestStr, want: &[char]) {
 
 #[test]
 fn strings_match_a_model() {
+    fn pick(rng: &mut Rng, pool: &[(TestStr, Vec<char>)]) -> (TestStr, Vec<char>) {
+        pool[rng.below(pool.len())].clone()
+    }
     for seed in 0..12 {
         let h = TestHost::new();
         let mut rng = Rng(seed);
         let mut pool: Vec<(TestStr, Vec<char>)> = Vec::new();
         for _ in 0..600 {
-            let pick = |rng: &mut Rng, pool: &[(TestStr, Vec<char>)]| pool[rng.below(pool.len())].clone();
             let (s, want) = match rng.below(if pool.is_empty() { 1 } else { 6 }) {
                 0 => {
                     let text = rng.text();
@@ -166,7 +168,7 @@ fn piece_at_a_time_stays_shallow() {
             let leaves = h.leaves(s);
             let depth = crate::info(&h, s).depth as f64;
             assert!(depth <= 1.45 * (leaves as f64 + 2.0).log2(), "depth {depth} for {leaves} leaves");
-            // Flat strings fill to about 512 bytes; without merging at the edges, to about half.
+            // Flat strings fill to about 512 bytes. Without merging at the edges, they would fill to about half of that.
             assert!(want.len() / leaves >= 384, "{leaves} leaves for {} characters", want.len());
         }
     }
@@ -242,7 +244,7 @@ fn external_characters_must_be_narrowest() {
     }
 }
 
-/// Reading a rope by position often enough flattens it once, and reads then use the copy.
+/// Reading a rope by index often enough flattens it once, and later reads use the flat copy.
 #[test]
 fn reads_by_position_flatten_a_rope() {
     let h = TestHost::with_capacity(1 << 20);
@@ -289,6 +291,14 @@ fn appends_between_reads_dont_flatten() {
 /// characters do.
 #[test]
 fn near_misses_compare_by_their_characters() {
+    fn shapes(h: &TestHost, text: &[char]) -> [TestStr; 3] {
+        let flat = make(h, text);
+        let half = text.len() / 2;
+        let rope = concat(h, make(h, &text[..half]), make(h, &text[half..])).unwrap();
+        let flattened = concat(h, make(h, &text[..half]), make(h, &text[half..])).unwrap();
+        flatten(h, flattened).unwrap();
+        [flat, rope, flattened]
+    }
     let h = TestHost::with_capacity(1 << 20);
     let mut rng = Rng(11);
     for widest in [Width::One, Width::Two, Width::Four] {
@@ -297,16 +307,8 @@ fn near_misses_compare_by_their_characters() {
             for at in [0, len / 2, len - 1] {
                 let mut other = text.clone();
                 other[at] = if other[at] == 'a' { 'b' } else { 'a' };
-                let shapes = |t: &[char]| {
-                    let flat = make(&h, t);
-                    let half = t.len() / 2;
-                    let rope = concat(&h, make(&h, &t[..half]), make(&h, &t[half..])).unwrap();
-                    let flattened = concat(&h, make(&h, &t[..half]), make(&h, &t[half..])).unwrap();
-                    flatten(&h, flattened).unwrap();
-                    [flat, rope, flattened]
-                };
-                for x in shapes(&text) {
-                    for y in shapes(&other) {
+                for x in shapes(&h, &text) {
+                    for y in shapes(&h, &other) {
                         assert_eq!(equal(&h, x, y), Ok(text == other));
                         assert_eq!(compare(&h, x, y), Ok(text.cmp(&other)));
                         assert_eq!(compare(&h, y, x), Ok(other.cmp(&text)));
@@ -317,8 +319,8 @@ fn near_misses_compare_by_their_characters() {
     }
 }
 
-/// Strings short enough to hash in one step hash the same flat, as ropes cut anywhere, and as
-/// `&str`, at every width and around the cutoff, and compare equal to their text.
+/// A string short enough to hash in one step has the same hash as a flat string, as a rope cut at any index and as a `&str`.
+/// This holds at every width and on both sides of the length cutoff. Each string also compares equal to its text.
 #[test]
 fn short_strings_hash_alike_in_every_shape() {
     let h = TestHost::with_capacity(1 << 20);
@@ -338,13 +340,13 @@ fn short_strings_hash_alike_in_every_shape() {
             }
         }
     }
-    // Neighbours around the cutoff differ, as do texts that only differ in a high bit.
+    // Texts of 16 and 17 bytes, on either side of the cutoff, hash differently. So do texts that differ only in a high bit.
     assert_ne!(hash_str("abcdefghijklmnop", SEED), hash_str("abcdefghijklmnopq", SEED));
     assert_ne!(hash_str("\u{e9}", SEED), hash_str("i", SEED));
     let s = make(&h, &"caf\u{e9}".chars().collect::<Vec<_>>());
     assert_eq!(equal_str(&h, s, "caf\u{e9}"), Ok(true));
     assert_eq!(equal_str(&h, s, "cafi"), Ok(false));
-    // One-byte characters whose bytes spell other text in UTF-8: "Ã©" is C3 A9, which is "é".
+    // One-byte units can hold the same bytes as the UTF-8 encoding of other text. "Ã©" is the units C3 A9, which are the UTF-8 bytes of "é".
     for n in [0, 3, 6, 7, 14, 15, 30] {
         let pad = "x".repeat(n);
         let latin: Vec<char> = format!("{pad}\u{c3}\u{a9}").chars().collect();
@@ -354,8 +356,8 @@ fn short_strings_hash_alike_in_every_shape() {
     }
 }
 
-/// Ropes with pieces narrower than the whole, cut at each offset in a word, hash as the flat
-/// string does, while every character and the seed change the hash.
+/// A rope with pieces narrower than the whole string, cut at each offset within a word, has the same hash as the flat
+/// string. Changing any character or the seed changes the hash.
 #[test]
 fn hashes_follow_the_characters() {
     let h = TestHost::with_capacity(1 << 20);
@@ -379,7 +381,7 @@ fn hashes_follow_the_characters() {
         }
         assert!(seen.insert(hash(&h, flat, SEED + 1).unwrap()));
     }
-    // Every string of up to four of these, including ones whose packed words match across widths.
+    // Hash every string of up to four of these characters. Some of them pack into equal words at different widths, and they must still hash differently.
     let alphabet = ['\0', 'a', 'b', '\u{6261}', '😀'];
     let mut texts = vec![String::new()];
     for _ in 0..4 {
@@ -392,7 +394,7 @@ fn hashes_follow_the_characters() {
     let hashes: std::collections::HashSet<u64> = texts.iter().map(|t| hash_str(t, SEED)).collect();
     assert_eq!(hashes.len(), texts.len());
     assert_ne!(hash_str("abcd", SEED), hash_str("\u{6261}\u{6463}\0\0", SEED));
-    // Each character of a short string changes its hash, wherever it falls in a word.
+    // Changing any one character of a short string changes the hash, at every position within a word.
     for widest in [Width::One, Width::Two, Width::Four] {
         let text: Vec<char> = (0..40).map(|_| rng.char(widest)).collect();
         for n in 0..=text.len() {

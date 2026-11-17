@@ -2,51 +2,55 @@
 //!
 //! # Keys
 //!
-//! Any value can be a key. Two keys are the same key under these rules, which are Lua's:
+//! Any value can be a key. These rules, modeled on Lua's, decide whether two keys are the same key:
 //!
 //! - Strings are compared by their characters.
 //! - Numbers are compared as `eqv?` compares them: by value and by exactness. So `1` and `1.0`
 //!   are two keys.
-//! - Symbols, characters, booleans and the other constants are compared by what they are.
-//! - External references are compared as their kind says: by the host's `equal`, or by
+//! - Symbols, characters, booleans and the other constants are compared by their value words.
+//!   Symbols are interned, so two symbols with the same name have the same word.
+//! - External references are compared as their kind specifies: by the host's `equal`, or by
 //!   identity if the kind has none. See [`crate::external`].
-//! - Everything else is compared by identity. Two pairs with the same contents are two keys.
+//! - Every other object is compared by identity, which is also a comparison of value words. Two
+//!   pairs with the same contents are two keys.
 //!
 //! # Layout
 //!
-//! A table has two arrays, both made when the first entry is added:
+//! A table has two arrays. Both are allocated when the first entry is added:
 //!
-//! - The entries hold a key and a value each, in the order they were added. A new entry goes
-//!   after the last one. A removed entry stays in place as a dead one.
-//! - The index is a hash table of entry numbers, probed linearly. Each slot also keeps the high
-//!   half of its key's hash, so most probes read no entry but the right one.
+//! - The entries array holds a key and a value for each entry, in the order they were added. A
+//!   new entry is appended after the last one. A removed entry stays in place as a tombstone.
+//! - The index is a hash table of entry numbers with linear probing. Each slot also stores the
+//!   high half of its key's hash, so a probe rarely reads an entry other than the matching one.
 //!
-//! When the entries are full, both arrays are made again. The live entries are copied in order,
-//! the dead ones are dropped, and the index ends at most half full. So a table grows by
-//! doubling, and shrinks if most of its entries were removed.
+//! When the entries array is full, both arrays are rebuilt. The live entries are copied in
+//! order, the tombstones are dropped, and the new index is at most half full. So a table grows
+//! by doubling, and shrinks if most of its entries were removed.
 //!
 //! # Hashes
 //!
-//! Hashes are seeded with the seed of the arena's symbols, which is random unless the program
-//! running the arena chose it. So which keys collide cannot be planned from outside.
+//! Hashes are seeded with the seed of the arena's symbol table. The seed is random unless the
+//! program that runs the arena chose it. So an outside party cannot predict which keys collide.
 //!
-//! A key compared by identity is hashed by where it is. A collection can move it, and its hash
-//! changes with that. A table that holds such a key makes its index again on first use after a
-//! collection that moved objects. A table with no such key never needs to.
+//! An object that is compared by identity, such as a pair, is hashed by its object word. A symbol
+//! is the exception: it is hashed by its name. The object word holds the object's index in the
+//! arena, so a collection that moves the object changes its hash. A table that holds such a key
+//! rebuilds its index on first use after a collection that moved objects. A table with no such
+//! key never needs to.
 
 //!
 //! # External tables
 //!
-//! A table's entries can also live with the host, as an [`ExternalTable`]: a payload the host
-//! has decoded, or settings it keeps. A program uses such a table like any other. Nothing is
-//! copied into the arena until it is read.
+//! A table's entries can also be owned by the host, as an [`ExternalTable`]. Examples are a
+//! payload that the host has decoded, or settings that the host keeps. A program uses such a
+//! table like any other. Nothing is copied into the arena until it is read.
 //!
 //! ```
 //! use ragwort_types::Error;
 //! use ragwort_types::gc::{Arena, Mutation, Value};
 //! use ragwort_types::table::{ExternalTable, Key, Tables};
 //!
-//! /// A message as the host received it: its fields are read where they are.
+//! /// A message as the host received it. Its fields are read in place, without copying.
 //! struct Message {
 //!     id: i64,
 //!     pinned: bool,
@@ -84,31 +88,34 @@
 //!
 //! What the arena does with an external table:
 //!
-//! - It keeps each value it reads. A second read of a key gives the same value without asking
-//!   the host, so a nested table the host made for a key stays the same object.
-//! - It asks the host for all the keys at once when the table is walked, as `table-for-each`
-//!   or the printer walks it, and keeps the result until the table is next written.
-//! - It refuses to write to a table whose type does not say [`ExternalTable::WRITABLE`].
+//! - It caches each value it reads. A second read of a key returns the cached value without
+//!   calling the host. So a nested table that the host created for a key stays the same object.
+//! - It requests all the keys from the host at once when the table is iterated, as
+//!   `table-for-each` or the printer does. It caches the result until the next write to the
+//!   table. A host that implements [`ExternalTable::entries`] supplies the values in the same
+//!   pass.
+//! - It rejects a write to a table whose type does not set [`ExternalTable::WRITABLE`].
 //!
-//! What the host promises, which the arena relies on and cannot check:
+//! What the host promises. The arena relies on these promises and cannot check them:
 //!
-//! - `has` holds for a key exactly when `get` gives a value for it, and `len` is the number of
-//!   keys that `keys` yields.
+//! - `has` returns `true` for a key exactly when `get` returns a value for it, and `len` is the
+//!   number of keys that `keys` yields.
 //! - `keys` yields each key once, in the same order on every call while the table is unchanged.
-//! - Two different keys never name the same entry.
-//! - What `get` gives for a key never changes, except through the table's own `set`, `delete`
-//!   and `clear`. For a type that is not writable it never changes at all.
-//! - No method reaches back into the table it is called on.
+//! - Two different keys never refer to the same entry.
+//! - The value that `get` returns for a key never changes, except through the table's own
+//!   `set`, `delete` and `clear`. For a type that is not writable it never changes at all.
+//! - No method calls back into the table it is called on.
 //!
-//! A broken promise makes the table give wrong or stale values. It cannot cause memory
+//! A broken promise makes the table return wrong or stale values. It cannot cause memory
 //! unsafety.
 //!
-//! Only strings, symbols, fixnums, flonums, characters and booleans can be keys of an external
-//! table, because the host cannot hold anything else of the arena's. Any other key is not in
-//! the table, and cannot be set.
+//! Only strings, symbols, integers that fit in an `i64`, flonums, characters and booleans can be
+//! keys of an external table, because the host cannot hold any other arena value. A lookup of
+//! any other key finds nothing, and setting one fails with [`TableError::Refused`].
 
 use std::any::Any;
 use std::cell::{Ref, RefCell};
+use std::fmt::{self, Write};
 use std::hash::Hasher;
 
 use crate::Error;
@@ -123,23 +130,23 @@ use crate::symbol::{Symbol, Symbols};
 #[path = "tests/table.rs"]
 mod tests;
 
-/// Fewest index slots a table that holds anything has.
+/// The minimum number of index slots in a table that has allocated its arrays.
 const MIN_SLOTS: usize = 8;
-/// The epoch of a table with no key hashed by where it is.
+/// The `epoch` of a table in which no key is hashed by its object word. Such a table never rebuilds its index after a collection.
 const STILL: u64 = u64::MAX;
-/// The half of an index slot that holds an entry's number plus one.
+/// Mask for the low half of an index slot, which holds an entry number plus one.
 const ENTRY: u64 = u32::MAX as u64;
-/// Mixed into a symbol's hash, so that a symbol and the string of its name hash apart.
+/// Mixed into a symbol's hash, so that a symbol and the string of its name hash differently.
 const SYMBOL: u64 = 0x5851_F42D_4C95_7F2D;
-/// Mixed into the hash a host gives an external value, so that it hashes apart from a number.
+/// Mixed into the hash that a host returns for an external value, so that the value and a number hash differently.
 const EXTERNAL: u64 = 0x1405_7B7E_F767_814F;
 
-/// What a table operation fails with.
+/// The error of a failed table operation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TableError {
-    /// The table is an external one that programs cannot change.
+    /// The table is an external table that programs cannot modify.
     Immutable,
-    /// The host did not take the key or the value. See [`Refused`].
+    /// The host rejected the key or the value, or the key is of a kind that no external table accepts. See [`Refused`].
     Refused,
     Arena(Error),
 }
@@ -156,7 +163,7 @@ impl From<OutOfMemory> for TableError {
     }
 }
 
-/// A table, whose entries are in the arena or with the host. See the [module docs](self).
+/// A table. Its entries are stored in the arena or owned by the host. See the [module docs](self).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Table<'gc>(Kept<'gc>);
 
@@ -183,12 +190,12 @@ impl<'gc> Table<'gc> {
         }
     }
 
-    /// Whether the entries are with the host.
+    /// Returns whether the entries are owned by the host.
     pub fn is_external(self) -> bool {
         matches!(self.0, Kept::Outside(_))
     }
 
-    /// Whether the table can be changed. Only an external table can be one that cannot.
+    /// Returns whether the table can be modified. Only an external table can be read-only.
     pub fn is_writable(self, mc: &Mutation<'gc>) -> bool {
         match self.0 {
             Kept::Inside(_) => true,
@@ -196,13 +203,13 @@ impl<'gc> Table<'gc> {
         }
     }
 
-    /// The host's value behind an external table, if it is a `T`.
+    /// Returns the host's value behind an external table, or `None` if the table is not external or the value is not a `T`.
     pub fn host<T: ExternalTable>(self, mc: &Mutation<'gc>) -> Option<Ref<'gc, T>> {
         let Kept::Outside(table) = self.0 else { return None };
         Ref::filter_map(table.0.host(mc)?.try_borrow().ok()?, |host| host.as_any().downcast_ref::<T>()).ok()
     }
 
-    /// The number of entries.
+    /// Returns the number of entries.
     pub fn len(self, mc: &Mutation<'gc>) -> usize {
         match self.0 {
             Kept::Inside(table) => table.len(mc),
@@ -214,7 +221,7 @@ impl<'gc> Table<'gc> {
         self.len(mc) == 0
     }
 
-    /// The value of `key`, or `None` if the table has no such key.
+    /// Returns the value of `key`, or `None` if the table has no such key.
     #[inline]
     pub fn get(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<Value<'gc>>, Error> {
         match self.0 {
@@ -223,7 +230,55 @@ impl<'gc> Table<'gc> {
         }
     }
 
-    /// Whether the table has an entry for `key`. For an external table this does not read the value.
+    /// Returns the value of `key` if the entry at `position` is the entry of `key`. Returns `None`
+    /// for any other position, whether or not the table has the key.
+    ///
+    /// This is the fast path back to an entry that [`Table::find`] found earlier. It serves code
+    /// that reads the same key repeatedly. It computes no hash and probes nothing. It only
+    /// compares the key at `position` with `key` as two value words. So it finds only keys that
+    /// always have the same word when they are the same key: symbols, fixnums, characters,
+    /// booleans and strings short enough to be stored inline in the value word. A position
+    /// becomes stale when entries are removed and the table is next rebuilt. This method then
+    /// returns `None`.
+    ///
+    /// For an external table, `position` is a position in the table of cached values.
+    #[inline]
+    pub fn get_at(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize) -> Option<Value<'gc>> {
+        match self.0 {
+            Kept::Inside(table) => table.get_at(mc, key, position),
+            Kept::Outside(table) => Inside(table.0.memo(mc)?).get_at(mc, key, position),
+        }
+    }
+
+    /// Returns the position of the entry of `key` and the entry's value, or `None` if the table
+    /// has no such key. The position is for [`Table::get_at`] and [`Table::set_at`].
+    pub fn find(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<(usize, Value<'gc>)>, Error> {
+        match self.0 {
+            Kept::Inside(table) => table.find(mc, key),
+            Kept::Outside(table) => {
+                // `get` caches the value in the memo table. The position is the entry's position in that table.
+                if table.get(mc, key)?.is_none() {
+                    return Ok(None);
+                }
+                table.memo(mc)?.find(mc, key)
+            }
+        }
+    }
+
+    /// Sets the value of `key` if the entry at `position` is the entry of `key`. Returns whether
+    /// the value was set. Like [`Table::get_at`], this finds an entry only at the position where
+    /// it was found earlier.
+    ///
+    /// Always returns `false` for an external table, because the host must be told of every change.
+    #[inline]
+    pub fn set_at(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize, value: Value<'gc>) -> bool {
+        match self.0 {
+            Kept::Inside(table) => table.set_at(mc, key, position, value),
+            Kept::Outside(_) => false,
+        }
+    }
+
+    /// Returns whether the table has an entry for `key`. For an external table, this does not read the value.
     #[inline]
     pub fn has(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<bool, Error> {
         match self.0 {
@@ -232,17 +287,25 @@ impl<'gc> Table<'gc> {
         }
     }
 
-    /// Sets the value of `key`. A key the table does not have yet becomes its last entry.
+    /// Sets the value of `key`. A key that the table does not have yet is appended as the last
+    /// entry.
     ///
-    /// Any value is stored as it is, [`Value::NIL`] included. A language in which setting a key to
-    /// nil removes it, as Lua has it, makes that check itself and calls [`Table::delete`].
+    /// Any value is stored as it is, including [`Value::NIL`]. In a language such as Lua, setting a
+    /// key to nil removes the key. Such a language must check for nil itself and call
+    /// [`Table::delete`].
     ///
-    /// An external table can refuse: one that is not writable always does, and a writable one
-    /// does for a key or a value the host cannot take.
+    /// An external table can reject the write. A table that is not writable always does. A
+    /// writable table does for a key or a value that the host cannot accept.
     pub fn set(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) -> Result<(), TableError> {
+        self.set_finding(mc, key, value).map(drop)
+    }
+
+    /// Sets the value of `key` as [`Table::set`] does. Returns the position of the entry, for
+    /// [`Table::get_at`] and [`Table::set_at`]. Returns `None` for an external table.
+    pub fn set_finding(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) -> Result<Option<usize>, TableError> {
         match self.0 {
-            Kept::Inside(table) => Ok(table.set(mc, key, value)?),
-            Kept::Outside(table) => table.set(mc, key, value),
+            Kept::Inside(table) => Ok(Some(table.set(mc, key, value)?)),
+            Kept::Outside(table) => table.set(mc, key, value).map(|()| None),
         }
     }
 
@@ -254,7 +317,6 @@ impl<'gc> Table<'gc> {
         }
     }
 
-    /// Removes every entry.
     pub fn clear(self, mc: &Mutation<'gc>) -> Result<(), TableError> {
         match self.0 {
             Kept::Inside(table) => {
@@ -265,9 +327,10 @@ impl<'gc> Table<'gc> {
         }
     }
 
-    /// The entries, in the order they were added, or for an external table, in the host's order.
+    /// Returns an iterator over the entries in the order they were added. For an external table,
+    /// the order is the host's order.
     ///
-    /// For an external table this reads every value the arena has not read yet.
+    /// For an external table, this reads every value that the arena has not cached yet.
     pub fn entries(self, mc: &Mutation<'gc>) -> Result<Entries<'gc>, Error> {
         match self.0 {
             Kept::Inside(table) => Ok(table.entries(mc)),
@@ -278,12 +341,13 @@ impl<'gc> Table<'gc> {
         }
     }
 
-    /// The `index`th value the table holds, or `None` past the last. Keys and values alternate,
-    /// in the order of [`Table::entries`]. Both places of a removed entry read as
-    /// [`Value::BROKEN`]. This is for code that walks any container by position, as a printer
-    /// does; [`Table::entries`] is the way to read a table.
+    /// Returns the value in slot `index` of the entries array, or `None` if `index` is past the
+    /// last slot in use. Keys and values alternate, in the order of [`Table::entries`]. Both
+    /// slots of a removed entry read as [`Value::BROKEN`]. This method is for code that traverses
+    /// any container by position, such as a printer. Use [`Table::entries`] to read a table.
     ///
-    /// An external table whose entries cannot be read, for want of memory, holds nothing here.
+    /// For an external table, this returns `None` for every index if the entries cannot be read,
+    /// for example because allocation fails.
     pub fn held(self, mc: &Mutation<'gc>, index: usize) -> Option<Value<'gc>> {
         match self.0 {
             Kept::Inside(table) => table.held(mc, index),
@@ -294,8 +358,9 @@ impl<'gc> Table<'gc> {
         }
     }
 
-    /// Whether the next read or write makes the index again, because a collection has moved
-    /// objects since it was made. That takes time in proportion to the number of entries.
+    /// Returns whether the next read or write rebuilds the index. That happens when a collection
+    /// has moved objects since the index was built. The rebuild takes time proportional to the
+    /// number of entries.
     pub fn is_stale(self, mc: &Mutation<'gc>) -> bool {
         match self.0 {
             Kept::Inside(table) => table.is_stale(mc),
@@ -304,7 +369,7 @@ impl<'gc> Table<'gc> {
     }
 }
 
-/// A table whose entries are in the arena.
+/// A table whose entries are stored in the arena.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Inside<'gc>(Gc<'gc, objects::Table>);
 
@@ -320,14 +385,39 @@ impl<'gc> Inside<'gc> {
         Ok(parts.find(mc, key, hashed.hash)?.map(|entry| parts.entries.get(2 * entry + 1)))
     }
 
-    fn set(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) -> Result<(), Error> {
+    /// Returns the value of the entry at `position` if its key is the same value word as `key`.
+    /// Unused slots and the slots of removed entries hold `Value::BROKEN`, which is never a key.
+    /// So the check needs only the array length, not `used`.
+    #[inline]
+    fn get_at(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize) -> Option<Value<'gc>> {
+        let entries = self.0.pairs(mc)?.items(mc);
+        let place = position.checked_mul(2)?;
+        (place < entries.len() && entries.get(place) == key).then(|| entries.get(place + 1))
+    }
+
+    #[inline]
+    fn set_at(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize, value: Value<'gc>) -> bool {
+        let Some(entries) = self.0.pairs(mc).map(|pairs| pairs.items(mc)) else { return false };
+        let Some(place) = position.checked_mul(2).filter(|&place| place < entries.len() && entries.get(place) == key) else { return false };
+        entries.set(mc, place + 1, value);
+        true
+    }
+
+    fn find(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<(usize, Value<'gc>)>, Error> {
+        let Some(parts) = self.settled(mc)? else { return Ok(None) };
+        let hashed = hash(mc, self.0.seed(mc), key)?;
+        Ok(parts.find(mc, key, hashed.hash)?.map(|entry| (entry, parts.entries.get(2 * entry + 1))))
+    }
+
+    /// Sets the value of `key`, and returns the number of its entry.
+    fn set(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) -> Result<usize, Error> {
         let hashed = hash(mc, self.0.seed(mc), key)?;
         let parts = self.settled(mc)?;
         if let Some(parts) = parts
             && let Some(entry) = parts.find(mc, key, hashed.hash)?
         {
             parts.entries.set(mc, 2 * entry + 1, value);
-            return Ok(());
+            return Ok(entry);
         }
         let live = self.0.live(mc);
         let parts = match parts {
@@ -346,21 +436,21 @@ impl<'gc> Inside<'gc> {
         if hashed.by_place && self.0.epoch(mc) == STILL {
             self.0.set_epoch(mc, mc.moves());
         }
-        Ok(())
+        Ok(entry)
     }
 
     fn delete(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<bool, Error> {
         let Some(parts) = self.settled(mc)? else { return Ok(false) };
         let hashed = hash(mc, self.0.seed(mc), key)?;
         let Some(entry) = parts.find(mc, key, hashed.hash)? else { return Ok(false) };
-        // The index slot stays, and probes go on past it. The next rebuild drops the dead entry.
+        // The index slot is kept, so probes continue past it. The entry becomes a tombstone, which the next rebuild drops.
         parts.entries.set(mc, 2 * entry, Value::BROKEN);
         parts.entries.set(mc, 2 * entry + 1, Value::BROKEN);
         self.0.set_live(mc, self.0.live(mc) - 1);
         Ok(true)
     }
 
-    /// Removes every entry, and gives up the arrays that held them.
+    /// Removes every entry and releases both arrays.
     fn clear(self, mc: &Mutation<'gc>) {
         self.0.set_index(mc, None);
         self.0.set_pairs(mc, None);
@@ -378,22 +468,24 @@ impl<'gc> Inside<'gc> {
         (index < 2 * self.0.used(mc) as usize).then(|| entries.get(index))
     }
 
+    #[inline]
     fn is_stale(self, mc: &Mutation<'gc>) -> bool {
         let epoch = self.0.epoch(mc);
         epoch != STILL && epoch != mc.moves()
     }
 
+    #[inline]
     fn parts(self, mc: &Mutation<'gc>) -> Option<Parts<'gc>> {
         Some(Parts { index: self.0.index(mc)?.items(mc), entries: self.0.pairs(mc)?.items(mc) })
     }
 
-    /// The arrays, with the index made again first if objects have moved since it was made.
+    /// Returns the arrays. Rebuilds the index first if objects have moved since it was built.
     #[inline]
     fn settled(self, mc: &Mutation<'gc>) -> Result<Option<Parts<'gc>>, Error> {
         if self.is_stale(mc) { self.reindex(mc) } else { Ok(self.parts(mc)) }
     }
 
-    /// Makes the index again from the entries as they are, in a new array of the same size.
+    /// Rebuilds the index from the current entries, in a new array of the same size.
     #[cold]
     #[inline(never)]
     fn reindex(self, mc: &Mutation<'gc>) -> Result<Option<Parts<'gc>>, Error> {
@@ -416,8 +508,8 @@ impl<'gc> Inside<'gc> {
         Ok(Some(parts))
     }
 
-    /// Makes both arrays again with room for `need` entries at half full or less, and copies the
-    /// live entries over in order. The table is unchanged if this fails.
+    /// Reallocates both arrays with room for `need` entries, so that the index is at most half
+    /// full. Copies the live entries over in order. The table is unchanged if this fails.
     #[inline(never)]
     fn rebuild(self, mc: &Mutation<'gc>, need: usize) -> Result<Parts<'gc>, Error> {
         let fresh = arrays(mc, need)?;
@@ -439,10 +531,11 @@ impl<'gc> Inside<'gc> {
     }
 }
 
-/// The live entries of a table, as [`Table::entries`] gives them: a key and its value each.
+/// An iterator over the live entries of a table, returned by [`Table::entries`]. Each item is a
+/// key and its value.
 ///
-/// It reads the entries the table had when it was made. Entries that are set or removed in
-/// the meantime may or may not show.
+/// It reads the entries that the table had when the iterator was created. Entries that are set
+/// or removed during iteration may or may not appear.
 #[derive(Clone, Copy)]
 pub struct Entries<'gc> {
     entries: Option<Slots<'gc>>,
@@ -481,13 +574,17 @@ impl<'a, 'gc> Tables<'a, 'gc> {
         Table::of(value)
     }
 
-    /// An empty table. It allocates its arrays when the first entry is added.
+    /// Returns an empty table. It allocates its arrays when the first entry is added.
     pub fn make(&self) -> Result<Table<'gc>, Error> {
         self.with_room(0)
     }
 
-    /// An empty table that can take `entries` entries before it has to grow.
+    /// Returns an empty table that can hold `entries` entries before it has to grow.
     pub fn with_room(&self, entries: usize) -> Result<Table<'gc>, Error> {
+        Ok(Table(Kept::Inside(self.inside(entries)?)))
+    }
+
+    fn inside(&self, entries: usize) -> Result<Inside<'gc>, Error> {
         let mc = self.mc;
         let seed = Symbols::of_arena(mc)?.seed(mc);
         let table = objects::Table::new(mc, None, None, 0, 0, seed, STILL)?;
@@ -496,13 +593,13 @@ impl<'a, 'gc> Tables<'a, 'gc> {
             table.set_index(mc, Some(fresh.index));
             table.set_pairs(mc, Some(fresh.entries));
         }
-        Ok(Table(Kept::Inside(Inside(table))))
+        Ok(Inside(table))
     }
 
-    /// A table whose entries are `host`'s. See the [module docs](self).
+    /// Returns a table whose entries are owned by `host`. See the [module docs](self).
     ///
-    /// `bytes` is charged to the arena's budget for what `host` owns, until the table is
-    /// collected and `host` dropped.
+    /// `bytes` is the size of the memory that `host` owns. It is charged to the arena's budget
+    /// until the table is collected and `host` is dropped.
     pub fn external<T: ExternalTable>(&self, host: T, bytes: usize) -> Result<Table<'gc>, Error> {
         let mc = self.mc;
         let host: RefCell<Box<dyn Hosted>> = RefCell::new(Box::new(host));
@@ -511,50 +608,62 @@ impl<'a, 'gc> Tables<'a, 'gc> {
     }
 }
 
-/// A key of an external table, as its host sees it.
+/// A key of an external table, in the form that is passed to the host.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Key<'a> {
     String(&'a str),
     Symbol(&'a str),
-    /// A fixnum.
+    /// An integer that fits in an `i64`.
     Integer(i64),
     Float(f64),
     Char(char),
     Boolean(bool),
 }
 
-/// What a host answers when it does not take a key or a value it is asked to set.
+/// The error that a host returns when it rejects a key or a value passed to `set`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Refused;
 
-/// A table whose entries the host holds. See the [module docs](self) for what the arena does with
-/// one and what the host promises.
+/// A table whose entries are owned by the host. See the [module docs](self) for what the arena
+/// does with an external table and what the host promises.
 ///
 /// A type is read-only unless it sets [`ExternalTable::WRITABLE`]. A read-only type implements
-/// `len`, `has`, `get` and `keys`, and leaves the rest as they are.
+/// `len`, `has`, `get` and `keys`, and keeps the default implementations of the other methods.
 pub trait ExternalTable: 'static {
-    /// Whether programs can change the table. It is read once, when the table is made.
+    /// Whether programs can modify the table. It is read once, when the table is created.
     const WRITABLE: bool = false;
 
-    /// The number of entries.
+    /// Returns the number of entries.
     fn len(&self) -> usize;
 
-    /// Whether there are no entries.
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Whether there is an entry for `key`.
+    /// Returns whether there is an entry for `key`.
     fn has(&self, key: Key<'_>) -> bool;
 
-    /// The value of `key`, made in the arena, or `None` if there is no such entry.
+    /// Returns the value of `key`, allocated in the arena, or `None` if there is no such entry.
     fn get<'gc>(&self, mc: &Mutation<'gc>, key: Key<'_>) -> Result<Option<Value<'gc>>, Error>;
 
-    /// Every key, once each.
+    /// Returns an iterator over every key. Each key is yielded once.
     fn keys(&self) -> impl Iterator<Item = Key<'_>>;
 
-    /// Sets the value of `key`. The host reads what it needs out of `value` now: it cannot keep
-    /// the value itself.
+    /// Returns an iterator over every entry, as a key and its value. Each entry is yielded once,
+    /// in the order of [`ExternalTable::keys`]. Each value is the value that
+    /// [`ExternalTable::get`] returns for its key.
+    ///
+    /// Returns `None` if the host cannot iterate its entries more efficiently than by calling
+    /// `keys` and then `get` for each key. That is the default, and the arena then does exactly
+    /// that. A host that has each value available while it iterates its entries should implement
+    /// this method. An iteration then calls the host once, instead of once more for every entry.
+    fn entries<'gc>(&self, mc: &Mutation<'gc>) -> Option<impl Iterator<Item = Result<(Key<'_>, Value<'gc>), Error>>> {
+        let _ = mc;
+        None::<std::iter::Empty<Result<(Key<'_>, Value<'gc>), Error>>>
+    }
+
+    /// Sets the value of `key`. The host must copy the data it needs out of `value` during the
+    /// call. It cannot keep `value` itself.
     fn set<'gc>(&mut self, mc: &Mutation<'gc>, key: Key<'_>, value: Value<'gc>) -> Result<(), Refused> {
         let _ = (mc, key, value);
         Err(Refused)
@@ -570,13 +679,15 @@ pub trait ExternalTable: 'static {
     fn clear(&mut self) {}
 }
 
-/// An [`ExternalTable`] with its type forgotten, as a table object keeps it.
+/// A type-erased [`ExternalTable`], as stored in a table object.
 pub(crate) trait Hosted: 'static {
     fn count(&self) -> usize;
     fn contains(&self, key: Key<'_>) -> bool;
     fn fetch<'gc>(&self, mc: &Mutation<'gc>, key: Key<'_>) -> Result<Option<Value<'gc>>, Error>;
-    /// Appends every key, as a value of the arena, to `keys`.
-    fn list<'gc>(&self, mc: &Mutation<'gc>, keys: &mut Vec<Value<'gc>>) -> Result<(), Error>;
+    /// Appends every key to `listed`, as an arena value. If the host implements
+    /// [`ExternalTable::entries`], each key is followed by its value, and this returns `true`.
+    /// Otherwise this returns `false`.
+    fn list<'gc>(&self, mc: &Mutation<'gc>, listed: &mut Vec<Value<'gc>>) -> Result<bool, Error>;
     fn store<'gc>(&mut self, mc: &Mutation<'gc>, key: Key<'_>, value: Value<'gc>) -> Result<(), Refused>;
     fn remove(&mut self, key: Key<'_>) -> bool;
     fn empty(&mut self);
@@ -596,11 +707,18 @@ impl<T: ExternalTable> Hosted for T {
         self.get(mc, key)
     }
 
-    fn list<'gc>(&self, mc: &Mutation<'gc>, keys: &mut Vec<Value<'gc>>) -> Result<(), Error> {
-        for key in self.keys() {
-            keys.push(key.value(mc)?);
+    fn list<'gc>(&self, mc: &Mutation<'gc>, listed: &mut Vec<Value<'gc>>) -> Result<bool, Error> {
+        if let Some(entries) = self.entries(mc) {
+            for entry in entries {
+                let (key, value) = entry?;
+                listed.extend([key.value(mc)?, value]);
+            }
+            return Ok(true);
         }
-        Ok(())
+        for key in self.keys() {
+            listed.push(key.value(mc)?);
+        }
+        Ok(false)
     }
 
     fn store<'gc>(&mut self, mc: &Mutation<'gc>, key: Key<'_>, value: Value<'gc>) -> Result<(), Refused> {
@@ -621,7 +739,7 @@ impl<T: ExternalTable> Hosted for T {
 }
 
 impl Key<'_> {
-    /// The key as a value of the arena.
+    /// Returns the key as an arena value.
     fn value<'gc>(self, mc: &Mutation<'gc>) -> Result<Value<'gc>, Error> {
         let strings = Strings::new(mc);
         Ok(match self {
@@ -644,26 +762,73 @@ impl Key<'_> {
     }
 }
 
-/// A key of the arena as a host can take it, with the characters of a string or a symbol's name
-/// copied out, since the arena holds them in its own way.
+/// The longest text, in UTF-8 bytes, that a [`Text`] holds without allocating.
+const SHORT: usize = 40;
+
+/// The text of a string or of a symbol's name, copied out of the arena as UTF-8.
+///
+/// Arena strings are packed, so a host cannot borrow their characters. Text of up to [`SHORT`]
+/// bytes is copied into the value itself. Longer text is copied into a `String`.
+struct Text {
+    short: [u8; SHORT],
+    len: usize,
+    /// The whole text if it is longer than [`SHORT`] bytes. It is empty otherwise.
+    long: String,
+}
+
+impl Text {
+    fn copy(shown: impl fmt::Display) -> Self {
+        let mut text = Self { short: [0; SHORT], len: 0, long: String::new() };
+        write!(text, "{shown}").expect("copying text into memory does not fail");
+        text
+    }
+
+    fn as_str(&self) -> &str {
+        if self.long.is_empty() {
+            std::str::from_utf8(&self.short[..self.len]).expect("only whole strings are copied in")
+        } else {
+            &self.long
+        }
+    }
+}
+
+impl fmt::Write for Text {
+    fn write_str(&mut self, part: &str) -> fmt::Result {
+        if !self.long.is_empty() {
+            self.long.push_str(part);
+        } else if let Some(room) = self.short.get_mut(self.len..self.len + part.len()) {
+            room.copy_from_slice(part.as_bytes());
+            self.len += part.len();
+        } else {
+            let start = std::str::from_utf8(&self.short[..self.len]).map_err(|_| fmt::Error)?;
+            self.long.reserve(start.len() + part.len());
+            self.long.push_str(start);
+            self.long.push_str(part);
+        }
+        Ok(())
+    }
+}
+
+/// An arena key in the form that a host accepts. The text of a string or of a symbol's name is
+/// copied out of the arena.
 enum HostKey {
-    String(String),
-    Symbol(String),
+    String(Text),
+    Symbol(Text),
     Plain(Key<'static>),
 }
 
 impl HostKey {
-    /// `key` for the host, or `None` if it is of a kind no external table has.
+    /// Converts `key` for the host. Returns `None` if `key` is of a kind that no external table accepts.
     fn of<'gc>(mc: &Mutation<'gc>, key: Value<'gc>) -> Option<Self> {
         if let Some(number) = key.as_fixnum() {
             return Some(Self::Plain(Key::Integer(number)));
         }
         let strings = Strings::new(mc);
         if let Some(symbol) = Symbol::of(key) {
-            return Some(Self::Symbol(string::display(&strings, symbol.name(mc)).to_string()));
+            return Some(Self::Symbol(Text::copy(string::display(&strings, symbol.name(mc)))));
         }
         if let Some(text) = strings.string(key) {
-            return Some(Self::String(string::display(&strings, text).to_string()));
+            return Some(Self::String(Text::copy(string::display(&strings, text))));
         }
         if let Some(character) = key.as_char() {
             return Some(Self::Plain(Key::Char(character)));
@@ -674,19 +839,22 @@ impl HostKey {
         if key.is_flonum() {
             return key.as_flonum(mc).map(|number| Self::Plain(Key::Float(number)));
         }
-        None
+        // An integer outside the fixnum range that still fits in an `i64`.
+        let nums = Nums::new(mc);
+        let number = int::to_i64(&nums, nums.integer(key)?)?;
+        Some(Self::Plain(Key::Integer(number)))
     }
 
     fn key(&self) -> Key<'_> {
         match self {
-            Self::String(text) => Key::String(text),
-            Self::Symbol(name) => Key::Symbol(name),
+            Self::String(text) => Key::String(text.as_str()),
+            Self::Symbol(name) => Key::Symbol(name.as_str()),
             Self::Plain(key) => *key,
         }
     }
 }
 
-/// A table whose entries are with the host.
+/// A table whose entries are owned by the host.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Outside<'gc>(Gc<'gc, objects::ExternTable>);
 
@@ -695,12 +863,12 @@ impl<'gc> Outside<'gc> {
         self.0.host(mc).and_then(|host| host.try_borrow().ok()).map_or(0, |host| host.count())
     }
 
-    /// The values read so far, in a table that is made at the first read.
+    /// Returns the memo table, which caches the values read from the host so far. Creates it if it does not exist yet.
     fn memo(self, mc: &Mutation<'gc>) -> Result<Inside<'gc>, Error> {
         if let Some(memo) = self.0.memo(mc) {
             return Ok(Inside(memo));
         }
-        let Kept::Inside(memo) = Tables::new(mc).make()?.0 else { unreachable!("a made table is in the arena") };
+        let memo = Tables::new(mc).inside(0)?;
         self.0.set_memo(mc, Some(memo.0));
         Ok(memo)
     }
@@ -715,7 +883,7 @@ impl<'gc> Outside<'gc> {
         let Ok(host) = host.try_borrow() else { return Ok(None) };
         let Some(value) = host.fetch(mc, host_key.key())? else { return Ok(None) };
         drop(host);
-        // Only values that are there are kept. A key that is not there is asked for again, so that asking for keys without end cannot fill the arena.
+        // Only present keys are cached. A missing key is requested from the host again on every read. Otherwise a program could fill the arena by reading an unbounded number of missing keys.
         self.memo(mc)?.set(mc, key, value)?;
         Ok(Some(value))
     }
@@ -737,8 +905,9 @@ impl<'gc> Outside<'gc> {
         let (Some(host_key), Some(host)) = (HostKey::of(mc, key), self.0.host(mc)) else { return Err(TableError::Refused) };
         host.try_borrow_mut().map_err(|_| TableError::Refused)?.store(mc, host_key.key(), value).map_err(|Refused| TableError::Refused)?;
         self.0.set_walk(mc, None);
-        // The value the program gave is the one it reads back, as from a table in the arena.
-        Ok(self.memo(mc)?.set(mc, key, value)?)
+        // Cache the value that the program stored. A later read then returns that same value, as it does for a table in the arena.
+        self.memo(mc)?.set(mc, key, value)?;
+        Ok(())
     }
 
     fn delete(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<bool, TableError> {
@@ -766,50 +935,72 @@ impl<'gc> Outside<'gc> {
         Ok(())
     }
 
-    /// The keys and values in the host's order, a key and then its value. They are read from the
-    /// host once, and kept until the table is next written.
+    /// Returns the keys and values in the host's order, as alternating key and value slots. They
+    /// are read from the host once and cached until the next write to the table.
     fn walk(self, mc: &Mutation<'gc>) -> Result<Slots<'gc>, Error> {
         if let Some(walk) = self.0.walk(mc) {
             return Ok(walk.items(mc));
         }
-        let mut keys = Vec::new();
-        if let Some(host) = self.0.host(mc).and_then(|host| host.try_borrow().ok()) {
-            host.list(mc, &mut keys)?;
+        let mut listed = Vec::new();
+        let mut with_values = false;
+        if let Some(host) = self.0.host(mc) {
+            let Ok(host) = host.try_borrow() else {
+                // The host is mutably borrowed by a write in progress, so it cannot be read. Return an empty walk without caching it. The next walk then reads from the host again.
+                return Ok(objects::TableEntries::new(mc, 0, Value::BROKEN)?.items(mc));
+            };
+            with_values = host.list(mc, &mut listed)?;
         }
-        let mut pairs = Vec::with_capacity(2 * keys.len());
-        for key in keys {
-            // A key the host lists and then has no value for is left out.
-            if let Some(value) = self.get(mc, key)? {
-                pairs.extend([key, value]);
-            }
-        }
-        let walk = objects::TableEntries::new(mc, pairs.len(), Value::BROKEN)?;
+        let slots = if with_values { listed.len() } else { 2 * listed.len() };
+        let walk = objects::TableEntries::new(mc, slots, Value::BROKEN)?;
         let items = walk.items(mc);
-        for (place, &value) in pairs.iter().enumerate() {
-            items.set(mc, place, value);
+        let mut place = 0;
+        if with_values {
+            let memo = self.memo(mc)?;
+            for &[key, given] in listed.as_chunks::<2>().0 {
+                // A value that is already cached takes precedence over the value the host just returned, so that a nested table keeps its identity. Any other value is cached as returned.
+                let value = match memo.get(mc, key)? {
+                    Some(known) => known,
+                    None => {
+                        memo.set(mc, key, given)?;
+                        given
+                    }
+                };
+                items.set(mc, place, key);
+                items.set(mc, place + 1, value);
+                place += 2;
+            }
+        } else {
+            for key in listed {
+                // Skip a key that the host lists but returns no value for. The two slots reserved for it stay unused at the end of the walk.
+                if let Some(value) = self.get(mc, key)? {
+                    items.set(mc, place, key);
+                    items.set(mc, place + 1, value);
+                    place += 2;
+                }
+            }
         }
         self.0.set_walk(mc, Some(walk));
         Ok(items)
     }
 }
 
-/// New arrays for a table, and the views of them.
+/// Newly allocated arrays for a table, with the slot views of both.
 struct Fresh<'gc> {
     index: Gc<'gc, objects::TableIndex>,
     entries: Gc<'gc, objects::TableEntries>,
     parts: Parts<'gc>,
 }
 
-/// Empty arrays with room for `need` entries at half full or less.
+/// Allocates empty arrays with room for `need` entries, so that the index is at most half full.
 fn arrays<'gc>(mc: &Mutation<'gc>, need: usize) -> Result<Fresh<'gc>, Error> {
     let slots = need.checked_mul(2).and_then(usize::checked_next_power_of_two).ok_or_else(|| mc.out_of_memory())?.max(MIN_SLOTS);
     let index = objects::TableIndex::new(mc, slots, 0)?;
-    // Three quarters of the slots can be taken, so a probe always ends at a slot never used.
+    // The entries array has room for three quarters as many entries as the index has slots. So the index always has a slot that was never used, and every probe ends there.
     let entries = objects::TableEntries::new(mc, 2 * (slots / 4 * 3), Value::BROKEN)?;
     Ok(Fresh { index, entries, parts: Parts { index: index.items(mc), entries: entries.items(mc) } })
 }
 
-/// The two arrays of a table.
+/// The slot views of a table's two arrays.
 #[derive(Clone, Copy)]
 struct Parts<'gc> {
     index: Slots<'gc, slot::u64>,
@@ -817,18 +1008,18 @@ struct Parts<'gc> {
 }
 
 impl<'gc> Parts<'gc> {
-    /// The number of entries the arrays have room for.
+    /// Returns the number of entries that the arrays have room for.
     fn room(self) -> usize {
         self.entries.len() / 2
     }
 
-    /// The number of the live entry whose key is `key`, which hashes to `hash`.
+    /// Returns the number of the live entry whose key is `key`, or `None` if there is none. `hash` is the hash of `key`.
     #[inline]
     fn find(self, mc: &Mutation<'gc>, key: Value<'gc>, hash: u64) -> Result<Option<usize>, Error> {
         let mask = self.index.len().wrapping_sub(1);
         let tag = hash >> 32;
         let mut at = hash as usize & mask;
-        // An index whose words were damaged may have no unused slot, so a probe stops after one lap.
+        // A corrupted index may have no unused slot. So the probe stops after one pass over the index.
         for _ in 0..self.index.len() {
             let word = self.index.get(at);
             if word == 0 {
@@ -860,19 +1051,19 @@ impl<'gc> Parts<'gc> {
     }
 }
 
-/// A key's hash, and whether it depends on where the key is.
+/// A key's hash. `by_place` is whether the hash was computed from the key's object word, which changes when a collection moves the object.
 struct Hashed {
     hash: u64,
     by_place: bool,
 }
 
-/// Hashes `key` so that keys that are [`same`] hash the same.
+/// Hashes `key`. Two keys that are the same key under [`same`] have the same hash.
 #[inline]
 fn hash<'gc>(mc: &Mutation<'gc>, seed: u64, key: Value<'gc>) -> Result<Hashed, Error> {
     if key.is_fixnum() {
         return Ok(Hashed { hash: mix(key.to_bits() ^ seed), by_place: false });
     }
-    // A symbol keeps the hash of its name, which the arena's seed went into.
+    // A symbol stores the hash of its name, which is already seeded with the arena's seed.
     if let Some(symbol) = Symbol::of(key) {
         return Ok(Hashed { hash: mix(symbol.hash(mc) ^ SYMBOL), by_place: false });
     }
@@ -883,8 +1074,9 @@ fn hash<'gc>(mc: &Mutation<'gc>, seed: u64, key: Value<'gc>) -> Result<Hashed, E
     Ok(hash_other(mc, seed, key))
 }
 
-/// Hashes a key that is no fixnum, symbol or string: a number by its value, an external
-/// reference as its kind says, anything else by its word, which for an object says where it is.
+/// Hashes a key that is not a fixnum, symbol or string. A number is hashed by its value. An
+/// external reference is hashed as its kind specifies. Any other key is hashed by its value word,
+/// which for an object holds the object's index in the arena.
 #[inline(never)]
 fn hash_other<'gc>(mc: &Mutation<'gc>, seed: u64, key: Value<'gc>) -> Hashed {
     let nums = Nums::new(mc);
@@ -899,21 +1091,22 @@ fn hash_other<'gc>(mc: &Mutation<'gc>, seed: u64, key: Value<'gc>) -> Hashed {
     Hashed { hash: mix(key.to_bits() ^ seed), by_place: key.object_parts().is_some() }
 }
 
-/// Whether `held` and `key` are the same key. See the [module docs](self).
+/// Returns whether `held` and `key` are the same key. See the [module docs](self).
 #[inline]
 fn same<'gc>(mc: &Mutation<'gc>, held: Value<'gc>, key: Value<'gc>) -> Result<bool, Error> {
     if held == key {
         return Ok(true);
     }
-    // Two fixnums of different words differ, and a fixnum is no other kind of number's equal.
+    // Two fixnums with different words are different numbers. A fixnum is also never the same key as a number of any other kind.
     if held.is_fixnum() || key.is_fixnum() {
         return Ok(false);
     }
     same_contents(mc, held, key)
 }
 
-/// Whether two values of different words are strings of the same characters, numbers of the
-/// same value and exactness, or external references their kind says are equal.
+/// Compares two values that have different words. Returns whether they are strings with the
+/// same characters, numbers with the same value and exactness, or external references that
+/// their kind reports as equal.
 #[inline(never)]
 fn same_contents<'gc>(mc: &Mutation<'gc>, held: Value<'gc>, key: Value<'gc>) -> Result<bool, Error> {
     let strings = Strings::new(mc);
@@ -930,14 +1123,14 @@ fn same_contents<'gc>(mc: &Mutation<'gc>, held: Value<'gc>, key: Value<'gc>) -> 
     }
 }
 
-/// Mixes a word so that every bit of it reaches both halves of the result.
+/// Mixes `word` so that every bit of it affects both halves of the result.
 #[inline]
 fn mix(word: u64) -> u64 {
     let product = u128::from(word) * 0x9E37_79B9_7F4A_7C15;
     (product >> 64) as u64 ^ product as u64
 }
 
-/// A hasher of the words that make up a number.
+/// A [`Hasher`] over the words that make up a number.
 struct Mixer(u64);
 
 impl Hasher for Mixer {

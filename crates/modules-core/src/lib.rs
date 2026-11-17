@@ -1,9 +1,11 @@
-//! Ragwort's languages together: modules whose files are in any of them, and the prelude, which
-//! Scheme is built on.
+//! Combines ragwort's languages. This crate builds modules whose files can be written in different
+//! languages, and it builds the prelude, which Scheme is built on.
 //!
-//! A module's files, each in the language the embedder says, are one body: each file's code
-//! refers to what the others define at the top level by name, but for what a Scheme macro defines
-//! hygienically, and a module provides what any of them define.
+//! The embedder states the language of each file. The files of a module make up one body:
+//!
+//! - Code in one file can refer by name to the top-level definitions of the other files.
+//! - The exception is a definition that a Scheme macro introduces hygienically. Other files cannot refer to it.
+//! - A module can provide a definition from any of its files.
 
 pub mod image;
 
@@ -25,9 +27,9 @@ use ragwort_vm::objects::Module;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Read(ReadError),
-    /// What's wrong with a Scheme file's code.
+    /// An error in the code of a Scheme file.
     Expand(ExpandError),
-    /// What's wrong with a native file's code.
+    /// An error in the code of a native file.
     Lower(LowerError),
     Compile(CompileError),
 }
@@ -52,7 +54,7 @@ impl From<LowerError> for Error {
 
 impl From<CompileError> for Error {
     fn from(error: CompileError) -> Self {
-        // The compiler resolves the top-level names of native forms, and reports a misused one as the lowerer would.
+        // The compiler resolves the top-level names of native forms. Its error about a misused name is reported as a lowering error.
         match LowerError::located(error) {
             Some(lower) => Error::Lower(lower),
             None => Error::Compile(error),
@@ -76,7 +78,7 @@ impl From<ragwort_native::Error> for Error {
     }
 }
 
-/// Builds the [`PRELUDE`]'s module, whose forms are to run before any Scheme is loaded.
+/// Builds the module of the [`PRELUDE`]. Its forms must run before any Scheme code is loaded.
 pub fn prelude<'gc>(mc: &Mutation<'gc>, symbols: Symbols<'gc>) -> Result<Loaded<'gc>, Error> {
     let session = SyntaxSession::named(mc, "prelude", PRELUDE).map_err(|error| LowerError::from(ragwort_types::Error::from(error)))?;
     Ok(ragwort_native::load(mc, symbols, PRELUDE_NAME, &[], &[&session], &mut NoModules)?)
@@ -89,7 +91,7 @@ pub enum Language {
     Native,
 }
 
-/// A file of a module, and its language, which only the embedder says.
+/// A file of a module and its language. Only the embedder decides the language.
 #[derive(Clone, Copy)]
 pub struct File<'s> {
     pub language: Language,
@@ -99,14 +101,14 @@ pub struct File<'s> {
 /// A module to build.
 ///
 /// - `name`: the module's name.
-/// - `hosts`: the host functions its native files call.
+/// - `hosts`: the host functions that its native files can call.
 /// - `files`: its files, in order.
-/// - `implicit`: the modules it requires implicitly, after the prelude. What each of them
-///   exports shadows what those before it do, and what the module defines or requires shadows
-///   them all.
+/// - `implicit`: the modules that it requires implicitly, after the prelude. The exports of each
+///   module shadow the exports of the modules before it. The module's own definitions and
+///   requires shadow all of them.
 /// - `internals`: whether its native files can name
 ///   [internal intrinsics](ragwort_vm::Intrinsic::is_internal) in an `%intrinsic`. Leave it
-///   `false` unless the embedder wrote the module itself: see [`Lowerer::new`].
+///   `false` unless the embedder wrote the module itself. See [`Lowerer::new`].
 pub struct Source<'a, 'gc> {
     pub name: &'a str,
     pub hosts: &'static [HostDef],
@@ -121,17 +123,17 @@ enum Form<'gc> {
     Native(Item<'gc>),
 }
 
-/// A [`load`] that failed: what's wrong, and which of the module's files it's in, by its place in
-/// [`Source::files`]. There's no file for what's wrong with what the module provides as a whole.
+/// The error of a failed [`load`], and the file that the error is in. `file` is an index into
+/// [`Source::files`]. It is `None` for an error that belongs to no single file, such as an error in the module's exports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Located {
     pub error: Error,
     pub file: Option<usize>,
 }
 
-/// Builds the module `source` describes, interning names in `symbols`, and compiles each of its
-/// forms. It requires the `prelude` module, which has run, implicitly, and the modules `resolver`
-/// finds as it says.
+/// Builds the module that `source` describes and compiles each of its forms. Names are interned in `symbols`.
+/// The module implicitly requires `prelude`, which must already have run. `resolver` finds the modules
+/// that the code requires explicitly.
 pub fn load<'gc>(
     mc: &Mutation<'gc>,
     symbols: Symbols<'gc>,
@@ -142,7 +144,7 @@ pub fn load<'gc>(
     load_located(mc, symbols, prelude, source, resolver).map_err(|failed| failed.error)
 }
 
-/// As [`load`], saying which file an error is in.
+/// Works like [`load`], but the error also says which file it is in.
 pub fn load_located<'gc>(
     mc: &Mutation<'gc>,
     symbols: Symbols<'gc>,
@@ -154,7 +156,7 @@ pub fn load_located<'gc>(
     load_from(mc, symbols, prelude, source, resolver, &mut file).map_err(|error| Located { error, file })
 }
 
-/// [`load`], keeping in `at` the file whose code it's working on.
+/// Implements [`load`]. While it works on the code of one file, `at` holds that file's index. Otherwise `at` is `None`.
 fn load_from<'gc>(
     mc: &Mutation<'gc>,
     symbols: Symbols<'gc>,

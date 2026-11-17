@@ -13,8 +13,8 @@
 //!    `L2` to `L3` and keeps each `Set`. The second phase, which runs after contification, moves a mutated variable
 //!    into an explicit heap box (`MakeBox`, `Unbox`, `SetBox`) only if it cannot stay in a frame register, for
 //!    example because a closure captures it. Every other mutated variable stays in its register.
-//! 5. `contify`: Contification pass (`L3 -> L3`), converting local functions called exclusively from tail position
-//!    at a single call site (including self-recursive loops) into in-frame control-flow joins (`L3::Join` / `L3::Jump`).
+//! 5. `contify`: Contification pass (`L3 -> L3`), converting local functions whose calls all return to the same
+//!    point (including self-recursive loops) into in-frame control-flow joins (`L3::Join` / `L3::Jump`).
 //! 6. `closure`: Closure conversion (`L3 -> L4`), resolving lexical variable references into [`ir::VarRef::Local`]
 //!    versus [`ir::VarRef::Upvalue`] and computing each closure's upvalue capture table.
 //! 7. `l5`: Lowers each function into a control flow graph of basic blocks in SSA form (`L4 -> L5`). Debug builds
@@ -181,7 +181,7 @@ pub struct Lambda<'gc> {
     pub body: Box<Core<'gc>>,
     /// The symbol the lambda is bound to by the definition or binding form that created it, if any. Error reports show it as the procedure's name.
     pub name: Option<Value<'gc>>,
-    /// Where the lambda's source form starts, if a front end read it from source. Error reports show it as the procedure's location.
+    /// The position where the lambda's source form starts, if a front end read it from source. Error reports show it as the procedure's location.
     pub at: Option<Position<'gc>>,
 }
 
@@ -227,34 +227,34 @@ impl Core<'_> {
 
     /// Extracts non-leaf child expressions from `self` and pushes them onto `out`, replacing them with leaf placeholder nodes.
     fn take_parts(&mut self, out: &mut std::vec::Vec<Self>) {
-        let mut take = |part: &mut Self| {
+        fn take<'gc>(part: &mut Core<'gc>, out: &mut std::vec::Vec<Core<'gc>>) {
             if !part.is_leaf() {
                 out.push(std::mem::replace(part, Core::Quote(Value::VOID)));
             }
-        };
+        }
         match self {
             Core::Quote(_) | Core::Ref(_) | Core::Import(_) | Core::Global(..) => {}
-            Core::If(test, consequent, other) => [test, consequent, other].into_iter().for_each(|part| take(part)),
+            Core::If(test, consequent, other) => [test, consequent, other].into_iter().for_each(|part| take(part, out)),
             Core::Let(binds, body) | Core::Letrec(binds, body) => {
-                binds.iter_mut().for_each(|(_, init)| take(init));
-                take(body);
+                binds.iter_mut().for_each(|(_, init)| take(init, out));
+                take(body, out);
             }
-            Core::Set(_, value) => take(value),
+            Core::Set(_, value) => take(value, out),
             Core::App(function, args, _) => {
-                take(function);
-                args.iter_mut().for_each(take);
+                take(function, out);
+                args.iter_mut().for_each(|arg| take(arg, out));
             }
-            Core::SetGlobal(_, value, _) => take(value),
-            Core::Lambda(lambda) => take(&mut lambda.body),
+            Core::SetGlobal(_, value, _) => take(value, out),
+            Core::Lambda(lambda) => take(&mut lambda.body, out),
             Core::OptionalLambda(lambda) => {
-                lambda.params.iter_mut().filter_map(|formal| formal.default.as_mut()).for_each(&mut take);
-                take(&mut lambda.body);
+                lambda.params.iter_mut().filter_map(|formal| formal.default.as_mut()).for_each(|default| take(default, out));
+                take(&mut lambda.body, out);
             }
             Core::KeywordApp(function, args, _) => {
-                take(function);
-                args.iter_mut().for_each(|arg| take(&mut arg.value));
+                take(function, out);
+                args.iter_mut().for_each(|arg| take(&mut arg.value, out));
             }
-            Core::Intrinsic(_, args, _) | Core::ApplyIntrinsic(_, args, _) => args.iter_mut().for_each(take),
+            Core::Intrinsic(_, args, _) | Core::ApplyIntrinsic(_, args, _) => args.iter_mut().for_each(|arg| take(arg, out)),
         }
     }
 }
@@ -293,11 +293,11 @@ pub enum CompileError {
     UnknownHost(&'static HostDef),
     /// Attempted to access a variable slot not present in the target module.
     UnknownSlot(u32),
-    /// The combined count of parameters and spilled local variables exceeded the 2^32 limit.
+    /// A function needs more frame registers than are available. Its optional parameters do not fit in the parameter registers, its parameter counts cannot be encoded, or a group of mutually recursive closures is larger than the scratch registers.
     TooManyRegisters,
     /// A host function call supplied more arguments than can fit into an execution frame.
     TooManyArguments,
-    /// A reference to an import that cannot be used as a value where it appears.
+    /// An import is referenced where it cannot be used as a value.
     Import(module::Unusable),
     /// A module-level name is used incorrectly. The name is at bytes `start..end` of its source.
     Global { kind: GlobalError, start: u32, end: u32 },

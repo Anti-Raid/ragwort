@@ -4,8 +4,8 @@ use std::cmp::Ordering;
 
 use super::{DIGIT_BITS, Digit, Digits, RWDigits, TwoDigits, compare, digit_add, digit_sub};
 
-/// `quotient = x / y` for a single digit `y != 0`, returning `x % y`. `quotient` needs `x` digits, and
-/// may be left out to only get the remainder.
+/// Computes `quotient = x / y` for a single digit `y != 0` and returns `x % y`. `quotient` needs as many digits as `x`.
+/// Pass `None` for `quotient` to compute only the remainder.
 pub fn divide_single(mut quotient: Option<RWDigits<'_>>, x: Digits<'_>, y: Digit) -> Digit {
     assert!(y != 0, "division by zero");
     let mut rem: Digit = 0;
@@ -22,13 +22,13 @@ pub fn divide_single(mut quotient: Option<RWDigits<'_>>, x: Digits<'_>, y: Digit
     rem
 }
 
-/// Scratch digits [`divide`] needs.
+/// Returns the number of scratch digits that [`divide`] needs.
 pub fn divide_scratch(x: Digits<'_>, y: Digits<'_>) -> usize {
     x.normalize().len() + 1 + y.normalize().len()
 }
 
-/// `quotient = x / y` and `remainder = x % y` for `y != 0`, either of which may be left out. `quotient` needs
-/// `x - y + 1` digits and `remainder` needs `y`.
+/// Computes `quotient = x / y` and `remainder = x % y` for `y != 0`. Either output can be `None`. `quotient` needs
+/// `x.len() - y.len() + 1` digits, and `remainder` needs `y.len()` digits.
 pub fn divide(
     quotient: Option<RWDigits<'_>>,
     remainder: Option<RWDigits<'_>>,
@@ -58,7 +58,7 @@ pub fn divide(
     divide_schoolbook(quotient, remainder, x, y, scratch);
 }
 
-/// Knuth's algorithm D, for normalized `x >= y` with at least two digits in `y`.
+/// Divides by Knuth's Algorithm D (TAOCP 4.3.1). `x` and `y` must be normalized, with `x >= y` and at least two digits in `y`.
 fn divide_schoolbook(
     mut quotient: Option<RWDigits<'_>>,
     remainder: Option<RWDigits<'_>>,
@@ -69,7 +69,7 @@ fn divide_schoolbook(
     let (n, excess) = (y.len(), x.len() - y.len());
     let (mut dividend, divisor) = scratch.split(x.len() + 1);
     let mut divisor = divisor.truncate(n);
-    // Shift so the divisor's top bit is set, which keeps each quotient guess within 2.
+    // Normalize: shift both operands left so that the top bit of the divisor is set. Then each quotient digit estimate is at most 2 too large.
     let shift = y.msd().leading_zeros() as usize;
     shift_into(divisor.reborrow(), y, shift);
     let top_bits = shift_into(dividend.reborrow(), x, shift);
@@ -88,7 +88,7 @@ fn divide_schoolbook(
                 break;
             }
         }
-        // u[j..=j + n] -= qhat * v
+        // Multiply and subtract: `dividend[j..=j + n] -= qhat * divisor`.
         let (mut carry, mut borrow) = (0 as Digit, 0 as Digit);
         for i in 0..n {
             let product = qhat * divisor.at(i) as TwoDigits + carry as TwoDigits;
@@ -97,7 +97,7 @@ fn divide_schoolbook(
         }
         let negative = dividend.put(j + n, digit_sub(dividend.at(j + n), carry, borrow));
         if negative != 0 {
-            // The guess was one too big, which is rare: add the divisor back.
+            // The estimate was one too large, which is rare. Add the divisor back.
             qhat -= 1;
             let mut add_carry = 0;
             for i in 0..n {
@@ -110,12 +110,12 @@ fn divide_schoolbook(
         }
     }
     if let Some(mut remainder) = remainder {
-        // The remainder is below the divisor, so it fits in `n` digits.
+        // The remainder is less than the divisor, so it fits in `n` digits. The right shift undoes the normalization.
         super::right_shift(remainder.reborrow(), dividend.read().slice(0, n), shift);
     }
 }
 
-/// `z = x << shift` for `shift < DIGIT_BITS` into `x` digits, returning the bits shifted out.
+/// Computes `z = x << shift` for `shift < DIGIT_BITS`, keeping `x.len()` digits. Returns the bits shifted out of the top digit.
 fn shift_into(mut z: RWDigits<'_>, x: Digits<'_>, shift: usize) -> Digit {
     if shift == 0 {
         z.copy_from(x);
@@ -129,7 +129,7 @@ fn shift_into(mut z: RWDigits<'_>, x: Digits<'_>, shift: usize) -> Digit {
     carry
 }
 
-/// The work [`divide`] does, in digit operations.
+/// Returns the cost of [`divide`], in digit operations.
 pub fn divide_cost(x: Digits<'_>, y: Digits<'_>) -> u64 {
     let (x, y) = (x.normalize().len() as u64, y.normalize().len() as u64);
     x.saturating_sub(y).saturating_add(1).saturating_mul(y.max(1))

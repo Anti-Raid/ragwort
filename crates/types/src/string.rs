@@ -1,8 +1,10 @@
-//! Strings in the arena, for `ragwort-string`: flat strings of up to [`INLINE_CHARS`] Latin-1
-//! characters in the value word; longer ones as [`Str8`], [`Str16`] or [`Str32`] objects, by
-//! their widest character, with the characters packed into their items; ropes as [`Rope`]
-//! objects; and flat strings whose characters the program running the arena owns, as
-//! [`Extern`] objects.
+//! Strings in the arena, for `ragwort-string`. A string is stored in one of these ways:
+//!
+//! - A flat string of up to [`INLINE_CHARS`] Latin-1 characters is stored inline in the value word.
+//! - A longer flat string is a [`Str8`], [`Str16`] or [`Str32`] object, chosen by its widest
+//!   character. The characters are packed into the object's items.
+//! - A rope is a [`Rope`] object.
+//! - A flat string whose characters are owned by the host is an [`Extern`] object.
 
 pub use ragwort_string::*;
 
@@ -14,27 +16,28 @@ use crate::gc::{INLINE_STRING, Mutation, TAG, Value};
 mod tests;
 
 crate::gc::objects! {
-    /// Every kind of string.
+    /// Every kind of string object.
     pub kind Text after crate::gc::table::Containers;
 
-    /// A flat string of `chars` characters up to U+00FF, eight to an item.
+    /// A flat string of `chars` characters, none above U+00FF, packed eight to an item.
     pub struct Str8 { chars: u64 } items u64
-    /// A flat string of characters up to U+FFFF, one above U+00FF at least, four to an item.
+    /// A flat string of characters, none above U+FFFF and at least one above U+00FF, packed four to an item.
     pub struct Str16 { chars: u64 } items u64
-    /// A flat string with a character above U+FFFF, two to an item.
+    /// A flat string with at least one character above U+FFFF, packed two to an item.
     pub struct Str32 { chars: u64 } items u64
-    /// Two nonempty strings, one after the other, and what `Info` says of them, packed. Once
-    /// flattened it keeps the flat copy, `#f` until then, and counts reads by position.
+    /// The concatenation of two nonempty strings, `left` then `right`. `info` is the packed `Info`
+    /// of the rope. `flat` is the flat copy once the rope has been flattened, and `#f` until then.
+    /// `reads` counts the reads of the rope by character index.
     pub struct Rope { left: Value, right: Value, info: u64, flat: Value, reads: u64 }
-    /// A flat string whose characters live outside the arena, dropped once nothing reaches it.
+    /// A flat string whose characters are stored outside the arena, in `owner`. `owner` is dropped once the string is unreachable.
     pub struct Extern { owner: Frozen<Box<dyn External>> }
 }
 
-/// Shorter externals are copied: keeping them outside costs more than their characters.
+/// External strings of fewer bytes than this are copied into the arena. Keeping them outside would cost more than their characters.
 const COPY_EXTERNAL: usize = 64;
 
-/// Strings of up to this many Latin-1 characters live in the value word, so making one
-/// allocates nothing, and equal ones are the same value.
+/// A string of up to this many Latin-1 characters is stored inline in the value word. Creating
+/// one allocates nothing, and equal inline strings are the same value.
 pub const INLINE_CHARS: usize = 7;
 
 #[inline]
@@ -78,8 +81,9 @@ impl<'a, 'gc> Strings<'a, 'gc> {
         self.mc
     }
 
-    /// A string of characters kept outside the arena, such as an [`ExternalText`], which must
-    /// never change, in number or in value, as no string's do.
+    /// Returns a string whose characters are stored outside the arena, in `chars`, such as an
+    /// [`ExternalText`]. The characters must never change in number or in value, because strings
+    /// are immutable. A string of fewer than 64 bytes is copied into the arena instead.
     pub fn external(&self, chars: impl External) -> Result<Str<'gc>, Error> {
         let units = chars.units();
         check_external(units)?;
@@ -96,7 +100,7 @@ impl<'a, 'gc> Strings<'a, 'gc> {
         matches!(Text::of(string.0), Some(Text::Extern(_)))
     }
 
-    /// `value` as a string, if it is one: read from the type number `value` carries.
+    /// Returns `value` as a string, or `None` if it is not a string. The check reads only the tag and the type number in the value word.
     #[inline]
     pub fn string(&self, value: Value<'gc>) -> Option<Str<'gc>> {
         (is_inline(value) || Text::of(value).is_some()).then_some(Str(value))
@@ -104,7 +108,7 @@ impl<'a, 'gc> Strings<'a, 'gc> {
 }
 
 impl<'gc> Strings<'_, 'gc> {
-    /// Ropes and externals, kept out of line so flat strings' views inline.
+    /// Returns the view of a rope or an external string. It is kept out of line so that the views of flat strings inline.
     #[inline(never)]
     fn view_rest(&self, string: Str<'gc>) -> StrView<'_, Str<'gc>> {
         let mc = self.mc;

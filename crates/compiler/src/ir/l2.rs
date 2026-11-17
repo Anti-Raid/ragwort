@@ -89,7 +89,7 @@ impl<'id, 'gc> L2<'id, 'gc> {
         (kind.fields(mc) as usize == values.len()).then_some((kind, args))
     }
 
-    /// Whether evaluating `id` cannot fault or cause side effects.
+    /// Returns whether evaluating `id` cannot fault or cause side effects.
     pub(crate) fn is_pure(&self, mc: &Mutation<'gc>, id: Id<'id>) -> bool {
         let mut todo = vec![id];
         while let Some(id) = todo.pop() {
@@ -117,7 +117,7 @@ impl<'id, 'gc> L2<'id, 'gc> {
         true
     }
 
-    /// Whether any normal return value of `id` is guaranteed not to be false (`#f`, `#nil` or `#none`).
+    /// Returns whether any normal return value of `id` is guaranteed not to be false (`#f`, `#nil` or `#none`).
     pub(crate) fn is_always_truthy(&self, id: Id<'id>) -> bool {
         let mut todo = vec![id];
         while let Some(id) = todo.pop() {

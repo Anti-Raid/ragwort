@@ -12,6 +12,10 @@ fn fix<'gc>(n: i64) -> Value<'gc> {
     Value::fixnum(n).unwrap()
 }
 
+fn text<'gc>(mc: &Mutation<'gc>, content: &str) -> Value<'gc> {
+    string::from_str(&Strings::new(mc), content).unwrap().value()
+}
+
 /// Executes `op.step(cx)` out of line (`#[inline(never)]`). In debug builds, inlining `step` causes every intrinsic implementation's stack frame to accumulate on the caller's stack, causing stack overflow in tests executing long operation sequences.
 #[inline(never)]
 fn step<'gc>(op: Op, cx: &mut Context<'_, 'gc>) -> Result<Control, Fault> {
@@ -128,7 +132,7 @@ fn malformed_bytecode_faults() {
 fn code<'gc>(mc: &Mutation<'gc>, captures: &[Capture]) -> Value<'gc> {
     let ops = mc.frozen(Box::from([Op::Return { src: 0 }])).unwrap();
     let empty = Vectors::new(mc).immutable_from_slice(&[]).unwrap().value(mc);
-    Value::object(mc, objects::Bytecode::new(mc, ops, empty, mc.frozen(Box::from(captures)).unwrap(), 0, None, Value::FALSE, Value::FALSE, 0, Value::FALSE, 0, 0).unwrap())
+    Value::object(mc, objects::Bytecode::new(mc, ops, empty, mc.frozen(Box::from(captures)).unwrap(), 0, None, Value::FALSE, Value::FALSE, 0, Value::FALSE, 0, 0, None).unwrap())
 }
 
 #[test]
@@ -147,12 +151,12 @@ fn closures_capture_registers_upvalues_and_each_other() {
 
         frame.set(0, fix(5));
         assert_eq!(step(Op::NewClosure { dst: 1, count: 2, code: 1 }, &mut cx), Ok(Control::Next));
-        let items = |r: u8| {
-            let upvalues = frame.get(r).downcast::<objects::Closure>(mc).unwrap().items(mc);
+        fn items<'gc>(mc: &Mutation<'gc>, closure: Value<'gc>) -> Vec<Value<'gc>> {
+            let upvalues = closure.downcast::<objects::Closure>(mc).unwrap().items(mc);
             (0..upvalues.len()).map(|i| upvalues.get(i)).collect::<Vec<_>>()
-        };
-        assert_eq!(items(1), [fix(5), fix(11), frame.get(2)]);
-        assert_eq!(items(2), [frame.get(1)]);
+        }
+        assert_eq!(items(mc, frame.get(1)), [fix(5), fix(11), frame.get(2)]);
+        assert_eq!(items(mc, frame.get(2)), [frame.get(1)]);
 
         for op in [
             Op::NewClosure { dst: 1, count: 1, code: 0 },
@@ -182,7 +186,9 @@ fn with_frame(f: impl for<'s, 'gc> FnOnce(&mut Context<'s, 'gc>)) {
 fn intrinsics_run_in_place() {
     with_frame(|cx| {
         let (mc, frame) = (cx.mc, cx.frame);
-        let call = |cx: &mut Context<'_, '_>, base, args, intrinsic| Op::CallIntrinsic { base, args, intrinsic }.step(cx);
+        fn call(cx: &mut Context<'_, '_>, base: u8, args: u8, intrinsic: Intrinsic) -> Result<Control, Fault> {
+            Op::CallIntrinsic { base, args, intrinsic }.step(cx)
+        }
         (0..3).for_each(|i| frame.set(10 + i, fix(i64::from(i) + 1)));
         assert_eq!(call(cx, 10, 3, Intrinsic::Add), Ok(Control::Next));
         assert_eq!(cx.acc, fix(6));
@@ -240,118 +246,129 @@ fn intrinsics_run_in_place() {
 fn equality_goes_as_deep_as_it_should() {
     with_frame(|cx| {
         let (mc, frame) = (cx.mc, cx.frame);
-        let test = |cx: &mut Context<'_, '_>, intrinsic, a, b| {
-            frame.set(27, a);
-            frame.set(28, b);
+        fn test<'gc>(cx: &mut Context<'_, 'gc>, intrinsic: Intrinsic, left: Value<'gc>, right: Value<'gc>) -> bool {
+            cx.frame.set(27, left);
+            cx.frame.set(28, right);
             Op::CallIntrinsic { base: 27, args: 2, intrinsic }.step(cx).unwrap();
             cx.acc == Value::TRUE
-        };
+        }
         let (eqv, equal) = (Intrinsic::Eqv, Intrinsic::Equal);
-        let (strings, pairs, vectors) = (Strings::new(mc), Pairs::new(mc), Vectors::new(mc));
-        let text = |s: &str| string::from_str(&strings, s).unwrap().value();
-        let boxed = |v| Value::object(mc, crate::objects::Box::new(mc, v).unwrap());
-        let big = |n: i64| {
-            let h = ragwort_types::num::Nums::new(mc);
-            let (a, b) = (h.number(fix(Value::MAX_FIXNUM)).unwrap(), h.number(fix(n)).unwrap());
-            ragwort_types::num::complex::add(&h, a, b).unwrap().value()
-        };
+        let vectors = Vectors::new(mc);
+        fn boxed<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Value<'gc> {
+            Value::object(mc, crate::objects::Box::new(mc, value).unwrap())
+        }
+        fn big<'gc>(mc: &Mutation<'gc>, addend: i64) -> Value<'gc> {
+            let nums = ragwort_types::num::Nums::new(mc);
+            let (most, addend) = (nums.number(fix(Value::MAX_FIXNUM)).unwrap(), nums.number(fix(addend)).unwrap());
+            ragwort_types::num::complex::add(&nums, most, addend).unwrap().value()
+        }
 
         // Under `eqv?`, numbers are equivalent if they have identical exactness and numerical value, irrespective of whether they share the same heap object identity (e.g. comparing separately allocated bignums or flonums).
-        assert!(test(cx, eqv, big(1), big(1)) && big(1) != big(1));
-        assert!(!test(cx, eqv, big(1), big(2)));
+        assert!(test(cx, eqv, big(mc, 1), big(mc, 1)) && big(mc, 1) != big(mc, 1));
+        assert!(!test(cx, eqv, big(mc, 1), big(mc, 2)));
         assert!(test(cx, eqv, Value::flonum(mc, 1e300).unwrap(), Value::flonum(mc, 1e300).unwrap()));
         assert!(!test(cx, eqv, fix(2), Value::flonum(mc, 2.0).unwrap()));
         assert!(!test(cx, equal, fix(2), Value::flonum(mc, 2.0).unwrap()));
-        assert!(!test(cx, Intrinsic::Eq, big(1), big(1)));
+        assert!(!test(cx, Intrinsic::Eq, big(mc, 1), big(mc, 1)));
 
         // Strings with equivalent character sequences compare `equal?`, but satisfy `eqv?` only when referencing the exact same heap allocation.
         let long = "a string too long to fit in a value";
-        assert!(!test(cx, eqv, text(long), text(long)));
-        assert!(test(cx, equal, text(long), text(long)));
-        assert!(!test(cx, equal, text(long), text("a string too long to fit in a value!")));
-        assert!(!test(cx, equal, text("1"), fix(1)));
+        assert!(!test(cx, eqv, text(mc, long), text(mc, long)));
+        assert!(test(cx, equal, text(mc, long), text(mc, long)));
+        assert!(!test(cx, equal, text(mc, long), text(mc, "a string too long to fit in a value!")));
+        assert!(!test(cx, equal, text(mc, "1"), fix(1)));
 
         // Structural equality `equal?` compares pairs, mutable/immutable vectors, and boxes by recursively comparing their contents.
-        let list = |items: &[_]| pairs.list(items).unwrap();
-        let tree = |n| list(&[text(long), list(&[big(n), boxed(fix(1))]), vectors.from_slice(&[fix(n), Value::NULL]).unwrap().value(mc)]);
-        assert!(!test(cx, eqv, tree(1), tree(1)));
-        assert!(test(cx, equal, tree(1), tree(1)));
-        assert!(!test(cx, equal, tree(1), tree(2)));
-        assert!(!test(cx, equal, list(&[fix(1), fix(2)]), list(&[fix(1)])));
-        let items = [fix(1), text(long)];
+        fn list<'gc>(mc: &Mutation<'gc>, items: &[Value<'gc>]) -> Value<'gc> {
+            Pairs::new(mc).list(items).unwrap()
+        }
+        fn tree<'gc>(mc: &Mutation<'gc>, long: &str, number: i64) -> Value<'gc> {
+            list(mc, &[text(mc, long), list(mc, &[big(mc, number), boxed(mc, fix(1))]), Vectors::new(mc).from_slice(&[fix(number), Value::NULL]).unwrap().value(mc)])
+        }
+        assert!(!test(cx, eqv, tree(mc, long, 1), tree(mc, long, 1)));
+        assert!(test(cx, equal, tree(mc, long, 1), tree(mc, long, 1)));
+        assert!(!test(cx, equal, tree(mc, long, 1), tree(mc, long, 2)));
+        assert!(!test(cx, equal, list(mc, &[fix(1), fix(2)]), list(mc, &[fix(1)])));
+        let items = [fix(1), text(mc, long)];
         assert!(test(cx, equal, vectors.from_slice(&items).unwrap().value(mc), vectors.immutable_from_slice(&items).unwrap().value(mc)));
         assert!(!test(cx, equal, vectors.from_slice(&items).unwrap().value(mc), vectors.from_slice(&items[..1]).unwrap().value(mc)));
-        assert!(!test(cx, equal, boxed(fix(1)), list(&[fix(1)])));
-        assert!(!test(cx, equal, boxed(fix(1)), boxed(fix(2))));
+        assert!(!test(cx, equal, boxed(mc, fix(1)), list(mc, &[fix(1)])));
+        assert!(!test(cx, equal, boxed(mc, fix(1)), boxed(mc, fix(2))));
 
         // Comparing long lists (200,000 items) and deep left-nested pair spines operates iteratively without consuming host Rust call stack frames.
-        let long_list = || pairs.list(&(0..200_000).map(fix).collect::<Vec<_>>()).unwrap();
-        assert!(test(cx, equal, long_list(), long_list()));
-        let deep = || (0..200_000).fold(Value::NULL, |v, _| pairs.cons(v, Value::NULL).unwrap().value(mc));
-        assert!(test(cx, equal, deep(), deep()));
+        fn long_list<'gc>(mc: &Mutation<'gc>) -> Value<'gc> {
+            Pairs::new(mc).list(&(0..200_000).map(fix).collect::<Vec<_>>()).unwrap()
+        }
+        assert!(test(cx, equal, long_list(mc), long_list(mc)));
+        fn deep<'gc>(mc: &Mutation<'gc>) -> Value<'gc> {
+            (0..200_000).fold(Value::NULL, |spine, _| Pairs::new(mc).cons(spine, Value::NULL).unwrap().value(mc))
+        }
+        assert!(test(cx, equal, deep(mc), deep(mc)));
 
         // Structural equality comparison properly terminates on cyclic structures (such as self-referential boxes and mutually referential vectors) rather than looping infinitely.
-        let cycle = || {
-            let b = boxed(Value::VOID);
-            b.downcast::<crate::objects::Box>(mc).unwrap().set_value(mc, b);
-            b
-        };
-        assert!(test(cx, equal, cycle(), cycle()));
-        let knot = |n| {
-            let b = boxed(Value::VOID);
-            b.downcast::<crate::objects::Box>(mc).unwrap().set_value(mc, list(&[fix(n), b]));
-            b
-        };
-        assert!(test(cx, equal, knot(1), knot(1)));
-        assert!(!test(cx, equal, knot(1), knot(2)));
+        fn cycle<'gc>(mc: &Mutation<'gc>) -> Value<'gc> {
+            let cell = boxed(mc, Value::VOID);
+            cell.downcast::<crate::objects::Box>(mc).unwrap().set_value(mc, cell);
+            cell
+        }
+        assert!(test(cx, equal, cycle(mc), cycle(mc)));
+        fn knot<'gc>(mc: &Mutation<'gc>, number: i64) -> Value<'gc> {
+            let cell = boxed(mc, Value::VOID);
+            cell.downcast::<crate::objects::Box>(mc).unwrap().set_value(mc, list(mc, &[fix(number), cell]));
+            cell
+        }
+        assert!(test(cx, equal, knot(mc, 1), knot(mc, 1)));
+        assert!(!test(cx, equal, knot(mc, 1), knot(mc, 2)));
 
         // Structural equality memoizes visits to shared subgraphs to avoid exponential traversal: a 64-level DAG of `(cons x x)` or `(vector x x)` containing 2^64 paths completes efficiently in linear time.
-        let shared = |leaf, vector: bool| {
-            (0..64).fold(leaf, |x, _| {
-                if vector { vectors.immutable_from_slice(&[x, x]).unwrap().value(mc) } else { pairs.cons(x, x).unwrap().value(mc) }
+        fn shared<'gc>(mc: &Mutation<'gc>, leaf: Value<'gc>, vector: bool) -> Value<'gc> {
+            (0..64).fold(leaf, |node, _| {
+                if vector { Vectors::new(mc).immutable_from_slice(&[node, node]).unwrap().value(mc) } else { Pairs::new(mc).cons(node, node).unwrap().value(mc) }
             })
-        };
-        for vector in [false, true] {
-            assert!(test(cx, equal, shared(fix(1), vector), shared(fix(1), vector)));
-            assert!(!test(cx, equal, shared(fix(1), vector), shared(fix(2), vector)));
         }
-        let ring = |n: usize, last: i64| {
-            let vs: Vec<_> = (0..n).map(|_| vectors.make(2, fix(0)).unwrap()).collect();
-            for (i, v) in vs.iter().enumerate() {
-                v.items(mc).set(mc, 0, vs[(i + 1) % n].value(mc));
-                v.items(mc).set(mc, 1, fix(if i == n - 1 { last } else { 0 }));
+        for vector in [false, true] {
+            assert!(test(cx, equal, shared(mc, fix(1), vector), shared(mc, fix(1), vector)));
+            assert!(!test(cx, equal, shared(mc, fix(1), vector), shared(mc, fix(2), vector)));
+        }
+        fn ring<'gc>(mc: &Mutation<'gc>, count: usize, last: i64) -> Value<'gc> {
+            let links: Vec<_> = (0..count).map(|_| Vectors::new(mc).make(2, fix(0)).unwrap()).collect();
+            for (i, link) in links.iter().enumerate() {
+                link.items(mc).set(mc, 0, links[(i + 1) % count].value(mc));
+                link.items(mc).set(mc, 1, fix(if i == count - 1 { last } else { 0 }));
             }
-            vs[0].value(mc)
-        };
-        assert!(test(cx, equal, ring(3000, 1), ring(3000, 1)));
-        assert!(!test(cx, equal, ring(2, 1), ring(4, 1)));
-        assert!(test(cx, equal, ring(3, 0), ring(5, 0)));
-        assert!(!test(cx, equal, ring(3000, 1), ring(3000, 2)));
+            links[0].value(mc)
+        }
+        assert!(test(cx, equal, ring(mc, 3000, 1), ring(mc, 3000, 1)));
+        assert!(!test(cx, equal, ring(mc, 2, 1), ring(mc, 4, 1)));
+        assert!(test(cx, equal, ring(mc, 3, 0), ring(mc, 5, 0)));
+        assert!(!test(cx, equal, ring(mc, 3000, 1), ring(mc, 3000, 2)));
 
         // Equality comparisons consume 1 unit of fuel for every 1,024 values visited (accounting for pair container nodes as well as element values).
-        let spent = |cx: &mut Context<'_, '_>, a, b| {
+        fn spent<'gc>(cx: &mut Context<'_, 'gc>, left: Value<'gc>, right: Value<'gc>) -> u64 {
             cx.fuel = Fuel { run: 100, rest: 0 };
-            test(cx, equal, a, b);
+            test(cx, Intrinsic::Equal, left, right);
             100 - cx.fuel.left()
-        };
+        }
         let (items, short): (Vec<_>, Vec<_>) = ((0..10_240).map(fix).collect(), (0..100).map(fix).collect());
-        let vector = |items: &[_]| vectors.from_slice(items).unwrap().value(mc);
-        assert_eq!(spent(cx, vector(&items), vector(&items)), 10);
-        assert_eq!(spent(cx, list(&items), list(&items)), 20);
-        assert_eq!(spent(cx, list(&short), list(&short)), 0);
+        fn vector<'gc>(mc: &Mutation<'gc>, items: &[Value<'gc>]) -> Value<'gc> {
+            Vectors::new(mc).from_slice(items).unwrap().value(mc)
+        }
+        assert_eq!(spent(cx, vector(mc, &items), vector(mc, &items)), 10);
+        assert_eq!(spent(cx, list(mc, &items), list(mc, &items)), 20);
+        assert_eq!(spent(cx, list(mc, &short), list(mc, &short)), 0);
 
         // Once the primary run fuel budget is exhausted, fuel is drawn from the reserve budget (`fuel.rest`); if both are depleted, execution stops with `Fault::OutOfFuel`.
         cx.fuel = Fuel { run: 3, rest: 20 };
-        test(cx, equal, vector(&items), vector(&items));
+        test(cx, equal, vector(mc, &items), vector(mc, &items));
         assert_eq!(cx.fuel, Fuel { run: 0, rest: 13 });
         cx.fuel = Fuel { run: 3, rest: 6 };
-        frame.set(27, vector(&items));
-        frame.set(28, vector(&items));
+        frame.set(27, vector(mc, &items));
+        frame.set(28, vector(mc, &items));
         assert_eq!(Op::CallIntrinsic { base: 27, args: 2, intrinsic: equal }.step(cx), Err(Fault::OutOfFuel));
         cx.fuel = Fuel { run: u64::MAX, rest: 0 };
 
-        frame.set(29, boxed(fix(1)));
-        frame.set(30, list(&[]));
+        frame.set(29, boxed(mc, fix(1)));
+        frame.set(30, list(mc, &[]));
         Op::CallIntrinsic { base: 29, args: 1, intrinsic: Intrinsic::IsBox }.step(cx).unwrap();
         assert_eq!(cx.acc, Value::TRUE);
         Op::CallIntrinsic { base: 30, args: 1, intrinsic: Intrinsic::IsBox }.step(cx).unwrap();
@@ -363,18 +380,22 @@ fn equality_goes_as_deep_as_it_should() {
 fn a_load_takes_exactly_one_value() {
     with_frame(|cx| {
         let (mc, frame) = (cx.mc, cx.frame);
-        // Each instruction goes through `step`, so the test holds one copy of the inlined instruction loop.
-        let step = |cx: &mut Context<'_, '_>, op: Op| op.step(cx);
-        let call = |cx: &mut Context<'_, '_>, base, args, intrinsic| step(cx, Op::CallIntrinsic { base, args, intrinsic });
+        // Every instruction is executed through this one `step` function, so the test contains a single copy of the inlined `Op::step`.
+        fn step(cx: &mut Context<'_, '_>, op: Op) -> Result<Control, Fault> {
+            op.step(cx)
+        }
+        fn call(cx: &mut Context<'_, '_>, base: u8, args: u8, intrinsic: Intrinsic) -> Result<Control, Fault> {
+            step(cx, Op::CallIntrinsic { base, args, intrinsic })
+        }
         (0..3).for_each(|i| frame.set(20 + i, fix(i64::from(i) + 10)));
-        // `values` of one argument is that argument, which a load takes. An intrinsic returns no other number of values.
+        // `values` with one argument returns that argument, and a load accepts it. An intrinsic can return only one value, so any other number of arguments fails.
         call(cx, 20, 1, Intrinsic::Values).unwrap();
         assert_eq!(cx.acc, fix(10));
         step(cx, Op::LoadAcc { dst: 30 }).unwrap();
         assert_eq!(frame.get(30), fix(10));
         assert_eq!(call(cx, 20, 3, Intrinsic::Values), Err(Fault::ValueCount));
         assert_eq!(call(cx, 20, 0, Intrinsic::Values), Err(Fault::ValueCount));
-        // A return of several values, or of none, leaves the marker and the list of them. A load takes neither.
+        // A return of several values, or of no values, leaves the marker in the accumulator and the list of values beside it. A load fails in both cases.
         assert_eq!(step(cx, Op::ReturnValues { src: 20, count: 3 }), Ok(Control::Return));
         assert_eq!((cx.acc, Pairs::new(mc).elements(cx.values).collect::<Vec<_>>()), (Value::VALUES, vec![fix(10), fix(11), fix(12)]));
         assert_eq!(step(cx, Op::LoadAcc { dst: 30 }), Err(Fault::ValueCount));
@@ -382,13 +403,13 @@ fn a_load_takes_exactly_one_value() {
         assert_eq!((cx.acc, cx.values), (Value::VALUES, Value::NULL));
         assert_eq!(step(cx, Op::LoadAcc { dst: 30 }), Err(Fault::ValueCount));
         assert_eq!(frame.get(30), fix(10));
-        // A return of one value, spread or not, is an ordinary value.
+        // A return of exactly one value, spread or not, leaves that value in the accumulator.
         assert_eq!(step(cx, Op::ReturnValues { src: 21, count: 1 }), Ok(Control::Return));
         assert_eq!(cx.acc, fix(11));
         frame.set(23, Pairs::new(mc).list(&[fix(7)]).unwrap());
         assert_eq!(step(cx, Op::ReturnSpread { base: 23, args: 1 }), Ok(Control::Return));
         assert_eq!(cx.acc, fix(7));
-        // A spread return puts the registers before the elements of the list, which must be a proper list.
+        // A spread return puts the register values before the elements of the list. The list must be a proper list.
         assert_eq!(step(cx, Op::ReturnSpread { base: 22, args: 2 }), Ok(Control::Return));
         assert_eq!((cx.acc, Pairs::new(mc).elements(cx.values).collect::<Vec<_>>()), (Value::VALUES, vec![fix(12), fix(7)]));
         frame.set(23, fix(5));
@@ -417,7 +438,6 @@ fn intrinsics_run_without_a_frame() {
     let mut arena = Arena::new(1 << 20, 0);
     arena.mutate(|mc| {
         let mut fuel = Fuel { run: u64::MAX, rest: 0 };
-        let fix = |n| Value::fixnum(n).unwrap();
         assert_eq!(Intrinsic::Add.run(mc, &[fix(1), fix(2), fix(3)], &mut fuel), Ok(fix(6)));
         assert_eq!(Intrinsic::Add.run(mc, &[], &mut fuel), Ok(fix(0)));
         let list = Pairs::new(mc).list(&[fix(1), fix(2)]).unwrap();
@@ -491,6 +511,35 @@ fn run<'gc>(mc: &Mutation<'gc>, op: Intrinsic, args: &[Value<'gc>]) -> Result<Va
     op.run(mc, args, &mut Fuel { run: u64::MAX, rest: 0 })
 }
 
+/// A type predicate with a sole value holds for that value and for nothing else, and the value leads back to the predicate.
+#[test]
+fn predicates_that_hold_for_one_value_name_that_value() {
+    let sole: Vec<Intrinsic> = Intrinsic::ALL.iter().copied().filter(|predicate| predicate.sole_value().is_some()).collect();
+    assert_eq!(sole, [Intrinsic::IsNull, Intrinsic::IsNil, Intrinsic::IsNone]);
+    let mut arena = Arena::new(1 << 20, 0);
+    arena.mutate(|mc| {
+        let others = [Value::FALSE, Value::TRUE, Value::VOID, Value::fixnum(0).unwrap()];
+        for &predicate in &sole {
+            let value = predicate.sole_value().unwrap();
+            assert!(predicate.is_type_predicate() && predicate.is_pure_foldable(), "{predicate:?}");
+            assert_eq!(Intrinsic::predicate_of(value), Some(predicate));
+            assert_eq!(run(mc, predicate, &[value]), Ok(Value::TRUE), "{predicate:?}");
+            for &other in &sole {
+                if other != predicate {
+                    assert_eq!(run(mc, predicate, &[other.sole_value().unwrap()]), Ok(Value::FALSE), "{predicate:?} of the value of {other:?}");
+                }
+            }
+            for other in others {
+                assert_eq!(run(mc, predicate, &[other]), Ok(Value::FALSE), "{predicate:?}");
+            }
+        }
+        // No predicate is named for a value that others share a test with: `not` holds for `#f`, `#nil` and `#none`.
+        for other in others {
+            assert_eq!(Intrinsic::predicate_of(other), None);
+        }
+    });
+}
+
 #[test]
 fn intrinsics_on_the_task_need_one_and_are_never_folded_or_moved() {
     let dynamic: Vec<Intrinsic> = Intrinsic::ALL.iter().copied().filter(|i| i.is_dynamic()).collect();
@@ -526,16 +575,22 @@ fn intrinsics_on_the_task_need_one_and_are_never_folded_or_moved() {
 fn structs_are_of_their_types_and_equal_by_their_fields_or_themselves() {
     let mut arena = Arena::new(1 << 20, 0);
     arena.mutate(|mc| {
-        let (symbols, strings, pairs) = (ragwort_types::symbol::Symbols::of_arena(mc).unwrap(), Strings::new(mc), Pairs::new(mc));
-        let symbol = |name: &str| symbols.intern_str(&strings, name).unwrap().value(mc);
-        let names = |names: &[&str]| pairs.list(&names.iter().map(|n| symbol(n)).collect::<Vec<_>>()).unwrap();
+        let pairs = Pairs::new(mc);
+        fn symbol<'gc>(mc: &Mutation<'gc>, name: &str) -> Value<'gc> {
+            ragwort_types::symbol::Symbols::of_arena(mc).unwrap().intern_str(&Strings::new(mc), name).unwrap().value(mc)
+        }
+        fn names<'gc>(mc: &Mutation<'gc>, names: &[&str]) -> Value<'gc> {
+            Pairs::new(mc).list(&names.iter().map(|name| symbol(mc, name)).collect::<Vec<_>>()).unwrap()
+        }
         // Generates field mutability flags for struct type definition (1 for mutable/settable, 0 for immutable).
-        let flags = |n: usize, mutable: bool| pairs.list(&vec![fix(i64::from(mutable)); n]).unwrap();
+        fn flags<'gc>(mc: &Mutation<'gc>, count: usize, mutable: bool) -> Value<'gc> {
+            Pairs::new(mc).list(&vec![fix(i64::from(mutable)); count]).unwrap()
+        }
         let (plain, identity, sealed) = (fix(0), fix(1), fix(2));
-        let point = run(mc, Intrinsic::MakeStructType, &[symbol("point"), Value::FALSE, names(&["x", "y"]), flags(2, true), plain]).unwrap();
-        let point3 = run(mc, Intrinsic::MakeStructType, &[symbol("point3"), point, names(&["z"]), flags(1, true), plain]).unwrap();
-        let point4 = run(mc, Intrinsic::MakeStructType, &[symbol("point4"), point3, names(&["w"]), flags(1, false), plain]).unwrap();
-        let other = run(mc, Intrinsic::MakeStructType, &[symbol("point"), Value::FALSE, names(&["x", "y"]), flags(2, false), plain]).unwrap();
+        let point = run(mc, Intrinsic::MakeStructType, &[symbol(mc, "point"), Value::FALSE, names(mc, &["x", "y"]), flags(mc, 2, true), plain]).unwrap();
+        let point3 = run(mc, Intrinsic::MakeStructType, &[symbol(mc, "point3"), point, names(mc, &["z"]), flags(mc, 1, true), plain]).unwrap();
+        let point4 = run(mc, Intrinsic::MakeStructType, &[symbol(mc, "point4"), point3, names(mc, &["w"]), flags(mc, 1, false), plain]).unwrap();
+        let other = run(mc, Intrinsic::MakeStructType, &[symbol(mc, "point"), Value::FALSE, names(mc, &["x", "y"]), flags(mc, 2, false), plain]).unwrap();
         let p = run(mc, Intrinsic::MakeStruct, &[point, fix(1), fix(2)]).unwrap();
         let q = run(mc, Intrinsic::MakeStruct, &[point4, fix(1), fix(2), fix(3), fix(4)]).unwrap();
         // Validates `struct-derived-from?`: verifies that an instance matches its concrete type descriptor and all ancestor supertypes, but does not match unrelated types or non-struct values.
@@ -567,9 +622,9 @@ fn structs_are_of_their_types_and_equal_by_their_fields_or_themselves() {
         assert_eq!(run(mc, Intrinsic::MakeStruct, &[point, fix(1)]), Err(Fault::Arity));
         assert_eq!(run(mc, Intrinsic::MakeStruct, &[point3, fix(1), fix(2), fix(3), fix(4)]), Err(Fault::Arity));
         assert_eq!(run(mc, Intrinsic::MakeStruct, &[fix(1), fix(1)]), Err(Fault::WrongType));
-        assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol("bad"), fix(1), Value::NULL, Value::NULL, plain]), Err(Fault::WrongType));
-        assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol("bad"), Value::FALSE, pairs.list(&[fix(1)]).unwrap(), flags(1, false), plain]), Err(Fault::WrongType));
-        assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol("bad"), Value::FALSE, names(&["x", "y"]), flags(1, false), plain]), Err(Fault::WrongType), "a flag for each field");
+        assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol(mc, "bad"), fix(1), Value::NULL, Value::NULL, plain]), Err(Fault::WrongType));
+        assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol(mc, "bad"), Value::FALSE, pairs.list(&[fix(1)]).unwrap(), flags(mc, 1, false), plain]), Err(Fault::WrongType));
+        assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol(mc, "bad"), Value::FALSE, names(mc, &["x", "y"]), flags(mc, 1, false), plain]), Err(Fault::WrongType), "a flag for each field");
         let same = run(mc, Intrinsic::MakeStruct, &[point, fix(1), pairs.list(&[fix(2)]).unwrap()]).unwrap();
         let alike = run(mc, Intrinsic::MakeStruct, &[point, fix(1), pairs.list(&[fix(2)]).unwrap()]).unwrap();
         let elsewhere = run(mc, Intrinsic::MakeStruct, &[other, fix(1), pairs.list(&[fix(2)]).unwrap()]).unwrap();
@@ -586,12 +641,12 @@ fn structs_are_of_their_types_and_equal_by_their_fields_or_themselves() {
         assert_eq!(run(mc, Intrinsic::Equal, &[a, b]), Ok(Value::TRUE));
 
         let listed = run(mc, Intrinsic::StructFields, &[point4]).unwrap();
-        assert_eq!(run(mc, Intrinsic::Equal, &[listed, names(&["x", "y", "z", "w"])]), Ok(Value::TRUE));
+        assert_eq!(run(mc, Intrinsic::Equal, &[listed, names(mc, &["x", "y", "z", "w"])]), Ok(Value::TRUE));
         assert_eq!(run(mc, Intrinsic::StructFields, &[p]), Err(Fault::WrongType));
 
         // Struct instances of types declared with the identity flag (and any subtypes derived from them) compare `equal?` solely via object identity rather than by comparing field values.
-        let session = run(mc, Intrinsic::MakeStructType, &[symbol("session"), Value::FALSE, names(&["token", "user"]), flags(2, true), identity]).unwrap();
-        let admin = run(mc, Intrinsic::MakeStructType, &[symbol("admin"), session, names(&[]), flags(0, false), plain]).unwrap();
+        let session = run(mc, Intrinsic::MakeStructType, &[symbol(mc, "session"), Value::FALSE, names(mc, &["token", "user"]), flags(mc, 2, true), identity]).unwrap();
+        let admin = run(mc, Intrinsic::MakeStructType, &[symbol(mc, "admin"), session, names(mc, &[]), flags(mc, 0, false), plain]).unwrap();
         let (s, t) = (run(mc, Intrinsic::MakeStruct, &[session, fix(1), fix(2)]).unwrap(), run(mc, Intrinsic::MakeStruct, &[session, fix(1), fix(2)]).unwrap());
         let (a, b) = (run(mc, Intrinsic::MakeStruct, &[admin, fix(1), fix(2)]).unwrap(), run(mc, Intrinsic::MakeStruct, &[admin, fix(1), fix(2)]).unwrap());
         assert_eq!(run(mc, Intrinsic::IsStructDerivedFrom, &[s, session]), Ok(Value::TRUE));
@@ -622,13 +677,13 @@ fn structs_are_of_their_types_and_equal_by_their_fields_or_themselves() {
         }
 
         // Asserts that extending a sealed struct type or passing unrecognized property flags to `make-struct-type` fails with a type fault.
-        let last = run(mc, Intrinsic::MakeStructType, &[symbol("last"), point, names(&["z"]), flags(1, false), sealed]).unwrap();
-        assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol("more"), last, names(&[]), flags(0, false), plain]), Err(Fault::WrongType));
+        let last = run(mc, Intrinsic::MakeStructType, &[symbol(mc, "last"), point, names(mc, &["z"]), flags(mc, 1, false), sealed]).unwrap();
+        assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol(mc, "more"), last, names(mc, &[]), flags(mc, 0, false), plain]), Err(Fault::WrongType));
         assert_eq!(run(mc, Intrinsic::IsStructDerivedFrom, &[run(mc, Intrinsic::MakeStruct, &[last, fix(1), fix(2), fix(3)]).unwrap(), point]), Ok(Value::TRUE));
         for bad in [fix(4), fix(-1), Value::FALSE] {
-            assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol("bad"), Value::FALSE, names(&[]), flags(0, false), bad]), Err(Fault::WrongType));
+            assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol(mc, "bad"), Value::FALSE, names(mc, &[]), flags(mc, 0, false), bad]), Err(Fault::WrongType));
         }
-        assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol("bad"), Value::FALSE, names(&["x"]), pairs.list(&[fix(2)]).unwrap(), plain]), Err(Fault::WrongType));
+        assert_eq!(run(mc, Intrinsic::MakeStructType, &[symbol(mc, "bad"), Value::FALSE, names(mc, &["x"]), pairs.list(&[fix(2)]).unwrap(), plain]), Err(Fault::WrongType));
 
     });
 }
@@ -698,20 +753,18 @@ fn booleans_void_and_bytevectors() {
 fn string_comparisons_spend_fuel_for_what_they_compare() {
     let mut arena = Arena::new(1 << 24, 0);
     arena.mutate(|mc| {
-        let strings = Strings::new(mc);
-        let text = |s: &str| string::from_str(&strings, s).unwrap().value();
         fn spent<'gc>(mc: &Mutation<'gc>, op: Intrinsic, args: &[Value<'gc>]) -> u64 {
             let mut fuel = Fuel { run: 100, rest: 0 };
             op.run(mc, args, &mut fuel).unwrap();
             100 - fuel.left()
         }
         // String comparison operations (`string=?`, `string<?`, `string>=?`) consume 1 unit of fuel per 1,024 characters compared up to the length of the shorter string.
-        let (long, other) = (text(&"a".repeat(10_240)), text(&"a".repeat(10_240)));
+        let (long, other) = (text(mc, &"a".repeat(10_240)), text(mc, &"a".repeat(10_240)));
         for op in [Intrinsic::StringEq, Intrinsic::StringLt, Intrinsic::StringGe] {
             assert_eq!(spent(mc, op, &[long, other]), 10, "{op:?}");
         }
         assert_eq!(spent(mc, Intrinsic::StringEq, &[long, other, long]), 20);
-        assert_eq!(spent(mc, Intrinsic::StringEq, &[long, text("a")]), 0);
+        assert_eq!(spent(mc, Intrinsic::StringEq, &[long, text(mc, "a")]), 0);
         let mut fuel = Fuel { run: 3, rest: 0 };
         assert_eq!(Intrinsic::StringEq.run(mc, &[long, other], &mut fuel), Err(Fault::OutOfFuel));
     });

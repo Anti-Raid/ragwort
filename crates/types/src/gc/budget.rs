@@ -2,22 +2,22 @@ use std::cell::Cell;
 
 use super::{Mutation, OutOfMemory};
 
-/// What an arena holds against its limit: committed pages with their bookkeeping, roots,
-/// stacks, host values, the collector's work lists, and what [`Charge`]s claim.
+/// The bytes that an arena has charged against its limit: committed pages with their bookkeeping, roots,
+/// stacks, host values, frozen values, the collector's work lists, and the bytes that [`Charge`]s hold.
 ///
-/// The last bytes under the limit are a reserve: an allocation that needs them succeeds, but
-/// makes a full collection due at the end of the step, so a heap full of garbage doesn't fail
-/// it. Past the limit, an allocation fails, and so does the step.
+/// The last bytes under the limit are a reserve. An allocation that needs the reserve succeeds, but
+/// makes a full collection due at the end of the step. So a heap full of garbage does not fail
+/// the step. An allocation that would pass the limit fails, and so does the step.
 pub(crate) struct Budget {
     used: Cell<usize>,
     peak: Cell<usize>,
     limit: usize,
     reserve: Cell<usize>,
     due: Cell<bool>,
-    /// Allocations that can be done without stay out of the reserve, and don't fail the step.
+    /// Whether an optional allocation is running. An optional allocation does not draw on the reserve, and its failure does not fail the step.
     in_optional: Cell<bool>,
     failed: Cell<bool>,
-    /// Allocations to let through before failing one, for testing, or `u64::MAX` for none.
+    /// For testing: the number of allocations to let succeed before one is failed. `u64::MAX` means that no failure is injected.
     fail_in: Cell<u64>,
 }
 
@@ -47,7 +47,7 @@ impl Budget {
         self.limit
     }
 
-    /// What could be allocated before the reserve if `used` bytes were charged.
+    /// Returns the bytes that could be allocated without drawing on the reserve if `used` bytes were charged.
     pub(crate) fn room_past(&self, used: usize) -> usize {
         self.limit.saturating_sub(self.reserve.get()).saturating_sub(used)
     }
@@ -72,7 +72,7 @@ impl Budget {
         self.failed.set(false);
     }
 
-    /// Fails the step, unless the allocation was optional.
+    /// Marks the step as failed, unless the allocation is optional. Returns the error.
     pub(crate) fn fail(&self) -> OutOfMemory {
         if !self.in_optional.get() {
             self.failed.set(true);
@@ -88,7 +88,7 @@ impl Budget {
         self.fail_in.get() != u64::MAX
     }
 
-    /// Counts an allocation while failures are injected, and fails the one picked.
+    /// Counts one allocation while failures are injected, and fails the allocation that `fail_after` selected.
     pub(crate) fn count_allocation(&self) -> Result<(), OutOfMemory> {
         match self.fail_in.get() {
             u64::MAX => Ok(()),
@@ -103,7 +103,7 @@ impl Budget {
         }
     }
 
-    /// Whether `bytes` more fit, drawing on the reserve if they must.
+    /// Checks whether `bytes` more bytes fit under the limit. If they fit only by drawing on the reserve, a full collection becomes due. An optional allocation cannot draw on the reserve and fails instead.
     pub(crate) fn ensure(&self, bytes: usize) -> Result<(), OutOfMemory> {
         let room = self.limit.saturating_sub(self.used.get());
         if bytes <= room.saturating_sub(self.reserve.get()) {
@@ -139,8 +139,8 @@ impl Budget {
     }
 }
 
-/// Bytes kept outside the arena, such as a buffer a host function builds, counted against the
-/// budget while this lives. It gives back exactly what it took when dropped.
+/// A charge against the budget for bytes kept outside the arena, such as a buffer that a host function builds. The bytes stay charged
+/// while the `Charge` lives. Dropping it refunds exactly the bytes it charged.
 pub struct Charge<'gc> {
     bytes: usize,
     budget: &'gc Budget,
@@ -155,14 +155,14 @@ impl<'gc> Charge<'gc> {
         self.bytes
     }
 
-    /// Charges `more` bytes, failing as an allocation would if the budget can't cover them.
+    /// Charges `more` bytes. Fails as an allocation does if the budget cannot cover them.
     pub fn grow(&mut self, more: usize) -> Result<(), OutOfMemory> {
         self.budget.charge(more)?;
         self.bytes += more;
         Ok(())
     }
 
-    /// Gives back up to `less` bytes.
+    /// Refunds `less` bytes, or the whole charge if the charge is smaller.
     pub fn shrink(&mut self, less: usize) {
         let less = less.min(self.bytes);
         self.budget.refund(less);
@@ -176,7 +176,7 @@ impl Drop for Charge<'_> {
     }
 }
 
-/// Puts a flag back to what it was when dropped, so a panic in `optional` can't leave it set.
+/// Restores a flag to its earlier value when dropped, so a panic in `optional` cannot leave the flag set.
 struct Restore<'a>(&'a Cell<bool>, bool);
 
 impl Drop for Restore<'_> {

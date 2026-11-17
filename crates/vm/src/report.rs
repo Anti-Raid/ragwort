@@ -2,7 +2,7 @@
 
 use ragwort_types::Wire;
 use ragwort_types::gc::raw::Raw;
-use ragwort_types::gc::{Frame, Gc, Mutation, Value};
+use ragwort_types::gc::{Frame, Gc, Mutation, Slots, Value};
 use ragwort_types::num::NumError;
 use ragwort_types::pair::{Pair, Pairs};
 use ragwort_types::string::{self, StrError, Strings};
@@ -98,20 +98,21 @@ fn count<'gc>(number: u8) -> Value<'gc> {
 pub(crate) fn origin<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, code: Gc<'gc, Bytecode>, pc: usize, received: Value<'gc>, fault: Fault) -> Result<Origin<'gc>, Fault> {
     let unknown = Origin { operation: None, irritants: Value::NULL };
     let Some(&op) = pc.checked_sub(1).and_then(|at| code.ops(mc)?.get(at)) else { return Ok(unknown) };
-    let registers = |base: u8, count: u8| (0..count).map(move |i| frame.get(base.wrapping_add(i)));
     let (operation, irritants) = match op {
         Op::CallIntrinsic1 { a: operand, intrinsic, .. } | Op::BranchIntrinsic1 { a: operand, intrinsic, .. } => (Some(Operation::Intrinsic(intrinsic)), list(mc, [frame.get(operand)].into_iter())?),
         Op::CallIntrinsic2 { a: left, b: right, intrinsic, .. } | Op::BranchIntrinsic2 { a: left, b: right, intrinsic, .. } => (Some(Operation::Intrinsic(intrinsic)), list(mc, [frame.get(left), frame.get(right)].into_iter())?),
         Op::CallIntrinsic3 { a: first, b: second, c: third, intrinsic, .. } => (Some(Operation::Intrinsic(intrinsic)), list(mc, [frame.get(first), frame.get(second), frame.get(third)].into_iter())?),
         Op::CallIntrinsic { base, args, intrinsic } | Op::TailCallIntrinsic { base, args, intrinsic } | Op::ApplyIntrinsic { base, args, intrinsic } => {
-            (Some(Operation::Intrinsic(intrinsic)), list(mc, registers(base, args))?)
+            (Some(Operation::Intrinsic(intrinsic)), list(mc, (0..args).map(|i| frame.get(base.wrapping_add(i))))?)
         }
+        Op::TableRefHinted { table, key, default, .. } => (Some(Operation::Intrinsic(Intrinsic::TableRef)), list(mc, [frame.get(table), frame.get(key), frame.get(default)].into_iter())?),
+        Op::TableSetHinted { table, key, value, .. } => (Some(Operation::Intrinsic(Intrinsic::TableSet)), list(mc, [frame.get(table), frame.get(key), frame.get(value)].into_iter())?),
         Op::AddImm { a: operand, imm, .. } => (Some(Operation::Intrinsic(Intrinsic::Add)), list(mc, [frame.get(operand), Value::fixnum(i64::from(imm)).unwrap_or(Value::VOID)].into_iter())?),
         Op::StructField { a: instance, .. } | Op::StructRef { a: instance, .. } => (None, list(mc, [frame.get(instance)].into_iter())?),
         Op::Call { base, args } if fault == Fault::Arity => (None, list(mc, [frame.get(base), count(args)].into_iter())?),
         // A failed tail call has already moved the callee into the frame's closure register.
         Op::TailCall { args, .. } if fault == Fault::Arity => (None, list(mc, [frame.get(CLOSURE), count(args)].into_iter())?),
-        // `received` is how many values the accumulator held. A load takes exactly one, so the irritant is that number.
+        // `received` is the number of values the accumulator held. A load takes exactly one value, so the irritant is that number.
         Op::LoadAcc { .. } if fault == Fault::ValueCount => (None, list(mc, [received].into_iter())?),
         // A receiving call passes the values in the accumulator, so `received` is its number of arguments. A failed tail call has already moved the callee, as above.
         Op::CallReceived { base } if fault == Fault::Arity => (None, list(mc, [frame.get(base), received].into_iter())?),
@@ -124,7 +125,7 @@ pub(crate) fn origin<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, code: Gc<'g
         Op::CallHost { base, args, host } | Op::TailCallHost { base, args, host } => {
             let hosts = code.module(mc).and_then(|module| module.hosts(mc));
             let Some(def) = hosts.and_then(|hosts| hosts.get(host as usize)) else { return Ok(unknown) };
-            (Some(Operation::Host(def)), list(mc, registers(base, args))?)
+            (Some(Operation::Host(def)), list(mc, (0..args).map(|i| frame.get(base.wrapping_add(i))))?)
         }
         _ => return Ok(unknown),
     };
@@ -172,18 +173,20 @@ fn calls<'gc>(mc: &Mutation<'gc>, chain: Value<'gc>, entries: &mut Entries<'gc>)
 
 /// Appends the calls in the parked frames of `task` to `entries`, innermost first: the frame that switched away, then its callers down to the bottom frame of the task's stack. Returns `false` once `entries` is full.
 fn parked<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, entries: &mut Entries<'gc>) -> bool {
+    fn code<'gc>(mc: &Mutation<'gc>, slots: Slots<'gc>, at: usize) -> Option<Gc<'gc, Bytecode>> {
+        if at < slots.len() { slots.get(at).downcast::<Closure>(mc).and_then(|closure| closure.code(mc)) } else { None }
+    }
     let (true, Some(segment)) = (coroutine::is_parked(mc, task), task.segment(mc)) else { return true };
     let slots = segment.slots(mc);
     let (fp, pc) = (task.park_fp(mc) as usize, task.park_pc(mc) as usize);
-    let code = |at: usize| if at < slots.len() { slots.get(at).downcast::<Closure>(mc).and_then(|closure| closure.code(mc)) } else { None };
-    let Some(top) = code(fp) else { return true };
+    let Some(top) = code(mc, slots, fp) else { return true };
     if !entries.push(mc, top, pc) {
         return false;
     }
     let Ok(link) = frame::link_at(mc, slots, fp) else { return true };
     for caller in frame::callers(mc, slots, task.base(mc) as usize, fp, link) {
         let Ok(caller) = caller else { break };
-        let Some(code) = code(caller.at) else { break };
+        let Some(code) = code(mc, slots, caller.at) else { break };
         if !entries.push(mc, code, caller.pc) {
             return false;
         }
@@ -205,7 +208,7 @@ pub(crate) fn capture<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, first: Optio
     let mut running = Some(task);
     let mut tasks = 0;
     while let Some(task) = running.filter(|_| complete && tasks < TRACE) {
-        // A task that waits for the one above it may be parked. Its frames are then on its segment, above everything on its chain.
+        // A task that is waiting for the coroutine it resumed may be parked. Its frames are then on its segment, above every record on its chain.
         complete = parked(mc, task, &mut entries) && calls(mc, task.chain(mc), &mut entries);
         let mut prompts = task.prompts(mc);
         while let Some(cell) = Pair::of(prompts).filter(|_| complete) {
@@ -257,28 +260,30 @@ struct Entry<'gc> {
 ///
 /// Each entry reports the position of the call or operation that was in progress in it. A function compiled without positions reports where it is defined.
 fn located<'gc>(mc: &Mutation<'gc>, code: Gc<'gc, Bytecode>, pc: usize, entries: &mut Vec<Entry<'gc>>) {
+    fn item<'gc>(items: Slots<'gc>, index: u32) -> Value<'gc> {
+        if (index as usize) < items.len() { items.get(index as usize) } else { Value::FALSE }
+    }
     let (mut source, mut offset) = (code.source(mc), code.start(mc));
     let sites = code.sites(mc).downcast::<Sites>(mc);
     if let Some(sites) = sites
         && let Some(table) = sites.table(mc)
     {
         let items = sites.items(mc);
-        let item = |index: u32| if (index as usize) < items.len() { items.get(index as usize) } else { Value::FALSE };
         let (start, len) = (code.lines_start(mc) as usize, code.lines_len(mc) as usize);
         let rows = table.lines.get(start..start + len).unwrap_or(&[]);
         let target = u32::try_from(pc.saturating_sub(1)).unwrap_or(u32::MAX);
         let row = rows.partition_point(|row| row.pc <= target).checked_sub(1).map(|at| rows[at]);
         if let Some(row) = row.filter(|row| row.source != u32::MAX) {
-            (source, offset) = (item(row.source), row.offset);
+            (source, offset) = (item(items, row.source), row.offset);
             let mut inlined = row.inlined;
-            // An inlined call is numbered after the call that encloses it, so the numbers fall along the chain.
+            // An inlined call has a higher number than the call that encloses it, so the numbers decrease along the chain of enclosing calls. A scope that breaks this rule ends the walk.
             while let Some(scope) = (inlined as usize).checked_sub(1).and_then(|at| table.scopes.get(at)) {
-                entries.push(Entry { name: item(scope.name), source, offset, inlined: true });
+                entries.push(Entry { name: item(items, scope.name), source, offset, inlined: true });
                 if scope.source == u32::MAX || scope.inlined >= inlined {
                     (source, offset) = (code.source(mc), code.start(mc));
                     break;
                 }
-                (source, offset, inlined) = (item(scope.source), scope.offset, scope.inlined);
+                (source, offset, inlined) = (item(items, scope.source), scope.offset, scope.inlined);
             }
         }
     }
@@ -349,7 +354,7 @@ pub(crate) fn traceback<'gc>(mc: &Mutation<'gc>, condition: Gc<'gc, Condition>) 
     Ok(all)
 }
 
-/// What was raised, decoded from a raised value so that a host can match on it.
+/// A raised value, decoded so that a host can match on it.
 ///
 /// Every variant holds live values of the arena, so a `Raised` is usable only within the mutation that produced it. `operation` is the built-in operation or host function that failed, when the VM could identify one, and `operands` is the list of values it was given.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -360,9 +365,9 @@ pub enum Raised<'gc> {
     OutOfRange { operation: Option<Operation>, operands: Value<'gc> },
     /// An operation tried to change an immutable object.
     Immutable { operation: Option<Operation>, operands: Value<'gc> },
-    /// A numeric operation failed, as `error` says.
+    /// A numeric operation failed. `error` gives the reason.
     Number { error: NumError, operation: Option<Operation>, operands: Value<'gc> },
-    /// A string operation failed, as `error` says.
+    /// A string operation failed. `error` gives the reason.
     String { error: StrError, operation: Option<Operation>, operands: Value<'gc> },
     /// A procedure or operation was called with a number of arguments it does not accept. `procedure` is the procedure that was called, when the call was to a procedure and not to a built-in operation.
     Arity { operation: Option<Operation>, procedure: Option<Value<'gc>>, given: usize },
@@ -384,7 +389,7 @@ pub enum Raised<'gc> {
     Value(Value<'gc>),
 }
 
-/// A raised value described for a host: what was raised and the calls that were in progress.
+/// A description of a raised value for a host: the raised value, the decoded error, and the calls that were in progress.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Report<'gc> {
     /// The value that was raised.
@@ -394,7 +399,7 @@ pub struct Report<'gc> {
 }
 
 impl<'gc> Report<'gc> {
-    /// Describes `raised`, a value that a program raised, such as the one [`Outcome::Raised`](crate::Outcome::Raised) holds.
+    /// Describes `raised`, a value that a program raised, such as the value in [`Outcome::Raised`](crate::Outcome::Raised).
     pub fn of(mc: &Mutation<'gc>, raised: Value<'gc>) -> Self {
         Report { value: raised, error: decoded(mc, raised), trace: trace(mc, raised) }
     }
@@ -417,7 +422,7 @@ fn decoded<'gc>(mc: &Mutation<'gc>, raised: Value<'gc>) -> Raised<'gc> {
             let given = Pair::of(operands).and_then(|cell| Pair::of(cell.tail(mc))).and_then(|cell| cell.head(mc).as_fixnum());
             Raised::Arity { operation, procedure: first, given: given.and_then(|given| usize::try_from(given).ok()).unwrap_or(0) }
         }
-        // The `values` operation lists the values it was given. A load lists only how many there were.
+        // For the `values` operation, the irritants are the values it was given. For a load, the only irritant is the number of values.
         Fault::ValueCount if operation.is_some() => Raised::ValueCount { received: Pairs::new(mc).list_len(operands).and_then(|received| usize::try_from(received).ok()) },
         Fault::ValueCount => Raised::ValueCount { received: first.and_then(Value::as_fixnum).and_then(|received| usize::try_from(received).ok()) },
         Fault::NotProcedure => Raised::NotProcedure { value: first },

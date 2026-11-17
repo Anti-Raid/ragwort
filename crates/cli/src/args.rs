@@ -1,4 +1,4 @@
-//! The command line.
+//! Parses the command line.
 //!
 //! ```text
 //! ragwort [name=folder]... entry.rg            runs entry.rg
@@ -9,14 +9,14 @@
 //!
 //! # Images
 //!
-//! `compile -o core.img core=lib/core` compiles and runs the modules it names and saves them
-//! to `core.img`. `--image core.img`, with any of the commands, starts from what the image
-//! holds, so `ragwort --image core.img bot.rg` runs `bot.rg` without compiling `core` again.
+//! `compile -o core.img core=lib/core` compiles and runs the modules that it names and saves them
+//! to `core.img`. `--image core.img` works with any of the commands and starts from the modules that the image
+//! holds. So `ragwort --image core.img bot.rg` runs `bot.rg` without compiling `core` again.
 //!
-//! - A module in an image has run already. It isn't run again when the image is loaded, so
-//!   what it does as it runs, such as writing a line, happens once, when the image is made.
-//! - `compile --image core.img -o more.img extra=lib/extra` makes an image of both.
-//! - An image is for the build of `ragwort` that made it.
+//! - A module in an image has already run. It does not run again when the image is loaded. So
+//!   an effect of running it, such as writing a line, happens once, when the image is made.
+//! - `compile --image core.img -o more.img extra=lib/extra` makes an image that holds both `core` and `extra`.
+//! - An image works only with the build of `ragwort` that made it.
 //!
 //! # Memory
 //!
@@ -27,12 +27,12 @@
 //!
 //! # Modules
 //!
-//! `name=folder` makes the files in `folder` the module `name`, which code requires by that
-//! name. `ragwort lib/text=src/text main.rg` lets `main.rg` say `(require lib/text)`.
+//! `name=folder` makes the files in `folder` the module `name`. Code requires the module by that
+//! name: `ragwort lib/text=src/text main.rg` lets `main.rg` use `(require lib/text)`.
 //!
-//! - The name can be left out: `=lib/text` is `lib/text=lib/text`.
-//! - A file ending in `.rg` is Scheme, one ending in `.rgn` is native ragwort, and other files
-//!   are left alone. The files of a folder are one module, read in the order of their names.
+//! - The name can be omitted: `=lib/text` means `lib/text=lib/text`.
+//! - A file that ends in `.rg` is Scheme, and a file that ends in `.rgn` is native ragwort. Other files
+//!   are ignored. The files of a folder make up one module and are read in the order of their names.
 
 #[cfg(test)]
 #[path = "tests/args.rs"]
@@ -55,18 +55,18 @@ usage:
   .rg files are Scheme, .rgn files are native ragwort
 ";
 
-/// A module the command line names: its files are the ones in `folder`.
+/// A module that the command line names. Its files are the source files in `folder`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModuleDir {
     pub name: String,
     pub folder: PathBuf,
 }
 
-/// What the command line asks for.
+/// The command that the command line asks for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     Help,
-    /// Runs `entry`, or opens a REPL if there's none.
+    /// Runs `entry`, or opens a REPL if there is no `entry`.
     Run { from: Source, entry: Option<PathBuf> },
     /// Compiles the modules and `entry`, and prints their bytecode.
     Compile { from: Source, entry: Option<PathBuf> },
@@ -74,7 +74,7 @@ pub enum Command {
     Save { from: Source, to: PathBuf },
 }
 
-/// Where a command's modules are from: an image, if it starts from one, and folders.
+/// The sources of a command's modules: an image if the command starts from one, and module folders.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Source {
     /// The memory limit given by `--heap`, in bytes.
@@ -83,7 +83,7 @@ pub struct Source {
     pub modules: Vec<ModuleDir>,
 }
 
-/// The language of the file at `path`, by its extension, if it's a source file.
+/// Returns the language of the file at `path`, judged by its extension, or `None` if the file is not a source file.
 pub fn language(path: &Path) -> Option<Language> {
     match path.extension()?.to_str()? {
         "rg" => Some(Language::Scheme),
@@ -107,7 +107,7 @@ fn size(text: &str) -> Option<usize> {
     count.checked_mul(1 << shift).filter(|&bytes| bytes > 0)
 }
 
-/// What `args`, the arguments after the program's name, ask for, or what's wrong with them.
+/// Parses `args`, the arguments after the program's name, into a command. Returns an error message if the arguments are invalid.
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
     let mut args = args.into_iter().peekable();
     let compile = args.next_if(|arg| arg == "compile").is_some();

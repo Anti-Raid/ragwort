@@ -113,7 +113,7 @@ pub(crate) enum Captured {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum End<'a> {
     Jump(Block, Vec<'a, Val>),
-    /// Branches conditionally: jumps to `other` if `test` evaluates to `#f`, otherwise jumps to `then`.
+    /// Branches conditionally: jumps to `other` if `test` evaluates to a false value (`#f`, `#nil` or `#none`), otherwise jumps to `then`.
     Branch { test: Val, then: Block, other: Block },
     Return(Val),
     TailCall { f: Val, args: Vec<'a, Val> },
@@ -257,16 +257,16 @@ struct Building<'a, 'gc> {
 }
 
 /// The continuation context for an expression's result: either continuing sequentially within the
-/// current basic block (`Ctx::Val`), or returning from the function (`Ctx::Tail`).
+/// current basic block (`Ctx::Value`), or returning from the function (`Ctx::Tail`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Ctx {
     Value,
     Tail,
 }
 
-/// Represents a join point within an active contification group: its target basic block (allocated
-/// on the first incoming jump), the count of explicit jump arguments, and the group index tracking
-/// mutated in-scope variables that must be passed along as extra arguments.
+/// A join point of an active join group. `block` is its target basic block, allocated on the first
+/// incoming jump. `params` holds its declared parameters. `group` is the index of its group in `Builder::groups`.
+/// The group lists the mutated in-scope variables that every jump passes as extra arguments.
 struct Join<'a> {
     block: Option<Block>,
     params: Vec<'a, Var>,
@@ -299,7 +299,7 @@ struct Builder<'a, 't, 'id, 'gc> {
     this: Val,
     /// The stack of remaining lowering tasks to execute, processed in LIFO order (next task at the top).
     todo: std::vec::Vec<Task<'a, 'id>>,
-    /// The source site of the expression being lowered, which the instructions built for it receive.
+    /// The source site of the expression being lowered. Instructions built for the expression are recorded with this site.
     site: u32,
     /// The SSA value produced by the most recently lowered expression, or `None` if control diverged
     /// (e.g. jumped or returned). This value is consumed by the subsequent task on the work stack.
@@ -330,14 +330,14 @@ enum Task<'a, 'id> {
     /// Produces a void value to represent the result of an assignment expression.
     Void,
     Return,
-    /// Finalizes the scope or the `code`th join definition in a join group, having preserved `n`
-    /// mutated variables across the join boundary.
+    /// Continues a join group after its scope or one of its join bodies has been lowered. `code` is `None` after the scope. After a join body, `code` holds the index of that body in `codes` and the length that `Builder::assigned` had before the body's parameters were bound.
+    /// `carried` lists the mutated variables passed across the group's jumps, `rest` is the exit block once it exists, and `lowered` marks the join bodies already lowered.
     Join { codes: Span<'id, JoinCode<'id>>, carried: std::vec::Vec<Var>, rest: Option<Block>, lowered: std::vec::Vec<bool>, ctx: Ctx, code: Option<(usize, usize)> },
     /// Evaluates function call arguments after the callee expression has been evaluated.
     Callee { args: Span<'id, Id<'id>>, tail: bool, site: u32 },
-    /// Evaluates argument index `at` from `args` (following evaluation sequence `order`, if specified),
-    /// accumulating results into `vals`.
-    /// Evaluates the arguments of the operation `then`, which reports the source site `site`.
+    /// Lowers the arguments `args` of the operation `then`, one argument per step. `at` is the number of arguments started so far, and `vals` collects their values.
+    /// If `order` is given, the arguments are lowered in that order: `order[k]` is the index of the argument lowered at step `k`.
+    /// `site` is the source site of the operation, which the instruction built for `then` reports.
     Args { args: Span<'id, Id<'id>>, order: Option<Vec<'a, usize>>, at: usize, vals: Vec<'a, Val>, then: Use, site: u32 },
     /// Manages mutually recursive closures for `funs` bound to `dsts`, tracking compiled function
     /// codes and environment captures as each closure is lowered.
@@ -657,8 +657,8 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
         let next = Rest { i: rest.i + 1, ..rest };
         match bind {
             Bind::Val(var, init) => match tree[init] {
-                // Non-terminal statements in a sequence evaluate for side effects. For assignments
-                // that mutate an unmonitored variable, record them as void without generating redundant bindings.
+                // The initializer is an assignment, as in a statement of a sequence that is evaluated for its side effect. Its value is void.
+                // This arm applies only if `var` is never assigned. It records `var` in `voids` instead of binding it to a void constant. `lookup` builds the constant only if `var` is read.
                 Node::Set(target, value) if !self.sets.contains(&var) => {
                     self.todo.push(Task::Bound { v: var, void: true, next });
                     self.todo.push(Task::Assign(target));
@@ -878,8 +878,8 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
     }
 }
 
-/// Determines a safe evaluation ordering for arguments passed in a jump to prevent an argument expression
-/// from overwriting a parameter register while that register's previous value is still required by a subsequent argument.
+/// Returns an evaluation order for the arguments `args` of a jump to a join with parameters `params`, or `None` if the arguments keep their written order.
+/// Where possible, the order evaluates an argument only after the other arguments that read its parameter. The argument can then be computed directly into the parameter's register, without overwriting a value that a later argument still needs.
 fn order<'a, 'id>(arena: &'a Arena, tree: &L4<'id, '_>, args: &[Id<'id>], params: &[Var]) -> Option<Vec<'a, usize>> {
     let count = args.len();
     if !(2..=16).contains(&count) || count != params.len() || !args.iter().all(|&arg| reorderable(tree, arg)) {
@@ -888,8 +888,8 @@ fn order<'a, 'id>(arena: &'a Arena, tree: &L4<'id, '_>, args: &[Id<'id>], params
     let mut done = arena.vec_of(false, count);
     let mut order = Vec::with_capacity_in(count, arena);
     while order.len() < count {
-        let ready = |i: usize| !done[i] && !(0..count).any(|j| j != i && !done[j] && reads_local(tree, args[j], params[i]));
-        let i = (0..count).find(|&i| ready(i)).or_else(|| (0..count).find(|&i| !done[i])).expect("one is left");
+        // Pick the first pending argument whose parameter no other pending argument reads. If there is none, the reads form a cycle, as in a swap. Break the cycle by picking the first pending argument.
+        let i = (0..count).find(|&i| !done[i] && !(0..count).any(|j| j != i && !done[j] && reads_local(tree, args[j], params[i]))).or_else(|| (0..count).find(|&i| !done[i])).expect("one is left");
         done[i] = true;
         order.push(i);
     }
@@ -911,11 +911,13 @@ pub(crate) fn reorderable<'id>(tree: &L4<'id, '_>, expr: Id<'id>) -> bool {
 
 /// Determines whether `expr` references local variable `target` via read, mutation (`set!`), or closure capture.
 pub(crate) fn reads_local<'id>(tree: &L4<'id, '_>, expr: Id<'id>, target: Var) -> bool {
-    let captures = |fun: Fun<'id>| tree[tree[fun].captures].contains(&UpvalSource::Local(target));
+    fn captures<'id>(tree: &L4<'id, '_>, fun: Fun<'id>, target: Var) -> bool {
+        tree[tree[fun].captures].contains(&UpvalSource::Local(target))
+    }
     tree.frame(expr).any(|id| match tree[id] {
         Node::Ref(VarRef::Local(var)) | Node::Set(var, _) => var == target,
-        Node::Lambda(fun) => captures(fun),
-        Node::Let(binds, _) => tree[binds].iter().any(|&bind| matches!(bind, Bind::Fix(group) if tree[group].iter().any(|&(_, fun)| captures(fun)))),
+        Node::Lambda(fun) => captures(tree, fun, target),
+        Node::Let(binds, _) => tree[binds].iter().any(|&bind| matches!(bind, Bind::Fix(group) if tree[group].iter().any(|&(_, fun)| captures(tree, fun, target)))),
         _ => false,
     })
 }
@@ -1031,13 +1033,12 @@ pub(crate) fn verify_function(checked: &Function<'_, '_>, before: &[Function<'_,
     if let Some(block) = (1..count).find(|&block| idom[block] >= block) {
         return Err(format!("b{block} comes before b{}, which it's only reached through", idom[block]));
     }
-    let check = |value: Val, block: usize, at: usize| defs.check(&idom, value, block, at);
     for (block_index, block) in checked.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             // Closures within a mutually recursive group may capture each other's allocated instances.
             let at = if let Inst::Closures { .. } = inst { i + 2 } else { i + 1 };
             for value in inst.uses() {
-                check(value, block_index, at)?;
+                defs.check(&idom, value, block_index, at)?;
             }
             match inst {
                 Inst::Upvalue(_, index) if *index >= checked.upvalues => return Err(format!("b{block_index} loads upvalue {index} of {}", checked.upvalues)),
@@ -1061,7 +1062,7 @@ pub(crate) fn verify_function(checked: &Function<'_, '_>, before: &[Function<'_,
             }
         }
         for value in block.end.uses() {
-            check(value, block_index, block.insts.len() + 1)?;
+            defs.check(&idom, value, block_index, block.insts.len() + 1)?;
         }
     }
     Ok(())

@@ -29,10 +29,10 @@ fn fixnum<'gc>(n: i64) -> Value<'gc> {
 
 #[test]
 fn layouts_match_hand_written_descriptions() {
-    let same = |a: &Desc, b: &Desc| {
+    fn same(a: &Desc, b: &Desc) -> bool {
         (a.fields, a.values, a.members, a.hosts, a.weaks, a.ephemerons, a.items)
             == (b.fields, b.values, b.members, b.hosts, b.weaks, b.ephemerons, b.items)
-    };
+    }
     assert!(same(&Pair::DESC, &Desc::of::<Pair>(2).values(0b11)));
     assert!(same(&Node::DESC, &Desc::of::<Node>(2).members(0b10)));
     assert!(same(&Words::DESC, &Desc::of::<Words>(5)));
@@ -221,7 +221,7 @@ fn kinds_tell_the_group_types_apart() {
     assert_eq!((Kind::BASE, Kind::END, Later::BASE, Later::END), (FIRST_TYPE, FIRST_TYPE + 10, FIRST_TYPE + 10, FIRST_TYPE + 11));
 }
 
-/// Types numbered by the arena come down from the top, so they never take a group's numbers.
+/// The arena numbers the types without a fixed number downwards from the top, so they never take a number that belongs to a group.
 #[test]
 fn unnumbered_types_stay_clear_of_groups() {
     struct Loose;
@@ -269,18 +269,18 @@ fn member_reads_check_the_target_type() {
     arena.mutate(|mc| {
         let pair = Pair::new(mc, Value::NULL, Value::NULL).unwrap();
         let node = Node::new(mc, 1, None).unwrap();
-        // Raw words can point a member at the wrong type; the typed read catches it.
+        // A raw word write can make a member field refer to an object of the wrong type. The typed read catches that.
         node.set_word(mc, 1, pair.to_word());
         node.next(mc);
     });
 }
 
-/// Host values alive in the arena's table.
+/// Returns the number of live host values in the arena's table.
 fn live_hosts(arena: &Arena) -> usize {
     arena.meta.hosts.borrow().iter().filter(|s| s.value.is_some()).count()
 }
 
-/// An `AnyHost` field holds a host value of any type and keeps it alive, and each read checks
+/// An `AnyHost` field holds a host value of any type and keeps it alive. Each read checks
 /// the type.
 #[test]
 fn any_host_fields_hold_any_type() {
@@ -296,8 +296,10 @@ fn any_host_fields_hold_any_type() {
     arena.collect();
     assert_eq!(live_hosts(&arena), 2);
     arena.mutate(|mc| {
-        let read = |i| mc.root(i).downcast::<Anything>(mc).unwrap().what(mc).unwrap();
-        let (text, number) = (read(0), read(1));
+        fn read<'gc>(mc: &Mutation<'gc>, i: usize) -> AnyHostRef<'gc> {
+            mc.root(i).downcast::<Anything>(mc).unwrap().what(mc).unwrap()
+        }
+        let (text, number) = (read(mc, 0), read(mc, 1));
         assert!(text.is::<String>(mc) && !text.is::<i32>(mc));
         assert_eq!(text.downcast_ref::<String>(mc).as_deref().map(String::as_str), Some("hi"));
         assert!(text.downcast_ref::<i32>(mc).is_none());

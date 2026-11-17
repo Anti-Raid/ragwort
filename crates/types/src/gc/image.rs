@@ -1,7 +1,7 @@
-//! An image: everything some values reach, as bytes, which another arena can be given.
+//! Heap images: the objects reachable from a set of values, serialized as bytes that another arena can load.
 //!
-//! [`save`] writes the objects that `roots` reach, and [`load`] makes them again in an arena
-//! and gives the roots back. What they made is theirs alone: the two arenas share nothing.
+//! [`save`] serializes the objects reachable from `roots`. [`load`] rebuilds them in an arena
+//! and returns the roots. The loaded objects are copies: the two arenas share nothing.
 //!
 //! ```text
 //! let bytes = arena.mutate(|mc| image::save(mc, STAMP, &[library], &kinds))?;
@@ -11,26 +11,28 @@
 //!
 //! # What's saved
 //!
-//! - An object is saved as its type's number, how many items it has, and its words. A word
-//!   that refers to an object refers to it by its place in the image, so the objects can be
-//!   anywhere in the arena they're loaded into.
-//! - A symbol or keyword is saved as its name, and loaded as the arena's symbol of that name.
-//! - A frozen value is saved by the [`Kind`] that knows its type, as [`Wire`] writes it.
+//! - An object is saved as its type number, its item count, and its words. A word
+//!   that refers to an object is saved as that object's position in the image. So the loaded objects can be
+//!   anywhere in the arena.
+//! - A symbol is saved as its name, and a keyword as its symbol. Each is loaded as the arena's interned symbol or keyword of that name.
+//! - A frozen value is saved by the [`Kind`] that matches its type, in the format that [`Wire`] writes.
 //!
 //! # What can't be
 //!
 //! [`save`] fails if a root reaches any of these:
 //!
-//! - A value the host owns: a `Host` field's, or a frozen one of no [`Kind`] given.
-//! - An object of a type with no fixed number, or one not among the `descs` [`load`] is given.
-//!   A stack's segment is one, so nothing that's running can be saved.
+//! - A value that the host owns: a host value in a `Host` field, or a frozen value that matches none of the given [`Kind`]s.
+//! - An object of a type with no fixed number.
+//!
+//! [`load`] rejects an image that holds an object of a type that is not among the `descs` it is given.
+//! A stack's segment has such a type, so running code cannot be saved and loaded.
 //!
 //! # Trust
 //!
-//! An image is read as what the same build of the same program wrote. `stamp` says which
-//! build that is, and [`load`] refuses another's, and bytes that have changed since they
-//! were written. It doesn't check that each object's words suit its type: an image made up to
-//! look right loads, and reading what it made can then panic, as reading any forged reference
+//! [`load`] trusts an image to be the output of the same build of the same program. `stamp` identifies
+//! the build. `load` rejects an image with another stamp, and an image whose bytes have changed since they
+//! were written. It does not check that the words of each object are valid for the object's type. So a forged image
+//! with a matching stamp and checksum loads, and reading the loaded objects can then panic, as reading any forged reference
 //! can.
 
 #[cfg(test)]
@@ -49,7 +51,7 @@ use crate::wire::{Malformed, Reader, Wire, Writer, mix, shape_of};
 
 const MAGIC: &[u8; 8] = b"ragwort\x01";
 
-/// How an object is saved.
+/// The tag of an object's entry in the image's object table. It tells how the object is saved.
 const PLAIN: u8 = 0;
 const SYMBOL: u8 = 1;
 const KEYWORD: u8 = 2;
@@ -58,17 +60,17 @@ const SYMBOLS: u8 = 3;
 /// A kind of frozen value that can be saved.
 #[derive(Clone, Copy)]
 pub struct Kind {
-    /// Writes the value, if it's of this kind.
+    /// Writes the value and returns true, if the value is of this kind. Returns false otherwise.
     pub save: fn(&dyn Any, &mut Writer) -> bool,
-    /// Reads a value and freezes it, charged `cost` in all, and gives the word a field holds
-    /// it by.
+    /// Reads a value and freezes it. The last argument is the total number of bytes to charge for the value. Returns the word that a frozen field holds
+    /// for the value.
     pub load: for<'gc> fn(&Mutation<'gc>, &mut Reader<'_>, usize) -> Result<u64, LoadError>,
-    /// A number that changes when the kind's form does.
+    /// A number that changes when the serialized format of the kind changes.
     pub shape: u64,
 }
 
 impl Kind {
-    /// The frozen values of type `T`, saved as [`Wire`] writes them.
+    /// Returns the kind for frozen values of type `T`, which are saved in the format that [`Wire`] writes.
     pub const fn of<T: Wire + Any>() -> Self {
         Self { save: save_as::<T>, load: load_as::<T>, shape: T::SHAPE }
     }
@@ -89,23 +91,23 @@ fn load_as<'gc, T: Wire + Any>(mc: &Mutation<'gc>, input: &mut Reader<'_>, cost:
     Ok(freeze(mc, value, cost)?)
 }
 
-/// Freezes `value`, charged `cost` in all, as the value it's a copy of was. Gives the word a
-/// field holds it by.
+/// Freezes `value` with a total charge of `cost` bytes, which is the charge of the value that it is a copy of. Returns the word that a
+/// frozen field holds for the value.
 pub fn freeze<'gc, T: Any>(mc: &Mutation<'gc>, value: T, cost: usize) -> Result<u64, OutOfMemory> {
     let owned = cost.saturating_sub(size_of::<T>() + FROZEN_COST);
     Ok(mc.frozen_owning(value, owned)?.to_word())
 }
 
-/// The kinds of frozen value this crate's own objects hold.
+/// The kinds of frozen value that this crate's own objects hold.
 pub const KINDS: [Kind; 2] = [Kind::of::<Box<[u8]>>(), Kind::of::<Box<[u32]>>()];
 
-/// How the collector sees each type this crate's own objects have, but a stack's segments.
+/// Returns the descriptors of this crate's own object types, except the `Segment` of a stack.
 pub fn descs() -> Vec<&'static Desc> {
     let groups = [super::table::Containers::DESCS, crate::string::Text::DESCS, crate::num::Numbers::DESCS, crate::objects::Data::DESCS];
     std::iter::once(&super::Boxed::DESC).chain(groups.into_iter().flatten().copied()).collect()
 }
 
-/// A number for `stamp` that changes when the form of anything in `descs` or `kinds` does.
+/// Returns a number to use in `stamp`. It changes when the layout of any type in `descs` or the format of any kind in `kinds` changes.
 pub fn shape(descs: &[&'static Desc], kinds: &[Kind]) -> u64 {
     let mut shape = shape_of("image 1");
     for desc in descs {
@@ -123,30 +125,30 @@ pub fn shape(descs: &[&'static Desc], kinds: &[Kind]) -> u64 {
     kinds.iter().fold(shape, |shape, kind| mix(shape, kind.shape))
 }
 
-/// Why some values can't be saved.
+/// The reason why [`save`] failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SaveError {
-    /// They reach a value the host owns, held by an object of the type with this number.
+    /// A root reaches a host value. The number is the type number of the object that holds it.
     Host(u16),
-    /// They reach a frozen value of no kind given, held by an object of the type with this
-    /// number.
+    /// A root reaches a frozen value that matches none of the given kinds. The number is the type number of the object
+    /// that holds it.
     Frozen(u16),
-    /// They reach an object of a type with no fixed number.
+    /// A root reaches an object of a type with no fixed number.
     Unnumbered,
-    /// A collection is moving objects.
+    /// A collection is moving objects: a root reaches an object with a forwarding header.
     Busy,
 }
 
-/// Why bytes can't be loaded.
+/// The reason why [`load`] failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoadError {
-    /// They aren't an image, or have changed since they were written.
+    /// The bytes are not an image, or have changed since they were written.
     Malformed,
-    /// Another build wrote them.
+    /// Another build wrote the image: its stamp differs.
     Stamp,
-    /// The arena has symbols already, hashed another way than the image's.
+    /// The arena already has symbols, and their hash seed differs from the image's.
     Symbols,
-    /// A collection is under way.
+    /// A major collection cycle is in progress.
     Busy,
     OutOfMemory,
 }
@@ -167,7 +169,7 @@ impl From<crate::Error> for LoadError {
     fn from(error: crate::Error) -> Self {
         match error {
             crate::Error::OutOfMemory => Self::OutOfMemory,
-            // A string or a number that can't be made comes from bytes that no build wrote.
+            // If a string or a number cannot be constructed, no build wrote these bytes.
             crate::Error::Num(_) | crate::Error::Str(_) => Self::Malformed,
         }
     }
@@ -177,15 +179,15 @@ fn number_of<T: Object>() -> u64 {
     u64::from(T::DESC.number.expect("a type of this crate's has a number"))
 }
 
-/// What's reached so far, as it's being saved.
+/// The state of a save in progress: the objects and frozen values reached so far.
 struct Saver<'k, 'gc> {
     mc: &'k Mutation<'gc>,
     heap: Heap<'gc>,
     kinds: &'k [Kind],
-    /// Each object reached, by its index, with its place from one, and those places in order.
+    /// `places` maps the index of each object reached to its position in the image, counted from one. `order` lists the object indices by position.
     places: HashMap<u32, u32>,
     order: Vec<u32>,
-    /// Each frozen value reached, by its word, with its place from one.
+    /// Maps the word of each frozen value reached to its position in the image, counted from one.
     frozen: HashMap<u64, u32>,
     frozen_out: Writer,
 }
@@ -200,7 +202,7 @@ impl<'gc> Saver<'_, 'gc> {
         place
     }
 
-    /// A value's word, with the place of the object it refers to for its index.
+    /// Returns the word to save for the value `word`. If the value refers to an object, the object's index is replaced by the object's position in the image.
     fn value(&mut self, word: u64) -> u64 {
         if word & TAG != OBJECT {
             return word;
@@ -237,7 +239,7 @@ impl<'gc> Saver<'_, 'gc> {
             let word = words[mask(at + 1 + field)].get();
             match desc.role(field) {
                 Some(Role::Word) => out.u64(word),
-                // An ephemeron's value is one too.
+                // `None` is the value field of an ephemeron, which is saved as a value too.
                 Some(Role::Value | Role::Ephemeron) | None => {
                     let word = self.value(word);
                     out.u64(word);
@@ -274,8 +276,8 @@ impl<'gc> Saver<'_, 'gc> {
         Ok(())
     }
 
-    /// Writes what the object in each place is, in `table`, and its words, in `words`, till
-    /// every object reached is written.
+    /// Writes each reached object in position order: its entry to `table` and its words to `words`. Writing an object can reach more objects, so this continues until
+    /// every reached object is written.
     fn objects(&mut self, table: &mut Writer, words: &mut Writer) -> Result<(), SaveError> {
         let mut next = 0;
         while let Some(&index) = self.order.get(next) {
@@ -309,11 +311,11 @@ impl<'gc> Saver<'_, 'gc> {
     }
 }
 
-/// Everything `roots` reach, as bytes that [`load`] takes. `stamp` is the build's, which
-/// `load` is to be given again: see [`shape`]. `kinds` are the kinds of frozen value there
-/// can be, which `load` is to be given in the same order.
+/// Serializes every object reachable from `roots` into bytes that [`load`] accepts. `stamp` identifies the build, and
+/// `load` must be given the same stamp. See [`shape`]. `kinds` lists the kinds of frozen value that
+/// can occur, and `load` must be given the same kinds in the same order.
 ///
-/// What's weakly held is saved as if it were held: collect first to leave out what's dead.
+/// A weak reference or an ephemeron is saved as if it were a strong reference. Collect first, so that the image leaves out dead objects.
 pub fn save<'gc>(mc: &Mutation<'gc>, stamp: u64, roots: &[Value<'gc>], kinds: &[Kind]) -> Result<Vec<u8>, SaveError> {
     let heap = mc.heap;
     let mut saver = Saver { mc, heap, kinds, places: HashMap::new(), order: Vec::new(), frozen: HashMap::new(), frozen_out: Writer::new() };
@@ -354,12 +356,12 @@ fn checksum(bytes: &[u8]) -> u64 {
     sum
 }
 
-/// What an image's objects are in the arena they're loaded into.
+/// The state of a load in progress: where each object and frozen value of the image is in the arena.
 struct Loader<'gc> {
     heap: Heap<'gc>,
-    /// The index of the object in each place, from one.
+    /// The arena index of the object at each position in the image. Positions count from one.
     indices: Vec<u32>,
-    /// The word of the frozen value in each place, from one.
+    /// The field word of the frozen value at each position in the image. Positions count from one.
     frozen: Vec<u64>,
 }
 
@@ -371,8 +373,8 @@ impl Loader<'_> {
         self.indices.get(place as usize - 1).copied().ok_or(Malformed)
     }
 
-    /// A value's word, with the index of the object in the place it names, and that object's
-    /// type.
+    /// Returns the loaded word for the saved value `word`. If the saved value refers to an object by position, the result holds the object's arena index and
+    /// type number.
     fn value(&self, word: u64) -> Result<u64, Malformed> {
         if word & TAG != OBJECT {
             return Ok(word);
@@ -385,8 +387,8 @@ impl Loader<'_> {
         Ok(u64::from(index) << 32 | ty << 16 | OBJECT)
     }
 
-    /// Reads the words of the object at `at`, which is of the type `desc` describes and has
-    /// `len` items.
+    /// Reads the words of the object at `at`. `desc` is the descriptor of the object's type, and
+    /// `len` is its item count.
     fn object(&self, at: u32, desc: &Desc, len: usize, input: &mut Reader<'_>) -> Result<(), Malformed> {
         let (heap, start) = (self.heap, at as usize + 1);
         let mut field = 0;
@@ -465,25 +467,25 @@ impl Loader<'_> {
     }
 }
 
-/// What an image says the object in a place is.
+/// An entry of the image's object table: how the object at one position was saved.
 enum Entry {
     Plain(&'static Desc, usize),
     Symbol,
-    /// A keyword, by the place of its symbol.
+    /// A keyword, with the position of its symbol.
     Keyword(u32),
     Symbols,
 }
 
-/// Makes what `bytes`, which [`save`] wrote, hold, and gives the roots it was given.
+/// Rebuilds the objects serialized in `bytes`, which [`save`] wrote, and returns the roots that `save` was given.
 ///
-/// - `stamp`: the one `save` was given.
-/// - `descs`: the types the image's objects can have: see [`descs`].
-/// - `kinds`: the kinds `save` was given.
-/// - `context`: what a frozen value's [`Wire::read`] needs to find, if any does.
+/// - `stamp`: the stamp that `save` was given.
+/// - `descs`: the descriptors of the types that the image's objects can have. See [`descs`].
+/// - `kinds`: the kinds that `save` was given, in the same order.
+/// - `context`: data that the [`Wire::read`] of a frozen value can look up, if any needs it.
 ///
-/// The arena's symbols are made the way the image's were, so it mustn't have symbols made
-/// another way already: load into a new arena, or one a load of an image made from this one
-/// started.
+/// The arena's intern table is created with the image's hash seed, unless the arena already has one. An existing intern table must have
+/// the same seed. So load into a new arena, or into an arena whose intern table was created by a load
+/// of an image with the same seed.
 pub fn load<'gc>(mc: &Mutation<'gc>, stamp: u64, bytes: &[u8], descs: &[&'static Desc], kinds: &[Kind], context: &dyn Any) -> Result<Vec<Value<'gc>>, LoadError> {
     let heap = mc.heap;
     if heap.m.phase.get() != Phase::Idle {
@@ -509,7 +511,7 @@ pub fn load<'gc>(mc: &Mutation<'gc>, stamp: u64, bytes: &[u8], descs: &[&'static
     if symbols.seed(mc) != seed {
         return Err(LoadError::Symbols);
     }
-    // Tables that hash by where an object is hashed by where it was.
+    // An identity table in the image was hashed by the object indices of the arena that saved it, at an evacuation count no higher than the saved count. Advance this arena's count past both counts, so every loaded identity table rehashes on first use.
     let moved = body.u64()?;
     heap.m.evacuations.set(heap.m.evacuations.get().max(moved) + 1);
 
@@ -531,7 +533,10 @@ pub fn load<'gc>(mc: &Mutation<'gc>, stamp: u64, bytes: &[u8], descs: &[&'static
     let strings = Strings::new(mc);
     let mut entries = Vec::with_capacity(count);
     let mut loader = Loader { heap, indices: Vec::with_capacity(count), frozen };
-    let index_of = |value: Value<'gc>| (value.to_bits() >> 32) as u32;
+    #[inline(always)]
+    fn index_of(value: Value<'_>) -> u32 {
+        (value.to_bits() >> 32) as u32
+    }
     for _ in 0..count {
         let (entry, index) = match table.u8()? {
             PLAIN => {
@@ -546,7 +551,7 @@ pub fn load<'gc>(mc: &Mutation<'gc>, stamp: u64, bytes: &[u8], descs: &[&'static
                 let name = std::str::from_utf8(table.bytes()?).map_err(|_| Malformed)?;
                 (Entry::Symbol, index_of(symbols.intern_str(&strings, name)?.value(mc)))
             }
-            // Made once its symbol is.
+            // The keyword is created in the next loop, once its symbol exists.
             KEYWORD => (Entry::Keyword(table.u32()?), 0),
             SYMBOLS => (Entry::Symbols, index_of(symbols.value(mc))),
             _ => return Err(LoadError::Malformed),

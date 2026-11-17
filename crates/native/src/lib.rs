@@ -1,5 +1,5 @@
-//! Native ragwort: the language the prelude is written in, read by the reader and lowered to the
-//! compiler's core forms. It has no macros, just the core forms, each spelled with a `%`:
+//! Native ragwort is the language that the prelude is written in. The Scheme reader reads it, and
+//! this crate lowers it to the compiler's core forms. It has no macros, only the core forms. The name of each form starts with `%`:
 //!
 //! ```text
 //! (%quote datum)  'datum
@@ -19,34 +19,51 @@
 //! (%call-host name arg ...)
 //! ```
 //!
-//! An `%apply-intrinsic`'s last argument is a list of more. A `%call-host` calls one of the
-//! [`HostDef`]s the code was loaded with, which only native ragwort can: other code calls the
-//! native procedures that wrap them, which pass on what they need, such as a mark.
+//! The last argument of `%apply-intrinsic` is a list of further arguments:
+//! `(%apply-intrinsic + 1 2 '(3 4))` computes the same as `(%intrinsic + 1 2 3 4)`.
 //!
-//! An `%intrinsic` can't name an [internal intrinsic](ragwort_vm::Intrinsic::is_internal):
-//! `(%intrinsic struct-ref s type 0)` is an error, as a struct's fields are read with the
-//! accessors `%struct` defines. Only a [`Lowerer`] made for code the embedder wrote itself
-//! takes them.
+//! `%call-host` calls one of the [`HostDef`]s that the code was loaded with. Only native ragwort
+//! can call a host function directly. Other code calls a native procedure that wraps the host call.
+//! The wrapper passes the host function the values that it needs, such as the value of a continuation mark.
 //!
-//! Code is loaded as a module, whose files' top-level forms are one body. A `%define`, which
-//! only goes at the top level, defines one of its variables, which code anywhere in the module
-//! can refer to, as it can to what a `%require` imports, and a `%provide` exports some. A require
-//! spec is a module's name, an identifier or a string, or `(only-in spec name ...)`,
-//! `(except-in spec name ...)`, `(prefix-in prefix spec)` or `(rename-in spec (old new) ...)`. A
-//! provide spec is a name, `(rename-out (name external) ...)`, `(all-defined-out)`, or
-//! `(struct-out name)`, which exports everything the struct form for `name` defines.
-//! `(struct-out name #:omit-constructor)` leaves out the form's constructors: see Scheme's
-//! `struct` for what the name is then.
+//! `%intrinsic` cannot name an [internal intrinsic](ragwort_vm::Intrinsic::is_internal).
+//! `(%intrinsic struct-ref s type 0)` is an error, because code reads a struct's fields with the
+//! accessors that `%struct` defines. A [`Lowerer`] accepts internal intrinsics only if it was created
+//! with `internals` set, which is meant for code that the embedder wrote itself.
 //!
-//! `%struct` defines a struct type the way Scheme's `struct` does, with the same syntax for
-//! fields and options. It only goes at the top level. `(%struct point (x y))` defines
-//! `struct:point`, `point`, `point?`, `point-x` and `point-y`, which code in any of the module's
-//! languages can use.
+//! Code is loaded as a module. The top-level forms of all the module's files make up one body.
+//! `%define`, `%struct`, `%require` and `%provide` are allowed only at the top level.
 //!
-//! A name is the innermost local of that name in scope, or else the module's variable of that
-//! name, or else its import of it. A body's expressions run in order, and the last one's value is
-//! the body's. A list that doesn't start with one of the forms is an error, as calls are
-//! `%app`s.
+//! - `%define` defines a module variable. Code anywhere in the module can refer to the variable.
+//! - `%require` imports bindings from other modules. Code anywhere in the module can refer to them too.
+//! - `%provide` exports some of the module's variables.
+//!
+//! A require spec is one of:
+//!
+//! - a module's name, written as an identifier or a string
+//! - `(only-in spec name ...)`
+//! - `(except-in spec name ...)`
+//! - `(prefix-in prefix spec)`
+//! - `(rename-in spec (old new) ...)`
+//!
+//! A provide spec is one of:
+//!
+//! - a name
+//! - `(rename-out (name external) ...)`
+//! - `(all-defined-out)`
+//! - `(struct-out name)`, which exports every binding that the struct form for `name` defines
+//! - `(struct-out name #:omit-constructor)`, which exports the same bindings without the form's
+//!   constructors. An importing module then cannot use the struct's name as a value. See Scheme's
+//!   `struct` for the uses of the name that remain.
+//!
+//! `%struct` defines a struct type as Scheme's `struct` does, with the same syntax for
+//! fields and options. `(%struct point (x y))` defines `struct:point`, `point`, `point?`,
+//! `point-x` and `point-y`. Code in any of the module's languages can use these bindings.
+//!
+//! A name refers to the innermost local variable of that name in scope. If there is none, the name
+//! refers to the module variable of that name, and otherwise to the import of that name. The
+//! expressions of a body run in order, and the body's value is the value of the last expression.
+//! A list that does not start with a form's name is an error, because a call is written with `%app`.
 
 mod lower;
 
@@ -102,9 +119,9 @@ impl From<CompileError> for Error {
     }
 }
 
-/// Builds the module named `name` from the native ragwort in `files`, one body across them all,
-/// interning names in `symbols`. Its code can call the host functions in `hosts`, and it requires
-/// the modules `resolver` finds.
+/// Builds the module named `name` from the native ragwort source in `files`. The forms of all the
+/// files make up one body. Names are interned in `symbols`. The code can call the host functions in
+/// `hosts`, and `resolver` finds the modules that the code requires.
 pub fn load<'gc>(
     mc: &Mutation<'gc>,
     symbols: Symbols<'gc>,

@@ -55,7 +55,7 @@ fn strings_and_characters_are_escaped_only_by_write() {
         let chars: Vec<_> = ['a', ' ', '\n', '\0', 'λ', '\u{85}'].iter().map(|&c| write(mc, Value::char(c))).collect();
         assert_eq!(chars, ["#\\a", "#\\space", "#\\newline", "#\\null", "#\\λ", "#\\x85"]);
         assert_eq!(display(mc, Value::char('λ')), "λ");
-        // What would show nothing is written by number; emoji keep their joiners and selectors.
+        // Invisible characters are written as hex escapes. Emoji sequences keep their joiners and variation selectors.
         let s = text(mc, "a\u{200b}b\u{feff}\u{10ffff}👨\u{200d}👩❤\u{fe0f}");
         assert_eq!(write(mc, s), "\"a\\x200b;b\\xfeff;\\x10ffff;👨\u{200d}👩❤\u{fe0f}\"");
         let chars: Vec<_> = ['\u{200b}', '\u{200d}', '\u{fe0f}', '\u{10ffff}', '\u{3000}', '🦀'].iter().map(|&c| write(mc, Value::char(c))).collect();
@@ -105,10 +105,10 @@ fn structs_are_written_with_their_fields() {
         let nested = run(mc, Intrinsic::MakeStruct, &[point, p, run(mc, Intrinsic::MakeStruct, &[unit])]);
         assert_eq!(write(mc, nested), r#"#(struct:point #(struct:point 1 "two") #(struct:unit))"#);
         assert_eq!(display(mc, p), "#(struct:point 1 two)");
-        // One that holds itself is labelled, as a vector is.
+        // A struct that contains itself is labelled, as a vector is.
         run(mc, Intrinsic::StructSet, &[p, point, number(mc, "1"), p]);
         assert_eq!(write(mc, p), "#0=#(struct:point 1 #0#)");
-        // One of an identity type is written no differently.
+        // A struct of an identity-eq type is written the same way.
         let session = run(mc, Intrinsic::MakeStructType, &[symbol(mc, "session"), Value::FALSE, fields, mutable, number(mc, "1")]);
         let s = run(mc, Intrinsic::MakeStruct, &[session, text(mc, "tok"), number(mc, "7")]);
         assert_eq!(write(mc, pairs.list(&[s, point, session]).unwrap()), r#"(#(struct:session "tok" 7) #<struct-type:point> #<struct-type:session>)"#);
@@ -135,20 +135,20 @@ fn cycles_are_labelled_and_shared_data_only_if_asked() {
         cyclic.items(mc).set(mc, 1, cyclic.value(mc));
         assert_eq!(write(mc, cyclic.value(mc)), "#0=#(1 #0#)");
         assert_eq!(display(mc, cyclic.value(mc)), "#0=#(1 #0#)");
-        // A list that comes back to itself through a vector: the vector is labelled, the only
-        // part of the cycle that could change to make it.
+        // A list forms a cycle through a vector. The vector gets the label, because it is the only
+        // mutable part of the cycle.
         let inner = vectors.make(1, Value::NULL).unwrap();
         let list = pairs.list(&[number(mc, "1"), inner.value(mc)]).unwrap();
         inner.items(mc).set(mc, 0, list);
         assert_eq!(write(mc, list), "(1 #0=#((1 #0#)))");
-        // A labelled vector reached again is its label, however many ways it's reached.
+        // Each later occurrence of a labelled vector is written as its label, on whatever path it is reached.
         let twice_cyclic = pairs.list(&[cyclic.value(mc), cyclic.value(mc)]).unwrap();
         assert_eq!(write(mc, twice_cyclic), "(#0=#(1 #0#) #0#)");
         let shared = pairs.list(&[number(mc, "1")]).unwrap();
         let twice = pairs.list(&[shared, shared, cyclic.value(mc)]).unwrap();
         assert_eq!(write(mc, twice), "((1) (1) #0=#(1 #0#))");
         assert_eq!(to_string(mc, twice, Mode::Shared, usize::MAX).unwrap(), "(#0=(1) #0# #1=#(1 #1#))");
-        // The tail of a list that's labelled is written after a dot.
+        // A list tail that has a label is written after a dot.
         let tail = pairs.list(&[number(mc, "2")]).unwrap();
         let both = pairs.list(&[pairs.cons(number(mc, "1"), tail).unwrap().value(mc), tail]).unwrap();
         assert_eq!(to_string(mc, both, Mode::Shared, usize::MAX).unwrap(), "((1 . #0=(2)) #0#)");
@@ -159,7 +159,7 @@ fn cycles_are_labelled_and_shared_data_only_if_asked() {
 fn output_stops_at_the_limit() {
     with(|mc| {
         let pairs = Pairs::new(mc);
-        // Shared without a cycle, so written out each time: 2^64 leaves.
+        // The data is shared without a cycle, so `write` would write it in full each time: 2^64 leaves.
         let mut v = number(mc, "1");
         for _ in 0..64 {
             v = pairs.list(&[v, v]).unwrap();
@@ -169,7 +169,7 @@ fn output_stops_at_the_limit() {
         assert_eq!(out, "> ");
         let shared = to_string(mc, v, Mode::Shared, 1000).unwrap();
         assert!(shared.starts_with("(#0=(#1=(#2=(") && shared.contains("#62=(1 1) #62#) #61#)") && shared.ends_with("#1#) #0#)"), "{shared}");
-        // A labelled vector is walked once, however many ways it's reached.
+        // A labelled vector is walked only once, on whatever path it is reached.
         let big = Vectors::new(mc).make(100, pairs.list(&[number(mc, "7")]).unwrap()).unwrap();
         big.items(mc).set(mc, 0, big.value(mc));
         let mut many = big.value(mc);
@@ -177,12 +177,12 @@ fn output_stops_at_the_limit() {
             many = pairs.list(&[many, many]).unwrap();
         }
         assert!(to_string(mc, many, Mode::Write, 20_000).unwrap().ends_with("#0#) (#0# #0#))))))))))"));
-        // Past the walk, the text itself can be too long.
+        // The walk can succeed and the text can still be too long.
         let long = text(mc, &"x".repeat(2000));
         assert_eq!(to_string(mc, pairs.list(&[long]).unwrap(), Mode::Display, 1000), Err(PrintError::TooLong));
         assert_eq!(to_string(mc, number(mc, "12345"), Mode::Write, 4), Err(PrintError::TooLong));
         assert_eq!(to_string(mc, number(mc, "12345"), Mode::Write, 5).unwrap(), "12345");
-        // One long string or bytevector is cut off just past the limit, not written out whole first.
+        // A single long string or bytevector is cut off just past the limit. It is not written in full first.
         let huge = text(mc, &"y".repeat(100_000));
         let bytes = Bytevectors::new(mc).immutable_from_slice(&[7; 100_000]).unwrap().value(mc);
         for (value, mode) in [(huge, Mode::Write), (huge, Mode::Display), (bytes, Mode::Write)] {
@@ -193,7 +193,7 @@ fn output_stops_at_the_limit() {
         assert_eq!(to_string(mc, text(mc, "abc"), Mode::Display, 3).unwrap(), "abc");
         assert_eq!(to_string(mc, text(mc, "abc"), Mode::Write, 5).unwrap(), "\"abc\"");
         assert_eq!(to_string(mc, text(mc, "abcd"), Mode::Display, 3), Err(PrintError::TooLong));
-        // The walk that finds what is shared stops at the limit too.
+        // The walk that finds shared data stops at the limit too.
         let mut wide = Value::NULL;
         for _ in 0..500 {
             wide = pairs.cons(pairs.list(&[number(mc, "1")]).unwrap(), wide).unwrap().value(mc);
@@ -206,11 +206,13 @@ fn output_stops_at_the_limit() {
 #[test]
 fn syntax_is_written_as_its_datum_once() {
     with(|mc| {
-        let meta = |kind| Some(SyntaxMeta::new(mc, kind, None, None).unwrap());
-        let node = |datum, kind| Syntax::new(mc, datum, SyntaxSpan::default(), meta(kind)).unwrap().value(mc);
-        let a = node(symbol(mc, "a"), SyntaxKind::Identifier);
-        let quoted = node(node(symbol(mc, "b"), SyntaxKind::Identifier), SyntaxKind::Abbreviation(Abbreviation::Quote));
-        let list = node(Pairs::new(mc).list(&[a, quoted, node(number(mc, "1"), SyntaxKind::Literal)]).unwrap(), SyntaxKind::List);
+        fn node<'gc>(mc: &Mutation<'gc>, datum: Value<'gc>, kind: SyntaxKind) -> Value<'gc> {
+            let meta = Some(SyntaxMeta::new(mc, kind, None, None).unwrap());
+            Syntax::new(mc, datum, SyntaxSpan::default(), meta).unwrap().value(mc)
+        }
+        let a = node(mc, symbol(mc, "a"), SyntaxKind::Identifier);
+        let quoted = node(mc, node(mc, symbol(mc, "b"), SyntaxKind::Identifier), SyntaxKind::Abbreviation(Abbreviation::Quote));
+        let list = node(mc, Pairs::new(mc).list(&[a, quoted, node(mc, number(mc, "1"), SyntaxKind::Literal)]).unwrap(), SyntaxKind::List);
         assert_eq!(write(mc, list), "#<syntax (a 'b 1)>");
         assert_eq!(write(mc, Pairs::new(mc).list(&[a, a]).unwrap()), "(#<syntax a> #<syntax a>)");
     });
@@ -228,13 +230,13 @@ fn tables_are_written_with_their_entries_in_order() {
         }
         assert_eq!(write(mc, table.value(mc)), r#"#table((name . "ragwort") ("id" . 7) (2 . (#t #\x)))"#);
         assert_eq!(display(mc, table.value(mc)), "#table((name . ragwort) (id . 7) (2 . (#t x)))");
-        // A removed entry leaves no trace, wherever it was.
+        // A removed entry is not written, wherever it was in the table.
         table.delete(mc, text(mc, "id")).unwrap();
         assert_eq!(write(mc, table.value(mc)), r#"#table((name . "ragwort") (2 . (#t #\x)))"#);
         table.delete(mc, symbol(mc, "name")).unwrap();
         table.delete(mc, number(mc, "2")).unwrap();
         assert_eq!(write(mc, table.value(mc)), "#table()");
-        // A table can hold itself, as a value or as a key, and tables nest.
+        // A table can contain itself as a value or as a key, and tables can nest.
         let (outer, inner) = (tables.make().unwrap(), tables.make().unwrap());
         inner.set(mc, symbol(mc, "up"), outer.value(mc)).unwrap();
         outer.set(mc, symbol(mc, "in"), inner.value(mc)).unwrap();

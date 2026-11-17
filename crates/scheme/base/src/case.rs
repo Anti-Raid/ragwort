@@ -1,9 +1,9 @@
-//! `syntax-case` and `syntax`, as R6RS has them, compiled to the VM's
-//! [`syntax_case`] patterns and templates: a clause's pattern is a
-//! constant the code matches its input with, which gives a vector of what its variables matched,
-//! a list of those for each ellipsis a variable's under. A template with pattern variables in it
-//! is a constant too, which the code makes syntax of with theirs; one without any is the syntax
-//! it's made of.
+//! `syntax-case` and `syntax`, as in R6RS, compiled to the patterns and templates of the VM's
+//! [`syntax_case`] module. The pattern of a clause becomes a
+//! constant, and the generated code matches the input against it. A successful match gives a vector with the match of each pattern variable.
+//! The match of a variable under ellipses is a list, nested once for each ellipsis. A template that contains pattern variables
+//! also becomes a constant, and the generated code builds syntax from it and the variables' matches. A template without pattern variables becomes
+//! its own syntax object.
 
 use std::rc::Rc;
 
@@ -24,8 +24,8 @@ fn index(items: &[Value<'_>]) -> u32 {
 }
 
 impl<'a, 'gc> Expander<'a, 'gc> {
-    /// `(syntax-case input (literal ...) clause ...)`: each clause `(pattern output)` or `(pattern
-    /// fender output)` tried in turn, its pattern variables bound for the fender and output.
+    /// Expands `(syntax-case input (literal ...) clause ...)`. A clause is `(pattern output)` or `(pattern
+    /// fender output)`. The clauses are tried in order. The pattern variables of a clause are bound in its fender and its output.
     pub(crate) fn syntax_case(&mut self, input: Stx, literals: Stx, clauses: Vec<Stx>) -> Result<Ex<'a, 'gc>, ExpandError> {
         let literals = self.proper(literals)?;
         if let Some(&bad) = literals.iter().find(|&&id| !self.is_id(id)) {
@@ -34,12 +34,11 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let var = self.fresh();
         let (literals, clauses): (Rc<[Stx]>, Rc<[Stx]>) = (literals.into(), clauses.into());
         Self::expr(input, move |_, value| {
-            let then = move |_: &mut Self, clauses| Ok(Step::Done(Core::Let(vec![(var, value)], Box::new(clauses))));
-            Ok(Step::then(Call::Run(Box::new(move |this: &mut Self| this.clauses(var, literals, clauses, 0))), then))
+            Ok(Step::then(Call::Run(Box::new(move |this: &mut Self| this.clauses(var, literals, clauses, 0))), move |_: &mut Self, clauses| Ok(Step::Done(Core::Let(vec![(var, value)], Box::new(clauses))))))
         })
     }
 
-    /// The clauses from `at` on, each tried if those before it don't match.
+    /// Expands the clauses from index `at` on. Each clause is tried if the clauses before it do not match. If no clause matches, the code raises a syntax error with the input.
     fn clauses(&mut self, input: Var, literals: Rc<[Stx]>, clauses: Rc<[Stx]>, at: usize) -> Result<Ex<'a, 'gc>, ExpandError> {
         let Some(&clause) = clauses.get(at) else {
             let error = Core::Intrinsic(Prim::Intrinsic(Intrinsic::MakeSyntaxError), vec![Core::Quote(Value::VOID), local(input)], None);
@@ -68,39 +67,42 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         }
         let output = self.tree.with(output, scope, Op::Add)?;
         let fender = fender.map(|fender| self.tree.with(fender, scope, Op::Add)).transpose()?;
-        let rest = Call::Run(Box::new(move |this: &mut Self| this.clauses(input, literals, clauses, at + 1)));
-        Ok(Step::then(rest, move |_, next| {
+        Ok(Step::then(Call::Run(Box::new(move |this: &mut Self| this.clauses(input, literals, clauses, at + 1))), move |_, next| {
             Self::expr(output, move |this, output| {
                 let Some(fender) = fender else {
                     let body = Core::Let(binds, Box::new(output));
                     return Ok(Step::Done(Core::Let(vec![(matched, asked)], Box::new(Core::If(Box::new(local(matched)), Box::new(body), Box::new(next))))));
                 };
-                // The rest are tried if the fender fails or the pattern doesn't match.
+                // The remaining clauses are tried if the fender fails or the pattern does not match. So their code goes into a thunk that both cases call.
                 let retry = this.fresh();
                 let thunk = Core::Lambda(Lambda { id: this.lambda_id(), params: Vec::new(), optional: 0, rest: None, body: Box::new(next), name: None, at: None });
                 Self::expr(fender, move |_, fender| {
-                    let again = || Core::App(Box::new(local(retry)), Vec::new(), None);
-                    let body = Core::If(Box::new(fender), Box::new(output), Box::new(again()));
+                    fn again<'gc>(retry: Var) -> Core<'gc> {
+                        Core::App(Box::new(local(retry)), Vec::new(), None)
+                    }
+                    let body = Core::If(Box::new(fender), Box::new(output), Box::new(again(retry)));
                     let body = Core::Let(binds, Box::new(body));
-                    let tried = Core::If(Box::new(local(matched)), Box::new(body), Box::new(again()));
+                    let tried = Core::If(Box::new(local(matched)), Box::new(body), Box::new(again(retry)));
                     Ok(Step::Done(Core::Let(vec![(retry, thunk)], Box::new(Core::Let(vec![(matched, asked)], Box::new(tried))))))
                 })
             })
         }))
     }
 
-    /// The pattern `root`, adding its variables to `vars`, each with how many ellipses it's
-    /// under, and what it refers to to `parts`. A list or vector's items are made before it,
-    /// and those it repeats with the slots of their variables, from a stack of their own.
+    /// Compiles the pattern `root`. Adds each pattern variable to `vars`, with the number of ellipses that it is
+    /// under. Adds the literals and data that the pattern refers to to `parts`. The traversal uses an explicit stack, and compiles the items of a list or vector before it.
+    /// A repeated item is recorded with the range of the slots of its variables.
     fn pattern(&mut self, root: Stx, literals: &[Stx], vars: &mut Vec<(Stx, u32)>, parts: &mut Vec<Value<'gc>>) -> Result<PatternShape, ExpandError> {
         enum Task {
             Visit(Stx, u32),
-            /// Into an item an ellipsis repeats, whose variables' slots start here.
+            /// Marks the start of an item that an ellipsis repeats. The slots of the item's variables start at the current number of variables.
             Repeat,
             Repeated,
             Seq { before: usize, repeat: bool, after: usize, tail: bool, vector: bool },
         }
-        let slot = |vars: &Vec<(Stx, u32)>| u32::try_from(vars.len()).expect("fewer than 2^32 variables");
+        fn slot(vars: &[(Stx, u32)]) -> u32 {
+            u32::try_from(vars.len()).expect("fewer than 2^32 variables")
+        }
         let mut shape = PatternShape::default();
         let (mut done, mut starts, mut repeats) = (Vec::new(), Vec::new(), Vec::new());
         let mut todo = vec![Task::Visit(root, 0)];
@@ -152,8 +154,8 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 View::List(items, tail) => (items, tail, false),
                 View::Vector(items) => (items, None, true),
             };
-            // Those before an ellipsis, the one it repeats, and those after, or all of them if
-            // there's none.
+            // Split the items into those before the repeated item, the repeated item, and those after the ellipsis. Without
+            // an ellipsis, all items count as before.
             let mut dots = Vec::new();
             for (i, &item) in items.iter().enumerate() {
                 if self.is_aux(item, Aux::Ellipsis)? {
@@ -181,7 +183,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         Ok(shape)
     }
 
-    /// Whether `id` is one of `literals`: the same name with the same scopes.
+    /// Returns whether `id` is one of `literals`, that is, has the same name and the same scopes as one of them.
     fn is_literal(&mut self, id: Stx, literals: &[Stx]) -> Result<bool, ExpandError> {
         let (symbol, set) = (self.tree.symbol(id), self.tree.scopes_of(id)?);
         for &literal in literals {
@@ -192,7 +194,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         Ok(false)
     }
 
-    /// `(syntax template)`: what `template` makes, of what the pattern variables in it matched.
+    /// Expands `(syntax template)` to code that builds the syntax of `template`, with each pattern variable replaced by its match.
     pub(crate) fn syntax(&mut self, template: Stx) -> Result<Core<'gc>, ExpandError> {
         let (mut used, mut parts) = (Vec::new(), Vec::new());
         let mut shape = self.template(template, &mut used, &mut parts)?;
@@ -208,13 +210,13 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         })
     }
 
-    /// The template `root`, its last node, with the pattern variables it refers to added to
-    /// `used`, unless they're there already, and the syntax it's made of to `parts`. A list or
-    /// vector's items are made before it. In an escaped one, `(... template)`, `...` is an
+    /// Compiles the template `root`. The root is the last node of the returned shape. Adds each pattern variable that the template refers to to
+    /// `used`, once. Adds the constant syntax objects of the template to `parts`. The items of a list or
+    /// vector are compiled before it. In an escaped template, `(... template)`, `...` is an ordinary
     /// identifier.
     fn template(&mut self, root: Stx, used: &mut Vec<(Var, u32)>, parts: &mut Vec<Value<'gc>>) -> Result<TemplateShape, ExpandError> {
-        /// A part made: its node, the slots of the variables in it, in the order they're first
-        /// found, whether it's a constant, and whether it has an escape in it.
+        /// A compiled part of a template: its node, the slots of the variables in it in order of first
+        /// occurrence, whether it is a constant, and whether it contains an escape.
         struct Made {
             node: u32,
             slots: Vec<u32>,
@@ -222,13 +224,13 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             escapes: bool,
         }
         enum Task {
-            /// A template, under so many ellipses, and whether it's escaped.
+            /// Compiles a template. The fields are the template, the number of ellipses that it is under, and whether it is escaped.
             Visit(Stx, u32, bool),
             Escaped,
-            /// An item made, which has variables under more ellipses than the list it's in if
-            /// it's under any of its own.
+            /// Checks a compiled item. The fields are the item, the number of ellipses that follow it, and the number of ellipses that the enclosing list is under.
+            /// An item followed by ellipses must contain a pattern variable whose depth is greater than that of the enclosing list.
             Item(Stx, u32, u32),
-            /// A list or vector, and how many parts, nodes, items and slots there were before it.
+            /// Builds a list or vector from its compiled items. `start` holds the lengths of `parts` and of the shape's nodes, items and slots before the items were compiled.
             Seq { t: Stx, ellipses: Vec<u32>, tail: bool, vector: bool, start: (usize, usize, usize, usize) },
         }
         let mut shape = TemplateShape::default();
@@ -252,8 +254,8 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                     let tail = if tail { done.pop() } else { None };
                     let built = done.split_off(done.len() - ellipses.len());
                     let inner = built.iter().chain(&tail).any(|made| made.escapes);
-                    // A list of constants is the syntax it's made from, unless an escape in it is
-                    // dropped.
+                    // A list of constants becomes one constant: the syntax object of the list itself. That is not possible if the list contains an escape,
+                    // because the `(... )` around the escaped template must be dropped.
                     if built.iter().chain(&tail).all(|made| made.constant) && !inner {
                         parts.truncate(parts_at);
                         shape.truncate(nodes, items, slots);
@@ -298,7 +300,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 }
                 View::Datum(_) => (Vec::new(), None, None),
                 View::List(items, tail) => {
-                    // `(... template)` is `template` with its ellipses as they are.
+                    // `(... template)` stands for `template`, with each `...` in it taken as an identifier.
                     if let [dots, inner] = items[..]
                         && !escaped
                         && tail.is_none()

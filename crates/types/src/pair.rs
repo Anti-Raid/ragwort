@@ -1,6 +1,6 @@
-//! Pairs, which are immutable, as in Racket. Each knows the length of the list it starts, so
-//! `length` and `list?` take constant time. A pair can't come to reach itself, so the length
-//! is always exact.
+//! Pairs. They are immutable, as in Racket. Each pair stores the length of the list that starts
+//! at it, so `length` and `list?` take constant time. An immutable pair cannot become part of a
+//! cycle, so the stored length is always exact.
 
 use crate::gc::{Gc, Mutation, OutOfMemory, Value};
 use crate::objects::{self, Data, PairFields};
@@ -36,8 +36,8 @@ impl<'gc> Pair<'gc> {
         self.0.tail(mc)
     }
 
-    /// The length of the list this pair starts, unless its pairs end in something other than
-    /// `()`.
+    /// Returns the length of the list that starts at this pair, or `None` if the chain of pairs
+    /// does not end in `()`.
     #[inline(always)]
     pub fn list_len(self, mc: &Mutation<'gc>) -> Option<u64> {
         Some(self.0.length(mc)).filter(|&length| length != 0)
@@ -67,7 +67,7 @@ impl<'a, 'gc> Pairs<'a, 'gc> {
         Ok(Pair(objects::Pair::new(self.mc, head, tail, len)?))
     }
 
-    /// A list of `items`.
+    /// Returns a list of `items`.
     pub fn list(&self, items: &[Value<'gc>]) -> Result<Value<'gc>, OutOfMemory> {
         self.list_with_tail(items.iter().copied(), Value::NULL)
     }
@@ -86,7 +86,7 @@ impl<'a, 'gc> Pairs<'a, 'gc> {
         Ok(tail)
     }
 
-    /// The length of `value` if it's a list: `()` or a pair whose pairs end in `()`.
+    /// Returns the length of `value` if it is a list. A list is `()` or a pair whose chain of pairs ends in `()`.
     #[inline(always)]
     pub fn list_len(&self, value: Value<'gc>) -> Option<u64> {
         match Pair::of(value) {
@@ -100,20 +100,20 @@ impl<'a, 'gc> Pairs<'a, 'gc> {
         self.list_len(value).is_some()
     }
 
-    /// The heads of the pairs starting at `value`. [`Elements::rest`] is what follows them.
+    /// Returns an iterator over the heads of the chain of pairs that starts at `value`. [`Elements::rest`] returns the value that follows the pairs yielded so far.
     pub fn elements(&self, value: Value<'gc>) -> Elements<'a, 'gc> {
         Elements { mc: self.mc, rest: value }
     }
 }
 
-/// The heads of a chain of pairs, from [`Pairs::elements`].
+/// An iterator over the heads of a chain of pairs, returned by [`Pairs::elements`].
 pub struct Elements<'a, 'gc> {
     mc: &'a Mutation<'gc>,
     rest: Value<'gc>,
 }
 
 impl<'gc> Elements<'_, 'gc> {
-    /// What's left: the tail of the last pair reached, `()` once a list is used up.
+    /// Returns the value that the iterator has not consumed yet: the tail of the last pair yielded. It is `()` once a proper list is exhausted.
     pub fn rest(&self) -> Value<'gc> {
         self.rest
     }

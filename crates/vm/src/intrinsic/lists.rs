@@ -54,6 +54,7 @@ pub(super) fn find<'gc>(mc: &Mutation<'gc>, kind: Intrinsic, target: Value<'gc>,
                 equal::eqv(mc, target, candidate)
             }
             _ => {
+                // `most` is the largest number of comparisons that the remaining fuel pays for. The search spends one unit for every `PER_FUEL` steps, counted over the whole list. The `steps % PER_FUEL` steps since the last whole unit already count towards the next unit, so they are subtracted.
                 let most = fuel
                     .left()
                     .saturating_add(1)

@@ -7,7 +7,7 @@ struct UserId(u64);
 struct ChannelId(u64);
 
 static USER_ID: ExternalKind<UserId> = ExternalKind::by_value("user-id", |first, second| first.0 == second.0, |id| id.0);
-/// A second kind whose values hash as user ids do, and are never equal to one.
+/// A second kind. Its values have the same hashes as user ids, but are never equal to a user id.
 static CHANNEL_ID: ExternalKind<ChannelId> = ExternalKind::by_value("channel-id", |first, second| first.0 == second.0, |id| id.0);
 static HANDLE: ExternalKind<String> = ExternalKind::by_identity("handle");
 
@@ -24,7 +24,7 @@ fn a_reference_holds_the_hosts_value_and_what_goes_with_it() {
         assert_eq!(handle.kept(mc), kept);
         mc.set_root(0, handle.value(mc));
     });
-    // Both the host's value and the arena's value that goes with it outlive collections that move objects.
+    // Both the host's value and the arena value kept with it survive a collection that moves objects.
     arena.set_evacuate_all(true);
     arena.collect();
     arena.mutate(|mc| {
@@ -37,9 +37,14 @@ fn a_reference_holds_the_hosts_value_and_what_goes_with_it() {
 #[test]
 fn a_kind_says_when_two_references_are_equal() {
     Arena::new(1 << 20, 0).mutate(|mc| {
+        fn user<'gc>(externals: &ExternalRefs<'_, 'gc>, id: u64) -> ExternalRef<'gc> {
+            externals.make(&USER_ID, UserId(id), 0, Value::NULL).unwrap()
+        }
+        fn handle<'gc>(externals: &ExternalRefs<'_, 'gc>, text: &str) -> ExternalRef<'gc> {
+            externals.make(&HANDLE, text.to_string(), 0, Value::NULL).unwrap()
+        }
         let externals = ExternalRefs::new(mc);
-        let user = |id| externals.make(&USER_ID, UserId(id), 0, Value::NULL).unwrap();
-        let (ann, again, bo) = (user(7), user(7), user(8));
+        let (ann, again, bo) = (user(&externals, 7), user(&externals, 7), user(&externals, 8));
         assert!(ann != again && ann.same(mc, again) && again.same(mc, ann) && ann.same(mc, ann));
         assert!(!ann.same(mc, bo));
         assert_eq!((ann.hash(mc), again.hash(mc), bo.hash(mc)), (Some(7), Some(7), Some(8)));
@@ -47,9 +52,8 @@ fn a_kind_says_when_two_references_are_equal() {
         let channel = externals.make(&CHANNEL_ID, ChannelId(7), 0, Value::NULL).unwrap();
         assert!(!ann.same(mc, channel) && !channel.same(mc, ann));
         assert_eq!((channel.name(mc), channel.hash(mc)), ("channel-id", Some(7)));
-        // A kind with no equality of its own compares by identity.
-        let handle = |text: &str| externals.make(&HANDLE, text.to_string(), 0, Value::NULL).unwrap();
-        let (first, second) = (handle("same"), handle("same"));
+        // A kind without an equality function compares by identity.
+        let (first, second) = (handle(&externals, "same"), handle(&externals, "same"));
         assert!(first.same(mc, first) && !first.same(mc, second) && !first.same(mc, ann));
         assert_eq!(first.hash(mc), None);
     });

@@ -1,28 +1,28 @@
-//! Gives the crate `RAGWORT_BUILD`, which tells this build of ragwort from any other: a
-//! number made of the source of every ragwort crate, and what the build is for.
+//! Sets the `RAGWORT_BUILD` environment variable for the crate. It is a stamp that identifies this build of ragwort: a
+//! hash of the source of every ragwort crate, the crate version and the build target.
 //!
-//! An image is only good for the build that made it, and what a change to the source does to
-//! an image's meaning can't be seen in the shape of what's saved: an intrinsic that does
-//! something else, or two fields of an object that change places. So any change to the source
-//! makes another build.
+//! An image is valid only for the build that made it. A change to the source can alter what
+//! an image means without altering the shape of the saved data. Examples are an intrinsic that changes its
+//! behaviour, and two fields of an object that swap places. So any change to the source
+//! produces a different stamp.
 //!
-//! The crates are the ones in the workspace this crate is in. Built on its own, it's this
-//! crate alone, with its version.
+//! The hashed crates are the ones under `crates` in the workspace that contains this crate. When this crate is built
+//! outside a workspace, the hash covers only this crate's own source and its version.
 
 use std::path::{Path, PathBuf};
 
-/// The folders that hold nothing a build is made of.
+/// Names of folders that are skipped, because they hold no source that goes into a build.
 const SKIPPED: [&str; 4] = ["target", "tests", "examples", "benches"];
 
 fn hash(sum: &mut u64, bytes: &[u8]) {
     for &byte in bytes {
         *sum = (*sum ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01B3);
     }
-    // What ends here isn't the start of what's next.
+    // Mix in a terminator after each input. Then `ab` followed by `c` does not hash like `a` followed by `bc`.
     *sum = (*sum ^ 0xFF).wrapping_mul(0x0000_0100_0000_01B3);
 }
 
-/// The source files under `folder`, added to `files`.
+/// Adds the source files under `folder` to `files`. A source file is a `Cargo.toml` or a file that ends in `.rs`, `.rg` or `.rgn`.
 fn sources(folder: &Path, files: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(folder) else { return };
     for entry in entries.flatten() {
@@ -39,7 +39,7 @@ fn sources(folder: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-/// The folder of the workspace `manifest` is in, if it's in one.
+/// Returns the root folder of the workspace that contains the crate folder `manifest`, or `None` if the crate is in no workspace.
 fn workspace(manifest: &Path) -> Option<&Path> {
     manifest.ancestors().skip(1).find(|folder| std::fs::read_to_string(folder.join("Cargo.toml")).is_ok_and(|text| text.contains("[workspace]")))
 }

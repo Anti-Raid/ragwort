@@ -9,7 +9,7 @@ fn naive_last(text: &[char], pattern: &[char], to: usize) -> Option<usize> {
     (0..=to.checked_sub(pattern.len())?).rev().find(|&i| text[i..i + pattern.len()] == *pattern)
 }
 
-/// Mostly two letters, so patterns often match in part, and now and then a wider one.
+/// Returns `len` random letters. Most are one of two letters, so patterns often match in part. Occasionally a letter is drawn from all five, which include wider characters.
 fn few_letters(rng: &mut Rng, len: usize) -> Vec<char> {
     let letters = ['a', 'b', 'c', 'Ā', '😀'];
     (0..len).map(|_| letters[if rng.below(8) == 0 { rng.below(5) } else { rng.below(2) }]).collect()
@@ -19,7 +19,7 @@ fn text_of(h: &TestHost, s: TestStr) -> Vec<char> {
     chars(h, s).collect()
 }
 
-/// Runs of the pattern's characters, partial repeats of short ones, and random ones.
+/// Returns a random pattern for `text`: a substring of `text`, a short unit repeated and cut off part-way, or random letters.
 fn pattern_for(rng: &mut Rng, text: &[char]) -> Vec<char> {
     match rng.below(4) {
         0 if !text.is_empty() => {
@@ -60,7 +60,7 @@ fn find_agrees_with_a_naive_search() {
     }
 }
 
-/// Patterns whose halves repeat, where a two-way search has to remember what matched.
+/// Periodic patterns, for which the two-way search must remember how much of the pattern already matched.
 #[test]
 fn periodic_patterns_are_found() {
     let h = TestHost::new();
@@ -93,7 +93,7 @@ fn find_checks_where_it_starts() {
     assert_eq!(rfind(&h, s, p, 2), Ok(None), "the match has to end by `to`");
     assert_eq!(rfind(&h, s, p, 4), Err(TestError::Str(StrError::OutOfRange)));
     assert_eq!(find(&h, s, from_str(&h, "Ā").unwrap(), 0), Ok(None), "wider than the text");
-    // Bytes past the end of a packed word read as zero, and mustn't match one.
+    // Bytes past the last unit of a word can be zero, as in an inline string. A search for U+0000 must not match them.
     let nul = from_str(&h, "\0").unwrap();
     for text in ["abc", "abcdefghij"] {
         for _ in 0..2 {
@@ -164,7 +164,7 @@ fn splits_agree_with_a_model() {
     }
 }
 
-/// Whitespace of every kind `char::is_whitespace` knows, among letters.
+/// Returns `len` random characters that mix several kinds of whitespace recognised by `char::is_whitespace` with letters.
 fn spaced(rng: &mut Rng, len: usize) -> String {
     let pool = [' ', ' ', '\t', '\n', '\r', '\u{a0}', '\u{3000}', '\u{2028}', 'a', 'b', 'é', 'Ā', '😀', 'x', 'y', 'z'];
     (0..len).map(|_| pool[rng.below(pool.len())]).collect()
@@ -172,6 +172,9 @@ fn spaced(rng: &mut Rng, len: usize) -> String {
 
 #[test]
 fn whitespace_splits_and_trims_like_str() {
+    fn show(h: &TestHost, string: TestStr) -> String {
+        text_of(h, string).into_iter().collect::<String>()
+    }
     let h = TestHost::with_capacity(1 << 20);
     let mut rng = Rng(9);
     for _ in 0..2000 {
@@ -181,10 +184,9 @@ fn whitespace_splits_and_trims_like_str() {
         for s in shapes(&h, &chars_, rng.below(chars_.len() + 1)) {
             let words: Vec<String> = split_whitespace(&h, s).map(|w| text_of(&h, w.unwrap()).into_iter().collect()).collect();
             assert_eq!(words, text.split_whitespace().collect::<Vec<_>>(), "{text:?}");
-            let show = |t: TestStr| text_of(&h, t).into_iter().collect::<String>();
-            assert_eq!(show(trim(&h, s).unwrap()), text.trim());
-            assert_eq!(show(trim_start(&h, s).unwrap()), text.trim_start());
-            assert_eq!(show(trim_end(&h, s).unwrap()), text.trim_end());
+            assert_eq!(show(&h, trim(&h, s).unwrap()), text.trim());
+            assert_eq!(show(&h, trim_start(&h, s).unwrap()), text.trim_start());
+            assert_eq!(show(&h, trim_end(&h, s).unwrap()), text.trim_end());
         }
     }
     let s = from_str(&h, "word").unwrap();

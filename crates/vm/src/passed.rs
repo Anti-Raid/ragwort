@@ -29,7 +29,7 @@ use crate::run::MAX_ARGS;
 pub(crate) struct Passed<'gc> {
     slots: Option<Slots<'gc>>,
     pub(crate) rest: Value<'gc>,
-    /// Whether the slots are the argument slots of the bottom frame already, as [`Outer::pass`] leaves them. The call that takes them then has nothing to move.
+    /// Whether the slots are already the argument slots of the bottom frame, as written by [`Outer::pass`]. The call that receives them then does not need to move them.
     pub(crate) placed: bool,
 }
 
@@ -98,7 +98,7 @@ impl<'gc> Passed<'gc> {
         Ok(Passed::list(at))
     }
 
-    /// Spreads the last value, which must be a list, as `apply` does: its elements take its place. This does not check that it is a proper list. That check happens where the values are bound.
+    /// Spreads the last value as `apply` does. The last value must be a list, and its elements replace it. This function does not check that the list is a proper list. That check happens when the values are bound to parameters.
     pub(crate) fn spread_last(self, mc: &Mutation<'gc>) -> Result<Self, Fault> {
         if self.rest == Value::NULL {
             let slots = self.held().ok_or(Fault::Arity)?;
@@ -161,7 +161,7 @@ impl<'gc> Outer<'_, 'gc> {
     /// Call this last, when everything the call needs from the stack has been read. It can move the stack to a new segment, and nothing else may use the stack between this and the call.
     pub(crate) fn pass(&mut self, values: &[Value<'gc>]) -> Result<Passed<'gc>, Fault> {
         let mc = self.mc();
-        // A frame's registers wrap around its window, so more values than a call can take would overwrite the first ones.
+        // Register indexes wrap around the frame window. So more values than a call can take would overwrite the first values.
         if values.len() > MAX_ARGS {
             return Err(Fault::Malformed);
         }
@@ -175,7 +175,7 @@ impl<'gc> Outer<'_, 'gc> {
         Ok(Passed { slots: Some(slots), rest: Value::NULL, placed: true })
     }
 
-    /// Returns `taken` as passed values again: one value is written into the bottom frame, as [`Outer::pass`] does.
+    /// Converts `taken` back to passed values. A single value is written into the bottom frame, as [`Outer::pass`] does. A list becomes the rest list.
     pub(crate) fn repass(&mut self, taken: Taken<'gc>) -> Result<Passed<'gc>, Fault> {
         match taken {
             Taken::One(value) => self.pass(&[value]),

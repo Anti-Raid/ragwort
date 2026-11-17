@@ -14,8 +14,8 @@ pub(crate) struct Backing {
 impl Backing {
     pub(crate) fn new(len: usize) -> Option<Self> {
         let bytes = len.checked_mul(8)?.max(8);
-        // Most of the region is never touched, so it reserves no swap for it, which lets many
-        // regions exist where the system counts what's committed.
+        // Most of the region is never touched, so the mapping reserves no swap. Many regions
+        // can then exist on a system that limits committed memory.
         let map = MmapRaw::from(MmapOptions::new().len(bytes).no_reserve_swap().map_anon().ok()?);
         Some(Self { map, len })
     }
@@ -27,8 +27,8 @@ impl Backing {
     #[inline]
     pub(crate) fn words(&mut self) -> &[Cell<u64>] {
         // SAFETY: the mapping is `len` words, aligned to an OS page, zeroed, readable and
-        // writable, and lives as long as `self`. Any bits are a `u64`, and `Cell` makes writes
-        // through the shared view sound.
+        // writable, and lives as long as `self`. Every bit pattern is a valid `u64`, and `Cell`
+        // makes writes through the shared view sound.
         unsafe { std::slice::from_raw_parts(self.map.as_mut_ptr().cast::<Cell<u64>>(), self.len) }
     }
 
@@ -42,11 +42,11 @@ impl Backing {
         lo / 8..hi / 8
     }
 
-    /// Frees the pages now, leaving zeroed ones in their place. Returns whether it did.
+    /// Frees the pages immediately and leaves zeroed pages in their place. Returns whether the pages were freed.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn free_pages(&mut self, offset: usize, len: usize) -> bool {
-        // SAFETY: `&mut self` means no view of the words is alive. The pages stay mapped and
-        // read back as zero, or as they were if the advice fails; `u64`s either way.
+        // SAFETY: `&mut self` means that no view of the words is alive. The pages stay mapped.
+        // They read back as zero, or as their previous contents if the advice fails. Both are valid `u64`s.
         unsafe { self.map.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, offset, len) }.is_ok()
     }
 
@@ -72,8 +72,8 @@ impl Backing {
     }
 }
 
-/// Where the system has it, so pages mapped over released ones reserve no swap either, like the
-/// rest of the region.
+/// The `MAP_NORESERVE` flag, on the systems that have it. With it, the pages that are mapped over
+/// released pages reserve no swap either, like the rest of the region.
 #[cfg(any(target_vendor = "apple", target_os = "netbsd", target_os = "solaris", target_os = "illumos"))]
 const MAP_NORESERVE: libc::c_int = libc::MAP_NORESERVE;
 #[cfg(not(any(
@@ -95,9 +95,10 @@ fn os_page() -> Option<usize> {
     })
 }
 
-/// Bytes the process holds as the system counts them: the physical footprint on macOS, which
-/// leaves out pages marked reusable, and the resident set elsewhere, which the BSDs give
-/// through `ps` as they needn't mount `/proc`.
+/// Returns the number of bytes that the system counts as held by the process. On macOS this is
+/// the physical footprint, which excludes pages marked reusable. Elsewhere it is the resident set
+/// size. Systems other than Linux, such as the BSDs, read it through `ps`, because they do not
+/// always mount `/proc`.
 #[cfg(test)]
 pub(crate) fn held_bytes() -> usize {
     #[cfg(target_vendor = "apple")]

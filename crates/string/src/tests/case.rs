@@ -26,7 +26,7 @@ fn case_maps_like_char() {
             h.check(up);
             assert_eq!(text_of(&h, up), want_up);
             assert_eq!(text_of(&h, down), want_down);
-            // Folding forgets case, except for dotless ı, which folds to itself but uppercases to I.
+            // Folding removes case distinctions. The exception is dotless ı, which folds to itself but uppercases to I.
             if !text.contains(&'ı') {
                 let fold_text = text_of(&h, fold);
                 assert_eq!(text_of(&h, foldcase(&h, up).unwrap()), fold_text);
@@ -41,7 +41,7 @@ fn case_maps_like_char() {
 fn ascii_case_maps_at_the_edges_of_the_letters() {
     let h = TestHost::new();
     let text = "@AZ[`az{ 09 ~\x7f\0 mixed Case, longer than a word";
-    // Made one after the other, so they're in both of the test host's layouts.
+    // The string is created twice in a row, to cover more than one layout of the test host. As the host's first two flat strings, both copies are currently stored as slices.
     for s in [from_str(&h, text).unwrap(), from_str(&h, text).unwrap()] {
         assert_eq!(text_of(&h, upcase(&h, s).unwrap()), "@AZ[`AZ{ 09 ~\x7f\0 MIXED CASE, LONGER THAN A WORD");
         assert_eq!(text_of(&h, downcase(&h, s).unwrap()), "@az[`az{ 09 ~\x7f\0 mixed case, longer than a word");

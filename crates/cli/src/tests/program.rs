@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 
-/// A new, empty folder for the test `name`.
+/// Creates a new, empty folder for the test `name`.
 fn scratch(name: &str) -> PathBuf {
     let folder = std::env::temp_dir().join(format!("ragwort-cli-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&folder);
@@ -21,7 +21,7 @@ fn dir(name: &str, folder: &Path) -> ModuleDir {
     ModuleDir { name: name.into(), folder: folder.into() }
 }
 
-/// What the REPL writes for the input `text`.
+/// Evaluates the REPL input `text` and returns the values that the REPL writes for it.
 fn eval(program: &mut Program, text: &str) -> Result<Vec<String>, Vec<String>> {
     let mut written = Vec::new();
     program.eval(text, &mut |value| written.push(value.to_string()))?;
@@ -32,8 +32,8 @@ fn values(written: &[&str]) -> Result<Vec<String>, Vec<String>> {
     Ok(written.iter().map(|value| value.to_string()).collect())
 }
 
-/// A library of two modules, the second requiring the first, whose folder has files in both
-/// languages and one that's neither.
+/// Creates a library of two modules under `root`. `lib/foo` requires `lib/text`. The folder of `lib/text` has a file in each
+/// language and a file that is not source code.
 fn library(root: &Path) -> Vec<ModuleDir> {
     file(root, "text/a.rg", "(provide shout (struct-out user #:omit-constructor) make-user)\n(struct user (name age))\n(define (make-user name age) (user name age))\n(define (shout s) (string-append s \"!\"))");
     file(root, "text/b.rgn", "(%provide twice)\n(%define twice (%lambda (x) (%intrinsic + x x)))");
@@ -51,11 +51,11 @@ fn the_repl_keeps_what_each_input_defines() {
     assert_eq!(eval(&mut program, "(struct point (x y))"), values(&[]));
     assert_eq!(eval(&mut program, "(match (point 1 2) [(point a _ ...) a])"), values(&["1"]));
     assert_eq!(eval(&mut program, "(list display write newline)").map(|written| written.len()), Ok(1));
-    // What's wrong with an input leaves the ones before it as they were.
+    // An input that fails does not change the inputs before it.
     assert_eq!(eval(&mut program, "(car 5)"), Err(vec!["error: car: wrong type of argument: 5\n  at <input>:1".to_string()]));
     assert_eq!(eval(&mut program, "1 (car 5) 2"), Err(vec!["error: car: wrong type of argument: 5\n  at <input>:1".to_string()]));
     assert_eq!(eval(&mut program, "\n (nope)"), Err(vec!["<input>:2:3: a name nothing defines".to_string()]));
-    // An input that fails keeps what it defined before the error, and nothing after it: neither a reference nor a call reaches a procedure whose definition never ran.
+    // An input that fails keeps the definitions that ran before the error, and none of the definitions after it. Neither a reference nor a call reaches a procedure whose definition never ran.
     assert_eq!(eval(&mut program, "(define (kept) 10) (car 7) (define (lost) 20)").map_err(|e| e.len()), Err(1));
     assert_eq!(eval(&mut program, "(kept)"), values(&["10"]));
     assert_eq!(eval(&mut program, "lost"), Err(vec!["<input>:1:1: a name nothing defines".to_string()]));
@@ -79,8 +79,8 @@ fn code_requires_the_modules_the_command_line_names() {
     let mut program = Program::new(HEAP, library(&root)).unwrap();
     assert_eq!(eval(&mut program, "(require lib/foo lib/text) (list (greet (make-user \"ann\" 3)) (twice 21))"), values(&["(\"ann!\" 42)"]));
     assert_eq!(eval(&mut program, "(require lib/text) (user \"ann\" 3)"), Err(vec!["<input>:1:21: a struct whose constructor its module doesn't provide".to_string()]));
-    // A module an input requires by name is there for the inputs after it, till they define
-    // what it does.
+    // A module that an input requires by name stays visible to the inputs after it. A later definition
+    // shadows the module's binding of the same name.
     assert_eq!(eval(&mut program, "(twice 4)"), values(&["8"]));
     assert_eq!(eval(&mut program, "(define (twice x) 'mine) (twice 4)"), values(&["mine"]));
     assert_eq!(eval(&mut program, "(list (twice 4) (shout \"a\"))"), values(&["(mine \"a!\")"]));
@@ -92,23 +92,27 @@ fn code_requires_the_modules_the_command_line_names() {
     let failing = file(&root, "failing.rg", "(require lib/text)\n(twice 'two)");
     assert_eq!(Program::new(HEAP, library(&root)).unwrap().run_file(&failing, true), Err(vec![format!("error: +: wrong type of argument: two two\n  at {}:2", failing.display())]));
     assert_eq!(Program::new(HEAP, library(&root)).unwrap().run_file(&failing, false), Ok(()));
-    // A module that's required runs as an entry point does: what it drops as it starts is
-    // collected as it goes, however much that is.
+    // A required module runs in steps, as an entry point does. The garbage that it creates while it runs is
+    // collected along the way, however much there is.
     let churn = "(define (churn i last) (if (= i 0) (vector-length last) (churn (- i 1) (make-vector 200000 i))))";
     file(&root, "heavy/heavy.rg", &format!("(provide made)\n{churn}\n(define made (churn 400 #f))"));
     let mut heavy = Program::new(HEAP, vec![dir("heavy", &root.join("heavy"))]).unwrap();
     assert_eq!(eval(&mut heavy, "(require heavy) made"), values(&["200000"]));
     assert_eq!(eval(&mut heavy, &format!("{churn} (churn 400 #f)")), values(&["200000"]));
-    // A long run is stepped, so what it drops is collected as it goes.
+    // A long run is stepped, so its garbage is collected along the way.
     let long = file(&root, "long.rg", "(define (count i acc) (if (= i 0) (length acc) (count (- i 1) (cons i '()))))\n(count 3000000 '())");
     assert_eq!(Program::new(HEAP, Vec::new()).unwrap().run_file(&long, true), Ok(()));
 }
 
 #[test]
 fn what_is_wrong_says_where() {
+    fn run(dirs: Vec<ModuleDir>, path: &Path) -> Vec<String> {
+        Program::new(HEAP, dirs).unwrap().run_file(path, true).unwrap_err()
+    }
+    fn at(path: &Path, rest: &str) -> String {
+        format!("{}:{rest}", path.display())
+    }
     let root = scratch("wrong");
-    let run = |dirs: Vec<ModuleDir>, path: &Path| Program::new(HEAP, dirs).unwrap().run_file(path, true).unwrap_err();
-    let at = |path: &Path, rest: &str| format!("{}:{rest}", path.display());
     let unbound = file(&root, "unbound.rg", "(define (f) 1)\n\n(f 1 2\n   (g))\n");
     assert_eq!(run(Vec::new(), &unbound), [at(&unbound, "4:5: a name nothing defines")]);
     let unclosed = file(&root, "unclosed.rgn", "(%define x 1)\n(%define y");
@@ -119,7 +123,7 @@ fn what_is_wrong_says_where() {
     assert_eq!(run(Vec::new(), &missing), [at(&missing, "1:10: a module that can't be found")]);
     assert!(run(Vec::new(), &root.join("absent.rg"))[0].starts_with(&at(&root.join("absent.rg"), " ")));
 
-    // An error in a required module comes first, then where it was required.
+    // An error in a required module is reported first, followed by the location of the `require`.
     let broken = file(&root, "broken/one.rg", "(provide f)\n(define (f) 1)");
     let second = file(&root, "broken/two.rg", "(define (g)\n  (h))");
     let user = file(&root, "user.rg", "(require broken)\n(f)");
@@ -169,7 +173,7 @@ fn an_image_starts_a_program_from_the_modules_it_holds() {
     let mut program = Program::new(HEAP, library(&root)).unwrap();
     assert_eq!(program.load_all(), Ok(()));
     let bytes = program.save_image().unwrap();
-    // Nothing is read from the folders again: the modules are the image's.
+    // Nothing is read from the folders again. The modules come from the image.
     std::fs::remove_dir_all(root.join("text")).unwrap();
     std::fs::remove_dir_all(root.join("foo")).unwrap();
     let mut loaded = Program::from_image(HEAP, Vec::new(), &bytes).unwrap();
@@ -178,7 +182,7 @@ fn an_image_starts_a_program_from_the_modules_it_holds() {
     let main = file(&root, "main.rg", "(require lib/foo lib/text)\n(greet (make-user \"bo\" 1))\n(twice 'two)");
     assert_eq!(Program::from_image(HEAP, Vec::new(), &bytes).unwrap().run_file(&main, true), Err(vec![format!("error: +: wrong type of argument: two two\n  at {}:3", main.display())]));
 
-    // Modules from folders go on top, and the two make another image.
+    // Modules from folders are loaded on top of the image, and the combination can be saved as another image.
     file(&root, "extra/e.rg", "(require lib/text)\n(provide thrice)\n(define (thrice x) (+ x (twice x)))");
     let mut more = Program::from_image(HEAP, vec![dir("extra", &root.join("extra"))], &bytes).unwrap();
     assert_eq!(more.load_all(), Ok(()));
@@ -219,15 +223,17 @@ fn an_uncaught_error_lists_the_calls_in_progress() {
 
 #[test]
 fn a_procedure_inlined_from_another_module_keeps_its_entry() {
+    fn dirs(root: &Path) -> Vec<ModuleDir> {
+        vec![dir("util", &root.join("util"))]
+    }
     let root = scratch("inlined");
     let util = file(&root, "util/u.rg", "(provide second)\n(define (second xs)\n  (car\n    (cdr xs)))");
     let main = file(&root, "main.rg", "(require util)\n(define (use x)\n  (+ 1 (second x)))\n(+ 1 (use 5))");
-    let dirs = || vec![dir("util", &root.join("util"))];
     // The entry has the line of the operation that failed, not the line where the procedure's definition starts.
     let report = format!("error: cdr: wrong type of argument: 5\n  in second [inlined] ({}:4)\n  in use ({at}:3)\n  at {at}:4", util.display(), at = main.display());
-    assert_eq!(Program::new(HEAP, dirs()).unwrap().run_file(&main, true), Err(vec![report.clone()]));
+    assert_eq!(Program::new(HEAP, dirs(&root)).unwrap().run_file(&main, true), Err(vec![report.clone()]));
     // The entry survives an image, which saves the inline template with the lines of its operations.
-    let mut library = Program::new(HEAP, dirs()).unwrap();
+    let mut library = Program::new(HEAP, dirs(&root)).unwrap();
     assert_eq!(library.load_all(), Ok(()));
     let bytes = library.save_image().unwrap();
     assert_eq!(Program::from_image(HEAP, Vec::new(), &bytes).unwrap().run_file(&main, true), Err(vec![report]));

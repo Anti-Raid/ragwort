@@ -10,7 +10,7 @@ fn arena(limit: usize) -> Arena {
     Arena::new(limit, 2)
 }
 
-// Syntax keeps its children and metadata; the session keeps the source text.
+// A syntax object keeps its children and metadata alive. The session keeps the source text alive.
 #[test]
 fn syntax_graph_survives_collection_and_compaction() {
     let mut arena = arena(1 << 20);
@@ -19,11 +19,11 @@ fn syntax_graph_survives_collection_and_compaction() {
         let source = session.source(mc).unwrap();
         let span = SyntaxSpan::new(mc, source, 0, source.byte_len(mc) as u32).unwrap();
         let symbol = Symbols::of_arena(mc).unwrap().intern_str(&Strings::new(mc), "a").unwrap();
-        let node = |kind, datum| {
+        fn node<'gc>(mc: &Mutation<'gc>, span: SyntaxSpan<'gc>, kind: SyntaxKind, datum: Value<'gc>) -> Syntax<'gc> {
             let meta = SyntaxMeta::new(mc, kind, None, None).unwrap();
             Syntax::new(mc, datum, span, Some(meta)).unwrap()
-        };
-        let a = node(SyntaxKind::Identifier, symbol.value(mc));
+        }
+        let a = node(mc, span, SyntaxKind::Identifier, symbol.value(mc));
         let b = Syntax::new(mc, Value::fixnum(42).unwrap(), span, None).unwrap();
         let pair = Pairs::new(mc).cons(a.value(mc), b.value(mc)).unwrap();
         let (seven, nine) = (SyntaxScope::new(mc).unwrap(), SyntaxScope::of(Value::fixnum(9).unwrap()));
@@ -34,8 +34,8 @@ fn syntax_graph_survives_collection_and_compaction() {
         let meta = SyntaxMeta::new(mc, SyntaxKind::List, Some(context), Some(origin)).unwrap();
         let list = Syntax::new(mc, pair.value(mc), span, Some(meta)).unwrap();
         let vector = Vectors::new(mc).immutable_from_slice(&[list.value(mc)]).unwrap();
-        let vector = node(SyntaxKind::Vector, vector.value(mc));
-        let quote = node(SyntaxKind::Abbreviation(Abbreviation::Quote), vector.value(mc));
+        let vector = node(mc, span, SyntaxKind::Vector, vector.value(mc));
+        let quote = node(mc, span, SyntaxKind::Abbreviation(Abbreviation::Quote), vector.value(mc));
         mc.set_root(0, quote.value(mc));
         session
     });

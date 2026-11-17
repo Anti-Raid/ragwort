@@ -101,7 +101,9 @@ pub fn inline(member: Member, kind: u32, fields: u32) -> Option<Inline> {
 /// Builds the value for `member` of struct type `kind`, whose total field count is `fields`: either
 /// the type object or a generated procedure.
 pub fn value<'gc>(member: Member, kind: Core<'gc>, fields: u32, fresh: &mut Locals<'gc>) -> Core<'gc> {
-    let local = |var: &Var| Core::Ref(Place::Local(*var));
+    fn local<'gc>(var: &Var) -> Core<'gc> {
+        Core::Ref(Place::Local(*var))
+    }
     let (params, prim, args) = match member {
         Member::Type => return kind,
         Member::Make => {
@@ -216,7 +218,9 @@ impl<'gc> Form<'gc> {
     /// `parent` is the resolved supertype, or `None` if the struct has no supertype. Returns [`ModuleError::Supertype`] if the supertype is sealed.
     pub fn plan(&self, mc: &Mutation<'gc>, parent: Option<Supertype<'gc>>) -> Result<Planned<'gc>, ModuleError> {
         let strings = Strings::new(mc);
-        let text = |symbol: Value<'gc>| Symbol::of(symbol).map(|symbol| chars(&strings, symbol.name(mc)).collect::<String>());
+        fn text<'gc>(mc: &Mutation<'gc>, strings: &Strings<'_, 'gc>, symbol: Value<'gc>) -> Option<String> {
+            Symbol::of(symbol).map(|symbol| chars(strings, symbol.name(mc)).collect::<String>())
+        }
         let (above, mut fields) = match parent {
             None => (Value::FALSE, Vec::new()),
             Some(parent) if !parent.sealed => (parent.kind, parent.fields),
@@ -224,9 +228,9 @@ impl<'gc> Form<'gc> {
         };
         let inherited = fields.len();
         for field in &self.fields {
-            fields.push(Field { name: text(field.name).ok_or(ModuleError::Struct)?.into(), mutable: field.mutable });
+            fields.push(Field { name: text(mc, &strings, field.name).ok_or(ModuleError::Struct)?.into(), mutable: field.mutable });
         }
-        let name = text(self.name.0).ok_or(ModuleError::Struct)?;
+        let name = text(mc, &strings, self.name.0).ok_or(ModuleError::Struct)?;
         let named = members(&name, &fields[inherited..], inherited).ok_or(ModuleError::OutOfMemory)?;
         let kind = make_type(mc, self.name.0, above, &self.fields, self.flags).map_err(|fault| match fault {
             Fault::OutOfMemory => ModuleError::OutOfMemory,

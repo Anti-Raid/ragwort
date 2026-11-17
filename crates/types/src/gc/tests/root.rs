@@ -36,7 +36,9 @@ fn dropping_every_clone_frees_the_object() {
     let clone = root.clone();
     drop(root);
     arena.collect();
-    let alive = |arena: &mut Arena| arena.mutate(|mc| mc.root(0).downcast::<Watch>(mc).unwrap().target(mc).is_some());
+    fn alive(arena: &mut Arena) -> bool {
+        arena.mutate(|mc| mc.root(0).downcast::<Watch>(mc).unwrap().target(mc).is_some())
+    }
     assert!(alive(&mut arena), "a clone still holds it");
     drop(clone);
     arena.collect();

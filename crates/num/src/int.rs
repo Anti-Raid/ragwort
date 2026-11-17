@@ -1,7 +1,7 @@
 //! Exact integers with Racket's semantics, on any heap that implements [`Host`].
 //!
-//! Results are normalized: an integer the host can hold small is never big, and a big one
-//! never has high zero digits. Everything is generic, so a host's small path compiles down
+//! Results are normalized. An integer that the host can hold as a small integer is never a big integer, and a big integer
+//! never has high-order zero digits. Every function is generic over the host, so a host's small-integer path compiles down
 //! to plain `i64` arithmetic.
 
 use std::cmp::Ordering;
@@ -12,43 +12,43 @@ use crate::bigint::{self, DIGIT_BITS, Digit, Digits, RWDigits};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NumError {
     DivideByZero,
-    /// Infinities and NaNs have no exact value.
+    /// An infinity or a NaN was converted to an exact number. Neither has an exact value.
     NoExactValue,
-    /// An integer operation got a number that isn't one, like `1.5`.
+    /// An integer operation received a number that is not an integer, such as `1.5`.
     NotInteger,
 }
 
-/// An integer as the host holds it.
+/// An integer in the representation that the host stores.
 #[derive(Clone, Copy, Debug)]
 pub enum IntView<'a> {
     Small(i64),
-    /// Digits without high zeros, of a value [`Host::small`] can't hold.
+    /// The magnitude of a value that [`Host::small`] cannot hold. The digits have no high-order zeros.
     Big { negative: bool, digits: Digits<'a> },
 }
 
-/// Where integers live. The library reads them through [`Host::view`] and makes them with
-/// [`Host::small`] and [`Host::big`], and keeps results normalized.
+/// The heap that stores integers. The library reads integers through [`Host::view`] and creates them with
+/// [`Host::small`] and [`Host::big`]. The library keeps results normalized.
 pub trait Host {
     type Int: Copy;
     type Error: From<NumError>;
 
     fn view(&self, x: Self::Int) -> IntView<'_>;
 
-    /// `n` as a small integer, or `None` if the host only holds it big.
+    /// Returns `n` as a small integer, or `None` if the host can hold `n` only as a big integer.
     fn small(&self, n: i64) -> Option<Self::Int>;
 
-    /// A big integer from `len` zeroed digits that `init` fills in, keeping as many as it
-    /// returns. Views of other integers stay valid while it runs.
+    /// Allocates a big integer with `len` zeroed digits and calls `init` to fill them in. `init` returns the number of
+    /// digits to keep. Views of other integers stay valid while `init` runs.
     fn big(&self, negative: bool, len: usize, init: impl FnOnce(RWDigits<'_>) -> usize) -> Result<Self::Int, Self::Error>;
 
-    /// Called before about `work` digit operations.
+    /// Called before the library performs about `work` digit operations. Returning an error aborts the operation.
     #[inline]
     fn charge(&self, work: u64) -> Result<(), Self::Error> {
         let _ = work;
         Ok(())
     }
 
-    /// Called before taking `digits` digits of temporary memory, which is freed before the
+    /// Called before the library allocates `digits` digits of temporary memory. The memory is freed before the
     /// operation returns.
     #[inline]
     fn scratch(&self, digits: usize) -> Result<(), Self::Error> {
@@ -56,7 +56,7 @@ pub trait Host {
         Ok(())
     }
 
-    /// `x + y` when the host can do it straight on its small representation, or `None` to
+    /// Returns `x + y` if the host can compute it directly on its small representation, or `None` to
     /// take the general path.
     #[inline]
     fn small_add(&self, x: Self::Int, y: Self::Int) -> Option<Self::Int> {
@@ -80,7 +80,7 @@ pub trait Host {
 pub(crate) type Res<H> = Result<<H as Host>::Int, <H as Host>::Error>;
 type Both<H> = Result<(Option<<H as Host>::Int>, Option<<H as Host>::Int>), <H as Host>::Error>;
 
-/// Sign and magnitude, with small integers' magnitudes in a buffer.
+/// An integer as a sign and a magnitude. The magnitude of a small integer is stored in a one-digit buffer that the caller provides.
 #[derive(Clone, Copy)]
 struct Signed<'a> {
     negative: bool,
@@ -107,11 +107,11 @@ impl<'a> Signed<'a> {
     }
 }
 
-/// Results of up to this many digits are computed on the stack, so ones that come out
-/// small never allocate.
+/// Results of at most this many digits are computed on the stack. So a result that turns out to be
+/// small never allocates.
 const STACK: usize = 4;
 
-/// The integer `init` computes into at most `len` digits.
+/// Returns the integer that `init` computes into a buffer of `len` digits. The result is normalized.
 #[inline]
 fn make<H: Host>(h: &H, negative: bool, len: usize, init: impl FnOnce(RWDigits<'_>)) -> Res<H> {
     if len <= STACK {
@@ -119,7 +119,7 @@ fn make<H: Host>(h: &H, negative: bool, len: usize, init: impl FnOnce(RWDigits<'
         init(RWDigits::new(&mut buf[..len]));
         return from_digits(h, negative, Digits::of_mut(&mut buf[..len]));
     }
-    // A long result can still come out short, as when subtracting nearly equal numbers.
+    // A result computed in many digits can still be short, for example when subtracting nearly equal numbers.
     let (mut short, mut kept) = (None, 0);
     let x = h.big(negative, len, |mut z| {
         init(z.reborrow());
@@ -129,8 +129,8 @@ fn make<H: Host>(h: &H, negative: bool, len: usize, init: impl FnOnce(RWDigits<'
     })?;
     match short.and_then(|n| h.small(n)) {
         Some(small) => Ok(small),
-        // Moved to an allocation its size, as the rest of this one, up to a whole run of pages,
-        // would stay with it. The copy costs less than making it did.
+        // Fewer than half of the digits were kept. Copy the result into an allocation of its own size. Otherwise the unused rest of
+        // this allocation, up to a whole run of pages, would stay allocated with it. The copy costs less than computing the result did.
         None if kept * 2 < len => match h.view(x) {
             IntView::Big { negative, digits } => from_digits(h, negative, digits),
             IntView::Small(_) => Ok(x),
@@ -139,8 +139,8 @@ fn make<H: Host>(h: &H, negative: bool, len: usize, init: impl FnOnce(RWDigits<'
     }
 }
 
-/// Like [`make`], for results that keep at least `len - 1` digits. Those that need the heap
-/// then never fit a small integer, so they skip checking.
+/// Like [`make`], for results that keep at least `len - 1` digits. A result that needs the heap
+/// then never fits a small integer, so the check for a small result is skipped.
 #[inline]
 fn make_long<H: Host>(h: &H, negative: bool, len: usize, init: impl FnOnce(RWDigits<'_>)) -> Res<H> {
     if len <= STACK {
@@ -154,7 +154,7 @@ fn make_long<H: Host>(h: &H, negative: bool, len: usize, init: impl FnOnce(RWDig
     })
 }
 
-/// `digits` are normalized.
+/// Returns the value as an `i64` if it fits. `digits` must be normalized.
 #[inline]
 fn to_small(negative: bool, digits: Digits<'_>) -> Option<i64> {
     debug_assert_eq!(digits.normalize().len(), digits.len());
@@ -220,7 +220,7 @@ pub fn to_i64<H: Host>(h: &H, x: H::Int) -> Option<i64> {
     }
 }
 
-/// An integral, finite double, exactly.
+/// Returns the exact integer value of `value`, which must be finite and integral.
 pub fn from_integral_f64<H: Host>(h: &H, value: f64) -> Res<H> {
     debug_assert!(value.is_finite() && value.fract() == 0.0, "{value} isn't an integer");
     if value.abs() < -(i64::MIN as f64) {
@@ -232,7 +232,7 @@ pub fn from_integral_f64<H: Host>(h: &H, value: f64) -> Res<H> {
     make_long(h, value < 0.0, shift / DIGIT_BITS + 2, |z| bigint::left_shift(z, Digits::of_mut(&mut [mantissa]), shift))
 }
 
-/// The nearest double, ties to even.
+/// Returns the `f64` nearest to `x`, with ties to even.
 pub fn to_f64<H: Host>(h: &H, x: H::Int) -> f64 {
     match h.view(x) {
         IntView::Small(n) => n as f64,
@@ -260,8 +260,8 @@ fn compare_signed(x: Signed<'_>, y: Signed<'_>) -> Ordering {
     }
 }
 
-/// Feeds `x`'s value to `state`. Equal integers hash the same however the host holds them,
-/// and the hasher sees every digit, so a keyed hasher keeps collisions unpredictable.
+/// Feeds the value of `x` to `state`. Equal integers hash the same in either representation.
+/// The hasher receives every digit, so a keyed hasher keeps collisions unpredictable.
 #[inline]
 pub fn hash<H: Host, S: Hasher>(h: &H, x: H::Int, state: &mut S) {
     match h.view(x) {
@@ -279,7 +279,7 @@ pub fn hash<H: Host, S: Hasher>(h: &H, x: H::Int, state: &mut S) {
     }
 }
 
-/// How `x` compares to zero.
+/// Returns the ordering of `x` relative to zero.
 pub fn sign<H: Host>(h: &H, x: H::Int) -> Ordering {
     match h.view(x) {
         IntView::Small(n) => n.cmp(&0),
@@ -379,13 +379,13 @@ pub fn abs<H: Host>(h: &H, x: H::Int) -> Res<H> {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Rounding {
-    /// Toward zero: `quotient` and `remainder`, whose sign is the dividend's.
+    /// Rounds the quotient toward zero, as `quotient` and `remainder` do. The remainder has the sign of the dividend.
     Truncate,
-    /// Down: `floor/`, whose remainder is `modulo`, with the divisor's sign.
+    /// Rounds the quotient down, as `floor/` does. The remainder is `modulo`, which has the sign of the divisor.
     Floor,
 }
 
-/// The quotient and remainder of `x / y`, each made only if asked for.
+/// Returns the quotient and the remainder of `x / y`. The quotient is computed only if `want_q` is set and the remainder only if `want_r` is set. The other is `None`.
 pub fn divide<H: Host>(
     h: &H,
     x: H::Int,
@@ -412,8 +412,8 @@ pub fn divide<H: Host>(
     };
     let (xd, yd) = (xs.digits, ys.digits);
     let q_negative = xs.negative != ys.negative;
-    // Flooring with a nonzero remainder and differing signs takes one off the truncated
-    // quotient and turns the remainder into `y - remainder`.
+    // Flooring needs an adjustment when the remainder is nonzero and the signs of the operands differ. The quotient is one less than
+    // the truncated quotient, and the remainder becomes `|y| - |remainder|` with the sign of `y`.
     let adjust = floor && q_negative;
     h.charge((xd.len().saturating_sub(yd.len()) as u64 + 1) * yd.len() as u64)?;
 
@@ -448,7 +448,7 @@ pub fn divide<H: Host>(
         return Ok((quotient, remainder));
     }
 
-    // One more quotient digit than division needs, for the carry of adjusting it.
+    // Reserve one more quotient digit than the division needs, to hold the carry from the adjustment.
     let (q_len, r_len) = (xd.len() - yd.len() + 2, yd.len());
     let len = q_len + r_len + bigint::divide_scratch(xd, yd);
     h.scratch(len)?;
@@ -513,7 +513,7 @@ fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
     }
 }
 
-/// The greatest common divisor, never negative.
+/// Returns the greatest common divisor of `x` and `y`, which is never negative.
 pub fn gcd<H: Host>(h: &H, x: H::Int, y: H::Int) -> Res<H> {
     let (mut bx, mut by) = ([0], [0]);
     let (x, y) = match (h.view(x), h.view(y)) {
@@ -524,7 +524,7 @@ pub fn gcd<H: Host>(h: &H, x: H::Int, y: H::Int) -> Res<H> {
     if y.is_zero() {
         return from_digits(h, false, x);
     }
-    // Euclid's algorithm, rotating three buffers: a, b, then a mod b.
+    // Euclid's algorithm. Three buffers rotate through the roles of `a`, `b` and `a mod b`.
     let len = x.len() + 1;
     h.scratch(3 * len + bigint::divide_scratch(x, y))?;
     let (mut a, mut b, mut remainder) = (x.iter().collect::<Vec<_>>(), y.iter().collect::<Vec<_>>(), vec![0; len]);
@@ -546,7 +546,7 @@ pub fn gcd<H: Host>(h: &H, x: H::Int, y: H::Int) -> Res<H> {
     }
 }
 
-/// The least common multiple, never negative.
+/// Returns the least common multiple of `x` and `y`, which is never negative.
 pub fn lcm<H: Host>(h: &H, x: H::Int, y: H::Int) -> Res<H> {
     if sign(h, x) == Ordering::Equal || sign(h, y) == Ordering::Equal {
         return from_i64(h, 0);
@@ -575,7 +575,7 @@ pub fn bitwise_xor<H: Host>(h: &H, x: H::Int, y: H::Int) -> Res<H> {
     bitwise(h, x, y, Bitwise::Xor)
 }
 
-/// Two's complement over infinitely many bits.
+/// Applies `op` to `x` and `y` as two's-complement integers of unlimited width.
 fn bitwise<H: Host>(h: &H, x: H::Int, y: H::Int, op: Bitwise) -> Res<H> {
     let (mut bx, mut by) = ([0], [0]);
     let (x, y) = match (h.view(x), h.view(y)) {
@@ -608,7 +608,7 @@ fn bitwise<H: Host>(h: &H, x: H::Int, y: H::Int, op: Bitwise) -> Res<H> {
     make(h, negative, len(xd, yd), |z| function(z, xd, yd))
 }
 
-/// `-x - 1`
+/// Returns the bitwise complement of `x`, which is `-x - 1`.
 pub fn bitwise_not<H: Host>(h: &H, x: H::Int) -> Res<H> {
     match h.view(x) {
         IntView::Small(n) => from_i64(h, !n),
@@ -617,7 +617,7 @@ pub fn bitwise_not<H: Host>(h: &H, x: H::Int) -> Res<H> {
     }
 }
 
-/// `x * 2^shift`, rounding down for negative shifts.
+/// Returns `x * 2^shift`. A negative `shift` shifts right and rounds toward negative infinity.
 pub fn arithmetic_shift<H: Host>(h: &H, x: H::Int, shift: i64) -> Res<H> {
     let mut bx = [0];
     let x = match h.view(x) {
@@ -650,34 +650,37 @@ pub fn arithmetic_shift<H: Host>(h: &H, x: H::Int, shift: i64) -> Res<H> {
     })
 }
 
-/// Bits needed for `x` in two's complement, without the sign bit.
+/// Returns the number of bits needed to represent `x` in two's complement, not counting the sign bit.
 pub fn integer_length<H: Host>(h: &H, x: H::Int) -> u64 {
     match h.view(x) {
         IntView::Small(n) => (64 - if n < 0 { !n } else { n }.leading_zeros()) as u64,
         IntView::Big { negative, digits } => {
             let bits = digits.bit_len() as u64;
-            // `-m` takes as many bits as `m - 1`, one fewer when `m` is a power of two.
+            // `-m` needs as many bits as `m - 1`. That is one fewer than `m` needs when `m` is a power of two, and the same number otherwise.
             let power_of_two = digits.msd().is_power_of_two() && digits.slice(0, digits.len() - 1).is_zero();
             bits - (negative && power_of_two) as u64
         }
     }
 }
 
-/// The bits set in `x` if it isn't negative, or else those clear.
+/// Returns the number of one bits in `x` if `x` is not negative, or the number of zero bits if `x` is negative.
 pub fn bit_count<H: Host>(h: &H, x: H::Int) -> Result<u64, H::Error> {
-    let ones = |digits: Digits<'_>| digits.iter().map(|digit| u64::from(digit.count_ones())).sum::<u64>();
+    #[inline(always)]
+    fn ones(digits: Digits<'_>) -> u64 {
+        digits.iter().map(|digit| u64::from(digit.count_ones())).sum::<u64>()
+    }
     Ok(match h.view(x) {
         IntView::Small(n) => u64::from(if n < 0 { !n } else { n }.count_ones()),
         IntView::Big { negative, digits } => {
             h.charge(digits.len() as u64)?;
-            // `-m` is `!(m - 1)`, and `m - 1` is `m` with its lowest one cleared and the zeros
-            // under it set.
+            // `-m` is `!(m - 1)`, so its zero bits are the one bits of `m - 1`. `m - 1` is `m` with its lowest one bit cleared
+            // and the zero bits below it set.
             if negative { ones(digits) - 1 + trailing_zeros(digits) } else { ones(digits) }
         }
     })
 }
 
-/// Whether bit `index` of `x` is set, in two's complement.
+/// Returns whether bit `index` of `x` is set, in two's complement.
 pub fn bit_set<H: Host>(h: &H, x: H::Int, index: u64) -> bool {
     match h.view(x) {
         IntView::Small(n) => n >> index.min(63) & 1 == 1,
@@ -687,8 +690,8 @@ pub fn bit_set<H: Host>(h: &H, x: H::Int, index: u64) -> bool {
             if !negative {
                 return bit;
             }
-            // Of `!(m - 1)`: under `m`'s lowest one, `m - 1` has ones, at it a zero, and over it
-            // `m`'s bits.
+            // The value is `-m`, which is `!(m - 1)`. Below the lowest one bit of `m`, `m - 1` has ones. At that bit it has a zero.
+            // Above that bit it has the bits of `m`.
             match index.cmp(&trailing_zeros(digits)) {
                 Ordering::Less => false,
                 Ordering::Equal => true,
@@ -698,7 +701,7 @@ pub fn bit_set<H: Host>(h: &H, x: H::Int, index: u64) -> bool {
     }
 }
 
-/// Bits `start..end` of `x`, as a non-negative integer. `start` is at most `end`.
+/// Returns bits `start..end` of `x` as a non-negative integer. `start` must be at most `end`.
 pub fn bit_field<H: Host>(h: &H, x: H::Int, start: u64, end: u64) -> Res<H> {
     let width = end - start;
     if let IntView::Small(n) = h.view(x)
@@ -707,14 +710,14 @@ pub fn bit_field<H: Host>(h: &H, x: H::Int, start: u64, end: u64) -> Res<H> {
         return from_i64(h, n >> start.min(63) & ((1 << width) - 1));
     }
     let low = arithmetic_shift(h, x, -shift_count(start))?;
-    // Past its length, a non-negative `x` has only zeros, so needs no mask.
+    // A non-negative `x` has only zero bits at and above its `integer_length`, so no mask is needed.
     if sign(h, x) != Ordering::Less && integer_length(h, x) <= end {
         return Ok(low);
     }
     bitwise_and(h, low, ones(h, width)?)
 }
 
-/// `dest` with bits `start..end` replaced by the low bits of `source`. `start` is at most `end`.
+/// Returns `dest` with bits `start..end` replaced by the low bits of `source`. `start` must be at most `end`.
 pub fn bit_field_replace<H: Host>(h: &H, dest: H::Int, source: H::Int, start: u64, end: u64) -> Res<H> {
     let width = end - start;
     if let (IntView::Small(small_dest), IntView::Small(small_source)) = (h.view(dest), h.view(source))
@@ -723,31 +726,31 @@ pub fn bit_field_replace<H: Host>(h: &H, dest: H::Int, source: H::Int, start: u6
         let low = (1 << width) - 1;
         return from_i64(h, small_dest & !(low << start) | (small_source & low) << start);
     }
-    // Made of the bits under `start` and over `end`, it takes no mask wider than the result.
+    // Build the result from the bits of `dest` below `start`, the bits of `dest` from `end` up, and the field. This needs no mask wider than the result.
     let low = bit_field(h, dest, 0, start)?;
     let high = arithmetic_shift(h, arithmetic_shift(h, dest, -shift_count(end))?, shift_count(end))?;
     let field = arithmetic_shift(h, bit_field(h, source, 0, width)?, shift_count(start))?;
     bitwise_or(h, bitwise_or(h, low, high)?, field)
 }
 
-/// `2^width - 1`.
+/// Returns `2^width - 1`.
 fn ones<H: Host>(h: &H, width: u64) -> Res<H> {
     let one = from_i64(h, 1)?;
     sub(h, arithmetic_shift(h, one, shift_count(width))?, one)
 }
 
-/// A bit position as a shift count, those past an `i64` as far as one goes.
+/// Converts a bit position to a shift count. A position too large for an `i64` saturates at `i64::MAX`.
 fn shift_count(bits: u64) -> i64 {
     i64::try_from(bits).unwrap_or(i64::MAX)
 }
 
-/// The zeros under the lowest one of a magnitude that isn't zero.
+/// Returns the number of zero bits below the lowest one bit of `digits`, which must not be zero.
 fn trailing_zeros(digits: Digits<'_>) -> u64 {
     let zeros = digits.iter().take_while(|&digit| digit == 0).count();
     (zeros * DIGIT_BITS) as u64 + u64::from(digits.get(zeros).trailing_zeros())
 }
 
-/// The host's error for an integer larger than any memory holds.
+/// Returns the host's error for an integer that is too large for any memory. The error is obtained by asking the host for `usize::MAX` digits.
 pub(crate) fn too_big<H: Host>(h: &H) -> H::Error {
     match h.big(false, usize::MAX, |_| 0) {
         Err(error) => error,
@@ -755,7 +758,7 @@ pub(crate) fn too_big<H: Host>(h: &H) -> H::Error {
     }
 }
 
-/// `x^exponent`, by squaring.
+/// Returns `x^exponent`, by repeated squaring.
 pub fn expt<H: Host>(h: &H, x: H::Int, mut exponent: u64) -> Res<H> {
     let mut result = from_i64(h, 1)?;
     let mut base = x;
@@ -771,12 +774,12 @@ pub fn expt<H: Host>(h: &H, x: H::Int, mut exponent: u64) -> Res<H> {
     Ok(result)
 }
 
-/// `⌊√x⌋` for `x >= 0`.
+/// Returns `⌊√x⌋`. `x` must not be negative.
 pub fn isqrt<H: Host>(h: &H, x: H::Int) -> Res<H> {
     assert!(sign(h, x) != Ordering::Less, "square root of a negative integer");
     if let Some(n) = to_i64(h, x) {
         let n = n as u64;
-        // The double's root can be off by one either way.
+        // The `f64` square root can be off by one in either direction, so correct it.
         let mut root = (n as f64).sqrt() as u64;
         while root * root > n {
             root -= 1;
@@ -786,8 +789,8 @@ pub fn isqrt<H: Host>(h: &H, x: H::Int) -> Res<H> {
         }
         return from_u64(h, root);
     }
-    // Newton's method from above falls to the root and then stops falling. It starts a little
-    // above the root of the top hundred-odd bits, which the double gets to within 2^-50.
+    // Newton's method. From a start above the root, the iterates decrease to `⌊√x⌋` and then stop decreasing. The start is a little
+    // above the root. It comes from the `f64` square root of the top 100 or so bits of `x`, which has a relative error within 2^-50.
     let shift = (integer_length(h, x).saturating_sub(100) / 2) as i64;
     let top = to_f64(h, arithmetic_shift(h, x, -2 * shift)?);
     let mut root = arithmetic_shift(h, from_u64(h, top.sqrt() as u64 + 2)?, shift)?;
@@ -800,8 +803,8 @@ pub fn isqrt<H: Host>(h: &H, x: H::Int) -> Res<H> {
     }
 }
 
-/// Reads digits in `radix`, without a sign, or `None` if `text` is empty or has a character
-/// that isn't a digit in the radix.
+/// Parses `text` as unsigned digits in `radix` and returns the integer, negated if `negative`. Returns `None` if `text` is empty
+/// or contains a character that is not a digit in `radix`.
 pub fn parse<H: Host>(h: &H, text: &[u8], radix: u32, negative: bool) -> Result<Option<H::Int>, H::Error> {
     assert!((2..=36).contains(&radix), "radix out of range");
     if text.is_empty() || !text.iter().all(|&byte| (byte as char).is_digit(radix)) {
@@ -815,7 +818,7 @@ pub fn parse<H: Host>(h: &H, text: &[u8], radix: u32, negative: bool) -> Result<
     Ok(Some(x))
 }
 
-/// `x` in `radix`, with a `-` if negative.
+/// Returns `x` written in `radix`, with a leading `-` if `x` is negative.
 pub fn to_string<H: Host>(h: &H, x: H::Int, radix: u32) -> Result<String, H::Error> {
     let mut bx = [0];
     let x = Signed::new(h.view(x), &mut bx);

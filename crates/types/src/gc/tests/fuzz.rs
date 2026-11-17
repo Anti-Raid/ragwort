@@ -8,15 +8,15 @@ use crate::gc::table::{Ephemerons, Strong, TableHead, WeakObjects};
 objects! {
     kind Kind;
 
-    /// Items hold `id + i`, and the frozen data `5 * id + i`, so a moved or overwritten payload
-    /// shows.
+    /// Item `i` holds `id + i`, and element `i` of the frozen data holds `5 * id + i`. So a payload that was moved wrongly or overwritten
+    /// is detected.
     struct Obj { id: i64, next: Member<Obj>, owned: Host<u64>, cache: Weak<Obj>, data: Frozen<Box<[u64]>>, text: Value } items u64
     struct Holder {} items Member<Obj>
 }
 
 const SLOTS: usize = 16;
-/// Root 0 holds the slots, 1 to 3 the ephemeron, weak-object and strong tables, and 4 the
-/// segments the stack retired.
+/// The number of roots. Root 0 holds the slots. Roots 1 to 3 hold the ephemeron table, the weak-object table and the strong table. Root 4 holds the
+/// segments that the stack retired.
 const ROOTS: usize = 5;
 const SEGMENT: usize = WINDOW + 128;
 const RETIRED: usize = 3;
@@ -49,7 +49,7 @@ struct Model {
     text: Option<String>,
 }
 
-/// What the arena should hold.
+/// The model: the state that the arena should hold.
 #[derive(Default)]
 struct World {
     objs: HashMap<i64, Model>,
@@ -57,16 +57,16 @@ struct World {
     roots: Vec<(Root<Obj>, i64)>,
     eph: HashMap<i64, i64>,
     weak: HashSet<i64>,
-    /// Keyed by the key string's characters.
+    /// The strong table, keyed by the characters of each key string.
     strong: HashMap<String, i64>,
-    /// The stack's segment, slot by slot, and the segments it retired, as root 4 lists them.
+    /// `stack` is the stack's current segment, slot by slot. `retired` is the segments that the stack retired, in the order of the list in root 4.
     stack: Vec<Option<i64>>,
     retired: Vec<Vec<Option<i64>>>,
 }
 
 impl World {
-    /// What the arena must keep: what the slots, roots, strong table and stack reach, and the
-    /// values of ephemerons whose keys are kept.
+    /// Returns the ids of the objects that the arena must keep alive: the objects reachable from the slots, roots, strong table and stack, and the
+    /// values of the ephemerons whose keys are kept.
     fn live(&self) -> HashSet<i64> {
         let stack = self.stack.iter().chain(self.retired.iter().flatten()).flatten();
         let roots = self.roots.iter().map(|r| &r.1);
@@ -88,7 +88,7 @@ impl World {
     }
 }
 
-/// What a step found, for the model to check or follow.
+/// The result of a step, which the model checks or applies.
 enum Got {
     Done,
     Root(Root<Obj>),
@@ -99,7 +99,7 @@ enum Got {
     Top(usize),
 }
 
-/// A weak reference may only ever read as its own target, and must while the target is reachable.
+/// A weak reference may read only as its own target or as none. It must read as its target while the target is reachable.
 fn check_weak(got: Option<i64>, want: Option<i64>, live: &HashSet<i64>) {
     assert!(got.is_none() || got == want, "weak read {got:?}, expected {want:?}");
     if want.is_some_and(|w| live.contains(&w)) {
@@ -144,8 +144,8 @@ fn verify_text<'gc>(h: &Strings<'_, 'gc>, o: Gc<'gc, Obj>, want: Option<&str>) {
     }
 }
 
-/// Entries the tables hold are ones the model has, and every one with a live key is there.
-/// When `exact`, after a full collection, those are all.
+/// Checks that every entry in the tables is in the model, and that every model entry with a live key is in the tables.
+/// If `exact` is true, as after a full collection, the tables must hold no other entries.
 fn verify_tables(mc: &Mutation<'_>, world: &World, live: &HashSet<i64>, exact: bool) {
     let eph: HashMap<i64, i64> =
         table::<Ephemerons>(mc, 1).entries(mc).map(|(k, v)| (id_of(mc, k).unwrap(), id_of(mc, v).unwrap())).collect();
@@ -171,13 +171,13 @@ fn verify_tables(mc: &Mutation<'_>, world: &World, live: &HashSet<i64>, exact: b
     assert_eq!(strong, world.strong);
 }
 
-/// A number from the environment variable `name`, if it's set.
+/// Returns the number in the environment variable `name`, or `None` if the variable is not set.
 fn fuzz_knob(name: &str) -> Option<u64> {
     let value = std::env::var(name).ok()?;
     Some(value.parse().unwrap_or_else(|_| panic!("{name} must be a number, not {value:?}")))
 }
 
-/// Reports which seed was running if it panics.
+/// Reports the seed that was running if the test panics.
 struct FuzzSeed(u64);
 
 impl Drop for FuzzSeed {
@@ -208,18 +208,18 @@ fn text_of<'gc>(h: &Strings<'_, 'gc>, o: Option<Gc<'gc, Obj>>) -> Option<Str<'gc
     o.and_then(|o| h.string(o.text(h.mutation())))
 }
 
-/// Up to `max` characters from one of four sets, so flat strings of every width turn up.
+/// Returns up to `max` characters from one of four character sets, so that flat strings of every character width occur.
 fn random_text(rng: &mut Rng, max: usize) -> String {
     const SETS: [&str; 4] = ["abc xyz!", "aéßÿ", "aé日本ā", "a😀é日"];
     let set: Vec<char> = SETS[rng.below(SETS.len())].chars().collect();
     (0..rng.below(max + 1)).map(|_| set[rng.below(set.len())]).collect()
 }
 
-/// Random steps and collections, checked against a model: objects with payloads, frozen data, host
+/// Runs random steps and collections, and checks the arena against a model. The model covers objects with payloads, frozen data, host
 /// values, weak references and strings; ephemeron, weak-object and strong tables; and a VM
-/// stack written without a barrier. Longer runs on demand: `RAGWORT_FUZZ_SEEDS` seeds from
-/// `RAGWORT_FUZZ_FIRST`, of `RAGWORT_FUZZ_OPS` operations each, or only seed
-/// `RAGWORT_FUZZ_SEED`. Seeds cycle through a roomy limit and two tight ones.
+/// stack that is written without a barrier. Environment variables select longer runs: `RAGWORT_FUZZ_SEEDS` seeds starting from
+/// `RAGWORT_FUZZ_FIRST`, with `RAGWORT_FUZZ_OPS` operations each, or the single seed
+/// `RAGWORT_FUZZ_SEED`. The seeds cycle through one roomy limit and two tight limits.
 #[test]
 fn model_fuzz() {
     const LIMITS: [usize; 3] = [3 << 20, 192 << 10, 96 << 10];
@@ -254,7 +254,7 @@ fn model_fuzz() {
             let (a, b, c) = (rng.below(SLOTS), rng.below(SLOTS), rng.below(SLOTS));
             let op = rng.below(28);
             let id = next_id;
-            // In words: a few objects larger than a page, some of several lines, most small.
+            // The length in words. A few objects are larger than a page, some span several lines, and most are small.
             let len = match rng.below(20) {
                 0 => 1100 + rng.below(3800),
                 1..=5 => 8 + rng.below(1000),
@@ -264,8 +264,8 @@ fn model_fuzz() {
             let data = if rng.chance(4) { rng.below(600) } else { rng.below(4) };
             let r = if world.roots.is_empty() { 0 } else { rng.below(world.roots.len()) };
             let live = world.live();
-            // Text operations, worked out from the model: the slot whose object gets new text,
-            // and what that text should read.
+            // The plan for a text operation, computed from the model: the slot whose object gets new text,
+            // and the text that the object should then hold.
             let external = rng.chance(2);
             let mut cut = None;
             let text_plan = match op {
@@ -311,7 +311,6 @@ fn model_fuzz() {
                     let result = arena.step(|mc| -> Result<Got, Error> {
                         let items = slots(mc);
                         let h = Strings::new(mc);
-                        let obj = |i: usize| items.get(i).unwrap();
                         Ok(match op {
                             0..=3 => {
                                 let words: Box<[u64]> = (5 * id as u64..).take(data).collect();
@@ -360,32 +359,32 @@ fn model_fuzz() {
                             16 if plan.is_some() => {
                                 let fresh = plan.as_ref().unwrap().1.clone();
                                 let s = if external { h.external(ExternalText::new(fresh))? } else { from_str(&h, &fresh)? };
-                                obj(a).set_text(mc, s.value());
+                                items.get(a).unwrap().set_text(mc, s.value());
                                 Got::Done
                             }
                             17 if plan.is_some() => {
                                 let s = concat(&h, text_of(&h, items.get(b)).unwrap(), text_of(&h, items.get(c)).unwrap())?;
-                                obj(a).set_text(mc, s.value());
+                                items.get(a).unwrap().set_text(mc, s.value());
                                 Got::Done
                             }
                             18 if plan.is_some() => {
                                 let (start, end) = cut.unwrap();
                                 let s = substring(&h, text_of(&h, items.get(b)).unwrap(), start, end)?;
-                                obj(a).set_text(mc, s.value());
+                                items.get(a).unwrap().set_text(mc, s.value());
                                 Got::Done
                             }
                             19 if plan.is_some() => {
                                 let s = flatten(&h, text_of(&h, items.get(a)).unwrap())?;
-                                obj(b).set_text(mc, s.value());
+                                items.get(b).unwrap().set_text(mc, s.value());
                                 Got::Done
                             }
                             20 if ready => {
-                                let (t, key) = (table::<Ephemerons>(mc, 1), Value::object(mc, obj(a)));
-                                let old = if remove { t.remove_eq(mc, key)? } else { t.insert_eq(mc, key, Value::object(mc, obj(b)))? };
+                                let (t, key) = (table::<Ephemerons>(mc, 1), Value::object(mc, items.get(a).unwrap()));
+                                let old = if remove { t.remove_eq(mc, key)? } else { t.insert_eq(mc, key, Value::object(mc, items.get(b).unwrap()))? };
                                 Got::Id(old.and_then(|v| id_of(mc, v)))
                             }
                             21 if ready => {
-                                let found = table::<Ephemerons>(mc, 1).get_eq(mc, Value::object(mc, obj(a)))?;
+                                let found = table::<Ephemerons>(mc, 1).get_eq(mc, Value::object(mc, items.get(a).unwrap()))?;
                                 let found = found.map(|v| v.downcast::<Obj>(mc).unwrap());
                                 items.set(mc, c, found);
                                 Got::Id(found.map(|o| o.id(mc)))
@@ -393,9 +392,9 @@ fn model_fuzz() {
                             22 if ready => {
                                 let t = table::<WeakObjects<Obj>>(mc, 2);
                                 if remove {
-                                    Got::Flag(t.contains_eq(mc, obj(a))?)
+                                    Got::Flag(t.contains_eq(mc, items.get(a).unwrap())?)
                                 } else {
-                                    t.insert_eq(mc, obj(a))?;
+                                    t.insert_eq(mc, items.get(a).unwrap())?;
                                     Got::Done
                                 }
                             }
@@ -408,7 +407,7 @@ fn model_fuzz() {
                                 } else if remove {
                                     t.remove(mc, hash, |(k, _)| equal(&h, h.string(k).unwrap(), key))?.map(|(_, v)| v)
                                 } else {
-                                    let value = Value::object(mc, obj(b));
+                                    let value = Value::object(mc, items.get(b).unwrap());
                                     t.insert(mc, hash, |k| equal(&h, h.string(k).unwrap(), key), key.value(), value)?
                                 };
                                 let old = old.map(|v| v.downcast::<Obj>(mc).unwrap());
@@ -427,7 +426,7 @@ fn model_fuzz() {
                                     let r = rng.below(WINDOW);
                                     let o = items.get(rng.below(SLOTS));
                                     frame.set(r as u8, o.map_or(Value::VOID, |o| Value::object(mc, o)));
-                                    // Slots from `top` up are dead, so collections void them.
+                                    // Slots from `top` up are dead, and collections reset them to void. So the model does not record writes to them.
                                     if fp + r < top {
                                         writes.push((fp + r, o.map(|o| o.id(mc))));
                                     }
@@ -597,8 +596,8 @@ fn model_fuzz() {
         world.eph.retain(|k, _| live.contains(k));
         world.weak.retain(|x| live.contains(x));
         arena.mutate(|mc| verify_tables(mc, &world, &live, true));
-        // Down to the objects the slots and roots reach, without their strings, so whatever
-        // else the arena still holds after collecting is a leak. A dropped stack is traced once more.
+        // Reduce the arena to the objects reachable from the slots and the root handles, without their strings. Anything
+        // else that the arena still holds after collecting is a leak. The dropped stack is traced one more time.
         drop(stack);
         arena.mutate(|mc| {
             for root in 1..ROOTS {

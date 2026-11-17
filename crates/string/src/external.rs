@@ -1,21 +1,21 @@
-//! Characters kept outside the heap, by the program that runs it. A host keeps an external
-//! string's owner alive while the string is reachable, and the library reads its characters
-//! like any flat string's.
+//! Characters stored outside the heap, by the program that runs the heap. A host keeps the owner of an
+//! external string alive while the string is reachable. The library reads the characters
+//! like those of any flat string.
 //!
-//! A string never changes, so its owner promises that the characters don't: there are always as
-//! many, with the same values. The library relies on that and can't check it: it keeps what it
-//! has read of a string, such as its length and its hash.
+//! Strings are immutable, so the owner must never change the characters. Their number and their
+//! values stay the same. The library relies on this and cannot check it. It caches values that it
+//! has read from a string, such as the length and the hash.
 
 use crate::{MAX_LEN, StrError, Units, Width};
 
-/// Characters owned outside the heap, which never change.
+/// Characters that are owned outside the heap and never change.
 pub trait External: 'static {
-    /// The same characters on every call, as many and with the same values, at their narrowest
-    /// width.
+    /// Returns the characters. Every call must return the same number of units with the same values,
+    /// at the narrowest width that holds them.
     fn units(&self) -> Units<'_>;
 }
 
-/// Checks that `units` can stand as a flat string.
+/// Checks that `units` are valid as a flat string. They must be no longer than [`MAX_LEN`] and at their narrowest width.
 pub fn check_external(units: Units<'_>) -> Result<(), StrError> {
     if units.len() > MAX_LEN {
         return Err(StrError::TooLong);
@@ -26,8 +26,8 @@ pub fn check_external(units: Units<'_>) -> Result<(), StrError> {
     Ok(())
 }
 
-/// UTF-8 text as an external string: ASCII stays as it is, and other text is converted once
-/// to characters at their narrowest width, kept with the text's owner rather than in the heap.
+/// UTF-8 text as an external string. ASCII text is used as it is. Other text is converted once
+/// to units at their narrowest width. The units are stored in this value, not in the heap.
 pub struct ExternalText<T>(Repr<T>);
 
 enum Repr<T> {

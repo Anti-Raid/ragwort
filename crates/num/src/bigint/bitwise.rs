@@ -1,7 +1,7 @@
-//! Bitwise operations with two's complement semantics on sign and magnitude, without
-//! converting: a negative `-y` is `!(y - 1)`, and the borrow of `y - 1` runs along with the
-//! loop. Each function names the signs of `x` and `y`; callers put the positive one first.
-//! The `_len` functions give how many digits `z` needs.
+//! Bitwise operations with two's-complement semantics on sign-and-magnitude numbers. The magnitudes are not
+//! converted to two's complement first. A negative number `-y` equals `!(y - 1)`, and each loop computes `y - 1` digit by digit, carrying the borrow along.
+//! The name of each function gives the signs of `x` and `y`. When the signs differ, the caller passes the positive operand first.
+//! Each `_len` function returns the number of digits that `z` needs.
 
 use super::{Digits, RWDigits, add_digit, digit_sub};
 
@@ -17,7 +17,7 @@ pub fn and_pos_pos_len(x: Digits<'_>, y: Digits<'_>) -> usize {
     x.len().min(y.len())
 }
 
-/// `-x & -y == -(((x - 1) | (y - 1)) + 1)`
+/// Computes the magnitude of `-x & -y`, using `-x & -y == -(((x - 1) | (y - 1)) + 1)`.
 pub fn and_neg_neg(mut z: RWDigits<'_>, x: Digits<'_>, y: Digits<'_>) {
     let (mut xb, mut yb) = (1, 1);
     let n = x.len().max(y.len());
@@ -35,7 +35,7 @@ pub fn and_neg_neg_len(x: Digits<'_>, y: Digits<'_>) -> usize {
     x.len().max(y.len()) + 1
 }
 
-/// `x & -y == x & !(y - 1)`
+/// Computes `x & -y`, using `x & -y == x & !(y - 1)`.
 pub fn and_pos_neg(mut z: RWDigits<'_>, x: Digits<'_>, y: Digits<'_>) {
     let mut borrow = 1;
     for i in 0..x.len() {
@@ -62,7 +62,7 @@ pub fn or_pos_pos_len(x: Digits<'_>, y: Digits<'_>) -> usize {
     x.len().max(y.len())
 }
 
-/// `-x | -y == -(((x - 1) & (y - 1)) + 1)`
+/// Computes the magnitude of `-x | -y`, using `-x | -y == -(((x - 1) & (y - 1)) + 1)`.
 pub fn or_neg_neg(mut z: RWDigits<'_>, x: Digits<'_>, y: Digits<'_>) {
     let (mut xb, mut yb) = (1, 1);
     let pairs = x.len().min(y.len());
@@ -80,7 +80,7 @@ pub fn or_neg_neg_len(x: Digits<'_>, y: Digits<'_>) -> usize {
     x.len().min(y.len()) + 1
 }
 
-/// `x | -y == -(((y - 1) & !x) + 1)`
+/// Computes the magnitude of `x | -y`, using `x | -y == -(((y - 1) & !x) + 1)`.
 pub fn or_pos_neg(mut z: RWDigits<'_>, x: Digits<'_>, y: Digits<'_>) {
     let mut borrow = 1;
     for i in 0..y.len() {
@@ -108,7 +108,7 @@ pub fn xor_pos_pos_len(x: Digits<'_>, y: Digits<'_>) -> usize {
     x.len().max(y.len())
 }
 
-/// `-x ^ -y == (x - 1) ^ (y - 1)`
+/// Computes `-x ^ -y`, using `-x ^ -y == (x - 1) ^ (y - 1)`.
 pub fn xor_neg_neg(mut z: RWDigits<'_>, x: Digits<'_>, y: Digits<'_>) {
     let (mut xb, mut yb) = (1, 1);
     let n = x.len().max(y.len());
@@ -125,7 +125,7 @@ pub fn xor_neg_neg_len(x: Digits<'_>, y: Digits<'_>) -> usize {
     x.len().max(y.len())
 }
 
-/// `x ^ -y == -((x ^ (y - 1)) + 1)`
+/// Computes the magnitude of `x ^ -y`, using `x ^ -y == -((x ^ (y - 1)) + 1)`.
 pub fn xor_pos_neg(mut z: RWDigits<'_>, x: Digits<'_>, y: Digits<'_>) {
     let mut borrow = 1;
     let n = x.len().max(y.len());

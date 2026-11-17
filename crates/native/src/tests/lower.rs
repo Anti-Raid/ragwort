@@ -10,8 +10,8 @@ use ragwort_types::pair::Pairs;
 use super::*;
 use crate::LowerErrorKind::*;
 
-/// Root 0 holds the symbol table and root 1 the modules that have run, as a list of pairs of
-/// a name and a module, so code loaded later can require them.
+/// Creates an arena for a test. Root 0 holds the symbol table. Root 1 holds the modules that have
+/// run, as a list of `(name . module)` pairs, so code loaded later can require them.
 fn arena() -> Arena {
     let mut arena = Arena::new(1 << 24, 2);
     arena.mutate(|mc| {
@@ -21,7 +21,7 @@ fn arena() -> Arena {
     arena
 }
 
-/// The modules in root 1.
+/// A [`Resolver`] that finds modules in root 1.
 struct Registry;
 
 impl<'gc> Resolver<'gc> for Registry {
@@ -41,12 +41,12 @@ fn list_host<'s, 'gc>(cx: &mut ragwort_vm::HostContext<'s, 'gc>, args: ragwort_v
     Ok(ragwort_vm::Reply::Value(Pairs::new(cx.mc()).list(&args.iter().collect::<Vec<_>>())?))
 }
 
-/// `(wait n)`: defers with `n`, as a fixnum, for the test to reply to.
+/// The host function `(wait n)`. It defers the call with `n` as a fixnum, and the test supplies the reply.
 fn wait_host<'s, 'gc>(_: &mut ragwort_vm::HostContext<'s, 'gc>, args: ragwort_vm::HostArgs<'s, 'gc>) -> Result<ragwort_vm::Reply<'gc>, Fault> {
     Ok(ragwort_vm::Reply::Defer(Box::new(args.get(0).and_then(|n| n.as_fixnum()))))
 }
 
-/// The host functions every test's code is loaded with.
+/// The host functions that every test's code is loaded with.
 static HOSTS: [HostDef; 3] = [
     ragwort_vm::host!("add", 2, Purity::Pure, add_host),
     ragwort_vm::host!("wait", 1, Purity::Impure, wait_host),
@@ -57,7 +57,7 @@ fn show<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> String {
     ragwort_printer_scheme::to_string(mc, v, ragwort_printer_scheme::Mode::Write, usize::MAX).unwrap()
 }
 
-/// Runs `thunk` to the end: its value, or the fault it raised.
+/// Runs `thunk` to completion. Returns its value, or the fault of the condition that it raised.
 fn run<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Result<Value<'gc>, Fault> {
     let mut machine = Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap();
     loop {
@@ -70,8 +70,8 @@ fn run<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Result<Value<'gc>, Fault> 
     }
 }
 
-/// Loads `text` as the module `name` and runs its forms in order. If they all do, other code can
-/// require it. Returns the last one's value, written out, or the fault one raised.
+/// Loads `text` as the module `name` and runs its forms in order. If every form completes, the module is
+/// registered so that later code can require it. Returns the written form of the last form's value, or the fault that a form raised.
 fn module_in(arena: &mut Arena, name: &str, text: &str) -> Result<Result<String, Fault>, Error> {
     arena.mutate(|mc| {
         let symbols = Symbols::of(mc.root(0)).unwrap();
@@ -104,7 +104,7 @@ fn fault(text: &str) -> Fault {
     eval_in(&mut arena(), text).unwrap().unwrap_err()
 }
 
-/// The kind of lowering error `text` has, and the text where it is.
+/// Returns the kind of the lowering error in `text`, and the source text that the error spans.
 fn error(text: &str) -> (LowerErrorKind, &str) {
     match eval_in(&mut arena(), text) {
         Err(Error::Lower(e)) => (e.kind, &text[e.start as usize..e.end as usize]),
@@ -124,10 +124,10 @@ fn quotes_ifs_and_intrinsics() {
 #[test]
 fn lets_scope_and_shadow() {
     assert_eq!(eval("(%let ((x 'a)) (%let ((x 'b)) x))"), "b");
-    // A `%let`'s inits are in the scope around it, a `%letrec`'s in its own.
+    // The inits of a `%let` are in the enclosing scope. The inits of a `%letrec` are in the scope of its own names.
     assert_eq!(eval("(%let ((x 'a)) (%let ((y x) (x 'b)) (%intrinsic cons y x)))"), "(a . b)");
     assert_eq!(eval("(%let ((x 'outer)) (%letrec ((f (%lambda () x)) (x 'inner)) (%app f)))"), "inner");
-    // A `%let*`'s inits see the names before them, which may repeat.
+    // Each init of a `%let*` can refer to the names bound before it. A name may be bound more than once.
     assert_eq!(eval("(%let ((x 'a)) (%let* ((y x) (x 'b) (z (%intrinsic cons y x)) (x z)) x))"), "(a . b)");
     assert_eq!(eval("(%let* () 'a)"), "a");
     assert_eq!(eval("(%let ((x 'a)) (%intrinsic cons (%let* ((x 'b) (x 'c)) x) x))"), "(c . a)");
@@ -157,7 +157,7 @@ fn letrec_and_definitions() {
                      (%app loop xs '()))))
                (%app reverse '(a b c))";
     assert_eq!(eval(rev), "(c b a)");
-    // A definition can be named before it's defined, but not used.
+    // Code can refer to a module variable before its definition, but cannot use the variable until the definition has run.
     assert_eq!(eval("(%define f (%lambda () later)) (%define later 'yes) (%app f)"), "yes");
     assert_eq!(fault("(%define f (%lambda () later)) (%app f) (%define later 'yes)"), Fault::Unbound);
     assert_eq!(fault("(%set! later 'no) (%define later 'yes)"), Fault::Unbound);
@@ -179,38 +179,44 @@ fn modules_require_what_others_provide() {
                (%define first (%lambda (p) (%intrinsic car p)))
                (%define hidden 'h)";
     assert_eq!(module_in(&mut arena, "lib", lib), Ok(Ok("#<void>".into())));
-    let mut eval = |text: &str| eval_in(&mut arena, text).unwrap().unwrap();
-    assert_eq!(eval("(%require lib) g"), "a");
-    // An export its module assigns is read as it is.
-    assert_eq!(eval("(%require lib) (%app bump!) (%app bump!) counter"), "2");
-    assert_eq!(eval("(%require \"lib\") (%app first '(x y))"), "x");
-    assert_eq!(eval("(%require (only-in lib g first)) (%app first (%intrinsic cons g g))"), "a");
-    assert_eq!(eval("(%require (prefix-in lib: lib)) lib:g"), "a");
-    assert_eq!(eval("(%require (rename-in lib (g h))) h"), "a");
-    assert_eq!(eval("(%require (except-in lib g)) (%define g 'mine) g"), "mine");
-    // Requiring the same thing twice is fine.
-    assert_eq!(eval("(%require lib (only-in lib g)) g"), "a");
-    let mut error = |text: &str| match eval_in(&mut arena, text) {
-        Err(Error::Lower(e)) => (e.kind, text[e.start as usize..e.end as usize].to_string()),
-        other => panic!("{text} lowered: {other:?}"),
-    };
-    assert_eq!(error("(%require lib) hidden"), (Unbound, "hidden".into()));
-    assert_eq!(error("(%require lib) bump"), (Unbound, "bump".into()));
-    assert_eq!(error("(%require lib) (%set! g 'b)"), (Immutable, "g".into()));
-    assert_eq!(error("(%require lib) (%define g 'b)"), (Conflict, "g".into()));
-    assert_eq!(error("(%require lib (rename-in lib (first g)))"), (Conflict, "(rename-in lib (first g))".into()));
-    assert_eq!(error("(%require (only-in lib nope))"), (NotProvided, "nope".into()));
-    assert_eq!(error("(%require (rename-in lib (nope x)))"), (NotProvided, "(nope x)".into()));
-    assert_eq!(error("(%require nowhere)"), (Resolve, "nowhere".into()));
-    assert_eq!(error("(%require (sideways lib))"), (BadShape, "(sideways lib)".into()));
-    assert_eq!(error("(%provide nope)"), (NotDefined, "nope".into()));
-    assert_eq!(error("(%define a 1) (%provide a (rename-out (a a)))"), (Duplicate, "(a a)".into()));
-    assert_eq!(error("(%provide (all-defined-out x))"), (BadShape, "(all-defined-out x)".into()));
+    fn eval(arena: &mut Arena, text: &str) -> String {
+        eval_in(arena, text).unwrap().unwrap()
+    }
+    assert_eq!(eval(&mut arena, "(%require lib) g"), "a");
+    // An export that its own module assigns is read with its current value.
+    assert_eq!(eval(&mut arena, "(%require lib) (%app bump!) (%app bump!) counter"), "2");
+    assert_eq!(eval(&mut arena, "(%require \"lib\") (%app first '(x y))"), "x");
+    assert_eq!(eval(&mut arena, "(%require (only-in lib g first)) (%app first (%intrinsic cons g g))"), "a");
+    assert_eq!(eval(&mut arena, "(%require (prefix-in lib: lib)) lib:g"), "a");
+    assert_eq!(eval(&mut arena, "(%require (rename-in lib (g h))) h"), "a");
+    assert_eq!(eval(&mut arena, "(%require (except-in lib g)) (%define g 'mine) g"), "mine");
+    // Requiring the same binding twice is allowed.
+    assert_eq!(eval(&mut arena, "(%require lib (only-in lib g)) g"), "a");
+    fn error(arena: &mut Arena, text: &str) -> (LowerErrorKind, String) {
+        match eval_in(arena, text) {
+            Err(Error::Lower(e)) => (e.kind, text[e.start as usize..e.end as usize].to_string()),
+            other => panic!("{text} lowered: {other:?}"),
+        }
+    }
+    assert_eq!(error(&mut arena, "(%require lib) hidden"), (Unbound, "hidden".into()));
+    assert_eq!(error(&mut arena, "(%require lib) bump"), (Unbound, "bump".into()));
+    assert_eq!(error(&mut arena, "(%require lib) (%set! g 'b)"), (Immutable, "g".into()));
+    assert_eq!(error(&mut arena, "(%require lib) (%define g 'b)"), (Conflict, "g".into()));
+    assert_eq!(error(&mut arena, "(%require lib (rename-in lib (first g)))"), (Conflict, "(rename-in lib (first g))".into()));
+    assert_eq!(error(&mut arena, "(%require (only-in lib nope))"), (NotProvided, "nope".into()));
+    assert_eq!(error(&mut arena, "(%require (rename-in lib (nope x)))"), (NotProvided, "(nope x)".into()));
+    assert_eq!(error(&mut arena, "(%require nowhere)"), (Resolve, "nowhere".into()));
+    assert_eq!(error(&mut arena, "(%require (sideways lib))"), (BadShape, "(sideways lib)".into()));
+    assert_eq!(error(&mut arena, "(%provide nope)"), (NotDefined, "nope".into()));
+    assert_eq!(error(&mut arena, "(%define a 1) (%provide a (rename-out (a a)))"), (Duplicate, "(a a)".into()));
+    assert_eq!(error(&mut arena, "(%provide (all-defined-out x))"), (BadShape, "(all-defined-out x)".into()));
 }
 
 #[test]
 fn structs() {
-    let list = |items: &[&str]| items.iter().rfold(String::from("'()"), |rest, item| format!("(%intrinsic cons {item} {rest})"));
+    fn list(items: &[&str]) -> String {
+        items.iter().rfold(String::from("'()"), |rest, item| format!("(%intrinsic cons {item} {rest})"))
+    }
     let point = "(%struct point (x (y #:mutable)))";
     let made = format!("{point} (%define p (%app point 1 2)) (%app set-point-y! p 5) {}", list(&[
         "(%app point? p)", "(%app point? 5)", "(%app point-x p)", "(%app point-y p)", "p", "struct:point", "(%intrinsic equal? p (%app point 1 5))",
@@ -228,13 +234,13 @@ fn structs() {
     assert_eq!(fault(&format!("{point} (%app point 1)")), Fault::Arity);
     assert_eq!(fault(&format!("{point} (%app point-x 5)")), Fault::WrongType);
     assert_eq!(fault(&format!("{point} (%struct session (token)) (%app session-token (%app point 1 2))")), Fault::WrongType);
-    // A struct is looked at as a whole by any code, and what the form is built from is the
-    // form's alone.
+    // Any code can use the intrinsics that inspect a whole struct, such as `struct-type` and `struct->list`.
+    // The internal intrinsics that a struct form is built from are not available to this code.
     let whole = format!("{point} (%define p (%app point 1 2)) {}", list(&["(%intrinsic struct-fields (%intrinsic struct-type p))", "(%intrinsic struct->list p)"]));
     assert_eq!(eval(&whole), "((x y) (1 2))");
     assert_eq!(error(&format!("{point} (%intrinsic struct-ref (%app point 1 2) struct:point 0)")), (LowerErrorKind::UnknownIntrinsic, "struct-ref"));
     assert_eq!(error(&format!("{point} (%apply-intrinsic make-struct struct:point '(1 2))")), (LowerErrorKind::UnknownIntrinsic, "make-struct"));
-    // Code before the form calls what it defines once the form has run, and not before.
+    // Code before the struct form can call the procedures that the form defines, but only after the form has run.
     assert_eq!(eval(&format!("(%define sum (%lambda (p) (%intrinsic + (%app point-x p) (%app point-y p)))) {point} (%app sum (%app point 3 4))")), "7");
     assert_eq!(fault(&format!("(%define make (%lambda () (%app point 1 2))) (%define early (%app make)) {point}")), Fault::Unbound);
     for (bad, at) in [
@@ -254,10 +260,10 @@ fn structs() {
     assert_eq!(error("(%struct point (x)) (%set! point-x 1)"), (LowerErrorKind::Immutable, "point-x"));
     assert_eq!(error("(%if 1 (%struct point (x)) 2)"), (LowerErrorKind::Definition, "(%struct point (x))"));
 
-    // A struct has no guard: a procedure that checks what it's given makes one.
+    // Structs have no guard option. A procedure that checks its arguments and then calls the constructor does the job of a guard.
     assert_eq!(error("(%struct p (x) #:guard car)"), (LowerErrorKind::BadShape, "#:guard"));
     assert_eq!(error("(%struct p ((x #:guard car)))"), (LowerErrorKind::BadShape, "(x #:guard car)"));
-    // A sealed struct has no subtypes.
+    // A sealed struct type cannot have subtypes.
     assert_eq!(eval("(%struct leaf (v) #:sealed) (%app leaf-v (%app leaf 4))"), "4");
     assert_eq!(error("(%struct leaf (v) #:sealed) (%struct more leaf (w))"), (LowerErrorKind::BadShape, "leaf"));
 
@@ -277,13 +283,13 @@ fn optional_and_keyword_parameters() {
     assert_eq!(eval(&format!("{greet} (%app greet \"bob\")")), "\"hi bob\"");
     assert_eq!(eval(&format!("{greet} (%app greet \"bob\" #:greeting \"yo\")")), "\"yo bob\"");
     assert_eq!(eval(&format!("{greet} (%app greet #:greeting \"yo\" \"al\")")), "\"yo al\"");
-    // Through a local, a call goes by `keyword-apply`.
+    // When the callee is a local variable, the keyword call is made with `keyword-apply`.
     assert_eq!(eval(&format!("{greet} (%let ((g greet)) (%app g \"x\" #:greeting \"hey\"))")), "\"hey x\"");
     assert_eq!(eval("(%app (%lambda (#:q [q 7]) q) #:q 8)"), "8");
     assert_eq!(eval("(%app (%lambda (#:q [q 7]) q))"), "7");
     let rest = "(%define r (%lambda (#:a [a 1] . more) (%intrinsic cons a more)))";
     assert_eq!(eval(&format!("{rest} (%intrinsic cons (%app r 1 2) (%app r #:a 9 1))")), "((1 1 2) 9 1)");
-    // A default sees the parameters before it, keyword ones too.
+    // A default can refer to the parameters before it, including keyword parameters.
     assert_eq!(eval("(%define d (%lambda (#:x [x 1] #:y [y (%intrinsic + x 1)]) (%intrinsic cons x y))) (%app d #:x 5)"), "(5 . 6)");
     let need = "(%define need (%lambda (x #:k k) (%intrinsic cons x k)))";
     assert_eq!(eval(&format!("{need} (%app need 1 #:k 2)")), "(1 . 2)");
@@ -355,7 +361,7 @@ fn calls_of_imported_wrappers_inline() {
 
 #[test]
 fn a_module_reads_its_variables_unchecked_once_theyre_defined() {
-    let ops = |text: &str| {
+    fn ops(text: &str) -> Vec<ragwort_vm::Op> {
         let mut arena = arena();
         arena.mutate(|mc| {
             let symbols = Symbols::of(mc.root(0)).unwrap();
@@ -366,7 +372,7 @@ fn a_module_reads_its_variables_unchecked_once_theyre_defined() {
                 let thunk = thunk.downcast::<ragwort_vm::objects::Closure>(mc).unwrap();
                 let code = ragwort_vm::objects::ClosureFields::code(thunk, mc).unwrap();
                 ops.extend_from_slice(ragwort_vm::objects::BytecodeFields::ops(code, mc).unwrap());
-                // And the code of the lambdas it makes.
+                // Also collect the code of the lambdas that the thunk creates.
                 let constants = ragwort_types::constant::Constants::of(ragwort_vm::objects::BytecodeFields::constants(code, mc)).unwrap();
                 for i in 0..constants.len(mc) as u32 {
                     let constant = constants.get(mc, i).unwrap();
@@ -378,9 +384,13 @@ fn a_module_reads_its_variables_unchecked_once_theyre_defined() {
             }
             ops
         })
-    };
-    let checked = |ops: &[ragwort_vm::Op]| ops.iter().any(|op| matches!(op, ragwort_vm::Op::LoadSlotChecked { .. }));
-    let unchecked = |ops: &[ragwort_vm::Op]| ops.iter().any(|op| matches!(op, ragwort_vm::Op::LoadSlot { .. }));
+    }
+    fn checked(ops: &[ragwort_vm::Op]) -> bool {
+        ops.iter().any(|op| matches!(op, ragwort_vm::Op::LoadSlotChecked { .. }))
+    }
+    fn unchecked(ops: &[ragwort_vm::Op]) -> bool {
+        ops.iter().any(|op| matches!(op, ragwort_vm::Op::LoadSlot { .. }))
+    }
     let earlier = ops("(%define a 1) a");
     assert!(unchecked(&earlier) && !checked(&earlier), "{earlier:?}");
     let later = ops("(%define f (%lambda () b)) (%define b 1)");
@@ -402,7 +412,7 @@ fn requests_are_intrinsics_too() {
 
 #[test]
 fn requests_pass_on_their_arguments_from_where_they_are() {
-    // At some depth, what with-mark calls doesn't fit on the segment its arguments are on.
+    // At some depth, the call that `with-mark` makes does not fit on the stack segment that holds its arguments.
     let deep = "(%define go
                   (%lambda (n)
                     (%if (%intrinsic eqv? n 0)
@@ -423,18 +433,18 @@ fn requests_pass_on_their_arguments_from_where_they_are() {
 #[test]
 fn reads_see_the_marks_where_they_run() {
     let k = "(%define k (%intrinsic make-continuation-prompt-tag))";
-    // Read in a frame and used in a closure run under another mark: the frame's value.
+    // A mark value is read in one frame and used in a closure that runs under another mark. The closure sees the value that the frame read.
     let outer = "(%intrinsic with-mark k 5
                    (%lambda () (%let ((h (%intrinsic mark-value k 0))) (%intrinsic with-mark k 1 (%lambda () h)))))";
     assert_eq!(eval(&format!("{k} {outer}")), "5");
-    // Read in a closure run under another mark: that mark's value, inlined or not.
+    // A mark value is read inside a closure that runs under another mark. The read returns that other mark's value, whether or not the closure is inlined.
     let inner = "(%let ((f (%lambda () (%intrinsic mark-value k 0))))
                    (%intrinsic cons (%intrinsic with-mark k 1 f) (%intrinsic with-mark k 2 (%lambda () (%app f)))))";
     assert_eq!(eval(&format!("{k} {inner}")), "(1 . 2)");
     let all = "(%intrinsic with-mark k 'a
                  (%lambda () (%intrinsic cons (%intrinsic frame-mark k 0) (%intrinsic frame-marks k 0 #f))))";
     assert_eq!(eval(&format!("{k} {all}")), "(a a)");
-    // It takes its arguments from a list as any intrinsic does, and as many as it takes.
+    // `mark-value` can take its arguments from a list through `%apply-intrinsic`, as any intrinsic can. The number of arguments is still checked.
     assert_eq!(eval(&format!("{k} (%intrinsic with-mark k 3 (%lambda () (%apply-intrinsic mark-value k '(0))))")), "3");
     let spread = eval_in(&mut arena(), "(%apply-intrinsic mark-value 'k '())");
     assert!(format!("{spread:?}").contains("Arity"), "{spread:?}");
@@ -468,10 +478,12 @@ fn bad_forms_point_at_themselves() {
     assert_eq!(error("(%intrinsic frob 'a)"), (UnknownIntrinsic, "frob"));
     assert_eq!(error("(%intrinsic car)"), (Arity, "(%intrinsic car)"));
     assert_eq!(error("(%intrinsic capture 'a)"), (Arity, "(%intrinsic capture 'a)"));
-    let deep = |n| format!("{}'a{}", "(%intrinsic car ".repeat(n), ")".repeat(n));
-    // However deep it nests, it lowers and compiles, and only fails as it runs.
+    fn deep(depth: usize) -> String {
+        format!("{}'a{}", "(%intrinsic car ".repeat(depth), ")".repeat(depth))
+    }
+    // A form nested 20,000 levels deep still lowers and compiles. It fails only when it runs.
     assert_eq!(fault(&deep(20_000)), Fault::WrongType);
-    // A body of many forms is one `let`, however many there are.
+    // A body with many expressions lowers to a single `let`, however many expressions there are.
     let long = format!("(%let ((n '())) {} (%intrinsic length n))", "(%set! n (%intrinsic cons 'a n)) ".repeat(10_000));
     assert_eq!(eval(&long), "10000");
     assert!(matches!(eval_in(&mut arena(), "(%if"), Err(Error::Read(_))));
@@ -479,8 +491,12 @@ fn bad_forms_point_at_themselves() {
 
 #[test]
 fn apply_takes_lists_longer_than_a_frame() {
-    let list = |n| format!("'({})", vec!["a"; n].join(" "));
-    let count = |text: &str| text.matches('a').count();
+    fn list(length: usize) -> String {
+        format!("'({})", vec!["a"; length].join(" "))
+    }
+    fn count(text: &str) -> usize {
+        text.matches('a').count()
+    }
     for n in [WINDOW - 3, WINDOW - 2, WINDOW - 1, WINDOW, 1000] {
         assert_eq!(count(&eval(&format!("(%intrinsic apply (%lambda xs xs) {})", list(n)))), n);
         assert_eq!(count(&eval(&format!("(%intrinsic apply (%lambda (x y . r) r) {})", list(n)))), n - 2);
@@ -491,8 +507,12 @@ fn apply_takes_lists_longer_than_a_frame() {
 
 #[test]
 fn calls_and_lambdas_of_any_size() {
-    let symbols = |n| vec!["'a"; n].join(" ");
-    let names = |n| (0..n).map(|i| format!("p{i}")).collect::<Vec<_>>().join(" ");
+    fn symbols(count: usize) -> String {
+        vec!["'a"; count].join(" ")
+    }
+    fn names(count: usize) -> String {
+        (0..count).map(|i| format!("p{i}")).collect::<Vec<_>>().join(" ")
+    }
     assert_eq!(eval(&format!("(%intrinsic receive (%lambda xs (%intrinsic length xs)) (%lambda () (%intrinsic values {})))", symbols(300))), "300");
     assert_eq!(eval(&format!("(%app (%lambda xs xs) {})", symbols(300))).matches('a').count(), 300);
     let wide = format!("(%app (%lambda ({}) (%intrinsic cons p0 p299)) {})", names(300), (0..300).map(|i| format!("'s{i}")).collect::<Vec<_>>().join(" "));
@@ -542,10 +562,10 @@ fn a_mark_set_for_a_call_is_put_back_when_it_returns() {
                     (%let ((r (%intrinsic with-mark key 1 (%lambda (x) (%intrinsic cons x (%intrinsic mark-value key #f))) 'in)))
                       (%intrinsic cons r (%intrinsic mark-value key #f))))";
     assert_eq!(eval(simple), "((in . 1) . #f)");
-    // Each level marks `n` for what it calls, which goes down a level and checks the marks it
-    // sees after, as does the level, as frames overflow segments, are cut into records and copied
-    // back, again each time a continuation captured at the bottom is called.
-    let deep = |inside: &str| {
+    // Each level sets the mark to `n` around a thunk. The thunk goes down one level and then checks that the mark is still `n`.
+    // After `with-mark` returns, the level checks that the mark is `outer` again. Meanwhile frames overflow stack segments, are split into
+    // continuation records and are copied back. That happens again each time the continuation captured at the bottom is called.
+    fn deep(inside: &str) -> String {
         format!(
             "(%let* ((key (%intrinsic make-continuation-prompt-tag)) (saved #f) (count 0)
                      (check (%lambda (want) (%if (%intrinsic eqv? (%intrinsic mark-value key #f) want) 0 1))))
@@ -558,23 +578,23 @@ fn a_mark_set_for_a_call_is_put_back_when_it_returns() {
                    (%set! count (%intrinsic + count 1))
                    (%if (%intrinsic eqv? count 3) (%intrinsic cons r count) (%app saved 0)))))"
         )
-    };
-    // A mark in tail position replaces the level's, and the requests keep records small.
+    }
+    // A `with-mark` in tail position replaces the level's mark. These requests keep the continuation records small.
     let replaced = "(%intrinsic with-mark key (%intrinsic + n 1000)
                       (%lambda ()
                         (%let ((inner (%app down (%intrinsic + n -1) (%intrinsic + n 1000))))
                           (%intrinsic + inner (%app check (%intrinsic + n 1000))))))";
     assert_eq!(eval(&deep(replaced)), "(0 . 3)");
-    // With no requests on the way down, the records are as big as segments, and copying them
-    // back splits them between a frame and the call that set its mark.
+    // With no requests on the way down, each continuation record is as large as a segment. Copying a record
+    // back then splits it between a frame and the call that set the frame's mark.
     let calls = "(%let ((inner (%app down (%intrinsic + n -1) n))) (%intrinsic + inner (%app check n)))";
     assert_eq!(eval(&deep(calls)), "(0 . 3)");
 }
 
 #[test]
 fn deferred_host_calls_go_to_what_runs_the_machine() {
-    // A host call defers from the task and from a coroutine it resumes, and each reply is what
-    // the call returns; a plain run replies void.
+    // A host call can defer from the main task and from a coroutine that the task resumes. The reply to a deferred call is the
+    // value that the call returns. Resuming with a plain `run` instead of a reply makes the call return void.
     let text = "(%let ((co (%intrinsic make-coroutine (%lambda () (%intrinsic cons (%call-host wait 3) 'done)))))
                   (%let* ((a (%call-host wait 1)) (b (%intrinsic co/resume co)) (c (%call-host wait 2)))
                     (%intrinsic cons a (%intrinsic cons b c))))";
@@ -603,7 +623,7 @@ fn deferred_host_calls_go_to_what_runs_the_machine() {
 
 #[test]
 fn a_finished_machine_restarts_on_its_stack() {
-    // A continuation the first task left keeps its frames while the next runs.
+    // A continuation that the first task captured keeps its frames while the later tasks run.
     let text = "(%define k #f)
                 (%define first (%lambda () (%intrinsic + 1 (%intrinsic call/cc (%lambda (c) (%set! k c) 1)))))
                 (%define again (%lambda (n) (%intrinsic cons n (%intrinsic co/resume (%intrinsic make-coroutine (%lambda () n))))))
@@ -613,24 +633,26 @@ fn a_finished_machine_restarts_on_its_stack() {
     let shown = arena.mutate(|mc| {
         let module = Registry.resolve(mc, "main", Value::FALSE).unwrap();
         let names = ragwort_types::vector::Vectors::new(mc).vector(ragwort_vm::objects::ModuleFields::names(module, mc)).unwrap();
-        let variable = |name: &str| {
+        fn variable<'gc>(mc: &Mutation<'gc>, module: Gc<'gc, Module>, names: ragwort_types::vector::AnyVector<'gc>, name: &str) -> Value<'gc> {
             let i = (0..names.len(mc)).find(|&i| show(mc, names.get(mc, i).unwrap()) == name).unwrap();
             ragwort_vm::objects::ModuleFields::items(module, mc).get(i)
-        };
-        let finish = |machine: &mut Machine| loop {
-            match machine.run(mc).unwrap() {
-                Outcome::Paused => {}
-                Outcome::Done(v) => break show(mc, v),
-                other => panic!("{other:?}"),
+        }
+        fn finish<'gc>(mc: &Mutation<'gc>, machine: &mut Machine) -> String {
+            loop {
+                match machine.run(mc).unwrap() {
+                    Outcome::Paused => {}
+                    Outcome::Done(v) => break show(mc, v),
+                    other => panic!("{other:?}"),
+                }
             }
-        };
-        let mut machine = Machine::new(mc, MIN_SEGMENT, variable("first"), &[]).unwrap();
-        let busy = format!("{:?}", machine.restart(mc, variable("first"), &[]).err());
-        let a = finish(&mut machine);
-        machine.restart(mc, variable("again"), &[Value::fixnum(7).unwrap()]).unwrap();
-        let b = finish(&mut machine);
-        machine.restart(mc, variable("back"), &[Value::fixnum(41).unwrap()]).unwrap();
-        (busy, a, b, finish(&mut machine))
+        }
+        let mut machine = Machine::new(mc, MIN_SEGMENT, variable(mc, module, names, "first"), &[]).unwrap();
+        let busy = format!("{:?}", machine.restart(mc, variable(mc, module, names, "first"), &[]).err());
+        let a = finish(mc, &mut machine);
+        machine.restart(mc, variable(mc, module, names, "again"), &[Value::fixnum(7).unwrap()]).unwrap();
+        let b = finish(mc, &mut machine);
+        machine.restart(mc, variable(mc, module, names, "back"), &[Value::fixnum(41).unwrap()]).unwrap();
+        (busy, a, b, finish(mc, &mut machine))
     });
     assert_eq!(shown, ("Some(NotPending)".into(), "2".into(), "(7 . 7)".into(), "42".into()));
 }
@@ -639,7 +661,7 @@ fn a_finished_machine_restarts_on_its_stack() {
 fn native_code_calls_the_host_and_wraps_it_for_other_code() {
     assert_eq!(eval("(%call-host add 1 2)"), "3");
     assert_eq!(eval("(%call-host list 1 2 3)"), "(1 2 3)");
-    // A wrapper is an ordinary procedure, which passes on what the host needs, such as a mark.
+    // A wrapper is an ordinary procedure. It passes the host function the values that it needs, such as the value of a mark.
     let wrapped = "(%define add (%lambda (a) (%call-host add a (%intrinsic mark-value 'k 0))))
                    (%intrinsic with-mark 'k 5 (%lambda () (%app add 1)))";
     assert_eq!(eval(wrapped), "6");

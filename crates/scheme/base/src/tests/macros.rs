@@ -2,15 +2,15 @@ use super::*;
 
 #[test]
 fn syntax_rules_macros_are_hygienic() {
-    // What a macro binds doesn't capture what it's given, and what it refers to means what it
-    // did where the macro was defined.
+    // A variable that a macro binds does not capture an identifier of the macro's input. An identifier that the macro's template introduces
+    // refers to the binding that it had where the macro was defined.
     let swap = "(define-syntax swap! (syntax-rules () ((_ a b) (let ((tmp a)) (set! a b) (set! b tmp)))))
                 (define tmp 1) (define y 2) (swap! tmp y) (list tmp y)";
     assert_eq!(eval(swap), "(2 1)");
     let or = "(define-syntax my-or (syntax-rules () ((_) #f) ((_ e) e) ((_ e r ...) (let ((t e)) (if t t (my-or r ...))))))
               (list (let ((t 5) (if list)) (my-or #f t)) (my-or) (my-or #f #f 3))";
     assert_eq!(eval(or), "(5 #f 3)");
-    // A definition a macro introduces at the top level is its own, apart from one of the name.
+    // A top-level definition that a macro introduces is private to the macro's output. It is distinct from a definition of the same name in the code.
     let hidden = "(define-syntax def-hidden (syntax-rules () ((_ get) (begin (define secret 42) (define (get) secret)))))
                   (def-hidden get-it) (define secret 1) (list (get-it) secret)";
     assert_eq!(eval(hidden), "(42 1)");
@@ -42,7 +42,7 @@ fn patterns_take_ellipses_tails_vectors_and_literals() {
 
 #[test]
 fn macros_define_and_nest() {
-    // A macro that defines macros, with `(... ...)` for an ellipsis of the one it defines.
+    // A macro that defines a macro. `(... ...)` in its template stands for an ellipsis of the macro that it defines.
     let text = "(define-syntax def-const (syntax-rules () ((_ name v) (define-syntax name (syntax-rules () ((_) v))))))
                 (define-syntax def-lister (syntax-rules () ((_ name) (define-syntax name (syntax-rules () ((_ x (... ...)) (list x (... ...))))))))
                 (define-syntax define-two (syntax-rules () ((_ a b v) (begin (define a v) (define b v)))))
@@ -99,13 +99,13 @@ fn syntax_objects_are_values() {
 
 #[test]
 fn syntax_procedures_run_outside_macros() {
-    // Each temporary is in a scope of its own, named as its element is if that's an identifier.
+    // Each temporary has a scope of its own. It has the name of its list element if the element is an identifier.
     let temporaries = "(let ((ts (generate-temporaries #'(a 1))) (us (generate-temporaries '(a))))
                          (list (map syntax->datum ts) (syntax->datum (car us)) (map identifier? ts)
                                (bound-identifier=? (car ts) (car ts)) (bound-identifier=? (car ts) (car us))
                                (bound-identifier=? (car ts) #'a)))";
     assert_eq!(eval(temporaries), "((a t) t (#t #t) #t #f #f)");
-    // A syntax violation is an error of kind `syntax`, its irritants the form and subform.
+    // A syntax violation is an error of kind `syntax`. Its irritants are the form and the subform.
     let violation = "(guard (e (#t (list (error-object-kind e) (error-object-message e) (map syntax->datum (error-object-irritants e)))))
                        (syntax-violation 'who \"no good\" #'(x y) #'y))";
     assert_eq!(eval(violation), "(syntax \"no good\" ((x y) y))");
@@ -121,11 +121,11 @@ fn syntax_case_runs_outside_macros() {
                     (_ 'other)))
                 (list (parts #'(1 to 2)) (parts #'(k (1 2) (3))) (parts #'#(a b c)) (parts #'(1 2)) (parts 5))";
     assert_eq!(eval(text), "((range 1 2) ((1 2 k) (3 k)) 3 other other)");
-    // With no clause that matches, it raises a syntax error, of what it was given.
+    // If no clause matches, `syntax-case` raises a syntax error whose irritant is its input.
     let none = "(guard (e (#t (list (error-object-kind e) (syntax->datum (car (error-object-irritants e))))))
                   (syntax-case #'(a b) () ((x) 'one)))";
     assert_eq!(eval(none), "(syntax (a b))");
-    // As does a template whose ellipses repeat variables that matched different numbers of times.
+    // A template also raises a syntax error if one ellipsis repeats variables whose matches have different lengths.
     let uneven = "(define (zip stx) (syntax-case stx () (((a ...) (b ...)) #'((a b) ...))))
                   (list (syntax->datum (zip #'((1 2) (3 4)))) (guard (e (#t (error-object-kind e))) (zip #'((1 2) (3)))))";
     assert_eq!(eval(uneven), "(((1 3) (2 4)) syntax)");
@@ -133,14 +133,14 @@ fn syntax_case_runs_outside_macros() {
 
 #[test]
 fn free_identifiers_are_the_same_if_they_refer_to_the_same_binding() {
-    // `quote-syntax` is the syntax as it is, even of a pattern variable.
+    // `quote-syntax` returns its argument as syntax, unchanged. A pattern variable in it is not replaced by its match.
     let quoted = "(define-syntax q (lambda (stx) (syntax-case stx () ((_ x) (list (quote-syntax quote) (list #'x (quote-syntax x)))))))
                   (list (q a) (syntax->datum (quote-syntax (b #(c)))) (identifier? (quote-syntax d)))";
     assert_eq!(eval(quoted), "((a x) (b #(c)) #t)");
     let runtime = "(list (free-identifier=? #'car #'car) (free-identifier=? #'car #'cdr) (free-identifier=? (let ((car 1)) (quote-syntax car)) #'car)
                          (free-identifier=? (datum->syntax #'car 'car) #'car) (free-identifier=? #'nowhere #'nowhere))";
     assert_eq!(eval(runtime), "(#t #f #f #t #t)");
-    // What a template names is what the module defines, even after the template's made.
+    // An identifier in a template refers to the module's definition of its name, even if the definition comes after the template.
     let later = "(define-syntax to? (lambda (stx) (syntax-case stx () ((_ x) (if (free-identifier=? #'x #'to) #''yes #''no)))))
                  (define-syntax range (lambda (stx) (syntax-case stx (to) ((_ a to b) #''(a b)) ((_ . _) #''bad))))
                  (define to 1)
@@ -165,7 +165,7 @@ fn syntax_from_an_earlier_load_keeps_its_scopes() {
     assert_eq!(eval_in(&mut arena, "(define (an-x) #'x) (define (a-car) #'car)"), Ok(Ok("#<void>".into())));
     // Each load's top level is a scope of its own, as each module's is.
     assert_eq!(eval_in(&mut arena, "(list (bound-identifier=? (an-x) (an-x)) (bound-identifier=? (an-x) #'x))"), Ok(Ok("(#t #f)".into())));
-    // What it refers to, a transformer can still put in what it makes.
+    // A transformer can put the identifier from the earlier load into its output. The identifier still refers to the binding it had in that load.
     let using = "(define-syntax first (lambda (stx) (syntax-case stx () ((_ e) (list (a-car) #'e)))))
                  (let ((car cdr)) (first '(1 2)))";
     assert_eq!(eval_in(&mut arena, using), Ok(Ok("1".into())));
@@ -185,13 +185,13 @@ fn macro_mistakes_point_at_themselves() {
     assert_eq!(error("(define-syntax p (lambda (s) (syntax-case s () ((_ x) x))))"), (BadSyntax, "x"));
     assert_eq!(error("(define-syntax two-dots (syntax-rules () ((_ a ... b ...) 1)))"), (BadSyntax, "(_ a ... b ...)"));
     assert_eq!(error("(define-syntax zip (syntax-rules () ((_ (a ...) (b ...)) '((a b) ...)))) (zip (1 2) (3))"), (BadSyntax, "(zip (1 2) (3))"));
-    // A macro that expands to itself stops when what it makes fills the arena, at the top level
-    // and in an expression.
+    // A macro that expands to a use of itself stops when its expansions fill the arena. This holds at the top level
+    // and inside an expression.
     assert_eq!(error("(define-syntax loop (syntax-rules () ((_) (loop)))) (loop)"), (OutOfMemory.into(), "(loop)"));
-    // Which of its expansions fills it depends on how much room there was.
+    // Which expansion fills the arena depends on how much memory was free.
     let (kind, at) = error("(define-syntax loop (syntax-rules () ((_) (+ 1 (loop))))) (loop)");
     assert_eq!(kind, OutOfMemory.into());
     assert!(["(loop)", "(+ 1 (loop))"].contains(&at), "{at}");
-    // One that runs forever runs out of fuel.
+    // A transformer that runs forever runs out of fuel.
     assert_eq!(error("(define-syntax spin (lambda (s) (let f () (f)))) (spin)"), (Transformer, "(spin)"));
 }

@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 
 use ragwort_types::gc::{Mutation, Value};
 use ragwort_types::num::rational::Round;
-use ragwort_types::num::{ComplexHost, ComplexView, Integer, Number, NumError, Nums, RationalHost, RationalView, RealHost, RealView, complex, int, literal, real};
+use ragwort_types::num::{ComplexHost, ComplexView, Integer, Number, NumError, Nums, RationalHost, RationalView, Real, RealHost, RealView, complex, int, literal, real};
 use ragwort_types::string::{self, Strings};
 
 use crate::op::Fuel;
@@ -16,21 +16,24 @@ impl Intrinsic {
     /// Evaluates advanced numeric intrinsics (beyond basic arithmetic) on `operands`.
     #[inline(never)]
     pub(super) fn numeric<'gc>(self, mc: &Mutation<'gc>, operands: impl Operands<'gc>, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
+        #[inline(always)]
+        fn number<'gc>(nums: &Nums<'_, 'gc>, value: Value<'gc>) -> Result<Number<'gc>, Fault> {
+            nums.number(value).ok_or(Fault::WrongType)
+        }
+        #[inline(always)]
+        fn real<'gc>(nums: &Nums<'_, 'gc>, value: Value<'gc>) -> Result<Real<'gc>, Fault> {
+            nums.real(value).ok_or(Fault::WrongType)
+        }
         let nums = Nums::new(mc);
-        let number = |value: Value<'gc>| nums.number(value).ok_or(Fault::WrongType);
-        let real = |value: Value<'gc>| nums.real(value).ok_or(Fault::WrongType);
         let made_of = match self {
             Intrinsic::IsNumber => return Ok(boolean(nums.number(operands.get(0)).is_some())),
             Intrinsic::IsReal => return Ok(boolean(nums.real(operands.get(0)).is_some())),
-            Intrinsic::IsRational => {
-                let finite = |operand| !matches!(nums.real_view(operand), RealView::Flonum(float) if !float.is_finite());
-                return Ok(boolean(nums.real(operands.get(0)).is_some_and(finite)));
-            }
+            Intrinsic::IsRational => return Ok(boolean(nums.real(operands.get(0)).is_some_and(|operand| !matches!(nums.real_view(operand), RealView::Flonum(float) if !float.is_finite())))),
             Intrinsic::IsInteger => return Ok(boolean(nums.real(operands.get(0)).is_some_and(|operand| real::is_integer(&nums, operand)))),
             Intrinsic::IsExactInteger => return Ok(boolean(nums.integer(operands.get(0)).is_some())),
-            Intrinsic::IsExact | Intrinsic::IsInexact => return Ok(boolean(complex::is_exact(&nums, number(operands.get(0))?) == (self == Intrinsic::IsExact))),
+            Intrinsic::IsExact | Intrinsic::IsInexact => return Ok(boolean(complex::is_exact(&nums, number(&nums, operands.get(0))?) == (self == Intrinsic::IsExact))),
             Intrinsic::IsNan | Intrinsic::IsInfinite | Intrinsic::IsFinite => {
-                let parts = match nums.complex_view(number(operands.get(0))?) {
+                let parts = match nums.complex_view(number(&nums, operands.get(0))?) {
                     ComplexView::Real(part) => [part, part],
                     ComplexView::Complex { re, im } => [re, im],
                 };
@@ -45,14 +48,14 @@ impl Intrinsic {
                 }));
             }
             Intrinsic::IsZero => {
-                return Ok(boolean(match nums.complex_view(number(operands.get(0))?) {
+                return Ok(boolean(match nums.complex_view(number(&nums, operands.get(0))?) {
                     ComplexView::Real(operand) => real::sign(&nums, operand) == Some(Ordering::Equal),
                     ComplexView::Complex { .. } => false,
                 }));
             }
             Intrinsic::IsPositive | Intrinsic::IsNegative => {
                 let want = if self == Intrinsic::IsPositive { Ordering::Greater } else { Ordering::Less };
-                return Ok(boolean(real::sign(&nums, real(operands.get(0))?) == Some(want)));
+                return Ok(boolean(real::sign(&nums, real(&nums, operands.get(0))?) == Some(want)));
             }
             Intrinsic::IsOdd | Intrinsic::IsEven => {
                 let even = match operands.get(0).as_fixnum() {
@@ -64,9 +67,9 @@ impl Intrinsic {
             Intrinsic::Max | Intrinsic::Min if operands.count() == 0 => return Err(Fault::Arity),
             Intrinsic::Max | Intrinsic::Min => {
                 let max = self == Intrinsic::Max;
-                let mut acc = real(operands.get(0))?;
+                let mut acc = real(&nums, operands.get(0))?;
                 for i in 1..operands.count() {
-                    let next = real(operands.get(i))?;
+                    let next = real(&nums, operands.get(i))?;
                     acc = match (acc.value().as_fixnum(), next.value().as_fixnum()) {
                         (Some(left), Some(right)) => if (right > left) == max { next } else { acc },
                         _ if max => real::max(&nums, acc, next)?,
@@ -80,7 +83,7 @@ impl Intrinsic {
             // require bignum promotion.
             Intrinsic::Abs => match operands.get(0).as_fixnum().and_then(|integer| Value::fixnum(integer.abs())) {
                 Some(value) => return Ok(value),
-                None => nums.of_real(real::abs(&nums, real(operands.get(0))?)?),
+                None => nums.of_real(real::abs(&nums, real(&nums, operands.get(0))?)?),
             },
             Intrinsic::Gcd | Intrinsic::Lcm => {
                 let gcd = self == Intrinsic::Gcd;
@@ -95,13 +98,13 @@ impl Intrinsic {
                 let acc = nums.of_rational(nums.of_int(acc));
                 nums.of_real(if exact { acc } else { real::inexact(&nums, acc)? })
             }
-            Intrinsic::Numerator => nums.of_real(real::numerator(&nums, real(operands.get(0))?)?),
-            Intrinsic::Denominator => nums.of_real(real::denominator(&nums, real(operands.get(0))?)?),
+            Intrinsic::Numerator => nums.of_real(real::numerator(&nums, real(&nums, operands.get(0))?)?),
+            Intrinsic::Denominator => nums.of_real(real::denominator(&nums, real(&nums, operands.get(0))?)?),
             Intrinsic::Floor | Intrinsic::Ceiling | Intrinsic::Truncate | Intrinsic::Round => {
                 if operands.get(0).is_fixnum() {
                     return Ok(operands.get(0));
                 }
-                let operand = real(operands.get(0))?;
+                let operand = real(&nums, operands.get(0))?;
                 charge_squared(&nums, fuel, nums.of_real(operand))?;
                 let mode = match self {
                     Intrinsic::Floor => Round::Floor,
@@ -116,11 +119,11 @@ impl Intrinsic {
                 if int::sign(&nums, integer) == Ordering::Less {
                     return Err(Fault::OutOfRange);
                 }
-                charge_squared(&nums, fuel, number(operands.get(0))?)?;
+                charge_squared(&nums, fuel, number(&nums, operands.get(0))?)?;
                 nums.of_real(nums.of_rational(nums.of_int(int::isqrt(&nums, integer)?)))
             }
-            Intrinsic::Exact => complex::exact(&nums, number(operands.get(0))?)?,
-            Intrinsic::Inexact => complex::inexact(&nums, number(operands.get(0))?)?,
+            Intrinsic::Exact => complex::exact(&nums, number(&nums, operands.get(0))?)?,
+            Intrinsic::Inexact => complex::inexact(&nums, number(&nums, operands.get(0))?)?,
             Intrinsic::StringToNumber if !(1..=2).contains(&operands.count()) => return Err(Fault::Arity),
             Intrinsic::StringToNumber => {
                 let strings = Strings::new(mc);
@@ -139,29 +142,29 @@ impl Intrinsic {
                     None => return Ok(Value::FALSE),
                 }
             }
-            Intrinsic::Exp => complex::exp(&nums, number(operands.get(0))?)?,
+            Intrinsic::Exp => complex::exp(&nums, number(&nums, operands.get(0))?)?,
             Intrinsic::Log if !(1..=2).contains(&operands.count()) => return Err(Fault::Arity),
-            Intrinsic::Log if operands.count() == 2 => complex::log_base(&nums, number(operands.get(0))?, number(operands.get(1))?)?,
-            Intrinsic::Log => complex::log(&nums, number(operands.get(0))?)?,
-            Intrinsic::Sin => complex::sin(&nums, number(operands.get(0))?)?,
-            Intrinsic::Cos => complex::cos(&nums, number(operands.get(0))?)?,
-            Intrinsic::Tan => complex::tan(&nums, number(operands.get(0))?)?,
-            Intrinsic::Asin => complex::asin(&nums, number(operands.get(0))?)?,
-            Intrinsic::Acos => complex::acos(&nums, number(operands.get(0))?)?,
+            Intrinsic::Log if operands.count() == 2 => complex::log_base(&nums, number(&nums, operands.get(0))?, number(&nums, operands.get(1))?)?,
+            Intrinsic::Log => complex::log(&nums, number(&nums, operands.get(0))?)?,
+            Intrinsic::Sin => complex::sin(&nums, number(&nums, operands.get(0))?)?,
+            Intrinsic::Cos => complex::cos(&nums, number(&nums, operands.get(0))?)?,
+            Intrinsic::Tan => complex::tan(&nums, number(&nums, operands.get(0))?)?,
+            Intrinsic::Asin => complex::asin(&nums, number(&nums, operands.get(0))?)?,
+            Intrinsic::Acos => complex::acos(&nums, number(&nums, operands.get(0))?)?,
             Intrinsic::Atan if !(1..=2).contains(&operands.count()) => return Err(Fault::Arity),
-            Intrinsic::Atan if operands.count() == 2 => nums.of_real(complex::atan2(&nums, real(operands.get(0))?, real(operands.get(1))?)?),
-            Intrinsic::Atan => complex::atan(&nums, number(operands.get(0))?)?,
+            Intrinsic::Atan if operands.count() == 2 => nums.of_real(complex::atan2(&nums, real(&nums, operands.get(0))?, real(&nums, operands.get(1))?)?),
+            Intrinsic::Atan => complex::atan(&nums, number(&nums, operands.get(0))?)?,
             Intrinsic::Sqrt => {
-                let operand = number(operands.get(0))?;
+                let operand = number(&nums, operands.get(0))?;
                 charge_squared(&nums, fuel, operand)?;
                 complex::sqrt(&nums, operand)?
             }
-            Intrinsic::MakeRectangular => complex::rectangular(&nums, real(operands.get(0))?, real(operands.get(1))?)?,
-            Intrinsic::MakePolar => complex::polar(&nums, real(operands.get(0))?, real(operands.get(1))?)?,
-            Intrinsic::RealPart => nums.of_real(complex::real_part(&nums, number(operands.get(0))?)),
-            Intrinsic::ImagPart => nums.of_real(complex::imag_part(&nums, number(operands.get(0))?)?),
-            Intrinsic::Magnitude => nums.of_real(complex::magnitude(&nums, number(operands.get(0))?)?),
-            Intrinsic::Angle => nums.of_real(complex::angle(&nums, number(operands.get(0))?)?),
+            Intrinsic::MakeRectangular => complex::rectangular(&nums, real(&nums, operands.get(0))?, real(&nums, operands.get(1))?)?,
+            Intrinsic::MakePolar => complex::polar(&nums, real(&nums, operands.get(0))?, real(&nums, operands.get(1))?)?,
+            Intrinsic::RealPart => nums.of_real(complex::real_part(&nums, number(&nums, operands.get(0))?)),
+            Intrinsic::ImagPart => nums.of_real(complex::imag_part(&nums, number(&nums, operands.get(0))?)?),
+            Intrinsic::Magnitude => nums.of_real(complex::magnitude(&nums, number(&nums, operands.get(0))?)?),
+            Intrinsic::Angle => nums.of_real(complex::angle(&nums, number(&nums, operands.get(0))?)?),
             _ => unreachable!("{self:?} isn't numeric"),
         };
         Ok(made(mc, fuel, made_of.value()))
@@ -380,17 +383,23 @@ pub(super) fn fixnum_to_string<'gc>(mc: &Mutation<'gc>, integer: i64, radix: u32
 /// Returns the total significant bit count of exact parts in number `number` beyond the initial
 /// bit, such that 0, 1, and -1 yield zero bits.
 pub(super) fn exact_bits<'gc>(nums: &Nums<'_, 'gc>, number: Number<'gc>) -> u64 {
-    let bits = |integer| int::integer_length(nums, integer).saturating_sub(1);
-    let real = |part| match nums.real_view(part) {
-        RealView::Flonum(_) => 0,
-        RealView::Exact(rational) => match nums.rational_view(rational) {
-            RationalView::Integer(integer) => bits(integer),
-            RationalView::Ratio { num, den } => bits(num) + bits(den),
-        },
-    };
+    #[inline(always)]
+    fn bits<'gc>(nums: &Nums<'_, 'gc>, integer: Integer<'gc>) -> u64 {
+        int::integer_length(nums, integer).saturating_sub(1)
+    }
+    #[inline(always)]
+    fn real<'gc>(nums: &Nums<'_, 'gc>, part: Real<'gc>) -> u64 {
+        match nums.real_view(part) {
+            RealView::Flonum(_) => 0,
+            RealView::Exact(rational) => match nums.rational_view(rational) {
+                RationalView::Integer(integer) => bits(nums, integer),
+                RationalView::Ratio { num, den } => bits(nums, num) + bits(nums, den),
+            },
+        }
+    }
     match nums.complex_view(number) {
-        ComplexView::Real(part) => real(part),
-        ComplexView::Complex { re, im } => real(re) + real(im),
+        ComplexView::Real(part) => real(nums, part),
+        ComplexView::Complex { re, im } => real(nums, re) + real(nums, im),
     }
 }
 
@@ -435,32 +444,44 @@ pub(super) fn charge_power<'gc>(mc: &Mutation<'gc>, nums: &Nums<'_, 'gc>, fuel: 
 /// numbers). All arguments are validated for correct numeric types even if an earlier
 /// comparison fails.
 pub(super) fn compare<'gc>(mc: &Mutation<'gc>, op: Intrinsic, mut xs: impl Iterator<Item = Value<'gc>>) -> Result<bool, Fault> {
-    let holds = |order: Ordering| match op {
-        Intrinsic::Lt => order.is_lt(),
-        Intrinsic::Gt => order.is_gt(),
-        Intrinsic::Le => order.is_le(),
-        Intrinsic::Ge => order.is_ge(),
-        _ => order.is_eq(),
-    };
+    #[inline(always)]
+    fn holds(op: Intrinsic, order: Ordering) -> bool {
+        match op {
+            Intrinsic::Lt => order.is_lt(),
+            Intrinsic::Gt => order.is_gt(),
+            Intrinsic::Le => order.is_le(),
+            Intrinsic::Ge => order.is_ge(),
+            _ => order.is_eq(),
+        }
+    }
+    #[inline(always)]
+    fn number<'gc>(nums: &Nums<'_, 'gc>, value: Value<'gc>) -> Result<Number<'gc>, Fault> {
+        nums.number(value).ok_or(Fault::WrongType)
+    }
+    #[inline(always)]
+    fn real<'gc>(nums: &Nums<'_, 'gc>, value: Value<'gc>) -> Result<Real<'gc>, Fault> {
+        nums.real(value).ok_or(Fault::WrongType)
+    }
+    #[inline(always)]
+    fn check<'gc>(nums: &Nums<'_, 'gc>, op: Intrinsic, value: Value<'gc>) -> Result<(), Fault> {
+        if op == Intrinsic::NumEq { number(nums, value).map(drop) } else { real(nums, value).map(drop) }
+    }
     let nums = Nums::new(mc);
-    let number = |value: Value<'gc>| nums.number(value).ok_or(Fault::WrongType);
-    let real = |value: Value<'gc>| nums.real(value).ok_or(Fault::WrongType);
-    let check = |value: Value<'gc>| if op == Intrinsic::NumEq { number(value).map(drop) } else { real(value).map(drop) };
     let mut before = xs.next().ok_or(Fault::Arity)?;
     let mut so_far = true;
     if before.as_fixnum().is_none() {
-        check(before)?;
+        check(&nums, op, before)?;
     }
     for next in xs {
         let fixnums = before.as_fixnum().zip(next.as_fixnum());
         if fixnums.is_none() {
-            check(next)?;
+            check(&nums, op, next)?;
         }
         if so_far {
             so_far = match fixnums {
-                Some((left, right)) => holds(left.cmp(&right)),
-                None if op == Intrinsic::NumEq => complex::equal(&nums, number(before)?, number(next)?)?,
-                None => real::compare(&nums, real(before)?, real(next)?)?.is_some_and(holds),
+                Some((left, right)) => holds(op, left.cmp(&right)),
+                None if op == Intrinsic::NumEq => complex::equal(&nums, number(&nums, before)?, number(&nums, next)?)?,
+                None => real::compare(&nums, real(&nums, before)?, real(&nums, next)?)?.is_some_and(|order| holds(op, order)),
             };
         }
         before = next;

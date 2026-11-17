@@ -1,4 +1,4 @@
-//! Workloads over any string or number host, so the arenas run the same code.
+//! Workloads that are generic over the string host and the number host, so that every host runs the same code.
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -6,7 +6,7 @@ use std::time::Instant;
 use ragwort_num::{Host as NumHost, int};
 use ragwort_string::{Host, char_at, concat, display, equal, find, from_str, hash, len, split};
 
-/// Keeps each benchmark's best time, since runs interleave and noise only adds.
+/// Keeps the best time of each benchmark. The runs of the benchmarks are interleaved, and noise only adds time.
 #[derive(Default)]
 pub struct Best(pub Vec<(&'static str, f64)>);
 
@@ -30,7 +30,7 @@ impl Best {
 
 pub const MESSAGES: [&str; 4] = ["user#1234: hello there", "!ping", "a much longer message about nothing much at all", "ok"];
 
-/// Short strings made and dropped, as a bot handling messages makes them.
+/// Creates and drops short strings, as a bot does when it handles messages.
 #[inline(never)]
 pub fn make_short<H: Host>(h: &H, n: usize) {
     for i in 0..n {
@@ -38,7 +38,7 @@ pub fn make_short<H: Host>(h: &H, n: usize) {
     }
 }
 
-/// Equal flat strings, compared in full.
+/// Compares equal flat strings, so every comparison reads all the characters.
 #[inline(never)]
 pub fn equal_flat<H: Host>(h: &H, n: usize) -> usize {
     let a = from_str(h, &"abcdefgh".repeat(8)).ok().expect("alloc");
@@ -46,7 +46,7 @@ pub fn equal_flat<H: Host>(h: &H, n: usize) -> usize {
     (0..n).filter(|_| equal(h, black_box(a), black_box(b)).ok().expect("equal")).count()
 }
 
-/// Characters by position, each read looking the string up again.
+/// Reads characters by index. Each read looks the string up again.
 #[inline(never)]
 pub fn char_reads<H: Host>(h: &H, n: usize) -> u64 {
     let s = from_str(h, &"the quick brown fox ".repeat(50)).ok().expect("alloc");
@@ -60,7 +60,7 @@ pub fn hashes<H: Host>(h: &H, n: usize) -> u64 {
     (0..n).fold(0, |acc, i| acc ^ hash(h, black_box(s), i as u64).ok().expect("hash"))
 }
 
-/// A reply assembled from parts and written out as UTF-8.
+/// Assembles a reply from parts and writes it out as UTF-8.
 #[inline(never)]
 pub fn replies<H: Host>(h: &H, n: usize) -> usize {
     let (hi, name) = (from_str(h, "hello, ").ok().expect("alloc"), from_str(h, "Ārvīds").ok().expect("alloc"));
@@ -75,7 +75,7 @@ pub fn replies<H: Host>(h: &H, n: usize) -> usize {
     out.len()
 }
 
-/// Short strings compared, as a bot matches a command's name against the ones it knows.
+/// Compares short strings, as a bot does when it matches a command name against the names it knows.
 #[inline(never)]
 pub fn equal_short<H: Host>(h: &H, n: usize) -> usize {
     let names = ["!help", "!ping", "!ban", "!kick"].map(|s| from_str(h, s).ok().expect("alloc"));
@@ -89,21 +89,21 @@ pub fn hash_short<H: Host>(h: &H, n: usize) -> u64 {
     (0..n).fold(0, |acc, i| acc ^ hash(h, black_box(s), i as u64).ok().expect("hash"))
 }
 
-/// A command split into its arguments, most of them short.
+/// Splits a command into its arguments, most of which are short.
 #[inline(never)]
 pub fn split_commands<H: Host>(h: &H, n: usize) -> usize {
     let (s, space) = (from_str(h, "!ban user42 7d spam links").ok().expect("alloc"), from_str(h, " ").ok().expect("alloc"));
     (0..n).map(|_| split(h, black_box(s), space).filter(|p| black_box(p.is_ok())).count()).sum()
 }
 
-/// A short word looked for in a message.
+/// Searches for a short word in a message.
 #[inline(never)]
 pub fn find_short<H: Host>(h: &H, n: usize) -> usize {
     let (s, word) = (from_str(h, MESSAGES[2]).ok().expect("alloc"), from_str(h, "nothing").ok().expect("alloc"));
     (0..n).filter_map(|_| find(h, black_box(s), black_box(word), 0).ok().expect("find")).sum()
 }
 
-/// Four-digit bignums multiplied, the results dropped.
+/// Multiplies four-digit bignums and drops the results.
 #[inline(never)]
 pub fn big_muls<H: NumHost>(h: &H, n: usize) {
     let digits = b"123456789012345678901234567890123456789012345678901234567890123456789012";
@@ -113,7 +113,7 @@ pub fn big_muls<H: NumHost>(h: &H, n: usize) {
     }
 }
 
-/// Bignums made by parsing and printed back.
+/// Parses bignums and prints them back.
 #[inline(never)]
 pub fn big_round_trips<H: NumHost>(h: &H, n: usize) -> usize {
     let mut total = 0;

@@ -75,7 +75,9 @@ fn a_file_is_in_the_language_of_its_extension() {
 
 #[test]
 fn the_command_line_sets_the_memory_limit() {
-    let limited = |heap: usize| Source { heap: Some(heap), image: None, modules: vec![] };
+    fn limited(heap: usize) -> Source {
+        Source { heap: Some(heap), image: None, modules: vec![] }
+    }
     assert_eq!(parsed(&["--heap", "16m", "bot.rg"]), Ok(Command::Run { from: limited(16 << 20), entry: Some(PathBuf::from("bot.rg")) }));
     assert_eq!(parsed(&["--heap", "512K"]), Ok(Command::Run { from: limited(512 << 10), entry: None }));
     assert_eq!(parsed(&["compile", "--heap", "1g", "main.rg"]), Ok(Command::Compile { from: limited(1 << 30), entry: Some(PathBuf::from("main.rg")) }));

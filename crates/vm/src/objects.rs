@@ -11,7 +11,7 @@ mod tests;
 objects! {
     pub kind Vm;
 
-    /// Compiled procedure bytecode: contains the instruction array ([`Op`]), the constant pool table shared across co-compiled code, capture descriptors mapping upvalues for instantiated closures, encoded parameter arity (following Chez Scheme conventions), and an optional reference to the enclosing [`Module`].
+    /// Compiled procedure bytecode. `ops` is the instruction array ([`Op`]). `constants` is the constant pool table, which is shared across code compiled together. `captures` describes the source of each upvalue of a closure created from the code. `arity` is the encoded parameter arity, which follows Chez Scheme conventions. `module` is an optional reference to the enclosing [`Module`].
     pub struct Bytecode {
         ops: Frozen<std::boxed::Box<[Op]>>,
         constants: Value,
@@ -29,7 +29,11 @@ objects! {
         /// The first row of this function in that table, and the number of rows it owns.
         lines_start: u32,
         lines_len: u32,
+        /// One word for each hinted table instruction of the code, or none if it has no such instruction. See [`Hints`].
+        hints: Member<Hints>,
     }
+    /// The hint words of the hinted table instructions of one [`Bytecode`]. Each word holds the entry position where its instruction last found its key (see `Table::get_at`). The instructions of the code are immutable, so the hints are stored in this separate object. A hint is only a guess, and the instruction checks it, so every word value is valid.
+    pub struct Hints {} items u64
     /// The source positions of code compiled together (see [`crate::report::Table`]). The items are the sources and procedure names that the table's rows refer to by index.
     pub struct Sites { table: Frozen<crate::report::Table> } items Value
     /// A compiled `syntax-case` pattern descriptor along with the literal identifiers and pattern data it references (see [`crate::syntax_case`]).
@@ -42,7 +46,7 @@ objects! {
     pub struct Box { value: Value }
     /// A slice of stack frames preserved for a continuation, modeled after Chez Scheme continuation records: occupies slots `start..end` within `segment` that are protected from stack overwrites. They end at the boundary where the overlying frame would begin, with `link` specifying the return link where the topmost frame resumes, and `next` referencing the next record down the continuation chain (or `#f`).
     ///
-    /// `attachments` contains continuation marks restored upon resumption so that marks created above them disappear upon return. When `one_shot` is true (indicating no escaping continuation retains the record), the frames are resumed in place rather than copied to the heap—either directly on the stack segment if adjacent to active frames, or by transferring execution back onto the segment if `owns` is true (as when unwinding a stack overflow).
+    /// `attachments` contains continuation marks restored upon resumption so that marks created above them disappear upon return. `one_shot` is true when no captured continuation holds the record. A one-shot record can be resumed in place, without copying its frames back onto the stack. This happens in two cases. If the frames are on the stack's current segment, directly below the active frames, the stack takes them back. If `owns` is true, as after a stack overflow, the stack moves back onto the record's segment.
     pub struct Frames {
         segment: Member<Segment>,
         start: u32,
@@ -63,11 +67,11 @@ objects! {
     pub struct Condition { failure: Frozen<crate::report::Failure>, message: Value, irritants: Value, trace: Value }
     /// Represents a `dynamic-wind` guard holding `before` and `after` thunks executed when entering or exiting a dynamic extent. Maintained innermost-first in task and prompt winders lists.
     pub struct Winder { before: Value, after: Value }
-    /// An exception handler record installed by `guard` or `co/try-resume` in continuation marks. When an unhandled exception reaches this guard, execution unwinds to its installation site and invokes `handler` with the raised value (or, if `handler` is `#f`, returns `#f` and the value), restoring the dynamic `winders` in place when the guard was established. Stored in a register beneath the protected thunk's frame or within an outer [`Native`] continuation record.
+    /// An exception handler record installed by `guard` or `co/try-resume` in continuation marks. When a raised value reaches this guard, execution unwinds to the point where the guard was installed and restores `winders`, the winders that were active at that point. It then calls `handler` with the raised value. If `handler` is `#f`, it returns `#f` and the value instead. `traced` is false for `guard/no-traceback`, and a condition that such a guard catches records no call trace. The guard is stored in a register beneath the protected thunk's frame, or in an outer [`Native`] continuation record.
     pub struct Guard { handler: Value, winders: Value, traced: bool }
     /// A continuation boundary record representing an internal VM control point on the stack chain. When overlying frames return, `kind` specifies the next VM action using operands `a` and `b`. `attachments` and `next` function like those in [`Frames`]. Immutable once constructed, allowing a continuation to resume from it repeatedly.
     pub struct Native { kind: u32, a: Value, b: Value, attachments: Value, next: Value }
-    /// A coroutine task representing an arena-allocated execution state managed by a [`crate::Machine`]: preserves the result accumulator (`acc`) between run steps, the continuation record chain (`chain`), continuation marks (`attachments` as an association list of `(key . value)` pairs), active dynamic [`Winder`]s, and enclosing delimited prompts (`prompts`). `spare` and `spare_base` retain a cached stack segment reused during stack overflows.
+    /// A coroutine task: the execution state of one coroutine, allocated in the arena and run by a [`crate::Machine`]. `acc` preserves the result accumulator between run steps. `chain` is the chain of continuation records. `attachments` holds the continuation marks as an association list of `(key . value)` pairs. `winders` lists the active [`Winder`]s, and `prompts` lists the enclosing delimited prompts. `spare` and `spare_base` hold a cached stack segment that is reused on stack overflow.
     ///
     /// `body` contains the initial entry procedure before execution begins. While `co/reset` is closing the coroutine, it holds the new body instead. `resumer` points to the task that resumed this one, while `resumed` points to any task currently resumed by it. While suspended, active stack frames reside on `segment` starting at `base` (or are preserved entirely within `chain`). `state` tracks whether the coroutine is pending, running, dead, failed, or being closed.
     ///
@@ -75,7 +79,7 @@ objects! {
     ///
     /// `values` preserves the accumulator's list of values between run steps, as `acc` preserves the accumulator.
     ///
-    /// A task that switched away at a `co/resume`, `co/try-resume` or `co/yield` is parked: its frames from `base` up stay on its segment and are not in `chain`. `park_fp` is the frame that made the request, `park_pc` the instruction it goes on with, and `park_base` the register of the request, which is 0 for a task that is not parked.
+    /// A task that switched away at a `co/resume`, `co/try-resume` or `co/yield` is parked. Its frames from `base` up stay on its segment and are not in `chain`. `park_fp` is the frame that resumes, `park_pc` is the instruction where it resumes, and `park_base` is the register of the pending request or call in that frame. `park_base` is 0 for a task that is not parked. For `co/try-resume` it also has the flag `coroutine::TRIED` set.
     pub struct Task {
         acc: Value,
         chain: Value,
@@ -96,7 +100,7 @@ objects! {
         park_pc: u32,
         park_base: u32,
     }
-    /// A runtime module instance: holds top-level variable slots (initialized to `UNDEFINED` until defined) accessed by slot instructions, an immutable vector of variable `names` for diagnostic messages, a host function table indexed by [`Op::CallHost`], and an opaque compiler-defined `interface` describing exports for importing modules.
+    /// A runtime module instance. Its items are the top-level variable slots, which the slot instructions access. A slot holds `UNDEFINED` until its variable is defined. `names` is an immutable vector of the variable names, used in diagnostic messages. `hosts` is the host function table that [`Op::CallHost`] indexes. `interface` is an opaque value defined by the compiler. It describes the module's exports to importing modules.
     pub struct Module {
         name: Value,
         names: Value,

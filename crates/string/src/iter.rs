@@ -1,15 +1,15 @@
 use crate::{Host, StrView, Units, len};
 
-/// Deeper than any balanced rope of [`crate::MAX_LEN`] characters gets, about 69.
+/// An upper bound on the depth of a balanced rope. A rope of [`crate::MAX_LEN`] characters is at most about 69 deep.
 pub(crate) const MAX_DEPTH: usize = 72;
 
-/// The flat runs of a range of a string, in order, none empty.
+/// Iterator over the flat runs in a range of a string, in order. No run is empty.
 pub struct Chunks<'h, H: Host> {
     h: &'h H,
-    /// What's left to visit, the next on top, below `top`.
+    /// The strings still to visit. The entries below index `top` are live, and the next string to visit is at `top - 1`.
     stack: [H::Str; MAX_DEPTH],
     top: usize,
-    /// Characters to pass over before the range starts, and then how many it has left.
+    /// `skip` is the number of characters to skip before the range starts. `left` is the number of characters remaining in the range.
     skip: usize,
     left: usize,
 }
@@ -67,7 +67,7 @@ impl<'h, H: Host> Iterator for Chunks<'h, H> {
     }
 }
 
-/// The characters of a string.
+/// Iterator over the characters of a string.
 pub struct Chars<'h, H: Host> {
     chunks: Chunks<'h, H>,
     run: Units<'h>,

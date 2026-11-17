@@ -30,7 +30,7 @@ fn subtraction() {
     binary("sub", 12, 4, sub);
 }
 
-/// Long operands that cancel down to a few digits or a small integer.
+/// Subtracts long operands whose difference has only a few digits or is a small integer.
 #[test]
 fn cancelling_subtraction() {
     let (mut rng, mut oracle) = (Rng(23), Oracle::default());
@@ -153,7 +153,7 @@ fn equal_integers_hash_the_same_however_they_are_held() {
             assert_eq!(other, text, "hash collision");
         }
     }
-    // Values a digit apart in every position, and either sign.
+    // Values of one to four digits, in either sign. The top digit is 1 and every lower digit is 0, 1 or `u64::MAX`. All of them must hash differently.
     let h = &hosts[2];
     let (mut values, mut hashes) = (std::collections::HashSet::new(), std::collections::HashSet::new());
     for len in 0..4 {
@@ -180,11 +180,10 @@ fn bit_counts_tests_and_fields() {
             let (xs, ys) = (h.show(x), h.show(y));
             let (index, start) = (rng.below(300), rng.below(150));
             let end = start + rng.below(150);
-            let at = |n: u64| hex_i64(n as i64);
             oracle.case("popcount", std::slice::from_ref(&xs), format!("{:x}", bit_count(&h, x).unwrap()));
-            oracle.case("bitset", &[at(index), xs.clone()], u8::from(bit_set(&h, x, index)).to_string());
-            oracle.case("bitfield", &[xs.clone(), at(start), at(end)], h.show(bit_field(&h, x, start, end).unwrap()));
-            oracle.case("bfreplace", &[xs, ys, at(start), at(end)], h.show(bit_field_replace(&h, x, y, start, end).unwrap()));
+            oracle.case("bitset", &[hex_i64(index as i64), xs.clone()], u8::from(bit_set(&h, x, index)).to_string());
+            oracle.case("bitfield", &[xs.clone(), hex_i64(start as i64), hex_i64(end as i64)], h.show(bit_field(&h, x, start, end).unwrap()));
+            oracle.case("bfreplace", &[xs, ys, hex_i64(start as i64), hex_i64(end as i64)], h.show(bit_field_replace(&h, x, y, start, end).unwrap()));
         }
     }
     oracle.check();
@@ -201,7 +200,7 @@ fn shifts() {
             let ours = h.show(arithmetic_shift(&h, x, shift).unwrap());
             oracle.case("ash", &[h.show(x), hex_i64(shift)], ours);
         }
-        // Shifts too big to make, and right shifts past everything.
+        // A left shift whose result is too big to allocate, and right shifts past every bit.
         let x = from_i64(&h, -5).unwrap();
         assert_eq!(arithmetic_shift(&h, x, i64::MAX).unwrap_err(), TestError::TooBig);
         assert_eq!(h.show(arithmetic_shift(&h, x, i64::MIN).unwrap()), "-1");
@@ -267,7 +266,7 @@ fn strings_round_trip() {
     oracle.check();
 }
 
-/// Integer square roots of squares, their neighbours, and anything else.
+/// Integer square roots of perfect squares, of their neighbours, and of arbitrary values.
 #[test]
 fn square_roots() {
     let (mut rng, mut oracle) = (Rng(24), Oracle::default());

@@ -1,6 +1,6 @@
-//! A fast seeded hash of a string's characters. It reads them as units of the string's width,
-//! packed into words, so every shape of a string hashes the same, and so does a `&str` of the
-//! same text. Strings whose units fit in [`SHORT`] bytes, such as most names, hash in one step.
+//! A fast seeded hash of a string's characters. The hash reads the characters as units of the string's width,
+//! packed into 64-bit words. So every representation of the same characters has the same hash, and so does a `&str` of the
+//! same text. A string whose units fit in [`SHORT`] bytes, such as most names, is hashed in one step.
 
 use crate::units::Unit;
 use crate::word::{HIGH, SHORT, fingerprint};
@@ -10,14 +10,14 @@ const K0: u64 = 0x243f_6a88_85a3_08d3;
 const K1: u64 = 0x1319_8a2e_0370_7344;
 const K2: u64 = 0xa409_3822_299f_31d0;
 
-/// The hash of a short string of `len` characters at `width`, whose units' bytes gave `words`.
+/// Returns the hash of a short string of `len` characters at `width`. `(a, b)` is the [`fingerprint`] of the bytes of its units.
 #[inline]
 fn short((a, b): (u64, u64), seed: u64, len: usize, width: Width) -> u64 {
     let key = seed.rotate_left(29) ^ K1;
     mix(mix(a ^ seed ^ K0, b ^ key) ^ (len as u64 | (width as u64) << 48), K2 ^ key)
 }
 
-/// Writes `codes` as `width`-byte little-endian units into `buf` from `at`, and returns the end.
+/// Writes `codes` as `width`-byte little-endian units into `buf`, starting at index `at`. Returns the index after the last byte written.
 fn gather(buf: &mut [u8; SHORT], mut at: usize, codes: impl Iterator<Item = u32>, width: Width) -> usize {
     let size = width.bytes();
     for code in codes {
@@ -37,15 +37,15 @@ fn mix(a: u64, b: u64) -> u64 {
     product as u64 ^ (product >> 64) as u64
 }
 
-/// Words go in pairs, one multiply for each pair. The key comes from the seed, so which
-/// texts collide can't be known without it.
+/// The state of the hash over a long string. Words are consumed in pairs, with one multiplication per pair.
+/// The key is derived from the seed, so collisions cannot be predicted without the seed.
 struct State {
     acc: u64,
     key: u64,
     width: Width,
-    /// A word waiting for its pair.
+    /// The first word of a pair, held until the second word arrives.
     half: Option<u64>,
-    /// The word being packed, and how many of its bits are filled.
+    /// The word that is being packed from units. `bits` is the number of its bits filled so far.
     packing: u64,
     bits: u32,
 }
@@ -85,7 +85,7 @@ impl State {
         }
     }
 
-    /// Whole words go straight in once a part-packed word is filled.
+    /// Hashes packed units. Units of the hash's width first complete the partly packed word, and then whole words are hashed directly. Units of another width are hashed one at a time.
     #[inline]
     fn packed(&mut self, packed: Packed<'_>) {
         if packed.width() != self.width {
@@ -119,8 +119,8 @@ impl State {
         }
     }
 
-    /// Units narrower than the string's width are widened one at a time; the rest go in
-    /// whole words once a part-packed word is filled.
+    /// Hashes a slice of units. Units narrower than the string's width are widened one at a time. Units of the string's width
+    /// first complete the partly packed word, and then whole words are hashed directly.
     fn run<U: Unit>(&mut self, mut slice: &[U]) {
         if U::BITS != 8 * self.width.bytes() as u32 {
             slice.iter().for_each(|unit| self.unit(unit.code()));
@@ -146,13 +146,13 @@ impl State {
             self.word(U::pack(&rest[..per]));
             rest = &rest[per..];
         }
-        // Filling a part-packed word above left it empty or used up `slice`.
+        // The loop above either completed the partly packed word or consumed all of `slice`. So `packing` is empty here, or `rest` is.
         if !rest.is_empty() {
             (self.packing, self.bits) = (U::pack(rest), rest.len() as u32 * U::BITS);
         }
     }
 
-    /// Length and width tell how many words there were and how they were packed.
+    /// Returns the hash. The last step mixes in `len` and the width, which determine how many words were hashed and how the units were packed into them.
     fn finish(mut self, len: usize) -> u64 {
         if self.bits != 0 {
             self.word(self.packing);
@@ -184,7 +184,7 @@ fn rope_hash<H: Host>(h: &H, string: H::Str, seed: u64) -> Result<u64, H::Error>
     })
 }
 
-/// The hash of a flat string's characters, which are at their narrowest width.
+/// Returns the hash of a flat string's units, which are at their narrowest width.
 #[inline]
 fn hash_flat(units: Units<'_>, seed: u64) -> u64 {
     let (len, width) = (units.len(), units.width());
@@ -216,7 +216,7 @@ fn hash_chunks<H: Host>(h: &H, string: H::Str, info: Info, seed: u64) -> u64 {
     state.finish(info.len)
 }
 
-/// What [`hash`] gives a string of these characters.
+/// Returns the hash that [`hash`] gives a string with the characters of `string`.
 pub fn hash_str(string: &str, seed: u64) -> u64 {
     let bytes = string.as_bytes();
     if bytes.len() <= SHORT {
@@ -229,7 +229,7 @@ pub fn hash_str(string: &str, seed: u64) -> u64 {
         state.run(bytes);
         return state.finish(bytes.len());
     }
-    // A character's first byte tells its length, and whether it's past U+00FF or U+FFFF.
+    // Every byte that is not a continuation byte starts a character. The largest byte gives the width: a lead byte of 0xC4 or more encodes a character above U+00FF, and 0xF0 or more encodes one above U+FFFF.
     let len = string.bytes().filter(|&byte| byte as i8 >= -0x40).count();
     let width = match string.bytes().max().unwrap_or(0) {
         0xF0.. => Width::Four,
@@ -251,7 +251,7 @@ pub fn hash_str(string: &str, seed: u64) -> u64 {
 }
 
 impl State {
-    /// Takes the characters of `string`, all of which fit `U`, a buffer at a time.
+    /// Hashes the characters of `string` as units of type `U`, a buffer at a time. Every character must fit in `U`.
     fn decoded<U: Unit + Default>(&mut self, string: &str) {
         let mut buf = [U::default(); 64];
         let mut n = 0;

@@ -1,5 +1,5 @@
-//! Times loading base code, expanding and compiling it, and running a countdown that calls the
-//! prelude's `eqv?` and `+` against one in native ragwort that calls the intrinsics.
+//! Times the loading of base code, which expands and compiles it. Also times a countdown that calls the
+//! prelude's `eqv?` and `+`, against a countdown in native ragwort that calls the intrinsics directly.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -14,7 +14,7 @@ use ragwort_vm::{MIN_SEGMENT, Machine, Outcome};
 
 const N: i64 = 10_000_000;
 
-/// Some of everything the expander does, each form different by its number.
+/// Returns the source of `forms` definitions that together use most features of the expander. Each definition differs from the others by its number.
 fn source(forms: usize) -> String {
     (0..forms)
         .map(|i| {
@@ -30,9 +30,8 @@ fn source(forms: usize) -> String {
         .collect()
 }
 
-/// Forms that use `cond`, `and`, `or` and `let*`, those of `syntax-rules` macros if `macros`.
-/// `forms` definitions using `cond`, `and`, `or` and `let*`: the built-in ones if `macros` is
-/// "", or else copies written with `syntax-rules`, if it's "rules", or `syntax-case`.
+/// Returns the source of `forms` definitions that use `cond`, `and`, `or` and `let*`. If `macros` is "", they use the built-in macros.
+/// Otherwise they use copies of those macros, written with `syntax-rules` if `macros` is "rules", and with `syntax-case` for any other value.
 fn macro_source(forms: usize, macros: &str) -> String {
     let rules = "(define-syntax my-or (syntax-rules () ((_) #f) ((_ e) e) ((_ e r ...) (let ((t e)) (if t t (my-or r ...))))))
                 (define-syntax my-and (syntax-rules () ((_) #t) ((_ e) e) ((_ e r ...) (if e (my-and r ...) #f))))
@@ -82,7 +81,7 @@ fn run<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Value<'gc> {
     }
 }
 
-/// An arena with the symbol table in root 0 and the prelude's module in 1, once it's run.
+/// Creates an arena with the symbol table in root 0 and the prelude's module in root 1. The prelude has run.
 fn arena() -> Arena {
     let mut arena = Arena::new(1 << 28, 2);
     arena.mutate(|mc| {
@@ -98,7 +97,7 @@ fn arena() -> Arena {
     arena
 }
 
-/// A fresh arena in which `text` is loaded and all its forms but the last have run. Returns the arena, the time loading took, and a machine that is ready to run the last form.
+/// Creates a fresh arena, loads `text` in it, and runs all forms of `text` but the last. Returns the arena, the time that loading took, and a machine that is ready to run the last form.
 fn prepared(text: &str, native: bool) -> (Arena, Duration, Machine) {
     let mut arena = arena();
     arena.collect();
@@ -123,8 +122,8 @@ fn prepared(text: &str, native: bool) -> (Arena, Duration, Machine) {
     (arena, loaded, machine)
 }
 
-/// Best time over a few runs of loading `text`, or if `run_all`, of running what it loads, all
-/// but the last form before timing, then the last.
+/// Returns the best time over a few runs of loading `text`. If `run_all`, returns the best time of running the last form of `text` instead. The forms
+/// before the last run before the timing starts.
 fn time(text: &str, native: bool, run_all: bool) -> Duration {
     let mut best = Duration::MAX;
     for _ in 0..5 {
@@ -140,7 +139,7 @@ fn time(text: &str, native: bool, run_all: bool) -> Duration {
     best
 }
 
-/// Best time over a few runs of the last form of `text`, which yields to the host over and over. The host reads what is yielded and resumes the machine at once, in the same step, until a run pauses. If `answers`, it resumes with one value, and otherwise with none.
+/// Returns the best time over a few runs of the last form of `text`, which yields to the host over and over. The host reads what is yielded and resumes the machine at once, in the same step, until a run pauses. If `answers`, it resumes with one value, and otherwise with none.
 fn time_yields(text: &str, answers: bool) -> Duration {
     let mut best = Duration::MAX;
     for _ in 0..5 {
@@ -193,7 +192,9 @@ fn main() {
     let native = format!(
         "(%define count (%lambda (n) (%if (%intrinsic eqv? n 0) 0 (%app count (%intrinsic + n -1))))) (%app count {N})"
     );
-    let per = |d: Duration| d.as_secs_f64() * 1e9 / N as f64;
+    fn per(elapsed: Duration) -> f64 {
+        elapsed.as_secs_f64() * 1e9 / N as f64
+    }
     println!("countdown through the prelude: {:.1} ns per iteration", per(time(&base, false, true)));
     println!("countdown on intrinsics:       {:.1} ns per iteration", per(time(&native, true, true)));
     let less = format!("(define (count n) (if (< n 1) 0 (count (- n 1)))) (count {N})");
@@ -206,7 +207,6 @@ fn main() {
     println!("string-append of 3 short:      {:.1} ns per iteration", per(time(&append, false, true)));
     let grow = format!("(define (count n s) (if (eqv? n 0) (string-length s) (count (- n 1) (string-append s \"ab\")))) (count {N} \"\")");
     println!("appending to a growing string: {:.1} ns per iteration", per(time(&grow, false, true)));
-    let loop_on = |body: &str| format!("(define s \"!ping someone about something\") (define (count n) (if (eqv? n 0) 0 (begin {body} (count (- n 1))))) (count {N})");
     for (name, body) in [
         ("substring of 5", "(substring s 1 6)"),
         ("string-ref", "(string-ref s 3)"),
@@ -217,9 +217,12 @@ fn main() {
         ("string-join of 3 with \", \"", "(string-join '(\"alice\" \"bob\" \"carol\") \", \")"),
         ("char<? and char->integer", "(if (char<? #\\a #\\b) (char->integer (string-ref s 2)) 0)"),
     ] {
-        println!("{name:<30} {:.1} ns per iteration", per(time(&loop_on(body), false, true)));
+        let text = format!("(define s \"!ping someone about something\") (define (count n) (if (eqv? n 0) 0 (begin {body} (count (- n 1))))) (count {N})");
+        println!("{name:<30} {:.1} ns per iteration", per(time(&text, false, true)));
     }
-    let command = |body: &str| format!("(define cmd '(\"!echo\" \"a\" \"b\")) (define (count n acc) (if (eqv? n 0) acc (count (- n 1) (+ acc {body})))) (count {N} 0)");
+    fn command(body: &str) -> String {
+        format!("(define cmd '(\"!echo\" \"a\" \"b\")) (define (count n acc) (if (eqv? n 0) acc (count (- n 1) (+ acc {body})))) (count {N} 0)")
+    }
     let matched = r#"(match cmd [(list "!ping") 1] [(list "!echo" args ...) (length args)] [_ 0])"#;
     let by_hand = r#"(cond [(and (pair? cmd) (equal? (car cmd) "!ping") (null? (cdr cmd))) 1] [(and (pair? cmd) (equal? (car cmd) "!echo")) (length (cdr cmd))] [else 0])"#;
     println!("command by match:              {:.1} ns per iteration", per(time(&command(matched), false, true)));
@@ -227,7 +230,6 @@ fn main() {
     let defs = "(define (pf a b) (+ a b)) (define (of a [b 1]) (+ a b)) (define (kf a #:b [b 1]) (+ a b))
                 (define kv (let ([f (lambda (a #:b [b 1]) (+ a b))]) f)) (define ap (car (list apply)))
                 (define two (car (list (lambda (a) (values a 1)))))";
-    let summing = |call: &str| format!("{defs} (define (count n acc) (if (eqv? n 0) acc (count (- n 1) (+ acc {call})))) (count {N} 0)");
     for (name, call) in [
         ("positional call", "(pf n 1)"),
         ("optional left out", "(of n)"),
@@ -239,14 +241,14 @@ fn main() {
         ("call-with-values of 2", "(call-with-values (lambda () (values n 1)) pf)"),
         ("call-with-values through a call", "(call-with-values (lambda () (two n)) pf)"),
     ] {
-        println!("{name:<30} {:.1} ns per iteration", per(time(&summing(call), false, true)));
+        let text = format!("{defs} (define (count n acc) (if (eqv? n 0) acc (count (- n 1) (+ acc {call})))) (count {N} 0)");
+        println!("{name:<30} {:.1} ns per iteration", per(time(&text, false, true)));
     }
 
     // A table of 8 entries as a payload has them, and one of 1000 integer keys. Each line reads or writes it once per iteration.
     let tables = "(define t (table 'id 1 'name \"ann\" 'age 3 \"kind\" 4 \"a key that is too long to fit in a word\" 5 7 6 'last 7 'more 8))
                   (define big (let fill ((i 0) (big (make-table))) (if (eqv? i 1000) big (begin (table-set! big i i) (fill (+ i 1) big)))))
                   (define v (vector 1 2 3 4 5 6 7 8))";
-    let reading = |call: &str| format!("{tables} (define (count n acc) (if (eqv? n 0) acc (count (- n 1) (+ acc {call})))) (count {N} 0)");
     for (name, call) in [
         ("vector-ref, for comparison", "(vector-ref v 6)"),
         ("table-ref, symbol key", "(table-ref t 'last)"),
@@ -258,7 +260,8 @@ fn main() {
         ("table-set!, key that is there", "(begin (table-set! t 'age n) 1)"),
         ("table-set! and table-delete!", "(begin (table-set! t 'new n) (table-delete! t 'new) 1)"),
     ] {
-        println!("{name:<31}{:.1} ns per iteration", per(time(&reading(call), false, true)));
+        let text = format!("{tables} (define (count n acc) (if (eqv? n 0) acc (count (- n 1) (+ acc {call})))) (count {N} 0)");
+        println!("{name:<31}{:.1} ns per iteration", per(time(&text, false, true)));
     }
     let building = format!("(define (build n) (if (eqv? n 0) 0 (begin (table 'id n 'name \"ann\" 'age 3 'kind 4) (build (+ n -1))))) (build {})", N / 10);
     println!("make a table of 4 entries:     {:.1} ns each", per(time(&building, false, true)) * 10.0);
@@ -296,10 +299,10 @@ fn main() {
     let respawn = format!("(define co (make-coroutine (lambda () 0))) (define (respawn n) (if (eqv? n 0) 0 (begin (co/resume (co/reset co (lambda () n))) (respawn (+ n -1))))) (respawn {})", N / 100);
     println!("reset and finish a coroutine:  {:.1} ns each", per(time(&respawn, false, true)) * 100.0);
 
-    let each = |name: &str, body: &str| {
+    fn each(name: &str, body: &str) {
         let text = format!("(define (go n) (if (eqv? n 0) 0 (begin {body} (go (+ n -1))))) (go {})", N / 100);
         println!("{name:<31}{:.1} ns each", per(time(&text, false, true)) * 100.0);
-    };
+    }
     each("try-resume a finishing coro:", "(co/try-resume (make-coroutine (lambda () n)))");
     each("make, suspend and close a coro:", "(let ((co (make-coroutine (lambda () (co/yield n))))) (co/resume co) (co/close co))");
     each("the same, closing in a wind:", "(let ((co (make-coroutine (lambda () (dynamic-wind (lambda () 1) (lambda () (co/yield n)) (lambda () 2)))))) (co/resume co) (co/close co))");

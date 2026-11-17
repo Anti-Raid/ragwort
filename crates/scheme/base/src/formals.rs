@@ -1,5 +1,5 @@
-//! Formals with optional and keyword parameters, as Racket's `lambda` takes them, and calls with
-//! keyword arguments, made as [`ragwort_compiler::keyword`] says.
+//! Formals with optional and keyword parameters, as in Racket's `lambda`, and calls with
+//! keyword arguments. [`ragwort_compiler::keyword`] describes how both are compiled.
 //!
 //! A positional parameter `[x default]`, or a keyword one `#:k [x default]`, is optional; `x` or
 //! `#:k x` is required. Optional lambdas and keyword calls expand to [`Core::OptionalLambda`] and
@@ -15,14 +15,14 @@ use crate::scope::Scope;
 use crate::tree::{Stx, View};
 use crate::{ExpandError, ExpandErrorKind};
 
-/// A parameter, in the order its formals have it.
+/// A parameter of formals. The parameters are kept in the order they are written.
 struct Param<'gc> {
     keyword: Option<Keyword<'gc>>,
     id: Stx,
     default: Option<Stx>,
 }
 
-/// Formals that take more than plain positional parameters.
+/// Parsed formals that have optional or keyword parameters.
 pub(crate) struct Formals<'gc> {
     params: Vec<Param<'gc>>,
     rest: Option<Stx>,
@@ -43,7 +43,7 @@ impl<'gc> Formals<'gc> {
 }
 
 impl<'a, 'gc> Expander<'a, 'gc> {
-    /// Whether `formals` are plain: identifiers, or a list of them with one as its tail.
+    /// Returns whether `formals` are plain: a single identifier, or a list of identifiers that can have an identifier as its tail.
     pub(crate) fn plain_formals(&mut self, formals: Stx) -> Result<bool, ExpandError> {
         Ok(match self.tree.view(formals)? {
             View::Id => true,
@@ -52,7 +52,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         })
     }
 
-    /// `formals` with optional or keyword parameters.
+    /// Parses `formals` that have optional or keyword parameters.
     pub(crate) fn formals(&mut self, formals: Stx) -> Result<Formals<'gc>, ExpandError> {
         let View::List(items, rest) = self.tree.view(formals)? else { return Err(self.error(ExpandErrorKind::BadSyntax, formals)) };
         let mut params: Vec<Param<'gc>> = Vec::new();
@@ -87,7 +87,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         Ok(Formals { params, rest })
     }
 
-    /// The keyword procedure's shape, if `value` is a `lambda` with keyword parameters.
+    /// Returns the call shape of the keyword procedure if `value` is a `lambda` form with keyword parameters.
     pub(crate) fn keyword_lambda(&mut self, value: Stx) -> Result<Option<CallShape<'gc>>, ExpandError> {
         let View::List(items, None) = self.tree.view(value)? else { return Ok(None) };
         let [head, formals, _, ..] = items[..] else { return Ok(None) };
@@ -142,13 +142,13 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         })
     }
 
-    /// A `lambda` whose `formals` aren't plain.
+    /// Expands a `lambda` whose `formals` are not plain.
     pub(crate) fn lambda_with(&mut self, stx: Stx, formals: Stx, body: Vec<Stx>, scope: Scope) -> Result<Ex<'a, 'gc>, ExpandError> {
         let formals = self.formals(formals)?;
         self.optional_lambda(stx, formals, body, scope, |_, lambda| Ok(Step::Done(Core::OptionalLambda(lambda))))
     }
 
-    /// Whether any of a call's `args` is a keyword.
+    /// Returns whether any of the call arguments `args` is a keyword.
     pub(crate) fn has_keyword_args(&self, args: &[Stx]) -> bool {
         args.iter().any(|&arg| self.tree.keyword(arg).is_some())
     }

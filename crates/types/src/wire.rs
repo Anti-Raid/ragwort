@@ -1,8 +1,8 @@
-//! A plain binary form for the values an image holds outside the arena, such as a function's
-//! instructions. See [`crate::gc::image`] for the image itself.
+//! A plain binary format for the values that an image stores outside the arena, such as a
+//! function's instructions. See [`crate::gc::image`] for the image itself.
 //!
-//! A type that can be saved implements [`Wire`], which `#[derive(Wire)]` writes for a struct or
-//! an enum whose fields can all be saved:
+//! A type that can be serialized implements [`Wire`]. `#[derive(Wire)]` generates the
+//! implementation for a struct or an enum whose fields all implement [`Wire`]:
 //!
 //! ```text
 //! #[derive(Wire)]
@@ -14,15 +14,17 @@
 //!
 //! # The form
 //!
-//! - A number is its bytes, the lowest first.
-//! - A struct is its fields in order.
-//! - An enum is its variant's place, as a `u16`, then the variant's fields.
-//! - A sequence or a string is its length, as a `u32`, then its elements or bytes.
+//! - A number is written as its bytes, least significant first.
+//! - A struct is written as its fields in order.
+//! - An enum is written as the index of its variant, as a `u16`, then the variant's fields.
+//! - A sequence or a string is written as its length, as a `u32`, then its elements or bytes.
 //!
-//! Nothing says what type the bytes are of. What's read must be what was written, by the same
-//! build: [`Wire::SHAPE`] changes when a type's fields do, and an image is stamped with the
-//! shapes of what it holds. A derived shape mixes the shapes of its field types transitively
-//! (breaking const cycles on recursive data structures).
+//! The format is not self-describing: the bytes do not record their type. A reader must read
+//! the same types that were written, and the same build must have written them. To check this,
+//! [`Wire::SHAPE`] changes when a type's fields change, and an image is stamped with the shapes
+//! of the types it holds. A derived shape mixes in the shapes of its field types transitively.
+//! It skips a field whose type names the type itself, which would otherwise be a cycle in const
+//! evaluation.
 
 #[cfg(test)]
 #[path = "tests/wire.rs"]
@@ -31,11 +33,11 @@ mod tests;
 use std::any::Any;
 use std::ops::Range;
 
-/// The most values inside one another that are read, so bytes that aren't an image's can't
-/// run the reader out of stack.
+/// The maximum nesting depth of the values that a reader accepts. The limit keeps malformed
+/// bytes from overflowing the reader's stack.
 const DEPTH: u32 = 512;
 
-/// Bytes that aren't the form of what's read from them.
+/// The error for bytes that are not a valid encoding of the type being read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Malformed;
 
@@ -65,17 +67,17 @@ impl Writer {
         self.bytes.extend(value.to_le_bytes());
     }
 
-    /// `bytes`, after how many there are.
+    /// Writes the length of `bytes`, then `bytes`.
     pub fn bytes(&mut self, bytes: &[u8]) {
         self.length(bytes.len());
         self.bytes.extend(bytes);
     }
 
-    /// The length of a sequence.
+    /// Writes the length of a sequence, as a `u32`.
     ///
     /// # Panics
     ///
-    /// If it's more than `u32::MAX`, which nothing an arena holds is.
+    /// Panics if `len` is more than `u32::MAX`. No sequence that an arena holds is that long.
     pub fn length(&mut self, len: usize) {
         self.u32(u32::try_from(len).expect("a sequence shorter than 2^32"));
     }
@@ -93,8 +95,8 @@ impl Writer {
     }
 }
 
-/// Bytes being read, and what the reader was given for the values that need it: a host
-/// function is found by its name in a table that's there.
+/// A cursor over the bytes being read, with a context value for the types that need one to be
+/// read. For example, a host function is looked up by its name in a table in the context.
 pub struct Reader<'a> {
     bytes: &'a [u8],
     context: &'a dyn Any,
@@ -128,7 +130,7 @@ impl<'a> Reader<'a> {
         Ok(u64::from_le_bytes(self.take()?))
     }
 
-    /// The bytes [`Writer::bytes`] wrote.
+    /// Reads the bytes that [`Writer::bytes`] wrote.
     pub fn bytes(&mut self) -> Result<&'a [u8], Malformed> {
         let len = self.u32()? as usize;
         let (taken, rest) = self.bytes.split_at_checked(len).ok_or(Malformed)?;
@@ -136,7 +138,7 @@ impl<'a> Reader<'a> {
         Ok(taken)
     }
 
-    /// A sequence's length, which is no more than the bytes left could hold elements for.
+    /// Reads the length of a sequence. Fails if the length is greater than the number of bytes left, because the remaining bytes could not hold that many elements.
     pub fn length(&mut self) -> Result<usize, Malformed> {
         let len = self.u32()? as usize;
         if len > self.bytes.len() {
@@ -149,12 +151,12 @@ impl<'a> Reader<'a> {
         self.bytes.is_empty()
     }
 
-    /// What the reader was given, if it's a `T`.
+    /// Returns the context that the reader was created with. Fails if the context is not a `T`.
     pub fn context<T: Any>(&self) -> Result<&'a T, Malformed> {
         self.context.downcast_ref().ok_or(Malformed)
     }
 
-    /// Reads a value that's inside another.
+    /// Reads a value that is nested inside another value, by calling `read`. Fails if the nesting exceeds the reader's depth limit.
     pub fn inner<T>(&mut self, read: impl FnOnce(&mut Self) -> Result<T, Malformed>) -> Result<T, Malformed> {
         if self.depth == DEPTH {
             return Err(Malformed);
@@ -166,7 +168,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// A number that's different for different text, for [`Wire::SHAPE`].
+/// Returns the 64-bit FNV-1a hash of `text`, for [`Wire::SHAPE`].
 pub const fn shape_of(text: &str) -> u64 {
     let bytes = text.as_bytes();
     let mut hash = 0xCBF2_9CE4_8422_2325u64;
@@ -178,14 +180,14 @@ pub const fn shape_of(text: &str) -> u64 {
     hash
 }
 
-/// One number of two, different if either is.
+/// Combines two 64-bit hashes into one. The result changes if either input changes.
 pub const fn mix(left: u64, right: u64) -> u64 {
     (left.rotate_left(23) ^ right).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
-/// A value with a binary form.
+/// A type whose values can be serialized in the binary format of this module.
 pub trait Wire: Sized {
-    /// A number that changes when the form does.
+    /// A hash that identifies the binary format of the type. It changes when the format changes.
     const SHAPE: u64;
 
     fn write(&self, out: &mut Writer);
@@ -358,7 +360,7 @@ impl<A: Wire, B: Wire> Wire for (A, B) {
     }
 }
 
-/// A value that refers to no object is its word.
+/// An immediate, which is a value that refers to no object, is written as its value word.
 impl Wire for crate::gc::Immediate {
     const SHAPE: u64 = shape_of("Immediate");
 

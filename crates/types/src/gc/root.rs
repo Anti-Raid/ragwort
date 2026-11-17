@@ -7,18 +7,18 @@ use std::rc::Rc;
 
 use crate::gc::{Gc, Mutation, OBJECT, Object, OutOfMemory, TAG, Value};
 
-/// What a root is charged.
+/// The bytes charged for a root.
 pub(crate) const ROOT_COST: usize = 32;
 
-/// The object's value word, rewritten when it moves. The arena holds one reference and each
-/// [`Root`] another, so a record whose roots were all dropped is pruned once traced.
+/// The collector's record of a rooted object. `word` is the object's value word, which is rewritten when the object moves. The arena holds one reference to the record and each
+/// [`Root`] holds another. So the next collection removes a record whose roots were all dropped.
 pub(crate) struct RootRecord {
     pub(crate) word: Cell<u64>,
 }
 
-/// Keeps an object alive across steps. It holds no brand, so it can live outside the arena,
-/// such as in a task; [`Root::get`] reads the object back inside a step. Dropping the last
-/// clone lets the next collection free the object.
+/// A handle that keeps an object alive across steps. It has no brand, so it can live outside the arena,
+/// such as in a task. [`Root::get`] returns the object inside a step. Once the last
+/// clone is dropped, the next collection can free the object.
 pub struct Root<T> {
     arena: u64,
     record: Rc<RootRecord>,
@@ -31,7 +31,7 @@ impl<T> Clone for Root<T> {
     }
 }
 
-/// A root used with an arena other than its own.
+/// The error for a root that is used with an arena other than its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ForeignRoot;
 
@@ -61,8 +61,8 @@ impl<T: Object> Root<T> {
     }
 }
 
-/// Keeps any value alive across steps, as a [`Root`] keeps an object, for what holds values of
-/// any kind outside the arena. One that isn't an object is kept in the handle, which costs the
+/// A handle that keeps any value alive across steps, as a [`Root`] does for an object. Use it for code outside the arena that holds values of
+/// any kind. A value that is not an object is stored in the handle itself, which costs the
 /// arena nothing.
 #[derive(Clone)]
 pub struct ValueRoot {

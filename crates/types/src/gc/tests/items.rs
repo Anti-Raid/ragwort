@@ -11,7 +11,7 @@ objects! {
 
 const BIG: usize = 100_000;
 
-/// Fills the space dead objects left, so a reference to one reads something else.
+/// Fills the space that dead objects left, so that a reference to a dead object reads something else.
 fn churn(mc: &Mutation<'_>) {
     for _ in 0..300_000 {
         Pair::new(mc, Value::NULL, Value::NULL).unwrap();
@@ -26,7 +26,7 @@ fn weaks<'gc>(mc: &Mutation<'gc>, root: usize) -> Gc<'gc, Weaks> {
     mc.root(root).downcast::<Weaks>(mc).unwrap()
 }
 
-/// What each item refers to, by its node's number.
+/// Returns the number of the node that each item refers to, or `None` for an item that refers to no node.
 fn numbers<'gc, S: Item<Out<'gc> = Option<Gc<'gc, Node>>>>(mc: &Mutation<'gc>, items: Slots<'gc, S>) -> Vec<Option<i64>> {
     (0..items.len()).map(|i| items.get(i).map(|n| n.n(mc))).collect()
 }
@@ -59,8 +59,8 @@ fn churn_a_little(mc: &Mutation<'_>) {
     }
 }
 
-/// Stores into an old array: a minor collection must find the young targets through the
-/// dirty cards, though it doesn't trace the rest of the array.
+/// Stores young objects into an old array. A minor collection must find the young targets through the
+/// dirty cards, although it does not trace the rest of the array.
 #[test]
 fn member_items_on_dirty_cards_survive_minor_collections() {
     let mut arena = Arena::new(32 << 20, 1);
@@ -110,14 +110,14 @@ fn weak_items_clear_once_their_targets_die() {
     arena.collect();
     arena.mutate(churn);
     assert_eq!(arena.mutate(|mc| numbers(mc, weaks(mc, 0).items(mc))), expected);
-    // Dropping the strong array kills the rest.
+    // Without the strong array, the remaining nodes die.
     arena.set_evacuate_all(false);
     arena.mutate(|mc| mc.set_root(1, Value::NULL));
     arena.collect();
     assert!(arena.mutate(|mc| numbers(mc, weaks(mc, 0).items(mc))).iter().all(Option::is_none));
 }
 
-/// A minor collection clears weak items on dirty cards whose young targets died, and leaves
+/// A minor collection clears the weak items on dirty cards whose young targets died. It leaves
 /// the rest of the array alone.
 #[test]
 fn weak_items_on_dirty_cards_clear_in_minor_collections() {
@@ -155,7 +155,7 @@ fn weak_items_on_dirty_cards_clear_in_minor_collections() {
 }
 
 /// Nodes move back and forth between an array of members and a list of values while a cycle
-/// runs in small slices, so most moves store into an object already traced.
+/// runs in small slices. So most moves store into an object that is already traced.
 #[test]
 fn member_item_stores_while_marking_keep_their_targets() {
     const N: usize = 2000;
@@ -166,14 +166,14 @@ fn member_item_stores_while_marking_keep_their_targets() {
         for i in 0..N {
             list = Value::object(mc, Pair::new(mc, Value::object(mc, Node::new(mc, i as i64).unwrap()), list).unwrap());
         }
-        // Roots are traced last first, so the array is traced before the list.
+        // Roots are traced from the last to the first, so the array is traced before the list.
         mc.set_root(1, Value::object(mc, array));
         mc.set_root(0, list);
     });
     arena.collect();
-    // Slices big enough that cycles end while nodes are in the array. Everything live moves,
-    // so a node the barrier missed leaves its page to be reused: kept in place, a line shared
-    // with a live pair would keep it readable.
+    // The slices are big enough that cycles end while nodes are in the array. Every live object is evacuated.
+    // So if the barrier missed a node, the node's page is reused and the test sees the damage. Without evacuation, a line shared
+    // with a live pair could keep the missed node readable.
     arena.set_evacuate_all(true);
     arena.set_stress(Some(16 << 10));
     for round in 0..61 {
@@ -184,7 +184,7 @@ fn member_item_stores_while_marking_keep_their_targets() {
                 let mut i = round % 2;
                 while let Some(pair) = cur.downcast::<Pair>(mc) {
                     if i < N {
-                        // Swap the pair's node and the array's.
+                        // Swap the node in the pair with the node in the array.
                         let held = array.get(i);
                         array.set(mc, i, pair.car(mc).downcast::<Node>(mc));
                         pair.set_car(mc, held.map_or(Value::NULL, |n| Value::object(mc, n)));
@@ -211,8 +211,8 @@ fn member_item_stores_while_marking_keep_their_targets() {
     });
 }
 
-/// Nodes move between two arrays by bulk copies and fills while a cycle runs in small slices,
-/// so a copy often lands in an array already traced, from one that isn't yet.
+/// Nodes move between two arrays by bulk copies and fills while a cycle runs in small slices.
+/// So a copy often goes into an array that is already traced, from an array that is not traced yet.
 #[test]
 fn bulk_member_copies_while_marking_keep_their_targets() {
     const N: usize = 4096;
@@ -251,8 +251,8 @@ fn bulk_member_copies_while_marking_keep_their_targets() {
     });
 }
 
-/// Bulk copies and fills into an old array dirty the cards they cover, so minor collections
-/// see them.
+/// A bulk copy or fill into an old array marks the cards it covers dirty, so a minor collection
+/// sees the stored references.
 #[test]
 fn bulk_stores_into_old_items_are_seen_by_minor_collections() {
     let mut arena = Arena::new(32 << 20, 3);

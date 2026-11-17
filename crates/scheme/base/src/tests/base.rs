@@ -7,14 +7,14 @@ use ragwort_vm::{Fault, MIN_SEGMENT, Machine, Outcome};
 use super::*;
 use crate::ExpandErrorKind::*;
 
-/// Root 0 holds the symbol table, root 1 a list of the modules loaded, newest first, root 2 the
-/// prelude's module, which has run, and root 3 the modules other modules can require, as a list
-/// of `(name . module)`.
+/// Creates the arena for the tests. Root 0 holds the symbol table. Root 1 holds a list of the loaded modules, newest first. Root 2 holds the
+/// prelude's module, which has run. Root 3 holds the modules that other modules can require, as a list
+/// of `(name . module)` pairs.
 fn arena() -> Arena {
     arena_of(1 << 24)
 }
 
-/// An arena as [`arena`] makes, of `bytes`.
+/// Creates an arena of `bytes` bytes, set up as [`arena`] describes.
 fn arena_of(bytes: usize) -> Arena {
     let mut arena = Arena::new(bytes, 4);
     arena.mutate(|mc| {
@@ -32,8 +32,8 @@ fn arena_of(bytes: usize) -> Arena {
     arena
 }
 
-/// Loads `text` as a module, which implicitly requires the modules loaded before it, as a REPL's
-/// input does, and exports what it defines for those loaded after.
+/// Loads `text` as a module and returns the thunks of its forms. The module implicitly requires the modules loaded before it, as the input
+/// of a REPL does. It exports all its definitions to the modules loaded after it.
 fn load_text<'gc>(mc: &Mutation<'gc>, text: &str) -> Result<Vec<Value<'gc>>, Error> {
     let symbols = Symbols::of(mc.root(0)).unwrap();
     let prelude = mc.root(2).downcast::<Module>(mc).unwrap();
@@ -51,7 +51,7 @@ fn run<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Result<Value<'gc>, Fault> 
     run_raising(mc, thunk).map_err(|raised| raised.downcast::<Condition>(mc).expect("a condition").failure(mc).unwrap().fault)
 }
 
-/// The thunk's value, or what it raised that nothing caught.
+/// Runs `thunk`. Returns its value, or the value that it raised and nothing caught.
 fn run_raising<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Result<Value<'gc>, Value<'gc>> {
     let mut machine = Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap();
     loop {
@@ -71,7 +71,7 @@ fn raised_text<'gc>(mc: &Mutation<'gc>, raised: Value<'gc>) -> String {
     }
 }
 
-/// What the one form `text` raised that nothing caught, written out.
+/// Runs `text`, which must be one form that raises a value that nothing catches. Returns the written form of the raised value.
 fn uncaught(text: &str) -> String {
     arena().mutate(|mc| {
         let [thunk] = load_text(mc, text).unwrap()[..] else { panic!("one form") };
@@ -102,7 +102,7 @@ fn eval(text: &str) -> String {
     eval_in(&mut arena(), text).unwrap().unwrap()
 }
 
-/// The kind of expansion error `text` has, and the text where it is.
+/// Returns the kind of the expansion error of `text`, and the part of `text` that the error's span covers.
 fn error(text: &str) -> (ExpandErrorKind, &str) {
     match eval_in(&mut arena(), text) {
         Err(Error::Expand(e)) => (e.kind, &text[e.start as usize..e.end as usize]),
@@ -294,11 +294,11 @@ fn macros_are_hygienic() {
     // `or` binds a temporary, which doesn't capture the code's own `t`.
     assert_eq!(eval("(let ((t 5)) (or #f t))"), "5");
     assert_eq!(eval("(define t 6) (or #f t)"), "6");
-    // What a macro introduces means the base binding, whatever the code binds the same names to.
+    // An identifier that a built-in macro introduces refers to the base binding, even if the code binds the same name.
     assert_eq!(eval("(let ((if list) (begin 'no)) (cond (#f 1) (else 2)))"), "2");
     assert_eq!(eval("(let ((loop 5)) (do ((i 0 (+ i 1))) ((eqv? i 3) loop)))"), "5");
     assert_eq!(eval("(let ((cons #f) (memv #f)) (list `(1 ,(+ 1 1)) (case 2 ((2) 'two))))"), "((1 2) two)");
-    // The code's own top-level definitions shadow the prelude's for it, but not for macros.
+    // A top-level definition of the code shadows the prelude's binding in the code, but not in the output of a built-in macro.
     assert_eq!(eval("(define (cons a b) 'mine) (list (cons 1 2) `(1 ,2))"), "(mine (1 2))");
     // `else` is auxiliary syntax: bound locally, it's an ordinary variable.
     assert_eq!(eval("(let ((else #f)) (cond (else 'yes)))"), "#<void>");
@@ -322,7 +322,7 @@ fn numbers_compare_by_value() {
     let text = "(list (< 1 2 3) (< 1 3 2) (> 3 2 1) (<= 1 1 2) (>= 2 2 3) (= 1 1.0 1) (< 1/3 0.34) (< 1) (= 1+2i 1+2i)
                       (< 1267650600228229401496703205376 1267650600228229401496703205377) (> +inf.0 100000000000000000000000000000000) (< +nan.0 1) (= +nan.0 +nan.0) (>= 2 1 +nan.0))";
     assert_eq!(eval(text), "(#t #f #t #t #f #t #t #t #t #t #t #f #f #f)");
-    // Every argument's checked, though the answer's known before it.
+    // Every argument is checked, even an argument after the ones that decide the result.
     assert_eq!(uncaught("(< 2 1 'x)"), "#<error <: wrong type of argument 2 1 x>");
     assert_eq!(uncaught("(< 1+2i 2)"), "#<error <: wrong type of argument 1+2i 2>");
     assert_eq!(uncaught("(<)"), "#<error wrong number of arguments #<procedure <> 0>");
@@ -334,11 +334,11 @@ fn powers_stay_exact_when_they_can() {
                       (expt 1 (expt 10 30)) (expt 0+1i 2) (expt -8 1/3))";
     assert_eq!(eval(text), "(1267650600228229401496703205376 8/27 1/4 2.25 2 1 1 1 1 -1 1.0+1.732050807568877i)");
     assert_eq!(uncaught("(expt 0 -1)"), "#<error expt: division by zero 0 -1>");
-    // A result too big for the arena is turned down before it's computed, which ends the run.
+    // A result that is too large for the arena is refused before it is computed, which ends the run.
     arena().mutate(|mc| {
         let [thunk] = load_text(mc, "(expt 3 (expt 10 15))").unwrap()[..] else { panic!("one form") };
         assert_eq!(Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap().run(mc), Err(Fault::OutOfMemory));
-        // And one that fits is charged for the work before it's done.
+        // A result that fits is charged for its work before the work is done.
         let [thunk] = load_text(mc, "(expt 3 1000000)").unwrap()[..] else { panic!("one form") };
         let mut machine = Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap();
         machine.set_fuel(10_000);
@@ -361,8 +361,8 @@ fn integer_division_keeps_the_sign_it_should() {
 
 #[test]
 fn a_continuation_reentered_in_a_loop_sees_its_own_spilled_values() {
-    // 60 values live across a `call/cc` in the loop's first pass, more than a frame's registers
-    // hold. Re-entered once the loop has gone round again, that pass must see its own.
+    // 60 values are live across a `call/cc` in the first pass of the loop, more than a frame's registers
+    // hold. When the continuation is called after the loop has run another pass, the first pass must see its own values.
     let names: Vec<String> = (0..60).map(|j| format!("a{j}")).collect();
     let binds: String = names.iter().enumerate().map(|(j, a)| format!("({a} (+ i {j}))")).collect();
     let text = format!(
@@ -406,7 +406,7 @@ fn bitwise_operations_work_on_any_exact_integer() {
 
 #[test]
 fn bit_fields_wider_than_their_numbers_cost_no_more() {
-    // Each would take a mask of 125 MB, far more than the arena has, if it made one.
+    // Each call would need a mask of 125 MB if it built one, far more than the arena has.
     let text = "(list (bit-field 5 0 1000000000) (bit-field-replace 1 2 0 1000000000) (logical-shift-right 5 0 1000000000)
                       (bit-field-replace 5 -1 1 2) (bit-field-replace -1 0 1 3) (bit-field (arithmetic-shift 1 100) 0 1000000000))";
     assert_eq!(eval(text), "(5 2 5 7 -7 1267650600228229401496703205376)");
@@ -479,7 +479,7 @@ fn strings_append_and_count_characters() {
     let text = "(list (string-length \"\") (string-length \"héllo\") (string-length \"🦀ab\") (string-append) (string-append \"a\")
                       (string-append \"ab\" \"\" \"cd\" \"é🦀\") (apply string-append (list \"x\" \"y\" \"z\")))";
     assert_eq!(eval(text), "(0 5 3 \"\" \"a\" \"abcdé🦀\" \"xyz\")");
-    // Long strings join into ropes, which count and compare as their characters.
+    // Long strings are joined into ropes. A rope has the length of its characters and compares by them.
     let long = "(define (grow s n) (if (eqv? n 0) s (grow (string-append s s \"!\") (- n 1))))
                 (define s (grow \"ab\" 12))
                 (list (string-length s) (equal? (string-append s \"z\") (string-append s \"z\")) (string-length (string-append s s)))";
@@ -502,7 +502,7 @@ fn strings_slice_index_and_compare() {
     assert_eq!(uncaught("(string-ref \"abc\" 3)"), "#<error string-ref: value out of range \"abc\" 3>");
     assert_eq!(uncaught("(string-ref \"abc\" -1)"), "#<error string-ref: value out of range \"abc\" -1>");
     assert_eq!(uncaught("(string->list \"abc\" 2 1)"), "#<error string->list: value out of range \"abc\" 2 1>");
-    // Every argument's checked, though the answer's known before it.
+    // Every argument is checked, even an argument after the ones that decide the result.
     assert_eq!(uncaught("(string<? \"b\" \"a\" 'c)"), "#<error string<?: wrong type of argument \"b\" \"a\" c>");
 }
 
@@ -512,7 +512,7 @@ fn characters_are_code_points() {
                       (char=? #\\a #\\a #\\a) (char=? #\\a #\\b) (char<? #\\a #\\b #\\é) (char<? #\\b #\\a) (char>? #\\c #\\b #\\a)
                       (char<=? #\\a #\\a) (char>=? #\\a #\\b) (char=? #\\x) (eqv? (string-ref \"λ\" 0) (integer->char 955)))";
     assert_eq!(eval(text), "(#t #f 97 129408 #\\λ #\\x10ffff #t #f #t #f #t #t #f #t #t)");
-    // What the printer writes for unseen characters reads back.
+    // The printer writes an invisible character as a hex escape, and the reader reads the escape back.
     assert_eq!(eval("(list (char->integer #\\x10ffff) (char->integer #\\x200b) (string->list \"a\\x200b;\\xfeff;\"))"), "(1114111 8203 (#\\a #\\x200b #\\xfeff))");
     assert_eq!(uncaught("(integer->char 55296)"), "#<error integer->char: value out of range 55296>");
     assert_eq!(uncaught("(integer->char 1114112)"), "#<error integer->char: value out of range 1114112>");
@@ -543,7 +543,7 @@ fn numbers_write_as_they_read() {
         eval(text),
         "(\"42\" \"-11\" \"ff\" \"1/11\" \"1.5\" \"1.1\" \"0.1999999999999a\" \"-0.0\" \"1e21\" \"+nan.0\" \"1+2i\" \"-1/10i\" \"10000000000000000000000000\" \"6.0\")"
     );
-    // Fixnums are written in place, the ends of the range included.
+    // `number->string` handles fixnums on its own path. The cases include both ends of the fixnum range and the first integer past it.
     let ends = "(list (number->string 0) (number->string 0 2) (number->string -1 16) (number->string 1234567) (number->string 12345678)
                       (number->string 4611686018427387903) (number->string -4611686018427387904 16) (number->string -4611686018427387904 2)
                       (number->string 4611686018427387904))";
@@ -592,25 +592,27 @@ fn bad_syntax_points_at_itself() {
     assert_eq!(error("()"), (BadSyntax, "()"));
     assert_eq!(error("(f . x)"), (BadSyntax, "(f . x)"));
     assert_eq!(error("else"), (BadSyntax, "else"));
-    let deep = |n| format!("{}1{}", "(car ".repeat(n), ")".repeat(n));
-    assert_eq!(eval_in(&mut arena(), &deep(20_000)), Ok(Err(Fault::WrongType)));
+    let deep = format!("{}1{}", "(car ".repeat(20_000), ")".repeat(20_000));
+    assert_eq!(eval_in(&mut arena(), &deep), Ok(Err(Fault::WrongType)));
 }
 
-/// Source nested however deeply reads, expands, compiles and runs on a small stack.
+/// Deeply nested source is read, expanded, compiled and run on a small native stack, whatever its depth.
 #[test]
 fn deep_source_runs_on_a_small_stack() {
     let n = 20_000;
-    let nest = |open: &str, inner: &str| format!("{}{inner}{}", open.repeat(n), ")".repeat(n));
+    fn nest(open: &str, inner: &str, depth: usize) -> String {
+        format!("{}{inner}{}", open.repeat(depth), ")".repeat(depth))
+    }
     let cases = vec![
-        (nest("(car ", "1"), Err(Fault::WrongType)),
-        // Each `let` adds scopes to all inside it, so their sets grow as they nest, as do those of
-        // the `let`s a `list` pattern matches with.
+        (nest("(car ", "1", n), Err(Fault::WrongType)),
+        // Each `let` adds a scope to everything inside it, so the scope sets grow with the nesting. The same holds for
+        // the `let` forms that a nested `list` pattern expands to.
         (format!("{}x{}", "(let ((x 1)) ".repeat(1000), ")".repeat(1000)), Ok("1".to_string())),
         (format!("(match 1 [{}x{} 2] [_ 3])", "(list ".repeat(1000), ")".repeat(1000)), Ok("3".to_string())),
-        (format!("(car '{})", nest("(", "x")), Ok(nest("(", "x")[1..n * 2].to_string())),
-        (format!("`{}", nest("(", ",(+ 1 2)")), Ok(nest("(", "3"))),
-        (format!("(match 1 [{} 2] [_ 3])", nest("(not ", "_")), Ok("2".to_string())),
-        (format!("(match 1 [{} 2] [_ 3])", nest("(and ", "x")), Ok("2".to_string())),
+        (format!("(car '{})", nest("(", "x", n)), Ok(nest("(", "x", n)[1..n * 2].to_string())),
+        (format!("`{}", nest("(", ",(+ 1 2)", n)), Ok(nest("(", "3", n))),
+        (format!("(match 1 [{} 2] [_ 3])", nest("(not ", "_", n)), Ok("2".to_string())),
+        (format!("(match 1 [{} 2] [_ 3])", nest("(and ", "x", n)), Ok("2".to_string())),
     ];
     let small = std::thread::Builder::new().stack_size(1 << 20).spawn(move || {
         let mut arena = arena_of(1 << 28);
@@ -620,8 +622,8 @@ fn deep_source_runs_on_a_small_stack() {
     assert!(wrong.is_none(), "{:?}", wrong.map(|(got, _)| got.map(|r| r.map(|s| s.len()))));
 }
 
-/// Syntax of data that holds itself stops rather than going on forever: out of fuel if the
-/// task has a little, or else once what it's made fills the arena.
+/// Converting cyclic data to syntax stops instead of running forever. It runs out of fuel if the
+/// task has only a little. Otherwise it stops when the syntax built so far fills the arena.
 #[test]
 fn syntax_of_cyclic_data_stops() {
     let cyclic = "(define v (vector 1)) (vector-set! v 0 v)";
@@ -649,8 +651,8 @@ fn syntax_of_cyclic_data_stops() {
     }
 }
 
-/// A call of the prelude's `list` with more arguments than it inlines is a call, rather than
-/// `cons`es nested as deep as it's long.
+/// A call of the prelude's `list` with more arguments than the compiler inlines stays a call. It does not become
+/// `cons` calls nested as deeply as the list is long.
 #[test]
 fn long_calls_of_inlined_functions_compile() {
     let nums = (0..1000).map(|i| i.to_string()).collect::<Vec<_>>().join(" ");
@@ -658,8 +660,8 @@ fn long_calls_of_inlined_functions_compile() {
     assert_eq!(eval("(list 1 2 3)"), "(1 2 3)");
 }
 
-/// The rest lists of calls to the prelude's `+` are the loop's only garbage, and binding them
-/// pauses the run for the collector, so it doesn't run out of room.
+/// The rest lists of the calls to the prelude's `+` are the only garbage that the loop creates. Binding a rest list
+/// pauses the run for the collector when a collection is due, so the loop does not run out of memory.
 #[test]
 fn rest_lists_let_the_collector_keep_up() {
     let mut arena = arena();
@@ -695,7 +697,7 @@ fn prelude_wraps_the_cxrs_booleans_void_and_bytevectors() {
 fn arithmetic() {
     assert_eq!(eval("(list (- 5) (- 10 1 2) (*) (* 2 3 4) (/ 12 3) (/ 2) (/ 1 2 3) (- 1/2 1/2))"), "(-5 7 1 24 4 1/2 1/6 0)");
     assert_eq!(eval("(list (eqv? (/ 2) 1/2) (eqv? (/ 1 2 3) 1/6) (eqv? (/ 7 2) 7/2) (eqv? (* 1.5 2) 3.0) (eqv? (- 0.5 1/2) 0.0))"), "(#t #t #t #t #t)");
-    // Past the fixnums, onto bignums, and back.
+    // Results that leave the fixnum range become bignums, and results that return to it become fixnums again.
     assert_eq!(eval("(define big (* 4611686018427387903 4611686018427387903)) (list (eqv? (/ big 4611686018427387903) 4611686018427387903) (- big big))"), "(#t 0)");
     assert_eq!(eval("(list (eqv? (- -4611686018427387904) 4611686018427387904) (eqv? (/ -4611686018427387904 -1) 4611686018427387904))"), "(#t #t)");
     assert_eq!(eval("(eqv? (* 1+2i 1-2i) 5)"), "#t");
@@ -771,14 +773,14 @@ fn structs() {
     let made = format!("{point} (define p (point 1 2)) (list (point? p) (point? 5) (point-x p) (point-y p) p struct:point)");
     assert_eq!(eval(&made), "(#t #f 1 2 #(struct:point 1 2) #<struct-type:point>)");
     assert_eq!(eval(&format!("{point} (list (equal? (point 1 '(2)) (point 1 '(2))) (eq? (point 1 2) (point 1 2)) (equal? (point 1 2) (point 1 3)))")), "(#t #f #f)");
-    // The procedures are values too, and a call that doesn't fit one goes to it.
+    // The procedures of a struct are also values. A call with the wrong number of arguments still calls the procedure, which reports the arity error.
     assert_eq!(eval(&format!("{point} (list (map point-x (list (point 1 2) (point 3 4))) (apply point '(5 6)) (procedure? point?))")), "((1 3) #(struct:point 5 6) #t)");
     assert_eq!(eval_in(&mut arena(), &format!("{point} (point 1)")), Ok(Err(Fault::Arity)));
     assert_eq!(eval_in(&mut arena(), &format!("{point} (point-x 1 2)")), Ok(Err(Fault::Arity)));
     assert_eq!(eval_in(&mut arena(), &format!("{point} (point-x 5)")), Ok(Err(Fault::WrongType)));
     assert_eq!(eval_in(&mut arena(), &format!("{point} (point-x (vector 1 2))")), Ok(Err(Fault::WrongType)));
-    // Code before the form calls what it defines once the form has run, and not before, as it
-    // can't refer to it before.
+    // Code before the `struct` form can call the form's procedures after the form has run. A use before the form has run
+    // faults as an unbound variable.
     assert_eq!(eval(&format!("(define (norm p) (+ (point-x p) (point-y p))) {point} (norm (point 3 4))")), "7");
     for early in ["(point 1 2)", "(point-x 5)", "(point? 5)", "point", "struct:point"] {
         assert_eq!(eval_in(&mut arena(), &format!("(define (f) {early}) (define early (f)) {point}")), Ok(Err(Fault::Unbound)), "{early}");
@@ -826,13 +828,13 @@ fn structs_equal_only_to_themselves() {
                         (list s (session? s) (session-token s) (session-uses s) (equal? s s) (equal? s (session \"tok\" 3)) (eqv? s s)
                               (equal? (list s) (list s)) (equal? (list s) (list (session \"tok\" 3))))");
     assert_eq!(eval(&made), r#"(#(struct:session "tok" 3) #t "tok" 3 #t #f #t #t #f)"#);
-    // A subtype of such a type is one too, and one of another type can be declared one.
+    // A subtype of an `#:identity-eq?` type is also `#:identity-eq?`. A subtype of an ordinary type can be declared `#:identity-eq?`.
     let sub = format!("{session} (struct admin session (level)) (struct point (x)) (struct pinned point (y) #:identity-eq?)
                        (list (equal? (admin 1 2 3) (admin 1 2 3)) (equal? (point 1) (point 1)) (equal? (pinned 1 2) (pinned 1 2))
                              (let ((p (pinned 1 2))) (equal? p p)) (member (point 1) (list (point 2) (point 1))) (member (session 1 2) (list (session 1 2))))");
     assert_eq!(eval(&sub), "(#f #t #f #t (#(struct:point 1)) #f)");
     assert_eq!(eval("(struct cell (v) #:identity-eq?) (define (f) (define c (cell 7)) (list c (cell-v c) (equal? c (cell 7)) (equal? c c))) (f)"), "(#(struct:cell 7) 7 #f #t)");
-    // It's matched and copied as any other is.
+    // An `#:identity-eq?` struct is matched and copied like any other struct.
     assert_eq!(eval(&format!("{session} (match (session 1 2) [(session t u) (list t u)])")), "(1 2)");
     assert_eq!(eval(&format!("{session} (define s (session 1 2)) (list (struct-copy session s [uses 9]) (equal? s (struct-copy session s)))")), "(#(struct:session 1 9) #f)");
 }
@@ -840,16 +842,16 @@ fn structs_equal_only_to_themselves() {
 #[test]
 fn struct_parts_are_the_forms_alone() {
     let account = "(struct account (id [balance #:mutable] owner))";
-    // A macro can't name the read `match` and `struct-copy` are made of, even with the scopes
-    // of syntax a built-in macro introduced, which do reach the prelude's `car`.
-    let borrowed = |name: &str, args: &str| {
+    // A macro cannot name `struct-ref`, the field read that `match` and `struct-copy` expand to. That holds even for an identifier with the scopes
+    // of syntax that a built-in macro introduced. Such an identifier does reach the prelude's `car`.
+    fn borrowed(account: &str, name: &str, args: &str) -> String {
         format!("{account} (define a (account 1 2 \"al\"))
                  (define-syntax borrow (lambda (stx) (syntax-case stx () [(_ t) (with-syntax ([f (datum->syntax #'t '{name})]) #'(f {args}))])))
                  (cond [1 => borrow])")
-    };
-    assert_eq!(eval(&borrowed("car", "'(1 2)")), "1");
-    assert_eq!(error(&borrowed("struct-ref", "a struct:account 0")).0, ExpandErrorKind::Unbound);
-    // Nothing but the form's own procedures makes a struct, or reads or sets a field of one.
+    }
+    assert_eq!(eval(&borrowed(account, "car", "'(1 2)")), "1");
+    assert_eq!(error(&borrowed(account, "struct-ref", "a struct:account 0")).0, ExpandErrorKind::Unbound);
+    // Only the procedures that a `struct` form defines can create a struct, or read or set a field of one.
     for name in ["make-struct-type", "make-struct", "struct-ref", "struct-field", "struct-set!"] {
         assert_eq!(error(&format!("{account} ({name} struct:account 1 2 3)")), (ExpandErrorKind::Unbound, name), "{name}");
     }
@@ -864,7 +866,7 @@ fn struct_parts_are_the_forms_alone() {
     ] {
         assert_eq!(error(bad), (ExpandErrorKind::BadSyntax, at), "{bad}");
     }
-    // What the form defines can't be assigned.
+    // The variables that a `struct` form defines cannot be assigned.
     assert_eq!(error("(struct p (x)) (set! p car)"), (ExpandErrorKind::Immutable, "p"));
     assert_eq!(error("(struct p ([x #:mutable])) (define (f) (set! set-p-x! car) 1)"), (ExpandErrorKind::Immutable, "set-p-x!"));
 }
@@ -939,7 +941,7 @@ fn structs_are_matched_and_copied() {
         (list (struct-copy point3 p [z 30]) (struct-copy point3 p [x 10] [z 30] [y 20]) (struct-copy point p [y 5]) (struct-copy point3 p) p
               (secret-v (struct-copy secret (secret 1) [v 2])))");
     assert_eq!(eval(&copied), "(#(struct:point3 1 2 30) #(struct:point3 10 20 30) #(struct:point 1 5) #(struct:point3 1 2 3) #(struct:point3 1 2 3) 2)");
-    // The values are made in the order they're written, after the struct.
+    // The struct expression is evaluated first. The field values are then evaluated in the order they are written.
     let order = "(struct p (a b)) (define log '()) (define (note x) (set! log (cons x log)) x)
                  (struct-copy p (note (p 1 2)) [b (note 'b)] [a (note 'a)]) (reverse log)";
     assert_eq!(eval(order), "(#(struct:p 1 2) b a)");
@@ -965,20 +967,20 @@ fn structs_as_wholes() {
     assert_eq!(eval(&any), "(#t #t #t #f #f #f #f (#t #f))");
     let types = format!("{shapes} (list (struct-type? struct:point) (struct-type? struct:point3) (struct-type? (point 1 2)) (struct-type? point) (struct-type? 'point))");
     assert_eq!(eval(&types), "(#t #t #f #f #f)");
-    // An instance gives the type it was made as, and its fields' values in the order the type
-    // names them.
+    // `struct-type` returns the type that an instance was created as. `struct->list` returns the values of its fields, in the order
+    // of `struct-fields` for that type.
     let whole = format!("{shapes} (struct unit ()) (define q (point3 1 2 3))
         (list (eq? (struct-type q) struct:point3) (eq? (struct-type q) struct:point) (struct-type (point 1 2)) (struct->list q) (struct->list (session 'tok 'al))
               (struct-fields (struct-type q)) (struct->list (unit)) (map struct->list (list (point 1 2))))");
     assert_eq!(eval(&whole), "(#t #f #<struct-type:point> (1 2 3) (tok al) (x y z) () ((1 2)))");
-    // The list is a new one each time, of the fields as they are then.
+    // Each call of `struct->list` returns a new list, with the values that the fields have at the time of the call.
     let cells = "(struct cell (label [value #:mutable])) (struct cell3 cell (extra) #:mutable)";
     let listed = format!("{cells} (define c (cell 'a 1)) (define before (struct->list c)) (set-cell-value! c 2) (list before (struct->list c) (eq? (struct->list c) (struct->list c)))");
     assert_eq!(eval(&listed), "((a 1) (a 2) #f)");
     let mutable = format!("{cells} (list (struct-field-mutable? struct:cell 0) (struct-field-mutable? struct:cell 1) (struct-field-mutable? struct:cell3 0)
                                       (struct-field-mutable? struct:cell3 1) (struct-field-mutable? struct:cell3 2))");
     assert_eq!(eval(&mutable), "(#f #t #f #t #t)");
-    // Code that knows nothing of a struct's type writes it out by its fields' names.
+    // Code that does not know the type of a struct can still list its fields by name.
     let by_name = format!("{shapes}
         (define (struct->alist s) (map cons (struct-fields (struct-type s)) (struct->list s)))
         (list (struct->alist (point3 1 2 3)) (struct->alist (session 'tok 'al)))");
@@ -1005,7 +1007,7 @@ fn characters() {
                        (char-upper-case? #\\A) (char-upper-case? #\\a) (char-lower-case? #\\ß) (char-lower-case? #\\1))";
     assert_eq!(eval(kinds), "(#t #t #f #t #t #f #f #t #t #f #t #f #t #f)");
     assert_eq!(eval("(list (digit-value #\\7) (digit-value #\\٣) (digit-value #\\x1E5F9) (digit-value #\\a) (digit-value #\\½))"), "(7 3 8 #f #f)");
-    // A character whose case maps to several stays itself.
+    // A character whose case mapping is more than one character is left unchanged.
     let cases = "(string (char-upcase #\\a) (char-upcase #\\ß) (char-downcase #\\Σ) (char-foldcase #\\Σ) (char-foldcase #\\ı) (char-upcase #\\1))";
     assert_eq!(eval(cases), "\"Aßσσı1\"");
     assert_eq!(eval("(list (char-ci=? #\\a #\\A #\\a) (char-ci<? #\\a #\\B #\\c) (char-ci=? #\\a #\\b) (char-ci>=? #\\Z #\\a))"), "(#t #t #f #t)");
@@ -1302,7 +1304,7 @@ fn co_running_is_the_innermost_running_coroutine() {
     assert_eq!(eval_in(&mut arena(), "(co/resume (co/running))"), Ok(Err(Fault::NotPending)));
     let from_inside = "(define top (co/running)) (co/resume (make-coroutine (lambda () (co/resume top))))";
     assert_eq!(eval_in(&mut arena(), from_inside), Ok(Err(Fault::NotPending)));
-    // Each top-level form runs in a machine of its own, which has finished by the next.
+    // Each top-level form runs in a machine of its own. That machine has finished when the next form runs.
     assert_eq!(eval("(define top (co/running)) (co/status top)"), "dead");
 }
 
@@ -1341,8 +1343,8 @@ fn coroutines_keep_their_own_prompts_and_continuations() {
 
 #[test]
 fn suspended_frames_survive_being_moved_and_shared() {
-    // A continuation captured in the coroutine, called again after each yield, with other
-    // coroutines run in between on whatever segments are free.
+    // A continuation is captured in the coroutine and called again after each yield. Other
+    // coroutines run in between, on whichever stack segments are free.
     let again = "(define co (make-coroutine (lambda ()
                    (let ((i 0))
                      (let ((k (call/cc (lambda (k) k))))
@@ -1353,14 +1355,14 @@ fn suspended_frames_survive_being_moved_and_shared() {
                  (let* ((a (co/resume co)) (b (scribble)) (c (co/resume co)) (d (scribble)) (e (co/resume co)) (f (scribble)))
                    (list a b c d e f (co/resume co)))";
     assert_eq!(eval(again), "(1 20 2 20 3 20 done)");
-    // One generator resumed in turn from the top and from inside another coroutine, so the
-    // segment it leaves goes to each.
+    // One generator is resumed alternately from the top level and from inside another coroutine.
+    // Each yield returns to whichever of the two resumed it.
     let turns = "(define gen (make-coroutine (lambda () (let loop ((i 0)) (co/yield i) (loop (+ i 1))))))
                  (define other (make-coroutine (lambda () (let loop () (co/yield (co/resume gen)) (loop)))))
                  (let loop ((n 0) (top #t) (acc '()))
                    (if (eqv? n 6) (reverse acc) (loop (+ n 1) (not top) (cons (if top (co/resume gen) (co/resume other)) acc))))";
     assert_eq!(eval(turns), "(0 1 2 3 4 5)");
-    // Frames over a prompt, and under marks, yielded from at a few depths.
+    // A coroutine yields from three call depths. The second yield is made inside a continuation prompt.
     let deep = "(define (down d) (if (eqv? d 0) (co/yield 'bottom) (list d (down (- d 1)))))
                 (define co (make-coroutine (lambda ()
                              (list (down 3) (call-with-continuation-prompt (lambda () (down 2))) (down 30)))))
@@ -1379,7 +1381,7 @@ fn a_failing_coroutine_raises_where_it_was_resumed_unless_protected() {
     let done = "(call-with-values (lambda () (co/try-resume (make-coroutine (lambda (x) (co/yield x (+ x 1)))) 5)) list)";
     assert_eq!(eval(done), "(#t 5 6)");
     assert_eq!(eval("(call-with-values (lambda () (co/try-resume (make-coroutine (lambda () 'end)))) list)"), "(#t end)");
-    // Its failure goes on through a coroutine that resumed it unprotected, which fails too.
+    // The failure of a coroutine propagates into a coroutine that resumed it with a plain `co/resume`. That coroutine fails too.
     let through = "(define inner (make-coroutine (lambda () (car 1))))
                    (define outer (make-coroutine (lambda () (co/resume inner) 'unreached)))
                    (let ((r (call-with-values (lambda () (co/try-resume outer)) list))) (list (car r) (co/status inner) (co/status outer)))";
@@ -1396,7 +1398,7 @@ fn a_failing_coroutine_raises_where_it_was_resumed_unless_protected() {
     assert_eq!(eval_in(&mut arena(), "(co/status car)"), Ok(Err(Fault::WrongType)));
 }
 
-/// The one thunk `text` loads as, in a machine.
+/// Loads `text`, which must be one form, and returns a machine that is ready to run the form's thunk.
 fn machine(arena: &mut Arena, text: &str) -> Machine {
     arena.mutate(|mc| {
         let thunks = load_text(mc, text).unwrap();
@@ -1413,7 +1415,7 @@ fn show_outcome<'gc>(mc: &Mutation<'gc>, outcome: Result<Outcome<'gc>, Fault>) -
     }
 }
 
-/// How a run that `first` starts ends, past any pauses for the collector.
+/// Starts a run with `first` and continues it through any pauses for the collector. Returns the written form of the final outcome.
 fn settled<'gc>(mc: &Mutation<'gc>, machine: &mut Machine, first: impl FnOnce(&mut Machine) -> Result<Outcome<'gc>, Fault>) -> String {
     let mut outcome = first(machine);
     while let Ok(Outcome::Paused) = outcome {
@@ -1431,13 +1433,13 @@ fn the_host_resumes_a_machine_that_yields() {
     let mut machine = machine(&mut arena, text);
     assert_eq!(arena.mutate(|mc| show_outcome(mc, machine.resume(mc, &[]))), "Err(NotPending)");
     assert_eq!(arena.mutate(|mc| settled(mc, &mut machine, |m| m.run(mc))), "yielded ((1 a))");
-    // What the coroutines hold stays alive while they wait.
+    // The values that the coroutines hold stay alive while the coroutines wait.
     arena.collect();
     assert_eq!(arena.mutate(|mc| settled(mc, &mut machine, |m| m.resume(mc, &[Value::fixnum(10).unwrap()]))), "yielded ((1 b))");
     arena.collect();
     assert_eq!(arena.mutate(|mc| settled(mc, &mut machine, |m| m.resume(mc, &[Value::fixnum(20).unwrap()]))), "done (10 20 (done 1))");
     assert_eq!(arena.mutate(|mc| show_outcome(mc, machine.resume(mc, &[]))), "Err(Finished)");
-    // Plain `run` goes on from a yield with no values.
+    // A plain `run` resumes a machine that yielded, and passes no values to the yield.
     let mut machine = self::machine(&mut arena, "(call-with-values (lambda () (co/yield 'x)) list)");
     assert_eq!(arena.mutate(|mc| settled(mc, &mut machine, |m| m.run(mc))), "yielded (x)");
     assert_eq!(arena.mutate(|mc| settled(mc, &mut machine, |m| m.run(mc))), "done ()");
@@ -1446,8 +1448,9 @@ fn the_host_resumes_a_machine_that_yields() {
 #[test]
 fn a_coroutine_two_machines_resume_in_turn_is_copied_where_it_waits() {
     let mut arena = arena();
-    // Each machine resumes the generator, then a coroutine of its own that suspends, which
-    // copies the generator's frames if it waits in between, as it may have since run elsewhere.
+    // Two machines share one generator. Each machine resumes the generator, then resumes a coroutine
+    // of its own, which suspends. So the generator is always resumed by a different machine from
+    // the one that resumed it last, and collections run in between.
     let text = "(cons (make-coroutine (lambda () (let loop ((i 0)) (co/yield i) (loop (+ i 1)))))
                       (lambda (gen) (let loop ()
                                       (co/yield (co/resume gen))
@@ -1505,14 +1508,14 @@ fn coroutines_survive_collections_between_steps() {
 
 #[test]
 fn a_suspended_coroutine_keeps_little_memory() {
-    let kept = |body: &str| {
+    fn kept(body: &str) -> usize {
         let mut arena = arena();
         let text = format!("(define keep (let loop ((i 0) (acc '())) (if (eqv? i 200) acc (loop (+ i 1) (cons {body} acc)))))");
         eval_in(&mut arena, &text).unwrap().unwrap();
         arena.collect();
         arena.collect();
         arena.used()
-    };
+    }
     let closures = kept("(lambda () i)");
     let suspended = kept("(let ((c (make-coroutine (lambda () (co/yield i) i)))) (co/resume c) c)");
     let each = (suspended - closures) / 200;
@@ -1526,11 +1529,11 @@ fn handlers_run_in_the_raise_under_the_handlers_outside_them() {
                     (lambda () (with-exception-handler (lambda (e) (raise-continuable (list 'inner e)))
                                  (lambda () (raise-continuable 1)))))";
     assert_eq!(eval(nested), "(outer (inner 1))");
-    // A handler of a `raise` that returns raises an error under the handlers outside it.
+    // If the handler of a `raise` returns, an error is raised under the handlers outside that handler.
     let returned = "(guard (e ((error-object? e) (list (error-object-message e) (error-object-irritants e))))
                       (with-exception-handler (lambda (e) 'ignored) (lambda () (raise 'boom))))";
     assert_eq!(eval(returned), r#"("exception handler returned" (boom))"#);
-    // One that isn't a procedure is a fault, raised under the handlers outside it.
+    // A handler that is not a procedure is a fault. The fault is raised under the handlers outside that handler.
     assert_eq!(eval("(guard (e (#t (error-object-kind e))) (with-exception-handler 5 (lambda () (raise 'x))))"), "not-procedure");
     assert_eq!(uncaught("(raise 'nobody)"), "nobody");
     assert_eq!(uncaught("(with-exception-handler (lambda (e) (raise (list 'again e))) (lambda () (raise 1)))"), "(again 1)");
@@ -1543,7 +1546,7 @@ fn guard_takes_what_its_clauses_match_and_raises_the_rest_again() {
     assert_eq!(eval("(guard (e ((assq 'a e) => cdr) ((assq 'b e))) (raise (list (cons 'b 23))))"), "(b . 23)");
     assert_eq!(eval("(guard (e ((eq? e 'x) 'no) (else (list 'else e))) (raise 'y))"), "(else y)");
     assert_eq!(eval("(guard (e (#t (list 'outer e))) (guard (e ((eq? e 'other) 'no)) (raise 'x)))"), "(outer x)");
-    // No clause matches: raised again, continuably, from the guard.
+    // If no clause matches, the guard raises the value again with `raise-continuable`.
     assert_eq!(eval("(with-exception-handler (lambda (e) 42) (lambda () (+ 1 (guard (e ((eq? e 'other) 'no)) (raise 'x)))))"), "43");
     assert_eq!(eval("(guard (e (#t 'caught)) (define x 1) (+ x 1))"), "2");
     assert_eq!(eval("(let ((e 'outer)) (guard (e (#f e)) e))"), "outer");
@@ -1558,7 +1561,9 @@ fn optional_parameters_take_defaults() {
     let text = "(define n 0) (define (g [a (begin (set! n (+ n 1)) 1)] [b (* a 2)] . r) (list a b r)) (list (g) (g 5) (g 5 6 7) n)";
     assert_eq!(eval(text), "((1 2 ()) (5 10 ()) (5 6 (7)) 1)");
     assert_eq!(eval("(let ([f (lambda (a [b 1]) (+ a b))]) (list (f 1) (apply f '(1 2)) (map f '(1 2))))"), "(2 3 (2 3))");
-    let kind = |call: &str| eval(&format!("(guard (e (#t (error-object-kind e))) (define (f a [b 1]) a) {call})"));
+    fn kind(call: &str) -> String {
+        eval(&format!("(guard (e (#t (error-object-kind e))) (define (f a [b 1]) a) {call})"))
+    }
     assert_eq!((kind("(f)"), kind("(f 1 2 3)")), ("arity".into(), "arity".into()));
     assert_eq!(error("(lambda ([a 1] b) 1)"), (BadSyntax, "b"));
     assert_eq!(error("(lambda ([a]) a)"), (BadSyntax, "[a]"));
@@ -1590,7 +1595,9 @@ fn keyword_arguments_go_by_name() {
 
 #[test]
 fn keyword_mistakes_name_the_keyword() {
-    let caught = |text: &str| eval(&format!("(guard (e (#t (list (error-object-kind e) (error-object-irritants e)))) {text})"));
+    fn caught(text: &str) -> String {
+        eval(&format!("(guard (e (#t (list (error-object-kind e) (error-object-irritants e)))) {text})"))
+    }
     assert_eq!(caught("((lambda (#:a a) a) #:b 1)"), "(keyword (#:b))");
     assert_eq!(caught("(let ([f (lambda (#:a a) a)]) (f))"), "(keyword (#:a))");
     assert_eq!(caught("(define (f #:a a) a) (f #:a 1 2)"), "(arity ())");
@@ -1606,7 +1613,9 @@ fn keyword_mistakes_name_the_keyword() {
 
 #[test]
 fn apply_spreads_only_a_proper_list() {
-    let caught = |text: &str| eval(&format!("(define two (car (list (lambda () (values 1 2))))) (define a (car (list apply))) (guard (e (#t (error-object-kind e))) {text})"));
+    fn caught(text: &str) -> String {
+        eval(&format!("(define two (car (list (lambda () (values 1 2))))) (define a (car (list apply))) (guard (e (#t (error-object-kind e))) {text})"))
+    }
     // The last argument is a proper list, whether or not the procedure takes a rest parameter.
     assert_eq!(caught("(apply list 1 2 '(3 4))"), "(1 2 3 4)");
     assert_eq!(caught("(apply apply list 1 '(2 (3 4)))"), "(1 2 3 4)");
@@ -1629,34 +1638,38 @@ fn calls_through_a_value_reach_keyword_procedures_and_apply() {
                 (define (down n #:step [step 1]) (if (eqv? n 0) 0 (+ 1 ((pick 3) (- n step)))))
                 (define procs (vector greet needs apply down list))
                 (define (pick i) (vector-ref procs i))";
-    let caught = |text: &str| eval(&format!("{defs} (guard (e (#t (list (error-object-kind e) (error-object-irritants e)))) {text})"));
+    fn caught(defs: &str, text: &str) -> String {
+        eval(&format!("{defs} (guard (e (#t (list (error-object-kind e) (error-object-irritants e)))) {text})"))
+    }
     // A keyword procedure called without keywords, in tail and non-tail position.
-    assert_eq!(caught("((pick 0) 7)"), "(7 1 #f)");
-    assert_eq!(caught("(car ((pick 0) 7 8))"), "7");
-    assert_eq!(caught("((pick 0) 7 #:loud #t)"), "(7 1 #t)");
-    assert_eq!(caught("(apply (pick 0) 7 '(8))"), "(7 8 #f)");
+    assert_eq!(caught(defs, "((pick 0) 7)"), "(7 1 #f)");
+    assert_eq!(caught(defs, "(car ((pick 0) 7 8))"), "7");
+    assert_eq!(caught(defs, "((pick 0) 7 #:loud #t)"), "(7 1 #t)");
+    assert_eq!(caught(defs, "(apply (pick 0) 7 '(8))"), "(7 8 #f)");
     // Deep enough to continue on further stack segments.
-    assert_eq!(caught("((pick 3) 100000)"), "100000");
+    assert_eq!(caught(defs, "((pick 3) 100000)"), "100000");
     // A call the procedure cannot take names the keyword procedure.
     for wrong in ["((pick 0))", "(car ((pick 0) 1 2 3))", "(apply (pick 0) '())", "((pick 2) (pick 0) '(1 2 3))"] {
-        assert_eq!(caught(wrong), "(arity (#<procedure greet>))", "{wrong}");
+        assert_eq!(caught(defs, wrong), "(arity (#<procedure greet>))", "{wrong}");
     }
-    assert_eq!(caught("((pick 1))"), "(keyword (#:key))");
-    assert_eq!(caught("((pick 2) (pick 1) '())"), "(keyword (#:key))");
+    assert_eq!(caught(defs, "((pick 1))"), "(keyword (#:key))");
+    assert_eq!(caught(defs, "((pick 2) (pick 1) '())"), "(keyword (#:key))");
     // The first-class `apply`, in tail and non-tail position.
-    assert_eq!(caught("((pick 2) (pick 4) '(1 2))"), "(1 2)");
-    assert_eq!(caught("(car ((pick 2) (pick 0) '(7)))"), "7");
-    assert_eq!(caught("((pick 2) (pick 4) '())"), "()");
-    assert_eq!(caught("((pick 2) (pick 4) 1 2 '(3))"), "(1 2 3)");
-    assert_eq!(caught("((pick 2) (pick 2) (pick 4) '((1 2)))"), "(1 2)");
+    assert_eq!(caught(defs, "((pick 2) (pick 4) '(1 2))"), "(1 2)");
+    assert_eq!(caught(defs, "(car ((pick 2) (pick 0) '(7)))"), "7");
+    assert_eq!(caught(defs, "((pick 2) (pick 4) '())"), "()");
+    assert_eq!(caught(defs, "((pick 2) (pick 4) 1 2 '(3))"), "(1 2 3)");
+    assert_eq!(caught(defs, "((pick 2) (pick 2) (pick 4) '((1 2)))"), "(1 2)");
     for improper in ["((pick 2) (pick 4) 5)", "((pick 2) (pick 4) '(1 . 2))"] {
-        assert_eq!(caught(improper), "(wrong-type ())", "{improper}");
+        assert_eq!(caught(defs, improper), "(wrong-type ())", "{improper}");
     }
 }
 
 #[test]
 fn multiple_values_pass_through_control_forms() {
-    let received = |producer: &str| eval(&format!("(call-with-values (lambda () {producer}) list)"));
+    fn received(producer: &str) -> String {
+        eval(&format!("(call-with-values (lambda () {producer}) list)"))
+    }
     assert_eq!(received("(values)"), "()");
     assert_eq!(received("(values 1)"), "(1)");
     assert_eq!(received("(apply values '(1 2 3))"), "(1 2 3)");
@@ -1708,18 +1721,20 @@ fn multiple_values_return_across_stack_segments() {
 fn a_place_for_one_value_takes_no_other_number() {
     // The procedures are reached through a list, so the compiler does not see what they return.
     let defs = "(define two (car (list (lambda () (values 1 2))))) (define none (car (list (lambda () (values)))))";
-    let caught = |text: &str| eval(&format!("{defs} (guard (e (#t (list (error-object-kind e) (error-object-irritants e)))) {text})"));
-    for (several, received) in [("(+ 1 (two))", 2), ("(list (none))", 0), ("(let ((x (two))) (list x))", 2), ("(if (two) 1 2)", 2), ("(vector-ref (vector 1 2) (none))", 0)] {
-        assert_eq!(caught(several), format!("(value-count ({received}))"), "{several}");
+    fn caught(defs: &str, text: &str) -> String {
+        eval(&format!("{defs} (guard (e (#t (list (error-object-kind e) (error-object-irritants e)))) {text})"))
     }
-    assert_eq!(caught("(let ((k (call/cc (lambda (k) k)))) (if (procedure? k) (k 1 2) k))"), "(value-count (2))");
+    for (several, received) in [("(+ 1 (two))", 2), ("(list (none))", 0), ("(let ((x (two))) (list x))", 2), ("(if (two) 1 2)", 2), ("(vector-ref (vector 1 2) (none))", 0)] {
+        assert_eq!(caught(defs, several), format!("(value-count ({received}))"), "{several}");
+    }
+    assert_eq!(caught(defs, "(let ((k (call/cc (lambda (k) k)))) (if (procedure? k) (k 1 2) k))"), "(value-count (2))");
     // A result that nothing uses is not checked.
-    assert_eq!(caught("(begin (two) 5)"), "5");
+    assert_eq!(caught(defs, "(begin (two) 5)"), "5");
     // A call's result is passed on as it is, to its own caller or to a receiver.
-    assert_eq!(caught("(call-with-values (lambda () (two)) list)"), "(1 2)");
-    assert_eq!(caught("(call-with-values (lambda () (if (pair? (list 1)) (two) 3)) list)"), "(1 2)");
-    assert_eq!(caught("(call-with-values (lambda () (guard (e (#f 0)) (two))) list)"), "(1 2)");
-    assert_eq!(caught("(call-with-values none list)"), "()");
+    assert_eq!(caught(defs, "(call-with-values (lambda () (two)) list)"), "(1 2)");
+    assert_eq!(caught(defs, "(call-with-values (lambda () (if (pair? (list 1)) (two) 3)) list)"), "(1 2)");
+    assert_eq!(caught(defs, "(call-with-values (lambda () (guard (e (#f 0)) (two))) list)"), "(1 2)");
+    assert_eq!(caught(defs, "(call-with-values none list)"), "()");
 }
 
 #[test]
@@ -1737,7 +1752,9 @@ fn values_are_bound_by_let_values_and_define_values() {
     assert_eq!(eval("(define-values (a b . more) (values 1 2 3 4)) (define-values all (values 5 6)) (define-values () (values)) (list a b more all)"), "(1 2 (3 4) (5 6))");
     assert_eq!(eval("(define (f) (define-values (a b) (values 1 2)) (define c (+ a b)) (list a b c)) (f)"), "(1 2 3)");
     // The number of values must fit the formals.
-    let caught = |text: &str| eval(&format!("(guard (e (#t (error-object-kind e))) {text})"));
+    fn caught(text: &str) -> String {
+        eval(&format!("(guard (e (#t (error-object-kind e))) {text})"))
+    }
     assert_eq!(caught("(let-values (((a b) (values 1 2 3))) a)"), "arity");
     assert_eq!(caught("(let-values (((a b) 1) ((c) 2)) a)"), "arity");
     assert_eq!(caught("(let () (define-values (a) (values)) a)"), "arity");
@@ -1750,22 +1767,24 @@ fn values_are_bound_by_let_values_and_define_values() {
 fn receiving_from_a_known_producer_keeps_its_order_and_checks() {
     // The compiler removes a producer whose body it can see. What runs, and in what order, stays the same.
     let defs = "(define log '()) (define (note x) (set! log (cons x log)) x) (define (two x) (values x (+ x 1)))";
-    let caught = |text: &str| eval(&format!("{defs} (guard (e (#t (error-object-kind e))) {text})"));
-    assert_eq!(caught("(call-with-values (lambda () (note 1) (values (note 2) (note 3))) (lambda (a b) (note 4) (list a b (reverse log))))"), "(2 3 (1 2 3 4))");
-    assert_eq!(caught("(call-with-values (lambda () (let ((x (note 1))) (values x (+ x 1)))) list)"), "(1 2)");
-    assert_eq!(caught("(call-with-values (lambda () (two (note 7))) (lambda (a b) (list a b (reverse log))))"), "(7 8 (7))");
-    assert_eq!(caught("(call-with-values (lambda () (two 1)) +)"), "3");
-    assert_eq!(caught("(call-with-values (lambda () 5) (lambda (a) (+ a 1)))"), "6");
-    assert_eq!(caught("(call-with-values (lambda () (note 5)) list)"), "(5)");
-    assert_eq!(caught("(call-with-values (lambda () (values)) (lambda () 'none))"), "none");
-    assert_eq!(caught("(call-with-values (lambda () (values 1 2 3)) (lambda (a . more) (list a more)))"), "(1 (2 3))");
-    assert_eq!(caught("(let ((c (lambda (a b) (- a b)))) (call-with-values (lambda () (values 5 3)) c))"), "2");
+    fn caught(defs: &str, text: &str) -> String {
+        eval(&format!("{defs} (guard (e (#t (error-object-kind e))) {text})"))
+    }
+    assert_eq!(caught(defs, "(call-with-values (lambda () (note 1) (values (note 2) (note 3))) (lambda (a b) (note 4) (list a b (reverse log))))"), "(2 3 (1 2 3 4))");
+    assert_eq!(caught(defs, "(call-with-values (lambda () (let ((x (note 1))) (values x (+ x 1)))) list)"), "(1 2)");
+    assert_eq!(caught(defs, "(call-with-values (lambda () (two (note 7))) (lambda (a b) (list a b (reverse log))))"), "(7 8 (7))");
+    assert_eq!(caught(defs, "(call-with-values (lambda () (two 1)) +)"), "3");
+    assert_eq!(caught(defs, "(call-with-values (lambda () 5) (lambda (a) (+ a 1)))"), "6");
+    assert_eq!(caught(defs, "(call-with-values (lambda () (note 5)) list)"), "(5)");
+    assert_eq!(caught(defs, "(call-with-values (lambda () (values)) (lambda () 'none))"), "none");
+    assert_eq!(caught(defs, "(call-with-values (lambda () (values 1 2 3)) (lambda (a . more) (list a more)))"), "(1 (2 3))");
+    assert_eq!(caught(defs, "(let ((c (lambda (a b) (- a b)))) (call-with-values (lambda () (values 5 3)) c))"), "2");
     // A producer or consumer that is used again is left alone.
-    assert_eq!(caught("(let ((p (lambda () (values 1 2)))) (list (call-with-values p list) (call-with-values p list)))"), "((1 2) (1 2))");
-    assert_eq!(caught("(let ((c (lambda (a b) (- a b)))) (list (call-with-values (lambda () (values 5 3)) c) (c 1 1)))"), "(2 0)");
+    assert_eq!(caught(defs, "(let ((p (lambda () (values 1 2)))) (list (call-with-values p list) (call-with-values p list)))"), "((1 2) (1 2))");
+    assert_eq!(caught(defs, "(let ((c (lambda (a b) (- a b)))) (list (call-with-values (lambda () (values 5 3)) c) (c 1 1)))"), "(2 0)");
     // The number of values is still checked against the consumer.
     for wrong in ["(call-with-values (lambda () (values 1 2 3)) (lambda (a b) a))", "(call-with-values (lambda () 5) (lambda (a b) a))", "(call-with-values (lambda () (two 1)) (lambda (a) a))", "(call-with-values (lambda () (values)) (lambda (a) a))"] {
-        assert_eq!(caught(wrong), "arity", "{wrong}");
+        assert_eq!(caught(defs, wrong), "arity", "{wrong}");
     }
 }
 
@@ -1779,24 +1798,26 @@ fn keyword_calls_through_a_value_match_while_they_run() {
                 (define (nine #:a [a 1] #:b [b 2] #:c [c 3] #:d [d 4] #:e [e 5] #:f [f 6] #:g [g 7] #:h [h 8] #:i [i 9] z) (list a b c d e f g h i z))
                 (define procs (vector none one two four nine))
                 (define (pick i) (vector-ref procs i))";
-    let caught = |text: &str| eval(&format!("{defs} (guard (e (#t (list (error-object-kind e) (error-object-irritants e)))) {text})"));
+    fn caught(defs: &str, text: &str) -> String {
+        eval(&format!("{defs} (guard (e (#t (list (error-object-kind e) (error-object-irritants e)))) {text})"))
+    }
     // One, two and more accepted keywords, given in any order, in tail and non-tail position.
-    assert_eq!(caught("((pick 1) 1 #:x 2)"), "(1 2)");
-    assert_eq!(caught("(car ((pick 1) 1 #:x 2))"), "1");
-    assert_eq!(caught("((pick 2) 1 2 #:y 3)"), "(1 2 dx 3)");
-    assert_eq!(caught("((pick 2) #:y 3 1 #:x 4 2)"), "(1 2 4 3)");
-    assert_eq!(caught("((pick 3) 0 #:s 's #:q 'q)"), "(0 1 q 3 s ())");
-    assert_eq!(caught("(cdr ((pick 3) 0 5 6 7 #:r 'r #:p 'p))"), "(p 2 r 4 (5 6 7))");
-    assert_eq!(caught("((pick 4) #:i 'i 0 #:a 'a)"), "(a 2 3 4 5 6 7 8 i 0)");
+    assert_eq!(caught(defs, "((pick 1) 1 #:x 2)"), "(1 2)");
+    assert_eq!(caught(defs, "(car ((pick 1) 1 #:x 2))"), "1");
+    assert_eq!(caught(defs, "((pick 2) 1 2 #:y 3)"), "(1 2 dx 3)");
+    assert_eq!(caught(defs, "((pick 2) #:y 3 1 #:x 4 2)"), "(1 2 4 3)");
+    assert_eq!(caught(defs, "((pick 3) 0 #:s 's #:q 'q)"), "(0 1 q 3 s ())");
+    assert_eq!(caught(defs, "(cdr ((pick 3) 0 5 6 7 #:r 'r #:p 'p))"), "(p 2 r 4 (5 6 7))");
+    assert_eq!(caught(defs, "((pick 4) #:i 'i 0 #:a 'a)"), "(a 2 3 4 5 6 7 8 i 0)");
     // The arguments are evaluated in the order they are written.
-    assert_eq!(caught("(let* ((log '()) (note (lambda (x) (set! log (cons x log)) x))) (list ((pick 2) (note 1) #:y (note 2) (note 3) #:x (note 4)) (reverse log)))"), "((1 3 4 2) (1 2 3 4))");
+    assert_eq!(caught(defs, "(let* ((log '()) (note (lambda (x) (set! log (cons x log)) x))) (list ((pick 2) (note 1) #:y (note 2) (note 3) #:x (note 4)) (reverse log)))"), "((1 3 4 2) (1 2 3 4))");
     // The errors are the ones the general path reports.
-    assert_eq!(caught("((pick 2) 1 2)"), "(keyword (#:y))");
-    assert_eq!(caught("((pick 2) 1 2 #:y 3 #:z 4)"), "(keyword (#:z))");
-    assert_eq!(caught("((pick 0) 1 #:x 2)"), "(keyword (#:x))");
-    assert_eq!(caught("((pick 1) #:x 2)"), "(arity ())");
-    assert_eq!(caught("((pick 1) 1 2 #:x 2)"), "(arity ())");
-    assert_eq!(caught("(5 1 #:x 2)"), "(keyword (#:x))");
+    assert_eq!(caught(defs, "((pick 2) 1 2)"), "(keyword (#:y))");
+    assert_eq!(caught(defs, "((pick 2) 1 2 #:y 3 #:z 4)"), "(keyword (#:z))");
+    assert_eq!(caught(defs, "((pick 0) 1 #:x 2)"), "(keyword (#:x))");
+    assert_eq!(caught(defs, "((pick 1) #:x 2)"), "(arity ())");
+    assert_eq!(caught(defs, "((pick 1) 1 2 #:x 2)"), "(arity ())");
+    assert_eq!(caught(defs, "(5 1 #:x 2)"), "(keyword (#:x))");
 }
 
 #[test]
@@ -1938,7 +1959,7 @@ fn closing_a_coroutine_runs_its_afters_and_ends_it() {
 
 #[test]
 fn a_close_that_fails_or_yields_fails_the_coroutine() {
-    let failing = |after: &str| {
+    fn failing(after: &str) -> String {
         format!(
             "(let ((co (make-coroutine (lambda ()
                          (dynamic-wind (lambda () (note 'in1))
@@ -1947,7 +1968,7 @@ fn a_close_that_fails_or_yields_fails_the_coroutine() {
                (co/resume co)
                (list (guard (e (#t (if (error-object? e) (error-object-kind e) e))) (co/close co)) (co/status co) (reverse log)))"
         )
-    };
+    }
     // An `after` thunk that raises: the outer ones still run, the coroutine fails, and the value is raised at the close.
     assert_eq!(coroutine_case(&failing("(raise 'oops)")), "(oops error (in1 in2 out2 out1))");
     // A coroutine that is being closed cannot yield.
@@ -2374,6 +2395,20 @@ fn a_large_table_keeps_its_entries_through_collections() {
     assert_eq!(run_to_outcome(&mut arena, &mut machine, true), "done (0 14667 (0) 0)");
 }
 
+/// The default prompt tag is a value of its own. A variable that holds it is not taken for one that was never defined, and it is written as a prompt tag.
+#[test]
+fn the_default_prompt_tag_is_a_value_of_its_own() {
+    assert_eq!(eval("(define (late) later) (define later (default-continuation-prompt-tag)) (list (eq? (late) (default-continuation-prompt-tag)) (eq? later (if #f #f)) (late) (if later 'true 'false))"), "(#t #f #<prompt-tag> true)");
+    // It is not the value an optional parameter has when no argument is passed for it.
+    assert_eq!(eval("(define (tagged [tag (make-continuation-prompt-tag)]) (eq? tag (default-continuation-prompt-tag))) (list (tagged) (tagged (default-continuation-prompt-tag)))"), "(#f #t)");
+}
+
+/// A variable that passed `null?`, `nil?` or `none?` is known to be that one value where the test held.
+#[test]
+fn a_variable_tested_for_one_value_is_that_value() {
+    assert_eq!(eval("(define (which x) (cond ((nil? x) (if x 'true (list 'nil x))) ((none? x) (if x 'true (list 'none x))) ((null? x) (if x (list 'null x) 'false)) (else x))) (map which (list #nil #none '() #f 5))"), "((nil #nil) (none #none) (null ()) #f 5)");
+}
+
 #[test]
 fn three_values_are_false() {
     // `#f`, `#nil` and `#none` are false in every conditional. Everything else is true, the empty list and void included.
@@ -2420,6 +2455,75 @@ fn tables_hold_false_values_like_any_other() {
     assert_eq!(eval("(define t (table 'n 1)) (table-update! t 'n (lambda (n) (and n (+ n 1)))) (table-update! t 'm (lambda (m) (or m 'new))) (table-update! t 'k (lambda (k) k) #none) (table->list t)"), "((n . 2) (m . new) (k . #none))");
 }
 
+/// A read or a write with a constant key remembers where it found the key, and tries that place first. What it remembers is only a guess: the same code must give the right answer for any table, however its entries are laid out and however they change in between.
+#[test]
+fn table_reads_and_writes_with_constant_keys_follow_the_table() {
+    let get = "(define (name t) (table-ref t 'name)) (define (id t) (table-ref t \"id\" 'none)) (define (seven t) (table-ref t 7 'none)) (define (rename! t v) (table-set! t 'name v))";
+    // Tables with the key in different places, with other keys in its place, or without it, read one after the other by the same code.
+    let layouts = "(define tables (list (table 'name 1 \"id\" 2 7 3) (table 7 30 \"id\" 20 'name 10) (table 'other 0 'name 100) (table 'name2 0 \"idx\" 0 8 0) (table) (table \"id\" 200 'pad 0 'pad2 0 'name 1000)))
+                   (list (map name tables) (map id tables) (map seven tables) (map name (reverse tables)) (map name tables))";
+    assert_eq!(eval(&format!("{get} {layouts}")), "((1 10 100 #f #f 1000) (2 20 none none none 200) (3 30 none none none none) (1000 #f #f 100 10 1) (1 10 100 #f #f 1000))");
+    // One table whose entries move: keys before the one that is read are removed, the table grows and is made again, and the key itself is removed and set again.
+    let moving = "(define t (table 'a 0 'b 0 'name 'first))
+                  (define seen (list (name t)))
+                  (define (note!) (set! seen (cons (name t) seen)))
+                  (table-delete! t 'a) (note!)
+                  (let fill ((i 0)) (if (< i 100) (begin (table-set! t i i) (fill (+ i 1))))) (note!)
+                  (let empty ((i 0)) (if (< i 100) (begin (table-delete! t i) (empty (+ i 1))))) (note!)
+                  (let fill ((i 100)) (if (< i 140) (begin (table-set! t i i) (fill (+ i 1))))) (note!)
+                  (table-delete! t 'name) (note!)
+                  (table-set! t 'name 'second) (note!)
+                  (table-clear! t) (note!)
+                  (rename! t 'third) (note!)
+                  (reverse seen)";
+    assert_eq!(eval(&format!("{get} {moving}")), "(first first first first first #f second #f third)");
+    // Writes go to the entry of the key in whichever table they are given, and add it where it is missing.
+    let writing = "(define tables (list (table 'name 1 'x 0) (table 'x 0 'name 2) (table 'x 0)))
+                   (for-each (lambda (t) (rename! t (list 'new (table-length t)))) tables)
+                   (for-each (lambda (t) (rename! t (list 'newer (table-ref t 'name)))) (reverse tables))
+                   (map table->list tables)";
+    assert_eq!(eval(&format!("{get} {writing}")), "(((name newer (new 2)) (x . 0)) ((x . 0) (name newer (new 2))) ((x . 0) (name newer (new 1))))");
+    // The default is given only when the key is missing, and a false value that is stored is not the default.
+    assert_eq!(eval("(define (limit t) (table-ref t 'limit 50)) (map limit (list (table) (table 'limit 5) (table 'limit #f) (table 'limit #nil) (table 'other 1)))"), "(50 5 #f #nil 50)");
+    // What is not a table is refused by name, as without a constant key.
+    assert_eq!(uncaught("(let () (define (name t) (table-ref t 'name)) (name (vector 1)))"), "#<error table-ref: wrong type of argument #(1) name #f>");
+    assert_eq!(uncaught("(let () (define (rename! t) (table-set! t 'name 1)) (rename! 5))"), "#<error table-set!: wrong type of argument 5 name 1>");
+}
+
+/// A write with a constant key stores a new object in a table that has lived through collections. The collector must still see it.
+#[test]
+fn values_written_with_a_constant_key_survive_collections() {
+    let mut arena = arena();
+    let text = "(let ()
+                  (define t (table 'held (list 0)))
+                  (define (churn n acc) (if (eqv? n 0) acc (churn (- n 1) (list n n n))))
+                  (define (hold! i) (table-set! t 'held (list i (number->string i))))
+                  (let loop ((i 0) (bad 0))
+                    (if (eqv? i 200)
+                        bad
+                        (begin
+                          (hold! i)
+                          (churn 2000 0)
+                          (loop (+ i 1) (if (equal? (table-ref t 'held) (list i (number->string i))) bad (+ bad 1)))))))";
+    let mut machine = machine(&mut arena, text);
+    assert_eq!(run_to_outcome(&mut arena, &mut machine, false), "done 0");
+}
+
+#[test]
+fn vectors_are_walked_and_mapped_by_index() {
+    assert_eq!(eval("(define seen '()) (vector-for-each (lambda (x) (set! seen (cons x seen))) (vector 1 2 3)) (list seen (vector-for-each car (vector)) (vector-for-each car #()))"), "((3 2 1) #<void> #<void>)");
+    assert_eq!(eval("(list (vector-map (lambda (x) (* x x)) (vector 1 2 3)) (vector-map car #()) (vector-map (lambda (x) x) #(a \"b\" #\\c)))"), "(#(1 4 9) #() #(a \"b\" #\\c))");
+    // With several vectors the procedure takes an element of each, up to the length of the shortest.
+    assert_eq!(eval("(define seen '()) (vector-for-each (lambda (a b c) (set! seen (cons (list a b c) seen))) (vector 1 2 3) #(x y) (vector \"p\" \"q\" \"r\" \"s\")) (reverse seen)"), "((1 x \"p\") (2 y \"q\"))");
+    assert_eq!(eval("(list (vector-map + #(1 2 3) #(10 20 30)) (vector-map list #(1 2 3) #(a b)) (vector-map + #(1 2) #() #(5)))"), "(#(11 22 33) #((1 a) (2 b)) #())");
+    // The result of a map is a new vector that can be written to, and the calls are made from the first index on.
+    assert_eq!(eval("(define v (vector 1 2 3)) (define order '()) (define m (vector-map (lambda (x) (set! order (cons x order)) (+ x 1)) v)) (vector-set! m 0 'changed) (list v m order (eq? v m))"), "(#(1 2 3) #(changed 3 4) (3 2 1) #f)");
+    // What is not a vector is refused by the operation that reads it, and an error in the procedure passes through.
+    assert_eq!(eval("(map (lambda (thunk) (guard (e (#t (list (error-object-kind e) (error-object-who e)))) (thunk))) (list (lambda () (vector-for-each car '(1 2))) (lambda () (vector-map car 5)) (lambda () (vector-map car #(1))) (lambda () (vector-for-each (lambda (a b) a) #(1) 'x))))"), "((wrong-type vector-length) (wrong-type vector-length) (wrong-type car) (wrong-type vector-length))");
+    // A long vector is walked without deep recursion.
+    assert_eq!(eval("(define v (make-vector 100000 1)) (define sum 0) (vector-for-each (lambda (x) (set! sum (+ sum x))) v) (list sum (vector-length (vector-map (lambda (x) (+ x 1)) v)) (vector-ref (vector-map (lambda (x) (+ x 1)) v) 99999))"), "(100000 100000 2)");
+}
+
 #[test]
 fn large_groups_of_mutually_recursive_closures_compile() {
     // Each procedure calls the next and captures `n`, so the group is one cycle of closures that escape.
@@ -2449,7 +2553,7 @@ fn match_takes_the_first_clause_that_matches() {
     assert_eq!(eval("(match '(1 2 3 4) [(list-rest a b r) (list a b r)])"), "(1 2 (3 4))");
     assert_eq!(eval("(match (vector 1 2) [(vector a) 1] [(vector a b) (+ a b)])"), "3");
     assert_eq!(eval("(match '(1 (2 3)) [(list x (list y z)) (match x [1 (+ y z)])])"), "5");
-    // A variable bound twice matches what's equal? to what it's bound to first.
+    // A variable that occurs twice in a pattern matches, at its second occurrence, a value `equal?` to its first binding.
     assert_eq!(eval("(list (match '(1 1) [(list a a) 'same] [_ 'diff]) (match '(1 2) [(list a a) 'same] [_ 'diff]))"), "(same diff)");
     // Clauses are in tail position.
     assert_eq!(eval("(define (count n) (match n [0 'done] [n (count (- n 1))])) (count 100000)"), "done");
@@ -2470,14 +2574,16 @@ fn match_repeats_the_last_pattern_of_a_list() {
 
 #[test]
 fn match_clauses_share_what_they_start_by_looking_at() {
-    let each = |clauses: &str, values: &str| eval(&format!("(map (lambda (v) (match v {clauses})) '{values})"));
+    fn each(clauses: &str, values: &str) -> String {
+        eval(&format!("(map (lambda (v) (match v {clauses})) '{values})"))
+    }
     let lists = "[(list 1 a) (list 'one a)] [(list 2 a) (list 'two a)] [(cons x _) (list 'pair x)] [_ 'other]";
     assert_eq!(each(lists, "((1 5) (2 6) (3 7) (1 2 3) (2) 9)"), "((one 5) (two 6) (pair 3) (pair 1) (pair 2) other)");
     let vectors = "[(vector 1 b) (list 'one b)] [(vector a b) (list a b)] [(vector a) (list a)] [_ 'other]";
     assert_eq!(each(vectors, "(#(1 2) #(3 4) #(5) #(1 2 3) (1 2))"), "((one 2) (3 4) (5) other other)");
     let guarded = "[(list a b) #:when (> a b) 'more] [(list a b) (=> next) (if (eqv? a b) (next) 'less)] [(list _ _) 'same] [_ 'other]";
     assert_eq!(each(guarded, "((2 1) (1 2) (3 3) (1))"), "(more less same other)");
-    // The pattern's variables are bound in the body, not in its expressions, even those an `or`
+    // The variables of a pattern are bound in the body of the clause, not in the expressions inside the pattern. That includes the variables that an `or`
     // or a repeat binds.
     assert_eq!(eval("(let ([a 10]) (match '(1 2) [(list a (? (lambda (y) (> y a)))) 'more] [_ 'not]))"), "not");
     assert_eq!(eval("(let ([a 10]) (match '(1 2) [(list (or a a) (? (lambda (y) (> y a)))) 'more] [_ 'not]))"), "not");
@@ -2497,7 +2603,7 @@ fn match_patterns_combine() {
     assert_eq!(eval("(match 5 [(and n (not (? pair?) 3)) (list 'neither n)])"), "(neither 5)");
     assert_eq!(eval("(match 3 [(not 3) 'not-three] [_ 'three])"), "three");
     assert_eq!(eval("(match '(1 2) [(app length 2) 'two])"), "two");
-    // As in Racket, `(== v same?)` is true of `x` if `(same? v x)` is.
+    // As in Racket, `(== v same?)` matches `x` if `(same? v x)` is true.
     assert_eq!(eval("(list (match 7 [(== 7) 'seven]) (match 7 [(== 8 <) 'less] [_ 'not]) (match 7 [(== 8 >) 'more]))"), "(seven not more)");
     assert_eq!(error("(match '(1 2) [(or (list a) (list a b)) a])"), (BadSyntax, "(list a b)"));
     assert_eq!(error("(match 1 [`(a) 1])"), (Unsupported, "`(a)"));
@@ -2518,11 +2624,11 @@ fn match_guards_and_escapes_go_on_to_the_next_clause() {
 
 #[test]
 fn vm_faults_and_errors_are_error_objects() {
-    let caught = |body: &str| {
+    fn caught(body: &str) -> String {
         eval(&format!(
             "(guard (e ((error-object? e) (list (error-object-kind e) (error-object-message e) (error-object-irritants e)))) {body})"
         ))
-    };
+    }
     assert_eq!(caught("(car 1)"), r#"(wrong-type "wrong type of argument" (1))"#);
     assert_eq!(caught("(vector-ref (vector 1) 5)"), r#"(out-of-range "value out of range" (#(1) 5))"#);
     assert_eq!(caught("(/ 1 0)"), r#"(divide-by-zero "division by zero" (1 0))"#);
@@ -2539,7 +2645,7 @@ fn marks_are_seen_inside_and_dropped_after() {
                 (define (nest n) (if (eqv? n 0) (list (depth)) (call-with-mark 'depth (+ (depth) 1) (lambda () (cons (depth) (nest (- n 1)))))))
                 (list (nest 3) (depth))";
     assert_eq!(eval(text), "((1 2 3 3) 0)");
-    // One set in tail position replaces the mark of the frame it's in, so a loop runs in
+    // A mark that is set in tail position replaces the mark of its frame, so a loop runs in
     // constant space.
     let tail = "(define (loop n) (if (eqv? n 0) (mark-value 'k #f) (call-with-mark 'k n (lambda () (loop (- n 1))))))
                 (list (loop 100000) (call-with-mark 'k 'outer (lambda () (+ 0 (loop 3)))))";
@@ -2552,8 +2658,8 @@ fn marks_are_seen_inside_and_dropped_after() {
 
 #[test]
 fn handlers_set_for_a_call_are_put_back_when_it_returns() {
-    // After each level's handler call returns, a raise goes to the level outside it, as frames
-    // overflow segments and are copied back, again each time the bottom's continuation is called.
+    // After the `with-exception-handler` call of a level returns, a raise in that level goes to the handler of the level outside it. The recursion is deep, so frames
+    // overflow stack segments and are copied back. All of this happens again each time the continuation captured at the bottom is called.
     let text = "(define saved #f) (define count 0)
                 (define (down n)
                   (if (eqv? n 0)
@@ -2568,8 +2674,10 @@ fn handlers_set_for_a_call_are_put_back_when_it_returns() {
 
 #[test]
 fn guards_the_loop_cant_keep_in_a_frame_go_back_to_their_records() {
-    // A thunk that takes any number of arguments, or a guard set by `apply`, can't be called
-    // in the loop, so the outer loop keeps its guard in a record on the chain.
+    // The inner loop installs a guard in the calling frame only when the request is a plain call
+    // and the thunk is a closure that takes exactly no arguments. A thunk with a rest parameter, or
+    // a guard installed through `apply`, is left to the outer loop, which keeps the guard in a
+    // record on the continuation chain.
     let text = "(define log '()) (define (note x) (set! log (cons x log)))
                 (define (f n) (if (eqv? n 0) (raise 'deep) (+ 1 (f (- n 1)))))
                 (define (through-wind)
@@ -2586,8 +2694,8 @@ fn guards_the_loop_cant_keep_in_a_frame_go_back_to_their_records() {
 
 #[test]
 fn guards_go_back_to_the_frames_they_were_set_in() {
-    // Each level raises what its guard caught to the level outside it, leaving a winder, as
-    // frames overflow segments and are copied back, again each time the bottom's continuation
+    // Each level raises the value that its guard caught to the level outside it, and leaves a `dynamic-wind` extent on the way. The recursion is deep, so
+    // frames overflow stack segments and are copied back. All of this happens again each time the continuation captured at the bottom
     // is called.
     let text = "(define saved #f) (define count 0) (define outs 0)
                 (define (down n)
@@ -2609,7 +2717,7 @@ fn guards_go_back_to_the_frames_they_were_set_in() {
                      (reverse log))"
     );
     assert_eq!(eval(&across), "((g x) (in out))");
-    // A guard in a composable continuation catches what's raised where it's called.
+    // A guard inside a composable continuation catches a value that is raised when the continuation is called.
     let mut arena = arena();
     let capture = "(define k #f)
                    (call-with-continuation-prompt
@@ -2622,14 +2730,16 @@ fn guards_go_back_to_the_frames_they_were_set_in() {
 #[test]
 fn winders_run_on_the_way_in_and_out() {
     let log = "(define log '()) (define (note x) (set! log (cons x log)))";
-    let wind = |body: &str| eval(&format!("{log} (let ((r {body})) (list r (reverse log)))"));
-    assert_eq!(wind("(dynamic-wind (lambda () (note 'in)) (lambda () (note 'during) 'v) (lambda () (note 'out)))"), "(v (in during out))");
+    fn wind(log: &str, body: &str) -> String {
+        eval(&format!("{log} (let ((r {body})) (list r (reverse log)))"))
+    }
+    assert_eq!(wind(log, "(dynamic-wind (lambda () (note 'in)) (lambda () (note 'during) 'v) (lambda () (note 'out)))"), "(v (in during out))");
     let values = "(call-with-values (lambda () (dynamic-wind (lambda () 0) (lambda () (values 1 2)) (lambda () 3))) list)";
     assert_eq!(eval(values), "(1 2)");
     let escape = "(call/cc (lambda (k) (dynamic-wind (lambda () (note 'in)) (lambda () (k 'escaped) (note 'not)) (lambda () (note 'out)))))";
-    assert_eq!(wind(escape), "(escaped (in out))");
+    assert_eq!(wind(log, escape), "(escaped (in out))");
     let inside = "(dynamic-wind (lambda () (note 'in)) (lambda () (call/cc (lambda (k) (note 'jump) (k 1)))) (lambda () (note 'out)))";
-    assert_eq!(wind(inside), "(1 (in jump out))");
+    assert_eq!(wind(log, inside), "(1 (in jump out))");
     let nested = "(call-with-continuation-prompt
                     (lambda ()
                       (dynamic-wind (lambda () (note 'a-in))
@@ -2637,8 +2747,8 @@ fn winders_run_on_the_way_in_and_out() {
                                                              (lambda () (abort-current-continuation (default-continuation-prompt-tag) (lambda () 'aborted)))
                                                              (lambda () (note 'b-out))))
                                     (lambda () (note 'a-out)))))";
-    assert_eq!(wind(nested), "(aborted (a-in b-in b-out a-out))");
-    // R7RS's example: a continuation captured inside, called from outside, goes back in.
+    assert_eq!(wind(log, nested), "(aborted (a-in b-in b-out a-out))");
+    // The example from R7RS: a continuation that is captured inside the extent and called from outside re-enters the extent.
     let again = "(let ((path '()) (c #f))
                    (let ((add (lambda (s) (set! path (cons s path)))))
                      (dynamic-wind (lambda () (add 'connect))
@@ -2646,7 +2756,7 @@ fn winders_run_on_the_way_in_and_out() {
                                    (lambda () (add 'disconnect)))
                      (if (eqv? (length path) 3) (c 'talk2) (reverse path))))";
     assert_eq!(eval(again), "(connect talk1 disconnect connect talk2 disconnect)");
-    // A composable continuation runs the befores of the winders it holds.
+    // Calling a composable continuation runs the `before` thunks of the winders that it holds.
     let mut arena = arena();
     let capture = format!(
         "{log} (define k #f)
@@ -2657,10 +2767,10 @@ fn winders_run_on_the_way_in_and_out() {
     );
     assert_eq!(eval_in(&mut arena, &capture), Ok(Ok("0".into())));
     assert_eq!(eval_in(&mut arena, "(list (+ 1 (k 5)) (reverse log))"), Ok(Ok("(6 (in out in out))".into())));
-    // A guard leaving the extent runs the afters, before its clauses.
+    // A guard that leaves the extent runs the `after` thunks before its clauses.
     let guarded = "(guard (e (#t (note (list 'caught e)) 'g))
                      (dynamic-wind (lambda () (note 'in)) (lambda () (raise 'x)) (lambda () (note 'out))))";
-    assert_eq!(wind(guarded), "(g (in out (caught x)))");
+    assert_eq!(wind(log, guarded), "(g (in out (caught x)))");
 }
 
 #[test]
@@ -2670,7 +2780,7 @@ fn errors_no_handler_takes_run_the_afters_first() {
     let failing = format!("{log} (dynamic-wind (lambda () (note 'in)) (lambda () (dynamic-wind (lambda () (note 'in2)) (lambda () (car 1)) (lambda () (note 'out2)))) (lambda () (note 'out)))");
     assert_eq!(eval_in(&mut arena, &failing), Ok(Err(Fault::WrongType)));
     assert_eq!(eval_in(&mut arena, "(reverse log)"), Ok(Ok("(in in2 out2 out)".into())));
-    // In a coroutine, a yield runs none, and a failure runs them before it's raised again
+    // In a coroutine, a yield runs no `after` thunk. A failure runs the `after` thunks before the value is raised again
     // where the coroutine was resumed.
     let co = format!(
         "{log} (define co (make-coroutine (lambda () (dynamic-wind (lambda () (note 'in)) (lambda () (co/yield 1) (car 1)) (lambda () (note 'out))))))
@@ -2681,7 +2791,7 @@ fn errors_no_handler_takes_run_the_afters_first() {
     assert_eq!(eval(&co), "(1 (in) (caught wrong-type error (in out)))");
     let inside = "(co/resume (make-coroutine (lambda () (guard (e (#t (list 'inside e))) (raise 'x)))))";
     assert_eq!(eval(inside), "(inside x)");
-    // co/try-resume returns what a resume of a coroutine that isn't pending raises.
+    // `co/try-resume` returns the error of resuming a coroutine that is not pending, instead of raising it.
     let done = "(define co (make-coroutine (lambda () 1))) (co/resume co)
                 (call-with-values (lambda () (co/try-resume co)) (lambda (ok e) (list ok (error-object-kind e))))";
     assert_eq!(eval(done), "(#f not-pending)");
@@ -2691,11 +2801,11 @@ fn errors_no_handler_takes_run_the_afters_first() {
 
 #[test]
 fn raising_in_a_loop_runs_in_constant_space() {
-    let text = |n: u64| {
+    fn text(rounds: u64) -> String {
         format!(
             "(let ((log 0))
                   (let loop ((i 0) (sum 0))
-                    (if (eqv? i {n})
+                    (if (eqv? i {rounds})
                         (list sum log)
                         (loop (+ i 1)
                               (+ sum (guard (e ((null? e) 0) ((pair? e) (car e)))
@@ -2704,9 +2814,9 @@ fn raising_in_a_loop_runs_in_constant_space() {
                                                                    (raise (list (vector-ref (vector 1) 0)))))
                                                      (lambda () (set! log (+ log 1))))))))))"
         )
-    };
+    }
     assert_eq!(eval(&text(1000)), "(1000 1000)");
-    // Run one that doesn't end for as many pauses as it takes to see the live memory settle.
+    // Run a loop that does not end, through enough pauses to see the amount of live memory settle.
     let mut arena = arena();
     let mut machine = machine(&mut arena, &text(u64::MAX >> 4));
     let mut live = Vec::new();
@@ -2735,13 +2845,13 @@ mod modules;
 
 #[test]
 fn faults_name_the_operation_and_what_it_was_given() {
-    let displayed = |text: &str| {
+    fn displayed(text: &str) -> String {
         arena().mutate(|mc| {
             let [thunk] = load_text(mc, text).unwrap()[..] else { panic!("one form") };
             let raised = run_raising(mc, thunk).expect_err("raised");
             ragwort_printer_scheme::to_string(mc, raised, ragwort_printer_scheme::Mode::Display, usize::MAX).unwrap()
         })
-    };
+    }
     assert_eq!(displayed("(car 5)"), "car: wrong type of argument: 5");
     assert_eq!(displayed("(string-length \"abc\" 1)"), "wrong number of arguments: #<procedure string-length> 2");
     assert_eq!(displayed("(vector-ref (vector 1 2) 9)"), "vector-ref: value out of range: #(1 2) 9");
@@ -2776,7 +2886,9 @@ fn procedures_are_named_for_what_they_are_bound_to() {
 #[test]
 fn errors_record_the_calls_in_progress() {
     let names = "(guard (e (#t (map car (error-object-traceback e))))";
-    let traced = |text: String| eval_in(&mut arena(), &text);
+    fn traced(text: String) -> Result<Result<String, Fault>, Error> {
+        eval_in(&mut arena(), &text)
+    }
     let fault = "(define (inner x) (vector-ref x 9)) (define (middle x) (+ 1 (inner x))) (define (outer x) (+ 1 (middle x)))";
     assert_eq!(traced(format!("{fault} {names} (outer (vector 1)))")), Ok(Ok("(inner middle outer #f)".into())));
     let raised = "(define (inner x) (+ 1 (error \"bad\" x))) (define (outer x) (+ 1 (inner x)))";
@@ -2799,7 +2911,7 @@ fn errors_record_the_calls_in_progress() {
 
 #[test]
 fn a_host_reads_the_trace_of_a_raised_condition() {
-    let trace_of = |text: &str| {
+    fn trace_of(text: &str) -> ragwort_vm::report::Trace {
         arena().mutate(|mc| {
             let mut raised = None;
             for &thunk in &load_text(mc, text).unwrap() {
@@ -2807,7 +2919,7 @@ fn a_host_reads_the_trace_of_a_raised_condition() {
             }
             ragwort_vm::report::trace(mc, raised.expect("raised"))
         })
-    };
+    }
     let trace = trace_of("(define (f x) (+ 1 (car x))) (+ 1 (f 1))");
     let seen: Vec<(Option<&str>, bool)> = trace.contexts.iter().map(|context| (context.procedure.as_deref(), context.top_level)).collect();
     assert_eq!(seen, [(Some("f"), false), (None, true)]);
@@ -2917,7 +3029,9 @@ fn scripts_read_which_operation_failed() {
 #[test]
 fn inlined_procedures_keep_their_place_in_a_trace() {
     let names = "(guard (e (#t (error-object-traceback e)))";
-    let traced = |text: String| eval_in(&mut arena(), &text);
+    fn traced(text: String) -> Result<Result<String, Fault>, Error> {
+        eval_in(&mut arena(), &text)
+    }
     // A local procedure called once is inlined into its caller, and still gets an entry with the line of the failed operation.
     let once = "(define (outer x)\n  (define (helper y)\n    (car y))\n  (+ 1 (helper x)))";
     assert_eq!(traced(format!("{once}\n{names}\n  (+ 1 (outer 5)))")), Ok(Ok("((helper #f 3) (outer #f 4) (#f #f 6) (#f #f 5))".into())));

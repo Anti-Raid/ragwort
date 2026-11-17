@@ -63,7 +63,7 @@ fn joins_take_their_parameters_and_have_one_parent() {
 /// Checks and walks a tree one million nodes deep on a small machine stack.
 #[test]
 fn deep_trees_need_no_stack() {
-    let run = || {
+    fn run() {
         scope(|mut t| {
             let mut e = void(&mut t);
             for _ in 0..1_000_000 {
@@ -74,6 +74,6 @@ fn deep_trees_need_no_stack() {
             assert_eq!(t.deep(e).count(), 1_000_001);
             assert_eq!(t.frame(e).count(), 1);
         });
-    };
+    }
     thread::Builder::new().stack_size(64 << 10).spawn(run).expect("spawned").join().expect("ran");
 }

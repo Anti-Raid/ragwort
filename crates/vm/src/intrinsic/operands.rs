@@ -1,11 +1,11 @@
-//! The operands of an intrinsic call, however the caller holds them.
+//! The operands of an intrinsic call, independent of how the caller stores them.
 
 use std::marker::PhantomData;
 
 use ragwort_types::gc::{Frame, Value};
 
-/// The operands of one intrinsic call. An intrinsic reads them by position, however the caller
-/// holds them: in a run of frame registers, in a few values, or in a slice.
+/// The operands of one intrinsic call. An intrinsic reads them by position. The caller can store
+/// them in a run of frame registers, in a fixed-size array of values, or in a slice.
 pub(crate) trait Operands<'gc>: Copy {
     /// Returns the number of operands.
     fn count(self) -> usize;
@@ -63,7 +63,7 @@ impl<'gc> Operands<'gc> for &[Value<'gc>] {
     }
 }
 
-/// The operands of a call from one position to the end, as [`Operands::from`] returns them.
+/// Iterator over the operands of a call from a start position to the end. Returned by [`Operands::from`].
 pub(crate) struct Rest<'gc, O> {
     operands: O,
     next: usize,

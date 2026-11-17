@@ -1,7 +1,7 @@
-//! Syntax between the expander's tree and the arena's syntax objects, which macros' transformers
-//! take and make. An identifier's object holds its scopes, and a list's a list of syntax. Each
-//! object made from the tree goes back to the node it came from, so the parts of a use that a
-//! transformer hands back as they were cost nothing to take back.
+//! Conversion between the expander's tree and the arena's syntax objects. Macro transformers
+//! take and return syntax objects. The syntax object of an identifier holds its scopes. The syntax object of a list holds a list of syntax objects. Each
+//! syntax object created from the tree is mapped back to its node. So when a transformer returns a part of
+//! its input unchanged, converting that part back takes one lookup.
 
 use ragwort_types::gc::{OutOfMemory, Value};
 use ragwort_types::pair::{Pair, Pairs};
@@ -18,13 +18,13 @@ use crate::tree::{Stx, View};
 use crate::{ExpandError, ExpandErrorKind};
 
 impl<'gc> Expander<'_, 'gc> {
-    /// `stx` as a syntax object. A list or vector is made of its items', from a stack of their
-    /// own.
+    /// Converts `root` to a syntax object. The traversal uses an explicit stack, and builds each
+    /// list or vector from the syntax objects of its items.
     pub(crate) fn wrap(&mut self, root: Stx) -> Result<Value<'gc>, ExpandError> {
         enum Task {
             Visit(Stx),
-            /// A list of the last items wrapped, after its tail if it has one, or a vector of
-            /// them.
+            /// Builds the list or vector of a node from the last `count` syntax objects created. The
+            /// syntax object of a list's tail, if the list has one, is on the stack above them.
             Make(Stx, usize, bool, SyntaxKind),
         }
         let mc = self.mc;
@@ -69,7 +69,7 @@ impl<'gc> Expander<'_, 'gc> {
         Ok(done.pop().expect("the root's wrapped"))
     }
 
-    /// The metadata of syntax of `kind` with the scopes `set`, made once for each.
+    /// Returns the metadata for syntax of `kind` with the scope set `set`. It is created once for each such pair and cached.
     pub(crate) fn meta(&mut self, set: Set, kind: SyntaxKind) -> Result<SyntaxMeta<'gc>, ExpandError> {
         let tag = match kind {
             SyntaxKind::Identifier => 0,
@@ -96,14 +96,17 @@ impl<'gc> Expander<'_, 'gc> {
         Ok(meta)
     }
 
-    /// What the identifier `id` refers to, as a value for its syntax: see
-    /// `ragwort_vm`'s `free-identifier=?`. One that's ambiguous has none.
+    /// Returns the binding value for the syntax object of the identifier `id`, or `None` if `id` is ambiguous.
+    /// `free-identifier=?` in `ragwort_vm` compares these values.
+    ///
+    /// - A keyword's value is the identifier's symbol.
+    /// - A [`Stamp::Named`] binding has a pair `(module . name)`. Two such pairs are the same binding if their parts are equal.
+    /// - A [`Stamp::Own`] binding has a fresh `SyntaxScope` object. The object is not used as a scope. It only serves as a unique value that is compared by identity.
     fn binding_value(&mut self, id: Stx) -> Result<Option<Value<'gc>>, ExpandError> {
         let mc = self.mc;
         let symbol = self.tree.symbol(id).expect("an identifier");
         let set = self.tree.scopes_of(id)?;
         let Ok(binding) = self.resolve_name(symbol, set) else { return Ok(None) };
-        let named = |module: Value<'gc>, name: Value<'gc>| Stamp::Named(module.to_bits(), name.to_bits());
         let (stamp, name) = match binding {
             Binding::Keyword(_) => return Ok(Some(symbol.value(mc))),
             Binding::Local(var) => (Stamp::Own(0, var.0), None),
@@ -112,12 +115,12 @@ impl<'gc> Expander<'_, 'gc> {
             Binding::Slot(slot) if !matches!(self.builder.binding(symbol.value(mc)), Some(module::Binding::Slot(bound)) if bound == slot) => (Stamp::Own(3, slot), None),
             Binding::Slot(_) | Binding::Free => {
                 let module = self.builder.name();
-                (named(module, symbol.value(mc)), Some((module, symbol.value(mc))))
+                (Stamp::Named(module.to_bits(), symbol.value(mc).to_bits()), Some((module, symbol.value(mc))))
             }
             Binding::Import(import) => {
                 let (module, names) = (import.module.name(mc), import.module.names(mc));
                 let name = AnyVector::of(names).and_then(|names| names.get(mc, import.export.slot as usize)).unwrap_or(Value::FALSE);
-                (named(module, name), Some((module, name)))
+                (Stamp::Named(module.to_bits(), name.to_bits()), Some((module, name)))
             }
         };
         if let Some(&value) = self.binding_values.get(&stamp) {
@@ -132,7 +135,7 @@ impl<'gc> Expander<'_, 'gc> {
         Ok(Some(value))
     }
 
-    /// The object that's `scope` in syntax.
+    /// Returns the `SyntaxScope` object that represents `scope` in syntax objects. It is created on first use.
     fn scope_object(&mut self, scope: Scope) -> Result<SyntaxScope<'gc>, OutOfMemory> {
         if let Some(&object) = self.scope_objects.get(&scope) {
             return Ok(object);
@@ -144,8 +147,8 @@ impl<'gc> Expander<'_, 'gc> {
         Ok(object)
     }
 
-    /// The scopes of `context`. One the load hasn't seen, from another or made at run time,
-    /// is a new scope to it.
+    /// Returns the scope set of `context`. A scope object that this load has not seen gets a fresh
+    /// scope number. Such an object comes from another load or was created at run time.
     pub(crate) fn set_of(&mut self, context: Option<SyntaxContext<'gc>>) -> Result<Set, OutOfMemory> {
         let Some(context) = context else { return Ok(Set::EMPTY) };
         let mut scopes = Vec::with_capacity(context.scopes(self.mc).len());
@@ -165,18 +168,17 @@ impl<'gc> Expander<'_, 'gc> {
         self.tree.scopes.set(scopes)
     }
 
-    /// The syntax a transformer made, `value`, in the tree. What it has that isn't syntax is as
-    /// if it were, at `at`, the use it's the output of; a symbol in it is an error. A list or
-    /// vector's items are made before it, from a stack charged as it grows, as data that
-    /// contains itself would grow it forever.
+    /// Converts `value`, the output of a transformer, into the tree. A part that is not a syntax
+    /// object is treated as syntax with the span of `at`, the macro use. A bare symbol is an error. The traversal uses an explicit stack, and creates the items of a list or
+    /// vector before it. The stack is charged to the arena's budget as it grows. Otherwise cyclic data
+    /// would grow the stack without limit.
     pub(crate) fn unwrap(&mut self, value: Value<'gc>, at: Stx) -> Result<Stx, ExpandError> {
         enum Task<'gc> {
             Visit(Value<'gc>),
-            /// A list of the last items made, after its tail if it has one, or a vector of them.
+            /// Builds a list or vector from the last `count` nodes created. The node of a list's tail, if the list has one, is on the stack above them.
             Make(SyntaxSpan<'gc>, usize, bool, bool),
         }
         let mc = self.mc;
-        let bad = |this: &Self| this.error(ExpandErrorKind::BadSyntax, at);
         let (mut todo, mut done) = (vec![Task::Visit(value)], Vec::new());
         while let Some(task) = todo.pop() {
             let value = match task {
@@ -194,15 +196,15 @@ impl<'gc> Expander<'_, 'gc> {
             }
             self.tree.scopes.charge(size_of::<Task<'gc>>())?;
             let (datum, span, kind, context) = match Syntax::of(value) {
-                Some(syntax) => (syntax.datum(mc), syntax.span(mc), syntax.kind(mc).ok_or_else(|| bad(self))?, syntax.context(mc)),
+                Some(syntax) => (syntax.datum(mc), syntax.span(mc), syntax.kind(mc).ok_or_else(|| self.error(ExpandErrorKind::BadSyntax, at))?, syntax.context(mc)),
                 None if value == Value::NULL || Pair::of(value).is_some() => (value, self.tree.span(at), SyntaxKind::List, None),
                 None if AnyVector::of(value).is_some() => (value, self.tree.span(at), SyntaxKind::Vector, None),
-                None if Symbol::of(value).is_some() => return Err(bad(self)),
+                None if Symbol::of(value).is_some() => return Err(self.error(ExpandErrorKind::BadSyntax, at)),
                 None => (value, self.tree.span(at), SyntaxKind::Literal, None),
             };
             match kind {
                 SyntaxKind::Identifier => {
-                    let symbol = Symbol::of(datum).ok_or_else(|| bad(self))?;
+                    let symbol = Symbol::of(datum).ok_or_else(|| self.error(ExpandErrorKind::BadSyntax, at))?;
                     let set = self.set_of(context)?;
                     done.push(self.tree.id(symbol, set, span)?);
                 }
@@ -214,7 +216,7 @@ impl<'gc> Expander<'_, 'gc> {
                             items.push(Task::Visit(pair.head(mc)));
                             rest = pair.tail(mc);
                         } else if let Some(list) = Syntax::of(rest).filter(|syntax| syntax.kind(mc) == Some(SyntaxKind::List)) {
-                            // A tail that's the syntax of a list goes on with its items.
+                            // A tail that is the syntax object of a list continues the list with its items.
                             rest = list.datum(mc);
                         } else {
                             break;
@@ -228,14 +230,14 @@ impl<'gc> Expander<'_, 'gc> {
                     todo.extend(items.into_iter().rev());
                 }
                 SyntaxKind::Vector => {
-                    let vector = AnyVector::of(datum).ok_or_else(|| bad(self))?;
+                    let vector = AnyVector::of(datum).ok_or_else(|| self.error(ExpandErrorKind::BadSyntax, at))?;
                     let items: Vec<_> = (0..vector.len(mc)).filter_map(|i| vector.get(mc, i)).collect();
                     self.tree.scopes.charge(items.len() * size_of::<Task<'gc>>())?;
                     todo.push(Task::Make(span, items.len(), false, true));
                     todo.extend(items.into_iter().rev().map(Task::Visit));
                 }
                 SyntaxKind::Literal if Symbol::of(datum).is_none() => done.push(self.tree.datum(datum, span)?),
-                _ => return Err(bad(self)),
+                _ => return Err(self.error(ExpandErrorKind::BadSyntax, at)),
             }
         }
         Ok(done.pop().expect("the root's made"))

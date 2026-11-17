@@ -1,6 +1,6 @@
-//! A growable array in the arena: a handle object holding the length and an array of `S`, which
-//! growing replaces. Slots past the length hold the zero word, which reads as fixnum 0, none, or
-//! 0, so they keep nothing alive.
+//! A growable array in the arena. It is a head object that holds the length and a reference to an array of `S`.
+//! Growing replaces the array. The slots past the length hold the zero word. The zero word reads as fixnum 0, as no object, or as the word
+//! 0, so those slots keep no object alive.
 
 use std::marker::PhantomData;
 
@@ -12,10 +12,10 @@ use crate::gc::{Desc, Field, Gc, Items, Mutation, Object, OutOfMemory, Slots, Va
 #[path = "tests/vec.rs"]
 mod tests;
 
-/// A [`GcVec`]'s handle object.
+/// The head object of a [`GcVec`].
 pub struct VecHead<S>(PhantomData<fn() -> S>);
 
-/// A [`GcVec`]'s slots.
+/// The slot array of a [`GcVec`].
 #[doc(hidden)]
 pub struct VecSlots<S>(PhantomData<fn() -> S>);
 
@@ -32,7 +32,7 @@ impl<S: Item> VecHead<S> {
     const SLOTS: Field<Self, slot::Member<VecSlots<S>>> = Field::new(1);
 }
 
-/// A growable array of `S`, values by default.
+/// A growable array of `S`. `S` defaults to values.
 pub struct GcVec<'gc, S = slot::Value> {
     head: Gc<'gc, VecHead<S>>,
 }
@@ -56,7 +56,7 @@ impl<'gc, S: Item> GcVec<'gc, S> {
         Ok(vector)
     }
 
-    /// The vector `head` is the handle of.
+    /// Returns the vector whose head is `head`.
     pub fn of(head: Gc<'gc, VecHead<S>>) -> Self {
         Self { head }
     }
@@ -65,7 +65,7 @@ impl<'gc, S: Item> GcVec<'gc, S> {
         self.head
     }
 
-    /// All the slots, and the length. The stored length can't be trusted, so it's capped here.
+    /// Returns all the slots, and the length. The stored length cannot be trusted, so it is capped at the number of slots here.
     #[inline]
     fn parts(self, mc: &Mutation<'gc>) -> Option<(Slots<'gc, S>, usize)> {
         let slots = self.head.get(mc, VecHead::SLOTS)?.item_slots::<S>(mc);
@@ -85,7 +85,7 @@ impl<'gc, S: Item> GcVec<'gc, S> {
         self.parts(mc).map_or(0, |(slots, _)| slots.len())
     }
 
-    /// The slots up to the length, for bulk reads and writes.
+    /// Returns the slots up to the length, for bulk reads and writes.
     pub fn items(self, mc: &Mutation<'gc>) -> Option<Slots<'gc, S>> {
         let (slots, len) = self.parts(mc)?;
         slots.slice(0..len)
@@ -97,7 +97,7 @@ impl<'gc, S: Item> GcVec<'gc, S> {
         (index < len).then(|| slots.get(index))
     }
 
-    /// Whether `index` is in bounds, and so was set.
+    /// Sets item `index` to `value`. Returns whether `index` was in bounds. If it was not, nothing is written.
     #[inline]
     pub fn set(self, mc: &Mutation<'gc>, index: usize, value: S::In<'gc>) -> bool {
         let Some((slots, _)) = self.parts(mc).filter(|&(_, len)| index < len) else { return false };
@@ -105,8 +105,8 @@ impl<'gc, S: Item> GcVec<'gc, S> {
         true
     }
 
-    /// Room for `additional` more without growing. Grows to double when the budget allows, and
-    /// to just what's needed when it doesn't.
+    /// Ensures room for `additional` more items without further growth. Grows to double the capacity if the budget allows, and
+    /// otherwise to exactly the capacity needed.
     pub fn reserve(self, mc: &Mutation<'gc>, additional: usize) -> Result<(), OutOfMemory> {
         let (old, len) = self.parts(mc).unzip();
         let len = len.unwrap_or(0);
@@ -115,12 +115,11 @@ impl<'gc, S: Item> GcVec<'gc, S> {
         if needed <= capacity {
             return Ok(());
         }
-        let alloc = |count| mc.alloc_items::<VecSlots<S>, 0>([], count, Value::from_bits(0));
         let doubled = (capacity * 2).max(4);
-        let slots = if doubled > needed { mc.optional(|| alloc(doubled)).ok() } else { None };
+        let slots = if doubled > needed { mc.optional(|| mc.alloc_items::<VecSlots<S>, 0>([], doubled, Value::from_bits(0))).ok() } else { None };
         let slots = match slots {
             Some(slots) => slots,
-            None => alloc(needed)?,
+            None => mc.alloc_items::<VecSlots<S>, 0>([], needed, Value::from_bits(0))?,
         };
         if let (Some(old), Some(new)) = (old.and_then(|previous| previous.slice(0..len)), slots.item_slots::<S>(mc).slice(0..len)) {
             new.copy_from(mc, old);
@@ -149,7 +148,7 @@ impl<'gc, S: Item> GcVec<'gc, S> {
     pub fn truncate(self, mc: &Mutation<'gc>, len: usize) {
         let Some((_, old)) = self.parts(mc) else { return };
         let len = len.min(old);
-        // Zero words, whatever `S` is, so the slots keep nothing alive.
+        // Write zero words, whatever `S` is, so the removed slots keep no object alive.
         if let Some(gone) = self.head.get(mc, VecHead::SLOTS).and_then(|slots| slots.item_slots::<slot::u64>(mc).slice(len..old)) {
             gone.fill(mc, 0);
         }
@@ -160,7 +159,7 @@ impl<'gc, S: Item> GcVec<'gc, S> {
         self.truncate(mc, 0);
     }
 
-    /// Reads each item as iteration reaches it.
+    /// Returns an iterator over the items. Each item is read when the iterator reaches it.
     pub fn iter<'m>(self, mc: &'m Mutation<'gc>) -> impl DoubleEndedIterator<Item = S::Out<'gc>> + ExactSizeIterator + use<'m, 'gc, S> {
         let parts = self.parts(mc);
         let len = parts.map_or(0, |(_, len)| len);

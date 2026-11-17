@@ -9,13 +9,14 @@ objects! {
     struct Vector {} items Value
     struct Boxed { data: Host<String> }
     struct Counter { count: Host<i32> }
-    /// Weakly holds a node, and links to the next holder.
+    /// Holds a weak reference to a node, and a link to the next holder.
     struct Holder { target: Weak<Node>, next: Member<Holder> }
     struct Table {} items Ephemeron
+    /// Field 0 is a value. Fields 1 and 2 hold an ephemeron.
     struct Cached { n: Value, cache: Ephemeron }
 }
 
-/// A list of fixnums `0..n` in root 0, last first.
+/// Builds a list of the fixnums `0..n` in root 0, with the last number first.
 fn build(arena: &mut Arena, n: i64) {
     arena.mutate(|mc| {
         for i in 0..n {
@@ -68,8 +69,8 @@ fn garbage_is_reused() {
     assert_eq!(sum(&mut arena), (45, 10));
 }
 
-/// An old object's young referent survives a minor collection through the card the store
-/// dirtied, and nothing else.
+/// A young object that only an old object refers to survives a minor collection. Nothing keeps it alive except the card that the store
+/// marked dirty.
 #[test]
 fn cards_keep_young_objects_alive() {
     let mut arena = Arena::new(REGION, 1);
@@ -139,7 +140,7 @@ fn hosts_live_while_referenced() {
     assert_eq!(arena.hosts(), 1, "the dead value's slot is dropped");
 }
 
-/// A forged reference reads as some other object or none, never out of bounds.
+/// A forged reference reads as some other object or as no object. It never reads out of bounds.
 #[test]
 fn forged_references_are_only_wrong() {
     let mut arena = Arena::new(1 << 20, 1);
@@ -152,8 +153,8 @@ fn forged_references_are_only_wrong() {
     });
 }
 
-/// A chain of holders in root 0, each weakly holding a node; every other node is also held
-/// strongly from root 1's vector.
+/// Builds a chain of `n` holders in root 0. Each holder has a weak reference to a node. Every second node is also held
+/// strongly by the vector in root 1.
 fn holders(arena: &mut Arena, n: usize) {
     arena.mutate(|mc| {
         let kept = Vector::new(mc, n / 2, Value::NULL).unwrap();
@@ -170,7 +171,7 @@ fn holders(arena: &mut Arena, n: usize) {
     });
 }
 
-/// The values of the live weak targets, in chain order.
+/// Returns the numbers of the live weak targets, in chain order.
 fn weak_targets(arena: &mut Arena) -> Vec<u64> {
     arena.mutate(|mc| {
         let mut out = Vec::new();
@@ -201,8 +202,8 @@ fn weak_references_clear_when_their_targets_die() {
     assert_eq!(weak_targets(&mut arena), expected);
 }
 
-/// The mutator rewires the list between slices of an evacuating cycle; nothing reachable is
-/// lost and every moved reference is fixed.
+/// The mutator relinks the list between the slices of an evacuating cycle. No reachable object is
+/// lost, and every reference to a moved object is updated.
 #[test]
 fn incremental_marking_keeps_what_the_mutator_moves_around() {
     let mut arena = Arena::new(REGION, 2);
@@ -213,7 +214,7 @@ fn incremental_marking_keeps_what_the_mutator_moves_around() {
     assert_eq!(arena.phase(), Phase::Marking);
     let mut round = 0;
     while arena.phase() == Phase::Marking {
-        // Move the list's tail half into root 1 and back, through a pair already marked.
+        // Move the second half of the list into root 1 and back, by way of a pair that is already marked.
         arena.mutate(|mc| {
             let mut cur = mc.root(0);
             for _ in 0..10_000 {
@@ -225,7 +226,7 @@ fn incremental_marking_keeps_what_the_mutator_moves_around() {
             let fresh = Pair::new(mc, Value::fixnum(-1).unwrap(), tail).unwrap();
             mc.set_root(1, Value::object(mc, fresh));
         });
-        // A slice when idle would start another cycle.
+        // A slice in the idle phase would start another cycle, so only a cycle that is still marking gets another slice.
         if arena.phase() == Phase::Marking {
             arena.collect_slice(4096);
         }
@@ -247,8 +248,8 @@ fn incremental_marking_keeps_what_the_mutator_moves_around() {
     assert_eq!(sum(&mut arena), (20_000 * 19_999 / 2, 20_000));
 }
 
-/// Steps pace collection on their own: minors as the nursery fills, majors as what survives
-/// them grows. Root 0's list grows by one pair a step, and the rest is garbage.
+/// Steps pace collection by themselves: minor collections as the nursery fills, and major cycles as the surviving
+/// data grows. The list in root 0 grows by one pair per step. Everything else is garbage.
 #[test]
 fn steps_collect_as_they_go() {
     let mut arena = Arena::new(64 << 20, 1);
@@ -267,7 +268,7 @@ fn steps_collect_as_they_go() {
     assert_eq!(sum(&mut arena), (20_000 * 19_999 / 2, 20_000));
 }
 
-/// A heap of nothing but garbage needs no major collections.
+/// A heap that holds only garbage needs no major collections.
 #[test]
 fn garbage_alone_needs_only_minors() {
     let mut arena = Arena::new(16 << 20, 1);
@@ -283,7 +284,7 @@ fn garbage_alone_needs_only_minors() {
     assert!(majors <= 1 && minors > 10, "{majors} majors, {minors} minors");
 }
 
-/// Large objects reuse the pages of dead ones instead of taking fresh pages until the limit.
+/// Large objects reuse the pages of dead large objects, instead of taking fresh pages until the arena reaches its limit.
 #[test]
 fn large_objects_reuse_freed_pages() {
     let mut arena = Arena::new(16 << 20, 1);
@@ -293,14 +294,14 @@ fn large_objects_reuse_freed_pages() {
     assert!(arena.pages_bytes() <= 16 << 20);
 }
 
-/// Pages left mostly empty are compacted by ordinary collections, without evacuate-all.
+/// Ordinary collections compact the pages that are mostly empty, without `set_evacuate_all`.
 #[test]
 fn sparse_pages_are_compacted() {
     let mut arena = Arena::new(REGION, 1);
     arena.mutate(|mc| {
         for i in 0..400_000 {
             let pair = Pair::new(mc, Value::fixnum(i).unwrap(), mc.root(0)).unwrap();
-            // One pair in forty is kept, so most lines stay empty but every page keeps some.
+            // One pair in forty is kept. So most lines end up empty, but every page keeps some live pairs.
             if i % 40 == 0 {
                 mc.set_root(0, Value::object(mc, pair));
             }
@@ -333,13 +334,13 @@ fn host_slots_are_reused() {
     });
 }
 
-/// Objects made while pages are still being swept lazily aren't swept away.
+/// Objects allocated while the lazy sweep is still running are not freed by the sweep.
 #[test]
 fn allocation_during_lazy_sweeping_is_kept() {
     let mut arena = Arena::new(REGION, 2);
     build(&mut arena, 50_000);
     arena.mutate(|mc| {
-        // Garbage, so the sweep has holes to hand out.
+        // Allocate garbage, so that the sweep frees holes for the allocator to use.
         for i in 0..200_000 {
             Pair::new(mc, Value::fixnum(i).unwrap(), Value::NULL).unwrap();
         }
@@ -371,8 +372,8 @@ fn allocation_during_lazy_sweeping_is_kept() {
     assert_eq!(young, steps * 1000);
 }
 
-/// Free pages past a nursery's worth go back to the system, and come back when needed. A
-/// backing that can't give memory back keeps counting them.
+/// Free pages beyond one nursery's worth are released to the system, and are committed again when needed. With a
+/// backing that cannot release memory, the pages stay counted as committed.
 #[test]
 fn free_pages_are_given_back() {
     let mut arena = Arena::new(REGION, 2);
@@ -393,7 +394,7 @@ fn free_pages_are_given_back() {
         assert_eq!(committed, arena.pages_bytes());
     }
     assert_eq!(sum(&mut arena), (10_000 * 9_999 / 2, 10_000));
-    // Allocating again reuses them, and what's written there reads back.
+    // A new allocation reuses the released pages, and the data written there reads back.
     arena.mutate(|mc| {
         let v = Vector::new(mc, 1 << 20, Value::fixnum(7).unwrap()).unwrap();
         mc.set_root(1, Value::object(mc, v));
@@ -431,7 +432,7 @@ fn flonums_round_trip_and_survive_moves() {
     ];
     let mut arena = Arena::new(REGION, 1);
     arena.mutate(|mc| {
-        // A type of the test's own registered first mustn't pass for a boxed flonum.
+        // The first type that the test registers must not be mistaken for a boxed flonum.
         let other = Pair::new(mc, Value::FALSE, Value::FALSE).unwrap();
         assert!(!Value::object(mc, other).is_flonum());
         let mut list = Value::NULL;
@@ -451,7 +452,7 @@ fn flonums_round_trip_and_survive_moves() {
         }
         assert_eq!(Value::flonum(mc, 1e300).unwrap().immediate(), None);
         assert_eq!(Value::object(mc, other).immediate(), None);
-        // Three values are false, and each is a value of its own. Nothing else is false: not the empty list, not void, not zero.
+        // Three values are false, and the three are distinct. No other value is false: not the empty list, not void, not zero.
         let falses = [Value::FALSE, Value::NIL, Value::NONE];
         for (index, &value) in falses.iter().enumerate() {
             assert!(value.is_false() && !value.is_true() && value.immediate().map(Immediate::value) == Some(value));
@@ -462,7 +463,7 @@ fn flonums_round_trip_and_survive_moves() {
             assert!(value.is_true() && !value.is_false() && !falses.contains(&value), "{value:?}");
         }
     });
-    let check = |arena: &mut Arena| {
+    fn check(arena: &mut Arena, doubles: &[f64]) {
         arena.mutate(|mc| {
             let mut cur = mc.root(0);
             for &f in doubles.iter().rev() {
@@ -470,17 +471,16 @@ fn flonums_round_trip_and_survive_moves() {
                 cur = cdr(mc, cur);
             }
         });
-    };
+    }
     arena.collect_minor();
-    check(&mut arena);
+    check(&mut arena, &doubles);
     arena.set_evacuate_all(true);
     arena.collect();
-    check(&mut arena);
+    check(&mut arena, &doubles);
 }
 
-/// Field 0 is a value, fields 1 and 2 an ephemeron.
-/// A table whose even keys are also held from root 1. Each value refers back to its key, which
-/// mustn't keep the key alive.
+/// Builds an ephemeron table of `n` entries in root 0. The keys of the even entries are also held from root 1. Each value refers back to its key, and
+/// that reference must not keep the key alive.
 fn half_held_table(arena: &mut Arena, n: usize) {
     arena.mutate(|mc| {
         let table = Table::new(mc, n).unwrap();
@@ -534,8 +534,8 @@ fn ephemerons_hold_values_only_while_their_keys_live() {
     }
 }
 
-/// Each value is the next entry's key, and only the last entry's key is held, so marking takes
-/// a pass over the table per link.
+/// The value of each entry is the key of the entry before it, and a root holds only the key of the last entry in the chain. So marking takes
+/// one pass over the table per link.
 #[test]
 fn ephemeron_chains_are_followed() {
     const LINKS: usize = 20;
@@ -566,14 +566,14 @@ fn ephemeron_chains_are_followed() {
     });
 }
 
-/// A value taken from an object not yet traced and stored in a table already traced, with
-/// nothing else holding it, is found at the end of marking, and moved.
+/// A value is taken out of an object that is not yet traced, and is stored as an ephemeron value in a table that is already traced.
+/// Nothing else holds the value. The end of marking must still find the value, and evacuation must move it.
 #[test]
 fn ephemeron_values_stored_while_marking_are_kept() {
     let mut arena = Arena::new(REGION, 4);
     arena.mutate(|mc| {
-        // Roots are traced last first: the table, the key, then the chain, deep enough that
-        // its end is untraced when the value is taken from it.
+        // Roots are traced from the last to the first: the table, the key, then the chain. The chain is long enough that
+        // its end is still untraced when the value is taken from it.
         let mut chain = pair(mc, pair(mc, fixnum(777), Value::NULL), Value::NULL);
         for i in 0..10_000 {
             chain = pair(mc, fixnum(i), chain);
@@ -598,7 +598,7 @@ fn ephemeron_values_stored_while_marking_are_kept() {
         arena.collect_slice(1024);
     }
     arena.mutate(|mc| {
-        // Fills the freed memory, so a value wrongly freed reads back as something else.
+        // Fill the freed memory, so that a value that was wrongly freed reads back as something else.
         for i in 0..300_000 {
             pair(mc, fixnum(i), Value::NULL);
         }
@@ -608,7 +608,7 @@ fn ephemeron_values_stored_while_marking_are_kept() {
     });
 }
 
-/// An old table sees young keys and values through its dirty cards. Old keys die only in a
+/// An old object with an ephemeron finds a young key and value through its dirty cards. An old key dies only in a
 /// major collection.
 #[test]
 fn old_ephemerons_hold_young_values() {
@@ -625,13 +625,13 @@ fn old_ephemerons_hold_young_values() {
         mc.root(0).downcast::<Cached>(mc).unwrap().set_cache(mc, (key, value));
     });
     arena.collect_minor();
-    let entry = |arena: &mut Arena| {
+    fn entry(arena: &mut Arena) -> Option<(Option<i64>, Option<i64>)> {
         arena.mutate(|mc| {
             let cached = mc.root(0).downcast::<Cached>(mc).unwrap();
             assert_eq!(cached.n(mc), fixnum(5));
             cached.cache(mc).map(|(key, value)| (car(mc, key).as_fixnum(), car(mc, value).as_fixnum()))
         })
-    };
+    }
     assert_eq!(entry(&mut arena), Some((Some(1), Some(2))));
     arena.mutate(|mc| mc.set_root(1, Value::NULL));
     arena.collect_minor();
@@ -640,7 +640,7 @@ fn old_ephemerons_hold_young_values() {
     assert_eq!(entry(&mut arena), None);
 }
 
-/// Keys that aren't objects never die.
+/// A key that is not an object never dies.
 #[test]
 fn immediate_keys_keep_their_values() {
     let mut arena = Arena::new(REGION, 1);
@@ -659,13 +659,13 @@ fn immediate_keys_keep_their_values() {
     });
 }
 
-/// Holds a host word but forgets to declare it: the wrong description the docs allow.
+/// Holds a host word in a field that its descriptor does not declare as a host field. The module docs allow this kind of wrong descriptor.
 struct Forgetful;
 impl Object for Forgetful {
     const DESC: Desc = Desc::of::<Forgetful>(1);
 }
 
-/// Host references are capabilities: a stale one must never read the value that reused its
+/// Host references are capabilities. A stale reference must never read the value that reused its
 /// slot.
 #[test]
 fn stale_host_refs_never_read_the_next_value() {
@@ -675,7 +675,7 @@ fn stale_host_refs_never_read_the_next_value() {
         let forgetful = mc.alloc::<Forgetful, 1>([user.to_word()]).unwrap();
         mc.set_root(0, Value::object(mc, forgetful));
     });
-    // Nothing declares the host, so it dies.
+    // No descriptor declares the host field, so the host value is not marked and dies.
     arena.collect();
     arena.mutate(|mc| {
         let admin = mc.host(String::from("admin")).unwrap();
@@ -689,7 +689,7 @@ fn stale_host_refs_never_read_the_next_value() {
     });
 }
 
-/// Index 0 means none, so nothing may be allocated there, even a large first object.
+/// Index 0 means no object, so no object may be allocated there, not even a large first object.
 #[test]
 fn large_first_allocation_is_not_none() {
     let mut arena = Arena::new(REGION, 1);
@@ -718,7 +718,7 @@ fn fields_past_the_declared_ones_panic() {
     });
 }
 
-/// Sets a flag when dropped, and panics if asked to.
+/// Sets a flag when dropped. Its destructor also panics if the second field is true.
 struct Flag(Rc<Cell<bool>>, bool);
 impl Drop for Flag {
     fn drop(&mut self) {
@@ -727,7 +727,7 @@ impl Drop for Flag {
     }
 }
 
-/// Dropped stacks are pruned, and give back their charge, once traced.
+/// The record of a dropped stack is removed, and its charge is refunded, once a collection has traced it.
 #[test]
 fn dropped_stacks_are_pruned() {
     let mut arena = Arena::new(REGION, 1);
@@ -750,11 +750,11 @@ fn dropped_stacks_are_pruned() {
     assert_eq!(arena.used(), used + 200 * STACK_COST);
     arena.collect();
     assert!(arena.meta.stacks.borrow().is_empty());
-    // The table of records keeps its capacity.
+    // The vector of stack records keeps its capacity, which stays charged.
     assert!(arena.used() <= used + 256 * 8, "{} bytes more", arena.used() - used);
 }
 
-/// Many stacks, moved together.
+/// One collection traces many stacks and evacuates their segments.
 #[test]
 fn many_stacks() {
     let mut arena = Arena::new(REGION, 1);
@@ -776,7 +776,7 @@ fn many_stacks() {
     });
 }
 
-/// A host destructor that panics does so after the collection is done, so the arena is
+/// A panic in the destructor of a host value happens after the collection has finished, so the arena is
 /// still usable.
 #[test]
 fn host_destructors_run_after_the_collector() {
@@ -793,7 +793,7 @@ fn host_destructors_run_after_the_collector() {
     assert_eq!(sum(&mut arena), (1000 * 999 / 2, 1000));
 }
 
-/// An arena's tables grow with its limit and its types, not to the most any arena could use.
+/// The tables of an arena are sized by its limit and by the types it uses, not by the maximum that any arena could need.
 #[test]
 fn small_arenas_are_small() {
     let mut arena = Arena::new(1 << 20, 1);
@@ -802,8 +802,8 @@ fn small_arenas_are_small() {
     assert_eq!(arena.meta.descs.chunks.iter().filter(|c| c.get().is_some()).count(), 0);
 }
 
-/// A minor collection scans only the dirty cards of an old vector, wherever in it they are,
-/// and finds small objects sharing the last page of a large one, even once it has died.
+/// A minor collection scans only the dirty cards of an old vector, wherever the cards are in the vector.
+/// It also finds small objects that share the last page of a large object, even after the large object has died.
 #[test]
 fn dirty_cards_of_large_objects() {
     const LEN: usize = 300_000;
@@ -811,7 +811,7 @@ fn dirty_cards_of_large_objects() {
     arena.mutate(|mc| {
         let vector = Vector::new(mc, LEN, Value::NULL).unwrap();
         mc.set_root(0, Value::object(mc, vector));
-        // Lands in the free lines after the vector's end.
+        // This pair is allocated in the free lines after the end of the vector.
         let tail = pair(mc, Value::NULL, Value::NULL);
         mc.set_root(1, tail);
     });
@@ -820,7 +820,7 @@ fn dirty_cards_of_large_objects() {
     arena.mutate(|mc| {
         let vector = mc.root(0).downcast::<Vector>(mc).unwrap();
         for &i in &stores {
-            // Garbage between them, so no two share a line and survive together.
+            // Allocate garbage between the stored pairs, so that no two of them share a line and survive together.
             Vector::new(mc, 32, Value::NULL).unwrap();
             vector.items(mc).set(mc, i, pair(mc, fixnum(i), Value::NULL));
         }
@@ -837,7 +837,7 @@ fn dirty_cards_of_large_objects() {
             assert_eq!(car(mc, vector.items(mc).get(i)), fixnum(i));
         }
         assert_eq!(car(mc, car(mc, mc.root(1))), fixnum(1_000_001));
-        // The vector dies; the tail pair, on its last page, lives on.
+        // The vector dies. The tail pair, which is on the vector's last page, stays alive.
         mc.set_root(0, Value::NULL);
     });
     arena.collect();

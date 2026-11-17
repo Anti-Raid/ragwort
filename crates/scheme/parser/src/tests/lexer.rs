@@ -12,7 +12,9 @@ fn error(text: &str) -> (ErrorKind, usize, usize) {
 #[test]
 fn brackets_prefixes_and_atoms_are_tokens() {
     use Token::*;
-    let id = |s| Identifier(Cow::Borrowed(s));
+    fn id(name: &str) -> Token<'_> {
+        Identifier(Cow::Borrowed(name))
+    }
     assert_eq!(
         tokens("(a [b] . c) 'x `y ,z ,@w #'s #`t #,u #,@v #(1) #u8(2) #;q #1=#1# #t #false #\\a #\\space").unwrap(),
         [
@@ -30,7 +32,7 @@ fn brackets_prefixes_and_atoms_are_tokens() {
 fn nil_and_none_are_tokens_of_their_own() {
     use Token::*;
     assert_eq!(tokens("#nil #none #NIL #None (#nil)").unwrap(), [Nil, NoneValue, Nil, NoneValue, Open(Bracket::Round), Nil, Close(Bracket::Round)]);
-    // A longer name that starts the same way is not one of them.
+    // A longer name that starts with `#nil` or `#none` is neither token.
     assert!(tokens("#nile").is_err() && tokens("#nones").is_err());
     assert_eq!(tokens("nil none").unwrap(), [Identifier(Cow::Borrowed("nil")), Identifier(Cow::Borrowed("none"))]);
 }
@@ -44,7 +46,9 @@ fn spans_cover_each_token() {
 #[test]
 fn numbers_and_what_might_be_are_told_apart() {
     assert_eq!(tokens("12 -3.5 .5 #x1F #e1.2").unwrap(), [Token::Number("12"), Token::Number("-3.5"), Token::Number(".5"), Token::Number("#x1F"), Token::Number("#e1.2")]);
-    let or = |s| Token::NumberOr { text: s, name: Cow::Borrowed(s) };
+    fn or(text: &str) -> Token<'_> {
+        Token::NumberOr { text, name: Cow::Borrowed(text) }
+    }
     assert_eq!(tokens("+i -inf.0 +nan.0x + - ...").unwrap(), [or("+i"), or("-inf.0"), or("+nan.0x"), Token::Identifier("+".into()), Token::Identifier("-".into()), Token::Identifier("...".into())]);
 }
 

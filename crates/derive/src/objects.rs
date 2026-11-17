@@ -5,8 +5,8 @@ use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::{Attribute, Error, GenericArgument, Ident, LitInt, Path, PathArguments, Token, Type, TypePath, Visibility, braced};
 
-/// Names a field can't take: methods of `Gc` that would hide its accessors, and the
-/// constructor's parameters.
+/// Names that a field cannot have. They are the methods of `Gc`, which would hide the field's
+/// accessors, and the parameters of the constructor.
 const RESERVED: [&str; 10] = ["get", "set", "len", "is_empty", "entry", "set_entry", "items", "mc", "fill", "entries"];
 
 fn krate() -> TokenStream {
@@ -48,13 +48,17 @@ enum Class {
 struct Slot {
     /// The marker type in `ragwort_types::gc::slot`.
     path: TokenStream,
-    /// What a read gives and what a write takes.
+    /// The type that a read returns. `input` is the type that a write takes.
     out: TokenStream,
     input: TokenStream,
     class: Class,
 }
 
 impl Slot {
+    fn new(path: TokenStream, out: TokenStream, input: TokenStream, class: Class) -> Self {
+        Self { path, out, input, class }
+    }
+
     fn width(&self) -> usize {
         if self.class == Class::Ephemeron { 2 } else { 1 }
     }
@@ -148,57 +152,56 @@ impl Parse for Field {
 }
 
 fn slot(ty: &Type) -> syn::Result<Slot> {
-    let krate = krate();
-    let err = || {
+    fn err(ty: &Type) -> Error {
         let kinds = "Value, Member<T>, Weak<T>, Host<T>, AnyHost, Frozen<T>, Ephemeron, u64, i64, u32, f64 or bool";
         Error::new_spanned(ty, format!("expected {kinds}"))
-    };
-    let Type::Path(TypePath { qself: None, path }) = ty else { return Err(err()) };
-    let [segment] = &path.segments.iter().collect::<Vec<_>>()[..] else { return Err(err()) };
+    }
+    let krate = krate();
+    let Type::Path(TypePath { qself: None, path }) = ty else { return Err(err(ty)) };
+    let [segment] = &path.segments.iter().collect::<Vec<_>>()[..] else { return Err(err(ty)) };
     if path.leading_colon.is_some() {
-        return Err(err());
+        return Err(err(ty));
     }
     let arg = match &segment.arguments {
         PathArguments::None => None,
         PathArguments::AngleBracketed(bracketed) => match &bracketed.args.iter().collect::<Vec<_>>()[..] {
             [GenericArgument::Type(inner)] => Some(inner),
-            _ => return Err(err()),
+            _ => return Err(err(ty)),
         },
-        PathArguments::Parenthesized(_) => return Err(err()),
+        PathArguments::Parenthesized(_) => return Err(err(ty)),
     };
     let ident = &segment.ident;
     let value = quote!(#krate::Value<'gc>);
-    let slot = |path, out: TokenStream, input, class| Slot { path, out, input, class };
     Ok(match (ident.to_string().as_str(), arg) {
-        ("Value", None) => slot(quote!(#krate::slot::Value), value.clone(), value, Class::Value),
+        ("Value", None) => Slot::new(quote!(#krate::slot::Value), value.clone(), value, Class::Value),
         ("u64" | "i64" | "u32" | "f64" | "bool", None) => {
-            slot(quote!(#krate::slot::#ident), quote!(::core::primitive::#ident), quote!(::core::primitive::#ident), Class::Word)
+            Slot::new(quote!(#krate::slot::#ident), quote!(::core::primitive::#ident), quote!(::core::primitive::#ident), Class::Word)
         }
         ("Member" | "Weak", Some(inner)) => {
             let out = quote!(::core::option::Option<#krate::Gc<'gc, #inner>>);
-            slot(quote!(#krate::slot::#ident<#inner>), out.clone(), out, Class::Reference)
+            Slot::new(quote!(#krate::slot::#ident<#inner>), out.clone(), out, Class::Reference)
         }
         ("Host", Some(inner)) => {
             let out = quote!(::core::option::Option<#krate::HostRef<'gc, #inner>>);
-            slot(quote!(#krate::slot::Host<#inner>), out.clone(), out, Class::Host)
+            Slot::new(quote!(#krate::slot::Host<#inner>), out.clone(), out, Class::Host)
         }
         ("AnyHost", None) => {
             let out = quote!(::core::option::Option<#krate::AnyHostRef<'gc>>);
-            slot(quote!(#krate::slot::AnyHost), out.clone(), out, Class::Host)
+            Slot::new(quote!(#krate::slot::AnyHost), out.clone(), out, Class::Host)
         }
-        ("Frozen", Some(inner)) => slot(
+        ("Frozen", Some(inner)) => Slot::new(
             quote!(#krate::slot::Frozen<#inner>),
             quote!(::core::option::Option<&'gc #inner>),
             quote!(#krate::FrozenRef<'gc, #inner>),
             Class::Frozen,
         ),
-        ("Ephemeron", None) => slot(
+        ("Ephemeron", None) => Slot::new(
             quote!(#krate::slot::Ephemeron),
             quote!(::core::option::Option<(#value, #value)>),
             quote!((#value, #value)),
             Class::Ephemeron,
         ),
-        _ => return Err(err()),
+        _ => return Err(err(ty)),
     })
 }
 
@@ -222,16 +225,16 @@ pub(crate) fn expand(input: TokenStream) -> syn::Result<TokenStream> {
         impl #kind<'_> {
             /// The type number of the group's first type.
             pub const BASE: u16 = #base;
-            /// One past the group's last type number, where a group declared `after` it starts.
+            /// One past the last type number of the group. A group declared `after` this group starts here.
             pub const END: u16 = Self::BASE + #count;
-            /// How the collector sees each of the group's types, in order.
+            /// The collector's descriptor of each of the group's types, in order.
             pub const DESCS: &'static [&'static #krate::Desc] = &[#(&<#names as #krate::Object>::DESC),*];
         }
 
         #[allow(dead_code)]
         impl<'gc> #kind<'gc> {
-            /// Which of the group's types `value` refers to, from the type number it carries, or
-            /// `None` for any other value.
+            /// Returns the variant for the object that `value` refers to, chosen by the type number in
+            /// the value word. Returns `None` if `value` does not refer to an object of this group.
             #[inline(always)]
             pub fn of(value: #krate::Value<'gc>) -> ::core::option::Option<Self> {
                 let (ty, index) = value.object_parts()?;
@@ -295,8 +298,8 @@ fn expand_object(object: &Object, kind: &Ident, number: &Literal) -> syn::Result
     let indices: Vec<Literal> = starts.iter().map(|&start| Literal::usize_unsuffixed(start)).collect();
     let ends: Vec<Literal> = fields.iter().zip(&starts).map(|(field, &start)| Literal::usize_unsuffixed(start + field.slot.width())).collect();
 
-    // Without items it's `alloc_fixed`, which is small enough to inline everywhere and has to
-    // be: LLVM stops inlining it into large functions otherwise.
+    // A constructor without items only calls `alloc_fixed`. It is small enough to inline
+    // everywhere, and the inlining must be forced: otherwise LLVM stops inlining it into large functions.
     let inline = if items.is_none() { quote!(#[inline(always)]) } else { quote!(#[inline]) };
     let (params, alloc, items_sig, items_impl) = match items {
         None => (quote!(), quote!(mc.alloc::<#name, #words>(__words)), quote!(), quote!()),

@@ -3,7 +3,7 @@ use crate::gc::{Arena, GcVec, slot};
 use super::*;
 use crate::string::*;
 
-/// Root 0 holds the table, root 1 the symbols a test keeps.
+/// Returns an arena. Root 0 holds the intern table. Root 1 holds the symbols that a test keeps.
 fn arena() -> Arena {
     let mut arena = Arena::new(16 << 20, 2);
     arena.mutate(|mc| {
@@ -21,7 +21,7 @@ fn names(n: usize) -> Vec<String> {
     (0..n).map(|i| format!("name {i} {}", ["", "é", "日本", "😀"][i % 4])).collect()
 }
 
-/// However its name is held, a name has one symbol, which keeps the name and its hash.
+/// A name has one symbol, however the string of the name is stored. The symbol stores the name and its hash.
 #[test]
 fn one_symbol_per_name() {
     let mut arena = arena();
@@ -54,8 +54,8 @@ fn one_symbol_per_name() {
     });
 }
 
-/// Symbols kept through collections that move everything are still the ones their names
-/// intern to.
+/// A symbol that is kept through collections that move every object is still the symbol that
+/// its name interns to.
 #[test]
 fn symbols_survive_moving_collections() {
     let mut arena = arena();
@@ -81,8 +81,8 @@ fn symbols_survive_moving_collections() {
     });
 }
 
-/// The table doesn't keep symbols alive. Ones still reached stay unique however many of their
-/// neighbors in the table died, and a dead one's name gets a new symbol.
+/// The intern table does not keep symbols alive. A symbol that is still reachable stays unique,
+/// however many of its neighbors in the table were collected. The name of a collected symbol gets a new symbol.
 #[test]
 fn unreachable_symbols_are_collected() {
     let mut arena = arena();
@@ -99,7 +99,7 @@ fn unreachable_symbols_are_collected() {
     });
     arena.collect();
     arena.collect();
-    // The kept symbols and their names, and a few containers.
+    // The live objects are the kept symbols, their names, and a few containers.
     let live = arena.objects();
     assert!((2 * 1000..2 * 1000 + 10).contains(&live), "{live} objects");
     arena.mutate(|mc| {
@@ -117,7 +117,7 @@ fn unreachable_symbols_are_collected() {
     });
 }
 
-/// Names made and dropped over and over don't grow the table past what the live ones need.
+/// Interning and dropping names repeatedly does not grow the table beyond the size that the live symbols need.
 #[test]
 fn churn_leaves_the_table_small() {
     let mut arena = arena();
@@ -150,20 +150,22 @@ fn churn_leaves_the_table_small() {
 
 #[test]
 fn an_arena_has_one_table_seeded_apart_from_others() {
-    let seed = |arena: &mut Arena| arena.mutate(|mc| Symbols::of_arena(mc).unwrap().seed(mc));
+    fn seed(arena: &mut Arena) -> u64 {
+        arena.mutate(|mc| Symbols::of_arena(mc).unwrap().seed(mc))
+    }
     let (mut a, mut b) = (Arena::new(1 << 20, 0), Arena::new(1 << 20, 0));
     assert_ne!(seed(&mut a), seed(&mut b));
     a.mutate(|mc| {
         let symbols = Symbols::of_arena(mc).unwrap();
         assert_eq!(Symbols::with_seed(mc, symbols.seed(mc) ^ 1), Ok(symbols));
     });
-    // The arena keeps it, and what it interned, with nothing else holding them.
+    // The arena keeps the intern table alive when nothing else references it. So the seed, and with it the hash of a name, is the same after a collection.
     let kept = a.mutate(|mc| Symbols::of_arena(mc).unwrap().intern_str(&Strings::new(mc), "kept").unwrap().hash(mc));
     a.collect();
     a.mutate(|mc| assert_eq!(Symbols::of_arena(mc).unwrap().intern_str(&Strings::new(mc), "kept").unwrap().hash(mc), kept));
 }
 
-/// A name has one keyword, apart from its symbol, which a collection keeps while it's reached.
+/// A name has one keyword, which is distinct from its symbol. A collection keeps the keyword while it is reachable.
 #[test]
 fn one_keyword_per_name() {
     let mut arena = arena();

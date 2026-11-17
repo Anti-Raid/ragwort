@@ -1,20 +1,20 @@
-//! Exact rationals with Racket's semantics: integers, and ratios in lowest terms whose
-//! denominator is above one. A ratio is never an integer, so the two never compare equal.
+//! Exact rationals with Racket's semantics. A rational is an integer or a ratio. A ratio is in lowest terms, and its
+//! denominator is greater than one. So a ratio never has an integer value, and a ratio and an integer never compare equal.
 
 use std::cmp::Ordering;
 use std::hash::Hasher;
 
 use crate::int::{self, Host, NumError, Rounding};
 
-/// A rational as the host holds it.
+/// A rational in the representation that the host stores.
 #[derive(Clone, Copy, Debug)]
 pub enum RationalView<I> {
     Integer(I),
-    /// In lowest terms, with `den > 1`.
+    /// A ratio in lowest terms, with `den > 1`.
     Ratio { num: I, den: I },
 }
 
-/// A host that also holds ratios.
+/// A host that also stores ratios.
 pub trait RationalHost: Host {
     /// An integer or a ratio.
     type Rational: Copy;
@@ -23,7 +23,7 @@ pub trait RationalHost: Host {
 
     fn of_int(&self, x: Self::Int) -> Self::Rational;
 
-    /// `num / den`, already reduced by the library: `den > 1` and they share no factor.
+    /// Creates the ratio `num / den`. The library has already reduced it: `den > 1`, and `num` and `den` share no factor.
     fn ratio(&self, num: Self::Int, den: Self::Int) -> Result<Self::Rational, Self::Error>;
 }
 
@@ -38,17 +38,17 @@ fn is_zero<H: Host>(h: &H, x: H::Int) -> bool {
     int::sign(h, x) == Ordering::Equal
 }
 
-/// `x / divisor` for a `divisor` known to divide it.
+/// Returns `x / divisor`. `divisor` must divide `x` exactly.
 fn exact_div<H: Host>(h: &H, x: H::Int, divisor: H::Int) -> IntRes<H> {
     if is_one(h, divisor) { Ok(x) } else { int::quotient(h, x, divisor) }
 }
 
-/// From a numerator and positive denominator with no common factor.
+/// Returns the rational `num / den`. `den` must be positive, and `num` and `den` must share no factor.
 fn reduced<H: RationalHost>(h: &H, num: H::Int, den: H::Int) -> Res<H> {
     if is_one(h, den) || is_zero(h, num) { Ok(h.of_int(num)) } else { h.ratio(num, den) }
 }
 
-/// `num / den` in lowest terms, or an error if `den` is zero.
+/// Returns `num / den` in lowest terms, or [`NumError::DivideByZero`] if `den` is zero.
 pub fn from_parts<H: RationalHost>(h: &H, num: H::Int, den: H::Int) -> Res<H> {
     let (num, den) = match int::sign(h, den) {
         Ordering::Equal => return Err(NumError::DivideByZero.into()),
@@ -59,7 +59,7 @@ pub fn from_parts<H: RationalHost>(h: &H, num: H::Int, den: H::Int) -> Res<H> {
     reduced(h, exact_div(h, num, divisor)?, exact_div(h, den, divisor)?)
 }
 
-/// Numerator and denominator, with 1 for integers.
+/// Returns the numerator and the denominator of `x`. The denominator of an integer is 1.
 fn parts<H: RationalHost>(h: &H, x: H::Rational) -> Result<(H::Int, H::Int), H::Error> {
     match h.rational_view(x) {
         RationalView::Integer(n) => Ok((n, int::from_i64(h, 1)?)),
@@ -84,7 +84,7 @@ pub fn is_integer<H: RationalHost>(h: &H, x: H::Rational) -> bool {
     matches!(h.rational_view(x), RationalView::Integer(_))
 }
 
-/// How `x` compares to zero.
+/// Returns the ordering of `x` relative to zero.
 pub fn sign<H: RationalHost>(h: &H, x: H::Rational) -> Ordering {
     int::sign(h, numerator(h, x))
 }
@@ -97,22 +97,23 @@ pub fn compare<H: RationalHost>(h: &H, x: H::Rational, y: H::Rational) -> Result
     if sx != sy {
         return Ok(sx.cmp(&sy));
     }
-    // Same sign: a/b against c/d is ad against cb, as denominators are positive.
+    // The signs are equal. `a/b` compares with `other_num/other_den` as `a·other_den` compares with `other_num·b`, because the denominators are positive.
     let ((a, b), (other_num, other_den)) = (parts(h, x)?, parts(h, y)?);
     Ok(int::compare(h, int::mul(h, a, other_den)?, int::mul(h, other_num, b)?))
 }
 
-/// Whether `x` and `y` are the same rational. Lowest terms make that a comparison of parts.
+/// Returns whether `x` and `y` are the same rational. Ratios are in lowest terms, so it is enough to compare the numerators and the denominators.
 pub fn eqv<H: RationalHost>(h: &H, x: H::Rational, y: H::Rational) -> bool {
-    let same = |a, b| int::compare(h, a, b) == Ordering::Equal;
     match (h.rational_view(x), h.rational_view(y)) {
-        (RationalView::Integer(a), RationalView::Integer(b)) => same(a, b),
-        (RationalView::Ratio { num: a, den: b }, RationalView::Ratio { num: other_num, den: other_den }) => same(a, other_num) && same(b, other_den),
+        (RationalView::Integer(a), RationalView::Integer(b)) => int::compare(h, a, b) == Ordering::Equal,
+        (RationalView::Ratio { num: a, den: b }, RationalView::Ratio { num: other_num, den: other_den }) => {
+            int::compare(h, a, other_num) == Ordering::Equal && int::compare(h, b, other_den) == Ordering::Equal
+        }
         _ => false,
     }
 }
 
-/// Feeds `x`'s value to `state`. Integers hash as [`int::hash`] does.
+/// Feeds the value of `x` to `state`. An integer hashes as [`int::hash`] hashes it.
 pub fn hash<H: RationalHost, S: Hasher>(h: &H, x: H::Rational, state: &mut S) {
     match h.rational_view(x) {
         RationalView::Integer(n) => int::hash(h, n, state),
@@ -150,18 +151,18 @@ pub fn sub<H: RationalHost>(h: &H, x: H::Rational, y: H::Rational) -> Res<H> {
     add_parts(h, a, b, int::neg(h, other_num)?, other_den)
 }
 
-/// `a/b + other_num/other_den` for reduced fractions, dividing out what the denominators share before
+/// Returns `a/b + other_num/other_den` for fractions in lowest terms. The common factor of the denominators is divided out before
 /// multiplying, as in Knuth 4.5.1.
 fn add_parts<H: RationalHost>(h: &H, a: H::Int, b: H::Int, other_num: H::Int, other_den: H::Int) -> Res<H> {
     let common = int::gcd(h, b, other_den)?;
     if is_one(h, common) {
-        // Nothing shared, so (ad + cb) / bd is already in lowest terms.
+        // The denominators share no factor, so `(a·other_den + other_num·b) / (b·other_den)` is already in lowest terms.
         let num = int::add(h, int::mul(h, a, other_den)?, int::mul(h, other_num, b)?)?;
         return reduced(h, num, int::mul(h, b, other_den)?);
     }
     let (b1, d1) = (int::quotient(h, b, common)?, int::quotient(h, other_den, common)?);
     let sum = int::add(h, int::mul(h, a, d1)?, int::mul(h, other_num, b1)?)?;
-    // Only factors of g can be left in common between t and b1 * d.
+    // Only factors of `common` can remain in common between `sum` and `b1 * other_den`.
     let g2 = int::gcd(h, sum, common)?;
     reduced(h, exact_div(h, sum, g2)?, int::mul(h, b1, exact_div(h, other_den, g2)?)?)
 }
@@ -176,7 +177,7 @@ pub fn mul<H: RationalHost>(h: &H, x: H::Rational, y: H::Rational) -> Res<H> {
 
 pub fn div<H: RationalHost>(h: &H, x: H::Rational, y: H::Rational) -> Res<H> {
     let ((a, b), (other_num, other_den)) = (parts(h, x)?, parts(h, y)?);
-    // a/b ÷ c/d is a/b × d/c, with the sign of c moved to the top.
+    // `a/b ÷ c/d` is `a/b × d/c`, where `c/d` is `other_num/other_den`. If `c` is negative, both `d` and `c` are negated, so that the denominator stays positive.
     match int::sign(h, other_num) {
         Ordering::Equal => Err(NumError::DivideByZero.into()),
         Ordering::Less => mul_parts(h, a, b, int::neg(h, other_den)?, int::neg(h, other_num)?),
@@ -184,7 +185,7 @@ pub fn div<H: RationalHost>(h: &H, x: H::Rational, y: H::Rational) -> Res<H> {
     }
 }
 
-/// `a/b × other_num/other_den` for reduced fractions, cancelling across before multiplying.
+/// Returns `a/b × other_num/other_den` for fractions in lowest terms. Each numerator is reduced against the denominator of the other fraction before multiplying.
 fn mul_parts<H: RationalHost>(h: &H, a: H::Int, b: H::Int, other_num: H::Int, other_den: H::Int) -> Res<H> {
     let (g1, g2) = (int::gcd(h, a, other_den)?, int::gcd(h, other_num, b)?);
     let num = int::mul(h, exact_div(h, a, g1)?, exact_div(h, other_num, g2)?)?;
@@ -192,7 +193,7 @@ fn mul_parts<H: RationalHost>(h: &H, a: H::Int, b: H::Int, other_num: H::Int, ot
     reduced(h, num, den)
 }
 
-/// `x^exponent`. Negative powers of zero divide by zero.
+/// Returns `x^exponent`. A negative power of zero is a [`NumError::DivideByZero`] error.
 pub fn expt<H: RationalHost>(h: &H, x: H::Rational, exponent: i64) -> Res<H> {
     let (num, den) = parts(h, x)?;
     let n = exponent.unsigned_abs();
@@ -207,8 +208,8 @@ pub fn expt<H: RationalHost>(h: &H, x: H::Rational, exponent: i64) -> Res<H> {
     }
 }
 
-/// Rounds to an integer: `floor`, `ceiling` and `truncate`, and `round`, which takes ties
-/// to even.
+/// Rounds `x` to an integer in the direction that `mode` selects. The modes are `floor`, `ceiling`, `truncate` and `round`,
+/// which rounds ties to even.
 pub fn round<H: RationalHost>(h: &H, x: H::Rational, mode: Round) -> IntRes<H> {
     let (num, den) = match h.rational_view(x) {
         RationalView::Integer(n) => return Ok(n),
@@ -221,7 +222,7 @@ pub fn round<H: RationalHost>(h: &H, x: H::Rational, mode: Round) -> IntRes<H> {
         Round::Nearest => {
             let (quotient, remainder) = int::divide(h, num, den, Rounding::Floor, true, true)?;
             let (quotient, remainder) = (quotient.expect("asked for the quotient"), remainder.expect("asked for the remainder"));
-            // 0 <= r < den, and the fraction left over is r / den.
+            // `0 <= remainder < den`, and the fractional part is `remainder / den`.
             let twice = int::arithmetic_shift(h, remainder, 1)?;
             let up = match int::compare(h, twice, den) {
                 Ordering::Less => false,
@@ -238,17 +239,17 @@ pub enum Round {
     Floor,
     Ceiling,
     Truncate,
-    /// Ties to even.
+    /// Rounds to the nearest integer, with ties to even.
     Nearest,
 }
 
-/// The nearest double, ties to even, as one rounding of the exact value.
+/// Returns the `f64` nearest to `x`, with ties to even. The exact value is rounded only once.
 pub fn to_f64<H: RationalHost>(h: &H, x: H::Rational) -> Result<f64, H::Error> {
     let (num, den) = match h.rational_view(x) {
         RationalView::Integer(n) => return Ok(int::to_f64(h, n)),
         RationalView::Ratio { num, den } => (num, den),
     };
-    // Both exact as doubles, so one division rounds once.
+    // Both parts are exact as `f64`, so the one division rounds once.
     if let (Some(small_num), Some(small_den)) = (int::to_i64(h, num), int::to_i64(h, den))
         && small_num.unsigned_abs() <= 1 << 53
         && small_den <= 1 << 53
@@ -261,7 +262,7 @@ pub fn to_f64<H: RationalHost>(h: &H, x: H::Rational) -> Result<f64, H::Error> {
     Ok(if negative { -value } else { value })
 }
 
-/// `num / den` for positive `num` and `den`.
+/// Returns the `f64` nearest to `num / den`, with ties to even. `num` and `den` must be positive.
 fn ratio_to_f64<H: Host>(h: &H, num: H::Int, den: H::Int) -> Result<f64, H::Error> {
     // n / d is in [2^(bn - bd - 1), 2^(bn - bd + 1)), so scaling by 2^shift puts the quotient
     // in [2^54, 2^56): enough bits for 53, a rounding bit and one to spare.
@@ -280,7 +281,7 @@ fn ratio_to_f64<H: Host>(h: &H, num: H::Int, den: H::Int) -> Result<f64, H::Erro
     let sticky = lost || !is_zero(h, remainder);
     let quotient = int::to_i64(h, quotient).expect("the quotient has at most 56 bits") as u64;
     let len = 64 - quotient.leading_zeros() as i64;
-    // The value is in [2^e, 2^(e + 1)).
+    // The value is in [2^exponent, 2^(exponent + 1)).
     let exponent = len - 1 - shift;
     if exponent > 1023 {
         return Ok(f64::INFINITY);
@@ -298,7 +299,7 @@ fn ratio_to_f64<H: Host>(h: &H, num: H::Int, den: H::Int) -> Result<f64, H::Erro
     Ok(scale(kept as f64, exponent + 1 - precision))
 }
 
-/// `x * 2^exponent` for a result that's representable, or overflows to infinity.
+/// Returns `x * 2^exponent`. The exact result must be representable, or else so large that it overflows to infinity.
 fn scale(mut x: f64, mut exponent: i64) -> f64 {
     if exponent < -1022 {
         x *= f64::from_bits(1 << 52);
@@ -307,7 +308,7 @@ fn scale(mut x: f64, mut exponent: i64) -> f64 {
     x * f64::from_bits(((exponent + 1023) as u64) << 52)
 }
 
-/// A finite double's exact value.
+/// Returns the exact value of `value`, or [`NumError::NoExactValue`] if `value` is not finite.
 pub fn from_f64<H: RationalHost>(h: &H, value: f64) -> Res<H> {
     if !value.is_finite() {
         return Err(NumError::NoExactValue.into());
@@ -321,7 +322,7 @@ pub fn from_f64<H: RationalHost>(h: &H, value: f64) -> Res<H> {
         0 => (fraction, -1074),
         _ => (fraction | 1 << 52, exponent as i64 - 1075),
     };
-    // Not an integer, so e < 0 and the denominator is a power of two above one.
+    // `value` is not an integer, so `shift` is negative and the denominator is a power of two greater than one.
     let tz = (significand.trailing_zeros() as i64).min(-shift);
     significand >>= tz;
     shift += tz;
@@ -330,7 +331,7 @@ pub fn from_f64<H: RationalHost>(h: &H, value: f64) -> Res<H> {
     h.ratio(num, den)
 }
 
-/// `x` in `radix`, as `num/den` for ratios.
+/// Returns `x` written in `radix`. A ratio is written as `num/den`.
 pub fn to_string<H: RationalHost>(h: &H, x: H::Rational, radix: u32) -> Result<String, H::Error> {
     match h.rational_view(x) {
         RationalView::Integer(n) => int::to_string(h, n, radix),

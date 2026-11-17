@@ -1,4 +1,4 @@
-//! The collector's benchmark: allocation, collections, barriers, weak references and frames. Objects are a
+//! Benchmarks the collector: allocation, collections, barriers, weak references and frames. Objects are a
 //! header word and two fields. Run with `--release`.
 
 use std::hint::black_box;
@@ -30,7 +30,7 @@ fn head<'gc>(mc: &Mutation<'gc>) -> Option<Gc<'gc, Node>> {
     mc.root(0).downcast::<Node>(mc)
 }
 
-/// A list of `n` nodes in root 0.
+/// Builds a list of `n` nodes in root 0.
 fn build(arena: &mut Arena, n: i64) {
     arena.mutate(|mc| {
         for i in 0..n {

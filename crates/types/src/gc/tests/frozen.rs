@@ -12,7 +12,7 @@ objects! {
     struct Pair { car: Value, cdr: Value }
 }
 
-/// Counts its drops.
+/// Increments a shared counter when dropped.
 struct Counted(Rc<Cell<usize>>);
 
 impl Drop for Counted {
@@ -21,7 +21,7 @@ impl Drop for Counted {
     }
 }
 
-/// `s`'s bytes, charged as they'd be charged in the region.
+/// Returns the bytes of `s` as a frozen value. The value is also charged `s.len()` bytes, as the bytes would be charged in the region.
 fn bytes<'gc>(mc: &Mutation<'gc>, s: &str) -> FrozenRef<'gc, Box<[u8]>> {
     mc.frozen_owning(Box::from(s.as_bytes()), s.len()).unwrap()
 }
@@ -54,7 +54,7 @@ fn each<'gc>(mc: &Mutation<'gc>, mut list: Value<'gc>) -> Vec<Value<'gc>> {
     out
 }
 
-/// Frozen values read back the same through collections that move their objects.
+/// Frozen values read back unchanged across collections that move the objects that hold them.
 #[test]
 fn frozen_values_read_back_through_collections() {
     let mut arena = Arena::new(16 << 20, 1);
@@ -65,7 +65,7 @@ fn frozen_values_read_back_through_collections() {
         let all: Vec<_> = items.into_iter().chain([Value::object(mc, wide), Value::object(mc, named)]).collect();
         mc.set_root(0, list(mc, all));
     });
-    let check = |arena: &mut Arena| {
+    fn check(arena: &mut Arena) {
         arena.mutate(|mc| {
             let items = each(mc, mc.root(0));
             let texts: Vec<_> = items[..3].iter().map(|&v| chars(mc, v).to_vec()).collect();
@@ -74,7 +74,7 @@ fn frozen_values_read_back_through_collections() {
             assert_eq!((wide.units(mc).map(|u| &u[..]), wide.tag(mc)), (Some(&[0x1F600, 7, 0x10FFFF][..]), 9));
             assert_eq!(items[4].downcast::<Named>(mc).unwrap().name(mc).map(String::as_str), Some("frozen"));
         });
-    };
+    }
     check(&mut arena);
     arena.collect_minor();
     arena.mutate(churn);
@@ -86,8 +86,8 @@ fn frozen_values_read_back_through_collections() {
     assert_eq!(arena.frozen_values(), 5);
 }
 
-/// A minor collection frees the young frozen values whose objects died, and those never stored,
-/// and a major one the old ones, refunding what they were charged.
+/// A minor collection frees the young frozen values whose objects died, and the young values that were never stored in an object.
+/// A major collection frees the dead old values. The charge of each freed value is refunded.
 #[test]
 fn dead_frozen_values_are_freed_and_refunded() {
     let mut arena = Arena::new(16 << 20, 1);
@@ -113,13 +113,13 @@ fn dead_frozen_values_are_freed_and_refunded() {
     arena.collect();
     arena.collect();
     assert_eq!((arena.frozen_values(), arena.meta.frozen.charged()), (0, 0));
-    // The table of frozen values is charged once a collection ends, so it's left out of the peak.
+    // The table of frozen values is charged only when a collection ends, so the peak does not include it.
     let table = arena.meta.frozen.table_bytes();
     assert!(arena.used() + charged <= peak + table + (16 << 10), "{} charged after freeing, {peak} at the peak", arena.used());
 }
 
-/// A young frozen value stored into an old object survives a minor collection, which doesn't
-/// trace the object again, and one stored into an object already traced survives the cycle.
+/// A young frozen value stored into an old object survives a minor collection, although the minor collection does not
+/// trace the object again. A frozen value stored into an object that is already traced survives the running cycle.
 #[test]
 fn frozen_values_stored_into_marked_objects_survive() {
     let mut arena = Arena::new(16 << 20, 1);
@@ -137,7 +137,7 @@ fn frozen_values_stored_into_marked_objects_survive() {
             assert_eq!(chars(mc, t), format!("young {i}").as_bytes());
         }
     });
-    // While marking, in slices: values move between texts, many of them already traced.
+    // While a cycle marks in slices, frozen values move between texts, many of which are already traced.
     arena.set_stress(Some(4 << 10));
     for round in 0..40 {
         arena

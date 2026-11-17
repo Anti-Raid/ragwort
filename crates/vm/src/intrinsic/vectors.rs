@@ -4,12 +4,29 @@ use ragwort_types::bytevector::{AnyBytevector, Bytevectors};
 use ragwort_types::gc::{Mutation, Value};
 use ragwort_types::num::{Nums, int};
 use ragwort_types::pair::Pairs;
-use ragwort_types::vector::{AnyVector, Vectors};
+use ragwort_types::vector::{EveryVector, ExternVector, Vectors};
 
 use crate::op::Fuel;
 use crate::{Fault, equal};
 
 use super::{Intrinsic, Operands, boolean, fixnum, index, made, not_fixnum};
+
+/// Implements `(vector-ref vector k)` for a `vector` that is not a vector in the arena. Returns element `k` of an external vector. The first read of an element fetches it from the host.
+#[inline(never)]
+pub(super) fn external_ref<'gc>(mc: &Mutation<'gc>, vector: Value<'gc>, k: Value<'gc>, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
+    let vector = ExternVector::of(vector).ok_or(Fault::WrongType)?;
+    let element = vector.get(mc, index(k)?)?.ok_or(Fault::OutOfRange)?;
+    // The first read of an element can allocate, and the vector caches the element.
+    Ok(made(mc, fuel, element))
+}
+
+/// Implements `(vector-set! vector k value)` for a `vector` that is not a vector in the arena. Passes `value` to the host of an external vector. Fails if the vector is not writable or the host rejects the value.
+#[inline(never)]
+pub(super) fn external_set<'gc>(mc: &Mutation<'gc>, vector: Value<'gc>, k: Value<'gc>, value: Value<'gc>, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
+    let vector = ExternVector::of(vector).ok_or(Fault::WrongType)?;
+    vector.set(mc, index(k)?, value)?;
+    Ok(made(mc, fuel, Value::VOID))
+}
 
 impl Intrinsic {
     /// Evaluates an intrinsic that makes or converts a vector on `operands`.
@@ -33,13 +50,13 @@ impl Intrinsic {
                 made(mc, fuel, vector.value(mc))
             }
             Intrinsic::VectorToList => {
-                let vector = AnyVector::of(operands.get(0)).ok_or(Fault::WrongType)?;
+                let vector = EveryVector::of(operands.get(0)).ok_or(Fault::WrongType)?;
                 let len = vector.len(mc);
                 fuel.spend(len as u64 / equal::PER_FUEL)?;
                 let pairs = Pairs::new(mc);
                 let mut list = Value::NULL;
                 for i in (0..len).rev() {
-                    list = pairs.cons(vector.get(mc, i).expect("in range"), list)?.value(mc);
+                    list = pairs.cons(vector.get(mc, i)?.ok_or(Fault::Malformed)?, list)?.value(mc);
                 }
                 made(mc, fuel, list)
             }

@@ -37,26 +37,21 @@ impl Intrinsic {
                 }
                 made(mc, fuel, table.value(mc))
             }
-            Intrinsic::TableRef => {
-                let (table, key) = (table_of(operands.get(0))?, operands.get(1));
+            Intrinsic::TableRef | Intrinsic::TableSet | Intrinsic::TableDelete | Intrinsic::TableHas => {
+                let table = table_of(operands.get(0))?;
+                let key = operands.get(1);
                 charge(mc, table, key, fuel)?;
-                table.get(mc, key)?.unwrap_or(operands.get(2))
-            }
-            Intrinsic::TableSet => {
-                let (table, key) = (table_of(operands.get(0))?, operands.get(1));
-                charge(mc, table, key, fuel)?;
-                table.set(mc, key, operands.get(2))?;
-                made(mc, fuel, Value::VOID)
-            }
-            Intrinsic::TableDelete => {
-                let (table, key) = (table_of(operands.get(0))?, operands.get(1));
-                charge(mc, table, key, fuel)?;
-                boolean(table.delete(mc, key)?)
-            }
-            Intrinsic::TableHas => {
-                let (table, key) = (table_of(operands.get(0))?, operands.get(1));
-                charge(mc, table, key, fuel)?;
-                boolean(table.has(mc, key)?)
+                let result = match self {
+                    Intrinsic::TableRef => table.get(mc, key)?.unwrap_or(operands.get(2)),
+                    Intrinsic::TableSet => {
+                        table.set(mc, key, operands.get(2))?;
+                        Value::VOID
+                    }
+                    Intrinsic::TableDelete => boolean(table.delete(mc, key)?),
+                    _ => boolean(table.has(mc, key)?),
+                };
+                // Each of these operations can allocate. A table rebuilds a stale index, and an external table caches the values it reads from its host.
+                made(mc, fuel, result)
             }
             Intrinsic::TableLength => Value::fixnum(table_of(operands.get(0))?.len(mc) as i64).expect("lengths are fixnums"),
             Intrinsic::TableClear => {
@@ -66,11 +61,12 @@ impl Intrinsic {
             Intrinsic::TableToVector => {
                 let table = table_of(operands.get(0))?;
                 fuel.spend(table.len(mc) as u64 / equal::PER_FUEL)?;
-                // An external table reads its entries from the host here, so they are counted as they come.
                 let entries = table.entries(mc)?;
-                let vector = Vectors::new(mc).make(2 * entries.count(), Value::VOID)?;
+                // The host of an external table can list fewer entries than the table's length, so the listed entries are counted.
+                let count = if table.is_external() { entries.count() } else { table.len(mc) };
+                let vector = Vectors::new(mc).make(2 * count, Value::VOID)?;
                 let items = vector.items(mc);
-                for (position, (key, value)) in entries.enumerate() {
+                for (position, (key, value)) in entries.take(count).enumerate() {
                     items.set(mc, 2 * position, key);
                     items.set(mc, 2 * position + 1, value);
                 }
@@ -85,9 +81,9 @@ fn table_of(value: Value<'_>) -> Result<Table<'_>, Fault> {
     Table::of(value).ok_or(Fault::WrongType)
 }
 
-/// Spends the fuel that finding `key` in `table` is worth beyond one step. A string key is
-/// hashed and compared by all its characters. A table that has to make its index again does
-/// so in time proportional to its entries.
+/// Spends the fuel that a lookup of `key` in `table` costs beyond one step. Hashing and comparing
+/// a string key reads all its characters. A table with a stale index rebuilds the index first,
+/// in time proportional to the number of entries.
 fn charge<'gc>(mc: &Mutation<'gc>, table: Table<'gc>, key: Value<'gc>, fuel: &mut Fuel) -> Result<(), Fault> {
     let strings = Strings::new(mc);
     if let Some(text) = strings.string(key) {

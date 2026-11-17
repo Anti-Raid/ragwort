@@ -17,8 +17,8 @@ fn pooled(c: Constant) -> Const {
     }
 }
 
-/// The `i`th of a run of constants that repeat: symbols, strings, some as ropes, bignums, ratios
-/// and boxed flonums.
+/// Returns the `i`th constant of a repeating sequence: symbols, strings (some as ropes), bignums,
+/// ratios and boxed flonums.
 fn make<'gc>(mc: &Mutation<'gc>, symbols: Symbols<'gc>, i: usize) -> Result<Value<'gc>, Error> {
     let (h, n) = (Strings::new(mc), Nums::new(mc));
     let k = i / 5;
@@ -200,8 +200,8 @@ fn failed_steps_leave_the_pool_whole() {
     }
 }
 
-/// The values each step adds: contents that merge, made once, and pairs, which take a slot every
-/// time.
+/// Returns the values that each step adds to the pool. Some have contents that are deduplicated.
+/// The others are pairs, which take a new slot every time they are added.
 fn values<'gc>(mc: &Mutation<'gc>) -> GcVec<'gc> {
     GcVec::of(mc.root(1).downcast(mc).unwrap())
 }

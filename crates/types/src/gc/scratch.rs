@@ -6,9 +6,9 @@ use crate::gc::{Charge, Mutation, OutOfMemory};
 #[path = "tests/scratch.rs"]
 mod tests;
 
-/// A vector outside the arena whose capacity counts against the arena's budget while it lives,
-/// for a step's scratch space, such as a reader's open lists. It can't outlive the step, so it
-/// can hold `'gc` values untraced: no collection runs during a step.
+/// A vector stored outside the arena, for scratch space within one step, such as a reader's open lists.
+/// Its capacity is charged to the arena's budget while it lives. It cannot outlive the step, and no collection runs during a step. So it
+/// can hold `'gc` values without being traced.
 pub struct ScratchVec<'gc, T> {
     items: Vec<T>,
     charge: Charge<'gc>,
@@ -19,7 +19,7 @@ impl<'gc, T> ScratchVec<'gc, T> {
         Self { items: Vec::new(), charge: mc.charge() }
     }
 
-    /// Fails as an allocation would if the budget can't cover the growth.
+    /// Reserves room for `additional` more items. Fails as an allocation does if the budget cannot cover the growth.
     pub fn reserve(&mut self, additional: usize) -> Result<(), OutOfMemory> {
         let needed = self.items.len().saturating_add(additional);
         if needed > self.items.capacity() {

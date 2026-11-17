@@ -121,10 +121,14 @@ fn merge_in<'gc>(mc: &Mutation<'gc>, function: &mut Function<'_, 'gc>) {
     // Replacement values for eliminated reads and the instructions to remove.
     let mut same: Vec<Option<Val>> = vec![None; function.values as usize];
     let mut merged = Vec::new();
-    let of = |same: &[Option<Val>], value: Val| same[value.0 as usize].unwrap_or(value);
+    fn of(same: &[Option<Val>], value: Val) -> Val {
+        same[value.0 as usize].unwrap_or(value)
+    }
     // Maps repeated upvalue loads to the first load of that captured variable.
     let mut loaded: Vec<Option<Val>> = vec![None; function.values as usize];
-    let fixnum = |value: Val| constants[value.0 as usize].and_then(|constant| constant.as_fixnum()).and_then(|number| usize::try_from(number).ok());
+    fn fixnum(constants: &[Option<Value<'_>>], value: Val) -> Option<usize> {
+        constants[value.0 as usize].and_then(|constant| constant.as_fixnum()).and_then(|number| usize::try_from(number).ok())
+    }
     // Caches immutable reads encountered along the current dominator path.
     let (mut fixed, mut noted) = (HashMap::<Fixed, Val>::default(), Vec::new());
     let mut todo = vec![Step::Into(0)];
@@ -144,7 +148,7 @@ fn merge_in<'gc>(mc: &Mutation<'gc>, function: &mut Function<'_, 'gc>) {
                 Inst::Upvalue(dst, index) => (*dst, Fixed::Upvalue(*index), false),
                 Inst::Prim { dst, prim: Prim::Intrinsic(Intrinsic::StructFixedField), args, spread: false } => {
                     let &[object, field] = args.as_slice() else { continue };
-                    let Some(field) = fixnum(field) else { continue };
+                    let Some(field) = fixnum(&constants, field) else { continue };
                     (*dst, Fixed::Field(of(&loaded, of(&same, object)), field), false)
                 }
                 // A successful typed read identifies the field, but the instruction must remain to perform its type
@@ -152,7 +156,7 @@ fn merge_in<'gc>(mc: &Mutation<'gc>, function: &mut Function<'_, 'gc>) {
                 Inst::Prim { dst, prim: Prim::Intrinsic(Intrinsic::StructRef), args, spread: false } => {
                     let &[object, kind, field] = args.as_slice() else { continue };
                     let kind = constants[kind.0 as usize].and_then(|kind| kind.downcast::<StructType>(mc));
-                    let Some((kind, field)) = kind.zip(fixnum(field)) else { continue };
+                    let Some((kind, field)) = kind.zip(fixnum(&constants, field)) else { continue };
                     if field >= StructTypeFields::fields(kind, mc) as usize || structs::is_mutable(mc, kind, field) {
                         continue;
                     }

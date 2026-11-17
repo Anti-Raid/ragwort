@@ -1,7 +1,8 @@
-//! Symbols: interned strings, which [`string::intern`] keeps one per name, so symbols are
-//! equal exactly when they're the same object. Each keeps its name's hash. The table holds
-//! them weakly, so a symbol nothing else reaches is collected, and interning its name again
-//! makes a new one. Keywords, `#:name`, are interned the same way, one for each symbol.
+//! Symbols: interned strings. [`string::intern`] keeps one symbol per name, so two symbols are
+//! equal exactly when they are the same object. Each symbol stores the hash of its name. The
+//! intern table holds symbols weakly. So a symbol that nothing else references is collected, and
+//! interning its name again creates a new symbol. Keywords, `#:name`, are interned the same way,
+//! one per symbol.
 
 use std::hash::{BuildHasher, RandomState};
 
@@ -31,18 +32,18 @@ impl<'gc> Symbol<'gc> {
         Value::object(mc, self.0)
     }
 
-    /// A flat string.
+    /// Returns the symbol's name, which is a flat string.
     pub fn name(self, mc: &Mutation<'gc>) -> Str<'gc> {
         Strings::new(mc).string(self.0.name(mc)).expect("a symbol's name is a string")
     }
 
-    /// The name's hash, with the seed of the table that made the symbol.
+    /// Returns the hash of the name, seeded with the seed of the intern table that created the symbol.
     pub fn hash(self, mc: &Mutation<'gc>) -> u64 {
         self.0.hash(mc)
     }
 }
 
-/// A keyword: interned, so keywords are equal exactly when they're the same object.
+/// A keyword. Keywords are interned, so two keywords are equal exactly when they are the same object.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Keyword<'gc>(Gc<'gc, objects::Keyword>);
 
@@ -59,25 +60,26 @@ impl<'gc> Keyword<'gc> {
         Value::object(mc, self.0)
     }
 
-    /// The symbol it's named as.
+    /// Returns the symbol that has the keyword's name.
     pub fn symbol(self, mc: &Mutation<'gc>) -> Symbol<'gc> {
         Symbol(self.0.symbol(mc).expect("a keyword has its symbol"))
     }
 }
 
-/// An arena's intern table, whose probing [`string::intern`] does. Each arena has one, which
-/// it keeps, so a name has one symbol wherever it's interned, the program's code included.
+/// An arena's intern table. [`string::intern`] does the probing. Each arena has one intern table
+/// and keeps it alive. So a name has one symbol wherever it is interned, including in the
+/// program's code.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Symbols<'gc>(Gc<'gc, objects::Interned>);
 
 impl<'gc> Symbols<'gc> {
-    /// The arena's table. If it has none yet, it's made, its hashes seeded at random so which
-    /// names collide can't be planned.
+    /// Returns the arena's intern table. If the arena has none yet, this creates it with a random
+    /// hash seed, so that collisions between names cannot be predicted.
     pub fn of_arena(mc: &Mutation<'gc>) -> Result<Self, OutOfMemory> {
         Self::with_seed(mc, RandomState::new().hash_one(0u8))
     }
 
-    /// The arena's table, made with `seed` if it has none yet.
+    /// Returns the arena's intern table. If the arena has none yet, this creates it with `seed`.
     pub fn with_seed(mc: &Mutation<'gc>, seed: u64) -> Result<Self, OutOfMemory> {
         if let Some(symbols) = Self::of(Value::from_bits(mc.interned().get())) {
             return Ok(symbols);
@@ -100,7 +102,7 @@ impl<'gc> Symbols<'gc> {
         Value::object(mc, self.0)
     }
 
-    /// The seed of the hashes the symbols keep.
+    /// Returns the seed of the hashes that the symbols store.
     pub fn seed(self, mc: &Mutation<'gc>) -> u64 {
         self.0.seed(mc)
     }
@@ -109,17 +111,23 @@ impl<'gc> Symbols<'gc> {
         string::intern(strings, &self.interner(strings), name).map(Symbol)
     }
 
-    /// The symbol named `name`, made without making a string first unless the name is new.
+    /// Returns the symbol named `name`. A string is allocated for the name only if the symbol is new.
     #[inline]
     pub fn intern_str(self, strings: &Strings<'_, 'gc>, name: &str) -> Result<Symbol<'gc>, Error> {
         string::intern_str(strings, &self.interner(strings), name).map(Symbol)
     }
 
-    /// The keyword named as `symbol` is.
+    /// Returns the keyword that has the name of `symbol`. Creates the keyword if it does not exist.
     pub fn keyword(self, mc: &Mutation<'gc>, symbol: Symbol<'gc>) -> Result<Keyword<'gc>, OutOfMemory> {
         let table = GcTable::<WeakObjects<objects::Keyword>>::of(self.0.keywords(mc).expect("an intern table has its keywords"));
-        let same = |keyword: Gc<'gc, objects::Keyword>| Ok::<_, OutOfMemory>(keyword.symbol(mc) == Some(symbol.0));
-        table.find_or_insert(mc, symbol.hash(mc), same, || objects::Keyword::new(mc, Some(symbol.0))).map(Keyword)
+        table
+            .find_or_insert(
+                mc,
+                symbol.hash(mc),
+                |keyword: Gc<'gc, objects::Keyword>| Ok::<_, OutOfMemory>(keyword.symbol(mc) == Some(symbol.0)),
+                || objects::Keyword::new(mc, Some(symbol.0)),
+            )
+            .map(Keyword)
     }
 
     #[inline]
@@ -135,7 +143,7 @@ impl<'gc> Symbols<'gc> {
     }
 }
 
-/// The table as [`Table`] sees it, kept private so only interning changes it.
+/// The intern table as an implementation of [`Table`]. It is private, so that only interning can modify the table.
 struct Interner<'a, 'gc> {
     mc: &'a Mutation<'gc>,
     seed: u64,

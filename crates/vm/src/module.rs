@@ -1,4 +1,4 @@
-//! Runtime representation of modules: defines the module instances storing top-level variables and host functions implemented in Rust. A host function hands values of the host's own types to a program as external references, which are in [`ragwort_types::external`].
+//! Runtime representation of modules: defines the module instances storing top-level variables and host functions implemented in Rust. A host function passes values of the host's own types to a program as external references. See [`ragwort_types::external`].
 //!
 //! A host function is defined using [`HostDef`]. The VM dispatch loop invokes it for [`crate::Op::CallHost`] operations via the host table of the calling module, passing arguments and a [`HostContext`]. Host functions are invoked from Scheme through native wrapper procedures using `%call-host`, which explicitly pass any required VM state (such as coroutine references or continuation marks) or host data (encapsulated in an [`ExternalRef`](ragwort_types::external::ExternalRef)).
 

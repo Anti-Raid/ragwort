@@ -1,6 +1,6 @@
 //! Racket's numeric tower over any heap: fixnums, bignums, exact rationals, flonums and
-//! complex numbers. Each layer has a host trait the heap implements, [`Host`] for integers,
-//! then [`RationalHost`], [`RealHost`] and [`ComplexHost`], and the library does the rest.
+//! complex numbers. Each layer has a host trait that the heap implements: [`Host`] for integers,
+//! then [`RationalHost`], [`RealHost`] and [`ComplexHost`]. The library implements the arithmetic on top of these traits.
 
 pub mod bigint;
 mod cfloat;

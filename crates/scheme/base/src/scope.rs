@@ -1,5 +1,5 @@
-//! Scope sets, interned, and the changes adding or flipping scopes makes to them. Syntax keeps
-//! such changes pending until it's taken apart, so a macro step doesn't copy what it's given.
+//! Interned scope sets, and the operations that add, remove or flip a scope in a set. Syntax keeps
+//! such operations pending until it is taken apart, so a macro step does not copy its input.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash, Hasher, RandomState};
@@ -8,19 +8,19 @@ use ragwort_types::gc::{Charge, Mutation, OutOfMemory};
 
 pub(crate) type Scope = u32;
 
-/// The scope of everything read at the top level.
+/// The scope that every form read from source has.
 pub(crate) const TOP: Scope = 0;
-/// The scope of what the built-in macros introduce, which nothing read can refer to.
+/// The scope of the identifiers that built-in macros introduce. No identifier read from source has it.
 pub(crate) const BASE: Scope = 1;
-/// The scope of the forms only the expander writes. No syntax a program is given has it, so no
-/// program can name one of them.
+/// The scope of the forms that only the expander generates. No syntax that a program receives
+/// has this scope, so a program cannot name such a form.
 pub(crate) const INTERNAL: Scope = 2;
 
-/// A set of scopes, sorted.
+/// An interned set of scopes, stored in sorted order.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct Set(u32);
 
-/// Changes to a set of scopes, made one after another, then folded to at most one per scope.
+/// An interned sequence of scope operations, reduced to at most one operation per scope.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct Ops(u32);
 
@@ -40,7 +40,7 @@ pub(crate) enum Op {
 }
 
 impl Op {
-    /// This change after `first`, or `None` if together they change nothing.
+    /// Returns the single operation equivalent to `first` followed by `self`, or `None` if the two cancel out.
     fn after(self, first: Option<Op>) -> Option<Op> {
         match (first, self) {
             (_, Op::Add) => Some(Op::Add),
@@ -53,13 +53,13 @@ impl Op {
     }
 }
 
-/// The expander's tables, keyed by numbers it hands out itself: scopes, interned sets of them,
-/// and symbols' words.
+/// The hash map of the expander's tables. The keys are numbers: scopes, ids of interned sets,
+/// and the raw bits of symbols.
 pub(crate) type Map<K, V> = HashMap<K, V, Seeded>;
 
-/// Hashes by a folded multiply, which spreads every bit of a word over all of them and is far
-/// cheaper than std's default on the long scope sets of deeply nested code. The seed is picked
-/// per table, so the code being expanded can't line its keys up to collide.
+/// A hasher builder that uses a folded multiply. The multiply mixes every bit of a word into the whole word. It is far
+/// cheaper than the standard library's default hasher on the long scope sets of deeply nested code. Each table gets
+/// a random seed, so the program being expanded cannot choose keys that collide.
 #[derive(Clone, Copy)]
 pub(crate) struct Seeded(u64);
 
@@ -114,12 +114,12 @@ impl Hasher for Folded {
     }
 }
 
-/// Values interned as small numbers, each with its memory charged to the arena's budget. They're
-/// found by their hash, so each is stored and hashed once, and growing the table moves only
-/// numbers.
+/// An interner that gives each distinct slice a small integer id. The memory of each slice is charged to the
+/// arena's budget. Lookup goes through a map from hash to id. So each slice is stored and hashed once, and growing the map moves only
+/// integers.
 struct Interned<T: Eq + Hash + Clone> {
     all: Vec<Box<[T]>>,
-    /// The last value interned with each hash; `same[id]` is the one before it with that hash.
+    /// Maps a hash to the id of the last slice interned with that hash. `same[id]` is the id of the previous slice with the same hash, or `NO_MORE`.
     by_hash: Map<u64, u32>,
     same: Vec<u32>,
     hasher: Seeded,
@@ -141,7 +141,7 @@ impl<T: Eq + Hash + Clone> Interned<T> {
         &self.all[id as usize]
     }
 
-    /// The number of `items`, which are copied only if they're new.
+    /// Returns the id of `items`. The slice is copied only if it is not interned yet.
     fn intern(&mut self, charge: &mut Charge<'_>, items: &[T]) -> Result<u32, OutOfMemory> {
         let hash = self.hasher.hash_one(items);
         let first = self.by_hash.get(&hash).copied().unwrap_or(NO_MORE);
@@ -168,7 +168,7 @@ pub(crate) struct Scopes<'gc> {
     applied: Map<(Set, Ops), Set>,
     composed: Map<(Ops, Ops), Ops>,
     next: Scope,
-    /// What a set or changes being worked out is made in, kept from one to the next.
+    /// Scratch buffers for building a set or a sequence of operations. They are kept between calls to reuse their capacity.
     scratch_set: Vec<Scope>,
     scratch_ops: Vec<(Scope, Op)>,
 }
@@ -202,7 +202,7 @@ impl<'gc> Scopes<'gc> {
         self.scopes(set).binary_search(&scope).is_ok()
     }
 
-    /// Whether every scope of `part` is in `whole`.
+    /// Returns whether every scope of `part` is in `whole`.
     pub(crate) fn subset(&self, part: Set, whole: Set) -> bool {
         let (part, whole) = (self.scopes(part), self.scopes(whole));
         let mut whole = whole.iter();
@@ -213,7 +213,7 @@ impl<'gc> Scopes<'gc> {
         self.ops.intern(&mut self.charge, &[(scope, op)]).map(Ops)
     }
 
-    /// `first`'s changes, then `then`'s.
+    /// Returns the operations equivalent to `first` followed by `then`.
     pub(crate) fn compose(&mut self, first: Ops, then: Ops) -> Result<Ops, OutOfMemory> {
         if first == Ops::NONE || then == Ops::NONE {
             return Ok(if then == Ops::NONE { first } else { then });
@@ -248,7 +248,7 @@ impl<'gc> Scopes<'gc> {
         Ok(ops)
     }
 
-    /// `set` with `ops` made to it.
+    /// Returns `set` with `ops` applied.
     pub(crate) fn apply(&mut self, set: Set, ops: Ops) -> Result<Set, OutOfMemory> {
         if ops == Ops::NONE {
             return Ok(set);
@@ -260,8 +260,8 @@ impl<'gc> Scopes<'gc> {
         let mut scopes = std::mem::take(&mut self.scratch_set);
         scopes.clear();
         let (mut i, mut j) = (0, 0);
-        // A scope the set has stays unless removed or flipped; one it lacks comes in if added or
-        // flipped.
+        // A scope in the set stays unless it is removed or flipped. A scope not in the set is
+        // inserted if it is added or flipped.
         while i < have.len() && j < changes.len() {
             let (scope, (changed, op)) = (have[i], changes[j]);
             if scope < changed {

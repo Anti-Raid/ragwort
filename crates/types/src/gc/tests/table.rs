@@ -5,7 +5,7 @@ use crate::gc::{Arena, objects};
 
 objects! {
     kind Types;
-    /// A symbol, named by a number, with its name's hash.
+    /// A symbol whose name is a number. It stores the hash of its name.
     struct Sym { n: i64, hash: u64 }
     struct Pair { car: Value, cdr: Value }
 }
@@ -20,7 +20,7 @@ fn fix<'gc>(n: i64) -> Value<'gc> {
     Value::fixnum(n).unwrap()
 }
 
-/// A hash of a number, made weak by `bits` to force collisions.
+/// Returns a hash of `n`. The mask `bits` weakens the hash, to force collisions.
 fn hash(n: i64, bits: u64) -> u64 {
     (n as u64).wrapping_mul(0x2545_F491_4F6C_DD1D).rotate_left(17) & bits
 }
@@ -44,8 +44,8 @@ fn remove<'gc>(mc: &Mutation<'gc>, t: Map<'gc>, n: i64, bits: u64) -> Option<i64
     gone.map(|(_, v)| v.as_fixnum().unwrap())
 }
 
-/// Inserting, replacing and removing, with hashes that collide more and more, and every entry
-/// found where a probe reaches it after each rebuild.
+/// Inserts, replaces and removes entries, with hashes that collide more and more. After each rebuild, a probe must still
+/// find every entry.
 #[test]
 fn maps_find_what_they_hold() {
     for bits in [u64::MAX, 0xFF, 0b110, 0] {
@@ -81,8 +81,8 @@ fn maps_find_what_they_hold() {
     }
 }
 
-/// Entries made and removed over and over don't grow the table past what the live ones need,
-/// and a key that comes and goes takes its old slot back without rebuilding.
+/// Entries that are inserted and removed over and over do not grow the table beyond the size that the live entries need.
+/// A key that is removed and inserted again reuses its old slot without a rebuild.
 #[test]
 fn churn_leaves_the_table_small() {
     let mut arena = Arena::new(8 << 20, 1);
@@ -110,7 +110,7 @@ fn churn_leaves_the_table_small() {
     });
 }
 
-/// An identity table's object keys move in an evacuating collection, and it finds them again.
+/// The object keys of an identity table move in an evacuating collection, and the table still finds them.
 #[test]
 fn identity_tables_rehash_after_objects_move() {
     let mut arena = Arena::new(16 << 20, 2);
@@ -157,7 +157,7 @@ fn churn_a_little(mc: &Mutation<'_>) {
     }
 }
 
-/// An ephemeron table's entry lasts while its key is held elsewhere, even when its value refers
+/// An entry of an ephemeron table lives only while its key is held elsewhere, even when its value refers
 /// to the key.
 #[test]
 fn ephemeron_entries_die_with_their_keys() {
@@ -201,8 +201,8 @@ fn intern<'gc>(mc: &Mutation<'gc>, t: Table<'gc, WeakObjects<Sym>>, n: i64, bits
     t.find_or_insert(mc, h, |s| Ok::<_, OutOfMemory>(s.n(mc) == n), || Sym::new(mc, n, h)).unwrap()
 }
 
-/// A weak table of symbols, as interning keeps them: one per name while it's held, gone once
-/// nothing else holds it, and a dead one's name gets a new symbol.
+/// A weak table of symbols, used as interning uses it. There is one symbol per name while the symbol is held. The symbol is removed once
+/// nothing else holds it. After that, its name gets a new symbol.
 #[test]
 fn weak_objects_go_once_unreachable() {
     for bits in [u64::MAX, 0b110] {
@@ -240,7 +240,7 @@ fn weak_objects_go_once_unreachable() {
     }
 }
 
-/// A failed `make` or a failed rebuild adds nothing, and the table works after.
+/// A failed `make` or a failed rebuild adds no entry, and the table still works afterwards.
 #[test]
 fn failures_leave_the_table_as_it_was() {
     let mut arena = Arena::new(8 << 20, 1);
@@ -254,7 +254,7 @@ fn failures_leave_the_table_as_it_was() {
         assert_eq!(made, Err(OutOfMemory));
         assert_eq!(get(mc, t, 99, u64::MAX), None);
     });
-    // The seventh entry needs a rebuild, and its allocations are failed one at a time.
+    // The seventh entry needs a rebuild. Each allocation of the rebuild is failed in turn.
     for fail in 0..2 {
         arena.fail_after(Some(fail));
         let result = arena.step(|mc| {
@@ -276,8 +276,8 @@ fn failures_leave_the_table_as_it_was() {
     });
 }
 
-/// Probe keys damaged so no slot is unused: probes stop after a lap instead of looping, and an
-/// insertion rebuilds.
+/// The probe keys are corrupted so that no slot is unused. A probe then stops after one pass over the slots instead of looping forever, and an
+/// insertion rebuilds the table.
 #[test]
 fn damaged_keys_end_probes() {
     let mut arena = Arena::new(4 << 20, 1);
@@ -291,7 +291,7 @@ fn damaged_keys_end_probes() {
     });
 }
 
-/// A table read as the wrong kind holds nothing.
+/// A table that is read as the wrong kind reads as empty.
 #[test]
 fn the_wrong_kind_is_empty() {
     let mut arena = Arena::new(4 << 20, 1);
@@ -304,8 +304,8 @@ fn the_wrong_kind_is_empty() {
     });
 }
 
-/// Removing an entry leaves a dead slot that the next insertion passing it reuses, even when
-/// the new entry's 64-bit hash differs in its upper bits.
+/// Removing an entry leaves a tombstone. The next insertion whose probe passes the tombstone reuses its slot, even when
+/// the 64-bit hash of the new entry differs in its upper bits.
 #[test]
 fn dead_entries_are_reused_by_colliding_hashes() {
     let mut arena = Arena::new(4 << 20, 1);

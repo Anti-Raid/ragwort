@@ -1,9 +1,9 @@
-//! Saving what's loaded, to load it again without compiling or running it.
+//! Saves loaded modules as an image, so that a later run can load them without compiling or running them again.
 //!
-//! An image holds values and everything they reach: modules that have run, with their code
-//! and what their variables hold. Loading one into a new arena leaves it as the arena that
-//! saved it was, so code loaded after is compiled against the image's modules as it would be
-//! against ones just built.
+//! An image holds a set of root values and every object reachable from them. For modules that have run, that includes their code
+//! and the values of their variables. Loading an image into a new arena reproduces the state of the arena that
+//! saved it. Code loaded afterwards is compiled against the image's modules exactly as it would be
+//! against newly built modules.
 //!
 //! ```text
 //! let bytes = arena.mutate(|mc| image::save(mc, &[symbols, prelude, library]))?;
@@ -13,12 +13,12 @@
 //!
 //! # What an image is good for
 //!
-//! - A module in it isn't run again when it's loaded: what its variables hold is what they
-//!   held when it was saved. What the module did to the world outside the arena as it ran,
-//!   such as a call of a host function, isn't done again either.
-//! - It's for the build that saved it: [`load`] refuses another's. A build is its source: see
+//! - A module in an image does not run again when the image is loaded. Its variables hold the values that they
+//!   held when the image was saved. Effects that the module had outside the arena while it ran,
+//!   such as calls of host functions, are not repeated either.
+//! - An image is valid only for the build that saved it. [`load`] rejects an image from another build. A build is identified by its source. See
 //!   [`BUILD`].
-//! - It's to be one the program wrote itself: see [`ragwort_types::gc::image`].
+//! - An image must be one that the program itself wrote, because an image is trusted. See [`ragwort_types::gc::image`].
 
 use ragwort_compiler::module::INTERFACE;
 use ragwort_types::gc::image::{self, Kind, LoadError, SaveError};
@@ -27,14 +27,14 @@ use ragwort_types::wire::{mix, shape_of};
 use ragwort_vm::HostDef;
 use ragwort_vm::image::Hosts;
 
-/// Why an image can't be loaded.
+/// The reason an image could not be loaded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImageError {
     Load(LoadError),
-    /// Its code calls a host function of this name that isn't among the ones given.
+    /// The image's code calls a host function with this name, and that function is not among the host functions given to [`load`].
     Host(String),
-    /// Two different host functions among the ones given are at this one place in the program,
-    /// so an image couldn't say which it means: see [`HostDef::path`].
+    /// Two different host functions given to [`load`] have this same [`HostDef::path`],
+    /// so an image could not identify which of them it means.
     SameHost(&'static str),
 }
 
@@ -51,28 +51,28 @@ fn kinds() -> Vec<Kind> {
     kinds
 }
 
-/// What tells this build of ragwort from any other: a number its build script makes of the
-/// source of every ragwort crate and what the build is for.
+/// A stamp that identifies this build of ragwort. The build script computes it as a hash of the
+/// source of every ragwort crate, the crate version and the build target.
 pub const BUILD: &str = env!("RAGWORT_BUILD");
 
-/// What tells this build's images from another's: [`BUILD`], with the shape of everything
-/// that's saved.
+/// Returns the stamp that identifies the images of this build. It combines [`BUILD`] with the shape of every
+/// type that an image saves.
 ///
-/// The shapes alone would let through a build whose source differs in what an image means
-/// and not in how it's laid out. `BUILD` doesn't know of the program ragwort is built into:
-/// one whose host functions change what they do keeps its own images apart.
+/// The shapes alone are not enough. Two builds can lay out saved data in the same way and still differ in what an image means.
+/// `BUILD` does not cover the program that ragwort is built into. If that program changes what its host functions do,
+/// it must keep its old and new images apart itself.
 pub fn stamp() -> u64 {
     let shape = mix(image::shape(&descs(), &kinds()), ragwort_vm::image::SHAPE);
     mix(shape, shape_of(BUILD))
 }
 
-/// Everything `roots` reach, as bytes for [`load`]. Collect first, so what's dead isn't saved.
+/// Serializes every object reachable from `roots` into bytes that [`load`] accepts. Run a collection first, so that dead objects are not saved.
 pub fn save<'gc>(mc: &Mutation<'gc>, roots: &[Value<'gc>]) -> Result<Vec<u8>, SaveError> {
     image::save(mc, stamp(), roots, &kinds())
 }
 
-/// Makes what `bytes` hold, in an arena with no symbols yet, and gives the roots they were
-/// saved with. `hosts` are the host functions the image's code can call.
+/// Deserializes the image in `bytes` into the arena and returns the roots that the image was
+/// saved with. The arena must have no symbols yet. `hosts` are the host functions that the image's code can call.
 pub fn load<'gc>(mc: &Mutation<'gc>, bytes: &[u8], hosts: impl IntoIterator<Item = &'static HostDef>) -> Result<Vec<Value<'gc>>, ImageError> {
     let hosts = Hosts::new(hosts).map_err(ImageError::SameHost)?;
     image::load(mc, stamp(), bytes, &descs(), &kinds(), &hosts).map_err(|error| match hosts.missing() {

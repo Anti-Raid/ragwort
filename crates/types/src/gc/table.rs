@@ -1,15 +1,15 @@
-//! Hash tables in the arena, by linear probing over numbered slots. A table keeps each slot's
-//! probe key, the hash with its low bit set, in a word array, so a probe reads only words until
-//! a key matches, and the entries in a second array whose kind decides how they hold on:
-//! [`Strong`] pairs, [`Ephemerons`], or [`WeakObjects`] that die with their objects.
+//! Hash tables in the arena, with linear probing over numbered slots. A table keeps the probe key of each slot
+//! in a word array. The probe key is the hash with its low bit set. So a probe reads only words until
+//! a key matches. The entries are in a second array. The table's [`Kind`] decides how that array holds the entries:
+//! as [`Strong`] pairs, as [`Ephemerons`], or as [`WeakObjects`], which are removed when their objects die.
 //!
-//! A dead entry keeps its probe key until the table is rebuilt, so probes go on past it, and
-//! the next insertion that passes it takes its slot. Rebuilding sizes the table to stay at most
-//! half full, and inserting keeps it at most three quarters full, counting dead slots.
+//! A removed or dead entry is a tombstone. It keeps its probe key until the table is rebuilt, so probes continue past it.
+//! The next insertion whose probe passes the tombstone reuses its slot. A rebuild sizes the table to be at most
+//! half full. Insertion keeps the table at most three quarters full, counting tombstones.
 //!
-//! Hashes are the caller's, and must stay the same while an entry is in the table, except in an
-//! identity table, [`Table::new_eq`]: its keys hash by what they are, which moving an object
-//! changes, so it rehashes on first use after a collection that moved objects.
+//! The caller computes the hashes. A hash must stay the same while its entry is in the table. The exception is an
+//! identity table, made by [`Table::new_eq`]. It hashes a key by the key's value word, which changes when a collection moves the object.
+//! So an identity table rehashes on first use after a collection that moved objects.
 
 use std::marker::PhantomData;
 
@@ -25,26 +25,26 @@ crate::gc::objects! {
     /// The collector's own containers.
     pub kind Containers at 2;
 
-    /// A table's handle: its probe keys and entries, which rebuilding replaces, the slots with a
-    /// key, and for an identity table, the evacuation count it last hashed at.
+    /// The head of a table. `keys` holds the probe keys and `buf` holds the entries. A rebuild replaces both. `used` is the number of slots that have a
+    /// probe key. In an identity table, `epoch` is the evacuation count at which the table last hashed its entries.
     pub struct TableHead { keys: Member<Keys>, buf: Value, used: u64, epoch: u64 }
-    /// Probe keys, 0 for a slot never used.
+    /// The probe keys of a table. 0 marks a slot that was never used.
     pub struct Keys {} items u64
-    /// A key and a value per slot, both `Value::BROKEN` once removed.
+    /// The entries of a strong table: a key and a value per slot. Both are `Value::BROKEN` in an unused slot and in a removed entry.
     pub struct Pairs {} items Value
     pub struct EphemeronPairs {} items Ephemeron
 }
 
-/// Fewest slots a table that holds anything has.
+/// The minimum number of slots in a table that has allocated its arrays.
 const MIN_SLOTS: usize = 8;
-/// What an identity table's epoch is set to by tables of caller hashes.
+/// The `epoch` sentinel of a table that uses caller-computed hashes. It marks the table as not an identity table.
 const NOT_EQ: u64 = u64::MAX;
 
 mod sealed {
     pub trait Sealed {}
 }
 
-/// How a table holds its entries.
+/// The way a table holds its entries: strongly, as ephemerons, or weakly.
 pub trait Kind: sealed::Sealed + 'static {
     type Entry<'gc>: Copy;
     #[doc(hidden)]
@@ -53,7 +53,7 @@ pub trait Kind: sealed::Sealed + 'static {
     #[doc(hidden)]
     fn alloc<'gc>(mc: &Mutation<'gc>, slots: usize) -> Result<Gc<'gc, Self::Buf>, OutOfMemory>;
 
-    /// The entry in slot `index`, unless it's dead.
+    /// Returns the entry in slot `index`, or `None` if the entry is dead or removed.
     #[doc(hidden)]
     fn entry<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, Self::Buf>, index: usize) -> Option<Self::Entry<'gc>>;
 
@@ -63,21 +63,21 @@ pub trait Kind: sealed::Sealed + 'static {
     #[doc(hidden)]
     fn kill<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, Self::Buf>, index: usize);
 
-    /// What an identity table hashes the entry by.
+    /// Returns the value whose word an identity table hashes for `entry`.
     #[doc(hidden)]
     fn identity<'gc>(mc: &Mutation<'gc>, entry: Self::Entry<'gc>) -> Value<'gc>;
 }
 
-/// Keys and values both held strongly.
+/// A table kind that holds both keys and values strongly.
 pub struct Strong;
 
-/// Values held only while their keys are reachable some other way.
+/// A table kind whose entries are ephemerons. A value is held only while its key is reachable in some other way.
 pub struct Ephemerons;
 
-/// Objects of type `U`, each gone once nothing else holds it, as a symbol table holds symbols.
+/// A table kind that holds objects of type `U` weakly. An entry is removed once nothing else holds its object. A symbol table holds its symbols this way.
 pub struct WeakObjects<U>(PhantomData<fn() -> U>);
 
-/// `WeakObjects`' entries.
+/// The entry array of a `WeakObjects` table.
 #[doc(hidden)]
 pub struct WeakSlots<U>(PhantomData<fn() -> U>);
 
@@ -176,22 +176,22 @@ impl<U: Object> Kind for WeakObjects<U> {
     }
 }
 
-/// A hash of what `value` is, rather than what it holds, for identity tables: two values hash
-/// the same if they're the same word.
+/// Returns the identity hash of `value`, for identity tables. The hash is computed from the value's word, not from the contents of an object. Two values have
+/// the same hash if they are the same word.
 #[inline]
 pub fn eq_hash(value: Value<'_>) -> u64 {
     let product = value.to_bits().wrapping_mul(0x9E37_79B9_7F4A_7C15);
     product ^ product >> 29
 }
 
-/// Where a probe for a key ended.
+/// The result of a probe for a key.
 enum Probe<E> {
     Found(usize, E),
-    /// Not there: the first dead or unused slot on the way, if there's room for it.
+    /// The key is not in the table. Holds the first tombstone or unused slot on the probe path, where a new entry can go, or `None` if the probe found no such slot.
     Missing(Option<usize>),
 }
 
-/// A hash table of `K` entries.
+/// A hash table of kind `K`.
 pub struct Table<'gc, K> {
     head: Gc<'gc, TableHead>,
     _marker: PhantomData<fn() -> K>,
@@ -206,17 +206,17 @@ impl<K> Clone for Table<'_, K> {
 impl<K> Copy for Table<'_, K> {}
 
 impl<'gc, K: Kind> Table<'gc, K> {
-    /// An empty table for hashes the caller computes.
+    /// Creates an empty table that uses hashes computed by the caller.
     pub fn new(mc: &Mutation<'gc>) -> Result<Self, OutOfMemory> {
         Ok(Self::of(TableHead::new(mc, None, Value::FALSE, 0, NOT_EQ)?))
     }
 
-    /// An empty identity table, used through the `_eq` methods, which hash with [`eq_hash`].
+    /// Creates an empty identity table. Use it through the `_eq` methods, which hash with [`eq_hash`].
     pub fn new_eq(mc: &Mutation<'gc>) -> Result<Self, OutOfMemory> {
         Ok(Self::of(TableHead::new(mc, None, Value::FALSE, 0, mc.heap.m.evacuations.get())?))
     }
 
-    /// The table `head` is the handle of. Read as the wrong kind, it's a table of nothing.
+    /// Returns the table whose head is `head`. If `K` is not the kind that the table was created with, the table reads as empty.
     pub fn of(head: Gc<'gc, TableHead>) -> Self {
         Self { head, _marker: PhantomData }
     }
@@ -231,17 +231,17 @@ impl<'gc, K: Kind> Table<'gc, K> {
         Some((keys, buf))
     }
 
-    /// Slots, used or not.
+    /// Returns the number of slots, used or not.
     pub fn capacity(self, mc: &Mutation<'gc>) -> usize {
         self.parts(mc).map_or(0, |(keys, _)| keys.len())
     }
 
-    /// Live entries, counted.
+    /// Returns the number of live entries. This takes a pass over all the slots.
     pub fn count(self, mc: &Mutation<'gc>) -> usize {
         self.entries(mc).count()
     }
 
-    /// The live entries, in slot order. Inserting while iterating may skip or repeat some.
+    /// Returns the live entries, in slot order. Inserting while iterating may skip or repeat some entries.
     pub fn entries<'m>(self, mc: &'m Mutation<'gc>) -> impl Iterator<Item = K::Entry<'gc>> + use<'m, 'gc, K> {
         let parts = self.parts(mc);
         let len = parts.map_or(0, |(keys, _)| keys.len());
@@ -251,7 +251,7 @@ impl<'gc, K: Kind> Table<'gc, K> {
         })
     }
 
-    /// The live entry with this hash that `same` accepts.
+    /// Returns the live entry that has hash `hash` and that `same` accepts, or `None` if there is none.
     pub fn find<E>(
         self,
         mc: &Mutation<'gc>,
@@ -264,8 +264,8 @@ impl<'gc, K: Kind> Table<'gc, K> {
         })
     }
 
-    /// The live entry with this hash that `same` accepts, or the one `make` makes, which the table
-    /// then keeps. Neither callback may change the table.
+    /// Returns the live entry that has hash `hash` and that `same` accepts. If there is none, inserts the entry that `make` returns, and returns that
+    /// entry. Neither callback may change the table.
     pub fn find_or_insert<E: From<OutOfMemory>>(
         self,
         mc: &Mutation<'gc>,
@@ -284,7 +284,7 @@ impl<'gc, K: Kind> Table<'gc, K> {
         }
     }
 
-    /// Removes the live entry with this hash that `same` accepts, and returns it.
+    /// Removes the live entry that has hash `hash` and that `same` accepts, and returns it. Returns `None` if there is none.
     pub fn remove<E>(
         self,
         mc: &Mutation<'gc>,
@@ -302,8 +302,8 @@ impl<'gc, K: Kind> Table<'gc, K> {
         }
     }
 
-    /// Probes from the key's home, past slots with other keys and dead entries. A table whose
-    /// words were damaged may have no unused slot, so it stops after one lap.
+    /// Probes from the home slot of `key`, past slots with other keys and past tombstones. A table whose
+    /// words were corrupted may have no unused slot, so the probe stops after one pass over the slots.
     #[inline]
     fn probe<E>(
         self,
@@ -331,8 +331,8 @@ impl<'gc, K: Kind> Table<'gc, K> {
         Ok(Probe::Missing(free))
     }
 
-    /// Stores a new entry in `free`, the slot a probe for its key ended at, unless counting it
-    /// would leave the table too full, in which case it rebuilds.
+    /// Stores the new entry `entry` in `free`, the slot where a probe for `key` ended. If `free` is an unused slot and using it
+    /// would leave the table more than three quarters full, or if `free` is `None`, the table is rebuilt first and the entry goes into the new arrays.
     fn put(self, mc: &Mutation<'gc>, key: u64, free: Option<usize>, entry: K::Entry<'gc>) -> Result<(), OutOfMemory> {
         let used = self.head.used(mc) as usize;
         let capacity = self.capacity(mc);
@@ -369,8 +369,8 @@ impl<'gc, K: Kind> Table<'gc, K> {
         None
     }
 
-    /// Copies the live entries into new arrays with room for one more while staying at most half
-    /// full, by their old keys or, for an identity table, by hashing them again.
+    /// Copies the live entries into new arrays. The new arrays have room for one more entry while staying at most half
+    /// full. Each entry keeps its old probe key. If `rehash` is true, as for an identity table, each entry is hashed again instead.
     fn rebuild(self, mc: &Mutation<'gc>, rehash: bool) -> Result<(), OutOfMemory> {
         let old = self.parts(mc);
         let live = self.count(mc);
@@ -392,7 +392,7 @@ impl<'gc, K: Kind> Table<'gc, K> {
         Ok(())
     }
 
-    /// For an identity table: hashes the entries again if objects have moved since it last did.
+    /// Rehashes the entries of an identity table if a collection has moved objects since the table last hashed them. Does nothing for any other table.
     #[inline]
     fn rehashed(self, mc: &Mutation<'gc>) -> Result<(), OutOfMemory> {
         let now = mc.heap.m.evacuations.get();
@@ -407,9 +407,9 @@ impl<'gc, K: Kind> Table<'gc, K> {
     }
 }
 
-/// Maps, whose entries are a key and a value.
+/// Methods for maps: tables whose entries are a key and a value.
 impl<'gc, K: for<'a> Kind<Entry<'a> = (Value<'a>, Value<'a>)>> Table<'gc, K> {
-    /// The value of the live entry with this hash whose key `same` accepts.
+    /// Returns the value of the live entry that has hash `hash` and whose key `same` accepts.
     pub fn get<E>(
         self,
         mc: &Mutation<'gc>,
@@ -419,8 +419,8 @@ impl<'gc, K: for<'a> Kind<Entry<'a> = (Value<'a>, Value<'a>)>> Table<'gc, K> {
         Ok(self.find(mc, hash, |(key, _)| same(key))?.map(|(_, value)| value))
     }
 
-    /// Sets the value of the live entry with this hash whose key `same` accepts, or adds an
-    /// entry, and returns the value it replaced.
+    /// Sets the value of the live entry that has hash `hash` and whose key `same` accepts, and returns the value it replaced. If there is no such entry, adds an
+    /// entry for `key` and `value`, and returns `None`.
     pub fn insert<E: From<OutOfMemory>>(
         self,
         mc: &Mutation<'gc>,
@@ -444,19 +444,19 @@ impl<'gc, K: for<'a> Kind<Entry<'a> = (Value<'a>, Value<'a>)>> Table<'gc, K> {
         }
     }
 
-    /// In an identity table, the value for `key`.
+    /// Returns the value for `key` in an identity table.
     pub fn get_eq(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<Value<'gc>>, OutOfMemory> {
         self.rehashed(mc)?;
         self.get(mc, eq_hash(key), |candidate| Ok(candidate == key))
     }
 
-    /// In an identity table, sets `key`'s value and returns the one it replaced.
+    /// Sets the value for `key` in an identity table, and returns the value it replaced.
     pub fn insert_eq(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) -> Result<Option<Value<'gc>>, OutOfMemory> {
         self.rehashed(mc)?;
         self.insert(mc, eq_hash(key), |candidate| Ok(candidate == key), key, value)
     }
 
-    /// In an identity table, removes `key`'s entry and returns its value.
+    /// Removes the entry for `key` from an identity table, and returns its value.
     pub fn remove_eq(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<Value<'gc>>, OutOfMemory> {
         self.rehashed(mc)?;
         Ok(self.remove(mc, eq_hash(key), |(candidate, _)| Ok::<_, OutOfMemory>(candidate == key))?.map(|(_, value)| value))
@@ -464,14 +464,14 @@ impl<'gc, K: for<'a> Kind<Entry<'a> = (Value<'a>, Value<'a>)>> Table<'gc, K> {
 }
 
 impl<'gc, U: Object> Table<'gc, WeakObjects<U>> {
-    /// In an identity table, adds `object` unless it's there.
+    /// Adds `object` to an identity table, unless the table already holds it.
     pub fn insert_eq(self, mc: &Mutation<'gc>, object: Gc<'gc, U>) -> Result<(), OutOfMemory> {
         self.rehashed(mc)?;
         let hash = eq_hash(Value::object(mc, object));
         self.find_or_insert(mc, hash, |candidate| Ok(candidate == object), || Ok(object)).map(drop)
     }
 
-    /// In an identity table, whether `object` is there.
+    /// Returns whether an identity table holds `object`.
     pub fn contains_eq(self, mc: &Mutation<'gc>, object: Gc<'gc, U>) -> Result<bool, OutOfMemory> {
         self.rehashed(mc)?;
         let hash = eq_hash(Value::object(mc, object));
@@ -479,12 +479,12 @@ impl<'gc, U: Object> Table<'gc, WeakObjects<U>> {
     }
 }
 
-/// Zero means unused, so the low bit is always set.
+/// Returns the probe key for `hash`. A probe key of 0 means an unused slot, so the low bit is always set.
 fn key_of(hash: u64) -> u64 {
     hash | 1
 }
 
-/// Where probes for `key` start. Its low bit is always set, so it's left out.
+/// Returns the slot where probes for `key` start. The low bit of `key` is always set, so it is shifted out.
 fn home(key: u64, mask: usize) -> usize {
     (key >> 1) as usize & mask
 }

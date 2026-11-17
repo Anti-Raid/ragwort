@@ -30,14 +30,14 @@ use ragwort_types::gc::Value;
 use crate::hash::HashMap;
 use crate::{Position, Var};
 
-/// What an error report shows for a lambda: the name it is bound to and where its source form starts.
+/// The description of a lambda in an error report: the name that the lambda is bound to, and the position where its source form starts.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Described<'gc> {
     pub(crate) name: Option<Value<'gc>>,
     pub(crate) at: Option<Position<'gc>>,
 }
 
-/// What error reports need to know about the code being compiled: the description of each lambda, keyed by lambda ID, and the source sites that IR nodes refer to. Passes identify a function by its lambda ID and a position by its site number, so this information travels beside the IR tables instead of inside every record.
+/// Information about the code being compiled that error reports need. `lambdas` maps each lambda ID to the description of the lambda. `sites` holds the source sites that IR nodes refer to. Passes identify a function by its lambda ID and a position by its site number. This information is therefore kept beside the IR tables instead of inside every record.
 #[derive(Default)]
 pub(crate) struct Origins<'gc> {
     lambdas: HashMap<u32, Described<'gc>>,
@@ -45,7 +45,7 @@ pub(crate) struct Origins<'gc> {
 }
 
 impl<'gc> Origins<'gc> {
-    /// Records the name and position of `lambda`, where it has them.
+    /// Records `name` and `at` for `lambda`. An argument that is `None` leaves the recorded value unchanged.
     pub(crate) fn describe(&mut self, lambda: u32, name: Option<Value<'gc>>, at: Option<Position<'gc>>) {
         if name.is_some() || at.is_some() {
             let entry = self.lambdas.entry(lambda).or_default();
@@ -66,7 +66,7 @@ impl<'gc> Origins<'gc> {
         self.lambdas.get(&lambda).copied().unwrap_or_default()
     }
 
-    /// Gives the lambda `to`, a copy of the lambda `from`, the same description.
+    /// Copies the description of lambda `from` to lambda `to`. A pass calls this when `to` is a copy of `from`.
     pub(crate) fn copy(&mut self, from: u32, to: u32) {
         if let Some(&described) = self.lambdas.get(&from) {
             self.lambdas.insert(to, described);
@@ -94,7 +94,7 @@ pub(crate) struct Site<'gc> {
 pub(crate) struct Sites<'gc> {
     pub(crate) sites: Vec<Site<'gc>>,
     pub(crate) inlined: Vec<Inlined<'gc>>,
-    /// The site already made for a site moved into an inlined call, keyed by the original site and the inlined call.
+    /// Cache for [`Sites::within`]. Maps an original site and an inlined call to the site already created for that pair.
     moved: HashMap<(u32, u32), u32>,
 }
 

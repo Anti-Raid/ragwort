@@ -1,6 +1,6 @@
-//! Numbers in the arena, for `ragwort-num`: fixnums and most flonums in the value word, bignums
-//! as [`Big`] objects with their digits in their items, ratios as [`Ratio`] objects, and complex
-//! numbers as [`Complex`] objects.
+//! Numbers in the arena, for `ragwort-num`. Fixnums and most flonums are stored inline in the
+//! value word. A bignum is a [`Big`] object with its digits in its items. A ratio is a [`Ratio`]
+//! object, and a complex number is a [`Complex`] object.
 
 use ragwort_num::bigint::{Digits, RWDigits};
 pub use ragwort_num::*;
@@ -13,11 +13,12 @@ use crate::gc::{Mutation, Value};
 mod tests;
 
 crate::gc::objects! {
-    /// Every kind of number that's an object, but boxed flonums.
+    /// Every kind of number object, except boxed flonums.
     pub kind Numbers after crate::string::Text;
 
-    /// Sign and magnitude, with no high zero digits. Never zero and never in fixnum range. The
-    /// magnitude is the first `digits` items; the rest, left over from making it, are zero.
+    /// A bignum as a sign and a magnitude, with no leading zero digits. It is never zero and never
+    /// in fixnum range. The magnitude is the first `digits` items. The remaining items are spare
+    /// capacity from construction and are zero.
     pub struct Big { negative: bool, digits: u64 } items u64
     /// A fraction in lowest terms whose denominator is above one. Both parts are [`Integer`]s.
     pub struct Ratio { num: Value, den: Value }

@@ -1,6 +1,6 @@
-//! Symbol interning, as a reader does it: mostly hits on a few hundred names, with some
-//! common keywords far more frequent than the rest. Run with `--release`. Given a file of
-//! names, one per line, it times interning those instead, after interning each once.
+//! Benchmarks symbol interning with the workload of a reader: mostly hits on a few hundred names,
+//! with a few common keywords far more frequent than the rest. Run with `--release`. If it is given
+//! a file of names, one per line, it instead times interning those names, after interning each once.
 
 use std::collections::HashMap;
 use std::hint::black_box;
@@ -10,7 +10,7 @@ use ragwort_types::gc::Arena;
 use ragwort_types::string::{Strings, equal_str, from_str, hash_str};
 use ragwort_types::symbol::Symbols;
 
-/// An arena whose root 0 holds a symbol table.
+/// Returns an arena whose root 0 holds a symbol table.
 fn new_arena() -> Arena {
     let mut arena = Arena::new(256 << 20, 1);
     arena.mutate(|mc| mc.set_root(0, Symbols::with_seed(mc, 1).expect("table").value(mc)));
@@ -52,8 +52,8 @@ fn names(distinct: usize, rng: &mut Rng) -> Vec<String> {
     out
 }
 
-/// Source text of `count` tokens, as a reader would slice it: half the tokens are keywords,
-/// the rest spread over all the names.
+/// Returns source text of `count` tokens, for a reader to split. Half of the tokens are keywords.
+/// The other half are drawn from all the names.
 fn source(names: &[String], count: usize, rng: &mut Rng) -> String {
     let tokens: Vec<&str> = (0..count)
         .map(|_| {
@@ -69,7 +69,7 @@ fn time(label: &str, ops: usize, mut run: impl FnMut() -> Duration) {
     println!("{label:<36} {:>8.2} ns/op", best.as_nanos() as f64 / ops as f64);
 }
 
-/// Interns the names in `path` in order, after interning each once.
+/// Times interning the names in the file `path` in order, after interning each once.
 fn intern_file(path: &str) {
     let text = std::fs::read_to_string(path).expect("names file");
     let tokens: Vec<&str> = text.lines().collect();

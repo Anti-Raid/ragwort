@@ -4,7 +4,7 @@ use crate::gc::{Arena, objects};
 objects! {
     kind Kind;
     struct Num { n: i64 }
-    /// About a page.
+    /// A filler object. The tests allocate it with 2000 items, which is about one page.
     struct Filler {} items u64
     struct Pair { car: Value, cdr: Value }
 }
@@ -46,7 +46,7 @@ fn iterators_keep_their_range_and_storage() {
         assert_eq!(iter.next_back(), Some(3));
         assert_eq!(iter.len(), 2);
         assert!(v.set(mc, 1, 11));
-        // Growing moves the vector to new slots, which the iterator doesn't see.
+        // Growing moves the vector to a new slot array. The iterator keeps reading the old array, so it does not see later changes.
         v.push(mc, 4).unwrap();
         assert!(v.set(mc, 1, 99));
         v.truncate(mc, 1);
@@ -80,7 +80,7 @@ fn slots_grow_and_are_traced() {
         assert_eq!(v.pop(mc).flatten().map(|x| x.n(mc)), Some(n - 1));
         v.truncate(mc, 10);
         assert!(v.set(mc, 0, None));
-        // The truncated slots hold the zero word, so they keep nothing alive.
+        // The truncated slots hold the zero word, so they keep no object alive.
         let slots = v.head().get(mc, VecHead::SLOTS).unwrap().item_slots::<slot::u64>(mc);
         assert!((10..slots.len()).all(|i| slots.get(i) == 0));
     });
@@ -93,8 +93,8 @@ fn slots_grow_and_are_traced() {
     });
 }
 
-/// Stores into an old vector's slots take the barrier, so a minor collection keeps their
-/// young targets.
+/// A store into a slot of an old vector applies the write barrier, so a minor collection keeps the
+/// young target.
 #[test]
 fn stores_into_old_slots_survive_minor_collections() {
     let mut arena = Arena::new(8 << 20, 1);
@@ -113,7 +113,7 @@ fn stores_into_old_slots_survive_minor_collections() {
     arena.mutate(|mc| assert!(nums(mc).iter(mc).enumerate().all(|(i, x)| x.map(|x| x.n(mc)) == Some(i as i64))));
 }
 
-/// A length past the slots, as damaged memory could hold, reads as the slots' length.
+/// A stored length greater than the number of slots, as corrupted memory could hold, reads as the number of slots.
 #[test]
 fn damaged_lengths_are_bounded() {
     let mut arena = word_arena(1 << 20);
@@ -122,8 +122,7 @@ fn damaged_lengths_are_bounded() {
         for i in 0..8 {
             v.push(mc, i).unwrap();
         }
-        let damage = || v.head().set_word(mc, 0, u64::MAX);
-        damage();
+        v.head().set_word(mc, 0, u64::MAX);
         assert_eq!((v.len(mc), v.capacity(mc)), (8, 8));
         assert_eq!(v.iter(mc).count(), 8);
         assert!(v.get(mc, 1000).is_none());
@@ -132,13 +131,13 @@ fn damaged_lengths_are_bounded() {
         assert_eq!(v.pop(mc), Some(7));
         v.truncate(mc, 2);
         assert_eq!(v.len(mc), 2);
-        damage();
+        v.head().set_word(mc, 0, u64::MAX);
         v.truncate(mc, 0);
         assert_eq!(v.len(mc), 0);
     });
 }
 
-/// Growth a vector can do without stays out of the reserve, so it grows by what it needs.
+/// The optional part of a vector's growth does not draw on the reserve. So growth that draws on the reserve is exactly the capacity needed.
 #[test]
 fn optional_growth_leaves_the_reserve_alone() {
     let mut arena = word_arena(1 << 20);

@@ -8,7 +8,7 @@
 //! Keep the allocation if any use requires the struct itself, such as a remaining procedure call,
 //! return, store, comparison, or truth test.
 
-use ragwort_types::gc::{Gc, Mutation};
+use ragwort_types::gc::{Gc, Mutation, Value};
 use ragwort_vm::objects::{StructType, StructTypeFields};
 use ragwort_vm::{Intrinsic, structs};
 
@@ -73,21 +73,25 @@ fn field_use<'id, 'gc>(mc: &Mutation<'gc>, tree: &L2<'id, 'gc>, made: &HashMap<V
     let args = &tree[args];
     let Node::Ref(var) = tree[*args.first()?] else { return None };
     let made_as = made.get(&var)?.kind;
-    let constant = |at: usize| match tree[args[at]] {
-        Node::Quote(value) => Some(value),
-        _ => None,
-    };
-    let index = |at: usize| usize::try_from(constant(at)?.as_fixnum()?).ok();
+    fn constant<'id, 'gc>(tree: &L2<'id, 'gc>, id: Id<'id>) -> Option<Value<'gc>> {
+        match tree[id] {
+            Node::Quote(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn index<'id>(tree: &L2<'id, '_>, id: Id<'id>) -> Option<usize> {
+        usize::try_from(constant(tree, id)?.as_fixnum()?).ok()
+    }
     // A typed field access is valid when the allocated struct derives from the requested type and the
     // index is in range.
-    let by_type = |at: usize| {
-        let kind = constant(1)?.downcast::<StructType>(mc)?;
-        index(at).filter(|&position| structs::derives(mc, made_as, kind) && position < kind.fields(mc) as usize)
-    };
+    fn by_type<'id, 'gc>(mc: &Mutation<'gc>, tree: &L2<'id, 'gc>, made_as: Gc<'gc, StructType>, kind: Id<'id>, field: Id<'id>) -> Option<usize> {
+        let kind = constant(tree, kind)?.downcast::<StructType>(mc)?;
+        index(tree, field).filter(|&position| structs::derives(mc, made_as, kind) && position < kind.fields(mc) as usize)
+    }
     let field = match (intrinsic, args.len()) {
-        (Intrinsic::StructField | Intrinsic::StructFixedField, 2) => Use::Read(index(1).filter(|&position| position < made_as.fields(mc) as usize)?),
-        (Intrinsic::StructRef, 3) => Use::Read(by_type(2)?),
-        (Intrinsic::StructSet, 4) => Use::Write(by_type(2).filter(|&position| structs::is_mutable(mc, made_as, position))?, args[3]),
+        (Intrinsic::StructField | Intrinsic::StructFixedField, 2) => Use::Read(index(tree, args[1]).filter(|&position| position < made_as.fields(mc) as usize)?),
+        (Intrinsic::StructRef, 3) => Use::Read(by_type(mc, tree, made_as, args[1], args[2])?),
+        (Intrinsic::StructSet, 4) => Use::Write(by_type(mc, tree, made_as, args[1], args[2]).filter(|&position| structs::is_mutable(mc, made_as, position))?, args[3]),
         _ => return None,
     };
     Some((var, field))

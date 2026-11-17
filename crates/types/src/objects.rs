@@ -1,68 +1,79 @@
-//! The objects behind the views the other modules give out. They're private to the crate, so
-//! only those views change them: pairs and literal vectors stay as they were made.
+//! The object types behind the views that the other modules export. The types are private to the
+//! crate, so only those views can modify the objects. Pairs and literal vectors therefore never
+//! change after they are created.
 
 use std::cell::RefCell;
 
 use crate::bytevector::{ExternalBuffer, ExternalBufferMut};
 use crate::external::Held;
 use crate::table::Hosted;
+use crate::vector::HostedVector;
 use crate::gc::table::TableHead;
 
 crate::gc::objects! {
-    /// Every object this crate makes. Strings and numbers are in their own groups.
+    /// Every object type defined in this module. Strings and numbers are in their own groups.
     pub(crate) kind Data after crate::num::Numbers;
 
-    /// A symbol: its name, a flat string, and the name's hash.
+    /// A symbol. `name` is a flat string, and `hash` is the hash of the name.
     pub(crate) struct Sym { name: Value, hash: u64 }
-    /// The intern table: the seed of its hashes, and the symbols and keywords, held weakly.
+    /// The intern table. `seed` seeds its hashes. `table` holds the symbols and `keywords` holds the keywords, both weakly.
     pub(crate) struct Interned { seed: u64, table: Member<TableHead>, keywords: Member<TableHead> }
-    /// A keyword, `#:name`, by its name's symbol.
+    /// A keyword, `#:name`. `symbol` is the symbol with the same name.
     pub(crate) struct Keyword { symbol: Member<Sym> }
-    /// `length` is that of the list the pair starts, or 0 if its pairs don't end in `()`.
+    /// `length` is the length of the list that starts at this pair, or 0 if the chain of pairs does not end in `()`.
     pub(crate) struct Pair { head: Value, tail: Value, length: u64 }
     pub(crate) struct Vector {} items Value
     pub(crate) struct ImmutableVector {} items Value
-    /// `bytes` bytes, eight to a word, the first lowest.
+    /// A bytevector of `bytes` bytes. The items pack eight bytes to a word, with the first byte in the lowest bits.
     pub(crate) struct Bytevector { bytes: u64 } items u64
     pub(crate) struct ImmutableBytevector { bytes: u64 } items u64
-    /// A bytevector whose `bytes` bytes live outside the arena, dropped once nothing reaches it.
-    /// They never change, in number or in value.
+    /// A bytevector whose `bytes` bytes are stored outside the arena, in `owner`. `owner` is dropped
+    /// once the bytevector is unreachable. The bytes never change in number or in value.
     pub(crate) struct ExternBytevector { bytes: u64, owner: Frozen<Box<dyn ExternalBuffer>> }
-    /// One that can be written to, in the buffer it was made of, which stays `bytes` long.
+    /// A writable bytevector whose bytes are stored outside the arena, in `buffer`. The buffer stays `bytes` bytes long.
     pub(crate) struct ExternMutBytevector { bytes: u64, buffer: Frozen<RefCell<Box<dyn ExternalBufferMut>>> }
     /// Source bytes, in no particular encoding.
     pub(crate) struct SyntaxText { bytes: Frozen<Box<[u8]>> }
-    /// A source's name, its text while a session keeps it, its length, and the byte offset of
-    /// each line's start, from zero.
+    /// A source's metadata: its name, its text, its length and its line starts. `text` is present
+    /// only while a session keeps it alive. `size` is the length of the text in bytes. `lines`
+    /// holds the byte offset of the start of each line, counted from zero.
     pub(crate) struct SyntaxSource { name: Member<SyntaxText>, text: Weak<SyntaxText>, size: u64, lines: Frozen<Box<[u32]>> }
-    /// What a session keeps alive: the source, and its text.
+    /// The objects that a session keeps alive: the source and its text.
     pub(crate) struct Session { source: Member<SyntaxSource>, text: Member<SyntaxText> }
-    /// A scope made to be apart from every other.
+    /// A scope that is distinct from every other scope.
     pub(crate) struct SyntaxScope {}
     /// An identifier's scopes.
     pub(crate) struct SyntaxContext {} items Value
-    /// Spans are the start byte in the low half, the end in the high.
+    /// `span` holds the start byte offset in its low half and the end byte offset in its high half.
     pub(crate) struct SyntaxOrigin { source: Member<SyntaxSource>, span: u64, parent: Member<SyntaxOrigin> }
     pub(crate) struct SyntaxMeta { kind: u32, context: Member<SyntaxContext>, origin: Member<SyntaxOrigin> }
-    /// `binding` is `#f` for none.
+    /// `binding` is `#f` if there is no binding.
     pub(crate) struct Syntax { datum: Value, source: Member<SyntaxSource>, span: u64, meta: Member<SyntaxMeta>, binding: Value }
-    /// A reference to a value of a host type, which lives outside the arena with its kind and is
-    /// dropped once nothing reaches the reference. `kept` is a value that lives as long as it does.
+    /// A reference to a value of a host type. The value and its kind are stored outside the arena,
+    /// in `payload`, and dropped once the reference is unreachable. `kept` is an arena value that
+    /// stays alive as long as the reference does.
     pub(crate) struct External { kept: Value, payload: Frozen<Held> }
-    /// A table: its entries in the order they were added, and the index that finds them by key.
-    /// `live` counts the entries. `used` counts the places of `pairs` taken, dead ones included.
-    /// `seed` seeds the hashes. `epoch` is the count of moving collections the index was made
-    /// at, or `u64::MAX` while no key is hashed by where it is.
+    /// A table. `pairs` holds the entries in the order they were added, and `index` finds them by
+    /// key. `live` is the number of live entries. `used` is the number of entries of `pairs` in
+    /// use, tombstones included. `seed` seeds the hashes. `epoch` is the number of moving
+    /// collections that had run when the index was built, or `u64::MAX` while no key is hashed by
+    /// its object word.
     pub(crate) struct Table { index: Member<TableIndex>, pairs: Member<TableEntries>, live: u64, used: u64, seed: u64, epoch: u64 }
-    /// A table whose entries the host holds, in `host`. `memo` is a table of the values read from
-    /// the host so far, made at the first read. `walk` is the keys and values in the host's order,
-    /// made when the table is first walked and dropped when it is next written. `writable` says
-    /// whether programs can change the table.
+    /// A vector whose `count` elements are owned by the host, in `host`. `memo` caches the elements
+    /// read from the host so far, and is created on the first read. It is one vector for a short
+    /// external vector, and a vector of chunks for a long one (see `ExternVector::remembered`).
+    /// `writable` is whether programs can modify the vector.
+    pub(crate) struct ExternVector { count: u64, writable: bool, memo: Member<Vector>, host: Frozen<RefCell<Box<dyn HostedVector>>> }
+    /// A table whose entries are owned by the host, in `host`. `memo` is a table that caches the
+    /// values read from the host so far, created on the first read. `walk` holds the keys and
+    /// values in the host's order. It is created when the table is first iterated and dropped on
+    /// the next write. `writable` is whether programs can modify the table.
     pub(crate) struct ExternTable { memo: Member<Table>, walk: Member<TableEntries>, writable: bool, host: Frozen<RefCell<Box<dyn Hosted>>> }
-    /// A table's index, probed linearly. A slot is 0 if it was never used. Otherwise its low half
-    /// is an entry's number plus one, and its high half is the high half of the key's hash.
+    /// A table's index, a hash table with linear probing. A slot is 0 if it was never used.
+    /// Otherwise its low half is an entry number plus one, and its high half is the high half of
+    /// the key's hash.
     pub(crate) struct TableIndex {} items u64
-    /// A table's entries, a key and a value each. Both are `Value::BROKEN` in an entry that was
-    /// removed and in the places not used yet.
+    /// A table's entries, a key slot and a value slot each. Both slots hold `Value::BROKEN` in a
+    /// removed entry and in the entries not used yet.
     pub(crate) struct TableEntries {} items Value
 }

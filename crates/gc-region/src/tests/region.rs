@@ -44,7 +44,7 @@ fn odd_ranges_are_harmless() {
     assert!(Region::new(0).is_some_and(|r| r.is_empty()));
 }
 
-/// Memory comes back to the system, so what the process holds drops after a release.
+/// A release returns memory to the system, so the memory that the process holds drops.
 #[cfg(all(feature = "mmap", unix))]
 #[test]
 fn release_gives_memory_back() {
@@ -56,7 +56,7 @@ fn release_gives_memory_back() {
     region.release(0..LEN / 8);
     let released = held_bytes();
     assert!(touched.saturating_sub(released) > LEN / 2, "{touched} -> {released} bytes held");
-    // Written again, the pages come back.
+    // Writing to the pages again commits them again.
     region.words().iter().step_by(512).for_each(|w| w.set(2));
     assert!(held_bytes() > released + LEN / 2);
 }

@@ -1,10 +1,15 @@
-//! Scheme text as tokens, with no heap of its own: brackets, abbreviations, datum comments and
-//! labels, dots, and atoms with their escapes decoded, as R7RS writes them. `;` line comments,
-//! nested `#| |#` block comments and the `#!fold-case` and `#!no-fold-case` directives are
-//! skipped, and after `#!fold-case`, identifiers and character names come in lower case.
-//! [`number`] reads number tokens, with any host of `ragwort-num`.
+//! A lexer that turns Scheme text into tokens. It does not need an arena.
 //!
-//! What the tokens make, and whether brackets match, is for what reads them.
+//! The tokens are brackets, abbreviations, datum comments, datum labels, dots and atoms, in the
+//! syntax of R7RS. Escapes in strings and `|`-quoted identifiers are decoded.
+//!
+//! - `;` line comments and nested `#| |#` block comments are skipped.
+//! - The `#!fold-case` and `#!no-fold-case` directives are skipped. After `#!fold-case`,
+//!   identifiers, keywords and character names are returned in lower case.
+//! - [`number`] parses number tokens. It works with any `ragwort-num` host.
+//!
+//! The lexer does not build data from the tokens and does not check that brackets match. The
+//! reader that consumes the tokens does both.
 
 pub use ragwort_num::literal as number;
 
@@ -20,10 +25,10 @@ fn is_space(byte: u8) -> bool {
     byte < 64 && SPACES >> byte & 1 != 0
 }
 
-/// Whitespace and the bytes that end an identifier.
+/// Lookup table of the bytes that end an identifier. See [`ends_name`].
 const ENDS_NAME: [bool; 256] = byte_set(b" \t\n\r\x0b\x0c()[]{}\"';`,|");
 
-/// A lookup table, faster here than `matches!`. `for` isn't allowed in `const fn`.
+/// Builds a lookup table that is true for each of `bytes`. A table is faster here than `matches!`. The loop is a `while` because `for` is not allowed in a `const fn`.
 const fn byte_set(bytes: &[u8]) -> [bool; 256] {
     let mut set = [false; 256];
     let mut i = 0;
@@ -34,7 +39,7 @@ const fn byte_set(bytes: &[u8]) -> [bool; 256] {
     set
 }
 
-/// Whether `byte` ends an identifier: whitespace, a bracket, a quote or `|`.
+/// Returns whether `byte` ends an identifier. The bytes that do are whitespace, brackets, braces, `"`, `'`, `;`, a backquote, `,` and `|`.
 pub fn ends_name(byte: u8) -> bool {
     ENDS_NAME[byte as usize]
 }
@@ -47,7 +52,7 @@ pub enum Bracket {
     Square,
 }
 
-/// An abbreviation, which stands for a list of its form and the datum after it.
+/// An abbreviation prefix. The prefix and the datum after it stand for a two-element list: `'x` stands for `(quote x)`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Prefix {
     /// `'`
@@ -77,32 +82,32 @@ pub enum Token<'a> {
     OpenBytevector,
     Close(Bracket),
     Prefix(Prefix),
-    /// `#;`, which drops the datum after it.
+    /// `#;`, which comments out the datum after it.
     DatumComment,
     /// `#n=`, which labels the datum after it.
     Label(u64),
-    /// `#n#`, the datum labelled `n`.
+    /// `#n#`, a reference to the datum labelled `n`.
     LabelRef(u64),
     /// A `.` on its own, before a list's tail.
     Dot,
     Boolean(bool),
-    /// `#nil`, which stands where there is no value.
+    /// `#nil`, which denotes the absence of a value.
     Nil,
-    /// `#none`, a value that says "none".
+    /// `#none`, a value that is present and means "none".
     NoneValue,
     Char(char),
     String(Cow<'a, str>),
     Identifier(Cow<'a, str>),
     /// `#:name`, the keyword named `name`.
     Keyword(Cow<'a, str>),
-    /// Text that starts as a number does, and must be one.
+    /// A token that must be a number. It starts as only a number can (see [`starts_numeric`]), or with a radix or exactness prefix such as `#x`. The reader reports an error if the text is not a valid number.
     Number(&'a str),
-    /// Text that's a number if it reads as one, as `+i` and `-inf.0` do, or else the
-    /// identifier `name`, as `+inf.0x` is.
+    /// A token that is a number if `text` parses as one, as `+i` and `-inf.0` do. Otherwise it is
+    /// the identifier `name`, as `+inf.0x` is.
     NumberOr { text: &'a str, name: Cow<'a, str> },
 }
 
-/// A token, and the bytes `start..end` of the text it's read from.
+/// A token and the byte range `start..end` of the text that it was read from.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Lexeme<'a> {
     pub token: Token<'a>,
@@ -112,20 +117,20 @@ pub struct Lexeme<'a> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
-    /// The text ended inside the string, `|`-quoted identifier or block comment that opened
-    /// here.
+    /// The text ended inside a string, a `|`-quoted identifier or a block comment. The error's
+    /// range is where that string, identifier or comment opened.
     Unclosed,
-    /// Syntax this doesn't read: braces, and `#` forms other than those R7RS has.
+    /// The text used syntax that the lexer does not support: a brace, or a `#` form that the lexer does not know.
     Unsupported,
-    /// A `#\` character name that isn't one.
+    /// A `#\` was followed by a name that is not a character name.
     BadChar,
-    /// A backslash in a string or `|`-quoted identifier that doesn't start an escape.
+    /// A backslash in a string or a `|`-quoted identifier did not start a valid escape.
     BadEscape,
-    /// A `#n=` or `#n#` whose `n` is too big to be a label.
+    /// The number `n` of a `#n=` or `#n#` was too large for a label, which is a `u64`.
     BadLabel,
 }
 
-/// What went wrong, and the bytes `start..end` of the text where.
+/// A lexical error: its kind, and the byte range `start..end` of the text where it occurred.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LexError {
     pub kind: ErrorKind,
@@ -148,7 +153,7 @@ impl fmt::Display for LexError {
 
 impl std::error::Error for LexError {}
 
-/// The tokens of a text, one at a time.
+/// Produces the tokens of a text one at a time. It is also an iterator over the tokens.
 pub struct Lexer<'a> {
     text: &'a str,
     at: usize,
@@ -161,12 +166,12 @@ impl<'a> Lexer<'a> {
         Self { text, at: 0, fold: false }
     }
 
-    /// Where the next token's search starts.
+    /// Returns the byte offset at which the search for the next token starts.
     pub fn position(&self) -> usize {
         self.at
     }
 
-    /// Skips the rest of the text, so there are no more tokens.
+    /// Skips the rest of the text, so the lexer returns no more tokens.
     pub fn finish(&mut self) {
         self.at = self.text.len();
     }
@@ -175,7 +180,7 @@ impl<'a> Lexer<'a> {
         LexError { kind, start, end }
     }
 
-    /// The next token, or `None` once the text is read.
+    /// Returns the next token, or `None` at the end of the text.
     #[inline]
     pub fn next_token(&mut self) -> Result<Option<Lexeme<'a>>, LexError> {
         loop {
@@ -205,7 +210,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Where the name starting at `start` ends: at the next delimiter, or the end.
+    /// Returns the offset where the name that starts at `start` ends. That is the next delimiter, or the end of the text.
     #[inline]
     fn name_end(&self, start: usize) -> usize {
         let rest = &self.text.as_bytes()[start..];
@@ -229,7 +234,7 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
-    /// Skips a `#| |#` comment, and those nested in it.
+    /// Skips a `#| |#` block comment, including the block comments nested in it.
     fn block_comment(&mut self) -> Result<(), LexError> {
         let (bytes, start) = (self.text.as_bytes(), self.at);
         let (mut depth, mut at) = (0usize, start);
@@ -249,8 +254,8 @@ impl<'a> Lexer<'a> {
         Err(self.error(ErrorKind::Unclosed, start, start + 2))
     }
 
-    /// The abbreviation `byte` starts: one of `'`, `` ` ``, `,` or `,@`, which stand for
-    /// `which`'s four, in that order.
+    /// Returns the abbreviation that `byte` starts. `which` holds the prefixes for `'`, `` ` ``, `,` and `,@`,
+    /// in that order. For `,@`, the `@` is consumed too.
     fn prefix(&mut self, byte: u8, which: [Prefix; 4]) -> Prefix {
         match byte {
             b'\'' => which[0],
@@ -263,9 +268,9 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// What follows a `#` at `start`: a vector's or bytevector's opening, a datum comment, a
-    /// label or a use of one, a character, a keyword, a boolean or a number with prefixes, or
-    /// `None` for a directive.
+    /// Lexes the token that begins with the `#` at `start`. The token is an abbreviation such as `#'`, the opening of a vector or
+    /// bytevector, a datum comment, a datum label or a reference to one, a character, a keyword, a boolean, `#nil`, `#none`, or a
+    /// number with prefixes. Returns `None` for a directive, which produces no token.
     fn hash(&mut self, start: usize) -> Result<Option<Token<'a>>, LexError> {
         let rest = &self.text.as_bytes()[self.at..];
         let (token, len) = match *rest {
@@ -290,7 +295,7 @@ impl<'a> Lexer<'a> {
         Ok(Some(token))
     }
 
-    /// `#n=` or `#n#`, with `digits` digits after the `#` at `start`.
+    /// Lexes a `#n=` or `#n#`. Its `#` is at `start`, and `n` has `digits` digits.
     fn label(&mut self, start: usize, digits: usize) -> Result<Token<'a>, LexError> {
         let number = self.text[self.at..self.at + digits].parse::<u64>();
         let define = self.text.as_bytes()[self.at + digits] == b'=';
@@ -299,28 +304,33 @@ impl<'a> Lexer<'a> {
         Ok(if define { Token::Label(number) } else { Token::LabelRef(number) })
     }
 
-    /// A boolean, a directive or a number after a `#` at `start`.
+    /// Lexes a boolean, `#nil`, `#none`, a directive or a prefixed number that begins with the `#` at `start`. Returns `None` for a directive.
     fn hash_name(&mut self, start: usize) -> Result<Option<Token<'a>>, LexError> {
         self.at = self.name_end(self.at);
         let token = &self.text[start..self.at];
-        let is = |names: &[&str]| names.iter().any(|name| token.eq_ignore_ascii_case(name));
-        Ok(Some(match () {
-            () if is(&["#t", "#true"]) => Token::Boolean(true),
-            () if is(&["#f", "#false"]) => Token::Boolean(false),
-            () if is(&["#nil"]) => Token::Nil,
-            () if is(&["#none"]) => Token::NoneValue,
-            () if is(&["#!fold-case", "#!no-fold-case"]) => {
-                self.fold = token.len() == "#!fold-case".len();
-                return Ok(None);
-            }
-            _ if matches!(token.as_bytes()[1..].first(), Some(b'x' | b'X' | b'b' | b'B' | b'o' | b'O' | b'd' | b'D' | b'e' | b'E' | b'i' | b'I')) => {
-                Token::Number(token)
-            }
-            _ => return Err(self.error(ErrorKind::Unsupported, start, self.at)),
+        fn is(token: &str, names: &[&str]) -> bool {
+            names.iter().any(|name| token.eq_ignore_ascii_case(name))
+        }
+        if is(token, &["#!fold-case", "#!no-fold-case"]) {
+            self.fold = token.len() == "#!fold-case".len();
+            return Ok(None);
+        }
+        Ok(Some(if is(token, &["#t", "#true"]) {
+            Token::Boolean(true)
+        } else if is(token, &["#f", "#false"]) {
+            Token::Boolean(false)
+        } else if is(token, &["#nil"]) {
+            Token::Nil
+        } else if is(token, &["#none"]) {
+            Token::NoneValue
+        } else if matches!(token.as_bytes()[1..].first(), Some(b'x' | b'X' | b'b' | b'B' | b'o' | b'O' | b'd' | b'D' | b'e' | b'E' | b'i' | b'I')) {
+            Token::Number(token)
+        } else {
+            return Err(self.error(ErrorKind::Unsupported, start, self.at));
         }))
     }
 
-    /// A `#:` keyword at `start`, its name read as an identifier's is, or between `|`s.
+    /// Lexes the `#:` keyword at `start`. The keyword's name is read as an identifier is, or it is quoted between `|`s.
     fn keyword(&mut self, start: usize) -> Result<Token<'a>, LexError> {
         let from = start + 2;
         if self.text.as_bytes().get(from) == Some(&b'|') {
@@ -335,7 +345,7 @@ impl<'a> Lexer<'a> {
         Ok(Token::Keyword(if self.fold { Cow::Owned(name.to_lowercase()) } else { Cow::Borrowed(name) }))
     }
 
-    /// A `#\` character at `start`: the character after it, or the name of one.
+    /// Lexes the `#\` character at `start`. The text after `#\` is a single character or a character name.
     fn character(&mut self, start: usize) -> Result<Token<'a>, LexError> {
         let from = start + 2;
         let Some(first) = self.text[from..].chars().next() else { return Err(self.error(ErrorKind::BadChar, start, from)) };
@@ -352,8 +362,8 @@ impl<'a> Lexer<'a> {
         character.map(Token::Char).ok_or(self.error(ErrorKind::BadChar, start, self.at))
     }
 
-    /// The characters up to the `quote` that closes the one at `start`, with escapes as in
-    /// strings, and in strings, line continuations. Borrowed from the text if it has no escapes.
+    /// Returns the characters between the opening `quote` at `start` and the closing `quote`, with escapes decoded.
+    /// A string also allows line continuations. The result borrows from the text if the text has no escapes.
     fn quoted(&mut self, start: usize, quote: char) -> Result<Cow<'a, str>, LexError> {
         let text = self.text;
         let from = self.at;
@@ -364,16 +374,15 @@ impl<'a> Lexer<'a> {
             self.at = from + length + 1;
             return Ok(Cow::Borrowed(&text[from..from + length]));
         }
-        let unclosed = || LexError { kind: ErrorKind::Unclosed, start, end: start + 1 };
+        let unclosed = LexError { kind: ErrorKind::Unclosed, start, end: start + 1 };
         let mut out = String::new();
         let mut chars = text[from..].char_indices().map(|(offset, character)| (from + offset, character)).peekable();
         let end = loop {
-            let Some((at, character)) = chars.next() else { return Err(unclosed()) };
+            let Some((at, character)) = chars.next() else { return Err(unclosed) };
             match character {
                 _ if character == quote => break at + 1,
                 '\\' => {
-                    let bad = |to: usize| LexError { kind: ErrorKind::BadEscape, start: at, end: to };
-                    let Some((next, escape)) = chars.next() else { return Err(unclosed()) };
+                    let Some((next, escape)) = chars.next() else { return Err(unclosed) };
                     match escape {
                         'a' => out.push('\x07'),
                         'b' => out.push('\x08'),
@@ -390,25 +399,25 @@ impl<'a> Lexer<'a> {
                             let semicolon = chars.next_if(|&(_, character)| character == ';');
                             let to = semicolon.map_or(next + 1 + digits.len(), |(position, _)| position + 1);
                             let character = u32::from_str_radix(&digits, 16).ok().and_then(char::from_u32).filter(|_| semicolon.is_some());
-                            out.push(character.ok_or(bad(to))?);
+                            out.push(character.ok_or(self.error(ErrorKind::BadEscape, at, to))?);
                         }
-                        // A line ending, \n, \r\n or \r, with the spaces and tabs around it, is dropped.
+                        // A line continuation is dropped: the backslash, the spaces and tabs after it, one line ending (\n, \r\n or \r), and the spaces and tabs after that.
                         ' ' | '\t' | '\n' | '\r' if quote == '"' => {
                             let mut escape = escape;
                             while escape == ' ' || escape == '\t' {
                                 match chars.next() {
                                     Some((_, character)) => escape = character,
-                                    None => return Err(unclosed()),
+                                    None => return Err(unclosed),
                                 }
                             }
                             match escape {
                                 '\r' => _ = chars.next_if(|&(_, character)| character == '\n'),
                                 '\n' => {}
-                                _ => return Err(bad(next + 1)),
+                                _ => return Err(self.error(ErrorKind::BadEscape, at, next + 1)),
                             }
                             while chars.next_if(|&(_, character)| character == ' ' || character == '\t').is_some() {}
                         }
-                        _ => return Err(bad(next + escape.len_utf8())),
+                        _ => return Err(self.error(ErrorKind::BadEscape, at, next + escape.len_utf8())),
                     }
                 }
                 character => out.push(character),
@@ -418,15 +427,15 @@ impl<'a> Lexer<'a> {
         Ok(Cow::Owned(out))
     }
 
-    /// The dot, identifier or number from `start` to the lexer's position.
+    /// Returns the token for the text from `start` to the lexer's position: a dot, an identifier or a number.
     #[inline]
     fn atom(&self, start: usize) -> Token<'a> {
         let token = &self.text[start..self.at];
         if token == "." {
             return Token::Dot;
         }
-        // A token that starts as a number must be one. One that starts as `+i` or an infinity
-        // might be an identifier instead, as `+inf.0x` is.
+        // A token that starts as only a number can must be a number. A token that is `+i` or `-i`, or that starts
+        // with a signed infinity or NaN, might be an identifier instead, as `+inf.0x` is.
         if starts_numeric(token) {
             return Token::Number(token);
         }
@@ -435,23 +444,24 @@ impl<'a> Lexer<'a> {
     }
 }
 
-/// Whether `token` starts as only a number can.
+/// Returns whether `token` starts as only a number can: with a digit, optionally preceded by a sign, a `.`, or a sign and a `.`.
 #[inline]
 pub fn starts_numeric(token: &str) -> bool {
     matches!(token.as_bytes(), [b'0'..=b'9', ..] | [b'+' | b'-' | b'.', b'0'..=b'9', ..] | [b'+' | b'-', b'.', b'0'..=b'9', ..])
 }
 
-/// Whether `token` starts as `+i`, `-i` or a signed infinity or NaN, and so might be a number.
+/// Returns whether `token` is `+i` or `-i`, or starts with a signed `inf.0` or `nan.0`. Such a token might be a number or an identifier.
 #[inline]
 pub fn might_be_number(token: &str) -> bool {
     let after_sign = token.strip_prefix(['+', '-']).unwrap_or("");
-    let special = |name: &str| after_sign.get(..name.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(name));
-    after_sign.eq_ignore_ascii_case("i") || special("inf.0") || special("nan.0")
+    fn special(after_sign: &str, name: &str) -> bool {
+        after_sign.get(..name.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(name))
+    }
+    after_sign.eq_ignore_ascii_case("i") || special(after_sign, "inf.0") || special(after_sign, "nan.0")
 }
 
-/// The character named `name` after `#\`, as a name or as `x` and hex digits.
+/// Returns the character that `name` denotes after `#\`. `name` is a character name such as `space`, or `x` or `u` followed by hex digits.
 pub fn named_char(name: &str) -> Option<char> {
-    let hex = |digits: &str| u32::from_str_radix(digits, 16).ok().and_then(char::from_u32);
     match name {
         "alarm" => Some('\x07'),
         "backspace" => Some('\x08'),
@@ -464,7 +474,7 @@ pub fn named_char(name: &str) -> Option<char> {
         "tab" => Some('\t'),
         "vtab" => Some('\x0b'),
         "page" => Some('\x0c'),
-        _ => name.strip_prefix(['x', 'u']).and_then(hex),
+        _ => name.strip_prefix(['x', 'u']).and_then(|digits| u32::from_str_radix(digits, 16).ok().and_then(char::from_u32)),
     }
 }
 

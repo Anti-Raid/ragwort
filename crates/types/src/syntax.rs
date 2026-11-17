@@ -1,7 +1,7 @@
-//! Syntax, lexical context, and source locations, in the arena.
+//! Syntax objects, lexical contexts and source locations, stored in the arena.
 //!
-//! Syntax spans keep their source's metadata. A [`SyntaxSession`] separately keeps the source
-//! bytes alive; dropping its last clone allows the text to be collected.
+//! A syntax span keeps the metadata of its source alive. A [`SyntaxSession`] separately keeps the
+//! source bytes alive. Dropping the last clone of the session allows the text to be collected.
 
 use crate::gc::{ForeignRoot, FrozenRef, Gc, Mutation, OutOfMemory, Root, Value};
 use crate::objects::{
@@ -29,8 +29,8 @@ impl<'gc> SyntaxText<'gc> {
     }
 }
 
-/// Source metadata: a name, the text while a session keeps it, and where lines start.
-/// Sessions keep the text; spans keep only this.
+/// Source metadata: a name, the offsets where lines start, and the text while a session keeps it
+/// alive. A session keeps the text alive. A span keeps only the metadata alive.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SyntaxSource<'gc>(Gc<'gc, objects::SyntaxSource>);
 
@@ -61,12 +61,12 @@ impl<'gc> SyntaxSource<'gc> {
         self.0.size(mc) as usize
     }
 
-    /// Each line's first byte offset, from zero.
+    /// Returns the byte offset of the start of each line. Offsets count from zero.
     pub fn line_starts(self, mc: &Mutation<'gc>) -> &'gc [u32] {
         self.0.lines(mc).map_or(&[], |lines| lines)
     }
 
-    /// Looks up a byte offset, including EOF. Works after the text is collected.
+    /// Returns the line and column of byte `offset`, or `None` if `offset` is past the end of the source. The offset of the end of the source is valid. This works after the text has been collected.
     pub fn location(self, mc: &Mutation<'gc>, offset: u32) -> Option<SyntaxLocation> {
         if offset as usize > self.byte_len(mc) {
             return None;
@@ -85,8 +85,8 @@ pub struct SyntaxLocation {
     pub column: u32,
 }
 
-/// Keeps one source and its text alive across steps. Dropping the last clone releases the
-/// text for collection, while surviving spans keep the source metadata.
+/// Keeps one source and its text alive across steps. Dropping the last clone allows the text to
+/// be collected. Spans that are still alive keep the source metadata alive.
 #[derive(Clone)]
 pub struct SyntaxSession {
     root: Root<objects::Session>,
@@ -120,8 +120,9 @@ impl SyntaxSession {
     }
 }
 
-/// `len` zeroed items that `fill` sets, frozen and charged their size, failing as an allocation
-/// would rather than aborting when the system has no room for them.
+/// Allocates a frozen slice of `len` default-valued items, which `fill` then initializes. The
+/// arena's budget is charged the size of the slice. If the system cannot allocate the slice, this
+/// fails as an arena allocation does, instead of aborting.
 fn frozen_slice<'gc, T: Copy + Default + 'static>(
     mc: &Mutation<'gc>,
     len: usize,
@@ -141,8 +142,8 @@ fn line_starts(bytes: &[u8]) -> impl Iterator<Item = u32> + '_ {
     }))
 }
 
-/// A source range `start..end`, measured in bytes. Keeps the metadata alive, not the text.
-/// A default span has no source.
+/// A source range `start..end`, measured in bytes. A span keeps the source metadata alive, but
+/// not the text. A default span has no source.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SyntaxSpan<'gc> {
     source: Option<SyntaxSource<'gc>>,
@@ -151,7 +152,7 @@ pub struct SyntaxSpan<'gc> {
 }
 
 impl<'gc> SyntaxSpan<'gc> {
-    /// Checks `start <= end <= source.byte_len()`.
+    /// Returns a span of `source`, or `None` unless `start <= end <= source.byte_len()`.
     #[inline]
     pub fn new(mc: &Mutation<'gc>, source: SyntaxSource<'gc>, start: u32, end: u32) -> Option<Self> {
         (start <= end && end as usize <= source.byte_len(mc)).then_some(Self { source: Some(source), start, end })
@@ -186,9 +187,9 @@ impl<'gc> SyntaxSpan<'gc> {
     }
 }
 
-/// A scope. Identifiers with the same name are the same identifier only if they have the same
-/// scopes, which are compared by identity, so any object can stand for one; [`SyntaxScope::new`]
-/// makes one that's apart from every other.
+/// A scope. Two identifiers with the same name are the same identifier only if they have the
+/// same scopes. Scopes are compared by identity, so any object can serve as a scope.
+/// [`SyntaxScope::new`] creates a scope that is distinct from every other scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SyntaxScope<'gc>(Value<'gc>);
 
@@ -197,7 +198,7 @@ impl<'gc> SyntaxScope<'gc> {
         Ok(Self(Value::object(mc, objects::SyntaxScope::new(mc)?)))
     }
 
-    /// The scope `value` stands for.
+    /// Returns the scope that `value` represents.
     pub fn of(value: Value<'gc>) -> Self {
         Self(value)
     }
@@ -207,7 +208,7 @@ impl<'gc> SyntaxScope<'gc> {
     }
 }
 
-/// An identifier's scopes, each once.
+/// An identifier's scopes. Each scope appears once.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SyntaxContext<'gc>(Gc<'gc, objects::SyntaxContext>);
 
@@ -246,8 +247,8 @@ impl<'gc> SyntaxOrigin<'gc> {
 }
 
 crate::named! {
-    /// Reader shorthand for quotation and unquotation, of data and of syntax, named for the form
-    /// each stands for.
+    /// A reader abbreviation for quoting or unquoting data or syntax. Each variant is named after
+    /// the form it stands for.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Abbreviation {
         /// `'`
@@ -355,14 +356,14 @@ impl<'gc> SyntaxMeta<'gc> {
 pub struct Syntax<'gc>(Gc<'gc, objects::Syntax>);
 
 impl<'gc> Syntax<'gc> {
-    /// Metadata describes the datum's shape; this does not check that they agree.
+    /// Creates a syntax node. `meta` describes the shape of `datum`. This does not check that they agree.
     #[inline]
     pub fn new(mc: &Mutation<'gc>, datum: Value<'gc>, span: SyntaxSpan<'gc>, meta: Option<SyntaxMeta<'gc>>) -> Result<Self, OutOfMemory> {
         Self::bound(mc, datum, span, meta, None)
     }
 
-    /// An identifier's syntax that also says what it refers to: `binding`, a value made to
-    /// stand for it, which [`Syntax::binding`] gives back.
+    /// Creates a syntax node as [`Syntax::new`] does, and also stores `binding`. For an identifier,
+    /// `binding` is a value that represents what the identifier refers to. [`Syntax::binding`] returns it.
     #[inline]
     pub fn bound(
         mc: &Mutation<'gc>,
@@ -391,8 +392,7 @@ impl<'gc> Syntax<'gc> {
         self.0.meta(mc).map(SyntaxMeta)
     }
 
-    /// What an identifier refers to, if what made it said: a value made to stand for its
-    /// binding.
+    /// Returns the binding value passed to [`Syntax::bound`], or `None` if there was none.
     pub fn binding(self, mc: &Mutation<'gc>) -> Option<Value<'gc>> {
         Some(self.0.binding(mc)).filter(|&binding| binding != Value::FALSE)
     }

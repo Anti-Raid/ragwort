@@ -1,35 +1,35 @@
-//! `match`, as Racket's: `(match e clause ...)` tries each clause's pattern on `e`'s value in
-//! turn and runs the body of the first that matches, with the pattern's variables bound. A
-//! clause is `[pattern body ...+]`, `[pattern #:when test body ...+]`, which also needs `test`
-//! true, or `[pattern (=> id) body ...+]`, which binds `id` to a procedure of no arguments that
-//! goes on to the next clause. When none matches, it raises an error with the value.
+//! `match`, as in Racket. `(match e clause ...)` tries the pattern of each clause on the value of `e`, in
+//! order. It runs the body of the first clause whose pattern matches, with the pattern's variables bound. A
+//! clause is `[pattern body ...+]`, or `[pattern #:when test body ...+]`, which also requires `test`
+//! to be true, or `[pattern (=> id) body ...+]`, which binds `id` to a procedure of no arguments that
+//! continues with the next clause. If no clause matches, `match` raises an error with the value.
 //!
 //! The patterns:
-//! - `_` matches anything; an identifier matches anything and binds it, and one that's already
-//!   bound in the pattern matches what's `equal?` to what it's bound to.
+//! - `_` matches any value. An identifier matches any value and binds it. An identifier that is already
+//!   bound in the pattern matches a value that is `equal?` to its binding.
 //! - A number, string, character, boolean, keyword, `()`, `'datum` or vector literal matches
-//!   what's `equal?` to it.
-//! - `(list p ...)` a list of as many elements, `(list-rest p ... rest)` and `(cons p rest)` one
-//!   with a tail matching `rest`. A list's last pattern can be followed by `...`, which matches
-//!   the rest of the list, each element matching it, and binds each of its variables to a list.
-//! - `(vector p ...)` a vector of as many elements.
-//! - `(name p ...)`, `name` a struct's, a struct of its type, or of a subtype of it, each field
-//!   matching its `p`: all its fields, its supertype's first. One `p` can be followed by `...`,
-//!   which matches it against each field the other patterns leave, and binds each of its
-//!   variables to a list: `(user name _ ...)` looks at the first field only, and
-//!   `(point3 x rest ...)` binds `rest` to the list of the other two.
-//! - `(? pred p ...)` what `pred` is true of and each `p` matches; `(and p ...)` what each `p`
-//!   matches; `(or p ...)` what any does, each binding the same variables; `(not p ...)` what
-//!   none does, binding nothing.
-//! - `(app f p)` what `p` matches the result of `f` on; `(== v)` what's `equal?` to `v`, and
-//!   `(== v same?)` what `(same? v x)` is true for.
+//!   a value that is `equal?` to it.
+//! - `(list p ...)` matches a list with one element for each `p`. `(list-rest p ... rest)` and `(cons p rest)` match a pair chain
+//!   whose remaining tail matches `rest`. The last pattern of a list can be followed by `...`. It then matches
+//!   each remaining element of the list, and each of its variables is bound to the list of its matches.
+//! - `(vector p ...)` matches a vector with one element for each `p`.
+//! - `(name p ...)`, where `name` is the name of a struct, matches an instance of that struct type or of a subtype. There is one
+//!   `p` for each field, for all fields, the supertype's first. One `p` can be followed by `...`.
+//!   That `p` is matched against each field that the other patterns do not take, and each of its
+//!   variables is bound to a list. `(user name _ ...)` examines the first field only, and
+//!   `(point3 x rest ...)` binds `rest` to the list of the other two fields.
+//! - `(? pred p ...)` matches a value for which `pred` returns true and which each `p` matches. `(and p ...)` matches a value that each `p`
+//!   matches. `(or p ...)` matches a value that any `p` matches, and each `p` must bind the same variables. `(not p ...)` matches a value that
+//!   no `p` matches, and binds nothing.
+//! - `(app f p)` matches a value `x` if `p` matches `(f x)`. `(== v)` matches a value that is `equal?` to `v`.
+//!   `(== v same?)` matches a value `x` for which `(same? v x)` is true.
 //!
-//! It's a step to simpler syntax, as the other macros in Rust are: each pattern is a list of
-//! [`Step`]s, which [`Matching::emit`] makes `if`s and `let`s of, and a clause that fails calls a
-//! procedure of no arguments that tries the next clause, which the compiler makes a jump. As in
-//! Racket, the pattern's variables are bound only in the clause's body, and clauses next to each
-//! other that start by looking at the same parts of the value the same way share those steps, so
-//! a part can be looked at fewer times than the patterns say, if a predicate changes it.
+//! `match` rewrites its use into simpler syntax in one step, as the other built-in macros do. Each pattern is compiled to a list of
+//! [`Step`]s, and [`Matching::emit`] turns the steps into `if` and `let` forms. A clause that fails calls a
+//! procedure of no arguments that tries the next clause. The compiler turns that call into a jump. As in
+//! Racket, the variables of a pattern are bound only in the body of the clause. Adjacent clauses
+//! that start with the same tests and reads of the value share those steps. So
+//! a part of the value can be read fewer times than the patterns suggest, which a predicate that changes the value can observe.
 
 use std::collections::HashMap;
 
@@ -43,14 +43,14 @@ use crate::scope::Set;
 use crate::tree::{Stx, View};
 use crate::{ExpandError, ExpandErrorKind};
 
-/// A temporary, which is the same as another with its number.
+/// A temporary variable. Two temporaries with the same number `n` are the same variable.
 #[derive(Clone, Copy)]
 struct Temp {
     n: u32,
     stx: Stx,
 }
 
-/// What a test with no effects checks a temporary is.
+/// A property of a temporary's value that a test without side effects checks.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Shape {
     Pair,
@@ -58,11 +58,11 @@ enum Shape {
     List,
     Vector,
     Length(usize),
-    /// A struct of the type that's this one of the matcher's.
+    /// An instance of the struct type at this index in `Matcher::structs`.
     Struct(usize),
 }
 
-/// A part of a pair or vector, or a field of a struct of one of the matcher's types.
+/// A component of a value: the car or cdr of a pair, an element of a vector, or a field of a struct. `Field(of, index)` is field `index` of the struct type at index `of` in `Matcher::structs`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Part {
     Car,
@@ -71,8 +71,8 @@ enum Part {
     Field(usize, usize),
 }
 
-/// One of a struct pattern's patterns, with the fields it's matched against, `count` of them
-/// from `first` on: one, or for a pattern that `...` follows, as many as the others leave.
+/// A sub-pattern of a struct pattern, and the fields it is matched against: `count` fields
+/// starting at field `first`. `count` is 1, except for a sub-pattern followed by `...`, which gets the fields that the other sub-patterns leave.
 #[derive(Clone, Copy)]
 struct FieldPat {
     pat: Stx,
@@ -81,35 +81,35 @@ struct FieldPat {
     repeats: bool,
 }
 
-/// A struct type patterns name: an expression for it, and what tells it from the others.
+/// A struct type that a pattern names: an expression for the type, and the type's value, which identifies it.
 struct Named<'gc> {
     kind: Stx,
     key: Value<'gc>,
 }
 
-/// What matching a pattern does, in order.
+/// One step of matching a pattern. The steps of a pattern run in order.
 enum Step {
-    /// Goes on if the temporary has the shape.
+    /// Continues if the temporary has the shape. Otherwise the match fails.
     Is(Shape, Temp),
-    /// Binds the first temporary to the part of the second, which it's always the one for.
+    /// Binds the first temporary to the given part of the second. A given part of a given temporary is always bound to the same temporary.
     Get(Temp, Part, Temp),
-    /// Goes on if the expression is true.
+    /// Continues if the expression is true. Otherwise the match fails.
     Test(Stx),
-    /// Binds a temporary to the expression for what's after.
+    /// Binds the temporary to the value of the expression, for the steps after this one.
     Bind(Temp, Stx),
-    /// Binds a pattern variable to the expression for what's after.
+    /// Binds the pattern variable to the value of the expression, for the code after this step.
     Var(Stx, Stx),
-    /// Goes on if any of `alts` matches, with `results` bound to that alternative's `values`.
+    /// Continues if any of `alts` matches. `results` are then bound to the `values` of the alternative that matched.
     Or { alts: Vec<Vec<Step>>, values: Vec<Vec<Stx>>, results: Vec<Stx> },
-    /// Goes on if the steps don't match.
+    /// Continues if the steps do not match.
     Not(Vec<Step>),
-    /// Goes on if `list` is a list each element of which, in `item`, matches `steps`, with each
-    /// of `results` bound to the list of what its `values` was for each.
+    /// Continues if `list` is a list and each of its elements matches `steps`. `item` is bound to each element in turn. Each
+    /// of `results` is then bound to a list that holds the value of the corresponding expression of `values` for each element.
     Each { list: Temp, item: Temp, steps: Vec<Step>, values: Vec<Stx>, results: Vec<Stx> },
 }
 
 impl Step {
-    /// Whether this step is `other`, and has no effects, so clauses can share it.
+    /// Returns whether this step is the same as `other` and has no side effects, so that clauses can share it.
     fn shares(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Is(shape, temp), Self::Is(other, other_temp)) => shape == other && temp.n == other_temp.n,
@@ -119,8 +119,8 @@ impl Step {
     }
 }
 
-/// A clause's body: `body` if `guard` is true, with `escape` bound to the procedure that goes on
-/// to the next clause.
+/// The body of a clause. `body` runs if `guard` is true or absent. `escape`, if present, is bound to the procedure that continues
+/// with the next clause.
 struct Body {
     clause: Stx,
     guard: Option<Stx>,
@@ -128,12 +128,12 @@ struct Body {
     body: Vec<Stx>,
 }
 
-/// What tells a pattern variable from others: its name and its scopes.
+/// The identity of a pattern variable: its name and its scope set.
 type Key<'gc> = (Symbol<'gc>, Set);
 
-/// A `match` being expanded: where it is, how many temporaries it has made, the one for each
-/// part of each, and the pattern variables of the pattern so far, each with what tells it from
-/// others of its name and what it's bound to.
+/// The state of expanding one `match` form. `at` is the form. `temps` is the number of temporaries created. `parts` maps
+/// a temporary's number and a part to the temporary for that part. `seen` holds the pattern variables of the current pattern so far.
+/// `structs` holds the struct types that the patterns name.
 struct Matcher<'gc> {
     at: Stx,
     temps: u32,
@@ -142,7 +142,7 @@ struct Matcher<'gc> {
     structs: Vec<Named<'gc>>,
 }
 
-/// A pattern variable: its identifier, name and scopes, and what it's bound to.
+/// A pattern variable: its identifier, its name and scope set, and the expression for the value it is bound to.
 #[derive(Clone, Copy)]
 struct Seen<'gc> {
     id: Stx,
@@ -157,8 +157,8 @@ impl<'gc> Seen<'gc> {
     }
 }
 
-// A step's steps go on a list to drop, so dropping steps nested as deeply as their pattern takes
-// no more of the machine's stack.
+// Dropping a step moves its nested steps to a work list, and the loop drops them one by one. So the native stack
+// does not grow with the nesting depth of the pattern.
 impl Drop for Step {
     fn drop(&mut self) {
         let mut todo = Vec::new();
@@ -181,36 +181,36 @@ impl Step {
     }
 }
 
-/// A `match` being expanded, by the expander: the steps of the patterns being made, the
-/// innermost last.
+/// The expander, with the state of the `match` form being expanded. `out` is a stack of the step lists of the patterns being compiled, with the
+/// innermost pattern last.
 struct Matching<'e, 'a, 'gc> {
     ex: &'e mut Expander<'a, 'gc>,
     m: Matcher<'gc>,
     out: Vec<Vec<Step>>,
 }
 
-/// What making a pattern's steps does next: see [`steps`]. Each call adds those of a pattern
-/// matched against a temporary.
+/// The next step of compiling a pattern. See [`steps`]. Each call holds a temporary and a pattern, and adds the steps that match the pattern
+/// against the temporary.
 type Pat<'e, 'a, 'gc> = Next<'e, Matching<'e, 'a, 'gc>, (Temp, Stx), (), ExpandError>;
 
-/// What making a `match`'s code does next. Each call makes code.
+/// The next step of generating the code of a `match`. Each call produces syntax.
 type Em<'s, 'e, 'a, 'gc> = Next<'s, Matching<'e, 'a, 'gc>, Code<'s>, Stx, ExpandError>;
 
-/// A clause's steps left, and its body.
+/// The remaining steps of a clause, and its body.
 type Clause<'s> = (&'s [Step], &'s Body);
 
-/// Code a `match` needs made.
+/// A call that generates a part of the code of a `match`.
 enum Code<'s> {
-    /// That of [`Matching::emit`].
+    /// The arguments of [`Matching::emit`].
     Emit(&'s [Step], Stx, Stx),
-    /// That of [`Matching::tries`].
+    /// The arguments of [`Matching::tries`].
     Tries(Vec<Clause<'s>>, Stx),
-    /// That of [`Matching::match_run`].
+    /// The arguments of [`Matching::match_run`].
     Run(Vec<Clause<'s>>, Stx),
 }
 
-/// An `or` pattern's alternatives being matched: the alternatives, the steps of those so far,
-/// and the variables each binds.
+/// The state of compiling an `or` pattern. `x` is the temporary to match. `alts` are the alternatives. `before` is `Matcher::seen` as it was before the pattern. `steps` and `bound` hold,
+/// for each alternative compiled so far, its steps and the variables it binds.
 struct Or<'gc> {
     x: Temp,
     alts: Vec<Stx>,
@@ -219,8 +219,8 @@ struct Or<'gc> {
     bound: Vec<Vec<Seen<'gc>>>,
 }
 
-/// An `or` step's code being made, its alternatives from the last: those `left`, and the code
-/// of those after them.
+/// The state of generating the code of an `or` step. The alternatives are handled from the last to the first. `left` is the number still to handle, and `next` is the code
+/// of the alternatives after them.
 struct Alternatives<'s> {
     alts: &'s [Vec<Step>],
     values: &'s [Vec<Stx>],
@@ -232,8 +232,8 @@ struct Alternatives<'s> {
 }
 
 impl<'gc> Expander<'_, 'gc> {
-    /// `(let ((x expr)) (let ((none (lambda () (error ...)))) clauses))`, the clauses as
-    /// [`Matching::tries`] makes them.
+    /// Expands `match` to `(let ((x expr)) (let ((none (lambda () (error ...)))) clauses))`.
+    /// [`Matching::tries`] generates the code of the clauses.
     pub(crate) fn match_form(&mut self, stx: Stx, expr: Stx, clauses: &[Stx]) -> Result<Stx, ExpandError> {
         let matcher = Matcher { at: stx, temps: 0, parts: HashMap::new(), seen: Vec::new(), structs: Vec::new() };
         Matching { ex: self, m: matcher, out: Vec::new() }.form(stx, expr, clauses)
@@ -258,7 +258,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         self.ex.with_temp(stx, target.stx, expr, code)
     }
 
-    /// `(let ((name (lambda () body))) code)`.
+    /// Builds `(let ((name (lambda () body))) code)`.
     fn let_thunk(&mut self, at: Stx, name: Stx, body: Stx, code: Stx) -> Result<Stx, ExpandError> {
         let none = self.ex.list(&[], at)?;
         let lambda = self.ex.build(at, "lambda", &[&[none, body]])?;
@@ -270,7 +270,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         Ok(Temp { n: self.m.temps, stx: self.ex.introduce(&format!("x{}", self.m.temps), self.m.at)? })
     }
 
-    /// The temporary for `part` of `target`: the same one each time.
+    /// Returns the temporary for `part` of `target`. Each call with the same arguments returns the same temporary.
     fn part(&mut self, target: Temp, part: Part) -> Result<Temp, ExpandError> {
         if let Some(&temp) = self.m.parts.get(&(target.n, part)) {
             return Ok(temp);
@@ -288,15 +288,15 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         }
     }
 
-    /// The code of `clauses`: the body of the first whose steps match, or else `(fail)`. Each
-    /// run of clauses that start with the same step that has no effects share it, and the run
-    /// fails by calling a procedure that tries what's after it.
+    /// Generates the code of `clauses`: the body of the first clause whose steps match, or `(fail)` if none does. Adjacent
+    /// clauses that start with the same step without side effects form a run, and share that step. A run
+    /// that fails calls a procedure that tries the clauses after the run.
     ///
-    /// A run that starts with a test, such as `(point? x)`, is in two procedures: `matched`,
-    /// which is the rest of the run, and one that's just `(if test (matched) (next))`. The
-    /// optimizer takes a call of that small one to be a call of the procedure it picks,
-    /// wherever what's known decides the test: a clause that failed for not being a `point`
-    /// goes past the later `point` clauses without testing again, however many there are.
+    /// A run that starts with a test, such as `(point? x)`, becomes two procedures. `matched`
+    /// is the rest of the run. The other procedure is only `(if test (matched) (next))`. Where the
+    /// optimizer already knows the result of the test, it replaces a call of that small procedure with a call of the procedure that the test picks.
+    /// So a clause that failed because the value is not a `point`
+    /// skips all later `point` clauses without testing again.
     fn tries<'s>(&mut self, clauses: Vec<Clause<'s>>, fail: Stx) -> Result<Em<'s, 'e, 'a, 'gc>, ExpandError> {
         let mut runs = Vec::new();
         let mut rest = clauses.as_slice();
@@ -315,13 +315,13 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         self.runs(runs, Vec::new(), fail)
     }
 
-    /// The code of the `runs` left, from the last. A run that fails calls `next`, and the
-    /// procedures the runs after these are in are `later`, each with its name, from the last
-    /// run's: each is bound around those after it in `later` and the code of the first run.
+    /// Generates the code of the remaining `runs`, starting with the last. A run that fails calls `next`. `later` holds the
+    /// procedures of the runs generated so far, each with its name, starting with those of the last
+    /// run. Each procedure is bound around the procedures after it in `later` and around the code of the first run.
     fn runs<'s>(&mut self, mut runs: Vec<Vec<Clause<'s>>>, mut later: Vec<(Stx, Stx)>, next: Stx) -> Result<Em<'s, 'e, 'a, 'gc>, ExpandError> {
         let at = self.m.at;
         let run = runs.pop().expect("a run left");
-        // The first run is tried where the match is.
+        // The first run needs no procedure. Its code runs in place, where the `match` form is.
         if runs.is_empty() {
             return Ok(Next::then(Code::Run(run, next), move |this: &mut Self, mut code| {
                 for (name, body) in later.into_iter().rev() {
@@ -337,7 +337,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
                 matching.runs(runs, later, tries)
             }));
         };
-        // A run that starts with a test is the test, which picks a procedure, and the rest.
+        // A run that starts with a test becomes two procedures: the test, which picks a procedure to call, and the rest of the run.
         let matched = self.temp()?.stx;
         let test = self.shape_test(shape, temp)?;
         let (to_matched, to_next) = (self.ex.list(&[matched], at)?, self.ex.list(&[next], at)?);
@@ -352,7 +352,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         }))
     }
 
-    /// The test of whether `target` has `shape`.
+    /// Builds the expression that tests whether `target` has `shape`.
     fn shape_test(&mut self, shape: Shape, target: Temp) -> Result<Stx, ExpandError> {
         let at = self.m.at;
         Ok(match shape {
@@ -373,7 +373,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         })
     }
 
-    /// The code of `run`, clauses that all start with the same step if there's more than one.
+    /// Generates the code of `run`. If `run` has more than one clause, all of its clauses start with the same step.
     fn match_run<'s>(&mut self, run: Vec<Clause<'s>>, fail: Stx) -> Result<Em<'s, 'e, 'a, 'gc>, ExpandError> {
         let failed = self.ex.list(&[fail], self.m.at)?;
         if let [(steps, body)] = *run.as_slice() {
@@ -385,7 +385,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         Ok(Next::then(Code::Tries(rest, fail), move |_, done| Ok(Next::Tail(Code::Emit(&shared[..1], done, failed)))))
     }
 
-    /// A clause's steps for matching `target` and its body.
+    /// Parses `clause`. Returns the steps that match its pattern against `target`, and its body.
     fn clause(&mut self, target: Temp, clause: Stx) -> Result<(Vec<Step>, Body), ExpandError> {
         let parts = self.ex.proper(clause)?;
         let Some((&pattern, rest)) = parts.split_first() else { return Err(self.ex.error(ExpandErrorKind::BadSyntax, clause)) };
@@ -405,7 +405,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         Ok((steps, Body { clause, guard, escape, body: body.to_vec() }))
     }
 
-    /// The code of `body`, which calls `fail` if its guard is false.
+    /// Builds the code of `body`. The code calls `fail` if the guard is false.
     fn match_body(&mut self, body: &Body, fail: Stx) -> Result<Stx, ExpandError> {
         let Body { clause, guard, escape, ref body } = *body;
         let none = self.ex.list(&[], clause)?;
@@ -420,7 +420,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         }
     }
 
-    /// The `id` of `(=> id)`, if `stx` is one.
+    /// Returns `id` if `stx` is `(=> id)`.
     fn escape(&mut self, stx: Stx) -> Result<Option<Stx>, ExpandError> {
         let View::List(items, None) = self.ex.tree.view(stx)? else { return Ok(None) };
         Ok(match *items {
@@ -429,7 +429,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         })
     }
 
-    /// The steps of matching `pattern` against `target`, binding its variables last.
+    /// Returns the steps that match `pattern` against `target`. The steps that bind the pattern's variables come last.
     fn match_pattern(&mut self, target: Temp, pattern: Stx) -> Result<Vec<Step>, ExpandError> {
         self.out.push(Vec::new());
         steps::run(self, (target, pattern), Self::pattern)?;
@@ -439,8 +439,8 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         Ok(steps)
     }
 
-    /// The steps of matching `pattern` against `target` within another pattern, which binds none of its
-    /// variables, to `then`: what they're bound to is in `m.seen`.
+    /// Compiles `pattern`, a part of another pattern, against `target`, and passes the steps to `then`. The steps bind none of the pattern's
+    /// variables. The expression for the value of each variable is in `m.seen`.
     fn inner_pattern(&mut self, target: Temp, pattern: Stx, then: impl FnOnce(&mut Self, Vec<Step>) -> Result<Pat<'e, 'a, 'gc>, ExpandError> + 'e) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
         self.out.push(Vec::new());
         Ok(Next::then((target, pattern), move |this: &mut Self, ()| {
@@ -454,8 +454,8 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         self.out.last_mut().expect("a pattern's steps").push(step);
     }
 
-    /// Binds the variables `m.seen` has from `first` on to `results`, temporaries for what they're
-    /// bound to once an `or` or a repeat has matched.
+    /// Binds the variables of `m.seen` from index `first` on to `results`. `results` are the temporaries that hold the
+    /// values of the variables once an `or` or a repeat has matched.
     fn bind_results(&mut self, first: usize, results: &[Stx]) {
         let out = self.out.last_mut().expect("a pattern's steps");
         for (seen, &result) in self.m.seen[first..].iter_mut().zip(results) {
@@ -464,12 +464,11 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         }
     }
 
-    /// Adds what matching `pattern` against `target` does to the steps being made.
+    /// Adds the steps that match `pattern` against `target` to the step list being built.
     fn pattern(&mut self, (target, pattern): (Temp, Stx)) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
-        let bad = |this: &Self, at| Err(this.ex.error(ExpandErrorKind::BadSyntax, at));
         let (items, tail) = match self.ex.tree.view(pattern)? {
             View::Id if self.ex.is_aux(pattern, Aux::Underscore)? => return Ok(Next::Done(())),
-            View::Id if self.ex.is_aux(pattern, Aux::Ellipsis)? => return bad(self, pattern),
+            View::Id if self.ex.is_aux(pattern, Aux::Ellipsis)? => return Err(self.ex.error(ExpandErrorKind::BadSyntax, pattern)),
             View::Id => {
                 self.variable(target, pattern)?;
                 return Ok(Next::Done(()));
@@ -495,7 +494,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         };
         let name = match self.ex.tree.symbol(items[0]) {
             Some(symbol) if tail.is_none() => string::chars(&Strings::new(self.ex.mc), symbol.name(self.ex.mc)).collect::<String>(),
-            _ => return bad(self, pattern),
+            _ => return Err(self.ex.error(ExpandErrorKind::BadSyntax, pattern)),
         };
         let args = &items[1..];
         let step = match (name.as_str(), args) {
@@ -530,7 +529,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
             ("==", &[expected]) => Step::Test(self.ex.build(pattern, "equal?", &[&[expected, target.stx]])?),
             ("==", &[expected, same]) => Step::Test(self.ex.list(&[same, expected, target.stx], pattern)?),
             _ => {
-                let Some(info) = self.ex.struct_info(items[0])? else { return bad(self, pattern) };
+                let Some(info) = self.ex.struct_info(items[0])? else { return Err(self.ex.error(ExpandErrorKind::BadSyntax, pattern)) };
                 let pats = self.field_pats(pattern, args, info.fields.len())?;
                 let key = info.kind;
                 let known = self.m.structs.iter().position(|named| named.key == key);
@@ -550,15 +549,15 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         Ok(Next::Done(()))
     }
 
-    /// Matches each of `pats` from `i` on against `target`.
+    /// Matches `target` against each of `pats` from index `i` on.
     fn each_pattern(&mut self, target: Temp, pats: Vec<Stx>, i: usize) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
         let Some(&pat) = pats.get(i) else { return Ok(Next::Done(())) };
         Ok(Next::then((target, pat), move |this: &mut Self, ()| this.each_pattern(target, pats, i + 1)))
     }
 
-    /// The fields each of `pats`, the patterns of the struct pattern `pattern`, is matched against,
-    /// the struct having `fields` of them. Only one pattern can repeat, and there's a field
-    /// for each one that doesn't.
+    /// Assigns fields to `pats`, the sub-patterns of the struct pattern `pattern`.
+    /// `fields` is the number of fields of the struct. At most one sub-pattern can be followed by `...`. Each
+    /// other sub-pattern gets exactly one field.
     fn field_pats(&mut self, pattern: Stx, pats: &[Stx], fields: usize) -> Result<Vec<FieldPat>, ExpandError> {
         let bad = ExpandErrorKind::BadSyntax;
         let mut dots = None;
@@ -589,16 +588,16 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         Ok(out)
     }
 
-    /// A temporary for field `index` of `target`, a struct of the matcher's type `of`, read by then.
+    /// Adds a step that reads field `index` of `target`, and returns the temporary that holds the field. `target` is an instance of the struct type at index `of` in `m.structs`.
     fn field(&mut self, target: Temp, of: usize, index: usize) -> Result<Temp, ExpandError> {
         let field = self.part(target, Part::Field(of, index))?;
         self.push(Step::Get(field, Part::Field(of, index), target));
         Ok(field)
     }
 
-    /// Matches the fields of `target`, a struct of the matcher's type `of`, against `pats` from `i`
-    /// on. A pattern that repeats is matched against the list of its fields, as a list's last
-    /// pattern is against the rest of the list, and `_ ...` reads none.
+    /// Matches the fields of `target` against `pats` from index `i` on. `target` is an instance of the struct type at index `of` in `m.structs`.
+    /// A sub-pattern followed by `...` is matched against the list of its fields, in the way the last
+    /// pattern of a list is matched against the rest of the list. `_ ...` reads no field.
     fn field_pattern(&mut self, target: Temp, of: usize, pats: Vec<FieldPat>, i: usize) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
         let Some(&FieldPat { pat, first, count, repeats }) = pats.get(i) else { return Ok(Next::Done(())) };
         if !repeats {
@@ -623,8 +622,8 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         self.repeat_pattern(all, pat, move |this| this.field_pattern(target, of, pats, i + 1))
     }
 
-    /// An error if the pattern so far binds the variable `id`: one that's bound to a list of
-    /// what it matched can't also be a test against what it was bound to before.
+    /// Returns a `Duplicate` error if the pattern so far already binds the variable `id`. A variable that is bound to a list of
+    /// matches cannot also be an equality test against an earlier binding.
     fn not_bound(&mut self, id: Stx) -> Result<(), ExpandError> {
         let key = (self.ex.tree.symbol(id).expect("an identifier"), self.ex.tree.scopes_of(id)?);
         if self.m.seen.iter().any(|seen| seen.key() == key) {
@@ -633,8 +632,8 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         Ok(())
     }
 
-    /// Matches each element of `list`, a list, against `item`, binds each of `item`'s variables
-    /// to the list of what it was bound to for each element, and goes on to `then`.
+    /// Matches each element of the list `list` against the pattern `item`. Binds each variable of `item`
+    /// to the list of its values, one for each element. Then continues with `then`.
     fn repeat_pattern(&mut self, list: Temp, item: Stx, then: impl FnOnce(&mut Self) -> Result<Pat<'e, 'a, 'gc>, ExpandError> + 'e) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
         let element = self.temp()?;
         let before = std::mem::take(&mut self.m.seen);
@@ -653,7 +652,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         })
     }
 
-    /// Matches the items of the vector `target` from `i` on against `pats`.
+    /// Matches the elements of the vector `target` from index `i` on against `pats`.
     fn vector_pattern(&mut self, target: Temp, pats: Vec<Stx>, i: usize) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
         let Some(&pat) = pats.get(i) else { return Ok(Next::Done(())) };
         if self.ex.is_aux(pat, Aux::Ellipsis)? {
@@ -664,14 +663,14 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         Ok(Next::then((item, pat), move |this: &mut Self, ()| this.vector_pattern(target, pats, i + 1)))
     }
 
-    /// Matches the alternatives of `or` from the next on, each binding the same variables.
+    /// Compiles the alternatives of `or` that are not compiled yet. Each alternative must bind the same variables.
     fn or_pattern(&mut self, mut or: Or<'gc>) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
         if let Some(&alt) = or.alts.get(or.steps.len()) {
             self.m.seen.clone_from(&or.before);
             return self.inner_pattern(or.x, alt, move |this, steps| {
                 or.steps.push(steps);
                 let vars = this.m.seen[or.before.len()..].to_vec();
-                // Each alternative binds the same variables, in any order.
+                // Each alternative must bind the same variables. Their order can differ.
                 if let Some(first) = or.bound.first()
                     && (first.len() != vars.len() || !vars.iter().all(|var| first.iter().any(|other| other.key() == var.key())))
                 {
@@ -692,7 +691,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         Ok(Next::Done(()))
     }
 
-    /// Matches `target` against none of `pats` from `i` on, binding nothing.
+    /// Adds steps that require `target` to match none of `pats` from index `i` on. The steps bind nothing.
     fn not_pattern(&mut self, target: Temp, pats: Vec<Stx>, i: usize) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
         let Some(&pat) = pats.get(i) else { return Ok(Next::Done(())) };
         let before = self.m.seen.clone();
@@ -703,8 +702,8 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         })
     }
 
-    /// Matches anything, bound to `id`, or if `id` is already bound in the pattern, what's
-    /// `equal?` to it.
+    /// Compiles the variable pattern `id`. It matches any value and binds `id` to it. If the pattern already binds `id`, it instead matches a value that is
+    /// `equal?` to that binding.
     fn variable(&mut self, target: Temp, id: Stx) -> Result<(), ExpandError> {
         let seen = Seen { id, symbol: self.ex.tree.symbol(id).expect("an identifier"), set: self.ex.tree.scopes_of(id)?, value: target.stx };
         match self.m.seen.iter().find(|other| other.key() == seen.key()) {
@@ -720,8 +719,8 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         Ok(())
     }
 
-    /// Matches `at`, the rest of a list, against `items` from `i` on, the last of which can be
-    /// followed by `...`, then `rest` against its tail, or else the end of the list.
+    /// Matches `at`, the remainder of a list, against `items` from index `i` on. The last item can be
+    /// followed by `...`. The tail after the items is matched against `rest`. Without `rest`, the tail must be the empty list.
     fn list_pattern(&mut self, at: Temp, items: Vec<Stx>, i: usize, rest: Option<Stx>) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
         let Some(&item) = items.get(i) else {
             return match rest {
@@ -738,12 +737,12 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         if let Some(&next) = items.get(i + 1)
             && self.ex.is_aux(next, Aux::Ellipsis)?
         {
-            // Only the last pattern can repeat, as only the rest of the list can be split
-            // without first counting it.
+            // Only the last pattern can repeat. A repeat anywhere else would need the length of the list
+            // before the list could be split.
             if i + 2 != items.len() || rest.is_some() {
                 return Err(self.ex.error(ExpandErrorKind::Unsupported, next));
             }
-            // A list of anything is the list itself.
+            // An identifier followed by `...` matches each element of any list. So the identifier is bound to the list itself.
             if self.ex.is_id(item) {
                 self.push(Step::Is(Shape::List, at));
                 if !self.ex.is_aux(item, Aux::Underscore)? {
@@ -761,12 +760,11 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         Ok(Next::then((head, item), move |this: &mut Self, ()| this.list_pattern(tail, items, i + 1, rest)))
     }
 
-    /// The code of `steps`: `done` if they match, `fail` if they don't.
+    /// Generates the code of `steps`. The code evaluates `done` if the steps match, and `fail` if they do not.
     fn emit<'s>(&mut self, steps: &'s [Step], done: Stx, fail: Stx) -> Result<Em<'s, 'e, 'a, 'gc>, ExpandError> {
         let Some((step, rest)) = steps.split_first() else { return Ok(Next::Done(done)) };
         let at = self.m.at;
         let rest = Code::Emit(rest, done, fail);
-        let fixnum = |this: &Self, index: usize| Value::fixnum(index as i64).ok_or_else(|| this.ex.error(ExpandErrorKind::BadSyntax, at));
         Ok(match *step {
             Step::Is(shape, target) => {
                 let test = self.shape_test(shape, target)?;
@@ -777,12 +775,12 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
                     Part::Car => self.ex.build(at, "car", &[&[target.stx]])?,
                     Part::Cdr => self.ex.build(at, "cdr", &[&[target.stx]])?,
                     Part::Item(index) => {
-                        let index = self.ex.value(fixnum(self, index)?, at)?;
+                        let index = self.ex.value(Value::fixnum(index as i64).ok_or_else(|| self.ex.error(ExpandErrorKind::BadSyntax, at))?, at)?;
                         self.ex.build(at, "vector-ref", &[&[target.stx, index]])?
                     }
                     Part::Field(of, index) => {
                         let kind = self.m.structs[of].kind;
-                        let index = self.ex.value(fixnum(self, index)?, at)?;
+                        let index = self.ex.value(Value::fixnum(index as i64).ok_or_else(|| self.ex.error(ExpandErrorKind::BadSyntax, at))?, at)?;
                         let get = self.ex.internal("struct-ref", at)?;
                         self.ex.list(&[get, target.stx, kind, index], at)?
                     }
@@ -798,8 +796,8 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
                     Ok(Next::then(rest, move |this: &mut Self, rest| Ok(Next::Done(this.ex.build(at, "if", &[&[test, fail, rest]])?))))
                 })
             }
-            // `(let ((k (lambda (result ...) rest))) alt)`, each alt calling `k` with its values,
-            // and each but the last trying the next if it fails.
+            // Expands to `(let ((k (lambda (result ...) rest))) alt)`. Each alternative calls `k` with its values.
+            // Each alternative but the last tries the next alternative if it fails.
             Step::Or { ref alts, ref values, ref results } => {
                 let join = self.temp()?.stx;
                 let formals = self.ex.list(results, at)?;
@@ -808,7 +806,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
                     this.alternatives(Alternatives { alts, values, left: alts.len(), next: None, k: join, lambda, fail })
                 })
             }
-            // `(let loop ((xs list) (acc '()) ...) (if (null? xs) (let ((result (reverse acc)) ...)
+            // Expands to `(let loop ((xs list) (acc '()) ...) (if (null? xs) (let ((result (reverse acc)) ...)
             // rest) (if (pair? xs) (let ((item (car xs))) steps, then (loop (cdr xs) (cons value
             // acc) ...)) fail)))`.
             Step::Each { list, item, ref steps, ref values, ref results } => {
@@ -845,7 +843,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         })
     }
 
-    /// The code of an `or` step's alternatives left, each calling its `k` with its values.
+    /// Generates the code of the remaining alternatives of an `or` step. Each alternative calls `k` with its values.
     fn alternatives<'s>(&mut self, mut alternatives: Alternatives<'s>) -> Result<Em<'s, 'e, 'a, 'gc>, ExpandError> {
         let at = self.m.at;
         let Some(left) = alternatives.left.checked_sub(1) else {

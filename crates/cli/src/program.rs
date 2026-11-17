@@ -1,36 +1,36 @@
-//! Loading and running what the command line names.
+//! Loads and runs the files and modules that the command line names.
 //!
-//! A [`Program`] has an arena with the prelude and the `repl` module in it. It loads a module
-//! from its folder the first time code requires it, and runs it then, since the code that
-//! requires it is compiled against what it defines.
+//! A [`Program`] owns an arena that holds the prelude and the `repl` module. It loads a module
+//! from its folder the first time that code requires the module, and runs the module at once. The code that
+//! requires the module is compiled against the module's definitions, so the module must run first.
 //!
 //! # Loading what a module requires
 //!
-//! A module is built in one step of the arena, and what it requires has to have run by then.
-//! So building stops at a `require` of a module that isn't loaded. That module is then built
-//! and run, and the first is built again from the start, as often as it takes: once for each
-//! module it's the first to require.
+//! A module is built in one step of the arena, and every module that it requires must have run by then.
+//! So a build stops at a `require` of a module that is not loaded. That module is then built
+//! and run, and the first module is built again from the start. This repeats once for each
+//! module that the first module is the first to require.
 //!
-//! Every module's code, the prelude's included, runs a step at a time between builds, so the
-//! collector keeps up with what it allocates as it does for the entry point.
+//! The code of every module, including the prelude, runs one step at a time between builds. So the
+//! collector keeps up with the module's allocation, as it does for the entry point.
 //!
 //! # Images
 //!
-//! [`Program::save_image`] saves the symbols, the prelude and every module loaded, by name,
-//! and [`Program::from_image`] starts from them: see [`ragwort_modules_core::image`]. The
-//! modules of an image have run, so they aren't loaded from their folders again.
+//! [`Program::save_image`] saves the symbol table, the prelude and every loaded module with its name.
+//! [`Program::from_image`] starts a program from that state. See [`ragwort_modules_core::image`]. The
+//! modules of an image have already run, so they are not loaded from their folders again.
 //!
 //! # The REPL
 //!
-//! Each input is a module of its own that provides everything it defines, and requires
-//! `repl` and every input before it implicitly. So:
+//! Each input is a module of its own. It provides everything that it defines, and it implicitly requires
+//! `repl` and every earlier input. So:
 //!
-//! - A definition is there for the inputs after it, and one of the same name later takes its
-//!   place for the inputs after that.
-//! - A module an input requires by its name alone, as `(require lib/text)` does, is there for
-//!   the inputs after it too. One required through `only-in` or the like is for that input.
-//! - An input can't `set!` a variable an earlier one defined, as no module can one it requires.
-//! - A macro lasts for the input that defines it.
+//! - A definition is visible to the inputs after it. A later definition of the same name replaces
+//!   it for the inputs after that.
+//! - A module that an input requires by its name alone, as in `(require lib/text)`, is visible to
+//!   the inputs after it too. A module required through `only-in` or another filter is visible only to that input.
+//! - An input cannot `set!` a variable that an earlier input defined, because no module can assign a variable that it imports.
+//! - A macro is visible only in the input that defines it.
 
 #[cfg(test)]
 #[path = "tests/program.rs"]
@@ -59,52 +59,52 @@ use crate::{hosts, listing};
 
 /// The default memory limit of a program, in bytes: the capacity of the object region.
 pub const HEAP: usize = REGION;
-/// The most characters a result or a raised value is shown in.
+/// The maximum length, in bytes, of the text shown for a result or a raised value.
 const SHOWN: usize = 1 << 16;
 const OUT_OF_MEMORY: &str = "out of memory";
 
-/// A file of a module: where it's from, its text and its language.
+/// A file of a module: its path, its text and its language.
 struct SourceFile {
     path: PathBuf,
     text: String,
     language: Language,
 }
 
-/// The modules the command line names, and what's become of them.
+/// The modules that the command line names, and their loading state.
 struct Modules {
     dirs: Vec<ModuleDir>,
-    /// Those loaded and run, by name.
+    /// The modules that are loaded and have run, each with its name.
     loaded: Vec<(String, Root<Module>)>,
-    /// The module the build under way asked for that isn't loaded, which it stopped at.
+    /// The name of a module that the current build required and that is not loaded yet. The build stopped at that `require`.
     wanted: Option<String>,
-    /// What went wrong, in order.
+    /// The error messages collected so far, in order.
     errors: Vec<String>,
-    /// The bytecode of each module loaded since [`Program::list`], if it's kept.
+    /// The bytecode listing of each module loaded since [`Program::list`] was called, or `None` if listings are not kept.
     listing: Option<String>,
 }
 
-/// A module that's built and hasn't run: the code of each of its forms, to run in order.
+/// A module that is built but has not run yet. `thunks` holds the code of its forms, which run in order.
 struct Built {
     thunks: Vec<ValueRoot>,
     module: Root<Module>,
 }
 
-/// Why a module wasn't built.
+/// The reason a module was not built.
 enum Missed {
-    /// It requires this module, which isn't loaded: the message says where.
+    /// The module requires the module named by the first field, which is not loaded. The second field is the error message that locates the `require`.
     Needs(String, String),
-    /// Something's wrong, which `Modules::errors` says.
+    /// The build failed. The error messages are in `Modules::errors`.
     Failed,
 }
 
-/// A module being loaded: its files, and where the module that asked for it requires it.
+/// A module that is being loaded: its name and its files. `asked` is the error message that locates the `require` in the module that asked for it, if a module did.
 struct Pending {
     name: String,
     files: Vec<SourceFile>,
     asked: Option<String>,
 }
 
-/// What every module is built on.
+/// The symbol table and the prelude, which every module build needs.
 #[derive(Clone, Copy)]
 struct Base<'gc> {
     symbols: Symbols<'gc>,
@@ -116,13 +116,13 @@ pub struct Program {
     symbols: ValueRoot,
     prelude: Root<Module>,
     modules: Modules,
-    /// The modules a REPL input requires implicitly: `repl`, then each input before it, and
-    /// each module one of them required by name, which are `required`.
+    /// The modules that a REPL input requires implicitly: `repl`, then each earlier input, and
+    /// each module that an earlier input required by name. `required` holds the names of those modules.
     inputs: Vec<Root<Module>>,
     required: Vec<String>,
 }
 
-/// The text of `node`, if it's an identifier or a string.
+/// Returns the text of `node` if `node` is an identifier or a string literal, and `None` otherwise.
 fn name_of<'gc>(mc: &Mutation<'gc>, node: Syntax<'gc>) -> Option<String> {
     let (strings, datum) = (Strings::new(mc), node.datum(mc));
     let name = match node.kind(mc)? {
@@ -133,8 +133,8 @@ fn name_of<'gc>(mc: &Mutation<'gc>, node: Syntax<'gc>) -> Option<String> {
     Some(chars(&strings, name).collect())
 }
 
-/// The modules that `text`'s forms require by name alone, as `(require lib/text "other")`
-/// does two.
+/// Returns the names of the modules that the forms of `text` require by name alone. `(require lib/text "other")`
+/// requires two modules in that way.
 fn required_by<'gc>(mc: &Mutation<'gc>, symbols: Symbols<'gc>, text: &str) -> Vec<String> {
     let mut names = Vec::new();
     let Ok(session) = SyntaxSession::new(mc, text) else { return names };
@@ -151,7 +151,7 @@ fn required_by<'gc>(mc: &Mutation<'gc>, symbols: Symbols<'gc>, text: &str) -> Ve
     names
 }
 
-/// The one-based line and column of byte `offset` of `text`.
+/// Returns the one-based line and column of byte `offset` in `text`.
 fn place(text: &str, offset: u32) -> (usize, usize) {
     let before = &text.as_bytes()[..(offset as usize).min(text.len())];
     let line = before.iter().filter(|&&byte| byte == b'\n').count() + 1;
@@ -159,7 +159,7 @@ fn place(text: &str, offset: u32) -> (usize, usize) {
     (line, column)
 }
 
-/// What's wrong with the module `name`, whose files are `files`, as `file:line:column: what`.
+/// Formats the error `failed` of the module `name`, whose files are `files`, as `file:line:column: message`.
 fn describe(name: &str, files: &[SourceFile], failed: &Located) -> String {
     let (what, start) = match failed.error {
         Error::Read(error) => (error.kind.to_string(), Some(error.start)),
@@ -189,7 +189,7 @@ fn fault(fault: Fault) -> String {
     format!("error: {}", Fault::KINDS[fault.kind()])
 }
 
-/// What a run of a machine came to.
+/// The outcome of running a machine.
 enum Ran<'gc> {
     More,
     Done(Value<'gc>),
@@ -207,12 +207,11 @@ fn ran<'gc>(mc: &Mutation<'gc>, outcome: Result<Outcome<'gc>, Fault>) -> Ran<'gc
     }
 }
 
-/// The source files in `folder`, in the order of their names.
+/// Reads the source files in `folder`, in the order of their paths.
 fn read_folder(folder: &Path) -> Result<Vec<SourceFile>, String> {
-    let wrong = |error: std::io::Error| format!("{}: {error}", folder.display());
     let mut paths = Vec::new();
-    for entry in std::fs::read_dir(folder).map_err(wrong)? {
-        let path = entry.map_err(wrong)?.path();
+    for entry in std::fs::read_dir(folder).map_err(|error| format!("{}: {error}", folder.display()))? {
+        let path = entry.map_err(|error| format!("{}: {error}", folder.display()))?.path();
         if path.is_file() && language(&path).is_some() {
             paths.push(path);
         }
@@ -230,8 +229,8 @@ fn read_file(path: &Path) -> Result<SourceFile, String> {
     Ok(SourceFile { path: path.to_path_buf(), text, language })
 }
 
-/// Builds the module `name` of `files`. What's wrong with it goes to `modules.errors`, unless
-/// it's that it requires a module that isn't loaded yet.
+/// Builds the module `name` from `files`. An error is added to `modules.errors`. The exception is a `require`
+/// of a module that is not loaded yet, which is returned as `Missed::Needs`.
 fn load_module<'gc>(
     mc: &Mutation<'gc>,
     base: Base<'gc>,
@@ -275,7 +274,7 @@ fn load_module<'gc>(
     }
 }
 
-/// `loaded`, kept across steps till it has run.
+/// Roots the thunks and the module of `loaded`, so that they stay alive across arena steps until the module has run. Returns `None` if allocation fails.
 fn rooted<'gc>(mc: &Mutation<'gc>, loaded: &Loaded<'gc>) -> Option<Built> {
     let mut thunks = Vec::with_capacity(loaded.thunks.len());
     for &thunk in &loaded.thunks {
@@ -284,8 +283,8 @@ fn rooted<'gc>(mc: &Mutation<'gc>, loaded: &Loaded<'gc>) -> Option<Built> {
     Some(Built { thunks, module: Root::new(mc, loaded.module).ok()? })
 }
 
-/// Finds the modules code requires among those loaded. One the command line gives a folder
-/// that isn't loaded yet is noted, for the build to be tried again once it is.
+/// A `Resolver` that finds required modules among the loaded modules. If a required module is not loaded but the command line gives it a folder,
+/// its name is recorded in `Modules::wanted`. The build is then tried again once that module is loaded.
 struct Finder<'m> {
     modules: &'m mut Modules,
 }
@@ -302,19 +301,20 @@ impl<'gc> Resolver<'gc> for Finder<'_> {
     }
 }
 
-/// The symbol table and the prelude, built, in a new arena's first step.
+/// Creates the symbol table and builds the prelude, in the first step of a new arena.
 fn start<'gc>(mc: &Mutation<'gc>) -> Result<(ValueRoot, Built), String> {
-    let oom = |_| OUT_OF_MEMORY.to_string();
-    let symbols = Symbols::with_seed(mc, RandomState::new().build_hasher().finish()).map_err(oom)?;
+    let symbols = Symbols::with_seed(mc, RandomState::new().build_hasher().finish()).map_err(|_| OUT_OF_MEMORY.to_string())?;
     let loaded = prelude(mc, symbols).map_err(|error| format!("the prelude: {error:?}"))?;
     let built = rooted(mc, &loaded).ok_or_else(|| OUT_OF_MEMORY.to_string())?;
-    Ok((ValueRoot::new(mc, symbols.value(mc)).map_err(oom)?, built))
+    Ok((ValueRoot::new(mc, symbols.value(mc)).map_err(|_| OUT_OF_MEMORY.to_string())?, built))
 }
 
-/// What an image holds, in a new arena's first step: the symbol table, the prelude, and each
-/// module with its name. A module the command line gives a folder too is an error.
+/// Loads the image `bytes`, in the first step of a new arena. An image holds the symbol table, the prelude, and each
+/// module with its name. Returns the symbol table and the prelude, and adds the modules to `modules.loaded`. Fails if the command line also gives a folder for a module in the image.
 fn restore<'gc>(mc: &Mutation<'gc>, bytes: &[u8], modules: &mut Modules) -> Result<(ValueRoot, Root<Module>), String> {
-    let oom = |_| OUT_OF_MEMORY.to_string();
+    fn damaged() -> String {
+        "an image that holds something other than modules".to_string()
+    }
     let roots = image::load(mc, bytes, hosts::HOSTS.iter()).map_err(|error| match error {
         ImageError::Host(name) => format!("the image calls the host function `{name}`, which this ragwort doesn't have"),
         ImageError::SameHost(path) => format!("two host functions are both `{path}`"),
@@ -322,7 +322,6 @@ fn restore<'gc>(mc: &Mutation<'gc>, bytes: &[u8], modules: &mut Modules) -> Resu
         ImageError::Load(LoadError::OutOfMemory) => OUT_OF_MEMORY.to_string(),
         ImageError::Load(_) => "not a ragwort image, or one that's damaged".to_string(),
     })?;
-    let damaged = || "an image that holds something other than modules".to_string();
     let [symbols, prelude, named @ ..] = roots.as_slice() else { return Err(damaged()) };
     let prelude = prelude.downcast::<Module>(mc).ok_or_else(damaged)?;
     let strings = Strings::new(mc);
@@ -333,13 +332,13 @@ fn restore<'gc>(mc: &Mutation<'gc>, bytes: &[u8], modules: &mut Modules) -> Resu
             return Err(format!("the module `{name}` is in the image already"));
         }
         let module = module.downcast::<Module>(mc).ok_or_else(damaged)?;
-        modules.loaded.push((name, Root::new(mc, module).map_err(oom)?));
+        modules.loaded.push((name, Root::new(mc, module).map_err(|_| OUT_OF_MEMORY.to_string())?));
     }
-    Ok((ValueRoot::new(mc, *symbols).map_err(oom)?, Root::new(mc, prelude).map_err(oom)?))
+    Ok((ValueRoot::new(mc, *symbols).map_err(|_| OUT_OF_MEMORY.to_string())?, Root::new(mc, prelude).map_err(|_| OUT_OF_MEMORY.to_string())?))
 }
 
-/// Calls `thunk` and runs it to its end, a step at a time, so the collector keeps up. Its
-/// value goes to `out`, written out, unless it's void.
+/// Calls `thunk` and runs it to completion, one arena step at a time, so the collector keeps up. The written form of its
+/// value is passed to `out`, unless the value is void.
 fn run(arena: &mut Arena, thunk: &ValueRoot, mut out: Option<&mut dyn FnMut(&str)>) -> Result<(), String> {
     let mut machine = arena.mutate(|mc| {
         let thunk = thunk.get(mc).map_err(|_| "a value of another arena".to_string())?;
@@ -366,7 +365,7 @@ fn run(arena: &mut Arena, thunk: &ValueRoot, mut out: Option<&mut dyn FnMut(&str
 }
 
 impl Program {
-    /// A program whose code can require the modules of `dirs`, none of them loaded yet.
+    /// Creates a program with a memory limit of `heap` bytes. Its code can require the modules of `dirs`, and none of them is loaded yet.
     pub fn new(heap: usize, dirs: Vec<ModuleDir>) -> Result<Self, Vec<String>> {
         let mut arena = Arena::new(heap, 0);
         let modules = Modules { dirs, loaded: Vec::new(), wanted: None, errors: Vec::new(), listing: None };
@@ -386,8 +385,8 @@ impl Program {
         std::mem::take(&mut self.modules.errors)
     }
 
-    /// One try at building the module `name` of `files`, which stops at a module it requires
-    /// that isn't loaded. A REPL input requires what the inputs before it defined implicitly.
+    /// Makes one attempt to build the module `name` from `files`. The attempt stops at a `require` of a module
+    /// that is not loaded. If `input` is true, the module is a REPL input and implicitly requires the modules in `inputs`.
     fn attempt(&mut self, name: &str, hosts: &'static [HostDef], files: &[SourceFile], input: bool) -> Result<Built, Missed> {
         let Self { arena, symbols, prelude, modules, inputs, .. } = self;
         let implicit: &[Root<Module>] = if input { inputs } else { &[] };
@@ -408,8 +407,8 @@ impl Program {
         })
     }
 
-    /// Builds the module `name` of `files`, after loading each module it requires that isn't
-    /// loaded yet.
+    /// Builds the module `name` from `files`. Each module that it requires and that is not
+    /// loaded yet is loaded first.
     fn build(&mut self, name: &str, hosts: &'static [HostDef], files: &[SourceFile], input: bool) -> Option<Built> {
         loop {
             match self.attempt(name, hosts, files, input) {
@@ -420,7 +419,7 @@ impl Program {
         }
     }
 
-    /// Runs the module `name`, which is built, and keeps it for the code that requires it.
+    /// Runs the built module `name` and records it as loaded, so that later code can require it.
     fn finish(&mut self, name: &str, built: Built) -> Result<(), String> {
         for thunk in &built.thunks {
             run(&mut self.arena, thunk, None).map_err(|message| format!("module {name}: {message}"))?;
@@ -429,13 +428,13 @@ impl Program {
         Ok(())
     }
 
-    /// Loads the module `name` from its folder and runs it, after each module it requires
-    /// that isn't loaded yet, and each that those require. `asked` is where the code that
-    /// requires it does, which is what's wrong with that code if the module can't be loaded.
+    /// Loads the module `name` from its folder and runs it. Every module that it requires, directly or indirectly,
+    /// and that is not loaded yet is loaded and run first. `asked` is the error message that locates the `require` in the
+    /// requiring code. If the module cannot be loaded, that message is reported as an error in the requiring code.
     fn ensure(&mut self, name: String, asked: Option<String>) -> Option<()> {
         let mut pending: Vec<Pending> = Vec::new();
         let mut next = Some((name, asked));
-        // Where the module that can't be loaded was asked for, if it isn't one of `pending`.
+        // The loop yields the `asked` message of the module that could not be loaded, if that module was not added to `pending`.
         let asked = loop {
             if let Some((name, asked)) = next.take() {
                 if pending.iter().any(|module| module.name == name) {
@@ -474,8 +473,8 @@ impl Program {
         None
     }
 
-    /// A program that starts from what the image `bytes` holds, and can require the modules of
-    /// `dirs` besides.
+    /// Creates a program that starts from the state in the image `bytes`. Its code can also require the modules of
+    /// `dirs`.
     pub fn from_image(heap: usize, dirs: Vec<ModuleDir>, bytes: &[u8]) -> Result<Self, Vec<String>> {
         let mut arena = Arena::new(heap, 0);
         let mut modules = Modules { dirs, loaded: Vec::new(), wanted: None, errors: Vec::new(), listing: None };
@@ -485,8 +484,8 @@ impl Program {
         Ok(Self { arena, symbols, prelude, modules, inputs: vec![repl], required: Vec::new() })
     }
 
-    /// The symbols, the prelude and every module loaded, as an image for
-    /// [`Program::from_image`].
+    /// Saves the symbol table, the prelude and every loaded module as an image that
+    /// [`Program::from_image`] accepts.
     pub fn save_image(&mut self) -> Result<Vec<u8>, Vec<String>> {
         let Self { arena, symbols, prelude, modules, .. } = self;
         arena.collect();
@@ -507,7 +506,7 @@ impl Program {
         }
     }
 
-    /// Keeps the bytecode of each module loaded from here on, for [`Program::take_listing`].
+    /// Starts keeping the bytecode listing of each module that is loaded from now on. [`Program::take_listing`] returns the listing.
     pub fn list(&mut self) {
         self.modules.listing = Some(String::new());
     }
@@ -516,7 +515,7 @@ impl Program {
         self.modules.listing.take().unwrap_or_default()
     }
 
-    /// Loads every module the command line names that isn't loaded yet.
+    /// Loads every module that the command line names and that is not loaded yet.
     pub fn load_all(&mut self) -> Result<(), Vec<String>> {
         let names: Vec<String> = self.modules.dirs.iter().map(|dir| dir.name.clone()).collect();
         for name in names {
@@ -528,7 +527,7 @@ impl Program {
         Ok(())
     }
 
-    /// Loads the file at `path` as a module named for it, and runs it if `running`.
+    /// Loads the file at `path` as a module named after the file's stem, and runs it if `running` is true.
     pub fn run_file(&mut self, path: &Path, running: bool) -> Result<(), Vec<String>> {
         let file = read_file(path).map_err(|message| vec![message])?;
         let name = path.file_stem().map_or_else(|| "main".to_string(), |stem| stem.to_string_lossy().into_owned());
@@ -541,7 +540,7 @@ impl Program {
         Ok(())
     }
 
-    /// Whether `text` ends inside a list, string or comment, so there's more of it to come.
+    /// Returns whether `text` ends inside a list, a string or a block comment, so that more input is expected.
     pub fn unfinished(&mut self, text: &str) -> bool {
         let Self { arena, symbols, .. } = self;
         arena.mutate(|mc| {
@@ -557,11 +556,13 @@ impl Program {
         })
     }
 
-    /// Runs `text` as the REPL's next input, giving `out` the value of each of its forms,
-    /// written out, as it's made.
+    /// Runs `text` as the next REPL input. The written form of the value of each form is passed to `out`
+    /// as soon as the form has run. A void value is not passed.
     pub fn eval(&mut self, text: &str, out: &mut dyn FnMut(&str)) -> Result<(), Vec<String>> {
+        fn file(text: &str) -> SourceFile {
+            SourceFile { path: "<input>".into(), text: text.to_string(), language: Language::Scheme }
+        }
         let name = format!("input-{}", self.inputs.len());
-        let file = |text: &str| SourceFile { path: "<input>".into(), text: text.to_string(), language: Language::Scheme };
         let files = [file(text), file("(provide (all-defined-out))")];
         let Some(built) = self.build(&name, &[], &files, true) else { return Err(self.take_errors()) };
         let Self { arena, symbols, modules, inputs, required, .. } = self;

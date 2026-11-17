@@ -60,7 +60,7 @@ fn division() {
     let (mut rng, mut oracle) = (Rng(4), Oracle::default());
     for round in 0..ROUNDS {
         let y = rng.nonzero(6);
-        // Dividends made from the divisor hit the add-back step, which random ones rarely do.
+        // A dividend built from a multiple of the divisor, plus or minus one, reaches the add-back step. Random dividends rarely do.
         let x = match round % 3 {
             0 => rng.digits(12),
             _ => {
@@ -140,14 +140,14 @@ fn bitwise_operations_are_twos_complement() {
 #[test]
 fn conversion_to_doubles_rounds_to_nearest_even() {
     let (mut rng, mut oracle) = (Rng(7), Oracle::default());
-    let mut case = |x: &[Cell<Digit>]| {
+    fn case(oracle: &mut Oracle, x: &[Cell<Digit>]) {
         let x = Digits::new(x);
         oracle.case("f64", &[hex(x)], format!("{:x}", to_f64(x).to_bits()));
-    };
-    // Ties either side of even, the largest finite double, and past it.
+    }
+    // Ties on either side of an even value, the largest finite `f64`, and values past it.
     let mut edges = vec![vec![(1 << 53) + 1], vec![(1 << 53) + 3], vec![(1 << 54) + 2], vec![0, (1 << 53) + 1]];
     edges.push([vec![0; 15], vec![1 << 63]].concat());
-    // Ties that only a one bit further down breaks, digit aligned and not.
+    // Values that would be ties except for a one bit further down. Some are digit-aligned and some are not.
     edges.push(vec![1, (1 << 63) | (1 << 10)]);
     edges.push(vec![1 << 40, 0, (1 << 63) | (1 << 10)]);
     edges.push(vec![1, (1 << 62) | (1 << 9)]);
@@ -156,10 +156,10 @@ fn conversion_to_doubles_rounds_to_nearest_even() {
     edges.push([vec![0; 15], vec![Digit::MAX << 11]].concat());
     edges.push([vec![0; 16], vec![1]].concat());
     for x in &edges {
-        case(&cells(x));
+        case(&mut oracle, &cells(x));
     }
     for _ in 0..ROUNDS {
-        case(&rng.digits(18));
+        case(&mut oracle, &rng.digits(18));
     }
     oracle.check();
 }

@@ -1,20 +1,20 @@
-//! Number literals, as R7RS writes them: integers and ratios in any radix, decimals, the
-//! infinities and NaNs, and complex numbers of them as `a+bi`, `+bi`, `a+i` or `m@angle`, after
-//! any of the `#x`, `#b`, `#o`, `#d`, `#e` and `#i` prefixes.
+//! Number literals in R7RS syntax. The parser accepts integers and ratios in any radix, decimals, the
+//! infinities and NaN, and complex numbers of these written as `a+bi`, `+bi`, `a+i` or `m@angle`.
+//! A literal can start with any of the prefixes `#x`, `#b`, `#o`, `#d`, `#e` and `#i`.
 
 use std::cmp::Ordering;
 
 use crate::{ComplexHost, complex, int, rational, real};
 
-/// The most a decimal's exponent can scale it by when it's read exact.
+/// The largest power of ten, in absolute value, by which a decimal that is read as exact can be scaled. A decimal beyond this limit is not parsed as a number.
 const MAX_EXACT_SCALE: u64 = 100_000;
 
-/// The number `token` writes, made by the host `nums`, or `None` if it doesn't write one.
+/// Parses `token` as a number literal and returns the number, created in the host `nums`. Returns `None` if `token` is not a number literal.
 pub fn parse<H: ComplexHost>(nums: &H, token: &str) -> Result<Option<H::Number>, H::Error> {
     parse_in(nums, token, 10)
 }
 
-/// The number `token` writes in `radix` unless a prefix says otherwise, as [`parse`] reads it.
+/// Like [`parse`], but reads `token` in `radix` unless a radix prefix in `token` overrides it.
 pub fn parse_in<H: ComplexHost>(nums: &H, token: &str, radix: u32) -> Result<Option<H::Number>, H::Error> {
     let (mut prefixed, mut exact, mut rest) = (None, None, token);
     while let [b'#', prefix, ..] = rest.as_bytes() {
@@ -39,13 +39,12 @@ pub fn parse_in<H: ComplexHost>(nums: &H, token: &str, radix: u32) -> Result<Opt
 }
 
 fn complex_number<H: ComplexHost>(nums: &H, text: &str, radix: u32, exact: Option<bool>) -> Result<Option<H::Number>, H::Error> {
-    let real = |text: &str| number(nums, text, radix, exact);
     if let Some((magnitude, angle)) = text.split_once('@') {
-        let (Some(modulus), Some(a)) = (real(magnitude)?, real(angle)?) else { return Ok(None) };
+        let (Some(modulus), Some(a)) = (number(nums, magnitude, radix, exact)?, number(nums, angle, radix, exact)?) else { return Ok(None) };
         return Ok(Some(complex::polar(nums, modulus, a)?));
     }
-    let Some(body) = text.strip_suffix(['i', 'I']) else { return Ok(real(text)?.map(|x| nums.of_real(x))) };
-    // The imaginary part starts at the last sign that isn't an exponent's.
+    let Some(body) = text.strip_suffix(['i', 'I']) else { return Ok(number(nums, text, radix, exact)?.map(|x| nums.of_real(x))) };
+    // The imaginary part starts at the last sign that is not the sign of an exponent.
     let bytes = body.as_bytes();
     let split = (1..bytes.len()).rev().find(|&index| matches!(bytes[index], b'+' | b'-') && !(radix == 10 && matches!(bytes[index - 1], b'e' | b'E')));
     let (re, im) = match split {
@@ -58,13 +57,13 @@ fn complex_number<H: ComplexHost>(nums: &H, text: &str, radix: u32, exact: Optio
     let im = match im {
         "+" => real::from_i64(nums, 1)?,
         "-" => real::from_i64(nums, -1)?,
-        _ => match real(im)? {
+        _ => match number(nums, im, radix, exact)? {
             Some(im) => im,
             None => return Ok(None),
         },
     };
     let re = match re {
-        Some(re) => match real(re)? {
+        Some(re) => match number(nums, re, radix, exact)? {
             Some(re) => re,
             None => return Ok(None),
         },
@@ -102,14 +101,17 @@ fn number<H: ComplexHost>(nums: &H, text: &str, radix: u32, exact: Option<bool>)
     if radix == 10 { decimal(nums, negative, body, exact) } else { Ok(None) }
 }
 
-/// `digits [. digits] [e [sign] digits]`, with a digit before or after the point.
+/// Parses a decimal of the form `digits [. digits] [e [sign] digits]`. There must be a digit before or after the point.
 fn decimal<H: ComplexHost>(nums: &H, negative: bool, body: &str, exact: Option<bool>) -> Result<Option<H::Real>, H::Error> {
     let (mantissa, exponent) = match body.find(['e', 'E']) {
         Some(i) => (&body[..i], Some(&body[i + 1..])),
         None => (body, None),
     };
     let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    let digits = |text: &str| text.bytes().all(|byte| byte.is_ascii_digit());
+    #[inline(always)]
+    fn digits(text: &str) -> bool {
+        text.bytes().all(|byte| byte.is_ascii_digit())
+    }
     if whole.len() + fraction.len() == 0 || !digits(whole) || !digits(fraction) {
         return Ok(None);
     }

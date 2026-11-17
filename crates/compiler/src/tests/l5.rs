@@ -105,7 +105,9 @@ fn counted<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
 
 /// (begin (s0 (call/cc s1)) (call/cc s2))
 fn calls<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
-    let call = |s| prim(Prim::Request(Request::CallCc), vec![slot(s)]);
+    fn call<'gc>(procedure: u32) -> Core<'gc> {
+        prim(Prim::Request(Request::CallCc), vec![slot(procedure)])
+    }
     seq(0, app(slot(0), vec![call(1)]), call(2))
 }
 
@@ -259,31 +261,39 @@ fn block<'a, 'gc>(arena: &'a Trees, params: &[u32], insts: Vec<Inst<'a, 'gc>>, e
 fn the_verifier_finds_what_is_malformed() {
     let trees = Trees::new();
     let a = &trees;
-    let vals = |vs: &[Val]| vs.iter().copied().collect_in(a);
-    let one = || Inst::Const(Val(1), Value::fixnum(1).unwrap());
+    fn vals<'a>(arena: &'a Trees, values: &[Val]) -> ragwort_alloc::Vec<'a, Val> {
+        values.iter().copied().collect_in(arena)
+    }
+    fn one<'a, 'gc>() -> Inst<'a, 'gc> {
+        Inst::Const(Val(1), Value::fixnum(1).unwrap())
+    }
     let ok = function(a, 2, vec![block(a, &[], vec![one()], End::Return(Val(1)))]);
     assert_eq!(verify_function(&ok, &[]), Ok(()));
-    let check = |f: Function<'_, '_>| verify_function(&f, &[]).unwrap_err();
+    fn check(function: Function<'_, '_>) -> String {
+        verify_function(&function, &[]).unwrap_err()
+    }
     assert_eq!(check(function(a, 2, vec![block(a, &[], vec![], End::Return(Val(1)))])), "v1, used in b0, isn't defined");
     assert_eq!(check(function(a, 2, vec![block(a, &[], vec![one(), one()], End::Return(Val(1)))])), "v1 is defined twice");
     assert_eq!(check(function(a, 1, vec![block(a, &[], vec![one()], End::Return(Val(0)))])), "v1 is past the function's values");
-    let used_first = vec![Inst::Prim { dst: Val(2), prim: Prim::Intrinsic(Add), args: vals(&[Val(1), Val(1)]), spread: false }, one()];
+    let used_first = vec![Inst::Prim { dst: Val(2), prim: Prim::Intrinsic(Add), args: vals(a, &[Val(1), Val(1)]), spread: false }, one()];
     assert_eq!(check(function(a, 3, vec![block(a, &[], used_first, End::Return(Val(2)))])), "v1, used in b0, isn't defined on every way there");
     // b0 branches to b1 and b2, which both go to b3; v2 is defined only in b1.
-    let diamond = |returned: u32| {
+    fn diamond<'a, 'gc>(arena: &'a Trees, returned: u32) -> Function<'a, 'gc> {
         let two = Inst::Const(Val(2), Value::fixnum(2).unwrap());
-        function(a, 3, vec![
-            block(a, &[], vec![one()], End::Branch { test: Val(1), then: Block(1), other: Block(2) }),
-            block(a, &[], vec![two], End::Jump(Block(3), vals(&[]))),
-            block(a, &[], vec![], End::Jump(Block(3), vals(&[]))),
-            block(a, &[], vec![], End::Return(Val(returned))),
+        function(arena, 3, vec![
+            block(arena, &[], vec![one()], End::Branch { test: Val(1), then: Block(1), other: Block(2) }),
+            block(arena, &[], vec![two], End::Jump(Block(3), vals(arena, &[]))),
+            block(arena, &[], vec![], End::Jump(Block(3), vals(arena, &[]))),
+            block(arena, &[], vec![], End::Return(Val(returned))),
         ])
-    };
-    assert_eq!(verify_function(&diamond(1), &[]), Ok(()));
-    assert_eq!(check(diamond(2)), "v2, used in b3, isn't defined on every way there");
-    let jumps = |args: Vec<Val>| function(a, 3, vec![block(a, &[], vec![one()], End::Jump(Block(1), vals(&args))), block(a, &[2], vec![], End::Return(Val(2)))]);
-    assert_eq!(verify_function(&jumps(vec![Val(1)]), &[]), Ok(()));
-    assert_eq!(check(jumps(vec![])), "b0 jumps to b1 with 0 values, not 1");
+    }
+    assert_eq!(verify_function(&diamond(a, 1), &[]), Ok(()));
+    assert_eq!(check(diamond(a, 2)), "v2, used in b3, isn't defined on every way there");
+    fn jumps<'a, 'gc>(arena: &'a Trees, args: Vec<Val>) -> Function<'a, 'gc> {
+        function(arena, 3, vec![block(arena, &[], vec![one()], End::Jump(Block(1), vals(arena, &args))), block(arena, &[2], vec![], End::Return(Val(2)))])
+    }
+    assert_eq!(verify_function(&jumps(a, vec![Val(1)]), &[]), Ok(()));
+    assert_eq!(check(jumps(a, vec![])), "b0 jumps to b1 with 0 values, not 1");
     let branch = function(a, 3, vec![
         block(a, &[], vec![one()], End::Branch { test: Val(1), then: Block(1), other: Block(1) }),
         block(a, &[2], vec![], End::Return(Val(2))),
@@ -291,7 +301,7 @@ fn the_verifier_finds_what_is_malformed() {
     assert_eq!(check(branch), "b0 branches to b1, which takes parameters");
     let unreached = function(a, 2, vec![block(a, &[], vec![one()], End::Return(Val(1))), block(a, &[], vec![], End::Return(Val(1)))]);
     assert_eq!(check(unreached), "b1 can't be reached");
-    let entry = function(a, 2, vec![block(a, &[], vec![one()], End::Jump(Block(0), vals(&[])))]);
+    let entry = function(a, 2, vec![block(a, &[], vec![one()], End::Jump(Block(0), vals(a, &[])))]);
     assert_eq!(check(entry), "b0 goes to the entry");
     let upvalue = function(a, 2, vec![block(a, &[], vec![Inst::Upvalue(Val(1), 0)], End::Return(Val(1)))]);
     assert_eq!(check(upvalue), "b0 loads upvalue 0 of 0");
@@ -331,7 +341,7 @@ const LAMBDAS: u32 = 10_000;
 /// the generated program's result.
 #[test]
 fn deep_code_needs_no_stack() {
-    let compile = |run: bool| {
+    fn compile(run: bool) {
         let mut arena = Arena::new(1 << 26, 0);
         arena.mutate(|mc| {
             let trees = Trees::new();
@@ -356,7 +366,7 @@ fn deep_code_needs_no_stack() {
                 assert_eq!(value, Value::fixnum(i64::from(ADDS)).unwrap());
             });
         });
-    };
+    }
     std::thread::Builder::new().stack_size(256 << 10).spawn(move || compile(false)).expect("spawned").join().expect("compiled");
     // Run the VM separately: its debug-build stack requirements exceed this test's deliberately small
     // compiler stack.

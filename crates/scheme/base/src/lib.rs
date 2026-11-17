@@ -1,37 +1,38 @@
-//! Ragwort's base language: Scheme, as R7RS and Racket write it, expanded to the compiler's core
-//! forms and compiled.
+//! Ragwort's base language: Scheme in the style of R7RS and Racket. This crate expands it to the
+//! compiler's core forms and compiles it.
 //!
-//! The expander knows `quote`, `if`, `lambda`, `define`, `set!`, `begin`, `let`, `letrec` and
-//! `letrec*` itself. A named `let`, `let*`, `and`, `or`, `when`, `unless`, `cond`, `case`, `do`,
+//! The expander handles `quote`, `if`, `lambda`, `define`, `set!`, `begin`, `let`, `letrec` and
+//! `letrec*` directly. Named `let`, `let*`, `and`, `or`, `when`, `unless`, `cond`, `case`, `do`,
 //! `quasiquote`, `guard`, `match`, `struct-copy`, `with-continuation-mark`, `syntax-rules` and
-//! `with-syntax` are macros written in Rust, which expand hygienically by sets of scopes, as the
-//! code's own do.
+//! `with-syntax` are built-in macros written in Rust. They expand hygienically with sets of scopes,
+//! in the same way as the macros that a program defines.
 //!
 //! `struct` defines a struct type, as Racket's `struct` does: `(struct point (x y))` defines the
 //! constructor `point`, the predicate `point?` and the accessors `point-x` and `point-y`. A
 //! struct is printed with its fields. Two instances of one type are `equal?` when their fields
-//! are, unless the type is declared `#:identity-eq?`. A struct type can have subtypes, `match`
-//! takes a struct apart, and `struct-copy` copies one with some fields changed. The `structs`
-//! module's documentation describes the form in full.
+//! are `equal?`, unless the type is declared `#:identity-eq?`. A struct type can have subtypes.
+//! `match` destructures a struct, and `struct-copy` copies one with some fields changed. The
+//! `structs` module's documentation describes the form in full.
 //!
-//! The code defines macros with `define-syntax`, `let-syntax` and `letrec-syntax`, as R6RS has
-//! them: a transformer is a procedure of the syntax of a use, which `syntax-case` takes apart
-//! and `syntax` makes, and the expander runs it in a machine as it goes; `quote-syntax` is the
-//! syntax of what it's given, as it is. Macros last as long as
-//! the module that defines them, and their transformers see what it requires, but not its own
-//! variables, which haven't been defined yet.
+//! A program defines macros with `define-syntax`, `let-syntax` and `letrec-syntax`, as in R6RS.
+//! A transformer is a procedure that takes the syntax object of a macro use and returns syntax.
+//! `syntax-case` destructures a syntax object and `syntax` builds one. `quote-syntax` returns its
+//! argument as a syntax object, unchanged. The expander runs each transformer in a VM machine
+//! during expansion. A macro exists only during the expansion of the module that defines it. Its
+//! transformer can refer to the names that the module requires. It cannot refer to the module's
+//! own variables, because they are not defined yet when the transformer runs.
 //!
-//! Code is [`load`]ed as a module, whose files are one body: its top-level definitions are all
-//! bound before any of its expressions expand, so they can refer to each other in any order, from
-//! any of its files. An [`Expander`] expands a module's Scheme files into a
-//! [`ModuleBuilder`](ragwort_compiler::module::ModuleBuilder) that
-//! other front ends can build the module with too, so a module can have files in more than one
-//! language. A name that's no local, definition or import is an error. `(require spec ...)` and `(provide spec ...)` go at the top level and take the specs
-//! native ragwort's `%require` and `%provide` do.
+//! [`load`] loads code as a module. The files of a module form one body. All top-level
+//! definitions are bound before any expression is expanded, so definitions can refer to each
+//! other in any order and across files. An [`Expander`] expands a module's Scheme files into a
+//! [`ModuleBuilder`](ragwort_compiler::module::ModuleBuilder). Other front ends can add to the
+//! same builder, so a module can have files in more than one
+//! language. A name that is not a local variable, a definition or an import is an error. `(require spec ...)` and `(provide spec ...)` are allowed only at the top level. They take the same
+//! specs as `%require` and `%provide` in native ragwort.
 //!
-//! Procedures such as `car` and `+` are what the [`PRELUDE`] module, in native ragwort, exports,
-//! which every Scheme module requires implicitly, and which must have run before one's expanded. A module can define its own of the same names, which
-//! shadow the prelude's, but can't assign the prelude's.
+//! Procedures such as `car` and `+` are exports of the [`PRELUDE`] module, which is written in
+//! native ragwort. Every Scheme module requires the prelude implicitly, and the prelude must have run before a Scheme module is expanded. A module can define a name that
+//! the prelude also exports. The module's definition then shadows the prelude's. A module cannot assign a prelude export.
 
 mod case;
 mod convert;
@@ -60,49 +61,49 @@ use ragwort_vm::objects::Module;
 
 pub use crate::expand::{Expander, Top};
 
-/// The prelude, in native ragwort.
+/// The source text of the prelude module, written in native ragwort.
 pub const PRELUDE: &str = include_str!("prelude.rg");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExpandErrorKind {
-    /// A form whose parts aren't the ones it takes, or a keyword used as a variable.
+    /// A form does not have the parts that its syntax requires, or a syntactic keyword such as `if` is used as a variable.
     BadSyntax,
-    /// Two bindings of one identifier in one binding form or body.
+    /// One binding form or body binds the same identifier twice. Also reported when one form gives the same keyword or struct field twice.
     Duplicate,
-    /// A definition where only expressions go, or a `struct`, `require` or `provide` that isn't
-    /// at the top level.
+    /// A definition appears where only an expression is allowed, or a `struct`, `require` or
+    /// `provide` form is not at the top level.
     Definition,
-    /// A body with no expression after its definitions.
+    /// A body does not end with an expression.
     NoExpression,
-    /// A `set!` of an import.
+    /// A `set!` assigns an import.
     Immutable,
-    /// A name that's no local, definition of the module's or import, or an import of a module
-    /// that hasn't defined it yet.
+    /// A name is not a local variable, a definition of the module or an import. Also reported for
+    /// an import that its module has not defined yet.
     Unbound,
-    /// A name the module both defines and requires, or requires as two different things.
+    /// The module both defines and requires a name, or requires the name as two different imports.
     Conflict,
-    /// A module the resolver doesn't have, or one it gave that no
-    /// [`ModuleBuilder`](ragwort_compiler::module::ModuleBuilder) built.
+    /// The resolver did not find a required module, or it returned a module that was not built by a
+    /// [`ModuleBuilder`](ragwort_compiler::module::ModuleBuilder).
     Resolve,
-    /// A require of a name the module doesn't export.
+    /// A `require` names something that the required module does not export.
     NotProvided,
-    /// A provide of a name the module doesn't define.
+    /// A `provide` names something that the module does not define.
     NotDefined,
-    /// The name of a struct whose module provides it without its constructor, used as a value
-    /// or in `struct-copy`: it's only for `match`.
+    /// A struct name is called, used as a value or used in `struct-copy`, but its module provides
+    /// the struct without its constructor. Such a name is valid only in a `match` pattern.
     NoConstructor,
-    /// An identifier that two bindings could be, neither of whose scopes include the other's.
+    /// An identifier has two candidate bindings, and neither binding's scope set is a subset of the other's.
     Ambiguous,
-    /// Syntax the expander doesn't support yet: `quasisyntax` and its unquotes, a `syntax-rules`
-    /// with an ellipsis of its own, and unquoting in a vector.
+    /// The expander does not support this syntax yet. Examples are `quasisyntax` and its unquotes, a
+    /// `syntax-rules` form with a custom ellipsis, and an unquote inside a quasiquoted vector.
     Unsupported,
-    /// A macro's transformer that raised, ran out of fuel, isn't a procedure, or made what isn't
-    /// syntax.
+    /// A macro transformer failed: it raised an error, ran out of fuel, or yielded to the host. Also
+    /// reported when a transformer expression does not evaluate to a procedure.
     Transformer,
-    /// A macro's transformer that refers to a variable of the code around it, which doesn't
-    /// exist yet when the transformer runs, as the code is still being expanded.
+    /// A macro transformer refers to a variable of the surrounding code. The variable does not
+    /// exist when the transformer runs, because the code is still being expanded.
     Phase,
-    /// The arena couldn't make a value expanding needed.
+    /// An arena operation that expansion needed failed, for example because the arena ran out of memory.
     Arena(ragwort_types::Error),
 }
 
@@ -118,7 +119,7 @@ impl From<ragwort_types::Error> for ExpandErrorKind {
     }
 }
 
-/// What went wrong, and the bytes `start..end` of the text where.
+/// An expansion error: its kind, and the byte range `start..end` of the source text where it occurred.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExpandError {
     pub kind: ExpandErrorKind,
@@ -201,13 +202,13 @@ impl From<CompileError> for Error {
     }
 }
 
-/// The name of the [`PRELUDE`]'s module.
+/// The name of the [`PRELUDE`] module.
 pub const PRELUDE_NAME: &str = "ragwort/prelude";
 
-/// Builds the module named `name` from the Scheme in `files`, one body across them all,
-/// interning names in `symbols`, and expands and compiles each of its forms. It requires the
-/// `prelude` module, which has run, implicitly, then each of `implicit`, whose exports shadow what
-/// those before it export, and the modules `resolver` finds as it says.
+/// Builds the module named `name` from the Scheme source in `files`, and expands and compiles each
+/// of its forms. The files form one body. Names are interned in `symbols`. The module implicitly
+/// requires `prelude`, which must have run, then each module of `implicit` in order. An export of a later
+/// module shadows the same name from an earlier one. `resolver` finds the modules that `require` forms name.
 pub fn load<'gc>(
     mc: &Mutation<'gc>,
     symbols: Symbols<'gc>,

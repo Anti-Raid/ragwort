@@ -1,13 +1,13 @@
-//! Write-once values outside the region, such as a source's text or where its lines start. An
-//! object holds one in a `Frozen<T>` field, and reading it lends `&'gc T` for the rest of the step.
+//! Frozen values: write-once values stored outside the region, such as the text of a source file or the positions where its lines start. An
+//! object holds a frozen value in a `Frozen<T>` field. A read returns `&'gc T`, which is valid for the rest of the step.
 //!
-//! That takes no unsafe code because nothing is freed during a step. Each value sits in a slot
-//! that's set once, and only `Arena::finish`, which borrows the arena mutably, empties the slots
-//! a collection found dead, so the borrow checker rules out a lent reference outliving its value.
+//! This needs no unsafe code, because no frozen value is freed during a step. Each value is in a slot
+//! that is set once. Only `Arena::finish` empties the slots of the values that a collection found dead, and it borrows the arena mutably.
+//! So the borrow checker rules out a reference that outlives its value.
 //!
-//! A frozen value is live while an object holding it is, which tracing finds: a minor collection
-//! frees those made since the last collection that no surviving object holds, and a major one
-//! any that no live object holds.
+//! A frozen value is live while a live object holds it. Tracing finds these values. A minor collection
+//! frees the values created since the last collection that no surviving object holds. A major collection
+//! frees every value that no live object holds.
 
 use std::any::Any;
 use std::cell::{Cell, OnceCell, RefCell};
@@ -18,7 +18,7 @@ use crate::gc::{Brand, OutOfMemory};
 
 /// Slots per chunk of the table.
 const CHUNK: usize = 1024;
-/// What a frozen value is charged beyond itself: its slot, and the allocation's header.
+/// The bytes charged for a frozen value beyond its own size. They cover its slot and the allocation's header.
 pub(crate) const FROZEN_COST: usize = size_of::<Slot>() + 16;
 
 #[derive(Default)]
@@ -28,7 +28,7 @@ struct Slot {
     cost: Cell<usize>,
 }
 
-/// A frozen `T` made this step, for a constructor to store in a field.
+/// A reference to a frozen `T` created in this step. A constructor stores it in a field.
 pub struct FrozenRef<'gc, T> {
     id: u32,
     _marker: PhantomData<(Brand<'gc>, fn() -> T)>,
@@ -47,34 +47,34 @@ impl<T> FrozenRef<'_, T> {
         Self { id, _marker: PhantomData }
     }
 
-    /// The word a frozen field holds: the id plus one, so 0 is none.
+    /// Returns the word that a frozen field holds: the id plus one, so that 0 means no value.
     pub fn to_word(self) -> u64 {
         u64::from(self.id) + 1
     }
 }
 
-/// The table of frozen values, in chunks made as they're needed, so slots never move.
+/// The table of frozen values. It is made of chunks that are allocated as they are needed, so a slot never moves.
 pub(crate) struct FrozenTable {
     chunks: Box<[OnceCell<Box<[Slot]>>]>,
     /// One past the highest id handed out.
     next: Cell<usize>,
     free: RefCell<Vec<u32>>,
-    /// Made since the last collection, for a minor one to check.
+    /// The ids of the values created since the last collection. A minor collection checks only these.
     young: RefCell<Vec<u32>>,
-    /// Found dead, emptied by `free_dead`.
+    /// The ids of the values that a collection found dead. `free_dead` empties their slots.
     dead: RefCell<Vec<u32>>,
-    /// Chunks made so far, for charging: counting them would take a pass over the table, after
+    /// The number of chunks allocated so far, kept for charging. Counting the chunks instead would take a pass over the table after
     /// every step.
     made: Cell<usize>,
-    /// What the values that outlived a collection, and weren't found dead since, are charged.
-    /// Young ones are left out: a minor collection frees those.
+    /// The bytes charged for the old values: the values that survived a collection and have not been found dead since.
+    /// Young values are not included, because a minor collection can free them.
     live: Cell<usize>,
-    /// What the young values are charged.
+    /// The bytes charged for the young values.
     young_bytes: Cell<usize>,
 }
 
 impl FrozenTable {
-    /// Room for as many values as `limit` bytes pay for.
+    /// Creates a table with room for as many values as `limit` bytes can pay for.
     pub(crate) fn new(limit: usize) -> Self {
         let max = (limit / FROZEN_COST).clamp(CHUNK, u32::MAX as usize - 1);
         Self {
@@ -95,13 +95,13 @@ impl FrozenTable {
         self.chunks.get(id / CHUNK)?.get()?.get(id % CHUNK)
     }
 
-    /// The value a frozen field's word names, or none if it names no `T`.
+    /// Returns the value that the frozen field word `word` refers to, or `None` if `word` does not refer to a `T`.
     #[inline]
     pub(crate) fn get<T: Any>(&self, word: u64) -> Option<&T> {
         self.slot(word)?.value.get()?.downcast_ref()
     }
 
-    /// The value a frozen field's word names, whatever its type, and what it's charged.
+    /// Returns the value that the frozen field word `word` refers to, whatever its type, and the bytes charged for it.
     pub(crate) fn any(&self, word: u64) -> Option<(&dyn Any, usize)> {
         let slot = self.slot(word)?;
         Some((&**slot.value.get()?, slot.cost.get()))
@@ -150,8 +150,8 @@ impl FrozenTable {
         }
     }
 
-    /// After a minor collection: values made since the last one that nothing marked are dead,
-    /// and the rest are old.
+    /// Runs after a minor collection. A value created since the last collection is dead if it was not marked.
+    /// Every other young value becomes old.
     pub(crate) fn sweep_young(&self) {
         let mut dead = self.dead.borrow_mut();
         let mut live = self.live.get();
@@ -167,8 +167,8 @@ impl FrozenTable {
         self.young_bytes.set(0);
     }
 
-    /// After a major collection's marking: every unmarked value is dead. That includes those a
-    /// minor collection found and `free_dead` hasn't emptied yet, so they're listed again.
+    /// Runs after the marking of a major collection. Every unmarked value is dead. That includes the values that a
+    /// minor collection found dead and `free_dead` has not emptied yet, so the dead list is rebuilt from scratch.
     pub(crate) fn sweep_all(&self) {
         let mut dead = self.dead.borrow_mut();
         dead.clear();
@@ -191,8 +191,8 @@ impl FrozenTable {
         self.young_bytes.set(0);
     }
 
-    /// Empties the slots of up to `max` dead values, between steps, when nothing can be
-    /// borrowing them.
+    /// Empties the slots of up to `max` dead values. It runs between steps, when nothing can
+    /// borrow the values.
     pub(crate) fn free_dead(&mut self, budget: &Budget, max: usize) {
         let (free, dead) = (self.free.get_mut(), self.dead.get_mut());
         let keep = dead.len().saturating_sub(max);
@@ -207,7 +207,7 @@ impl FrozenTable {
         }
     }
 
-    /// What the values not yet freed were charged.
+    /// Returns the bytes charged for the values not yet freed.
     #[cfg(test)]
     pub(crate) fn charged(&self) -> usize {
         self.chunks.iter().filter_map(OnceCell::get).flat_map(|chunk| chunk.iter()).map(|slot| slot.cost.get()).sum()
@@ -217,7 +217,7 @@ impl FrozenTable {
         self.live.get()
     }
 
-    /// What the values made since the last collection are charged.
+    /// Returns the bytes charged for the values created since the last collection.
     pub(crate) fn young_bytes(&self) -> usize {
         self.young_bytes.get()
     }
@@ -226,7 +226,7 @@ impl FrozenTable {
         self.next.get() - self.free.borrow().len()
     }
 
-    /// The bytes the table and its lists take, beyond the values' own charges.
+    /// Returns the bytes that the table and its lists take, beyond the charges of the values themselves.
     pub(crate) fn table_bytes(&self) -> usize {
         self.chunks.len() * size_of::<OnceCell<Box<[Slot]>>>()
             + self.made.get() * CHUNK * size_of::<Slot>()

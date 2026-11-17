@@ -1,7 +1,7 @@
-//! A compilation unit's constants: kept in the arena behind one root, and named by index, so the
-//! compiler can hold them across steps. Symbols, strings and numbers are merged by content, as
-//! `eqv?` sees numbers and `equal?` strings; any other object gets a slot for each time it's
-//! added. Immediates need no slot.
+//! The constants of a compilation unit. They are stored in the arena behind one root and referred
+//! to by index, so the compiler can hold them across steps. Symbols, keywords, strings and
+//! numbers are deduplicated by content: numbers as `eqv?` compares them, and strings as `equal?`
+//! compares them. Any other object gets a new slot each time it is added. Immediates need no slot.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher, RandomState};
@@ -27,8 +27,8 @@ impl Const {
     }
 }
 
-/// A finished pool, as code reads it: an immutable vector, indexed by `u32` as instructions name
-/// constants.
+/// A finished pool in the form that code reads: an immutable vector. It is indexed by `u32`,
+/// which is how instructions refer to constants.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Constants<'gc>(ImmutableVector<'gc>);
 
@@ -62,19 +62,19 @@ pub enum Constant {
     Pooled(Const),
 }
 
-/// It holds no brand, so it can live between steps, as a [`Root`] does. Using it with another
-/// arena panics.
+/// A pool of constants under construction. It has no `'gc` lifetime, so it can be kept between
+/// steps, as a [`Root`] can. Using it with a different arena panics.
 pub struct ConstPool {
     items: Root<VecHead<slot::Value>>,
     seed: u64,
     state: RandomState,
-    /// The newest constant merged by each hash.
+    /// For each hash, the index of the newest deduplicated constant with that hash.
     heads: HashMap<u64, u32>,
-    /// For each constant, the one before it with the same hash.
+    /// For each constant, the index of the previous constant with the same hash, if there is one.
     older: Vec<Option<u32>>,
 }
 
-/// What's compared to merge a constant.
+/// The content that is compared to deduplicate a constant.
 #[derive(Clone, Copy)]
 enum Content<'gc> {
     Symbol(Symbol<'gc>),
@@ -102,8 +102,9 @@ impl ConstPool {
         GcVec::of(self.items.get(mc).expect("pool belongs to a different arena"))
     }
 
-    /// `value` itself if it's immediate, and otherwise its slot: the one an equal constant has, or
-    /// a new one. Failing changes nothing.
+    /// Adds `value` to the pool. Returns `value` itself if it is an immediate. Otherwise returns
+    /// its slot: the slot of an equal constant if the pool has one, or a new slot. The pool is
+    /// unchanged if this fails.
     pub fn add<'gc>(&mut self, mc: &Mutation<'gc>, value: Value<'gc>) -> Result<Constant, Error> {
         if let Some(immediate) = value.immediate() {
             return Ok(Constant::Immediate(immediate));
@@ -124,7 +125,7 @@ impl ConstPool {
         Ok(Constant::Pooled(Const(index)))
     }
 
-    /// The constant with this hash that's the same as `key`, if there's one.
+    /// Returns the constant with hash `hash` that is equal to `key`, if there is one.
     fn find<'gc>(&self, mc: &Mutation<'gc>, key: Content<'gc>, hash: u64) -> Result<Option<Const>, Error> {
         let items = self.items(mc);
         let mut at = self.heads.get(&hash).copied();
@@ -138,12 +139,12 @@ impl ConstPool {
         Ok(None)
     }
 
-    /// The constant, if `constant` is from this pool.
+    /// Returns the value of `constant`, which must come from this pool. Returns `None` if its index is out of range.
     pub fn get<'gc>(&self, mc: &Mutation<'gc>, constant: Const) -> Option<Value<'gc>> {
         self.items(mc).get(mc, constant.0 as usize)
     }
 
-    /// The constants as they are now, in a vector the unit's code shares.
+    /// Returns the current constants in an immutable vector, which the unit's code shares.
     pub fn finish<'gc>(&self, mc: &Mutation<'gc>) -> Result<Constants<'gc>, Error> {
         let items = self.items(mc).items(mc);
         Ok(Constants(Vectors::new(mc).immutable_with(self.len(), |i| items.map_or(Value::NULL, |slots| slots.get(i)))?))

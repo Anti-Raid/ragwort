@@ -1,21 +1,21 @@
-//! Ragwort's garbage collector. The region is words in `Cell`s, references are word indices, 
-//! and a type is described by data the collector reads rather than code it runs. A wrong description 
-//! or a forged reference gives wrong results or a panic but never undefined behavior.
+//! Ragwort's garbage collector. The region is an array of words in `Cell`s, and a reference is a word index.
+//! Each type is described by data that the collector reads, not by code that the collector runs. A wrong descriptor
+//! or a forged reference gives wrong results or a panic, but never undefined behavior.
 //!
-//! It has 16 KiB pages of 128-byte lines, 512-byte cards, sticky mark bits for minor
+//! The collector has 16 KiB pages of 128-byte lines, 512-byte cards, sticky mark bits for minor
 //! collections, major cycles marked in incremental slices, weak references and ephemerons,
 //! evacuation of fragmented pages through forwarding headers in the atomic phase, and lazy
-//! sweeping. Free pages past a nursery's worth go back to the system through
+//! sweeping. Free pages beyond one nursery's worth are returned to the system through
 //! `ragwort-gc-region`, which holds the only unsafe code in Ragwort (at least in interpreter mode).
-//! Memory is counted against a budget with a reserve, and VM stacks have segments, continuation capture and parking.
+//! Memory is counted against a budget with a reserve. VM stacks have segments, continuation capture and parking.
 //!
-//! The arena has a fixed number of value roots, set when it's made. A [`Root`] keeps an object
+//! The arena has a fixed number of value roots, set when the arena is created. A [`Root`] keeps an object
 //! alive across steps from outside the arena, such as from a task.
 //!
 //! # Typed objects
 //!
-//! [`objects!`] declares a group of types. Each field names what it holds, and the macro
-//! derives the collector's description from that, so the two can't disagree:
+//! [`objects!`] declares a group of types. Each field declares the kind of data it holds. The macro
+//! derives the collector's descriptor from the declarations, so the two cannot disagree:
 //!
 //! ```
 //! use ragwort_types::gc::*;
@@ -51,36 +51,36 @@
 //! });
 //! ```
 //!
-//! For each `struct` it generates:
+//! For each `struct`, the macro generates:
 //! - a unit struct implementing [`Object`];
 //! - a [`Field`] constant per field, named in capitals (`Pair::CAR`), for [`Gc::get`] and
 //!   [`Gc::set`];
 //! - `new(mc, fields…)`, which also takes a length and fill value when the type has items, or
 //!   an entry count for `items Ephemeron`;
 //! - a trait `PairFields` for `Gc<Pair>`, with a getter and a `set_` setter per field, and
-//!   `items` for any items but ephemerons, which `Gc::entry` reads.
+//!   an `items` method for every kind of items except ephemerons. `Gc::entry` reads ephemeron items.
 //!
 //! A field holds a `Value`, a word (`u64`, `i64`, `u32`, `f64` or `bool`), a `Member<T>`, a
 //! `Weak<T>`, a `Host<T>`, an `AnyHost`, a `Frozen<T>` or an `Ephemeron`. Items can be any of
-//! these but hosts and frozen values. A `Host<T>` holds a [`HostRef`], and an `AnyHost`
-//! an [`AnyHostRef`], a host value of any type whose reads check the type. Writes take the barrier their kind needs, and a member or weak read
-//! checks that the target has the type the field or items declare.
+//! these except hosts and frozen values. A `Host<T>` holds a [`HostRef`]. An `AnyHost` holds
+//! an [`AnyHostRef`], which refers to a host value of any type and checks the type on each read. Each write applies the write barrier that its kind needs. A member or weak read
+//! checks that the target has the type declared by the field or the items.
 //!
 //! The group's enum, `Kind` here, has a variant per type. `Kind::of(value)` reads the type
-//! number the value carries, so it needs no memory read. Types get fixed numbers from
-//! `Kind::BASE`, in declaration order. Groups used in one arena mustn't overlap: declare the
-//! second `kind Extra after Kind;`. If they overlap, the first allocation of a clashing type
+//! number stored in the value, so it needs no memory read. Types get fixed numbers from
+//! `Kind::BASE`, in declaration order. Groups used in one arena must not overlap: declare the
+//! second group as `kind Extra after Kind;`. If two groups overlap, the first allocation of a clashing type
 //! panics. `kind Name at N;` starts the group at `N` instead.
 //!
-//! Fields can't take a name that a method of `Gc` or a constructor parameter uses. The raw API
-//! beneath, fields by number, is in the hidden `raw` module.
+//! A field cannot have the name of a `Gc` method or of a constructor parameter. The underlying raw API,
+//! which addresses fields by number, is in the hidden `raw` module.
 //!
 //! # Frozen values
 //!
-//! A `Frozen<T>` field holds a value outside the region, made once by [`Mutation::frozen`] and
-//! read as `&'gc T`: for data too big to copy into items as cells, such as a source's text.
-//! Nothing is freed while a step runs, so the borrow checker keeps a reference from outliving
-//! it: a collection needs the arena mutably.
+//! A `Frozen<T>` field holds a value stored outside the region. [`Mutation::frozen`] creates the value once, and
+//! a read returns `&'gc T`. Use it for data that is too big to copy into items as cells, such as the text of a source file.
+//! No frozen value is freed while a step runs, and a collection needs the arena mutably. So the borrow checker
+//! stops a reference from outliving its value.
 //!
 //! ```
 //! use ragwort_types::gc::*;
@@ -107,12 +107,12 @@
 //!
 //! # Containers, strings and numbers
 //!
-//! [`GcVec`] is a growable array, [`Table`] a hash table of strong, ephemeron or weak entries,
-//! and [`ScratchVec`] a step's scratch space outside the arena, counted against its budget.
-//! [`crate::string`] and [`crate::num`] hold `ragwort-string`'s strings and `ragwort-num`'s numbers: a flat
+//! [`GcVec`] is a growable array. [`Table`] is a hash table of strong, ephemeron or weak entries.
+//! [`ScratchVec`] is scratch space for one step, stored outside the arena and counted against the arena's budget.
+//! [`crate::string`] and [`crate::num`] hold `ragwort-string`'s strings and `ragwort-num`'s numbers. A flat
 //! string's characters are packed into its own items, and a bignum's digits are its items.
 //!
-//! What doesn't compile: storing an object of the wrong type,
+//! The following mistakes do not compile. Storing an object of the wrong type:
 //!
 //! ```compile_fail
 //! # use ragwort_types::gc::*;
@@ -125,7 +125,7 @@
 //! });
 //! ```
 //!
-//! using one type's field on another,
+//! Using one type's field on another type:
 //!
 //! ```compile_fail
 //! # use ragwort_types::gc::*;
@@ -137,7 +137,7 @@
 //! });
 //! ```
 //!
-//! a field handle whose kind doesn't match the description,
+//! Making a field handle whose kind does not match the descriptor:
 //!
 //! ```compile_fail
 //! # use ragwort_types::gc::*;
@@ -150,7 +150,7 @@
 //! });
 //! ```
 //!
-//! and a field named like a method of `Gc`:
+//! Giving a field the name of a `Gc` method:
 //!
 //! ```compile_fail
 //! # use ragwort_types::gc::*;
@@ -251,21 +251,21 @@ const fn region() -> usize {
     mebibytes << 20
 }
 
-/// The region in words: twice `REGION`, so evacuation has fresh pages to copy into.
+/// The size of the region in words. It is twice `REGION`, so evacuation has fresh pages to copy into.
 const WORDS: usize = 2 * REGION / 8;
-/// The words of the region, as everything that reads them sees it.
+/// The type of the region's word array. The array has `SLACK` extra words at its end.
 type RegionWords = [Cell<u64>; WORDS + SLACK];
 /// Page, line and card sizes in words.
 const PAGE: usize = 2048;
 const LINE: usize = 16;
 const CARD: usize = 64;
 const PAGES: usize = WORDS / PAGE;
-/// Unused words past the region, so `mask(index) + 1 + field` for a constant field needs no
-/// bounds check.
+/// The number of unused words past the end of the region. With them, `mask(index) + 1 + field` needs no
+/// bounds check when `field` is a constant.
 const SLACK: usize = 128;
 const LINES: usize = PAGE / LINE;
-/// How many registers a frame has: the slots a [`Frame`] or [`Window`] sees from its start. Every
-/// register limit of the VM and compiler follows from it. A register is a byte, taken modulo
+/// The number of registers in a frame. A [`Frame`] or [`Window`] sees this many slots from its start. Every
+/// register limit in the VM and the compiler is derived from it. A register number is a byte and is taken modulo
 /// `WINDOW`, so no access needs a bounds check.
 pub const WINDOW: usize = 64;
 const _: () = assert!(WINDOW.is_power_of_two() && WINDOW >= 32 && WINDOW <= 256);
@@ -273,26 +273,26 @@ const _: () = assert!(WINDOW.is_power_of_two() && WINDOW >= 32 && WINDOW <= 256)
 pub(crate) const TAG: u64 = 0b1111;
 pub(crate) const OBJECT: u64 = 0b0001;
 const CONSTANT: u64 = 0b1101;
-/// The bits of a constant's id that the false constants differ in: see [`Value::is_false`].
+/// The bits of a constant's id in which the false constants differ. See [`Value::is_false`].
 const FALSE_IDS: u64 = (8 | 16) << 32;
 /// The bit of a constant's id that makes it a character.
 const CHAR: u64 = 1 << 31;
-/// A string of [`crate::string::INLINE_CHARS`] Latin-1 characters or fewer: the length in the next
-/// four bits, then a byte for each character, the first lowest.
+/// The tag of an inline string, which holds at most [`crate::string::INLINE_CHARS`] Latin-1 characters. The next
+/// four bits hold the length. One byte per character follows, with the first character in the lowest byte.
 pub(crate) const INLINE_STRING: u64 = 0b0101;
-/// Inline flonums end in 11: a double with two redundant exponent bits dropped.
+/// The low two bits of an inline flonum. An inline flonum is a double with two redundant exponent bits dropped.
 const FLONUM: u64 = 0b11;
-/// The special doubles take the words of the lowest few inline ones, ±1.7272337110188889e-77
-/// and the two above, which are boxed instead. The NaNs are the defaults ARM and x86 make.
+/// The special doubles: ±0, ±infinity, and the default NaNs of ARM and x86. Their words are the words of the six smallest inline doubles,
+/// ±1.7272337110188889e-77 and the two doubles above each. Those six doubles are boxed instead.
 const SPECIALS: [u64; 6] = [0, 1 << 63, 0x7FF0 << 48, 0xFFF0 << 48, 0x7FF8 << 48, 0xFFF8 << 48];
-/// The first special's word. Each next one is 4 above it.
+/// The word of the first special. The word of each later special is 4 above the word before it.
 const ZERO: u64 = 0x8000_0000_0000_0003;
 const LAST_SPECIAL: u64 = 4 * (SPECIALS.len() as u64 - 1);
 
 #[inline]
 fn encode(double: f64) -> Option<u64> {
     let bits = double.to_bits();
-    // Exponents starting 011 or 100: the second and third bits copy the inverse of the first.
+    // A double is stored inline if its exponent starts with 011 or 100. The third exponent bit then determines the first two. The rotation moves those two to the low bits, and the tag replaces them.
     let top = bits >> 60 & 0b111;
     if top == 0b011 || top == 0b100 {
         let word = bits.rotate_left(3) | FLONUM;
@@ -308,24 +308,25 @@ fn decode(word: u64) -> f64 {
     if special <= LAST_SPECIAL {
         return f64::from_bits(SPECIALS[special as usize / 4]);
     }
+    // `first` is the exponent bit that was kept, now the top bit of the word. The two dropped exponent bits are its inverse and then a copy of it: `10` if it is 0 and `01` if it is 1. That is `2 - first`.
     let first = word >> 63;
     f64::from_bits((word & !FLONUM | (2 - first)).rotate_right(3))
 }
 
-/// A double that doesn't fit in a word: magnitudes beyond about 1e±77, and the NaNs not in
-/// `SPECIALS`. Every arena registers it first, as type 0.
+/// A boxed double, for a double that has no inline encoding. These are the magnitudes outside about 1e-77 to 1e77, and the NaNs that are not in
+/// `SPECIALS`. Every arena registers `Boxed` first, as type 0.
 struct Boxed;
 
 impl Object for Boxed {
     const DESC: Desc = Desc::of::<Boxed>(1).numbered(0);
 }
 
-/// Type numbers below this are this crate's own: `Boxed`, `Segment`, the containers, strings,
+/// The first type number that other crates can use. The numbers below it belong to this crate's types: `Boxed`, `Segment`, the containers, strings,
 /// numbers, and the data types. An `objects!` group declared without a base starts here.
 #[doc(hidden)]
 pub const FIRST_TYPE: u16 = crate::objects::Data::END;
-/// A header is the type index, a flag, and the item count in the upper half. A forwarded one
-/// has the new index there instead.
+/// A header holds the type index, the `FORWARDED` flag, and the item count in the upper half. A forwarded header
+/// holds the object's new index in the upper half instead.
 const TYPE_BITS: u64 = 0xFFFF;
 const FORWARDED: u64 = 1 << 16;
 const TYPES: usize = 1 << 16;
@@ -336,7 +337,7 @@ type Brand<'gc> = PhantomData<Cell<&'gc ()>>;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct OutOfMemory;
 
-/// What string and number operations fail with.
+/// The error type of string and number operations.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Error {
     OutOfMemory,
@@ -367,39 +368,39 @@ pub enum Items {
     None,
     Values,
     Words,
-    /// Pairs of a key and a value, held like `Desc::ephemerons`. The length counts words.
+    /// Pairs of a key and a value, which behave like the fields in `Desc::ephemerons`. The item count is in words, two per pair.
     Ephemerons,
-    /// Object indices, 0 for none, that keep their targets alive.
+    /// Object indices that keep their targets alive. Index 0 means no object.
     Members,
-    /// Object indices, 0 for none, cleared once their targets die.
+    /// Object indices that do not keep their targets alive. An index is set to 0 once its target dies. Index 0 means no object.
     Weaks,
 }
 
-/// How the collector sees a type: its fixed words, which of them hold references, and its items.
+/// The collector's descriptor of a type: the number of fixed fields, the fields that hold references, and the kind of items.
 pub struct Desc {
     pub type_id: TypeId,
     pub fields: u32,
-    /// Fields holding a `Value`.
+    /// Bit mask of the fields that hold a `Value`.
     pub values: u64,
-    /// Fields holding an object index, 0 for none.
+    /// Bit mask of the fields that hold an object index. Index 0 means no object.
     pub members: u64,
-    /// Fields holding a host id plus one, 0 for none.
+    /// Bit mask of the fields that hold a host reference, as the word from [`HostRef::to_word`]. Word 0 means no host value.
     pub hosts: u64,
-    /// Fields holding an object index that doesn't keep the object alive, 0 for none.
+    /// Bit mask of the fields that hold an object index without keeping the object alive. Index 0 means no object.
     pub weaks: u64,
-    /// Fields holding a frozen value's id plus one, 0 for none: write-once values outside the
+    /// Bit mask of the fields that hold a frozen value's id plus one, where 0 means no value. A frozen value is a write-once value stored outside the
     /// region.
     pub frozen: u64,
-    /// Fields holding an ephemeron's key, with its value in the next field. The value is kept
-    /// alive only while the key is reachable some other way; once the key dies, both become
-    /// `Value::BROKEN`. A key that isn't an object never dies.
+    /// Bit mask of the fields that hold an ephemeron's key. The ephemeron's value is in the next field. The value is kept
+    /// alive only while the key is reachable in some other way. Once the key dies, both fields become
+    /// `Value::BROKEN`. A key that is not an object never dies.
     pub ephemerons: u64,
     pub items: Items,
-    /// A fixed type number, which `objects!` gives its types so type checks compare against a
-    /// constant. Types without one are numbered by each arena as it first sees them.
+    /// A fixed type number. `objects!` gives one to each of its types, so that type checks compare against a
+    /// constant. Each arena numbers a type that has no fixed number when it first sees the type.
     pub number: Option<u16>,
-    /// Whether marking an object of the type has anything to trace, kept up to date by every
-    /// builder: marking asks for each object, and working it out each time costs 4%.
+    /// Whether an object of the type holds anything for marking to trace. Every builder method keeps the flag up to
+    /// date. Marking reads it for each object, and computing it each time costs 4%.
     traces: bool,
 }
 
@@ -420,7 +421,7 @@ impl Desc {
         }
     }
 
-    /// Fields with these roles in order, where an ephemeron takes two words.
+    /// Returns a descriptor whose fields have the roles in `roles`, in order, and whose items are `items`. An ephemeron role takes two fields.
     #[doc(hidden)]
     pub const fn layout<T: 'static>(roles: &[Role], items: Items) -> Self {
         let mut desc = Self::of::<T>(0).items(items);
@@ -446,7 +447,7 @@ impl Desc {
         desc.settled()
     }
 
-    /// What field `field` holds, or `None` past the fields and for an ephemeron's value.
+    /// Returns the role of field `field`. Returns `None` if `field` is out of range or is the value field of an ephemeron. An ephemeron key in the last field has no value field, so `role` also returns `None` for it.
     pub const fn role(&self, field: usize) -> Option<Role> {
         if field >= self.fields as usize {
             return None;
@@ -529,7 +530,7 @@ pub trait Object: 'static {
     const DESC: Desc;
 }
 
-/// A value in one word: a fixnum shifted left by one, an object's index and type, a short string,
+/// A value in one word: a fixnum shifted left by one, an inline flonum, an object's index and type, a short string,
 /// or a constant.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Value<'gc> {
@@ -542,25 +543,29 @@ impl<'gc> Value<'gc> {
     pub const TRUE: Self = Self::constant(1);
     /// The empty list.
     pub const NULL: Self = Self::constant(2);
-    /// What a stack slot above `top` becomes.
+    /// The void value. A stack slot above `top` is reset to it.
     pub const VOID: Self = Self::constant(3);
-    /// What a module's variable holds until it's defined.
+    /// The value of a module variable that is not defined yet.
     pub const UNDEFINED: Self = Self::constant(4);
-    /// What an optional parameter is bound to when its call passes no argument for it.
+    /// The value bound to an optional parameter when the call passes no argument for it.
     pub const UNSUPPLIED: Self = Self::constant(5);
-    /// What the VM's accumulator holds when a call returned no value or several values. The values are then in a list beside it. It is never stored in a variable.
+    /// The marker that the VM's accumulator holds when a call returned no value or several values. The values are then in a list beside the accumulator. The marker is never stored in a variable.
     pub const VALUES: Self = Self::constant(6);
-    /// What an ephemeron's key and value become once the key dies.
+    /// The value that replaces an ephemeron's key and value once the key dies.
     pub const BROKEN: Self = Self::constant(7);
-    /// `#nil`: what stands where there is no value at all, as a table reads for a key it does not
+    /// `#nil`: the absence of a value. For example, a table read returns it for a key that the table does not
     /// have. It is false in a conditional. See [`Value::is_false`].
     pub const NIL: Self = Self::constant(8);
-    /// `#none`: a value that is there and says "none", as a host gives for a `null`. It is false in
+    /// The default continuation prompt tag. A program can hold it like any other value.
+    pub const DEFAULT_TAG: Self = Self::constant(9);
+    /// The continuation mark key under which the VM keeps the installed exception handlers. A program never holds it.
+    pub const HANDLER_KEY: Self = Self::constant(10);
+    /// `#none`: a value that is present and means "none". For example, a host returns it for a `null`. It is false in
     /// a conditional. See [`Value::is_false`].
     pub const NONE: Self = Self::constant(16);
 
-    /// Whether a conditional takes the value as false. Three values are false: `#f`, `#nil` and
-    /// `#none`. Everything else is true, the empty list and void included.
+    /// Returns whether a conditional treats the value as false. Three values are false: `#f`, `#nil` and
+    /// `#none`. Every other value is true, including the empty list and void.
     ///
     /// The ids of the three constants differ only in two bits, so clearing
     /// those bits and comparing with `#f` tests for all three at once. No constant is made with
@@ -570,7 +575,7 @@ impl<'gc> Value<'gc> {
         self.word & !FALSE_IDS == Self::FALSE.word
     }
 
-    /// Whether a conditional takes the value as true: whether it is not [false](Value::is_false).
+    /// Returns whether a conditional treats the value as true. That is every value that is not [false](Value::is_false).
     #[inline(always)]
     pub const fn is_true(self) -> bool {
         !self.is_false()
@@ -580,7 +585,7 @@ impl<'gc> Value<'gc> {
         Self::from_bits(id << 32 | CONSTANT)
     }
 
-    /// A character: a constant whose id has its top bit set, the code point below it.
+    /// Returns `character` as a value. A character is a constant whose id has its top bit set and holds the code point in the bits below.
     #[inline]
     pub const fn char(character: char) -> Self {
         Self::constant(CHAR | character as u64)
@@ -595,7 +600,7 @@ impl<'gc> Value<'gc> {
         char::from_u32((id & !CHAR) as u32)
     }
 
-    /// Any word is a valid value. One that names no object reads as some other object or none.
+    /// Returns the value with the bits `word`. Every word is a valid value. An object reference that matches no object reads as some other object or as no object.
     pub const fn from_bits(word: u64) -> Self {
         Self { word, _brand: PhantomData }
     }
@@ -639,7 +644,7 @@ impl<'gc> Value<'gc> {
         (self.word as i64).checked_sub(other.word as i64).map(|word| Self::from_bits(word as u64))
     }
 
-    /// Twice `a` times `b` is twice their product, so one operand stays shifted.
+    /// Returns the product of two fixnums, or `None` if it overflows or an operand is not a fixnum. A fixnum's word is twice its number, and `2a * b` is twice the product. So only one operand is shifted back.
     #[inline]
     pub fn fixnum_mul(self, other: Self) -> Option<Self> {
         if (self.word | other.word) & 1 != 0 {
@@ -648,7 +653,7 @@ impl<'gc> Value<'gc> {
         (self.word as i64).checked_mul(other.word as i64 >> 1).map(|word| Self::from_bits(word as u64))
     }
 
-    /// Stores the double in the word when it fits, and boxes it otherwise.
+    /// Returns `double` as a value. The double is stored in the word if it has an inline encoding, and boxed otherwise.
     #[inline]
     pub fn flonum(mc: &Mutation<'gc>, double: f64) -> Result<Self, OutOfMemory> {
         match encode(double) {
@@ -657,13 +662,13 @@ impl<'gc> Value<'gc> {
         }
     }
 
-    /// The double as a value without allocating, if it fits in the word.
+    /// Returns `double` as a value without allocating, or `None` if `double` has no inline encoding.
     #[inline]
     pub fn inline_flonum(double: f64) -> Option<Self> {
         encode(double).map(Self::from_bits)
     }
 
-    /// Inline, or a reference to a boxed one: type 0 in every arena.
+    /// Returns whether the value is a flonum: an inline flonum, or a reference to a boxed one. `Boxed` is type 0 in every arena.
     #[inline]
     pub fn is_flonum(self) -> bool {
         self.word & FLONUM == FLONUM || self.word & (TYPE_BITS << 16 | TAG) == OBJECT
@@ -695,28 +700,28 @@ impl<'gc> Value<'gc> {
         self.downcast_tag(mc.type_tag::<T>()?)
     }
 
-    /// Compares the type the reference carries, without reading the object.
+    /// Returns the object if the value refers to a `T`. Compares the type number stored in the value with `tag`, without reading the object.
     #[inline]
     pub fn downcast_tag<T: Object>(self, tag: TypeTag<'gc, T>) -> Option<Gc<'gc, T>> {
         (self.word & (TYPE_BITS << 16 | TAG) == u64::from(tag.ty) << 16 | OBJECT).then(|| Gc::new((self.word >> 32) as u32))
     }
 
-    /// The type number and index of the object this refers to, for `objects!` kinds.
+    /// Returns the type number and index of the object that the value refers to, or `None` if it refers to no object. For `objects!` kinds.
     #[doc(hidden)]
     #[inline]
     pub fn object_parts(self) -> Option<(u16, u32)> {
         (self.word & TAG == OBJECT).then_some(((self.word >> 16 & TYPE_BITS) as u16, (self.word >> 32) as u32))
     }
 
-    /// The value, if it refers to no object.
+    /// Returns the value as an [`Immediate`], or `None` if it refers to an object.
     #[inline]
     pub fn immediate(self) -> Option<Immediate> {
         (self.word & TAG != OBJECT).then_some(Immediate(self.word))
     }
 }
 
-/// A value that refers to no object, such as a fixnum, an inline flonum or `#t`. It holds no
-/// brand: no collection changes it, so it can be kept outside the arena.
+/// A value that refers to no object, such as a fixnum, an inline flonum or `#t`. It has no
+/// brand, because no collection changes it. So it can be kept outside the arena.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Immediate(u64);
 
@@ -744,7 +749,7 @@ impl<T> Clone for TypeTag<'_, T> {
 
 impl<T> Copy for TypeTag<'_, T> {}
 
-/// An object: its header's index in the region.
+/// A reference to an object: the index of the object's header in the region.
 pub struct Gc<'gc, T> {
     index: u32,
     _marker: PhantomData<(Brand<'gc>, fn() -> T)>,
@@ -777,8 +782,8 @@ impl<'gc, T: Object> Gc<'gc, T> {
         Self { index, _marker: PhantomData }
     }
 
-    /// The object at `index`, taken to be a `T`: for `objects!` kinds, which have checked the
-    /// type the value carries.
+    /// Returns the object at `index` as a `T`, without a type check. For `objects!` kinds, which have already checked the
+    /// type number stored in the value.
     #[doc(hidden)]
     pub const fn forge(index: u32) -> Self {
         Self::new(index)
@@ -789,7 +794,7 @@ impl<'gc, T: Object> Gc<'gc, T> {
         S::get(self, mc, field.index)
     }
 
-    /// Takes the barrier the field's kind needs.
+    /// Stores `value` in `field` and applies the write barrier that the field's kind needs.
     #[inline]
     pub fn set<S: Slot>(self, mc: &Mutation<'gc>, field: Field<T, S>, value: S::In<'gc>) {
         S::set(self, mc, field.index, value);
@@ -803,8 +808,8 @@ impl<'gc, T: Object> Gc<'gc, T> {
         self.len(mc) == 0
     }
 
-    /// Entry `index` of `Items::Ephemerons` items, or `None` once its key has died. Panics past
-    /// the end.
+    /// Returns entry `index` of `Items::Ephemerons` items, or `None` once the entry's key has died. Panics if
+    /// `index` is out of range.
     #[inline]
     pub fn entry(self, mc: &Mutation<'gc>, index: usize) -> Option<(Value<'gc>, Value<'gc>)> {
         assert!(2 * index + 1 < self.len(mc), "entry {index} out of bounds");
@@ -818,8 +823,8 @@ impl<'gc, T: Object> Gc<'gc, T> {
     }
 }
 
-/// The word of field `field`. Panics past the declared fields, so a write can't reach the next
-/// object; constant field numbers fold the check away.
+/// Returns the word index of field `field`. Panics if `field` is not a declared field, so a write cannot reach the next
+/// object. The check folds away when the field number is a constant.
 #[inline]
 fn field_slot<T: Object>(gc: Gc<'_, T>, field: usize) -> usize {
     assert!(field < T::DESC.fields as usize, "field {field} of {}", T::DESC.fields);
@@ -831,8 +836,8 @@ fn items_start<T: Object>(gc: Gc<'_, T>) -> usize {
     mask(gc.index as usize) + 1 + T::DESC.fields as usize
 }
 
-/// A member or weak field's target, checked against the type the field declares when that type
-/// has a fixed number: one load and compare.
+/// Returns the target of a member or weak field, or `None` for index 0. If the field's declared type
+/// has a fixed number, the target's type is checked against it with one load and compare. A mismatch panics.
 #[inline]
 fn target<'gc, U: Object>(region: &RegionWords, index: u32) -> Option<Gc<'gc, U>> {
     if index == 0 {
@@ -852,8 +857,8 @@ fn wrong_target(index: u32, ty: u16) -> ! {
     panic!("object {index} isn't of type {ty}, which the field it was read from declares")
 }
 
-/// A typed handle to field `index` of a `T`, which holds an `S`. `objects!` makes them, and
-/// one whose kind doesn't match `T`'s description doesn't compile.
+/// A typed handle to field `index` of a `T`, which holds an `S`. `objects!` makes the handles. A handle
+/// whose kind does not match `T`'s descriptor does not compile.
 pub struct Field<T, S> {
     index: usize,
     _marker: PhantomData<fn() -> (T, S)>,
@@ -881,7 +886,7 @@ impl<T: Object, S: Slot> Field<T, S> {
     }
 }
 
-/// An object's fields as a fixed array, so constant field numbers need no bounds check: the
+/// An object's fields as a fixed-size array, so constant field numbers need no bounds check. It is the
 /// safe counterpart of a `&'gc T`.
 #[doc(hidden)]
 #[derive(Clone, Copy)]
@@ -910,10 +915,10 @@ impl<'gc, const N: usize> Fields<'gc, N> {
     }
 }
 
-/// An object's items, each an `S`: values unless the type declares words.
+/// An object's items, each of slot kind `S`. The default kind is `slot::Value`.
 pub struct Slots<'gc, S = slot::Value> {
     words: &'gc [Cell<u64>],
-    /// The whole region, for reads that check what an index refers to.
+    /// The whole region. A read uses it to check the type of the object that an index refers to.
     region: &'gc RegionWords,
     at: usize,
     owner: u32,
@@ -929,7 +934,7 @@ impl<S> Clone for Slots<'_, S> {
 impl<S> Copy for Slots<'_, S> {}
 
 impl<'gc> Slots<'gc, slot::u64> {
-    /// The words themselves: plain words refer to nothing, so writing them takes no barrier.
+    /// Returns the item cells. A plain word refers to no object, so writing one needs no barrier.
     #[inline]
     pub fn words(self) -> &'gc [Cell<u64>] {
         self.words
@@ -964,13 +969,13 @@ impl<'gc, S: Item> Slots<'gc, S> {
         }
     }
 
-    /// The items in `range`, or `None` past the end.
+    /// Returns the items in `range`, or `None` if `range` is out of bounds.
     pub fn slice(self, range: Range<usize>) -> Option<Self> {
         let words = self.words.get(range.clone())?;
         Some(Slots { words, at: self.at + range.start, ..self })
     }
 
-    /// Copies `src` in, which may overlap, with one barrier for the whole range. Panics if the
+    /// Copies the items of `src` into these items. The two ranges may overlap. One barrier covers the whole range. Panics if the
     /// lengths differ.
     pub fn copy_from(self, mc: &Mutation<'gc>, src: Self) {
         assert_eq!(self.len(), src.len(), "copy between slices of different lengths");
@@ -1001,7 +1006,7 @@ impl<'gc, S: Item> Slots<'gc, S> {
 }
 
 impl<'gc> Slots<'gc> {
-    /// The first `WINDOW` items, indexed by a byte modulo `WINDOW` so no access needs a bounds
+    /// Returns the first `WINDOW` items, or `None` if there are fewer. A [`Window`] is indexed by a byte modulo `WINDOW`, so no access needs a bounds
     /// check.
     pub fn window(self) -> Option<Window<'gc>> {
         Some(Window { slots: self.words.first_chunk()?, at: self.at, owner: self.owner, _brand: PhantomData })
@@ -1030,7 +1035,7 @@ impl<'gc> Window<'gc> {
     }
 }
 
-/// Host data, kept outside the region.
+/// A reference to a host value of type `T`. Host values are stored outside the region.
 pub struct HostRef<'gc, T> {
     id: u32,
     generation: u32,
@@ -1046,14 +1051,14 @@ impl<T> Clone for HostRef<'_, T> {
 impl<T> Copy for HostRef<'_, T> {}
 
 impl<'gc, T: Any> HostRef<'gc, T> {
-    /// The value, or `None` once it's been freed: a stale reference never reads the value that
-    /// took its slot. While the `Ref` is held, `Mutation::host` fails with `HostError::InUse`.
+    /// Returns the value, or `None` once the value has been freed. A stale reference never reads the value that
+    /// reused its slot. While the `Ref` is held, `Mutation::host` fails with `HostError::InUse`.
     #[inline]
     pub fn get(self, mc: &Mutation<'gc>) -> Option<Ref<'gc, T>> {
         self.erase().downcast_ref(mc)
     }
 
-    /// The same reference, with its type left to be checked on each read.
+    /// Returns the same reference with its type erased. Each read then checks the type.
     pub fn erase(self) -> AnyHostRef<'gc> {
         AnyHostRef { id: self.id, generation: self.generation, _brand: PhantomData }
     }
@@ -1063,8 +1068,8 @@ impl<'gc, T: Any> HostRef<'gc, T> {
         self.erase().set_owned_bytes(mc, bytes)
     }
 
-    /// The word a field declared in `Desc::hosts` holds: the slot's generation, and its id plus
-    /// one so that 0 is none.
+    /// Returns the word that a field declared in `Desc::hosts` holds. The upper half is the slot's generation. The lower half is the slot's id plus
+    /// one, so that 0 means no host value.
     pub fn to_word(self) -> u64 {
         self.erase().to_word()
     }
@@ -1082,8 +1087,8 @@ impl<'gc, T: Any> From<HostRef<'gc, T>> for AnyHostRef<'gc> {
     }
 }
 
-/// A reference to a host value of any type, for a field that can hold several. Each read checks
-/// the type, and like [`HostRef`], a stale reference reads nothing.
+/// A reference to a host value of any type, for a field that can hold several types. Each read checks
+/// the type. As with [`HostRef`], a stale reference reads nothing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct AnyHostRef<'gc> {
     id: u32,
@@ -1092,7 +1097,7 @@ pub struct AnyHostRef<'gc> {
 }
 
 impl<'gc> AnyHostRef<'gc> {
-    /// The value, or `None` once it's been freed.
+    /// Returns the value, or `None` once the value has been freed.
     #[inline]
     fn value(self, mc: &Mutation<'gc>) -> Option<Ref<'gc, dyn Any>> {
         let hosts = mc.heap.m.hosts.try_borrow().ok()?;
@@ -1103,22 +1108,22 @@ impl<'gc> AnyHostRef<'gc> {
         .ok()
     }
 
-    /// Whether the value is alive and a `T`.
+    /// Returns whether the value is alive and is a `T`.
     pub fn is<T: Any>(self, mc: &Mutation<'gc>) -> bool {
         self.value(mc).is_some_and(|value| (*value).is::<T>())
     }
 
-    /// The value, if it's alive and a `T`. While the `Ref` is held, `Mutation::host` fails with
+    /// Returns the value if it is alive and is a `T`. While the `Ref` is held, `Mutation::host` fails with
     /// `HostError::InUse`.
     #[inline]
     pub fn downcast_ref<T: Any>(self, mc: &Mutation<'gc>) -> Option<Ref<'gc, T>> {
         Ref::filter_map(self.value(mc)?, |value| value.downcast_ref::<T>()).ok()
     }
 
-    /// Counts `bytes` the value owns outside the arena, such as a `String`'s characters, in place
-    /// of what was counted before, until the value is freed. Call it again whenever that memory
-    /// grows or shrinks. Growing fails as an allocation would, failing the step, and counts
-    /// nothing; shrinking gives the difference back at once. A freed value's reference does
+    /// Sets the number of bytes that the value owns outside the arena, such as a `String`'s characters, to `bytes`. The new count replaces
+    /// the previous count and stays charged until the value is freed. Call it again whenever that memory
+    /// grows or shrinks. Growing can fail as an allocation can: the step fails and the count does not
+    /// change. Shrinking refunds the difference at once. A call on a freed value's reference does
     /// nothing. Fails with `HostError::InUse` while a `Ref` from a read is held.
     pub fn set_owned_bytes(self, mc: &Mutation<'gc>, bytes: usize) -> Result<(), HostError> {
         let meta = mc.heap.m;
@@ -1137,17 +1142,17 @@ impl<'gc> AnyHostRef<'gc> {
         Ok(())
     }
 
-    /// A typed reference, if the value is alive and a `T`.
+    /// Returns a typed reference if the value is alive and is a `T`.
     pub fn downcast<T: Any>(self, mc: &Mutation<'gc>) -> Option<HostRef<'gc, T>> {
         self.is::<T>(mc).then_some(self.assume())
     }
 
-    /// Typed without checking: `HostRef::get` checks on every read.
+    /// Returns a typed reference without checking the type. `HostRef::get` checks the type on every read.
     fn assume<T>(self) -> HostRef<'gc, T> {
         HostRef { id: self.id, generation: self.generation, _marker: PhantomData }
     }
 
-    /// The word a host field holds: see [`HostRef::to_word`].
+    /// Returns the word that a host field holds. See [`HostRef::to_word`].
     pub fn to_word(self) -> u64 {
         u64::from(self.generation) << 32 | (u64::from(self.id) + 1)
     }
@@ -1160,14 +1165,14 @@ fn host_parts(word: u64) -> Option<(u32, u32)> {
 struct HostSlot {
     generation: u32,
     marked: bool,
-    /// What the value is charged, refunded when it's freed: its size, `HOST_COST`, and `owned`.
+    /// The bytes charged for the value, which are refunded when it is freed: its size, `HOST_COST`, and `owned`.
     cost: usize,
-    /// Bytes the value owns outside the arena, as `AnyHostRef::set_owned_bytes` last set them.
+    /// The bytes that the value owns outside the arena, as last set by `AnyHostRef::set_owned_bytes`.
     owned: usize,
     value: Option<Box<dyn Any>>,
 }
 
-/// What a host value is charged beyond its size: its slot, and the box's header.
+/// The bytes charged for a host value beyond its size. They cover its slot and the box's header.
 const HOST_COST: usize = 32;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1183,12 +1188,12 @@ impl From<OutOfMemory> for HostError {
     }
 }
 
-/// A table that grows a chunk at a time, so an arena pays only for the entries it uses.
-/// `C * N` entries, the first `C` made up front and the rest a chunk at a time. Indexing with
-/// a `u16` when that's 65536 needs no bounds check.
+/// A table of `C * N` entries that grows one chunk at a time, so an arena pays only for the chunks it uses.
+/// The first `C` entries are allocated up front, and each later chunk on first use. Indexing with
+/// a `u16` needs no bounds check when `C * N` is 65536.
 struct Chunked<T, const C: usize, const N: usize> {
     first: Box<[T; C]>,
-    /// The chunks after the first; the slot for the first is unused.
+    /// The chunks after the first. Slot 0 is unused, because `first` holds the first chunk.
     chunks: Box<[OnceCell<Box<[T; C]>>; N]>,
 }
 
@@ -1222,25 +1227,25 @@ impl<T: Default, const C: usize, const N: usize> Chunked<T, C, N> {
 struct Page {
     starts: [Cell<u64>; PAGE / 64],
     marks: [Cell<u64>; PAGE / 64],
-    /// Lines holding marked objects, built while marking.
+    /// Bit mask of the lines that hold marked objects. It is built while marking.
     lines: Cell<u128>,
-    /// Lines the allocator can't use: `lines` as of the last sweep.
+    /// Bit mask of the lines that the allocator cannot use. A sweep sets it to `lines`, and the allocator adds the lines of each hole it claims.
     used: Cell<u128>,
     cards: Cell<u32>,
     evacuating: Cell<bool>,
-    /// Swept since the last cycle's marking ended.
+    /// Whether the page has been swept since the last major cycle finished marking.
     swept: Cell<bool>,
-    /// Holds part of an object larger than a page, which starts on this page: it isn't
+    /// The first page of a large object, if this page holds part of one. A large object has its own run of pages. Such a page is not
     /// evacuated, and a dirty card finds the object's header without scanning back to it.
     large: Cell<Option<u32>>,
-    /// Given back to the system while free.
+    /// Whether the page's memory has been released to the system. Only a free page is released.
     released: Cell<bool>,
-    /// Held something when last swept, as `Meta::occupied` counts.
+    /// Whether the page held any object when it was last swept. `Meta::occupied` counts these pages.
     counted: Cell<bool>,
 }
 
-/// Gives the free ones of `pages`, in order, back to the system in runs, past the first
-/// nursery's worth. Only pages the system wholly took back stop being charged; the rest stay
+/// Releases the free pages among `pages` to the system, in runs of adjacent pages. `pages` is in ascending order. The first free pages,
+/// one nursery's worth, are kept. Only a page that the system released completely is refunded. Every other page stays
 /// committed.
 fn give_back(memory: &mut Region, meta: &Meta, pages: impl Iterator<Item = usize>) {
     let mut warm = meta.nursery / (PAGE * 8);
@@ -1275,7 +1280,7 @@ fn give_back(memory: &mut Region, meta: &Meta, pages: impl Iterator<Item = usize
     }
 }
 
-/// Pages, as bits.
+/// A set of pages, stored as a bit set.
 struct PageSet(Box<[Cell<u64>]>);
 
 impl PageSet {
@@ -1294,7 +1299,7 @@ impl PageSet {
         pages.for_each(|page| self.insert(page));
     }
 
-    /// The pages in order, taken out if `take`.
+    /// Returns the pages in the set, in ascending order. If `take` is true, the iterator also removes them from the set.
     fn iter(&self, take: bool) -> impl Iterator<Item = usize> + '_ {
         self.0.iter().enumerate().flat_map(move |(i, word)| {
             let mut bits = if take { word.replace(0) } else { word.get() };
@@ -1315,7 +1320,7 @@ impl PageSet {
 pub enum Phase {
     Idle,
     Marking,
-    /// Marking is done; pages are swept in later slices, or before the allocator uses them.
+    /// Marking is done. Each page is swept in a later slice, or just before the allocator uses it.
     Sweeping,
 }
 
@@ -1323,97 +1328,97 @@ pub enum Phase {
 #[derive(Default)]
 struct Work {
     gray: Vec<u32>,
-    /// Slots that refer to objects on pages being evacuated, as (object, word in it).
+    /// Slots that refer to objects on pages being evacuated. Each entry is the object that owns the slot, and the slot's word offset from that object's header. The offset is the field or item number plus one.
     fixups: Vec<(u32, u32)>,
-    /// Objects with weak fields or items that were traced.
+    /// Traced objects that have weak fields or weak items.
     holders: Vec<u32>,
-    /// Runs of weak items on dirty cards, which a minor collection clears without the rest of
-    /// their object.
+    /// Runs of weak items on dirty cards, as ranges of word indices. A minor collection clears the dead references in a run without visiting the rest of
+    /// the object.
     weak_runs: Vec<(u32, u32)>,
-    /// Objects with ephemerons that were traced.
+    /// Traced objects that have ephemerons.
     ephemerons: Vec<u32>,
 }
 
-/// Everything but the words.
+/// The arena's state, apart from the words of the region.
 struct Meta {
     pages: Box<[Page]>,
-    /// Pages handed out, from the start of the region. Those not released are charged.
+    /// The number of pages handed out, counted from the start of the region. The pages among them that are not released are charged.
     used: Cell<usize>,
     budget: Budget,
-    /// The hole being allocated into. While failures are injected, `end` is kept at `cursor`
-    /// so every allocation takes the slow path, which counts it.
+    /// The hole that allocation bumps into. `cursor` is the next free word and `hole_end` is the end of the hole. `end` is the limit that the fast path checks. It equals `hole_end`, except while failures are injected. Then `end` is kept at `cursor`,
+    /// so every allocation takes the slow path, which counts the allocation.
     cursor: Cell<usize>,
     end: Cell<usize>,
     hole_end: Cell<usize>,
-    /// The next line to look for a hole from, as `page * LINES + line`.
+    /// The line where the search for the next hole starts, as `page * LINES + line`.
     scan: Cell<usize>,
-    /// Where evacuation copies to.
+    /// The range that evacuation copies objects into. `to_cursor` is the next free word and `to_end` is the end of the range.
     to_cursor: Cell<usize>,
     to_end: Cell<usize>,
     /// Bytes allocated since the last collection.
     young: Cell<usize>,
-    /// Pages holding something as of the last sweep.
+    /// The number of pages that held an object when they were last swept.
     occupied: Cell<usize>,
-    /// Pages allocated into since the allocator was last reset. Only they can hold what's young:
-    /// the rest hold marked objects only, so a minor collection has nothing to sweep there.
+    /// The pages allocated into since the allocator was last reset. Only these pages can hold young objects.
+    /// Every other page holds only marked objects, so a minor collection has nothing to sweep there.
     young_pages: PageSet,
     /// Pages with dirty cards.
     dirty_pages: PageSet,
-    /// Pages a minor collection left free, which settling gives back past a nursery's worth.
+    /// The pages that a minor collection left free. `Arena::settle` releases them to the system, except for one nursery's worth.
     emptied: RefCell<Vec<u32>>,
-    /// Pages charged for: handed out and not given back.
+    /// The number of pages charged to the budget: the pages handed out and not released.
     committed: Cell<usize>,
-    /// Pages before this are swept.
+    /// Every page before this page has been swept.
     sweep_cursor: Cell<usize>,
-    /// A collection swept everything since free pages were last given back.
+    /// Whether a major cycle has swept every page since free pages were last released.
     settle: Cell<bool>,
     nursery: usize,
-    /// A major cycle starts once the pages in use reach this many bytes.
+    /// A major cycle starts once `paced_bytes` reaches this many bytes.
     threshold: Cell<usize>,
     phase: Cell<Phase>,
     /// Whether this cycle evacuates the pages flagged at its start.
     evacuating: Cell<bool>,
     evacuate_all: Cell<bool>,
-    /// Fixed type numbers count up from 0, and the rest down from the top.
+    /// The descriptor of each registered type, by type number. Fixed type numbers count up from 0. The other numbers are assigned downwards from the top.
     descs: Chunked<Cell<Option<&'static Desc>>, 256, { TYPES / 256 }>,
     /// One past the highest fixed number in use.
     low: Cell<usize>,
-    /// The next number for a type without a fixed one.
+    /// The next number to assign to a type that has no fixed number.
     next: Cell<usize>,
-    /// Type numbers of descriptors without a fixed one, by [`cache_slot`] of their types.
+    /// A cache of the type numbers of types that have no fixed number. The entry of a type is at [`cache_slot`] of its `TypeId`.
     cache: [Cell<Option<(TypeId, u16)>>; 64],
     roots: Box<[Cell<u64>]>,
     stacks: RefCell<Vec<Rc<StackRecord>>>,
     handles: RefCell<Vec<Rc<RootRecord>>>,
-    /// Tells arenas apart, for handles that live outside them.
+    /// An id that is unique to this arena. A handle that lives outside the arena stores it, to check that it is used with its own arena.
     id: u64,
     hosts: RefCell<Vec<HostSlot>>,
     free_hosts: RefCell<Vec<u32>>,
-    /// Freed by the last collection, dropped once it has returned.
+    /// Host values that a collection found dead. They are dropped after the collection has returned.
     dead_hosts: RefCell<Vec<Box<dyn Any>>>,
     frozen: FrozenTable,
     work: RefCell<Work>,
-    /// What the work lists and tables outside the region were last charged.
+    /// The bytes last charged for the work lists and for the tables outside the region.
     tables: Cell<usize>,
-    /// A cycle slice of this many bytes after every step, for testing barriers.
+    /// For testing barriers. If set, every step ends with a minor collection and a cycle slice of this many bytes.
     stress: Cell<Option<usize>>,
-    /// Bytes of work a running cycle does per byte steps allocate.
+    /// The bytes of work that a running cycle does for each byte that steps allocate.
     pace: Cell<usize>,
-    /// Work steps owe the running cycle, done once it reaches `MIN_SLICE`.
+    /// The bytes of work that steps owe the running cycle. The work is done once the debt reaches `MIN_SLICE`.
     debt: Cell<usize>,
-    /// What `made` reaches when the step owes the collector work, as of the step's start.
+    /// The value of `made` at which the current step owes the collector work. It is computed when the step starts.
     step_end: Cell<usize>,
-    /// Work done so far in this cycle, and what the last one took in all.
+    /// `cycle_work` is the work done so far in the current cycle, in bytes. `last_work` is the total work of the last finished cycle.
     cycle_work: Cell<usize>,
     last_work: Cell<usize>,
     collections: Cell<u64>,
     minors: Cell<u64>,
-    /// Collections that moved objects, which identity tables rehash after.
+    /// The number of collections that moved objects. Identity tables rehash after each one.
     evacuations: Cell<u64>,
-    /// What live host values are charged.
+    /// The bytes charged for live host values.
     host_bytes: Cell<usize>,
-    /// The generation new host slots start at: past what any dropped slot reached, so a stale
-    /// reference to a dropped slot never reads a value made in its place.
+    /// The generation at which a new host slot starts. It is at least the generation of every slot removed from the table, which is already above the generation of every reference to that slot. So a stale
+    /// reference to a removed slot never reads a value that later gets the same id.
     host_floor: Cell<u32>,
 }
 
@@ -1423,8 +1428,8 @@ struct Heap<'a> {
     m: &'a Meta,
 }
 
-/// Wraps an index into the region, so indexing it needs no bounds check: a bad index reads
-/// some other word, as a forged one would anyway. Small offsets past it land in `SLACK`.
+/// Wraps `index` into the region, so that indexing the region with the result needs no bounds check. A bad index reads
+/// some other word, as a forged index would anyway. A small offset added to the result lands in `SLACK` at worst.
 #[inline]
 fn mask(index: usize) -> usize {
     index & (WORDS - 1)
@@ -1433,14 +1438,14 @@ fn mask(index: usize) -> usize {
 const MIN_THRESHOLD: usize = 64 << 10;
 
 impl Meta {
-    /// The heap's size as pacing sees it: the pages in use, and what live host values and old
-    /// frozen values are charged, since only a major collection frees those.
+    /// Returns the heap size that pacing uses: the bytes of the occupied pages, plus the bytes charged for live host values and for old
+    /// frozen values. Host values and old frozen values count because only a major collection frees them.
     fn paced_bytes(&self) -> usize {
         self.occupied.get() * PAGE * 8 + self.host_bytes.get() + self.frozen.live()
     }
 
-    /// What a major cycle started now should take: a quarter more than the last one did, or
-    /// before there's been one, tracing every occupied page and sweeping every page in use.
+    /// Returns an estimate of the work, in bytes, for a major cycle that starts now. The estimate is a quarter more than the work of the last cycle.
+    /// Before the first cycle, it is the cost of tracing every occupied page and sweeping every page handed out.
     fn cycle_work(&self) -> usize {
         match self.last_work.get() {
             0 => self.occupied.get() * PAGE * 8 + self.used.get() * SWEEP_COST,
@@ -1448,37 +1453,37 @@ impl Meta {
         }
     }
 
-    /// What steps can allocate before they draw on the reserve. Committed pages nothing is on
-    /// don't count against it: they're kept for new objects to fill. Objects made since the
-    /// last sweep do, as they fill them.
+    /// Returns the bytes that steps can allocate before they draw on the reserve. Committed pages that hold no object
+    /// do not count as used, because they are kept for new objects to fill. The objects allocated since the
+    /// last sweep do count, because they fill those pages.
     fn room(&self) -> usize {
         let pages = (self.committed.get() - self.occupied.get().min(self.committed.get())) * PAGE_COST;
         self.budget.room_past(self.budget.used().saturating_sub(pages) + self.young.get())
     }
 
-    /// Whether a major cycle has to start now to be done, paced at up to `MAX_PACE`, before the
-    /// room runs out: past that the reserve forces a full collection, one pause as long as the
-    /// whole cycle. Starting as late as that frees as much as a full collection would. A slice's
-    /// worth of room is kept for what the steps in between allocate.
+    /// Returns whether a major cycle must start now to finish before the room runs out, when it is paced at up to `MAX_PACE`.
+    /// If the room runs out first, the reserve forces a full collection, which is one pause as long as the
+    /// whole cycle. A cycle that starts this late still frees as much as a full collection would. One slice's
+    /// worth of room is kept for the allocations of the steps between slices.
     fn short_of_room(&self) -> bool {
         self.room() <= self.cycle_work() / MAX_PACE + MIN_SLICE
     }
 
-    /// What steps have made: bytes of objects and frozen values since the last collection, and
-    /// host values.
+    /// Returns the bytes that steps have allocated: the objects and frozen values allocated since the last collection, and
+    /// the live host values.
     fn made(&self) -> usize {
         self.young_bytes() + self.host_bytes.get()
     }
 
-    /// Bytes of objects and frozen values made since the last collection, which a minor one may
-    /// free.
+    /// Returns the bytes of the objects and frozen values allocated since the last collection. A minor collection can
+    /// free these.
     fn young_bytes(&self) -> usize {
         self.young.get() + self.frozen.young_bytes()
     }
 
-    /// What a step can make before it owes the collector work that ending it does, as
-    /// [`Arena::step`] paces it: a minor collection once the nursery fills, a major cycle once
-    /// one's due, or a slice of the one running.
+    /// Returns the bytes that a step can allocate before it owes the collector work. [`Arena::step`] does that work
+    /// when the step ends: a minor collection once the nursery is full, the start of a major cycle once
+    /// a cycle is due, or a slice of the running cycle.
     fn step_allowance(&self) -> usize {
         if self.phase.get() != Phase::Idle {
             return (MIN_SLICE - self.debt.get().min(MIN_SLICE)).div_ceil(self.pace.get().max(1));
@@ -1490,20 +1495,20 @@ impl Meta {
     }
 }
 
-/// Gives back most of the room a table no longer needs, keeping some so it doesn't regrow at once.
+/// Shrinks the capacity of `table` if most of it is unused. Some spare capacity is kept, so the table does not regrow at once.
 fn shrink<T>(table: &mut Vec<T>) {
     if table.capacity() > 4 * table.len() + 64 {
         table.shrink_to(2 * table.len() + 16);
     }
 }
-/// What a committed page is charged: its words and its bookkeeping.
+/// The bytes charged for a committed page: its words and its `Page` record.
 const PAGE_COST: usize = PAGE * 8 + size_of::<Page>();
-/// A page's sweep counts as this many bytes of slice work.
+/// Sweeping one page counts as this many bytes of slice work.
 const SWEEP_COST: usize = PAGE;
 const MIN_SLICE: usize = 64 << 10;
 const STEP_MUL: usize = 2;
 const MAX_PACE: usize = 16;
-/// Dead host values, and dead frozen values, freed after a step at most.
+/// The most dead host values, and the most dead frozen values, that are freed after one step.
 const FREE_BATCH: usize = 1024;
 
 pub struct Arena {
@@ -1512,23 +1517,23 @@ pub struct Arena {
 }
 
 impl Arena {
-    /// An arena allowed `limit` bytes, with `roots` value slots. The table of pages, made up
-    /// front for twice the limit, isn't charged; the roots are. Objects in the region take at
-    /// most [`REGION`] bytes whatever the limit; frozen and host values can use the rest.
+    /// Creates an arena with a limit of `limit` bytes and `roots` value roots. The page table is allocated up
+    /// front for twice the limit and is not charged. The roots are charged. Objects in the region take at
+    /// most [`REGION`] bytes, whatever the limit is. Frozen and host values can use the rest of the limit.
     ///
     /// # Panics
     ///
-    /// If the system won't reserve the region's address space. [`Arena::try_new`] fails then
+    /// Panics if the system cannot reserve the region's address space. [`Arena::try_new`] returns an error
     /// instead.
     pub fn new(limit: usize, roots: usize) -> Self {
         Self::try_new(limit, roots).expect("reserve the arena's memory")
     }
 
-    /// Like [`Arena::new`], failing if the system won't reserve the region's address space.
+    /// Like [`Arena::new`], but returns `OutOfMemory` if the system cannot reserve the region's address space.
     pub fn try_new(limit: usize, roots: usize) -> Result<Self, OutOfMemory> {
         let memory = Region::new(WORDS + SLACK).ok_or(OutOfMemory)?;
-        // Page 0 holds nothing, so index 0 can mean none. Twice the limit leaves evacuation room
-        // to copy everything.
+        // Page 0 holds no object, so index 0 can mean no object. The page table covers twice the limit, so evacuation has room
+        // to copy every object.
         let pages = (limit / (PAGE * 8)).clamp(1, PAGES / 2 - 1);
         let count = 2 * pages + 2;
         let meta = Meta {
@@ -1558,7 +1563,7 @@ impl Arena {
             low: Cell::new(1),
             next: Cell::new(TYPES - 1),
             cache: [const { Cell::new(None) }; 64],
-            // One more, after the program's, for the arena's intern table.
+            // One more root, after the program's roots, holds the arena's intern table.
             roots: vec![Cell::new(Value::NULL.word); roots + 1].into_boxed_slice(),
             stacks: RefCell::new(Vec::new()),
             handles: RefCell::new(Vec::new()),
@@ -1593,11 +1598,11 @@ impl Arena {
         Heap { words, m: &self.meta }
     }
 
-    /// After every collection entry point: gives back free pages, and runs the destructors of
-    /// hosts freed, outside the collector.
+    /// Runs at the end of every collection entry point. Releases free pages to the system, and drops dead host values, so that
+    /// their destructors run outside the collector.
     ///
-    /// Frees at most `free` dead host values and as many dead frozen ones, the rest later: a cycle
-    /// can leave a great many, and freeing them all at once would be a pause of its own.
+    /// Drops at most `free` dead host values and at most `free` dead frozen values. The rest are dropped later. A cycle
+    /// can leave a great many, and dropping them all at once would be a pause of its own.
     fn finish(&mut self, free: usize) {
         self.settle();
         let dead = {
@@ -1611,8 +1616,8 @@ impl Arena {
         self.charge_tables();
     }
 
-    /// Charges the work lists and tables outside the region for what they hold now. They grow
-    /// within collections, which can't fail, so they're charged after.
+    /// Charges the budget for the current capacity of the work lists and of the tables outside the region. They grow
+    /// during collections, which cannot fail, so they are charged afterwards.
     fn charge_tables(&self) {
         let meta = &self.meta;
         let work = meta.work.borrow();
@@ -1632,9 +1637,9 @@ impl Arena {
         }
     }
 
-    /// Once a collection has swept: gives back the free pages it may have made past a nursery's
-    /// worth, which the next steps would fill again, and trims the pages handed out to the last
-    /// one kept. A major cycle may have freed any page; a minor collection, those it emptied.
+    /// Runs once a collection has swept. Releases the pages that the collection freed, except for one nursery's
+    /// worth, which the next steps would fill again. Then lowers the count of pages handed out, so that it ends at the last
+    /// page still committed. A major cycle may have freed any page. A minor collection may have freed only the pages in `emptied`.
     fn settle(&mut self) {
         let Self { memory, meta } = self;
         if meta.phase.get() != Phase::Idle {
@@ -1648,7 +1653,7 @@ impl Arena {
         } else {
             return;
         }
-        // Pages past the last one still committed are handed out again as fresh ones.
+        // The pages after the last committed page are handed out again as fresh pages.
         let used = meta.used.get();
         meta.used.set((1..used).rev().find(|&page| !meta.pages[page].released.get()).map_or(1, |page| page + 1));
     }
@@ -1659,17 +1664,17 @@ impl Arena {
         body(&Mutation { heap: self.heap(), _brand: PhantomData })
     }
 
-    /// Like `mutate`, then paces collection: a minor collection once the nursery fills, and a
-    /// major cycle once the pages in use, with what live host and frozen values are charged, reach
-    /// the threshold, twice what the last cycle left, or sooner if the room left under the reserve
-    /// would run out before the cycle is done. Each step owes the cycle twice what it allocated,
-    /// or more when room is short, paid in slices of at least `MIN_SLICE`. Dead host and frozen
-    /// values are freed a batch after each step.
+    /// Runs `body` like `mutate`, then paces collection. A minor collection runs once the nursery is full. A
+    /// major cycle starts once the occupied pages, plus the bytes charged for live host and frozen values, reach
+    /// the threshold. The threshold is twice the size that the last cycle left. A cycle starts sooner if the room under the reserve
+    /// would otherwise run out before the cycle finishes. Each step owes the cycle twice the bytes it allocated,
+    /// or more when room is short. The debt is paid in slices of at least `MIN_SLICE`. One batch of dead host and frozen
+    /// values is freed after each step.
     ///
     /// If `body` drew on the reserve, a full collection runs instead. If an allocation failed,
-    /// even one `body` went on without, the result is dropped, a full collection runs, and the
-    /// step fails. Whatever `body` did before the failure stays done, so the caller picks up from
-    /// there: an interpreter runs the failed instruction again.
+    /// even one that `body` then did without, the result is dropped, a full collection runs, and the
+    /// step fails. Everything `body` did before the failure stays done, so the caller continues from
+    /// there. An interpreter, for example, runs the failed instruction again.
     pub fn step<R>(&mut self, body: impl for<'gc> FnOnce(&Mutation<'gc>) -> R) -> Result<R, OutOfMemory> {
         self.meta.budget.clear_failed();
         let before = self.meta.made();
@@ -1701,7 +1706,7 @@ impl Arena {
                 self.heap().minor();
             }
             self.heap().start();
-            // Fast enough to be done before the room runs out.
+            // Set a pace that finishes the cycle before the room runs out.
             let meta = &self.meta;
             meta.pace.set(meta.cycle_work().div_ceil(meta.room().max(1)).max(STEP_MUL));
             meta.debt.set(0);
@@ -1719,7 +1724,7 @@ impl Arena {
         Ok(result)
     }
 
-    /// Finishes any cycle in progress, then runs a full one.
+    /// Finishes any cycle in progress, then runs a full cycle.
     pub fn collect(&mut self) {
         self.heap().work(usize::MAX);
         self.heap().start();
@@ -1734,8 +1739,8 @@ impl Arena {
         self.finish(usize::MAX);
     }
 
-    /// Starts a cycle if none is running, then does about `work` bytes of it. Like a step, it
-    /// frees only a batch of the dead host and frozen values.
+    /// Starts a cycle if none is running, then does about `work` bytes of work on it. Like a step, it
+    /// frees only one batch of the dead host and frozen values.
     pub fn collect_slice(&mut self, work: usize) {
         self.heap().start();
         self.heap().work(work);
@@ -1750,24 +1755,24 @@ impl Arena {
         (self.meta.collections.get(), self.meta.minors.get())
     }
 
-    /// Bytes of pages handed out so far: the most the arena has used at once.
+    /// Returns the bytes of the pages handed out, counted from the start of the region. The count drops when the pages at its end are released to the system.
     pub fn pages_bytes(&self) -> usize {
         (self.meta.used.get() - 1) * PAGE * 8
     }
 
-    /// Bytes of pages handed out and not given back: about what the arena holds in memory.
+    /// Returns the bytes of the pages handed out and not released. This is about the memory that the arena holds.
     pub fn committed_bytes(&self) -> usize {
         let meta = &self.meta;
         let pages = &meta.pages[1..meta.used.get()];
         (pages.len() - pages.iter().filter(|page| page.released.get()).count()) * PAGE * 8
     }
 
-    /// Bytes of pages holding something, as of the last sweep.
+    /// Returns the bytes of the pages that held an object when they were last swept.
     pub fn occupied_bytes(&self) -> usize {
         self.meta.occupied.get() * PAGE * 8
     }
 
-    /// Objects marked and not yet swept away: after [`Arena::collect`], the live ones.
+    /// Returns the number of marked objects. After [`Arena::collect`], these are the live objects.
     pub fn objects(&self) -> usize {
         let pages = &self.meta.pages[..self.meta.used.get()];
         pages.iter().flat_map(|page| page.starts.iter().zip(&page.marks)).map(|(start, mark)| (start.get() & mark.get()).count_ones() as usize).sum()
@@ -1777,13 +1782,13 @@ impl Arena {
         self.meta.hosts.borrow().len()
     }
 
-    /// Frozen values not yet freed, including any a collection found dead that the next one
-    /// frees.
+    /// Returns the number of frozen values not yet freed. The count includes values that a collection found dead and
+    /// that are still waiting to be freed.
     pub fn frozen_values(&self) -> usize {
         self.meta.frozen.count()
     }
 
-    /// Bytes charged against the limit: committed pages, roots, stacks, host values, the
+    /// Returns the bytes charged against the limit: committed pages, roots, stacks, host values, frozen values, the
     /// collector's tables, and `Charge`s.
     pub fn used(&self) -> usize {
         self.meta.budget.used()
@@ -1797,21 +1802,21 @@ impl Arena {
         self.meta.budget.limit()
     }
 
-    /// Keeps the last `bytes` under the limit for a step to finish in once the rest is used.
-    /// Optional allocations don't draw on it. It starts at a sixteenth of the limit.
+    /// Sets the reserve to `bytes`. The reserve is the last part of the limit. It lets a step finish once the rest is used.
+    /// Optional allocations do not draw on it. The default is a sixteenth of the limit.
     pub fn set_reserve(&mut self, bytes: usize) {
         self.meta.budget.set_reserve(bytes);
     }
 
-    /// Testing: lets `allocations` more allocations through, then fails the next one, once.
-    /// Objects, host values and stacks count.
+    /// For testing. Lets `allocations` more allocations succeed, then fails the next one, once. `None` turns failure injection off.
+    /// Allocations of objects, host values, frozen values, stacks and roots count.
     pub fn fail_after(&mut self, allocations: Option<u64>) {
         let meta = &self.meta;
         meta.budget.fail_after(allocations);
         meta.end.set(if meta.budget.injecting() { meta.cursor.get() } else { meta.hole_end.get() });
     }
 
-    /// Testing: a minor collection and a cycle slice of `work` bytes after every step.
+    /// For testing. Makes every step end with a minor collection and a cycle slice of `work` bytes. `None` turns this off.
     pub fn set_stress(&mut self, work: Option<usize>) {
         self.meta.stress.set(work);
     }
@@ -1827,15 +1832,15 @@ pub struct Mutation<'gc> {
 }
 
 impl<'gc> Mutation<'gc> {
-    /// Fields by their words, beneath `objects!` constructors.
+    /// Allocates a `T` whose fields hold the words in `fields`. `objects!` constructors call it.
     #[doc(hidden)]
     #[inline]
     pub fn alloc<T: Object, const N: usize>(&self, fields: [u64; N]) -> Result<Gc<'gc, T>, OutOfMemory> {
         self.heap.alloc_fixed(&T::DESC, &fields).map(Gc::new)
     }
 
-    /// `alloc_items` with zero items, the zero word reading as fixnum 0, none or 0: small
-    /// enough to inline, for objects made often with few items.
+    /// Like `alloc_items`, with every item set to the zero word. The zero word reads as fixnum 0, as no object, or as the word 0, depending on the kind of items. The function is small
+    /// enough to inline, for objects that are allocated often with few items.
     #[doc(hidden)]
     #[inline]
     pub fn alloc_zeroed<T: Object, const N: usize>(&self, fields: [u64; N], len: usize) -> Result<Gc<'gc, T>, OutOfMemory> {
@@ -1871,18 +1876,18 @@ impl<'gc> Mutation<'gc> {
         roots[..roots.len() - 1][index].set(value.word);
     }
 
-    /// The root that holds the arena's intern table, once there is one.
+    /// Returns the root that holds the arena's intern table, once the table exists.
     pub(crate) fn interned(&self) -> &Cell<u64> {
         self.heap.m.roots.last().expect("the arena has a root for its intern table")
     }
 
-    /// How many collections so far have moved objects. A hash of where an object is holds only
-    /// while this stays the same.
+    /// Returns the number of collections so far that moved objects. A hash of an object's index stays valid only
+    /// while this number is unchanged.
     pub(crate) fn moves(&self) -> u64 {
         self.heap.m.evacuations.get()
     }
 
-    /// Charged its size, plus `HOST_COST`. Memory the value owns elsewhere, such as a
+    /// Stores `value` as a host value and returns a reference to it. The value is charged its size plus `HOST_COST`. Memory that the value owns elsewhere, such as a
     /// `String`'s bytes, can be counted with [`HostRef::set_owned_bytes`].
     pub fn host<T: Any>(&self, value: T) -> Result<HostRef<'gc, T>, HostError> {
         let meta = self.heap.m;
@@ -1890,7 +1895,7 @@ impl<'gc> Mutation<'gc> {
         meta.budget.count_allocation()?;
         let cost = size_of::<T>() + HOST_COST;
         meta.budget.ensure(cost)?;
-        // Made while marking, it lives through the cycle, as objects do.
+        // A host value created while marking starts marked, so it survives the cycle, as a new object does.
         let marked = meta.phase.get() == Phase::Marking;
         let value: Box<dyn Any> = Box::new(value);
         let id = match meta.free_hosts.borrow_mut().pop() {
@@ -1900,7 +1905,7 @@ impl<'gc> Mutation<'gc> {
                     return Err(meta.budget.fail().into());
                 };
                 if hosts.len() == hosts.capacity() {
-                    // Charged as it grows, so growing fails as an allocation would.
+                    // The table is charged as it grows, so growing it can fail as an allocation can.
                     let more = hosts.capacity().max(16);
                     meta.budget.ensure(cost + more * size_of::<HostSlot>())?;
                     let before = hosts.capacity();
@@ -1923,51 +1928,51 @@ impl<'gc> Mutation<'gc> {
         Ok(HostRef { id, generation: slot.generation, _marker: PhantomData })
     }
 
-    /// `value` outside the region, readable as `&'gc T` and never changed: what a field of
-    /// `Frozen<T>` holds. Store it in an object this step: a value nothing holds is freed by the
-    /// next collection.
+    /// Stores `value` outside the region as a frozen value, which is read as `&'gc T` and never changes. A
+    /// `Frozen<T>` field holds the returned reference. Store the reference in an object during this step. The
+    /// next collection frees a frozen value that no object holds.
     pub fn frozen<T: Any>(&self, value: T) -> Result<FrozenRef<'gc, T>, OutOfMemory> {
         self.frozen_owning(value, 0)
     }
 
-    /// Like [`Mutation::frozen`], also charged `bytes` that `value` owns outside the arena, such
-    /// as a string's characters, until it's freed.
+    /// Like [`Mutation::frozen`], and also charges `bytes` for memory that `value` owns outside the arena, such
+    /// as a string's characters. The charge lasts until the value is freed.
     pub fn frozen_owning<T: Any>(&self, value: T, bytes: usize) -> Result<FrozenRef<'gc, T>, OutOfMemory> {
         let meta = self.heap.m;
         meta.frozen.alloc(&meta.budget, false, value, bytes).map(FrozenRef::new)
     }
 
-    /// Runs allocations the caller can do without, such as growing a buffer by more than it
-    /// needs: failing them doesn't fail the step, and they don't draw on the reserve.
+    /// Runs `allocate`, whose allocations the caller can do without, such as growing a buffer by more than it
+    /// needs. A failed allocation in `allocate` does not fail the step, and the allocations do not draw on the reserve.
     pub fn optional<R>(&self, allocate: impl FnOnce() -> Result<R, OutOfMemory>) -> Result<R, OutOfMemory> {
         self.heap.m.budget.optional(allocate)
     }
 
-    /// Fails the step as a failed allocation would, for a request too large to even size.
+    /// Fails the step as a failed allocation does, and returns the error. Use it for a request so large that its size cannot be computed.
     pub fn out_of_memory(&self) -> OutOfMemory {
         self.heap.m.budget.fail()
     }
 
-    /// Whether an allocation has drawn on the reserve, so a full collection is due. An
-    /// interpreter checks it between instructions and ends the step, which collects.
+    /// Returns whether an allocation has drawn on the reserve, which makes a full collection due. An
+    /// interpreter checks it between instructions and ends the step, so that the collection runs.
     pub fn collection_due(&self) -> bool {
         self.heap.m.budget.due()
     }
 
-    /// Whether the step has made enough that [`Arena::step`] owes the collector work once it
-    /// ends, or a full collection is due. An interpreter checks it after it allocates, and ends
-    /// the step at the next place it can go on from, so collection keeps up.
+    /// Returns whether the step has allocated enough that [`Arena::step`] owes the collector work when the step
+    /// ends, or whether a full collection is due. An interpreter checks it after it allocates, and ends
+    /// the step at the next point where it can resume. That keeps collection up with allocation.
     pub fn step_due(&self) -> bool {
         let meta = self.heap.m;
         meta.made() >= meta.step_end.get() || meta.budget.due()
     }
 
-    /// A charge of nothing yet against the budget, for memory kept outside the arena.
+    /// Returns an empty [`Charge`] against the budget, for memory kept outside the arena.
     pub fn charge(&self) -> Charge<'gc> {
         Charge::new(self)
     }
 
-    /// Whether `bytes` more fit, as an allocation of them would check.
+    /// Checks whether `bytes` more bytes fit in the budget, as an allocation of `bytes` does, without charging them.
     pub fn ensure(&self, bytes: usize) -> Result<(), OutOfMemory> {
         self.heap.m.budget.ensure(bytes)
     }
@@ -1981,7 +1986,7 @@ impl<'gc> Mutation<'gc> {
     }
 }
 
-/// Where `type_id`'s type number is cached: by what its hash writes, which is a hash already.
+/// Returns the index in `Meta::cache` for `type_id`. A `TypeId` is already a hash, so the index comes from the bits that the `TypeId`'s `Hash` impl writes, with no further mixing.
 #[inline]
 fn cache_slot(type_id: TypeId) -> usize {
     struct Bits(u64);
@@ -2006,7 +2011,7 @@ fn cache_slot(type_id: TypeId) -> usize {
 impl<'a> Heap<'a> {
     #[inline]
     fn type_index(self, desc: &'static Desc) -> Option<u16> {
-        // A type with a number is where its number says, once registered; others are cached.
+        // A type with a fixed number is registered at that number in `descs`. A type without one is looked up in the cache.
         let found = if let Some(ty) = desc.number {
             self.m.descs.get(usize::from(ty)).and_then(Cell::get).filter(|registered| registered.type_id == desc.type_id).map(|_| ty)
         } else {
@@ -2018,7 +2023,6 @@ impl<'a> Heap<'a> {
     #[inline(never)]
     fn type_index_slow(self, desc: &'static Desc) -> Option<u16> {
         let (meta, next) = (self.m, self.m.next.get());
-        let same = |other: &'static Desc| other.type_id == desc.type_id;
         let ty = if let Some(ty) = desc.number {
             let ty = usize::from(ty);
             if ty > next {
@@ -2027,13 +2031,13 @@ impl<'a> Heap<'a> {
             let slot = meta.descs.get_or_grow(ty)?;
             match slot.get() {
                 None => slot.set(Some(desc)),
-                Some(registered) if same(registered) => {}
+                Some(registered) if registered.type_id == desc.type_id => {}
                 Some(_) => panic!("two types have type number {ty}: declare one objects! group `after` the other"),
             }
             meta.low.set(meta.low.get().max(ty + 1));
             ty
         } else {
-            match (next + 1..TYPES).find(|&i| meta.descs.get(i).and_then(Cell::get).is_some_and(same)) {
+            match (next + 1..TYPES).find(|&i| meta.descs.get(i).and_then(Cell::get).is_some_and(|other| other.type_id == desc.type_id)) {
                 Some(ty) => ty,
                 None if next < meta.low.get() => return None,
                 None => {
@@ -2102,8 +2106,8 @@ impl<'a> Heap<'a> {
         Ok(at as u32)
     }
 
-    /// `alloc` without items: the common case, small enough to inline at every call site,
-    /// which LLVM stops doing for `alloc` once there are a few dozen.
+    /// Like `alloc`, for an object without items. This is the common case. It is small enough to inline at every call site.
+    /// LLVM stops inlining `alloc` once there are a few dozen call sites.
     #[inline(always)]
     fn alloc_fixed(self, desc: &'static Desc, fields: &[u64]) -> Result<u32, OutOfMemory> {
         let ty = self.type_index(desc).ok_or_else(|| self.m.budget.fail())?;
@@ -2121,8 +2125,8 @@ impl<'a> Heap<'a> {
         Ok(at as u32)
     }
 
-    /// Objects made while marking are marked, and traced in case they were stored somewhere
-    /// already traced.
+    /// Marks the new object at `at`. An object allocated while marking is marked. It is also queued for tracing, in case it is stored in an object
+    /// that has already been traced.
     #[cold]
     fn color_marked(self, at: usize) {
         self.mark(at as u32, &mut self.m.work.borrow_mut());
@@ -2145,7 +2149,7 @@ impl<'a> Heap<'a> {
     fn reserve_slow(self, size: usize) -> Result<usize, OutOfMemory> {
         let meta = self.m;
         meta.budget.count_allocation()?;
-        // The hole still fits it if failures are injected, or just stopped being.
+        // The object still fits in the hole if failures are being injected, or if injection has just stopped. In both cases `end` was below `hole_end`.
         let at = meta.cursor.get();
         if at + size <= meta.hole_end.get() {
             meta.cursor.set(at + size);
@@ -2153,7 +2157,7 @@ impl<'a> Heap<'a> {
             return Ok(at);
         }
         if size > PAGE - LINE {
-            // Its own run of free pages, its lines claimed so nothing else is put there.
+            // A large object gets its own run of free pages. Its lines are marked used, so nothing else is allocated on them.
             let count = size.div_ceil(PAGE);
             let first = match self.free_run(count, false)? {
                 Some(first) => first,
@@ -2182,7 +2186,7 @@ impl<'a> Heap<'a> {
         }
     }
 
-    /// Claims the next run of free lines in the pages handed out.
+    /// Claims the next run of free lines in the pages handed out. Returns the run's word range, or `None` if no page from `scan` on has a free line.
     fn next_hole(self) -> Result<Option<(usize, usize)>, OutOfMemory> {
         let mut scan = self.m.scan.get();
         while scan < self.m.used.get() * LINES {
@@ -2198,6 +2202,8 @@ impl<'a> Heap<'a> {
             }
             self.recommit(page..page + 1)?;
             self.m.young_pages.insert(page);
+            // `free` holds the free lines at or after `line`. The hole runs from the first free line, `start`, to the next used line, `end`. If no used line follows, `end` is `LINES`.
+            // The last mask has bits `start..end` set, which marks the hole's lines as used. `end` is above `start`, so the shift by `LINES - end` is at most 127.
             let start = free.trailing_zeros() as usize;
             let end = (used & (u128::MAX << start)).trailing_zeros() as usize;
             entry.used.set(used | (u128::MAX >> (LINES - end)) & (u128::MAX << start));
@@ -2208,7 +2214,7 @@ impl<'a> Heap<'a> {
         Ok(None)
     }
 
-    /// Charges again for pages given back to the system, before they're used.
+    /// Charges the budget again for the pages in `pages` that were released to the system, before they are reused.
     fn recommit(self, pages: Range<usize>) -> Result<(), OutOfMemory> {
         let pages = &self.m.pages[pages];
         let released = pages.iter().filter(|page| page.released.get()).count();
@@ -2220,8 +2226,8 @@ impl<'a> Heap<'a> {
         Ok(())
     }
 
-    /// The first of `count` free pages in a row among those handed out. Evacuation can't copy
-    /// onto pages being evacuated.
+    /// Returns the first page of a run of `count` adjacent free pages among the pages handed out, or `None` if there is no such run. If `evacuation` is true, pages being evacuated
+    /// are skipped, because evacuation cannot copy onto them.
     fn free_run(self, count: usize, evacuation: bool) -> Result<Option<usize>, OutOfMemory> {
         let mut run = 0;
         for index in 1..self.m.used.get() {
@@ -2248,7 +2254,7 @@ impl<'a> Heap<'a> {
         self.m.committed.set(self.m.committed.get() + count);
         self.m.used.set(first + count);
         self.m.young_pages.insert_all(first..first + count);
-        // Nothing on them is from before the cycle, so a lazy sweep has nothing to do there.
+        // A fresh page holds no object from before the cycle, so the lazy sweep has nothing to do on it.
         for page in &self.m.pages[first..first + count] {
             page.swept.set(true);
             page.released.set(false);
@@ -2256,7 +2262,7 @@ impl<'a> Heap<'a> {
         Ok(first)
     }
 
-    /// Pages are swept before the allocator looks at them, so it never sees stale lines.
+    /// Sweeps `page` if the lazy sweep has not reached it yet. The allocator calls this before it reads the page's lines, so it never sees stale lines.
     #[inline]
     fn sweep_before_use(self, page: usize) {
         if self.m.phase.get() == Phase::Sweeping && !self.m.pages[page].swept.get() {
@@ -2264,7 +2270,7 @@ impl<'a> Heap<'a> {
         }
     }
 
-    /// Drops the hole, and looks for the next from line `scan`.
+    /// Abandons the current hole. The search for the next hole starts from line `scan`.
     fn reset_allocator(self, scan: usize) {
         self.m.cursor.set(0);
         self.m.end.set(0);
@@ -2283,7 +2289,7 @@ impl<'a> Heap<'a> {
         self.m.pages.get(index / PAGE).is_some_and(|page| bits(page)[index % PAGE / 64].get() & 1 << (index % 64) != 0)
     }
 
-    /// Sets the lines under `size` words at `start` in one of a page's line maps.
+    /// Sets the bits of the lines that the `size` words at `start` cover. `lines` selects one of a page's line maps, `Page::lines` or `Page::used`.
     fn cover_lines(self, start: usize, size: usize, lines: impl Fn(&Page) -> &Cell<u128>) {
         let (mut at, end) = (start, start + size);
         while at < end {
@@ -2307,7 +2313,7 @@ impl<'a> Heap<'a> {
         }
     }
 
-    /// Marks the host a word names, if its generation still matches.
+    /// Marks the host value that `word` refers to, if the generation of its slot still matches.
     fn mark_host(self, word: u64) {
         let Some((id, generation)) = host_parts(word) else { return };
         if let Some(host) = self.m.hosts.borrow_mut().get_mut(id as usize).filter(|host| host.generation == generation) {
@@ -2321,8 +2327,8 @@ impl<'a> Heap<'a> {
         (key != Value::BROKEN).then(|| (key, Value::from_bits(self.words[slot + 1].get())))
     }
 
-    /// Neither part is shaded while marking: the value is traced once the key is found live.
-    /// The cards are dirtied, so a minor collection sees both.
+    /// Stores an ephemeron's `key` and `value` at `slot`. Neither is shaded while marking, because the value is traced once the key is found live.
+    /// Both cards are marked dirty, so a minor collection sees both words.
     #[inline]
     fn set_ephemeron_at(self, slot: usize, key: Value<'_>, value: Value<'_>) {
         self.words[slot].set(key.word);
@@ -2340,8 +2346,8 @@ impl<'a> Heap<'a> {
 
     #[inline]
     fn barrier_ref(self, slot: usize, owner: u32, target: u32) {
-        // Minor collections trace only marked objects from their cards: an unmarked one is young,
-        // and traced anyway if it's reached.
+        // A minor collection traces only marked objects from their dirty cards. An unmarked owner is young,
+        // and is traced anyway if it is reachable.
         if self.has_bit(owner as usize, |page| &page.marks) {
             self.dirty(slot);
             if self.m.phase.get() == Phase::Marking {
@@ -2350,8 +2356,8 @@ impl<'a> Heap<'a> {
         }
     }
 
-    /// While marking, a store into a marked object marks its target, and if the target is to
-    /// move, notes the slot to fix.
+    /// Handles a store of `target` into `slot` of `owner` while marking. If `owner` is marked, marks `target`. If `target` is on a page being
+    /// evacuated, also records the slot as a fixup.
     fn shade(self, slot: usize, owner: u32, target: u32) {
         if self.has_bit(owner as usize, |page| &page.marks) {
             self.shade_marked(slot, owner, target);
@@ -2362,12 +2368,13 @@ impl<'a> Heap<'a> {
         let mut work = self.m.work.borrow_mut();
         self.mark(target, &mut work);
         if self.m.evacuating.get() && self.in_evacuation(target) {
+            // The fixup position is the slot's word offset from the header: the field or item number plus one.
             work.fixups.push((owner, (slot - owner as usize) as u32));
         }
     }
 
-    /// Dirties the cards under `slots`, and while marking shades what they refer to, as `refs`
-    /// reads them.
+    /// Marks the cards under `slots` dirty. `at` is the word index of the first slot. While marking, also shades the target of each slot. `refs` tells
+    /// how to read the target from a slot's word.
     fn barrier_range(self, at: usize, slots: &[Cell<u64>], owner: u32, refs: Refs) {
         if slots.is_empty() {
             return;
@@ -2422,8 +2429,8 @@ impl<'a> Heap<'a> {
         if meta.phase.get() != Phase::Idle {
             return;
         }
-        // Pages at most a quarter in use are evacuated while half the free room covers them.
-        // Pages of large objects stay.
+        // A page is a candidate for evacuation if at most a quarter of it is in use. Candidates are taken while half of the free room can hold their objects.
+        // Pages of large objects are never evacuated.
         let pages = &meta.pages[..meta.used.get()];
         let all = meta.evacuate_all.get();
         let occupied: usize = pages.iter().map(|page| page.used.get().count_ones() as usize * LINE).sum();
@@ -2462,7 +2469,7 @@ impl<'a> Heap<'a> {
         *meta.work.borrow_mut() = work;
     }
 
-    /// Does about `budget` bytes of the cycle: marking, the atomic phase once nothing is left
+    /// Does about `budget` bytes of work on the cycle: marking, then the atomic phase once nothing is left
     /// to mark, then sweeping.
     fn work(self, budget: usize) {
         let mut left = budget;
@@ -2502,8 +2509,8 @@ impl<'a> Heap<'a> {
         self.m.cycle_work.set(self.m.cycle_work.get().saturating_add(done));
     }
 
-    /// Traces gray objects until `budget` bytes are done. Returns the budget left once none
-    /// remain.
+    /// Traces gray objects until `budget` bytes of work are done. Returns the budget that is left if no gray object
+    /// remains, and `None` otherwise.
     fn drain(self, work: &mut Work, budget: usize) -> Option<usize> {
         let mut left = budget;
         while left > 0 {
@@ -2513,8 +2520,8 @@ impl<'a> Heap<'a> {
         work.gray.is_empty().then_some(0)
     }
 
-    /// Ends marking: rescans the roots, which take no barrier, clears dead weak references,
-    /// moves the objects being evacuated, and frees dead hosts. Sweeping comes after.
+    /// Ends marking in one atomic phase. Rescans the roots, because a write to a root applies no barrier. Then clears dead weak references,
+    /// moves the objects being evacuated, and frees dead host values. Sweeping follows.
     fn atomic(self, work: &mut Work) {
         let meta = self.m;
         self.mark_roots(work);
@@ -2544,10 +2551,14 @@ impl<'a> Heap<'a> {
         work.ephemerons.clear();
     }
 
-    /// Frees the host values marking didn't reach, drops the free slots at the end of the table,
-    /// and gives back room the table no longer needs. The free list hands out the lowest ids
-    /// first, so live values gather at the front and the end keeps emptying.
+    /// Frees the host values that marking did not reach. Then removes the free slots at the end of the table,
+    /// and shrinks the table's capacity. The free list hands out the lowest ids
+    /// first, so live values gather at the front and the end of the table keeps emptying.
     fn sweep_hosts(self) {
+        #[inline(always)]
+        fn free(host: &HostSlot) -> bool {
+            host.value.is_none() && host.generation < u32::MAX
+        }
         let meta = self.m;
         let mut hosts = meta.hosts.borrow_mut();
         let mut dead = meta.dead_hosts.borrow_mut();
@@ -2556,11 +2567,10 @@ impl<'a> Heap<'a> {
                 dead.push(value);
                 meta.budget.refund(host.cost);
                 meta.host_bytes.set(meta.host_bytes.get() - std::mem::take(&mut host.cost));
-                // A slot whose generation reaches the last one is retired.
+                // A slot whose generation reaches `u32::MAX` is retired and is never reused.
                 host.generation = host.generation.saturating_add(1);
             }
         }
-        let free = |host: &HostSlot| host.value.is_none() && host.generation < u32::MAX;
         let len = hosts.iter().rposition(|host| !free(host)).map_or(0, |index| index + 1);
         let floor = hosts[len..].iter().map(|host| host.generation).max().unwrap_or(0);
         meta.host_floor.set(meta.host_floor.get().max(floor));
@@ -2574,7 +2584,7 @@ impl<'a> Heap<'a> {
 
     fn finish_cycle(self) {
         let meta = self.m;
-        // Pages handed out fresh while sweeping held nothing to sweep, so they're counted here.
+        // A fresh page handed out during sweeping was never swept, so every page is counted again here.
         let mut occupied = 0;
         for page in &meta.pages[..meta.used.get()] {
             page.counted.set(page.used.get() != 0);
@@ -2598,7 +2608,7 @@ impl<'a> Heap<'a> {
         for stack in stacks.iter() {
             stack.trace(self, work, Rc::strong_count(stack) == 1);
         }
-        // A dropped stack, traced once more for what it wrote, is done with.
+        // A dropped stack has now been traced one last time, which covers its last writes. Remove its record and refund its cost.
         let before = stacks.len();
         stacks.retain(|stack| Rc::strong_count(stack) > 1);
         self.m.budget.refund((before - stacks.len()) * STACK_COST);
@@ -2611,9 +2621,9 @@ impl<'a> Heap<'a> {
         }
     }
 
-    /// Sweeps the young pages at once, for a minor collection, and clears the cards. The
-    /// allocator looks again from the first young page with a free line: those before it that it
-    /// looked at, it found full, and they still are.
+    /// Sweeps all young pages at once and clears the dirty cards, for a minor collection. The
+    /// allocator then searches again from the first young page with a free line, if that page is before `scan`. The pages before it that the allocator
+    /// has already passed were full, and they still are.
     fn sweep_young(self) {
         let meta = self.m;
         for page in meta.dirty_pages.iter(true) {
@@ -2633,7 +2643,7 @@ impl<'a> Heap<'a> {
         self.reset_allocator(first.map_or(meta.scan.get(), |page| meta.scan.get().min(page * LINES)));
     }
 
-    /// Frees what wasn't marked and gives the allocator the lines that were.
+    /// Sweeps page `index`. Frees the objects that were not marked, and makes every line without a marked object available to the allocator.
     fn sweep_page(self, index: usize) {
         let page = &self.m.pages[index];
         for (start, mark) in page.starts.iter().zip(&page.marks) {
@@ -2645,14 +2655,14 @@ impl<'a> Heap<'a> {
             let occupied = self.m.occupied.get();
             self.m.occupied.set(if lines != 0 { occupied + 1 } else { occupied - 1 });
         }
-        // Its last page can hold small objects that outlive it.
+        // The last page of a large object can also hold small objects, which can outlive the large object. So `large` is cleared once the large object is dead.
         if lines == 0 || page.large.get().is_some_and(|first| !self.has_bit(first as usize * PAGE, |page| &page.marks)) {
             page.large.set(None);
         }
         page.swept.set(true);
     }
 
-    /// Clears weak fields whose targets weren't marked.
+    /// Clears the weak fields and weak items whose targets were not marked, and breaks the ephemerons whose keys are dead.
     fn clear_weaks(self, work: &mut Work) {
         for &holder in &work.holders {
             let index = holder as usize;
@@ -2685,7 +2695,7 @@ impl<'a> Heap<'a> {
         }
     }
 
-    /// Clears a weak slot whose target wasn't marked.
+    /// Sets the weak slot `slot` to 0 if its target was not marked.
     #[inline]
     fn clear_dead(self, slot: &Cell<u64>) {
         let target = slot.get() as u32;
@@ -2694,7 +2704,7 @@ impl<'a> Heap<'a> {
         }
     }
 
-    /// The items of the object at `index`.
+    /// Returns the items of the object at `index`.
     fn items_of(self, index: usize) -> &'a [Cell<u64>] {
         let Some(header) = self.words.get(index).map(Cell::get) else { return &[] };
         let Some(desc) = self.desc(header) else { return &[] };
@@ -2725,13 +2735,13 @@ impl<'a> Heap<'a> {
         }
     }
 
-    /// Whether an ephemeron's key is reachable: marked, or not an object.
+    /// Returns whether the ephemeron key `word` is live. A key is live if it is a marked object or is not an object.
     fn key_live(self, word: u64) -> bool {
         word & TAG != OBJECT || self.has_bit((word >> 32) as usize, |page| &page.marks)
     }
 
-    /// Marks the values of ephemerons whose keys are marked, and what they reach, until a pass
-    /// finds no more.
+    /// Marks the value of each ephemeron whose key is live, and everything reachable from the value. Repeats until a pass
+    /// marks nothing new.
     fn trace_ephemerons(self, work: &mut Work) {
         loop {
             let mut marked = false;
@@ -2760,9 +2770,9 @@ impl<'a> Heap<'a> {
         }
     }
 
-    /// Marks the object at `index` and queues it to be traced. An index that isn't an
-    /// object's is left alone.
-    /// Returns whether it wasn't marked before.
+    /// Marks the object at `index` and queues it for tracing. Does nothing if `index` is not
+    /// the start of an object.
+    /// Returns whether this call marked the object.
     fn mark(self, index: u32, work: &mut Work) -> bool {
         let at = index as usize;
         let Some(page) = self.m.pages.get(at / PAGE) else { return false };
@@ -2779,23 +2789,18 @@ impl<'a> Heap<'a> {
         true
     }
 
-    /// Marks what the object refers to. Returns its size in words.
+    /// Marks every object that the object at `index` refers to. Returns the size of the object at `index` in words.
     fn trace(self, index: usize, work: &mut Work) -> usize {
         self.trace_parts(index, work, true)
     }
 
-    /// Traces the object's fields, and its items if `items`.
+    /// Traces the fields of the object at `index`, and also its items if `items` is true. Returns the object's size in words.
     #[inline(always)]
     fn trace_parts(self, index: usize, work: &mut Work, items: bool) -> usize {
         let Some(header) = self.words.get(index).map(Cell::get) else { return 1 };
         let Some(desc) = self.desc(header) else { return 1 };
         let evacuating = self.m.evacuating.get();
         let fields = self.words.get(index + 1..index + 1 + desc.fields as usize).unwrap_or(&[]);
-        let note = |work: &mut Work, at: usize, target: u32| {
-            if evacuating && self.in_evacuation(target) {
-                work.fixups.push((index as u32, at as u32 + 1));
-            }
-        };
         let mut bits = desc.values;
         while bits != 0 {
             let field = bits.trailing_zeros() as usize;
@@ -2803,7 +2808,7 @@ impl<'a> Heap<'a> {
                 let word = slot.get();
                 if word & TAG == OBJECT {
                     self.mark((word >> 32) as u32, work);
-                    note(work, field, (word >> 32) as u32);
+                    self.note(work, evacuating, index, field, (word >> 32) as u32);
                 }
             }
             bits &= bits - 1;
@@ -2815,14 +2820,14 @@ impl<'a> Heap<'a> {
                 let target = slot.get() as u32;
                 if target != 0 {
                     self.mark(target, work);
-                    note(work, field, target);
+                    self.note(work, evacuating, index, field, target);
                 }
             }
             bits &= bits - 1;
         }
         if desc.has_ephemerons() {
             work.ephemerons.push(index as u32);
-            // Values whose keys are marked already; the rest wait for `trace_ephemerons`.
+            // Trace the values whose keys are already marked. The other values wait for `trace_ephemerons`.
             self.each_ephemeron(index, |key, value| {
                 if self.key_live(key.get()) {
                     self.visit(value, work);
@@ -2835,7 +2840,7 @@ impl<'a> Heap<'a> {
             while bits != 0 {
                 let field = bits.trailing_zeros() as usize;
                 if let Some(target) = fields.get(field).map(|slot| slot.get() as u32).filter(|&target| target != 0) {
-                    note(work, field, target);
+                    self.note(work, evacuating, index, field, target);
                 }
                 bits &= bits - 1;
             }
@@ -2860,21 +2865,20 @@ impl<'a> Heap<'a> {
             size += len;
             let traced = self.traced_items(index, header, desc);
             let start = desc.fields as usize;
-            let slots = || self.words.get(index + 1 + start..index + 1 + start + traced).unwrap_or(&[]).iter().enumerate();
             if items && desc.items == Items::Values {
-                for (j, slot) in slots() {
+                for (j, slot) in self.words.get(index + 1 + start..index + 1 + start + traced).unwrap_or(&[]).iter().enumerate() {
                     let word = slot.get();
                     if word & TAG == OBJECT {
                         self.mark((word >> 32) as u32, work);
-                        note(work, start + j, (word >> 32) as u32);
+                        self.note(work, evacuating, index, start + j, (word >> 32) as u32);
                     }
                 }
             } else if items && desc.items == Items::Members {
-                for (j, slot) in slots() {
+                for (j, slot) in self.words.get(index + 1 + start..index + 1 + start + traced).unwrap_or(&[]).iter().enumerate() {
                     let target = slot.get() as u32;
                     if target != 0 {
                         self.mark(target, work);
-                        note(work, start + j, target);
+                        self.note(work, evacuating, index, start + j, target);
                     }
                 }
             }
@@ -2882,8 +2886,16 @@ impl<'a> Heap<'a> {
         size
     }
 
-    /// How many items of the object at `index` are ordinary arena memory: for a [`Segment`], those
-    /// below the active stack's `base` (or `top` once retired).
+    /// Records a fixup for field or item `at` of the object at `index`, if `target` is on a page being evacuated. The stored position is `at + 1`, which is the slot's word offset from the object's header.
+    #[inline(always)]
+    fn note(self, work: &mut Work, evacuating: bool, index: usize, at: usize, target: u32) {
+        if evacuating && self.in_evacuation(target) {
+            work.fixups.push((index as u32, at as u32 + 1));
+        }
+    }
+
+    /// Returns the number of items of the object at `index` that are ordinary arena memory. That is every item, except in a [`Segment`]. In a segment, it is the items
+    /// below the attached stack's `base` (or below its `top` once the stack is retired).
     #[inline]
     fn traced_items(self, index: usize, header: u64, desc: &'static Desc) -> usize {
         let len = (header >> 32) as usize;
@@ -2894,8 +2906,8 @@ impl<'a> Heap<'a> {
         }
     }
 
-    /// Moves the marked objects off the pages being evacuated, then fixes every reference
-    /// to them: the roots, root handles and stacks, which are rescanned, and the slots noted while marking.
+    /// Moves the marked objects off the pages being evacuated, then updates every reference
+    /// to them. The roots, root handles and stacks are rescanned. Every other reference is in the fixups recorded while marking.
     fn evacuate(self, work: &mut Work) {
         let used = self.m.used.get();
         for index in 0..used {
@@ -2920,6 +2932,8 @@ impl<'a> Heap<'a> {
         for handle in self.m.handles.borrow().iter() {
             self.fix_value(&handle.word);
         }
+        // `at` is the slot's word offset from the header, so the slot is field or item `at - 1`. A number at or past `desc.fields` is an item.
+        // A member or weak slot holds a bare index. Every other recorded slot holds a value.
         for &(owner, at) in &work.fixups {
             let object = self.resolve(owner) as usize;
             let Some(desc) = self.words.get(object).and_then(|header| self.desc(header.get())) else { continue };
@@ -2959,7 +2973,7 @@ impl<'a> Heap<'a> {
                 self.fix_value(value);
             });
         }
-        // Objects that didn't fit in fresh pages stay, so their lines are found again.
+        // An object that found no room in the fresh pages stays where it is. So rebuild the line maps of the evacuated pages from the objects that stayed.
         for page in &self.m.pages[..used] {
             if page.evacuating.get() {
                 page.lines.set(0);
@@ -2983,8 +2997,8 @@ impl<'a> Heap<'a> {
         }
     }
 
-    /// Copies a marked object to a fresh page and leaves a forwarding header. The copy is
-    /// marked; the original isn't, so the sweep frees it.
+    /// Copies the marked object at `index` to a fresh page and leaves a forwarding header in its place. The copy is
+    /// marked and the original is unmarked, so the sweep frees the original.
     fn move_object(self, index: usize) {
         let header = self.words[index].get();
         let Some(desc) = self.desc(header) else { return };
@@ -3011,7 +3025,7 @@ impl<'a> Heap<'a> {
         // An object that finds no room stays where it is.
         let count = size.div_ceil(PAGE);
         let first = self.m.budget.optional(|| self.free_run(count, true)?.map_or_else(|| self.fresh_pages(count), Ok)).ok()?;
-        // Claimed until the sweep sets them from what's marked.
+        // Mark every line as used, so the allocator leaves the pages alone. The sweep later sets the lines from the marked objects.
         self.m.pages[first..first + count].iter().for_each(|page| page.used.set(u128::MAX));
         let start = first * PAGE;
         self.m.to_cursor.set(start + size);
@@ -3019,7 +3033,7 @@ impl<'a> Heap<'a> {
         Some(start)
     }
 
-    /// Where the object at `index` is now.
+    /// Returns the current index of the object that was at `index`: the forwarding target if the object moved, and `index` otherwise.
     fn resolve(self, index: u32) -> u32 {
         let at = index as usize;
         match self.words.get(at).map(Cell::get) {
@@ -3055,16 +3069,16 @@ impl<'a> Heap<'a> {
                         self.trace_card(object, from..to, object != last, work);
                         last = object;
                     }
-                    // Nothing starts between the object found before the card and the card.
+                    // No object starts between an object found before the card and the start of the card.
                     next = self.next_start((object + 1).max(from), to);
                 }
             }
         }
     }
 
-    /// Traces what an old object on a dirty card refers to: for items of values, only those on
-    /// the card, so storing into a large vector doesn't rescan all of it. The rest of the
-    /// object is traced once, for its first card.
+    /// Traces the references of an old object that overlaps a dirty card. If the items hold references, only the items on
+    /// the card are traced, so a store into a large vector does not rescan the whole vector. The rest of the
+    /// object is traced once, for its first dirty card.
     fn trace_card(self, index: usize, card: Range<usize>, first: bool, work: &mut Work) {
         let header = self.words[mask(index)].get();
         let Some(desc) = self.desc(header) else { return };
@@ -3101,7 +3115,7 @@ impl<'a> Heap<'a> {
             if word > 0 {
                 word -= 1;
             } else if let Some(first) = self.m.pages[page].large.get().map(|first| first as usize).filter(|&first| first < page) {
-                // Nothing starts between the large object's header and its pages' end.
+                // No object starts between a large object's header and this page, so continue from the object's first page.
                 (page, word) = (first, 0);
             } else if page > 0 {
                 (page, word) = (page - 1, PAGE / 64 - 1);

@@ -26,7 +26,7 @@ fn the_limit_fails_the_step_and_the_arena_recovers() {
     assert_eq!(grow_until_full(&mut arena), Err(OutOfMemory));
     assert!(arena.peak() <= arena.limit(), "peak {} over {}", arena.peak(), arena.limit());
     assert!(arena.committed_bytes() <= 1 << 20);
-    // What the step did before failing stays done: the list is still there.
+    // The work that the step did before it failed is kept: the list is still there.
     let len = arena.mutate(|mc| {
         let mut n = 0;
         let mut v = mc.root(0);
@@ -44,8 +44,8 @@ fn the_limit_fails_the_step_and_the_arena_recovers() {
     }
 }
 
-/// A heap full of garbage doesn't fail a step: the reserve covers it, and the full collection
-/// it calls for runs at the end of the step.
+/// A heap full of garbage does not fail a step. The reserve covers the allocations, and the full collection
+/// that the reserve makes due runs at the end of the step.
 #[test]
 fn the_reserve_lets_a_step_finish_and_collects() {
     let mut arena = Arena::new(1 << 20, 1);
@@ -92,7 +92,7 @@ fn charges_count_until_dropped() {
         assert_eq!(charge.bytes(), 600);
     });
     assert_eq!(arena.used(), used);
-    // The failed charge fails the step, as an allocation would.
+    // A failed charge fails the step, as a failed allocation does.
     let result = arena.step(|mc| mc.charge().grow(2 << 20));
     assert_eq!(result, Err(OutOfMemory));
 }
@@ -100,7 +100,7 @@ fn charges_count_until_dropped() {
 #[test]
 fn hosts_are_charged_until_freed() {
     let mut arena = Arena::new(1 << 20, 1);
-    // Sizes the tables first.
+    // Allocate one host value first, so that the tables are already sized when `used` is read.
     arena.mutate(|mc| {
         mc.host(0u64).unwrap();
     });
@@ -114,8 +114,8 @@ fn hosts_are_charged_until_freed() {
     assert_eq!(arena.used(), used);
 }
 
-/// What a host value owns outside the arena counts until it's freed, at whatever it was last
-/// set to.
+/// The bytes that a host value owns outside the arena are charged until the value is freed, at the count that was last
+/// set.
 #[test]
 fn hosts_count_the_bytes_they_own() {
     let mut arena = Arena::new(1 << 20, 1);
@@ -137,7 +137,7 @@ fn hosts_count_the_bytes_they_own() {
         assert_eq!(text.set_owned_bytes(mc, 2 << 20), Err(HostError::OutOfMemory));
         assert_eq!(mc.used(), used + base + 300, "a failed claim counts nothing");
     });
-    // Nothing holds the value, so a collection frees it with all it was charged.
+    // No object holds the value, so a collection frees it and refunds its whole charge.
     assert_eq!(arena.used(), used + base + 300);
     arena.collect();
     assert_eq!(arena.used(), used);
@@ -167,7 +167,7 @@ fn injected_failures_fail_the_picked_allocation() {
     arena.fail_after(Some(5));
     let made = arena.mutate(|mc| (0..10).take_while(|_| pair(mc, Value::NULL, Value::NULL).is_ok()).count());
     assert_eq!(made, 5);
-    // Only once, and the next allocations go on in the same hole.
+    // The failure is injected only once, and the next allocations continue in the same hole.
     let pages = arena.pages_bytes();
     arena.mutate(|mc| {
         for _ in 0..10 {
@@ -175,7 +175,7 @@ fn injected_failures_fail_the_picked_allocation() {
         }
     });
     assert_eq!(arena.pages_bytes(), pages);
-    // Retried over and over, a step's allocations don't waste memory.
+    // A step that fails and is retried many times does not waste memory.
     for _ in 0..2000 {
         arena.fail_after(Some(50));
         let result = arena.step(|mc| (0..100).try_for_each(|_| pair(mc, Value::NULL, Value::NULL).map(drop)));
@@ -186,9 +186,9 @@ fn injected_failures_fail_the_picked_allocation() {
     arena.step(|mc| (0..1000).try_for_each(|_| pair(mc, Value::NULL, Value::NULL).map(drop))).unwrap().unwrap();
 }
 
-/// Minor collections sweep only the pages allocated into since the last, beside an old heap many
-/// times bigger, and the allocator reuses what they free. Old pages that new objects were linked
-/// from keep them alive through their cards.
+/// A minor collection sweeps only the pages allocated into since the last collection, even with an old heap that is many
+/// times bigger. The allocator reuses the memory that the minor collection frees. A new object that an old page refers to
+/// stays alive through the old page's dirty cards.
 #[test]
 fn minor_collections_sweep_only_young_pages() {
     let mut arena = Arena::new(64 << 20, 1);
@@ -205,7 +205,7 @@ fn minor_collections_sweep_only_young_pages() {
             for _ in 0..20_000 {
                 pair(mc, Value::NULL, Value::NULL).unwrap();
             }
-            // A new object linked from the old list's head.
+            // Store a new object in the head of the old list.
             let head = mc.root(0).downcast::<Pair>(mc).unwrap();
             head.set_car(mc, pair(mc, Value::fixnum(round).unwrap(), Value::NULL).unwrap());
         });
@@ -228,7 +228,7 @@ fn minor_collections_sweep_only_young_pages() {
     assert_eq!((len, last), (300_000, Some(49)));
 }
 
-/// A minor collection gives back the pages a burst of garbage left free, past a nursery's worth.
+/// A minor collection releases the pages that a burst of garbage left free, except for one nursery's worth.
 #[test]
 fn a_minor_collection_gives_back_what_a_burst_freed() {
     let mut arena = Arena::new(64 << 20, 1);
@@ -236,7 +236,7 @@ fn a_minor_collection_gives_back_what_a_burst_freed() {
         for _ in 0..1_000_000 {
             pair(mc, Value::NULL, Value::NULL).unwrap();
         }
-        // Keeps the last page, so the free ones before it are released rather than trimmed.
+        // Keep an object on the last page. The free pages before it are then released to the system, not trimmed from the count of pages handed out.
         let last = pair(mc, Value::NULL, Value::NULL).unwrap();
         mc.set_root(0, last);
     });
@@ -248,8 +248,8 @@ fn a_minor_collection_gives_back_what_a_burst_freed() {
     }
 }
 
-/// Pages given back to the system are refunded, and charged again once reused. A backing that
-/// can't give memory back keeps them charged.
+/// Pages released to the system are refunded, and are charged again once they are reused. With a backing that
+/// cannot release memory, the pages stay charged.
 #[test]
 fn released_pages_are_refunded() {
     let mut arena = Arena::new(64 << 20, 1);
@@ -257,7 +257,7 @@ fn released_pages_are_refunded() {
         for _ in 0..1_000_000 {
             pair(mc, Value::NULL, Value::NULL).unwrap();
         }
-        // Keeps the last page, so the free ones before it are released rather than trimmed.
+        // Keep an object on the last page. The free pages before it are then released to the system, not trimmed from the count of pages handed out.
         let last = pair(mc, Value::NULL, Value::NULL).unwrap();
         mc.set_root(0, last);
     });
@@ -282,8 +282,8 @@ fn released_pages_are_refunded() {
     assert_eq!(arena.peak(), peak.max(arena.used()));
 }
 
-/// An arena with about a megabyte of pairs live in root 1, so pages alone start a cycle only
-/// past a couple of megabytes.
+/// Returns an arena with about a megabyte of live pairs in root 1. So the occupied pages alone start a major cycle only
+/// beyond a couple of megabytes.
 fn arena_with_live_pages(limit: usize) -> Arena {
     let mut arena = Arena::new(limit, 2);
     arena.mutate(|mc| {
@@ -295,8 +295,8 @@ fn arena_with_live_pages(limit: usize) -> Arena {
     arena
 }
 
-/// Host values and old frozen values that die count toward starting a major cycle, as pages do, so
-/// they're freed long before the arena nears its limit.
+/// Host values and old frozen values count toward the start of a major cycle, as pages do. So the dead ones
+/// are freed long before the arena nears its limit.
 #[test]
 fn dead_hosts_and_frozen_values_pace_major_cycles() {
     let limit = 32 << 20;
@@ -317,7 +317,7 @@ fn dead_hosts_and_frozen_values_pace_major_cycles() {
 
     let mut arena = arena_with_live_pages(limit);
     for _ in 0..3000 {
-        // Each value outlives a step, so a minor collection may make it old before it dies.
+        // Each value stays alive past the end of its step, so a minor collection can make it old before it dies.
         arena
             .step(|mc| {
                 let bytes = Bytes::new(mc, mc.frozen_owning(Box::from([0u8; 10_000]), 10_000).unwrap()).unwrap();
@@ -330,8 +330,8 @@ fn dead_hosts_and_frozen_values_pace_major_cycles() {
     assert!(arena.peak() < limit / 2, "frozen values: peak {} of {limit}", arena.peak());
 }
 
-/// With most of the limit live, major cycles still start early enough to finish within the
-/// steps, so the reserve never forces a full collection: one pause the length of a cycle.
+/// With most of the limit live, major cycles still start early enough to finish in slices between the
+/// steps. So the reserve never forces a full collection, which would be one pause as long as a whole cycle.
 #[test]
 fn a_nearly_full_heap_is_collected_in_slices() {
     let limit = 8 << 20;
@@ -359,8 +359,8 @@ fn a_nearly_full_heap_is_collected_in_slices() {
     assert!(arena.peak() <= limit - limit / 16, "peak {} of {limit}: the reserve was drawn on", arena.peak());
 }
 
-/// Frozen values count toward a minor collection as objects do, so short-lived ones that small
-/// objects hold are freed long before the arena nears its limit.
+/// Frozen values count toward the start of a minor collection, as objects do. So short-lived frozen values held by small
+/// objects are freed long before the arena nears its limit.
 #[test]
 fn young_frozen_values_pace_minor_collections() {
     let limit = 32 << 20;
@@ -378,12 +378,14 @@ fn young_frozen_values_pace_minor_collections() {
     assert!(arena.peak() < limit / 4, "peak {} of {limit}", arena.peak());
 }
 
-/// Once host values die, the table drops the slots at its end and gives their room back, and
-/// new values take the lowest free ids.
+/// Once host values die, the host table removes the free slots at its end and shrinks its capacity.
+/// New values take the lowest free ids.
 #[test]
 fn host_tables_shrink_after_their_values_die() {
     let mut arena = Arena::new(64 << 20, 1);
-    let tables = |arena: &Arena| (arena.meta.hosts.borrow().capacity(), arena.meta.free_hosts.borrow().capacity());
+    fn tables(arena: &Arena) -> (usize, usize) {
+        (arena.meta.hosts.borrow().capacity(), arena.meta.free_hosts.borrow().capacity())
+    }
     arena.mutate(|mc| {
         for i in 0..100_000 {
             let owner = Owner::new(mc, Some(mc.host(String::new()).unwrap())).unwrap();
@@ -402,8 +404,8 @@ fn host_tables_shrink_after_their_values_die() {
     assert!(tables(&arena).0 <= 64 && tables(&arena).1 <= 64, "{:?}", tables(&arena));
 }
 
-/// A slot dropped from the table and made again starts past the generations it had, so a stale
-/// reference to it reads nothing.
+/// A slot that is removed from the table and later created again starts at a generation past the ones it had. So a stale
+/// reference to the slot reads nothing.
 #[test]
 fn dropped_host_slots_never_reuse_a_generation() {
     let mut arena = Arena::new(1 << 20, 1);
@@ -422,8 +424,8 @@ fn dropped_host_slots_never_reuse_a_generation() {
     });
 }
 
-/// The host table is charged as it grows, so growing it can't take the arena past its limit.
-/// Across these limits, the table's last growth lands on both sides of it.
+/// The host table is charged as it grows, so growing it cannot take the arena past its limit.
+/// The limits tried here cover both cases: the table's last growth fits under the limit, and it does not fit.
 #[test]
 fn host_tables_grow_within_the_limit() {
     for limit in (512..1024).step_by(32).map(|k| k << 10) {
@@ -438,7 +440,7 @@ fn host_tables_grow_within_the_limit() {
 fn steps_that_end_when_due_keep_collection_incremental() {
     let limit = 4 << 20;
     let mut arena = Arena::new(limit, 1);
-    // A live list to keep marking, and garbage made in steps that end once one's due.
+    // Build a live list, so that cycles have something to mark. The loop below allocates garbage in steps that end as soon as `step_due` is true.
     arena.mutate(|mc| {
         for _ in 0..10_000 {
             let list = pair(mc, Value::NULL, mc.root(0)).unwrap();
@@ -463,7 +465,7 @@ fn steps_that_end_when_due_keep_collection_incremental() {
     }
     let (majors, minors) = arena.collections();
     assert!(majors > 0 && minors > 0, "{majors} majors, {minors} minors");
-    // Never into the reserve, so never a full collection, and no step made more than a nursery.
+    // The peak never reaches the reserve, so no full collection ran. No step allocated more than one nursery.
     assert!(arena.peak() <= limit - limit / 16, "peak {} of {limit}", arena.peak());
     assert!(longest <= (limit / 8).clamp(64 << 10, 4 << 20) + 64, "{longest}");
     let len = arena.mutate(|mc| {

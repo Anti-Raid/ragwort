@@ -1,20 +1,20 @@
-//! Finding strings in strings, and the prefix tests, splitting and trimming built on it.
-//! Search is Crochemore and Perrin's two-way algorithm, as `str::find` uses: linear time
-//! whatever the text, and no memory beyond a few counters. Searches and scans are charged for
-//! the characters they pass over once they're done.
+//! Substring search, and the prefix tests, splitting and trimming built on it.
+//! Search uses the two-way algorithm of Crochemore and Perrin, as `str::find` does. It takes linear time
+//! on any text and needs no memory beyond a few counters. A search or a scan charges the host for
+//! the characters it passed over, after it finishes.
 
 use std::cell::Cell;
 use std::cmp::Ordering;
 use std::ops::Range;
 
 use crate::word::{HIGH, ONES, low_bytes};
-use crate::{Chunks, Host, Res, StrError, Units, Width, chunks, compare_runs, flat, flatten, info, len, substring};
+use crate::{Chunks, Host, Packed, Res, StrError, Units, Width, chunks, compare_runs, flat, flatten, info, len, substring};
 
 #[cfg(test)]
 #[path = "tests/search.rs"]
 mod tests;
 
-/// Where `pattern` first occurs in `string` at or after character `from`.
+/// Returns the index of the first occurrence of `pattern` in `string` that starts at or after character `from`, or `None` if there is none.
 #[inline]
 pub fn find<H: Host>(h: &H, string: H::Str, pattern: H::Str, from: usize) -> Result<Option<usize>, H::Error> {
     match (flat(h, string), flat(h, pattern)) {
@@ -23,7 +23,7 @@ pub fn find<H: Host>(h: &H, string: H::Str, pattern: H::Str, from: usize) -> Res
     }
 }
 
-/// Where `pattern` last occurs in `string` before character `to`, all of it.
+/// Returns the index of the last occurrence of `pattern` in `string` that ends at or before character `to`, or `None` if there is none.
 #[inline]
 pub fn rfind<H: Host>(h: &H, string: H::Str, pattern: H::Str, to: usize) -> Result<Option<usize>, H::Error> {
     match (flat(h, string), flat(h, pattern)) {
@@ -32,7 +32,7 @@ pub fn rfind<H: Host>(h: &H, string: H::Str, pattern: H::Str, to: usize) -> Resu
     }
 }
 
-/// Where to search from `at`: back to the start if `BACK`, else on to the end.
+/// Returns the range of a text of `n` characters to search. A forward search covers `at..n`, and a backward search (`BACK`) covers `0..at`.
 fn room<const BACK: bool>(at: usize, n: usize) -> Range<usize> {
     if BACK { 0..at } else { at..n }
 }
@@ -55,7 +55,7 @@ fn find_units<H: Host, const BACK: bool>(h: &H, text: Units<'_>, pattern: Units<
         return Err(StrError::OutOfRange.into());
     }
     let (room, pattern_len) = (room::<BACK>(at, text.len()), pattern.len());
-    // Flat strings are at their narrowest, so a wider pattern has a character the text lacks.
+    // Flat strings are at their narrowest width, so a pattern wider than the text has a character that the text lacks.
     if pattern_len > room.len() || pattern.width() > text.width() {
         return Ok(None);
     }
@@ -69,14 +69,17 @@ fn find_units<H: Host, const BACK: bool>(h: &H, text: Units<'_>, pattern: Units<
     Ok(found.map(|i| i + room.start))
 }
 
-/// Where `pattern` first occurs in `text`, or last if `BACK`. Backwards, both are read from
-/// their ends, so the first match found is the last.
+/// Returns the index of the first occurrence of `pattern` in `text`, or of the last occurrence if `BACK`. A backward search
+/// reads both `text` and `pattern` from their ends, so the first match it finds is the last occurrence.
 #[inline]
 fn search<const BACK: bool>(text: Units<'_>, pattern: Units<'_>) -> Option<usize> {
+    #[inline(always)]
+    fn at<const BACK: bool>(n: usize, i: usize) -> usize {
+        if BACK { n - 1 - i } else { i }
+    }
     let cell = Cell::new(0);
     let text = text.anchored(&cell);
     let (n, pattern_len) = (text.len(), pattern.len());
-    let at = move |i: usize| if BACK { n - 1 - i } else { i };
     let found = match pattern_len {
         0 => return Some(if BACK { n } else { 0 }),
         1 => return find_code::<BACK>(text, pattern.code(0)),
@@ -85,28 +88,28 @@ fn search<const BACK: bool>(text: Units<'_>, pattern: Units<'_>) -> Option<usize
             buf.iter_mut().zip(0..pattern_len).for_each(|(slot, i)| *slot = pattern.code(if BACK { pattern_len - 1 - i } else { i }));
             let copied = &buf[..pattern_len];
             match text {
-                Units::Packed(packed) if packed.width() == Width::One => two_way(|i| packed.byte(at(i)), n, |i| copied[i], pattern_len),
-                _ => two_way(|i| text.code(at(i)), n, |i| copied[i], pattern_len),
+                Units::Packed(packed) if packed.width() == Width::One => two_way(|i| packed.byte(at::<BACK>(n, i)), n, |i| copied[i], pattern_len),
+                _ => two_way(|i| text.code(at::<BACK>(n, i)), n, |i| copied[i], pattern_len),
             }
         }
-        _ => two_way(|i| text.code(at(i)), n, |i| pattern.code(if BACK { pattern_len - 1 - i } else { i }), pattern_len),
+        _ => two_way(|i| text.code(at::<BACK>(n, i)), n, |i| pattern.code(if BACK { pattern_len - 1 - i } else { i }), pattern_len),
     };
     found.map(|i| if BACK { n - pattern_len - i } else { i })
 }
 
-/// Where the code `code` first occurs in `text`, or last if `BACK`.
+/// Returns the index of the first unit of `text` equal to `code`, or of the last such unit if `BACK`.
 fn find_code<const BACK: bool>(text: Units<'_>, code: u32) -> Option<usize> {
     match text {
         Units::One(bytes) if BACK => bytes.iter().rposition(|&byte| u32::from(byte) == code),
         Units::One(bytes) => bytes.iter().position(|&byte| u32::from(byte) == code),
         Units::Packed(packed) if packed.width() == Width::One => {
-            let (n, pattern) = (packed.len(), ONES * u64::from(code));
-            let zeros = |index: usize| {
+            #[inline(always)]
+            fn zeros<const BACK: bool>(packed: Packed<'_>, n: usize, pattern: u64, index: usize) -> u64 {
                 let bytes = (n - 8 * index).min(8);
                 let x = packed.word_at(index, bytes) ^ pattern;
-                // Zero bytes of `x` are matches. Subtracting one from each byte borrows into the
-                // high bit of the lowest zero byte first, so that one is exact; backwards, every
-                // one has to be, so adding 0x7F to the low bits marks each byte that isn't zero.
+                // A zero byte of `x` is a match. The forward test subtracts one from each byte. The borrow reaches the
+                // high bit of the lowest zero byte first, so the lowest marked byte is exact. A backward search needs every
+                // mark to be exact. So it adds 0x7F to the low seven bits of each byte, which marks each byte that is not zero.
                 let mut zero = if BACK {
                     !(((x & !HIGH) + !HIGH) | x) & HIGH
                 } else {
@@ -116,12 +119,17 @@ fn find_code<const BACK: bool>(text: Units<'_>, code: u32) -> Option<usize> {
                     zero &= low_bytes(bytes);
                 }
                 zero
-            };
-            let (words, hit) = (0..n.div_ceil(8), |index| Some((index, zeros(index))).filter(|&(_, z)| z != 0));
+            }
+            #[inline(always)]
+            fn hit<const BACK: bool>(packed: Packed<'_>, n: usize, pattern: u64, index: usize) -> Option<(usize, u64)> {
+                Some((index, zeros::<BACK>(packed, n, pattern, index))).filter(|&(_, z)| z != 0)
+            }
+            let (n, pattern) = (packed.len(), ONES * u64::from(code));
+            let words = 0..n.div_ceil(8);
             if BACK {
-                words.rev().find_map(hit).map(|(index, z)| 8 * index + (63 - z.leading_zeros() as usize) / 8)
+                words.rev().find_map(|index| hit::<BACK>(packed, n, pattern, index)).map(|(index, z)| 8 * index + (63 - z.leading_zeros() as usize) / 8)
             } else {
-                words.clone().find_map(hit).map(|(index, z)| 8 * index + z.trailing_zeros() as usize / 8)
+                words.clone().find_map(|index| hit::<BACK>(packed, n, pattern, index)).map(|(index, z)| 8 * index + z.trailing_zeros() as usize / 8)
             }
         }
         _ if BACK => (0..text.len()).rev().find(|&i| text.code(i) == code),
@@ -129,25 +137,28 @@ fn find_code<const BACK: bool>(text: Units<'_>, code: u32) -> Option<usize> {
     }
 }
 
-/// Patterns this long or shorter are copied out to search for.
+/// The maximum length of a pattern that is copied into a local buffer for the search.
 const COPIED_PATTERN: usize = 64;
 
-/// Where the pattern of `pattern_len` characters, two or more, that `pattern` gives first occurs in the `n`
-/// characters `text` gives. The pattern is cut where its two halves can't both line up with a
-/// shifted copy of it; the right half is matched first, and a mismatch there shifts by how far
-/// it got, one in the left half by the period. A window whose last character isn't in the
-/// pattern is skipped whole.
+/// Returns the index of the first occurrence of a pattern in a text, by the two-way algorithm. `text(i)` and `pattern(i)` return the code at index `i`.
+/// The text has `n` characters, and the pattern has `pattern_len`, which is at least two. The pattern is split at a critical factorization,
+/// and the right part is matched first. A mismatch in the right part shifts the window by one more than the number of characters matched there.
+/// A mismatch in the left part shifts the window by the period if the pattern is periodic, and by `max(crit, pattern_len - crit) + 1` otherwise.
+/// A window whose last character does not occur in the pattern is skipped entirely. That test uses a 64-bit set of the pattern's codes modulo 64.
 #[inline]
 fn two_way(text: impl Fn(usize) -> u32, n: usize, pattern: impl Fn(usize) -> u32 + Copy, pattern_len: usize) -> Option<usize> {
     let (crit, period) = critical_factorization(pattern, pattern_len);
+    #[inline(always)]
+    fn absent(seen: u64, code: u32) -> bool {
+        seen >> (code & 63) & 1 == 0
+    }
     let seen = (0..pattern_len).fold(0u64, |seen, i| seen | 1 << (pattern(i) & 63));
-    let absent = |code: u32| seen >> (code & 63) & 1 == 0;
     let mut pos = 0;
     if (0..crit).all(|i| pattern(i) == pattern(i + period)) {
-        // Periodic: after a shift by the period, the first `memory` characters still match.
+        // The pattern is periodic. After a shift by the period, the first `memory` characters of the pattern are known to match.
         let mut memory = 0;
         while pos + pattern_len <= n {
-            if absent(text(pos + pattern_len - 1)) {
+            if absent(seen, text(pos + pattern_len - 1)) {
                 (pos, memory) = (pos + pattern_len, 0);
             } else if let Some(i) = (crit.max(memory)..pattern_len).find(|&i| pattern(i) != text(pos + i)) {
                 (pos, memory) = (pos + i - crit + 1, 0);
@@ -160,7 +171,7 @@ fn two_way(text: impl Fn(usize) -> u32, n: usize, pattern: impl Fn(usize) -> u32
     } else {
         let shift = crit.max(pattern_len - crit) + 1;
         while pos + pattern_len <= n {
-            if absent(text(pos + pattern_len - 1)) {
+            if absent(seen, text(pos + pattern_len - 1)) {
                 pos += pattern_len;
             } else if let Some(i) = (crit..pattern_len).find(|&i| pattern(i) != text(pos + i)) {
                 pos += i - crit + 1;
@@ -174,15 +185,15 @@ fn two_way(text: impl Fn(usize) -> u32, n: usize, pattern: impl Fn(usize) -> u32
     None
 }
 
-/// Where to cut the pattern, and the period of what's right of the cut: the later of its
-/// maximal suffixes by either order.
+/// Returns the index at which to split the pattern and the period of the part to the right of the split. The split is at the start
+/// of the later of the two maximal suffixes, one for each ordering of code points. That split is a critical factorization.
 fn critical_factorization(pattern: impl Fn(usize) -> u32 + Copy, pattern_len: usize) -> (usize, usize) {
     let (a, b) = (maximal_suffix(pattern, pattern_len, Ordering::Less), maximal_suffix(pattern, pattern_len, Ordering::Greater));
     if a.0 > b.0 { a } else { b }
 }
 
-/// Where the pattern's greatest suffix starts, by code points in the order `order` gives
-/// (`Greater` for ascending), and that suffix's period.
+/// Returns the start index of the maximal suffix of the pattern and the period of that suffix. `order` selects the ordering
+/// of code points: `Greater` for the usual ascending order, `Less` for the reverse.
 fn maximal_suffix(pattern: impl Fn(usize) -> u32, pattern_len: usize, order: Ordering) -> (usize, usize) {
     let (mut left, mut right, mut offset, mut period) = (0, 1, 0, 1);
     while right + offset < pattern_len {
@@ -214,15 +225,15 @@ pub fn ends_with<H: Host>(h: &H, string: H::Str, suffix: H::Str) -> Result<bool,
     }
 }
 
-/// Whether `units` holds the characters of `part` from `at`, where there's room for them.
+/// Returns whether `units` contains the characters of `part` starting at index `at`. The caller ensures that `part` fits there.
 #[inline]
 fn units_at<H: Host>(h: &H, units: Units<'_>, at: usize, part: Units<'_>) -> Result<bool, H::Error> {
     h.charge(part.len() as u64)?;
     Ok(units.slice(at..at + part.len()).compare(part).is_eq())
 }
 
-/// Whether `string` holds the characters of `part` from where `at` puts them, given the lengths of
-/// both, if there's room.
+/// Returns whether `string` contains the characters of `part` at the index that `at` returns. `at` is called with the lengths of
+/// `string` and `part`. Returns `false` if `part` is longer than `string`.
 #[inline(never)]
 fn rope_at<H: Host>(h: &H, string: H::Str, at: fn(usize, usize) -> usize, part: H::Str) -> Result<bool, H::Error> {
     let (n, part_len) = (len(h, string), len(h, part));
@@ -234,14 +245,14 @@ fn rope_at<H: Host>(h: &H, string: H::Str, at: fn(usize, usize) -> usize, part: 
     Ok(compare_runs(Chunks::new(h, string, at, at + part_len), chunks(h, part)).is_eq())
 }
 
-/// The pieces of `string` between occurrences of `separator`, in order, one more than there are
-/// separators, so some may be empty. An empty separator splits between characters, so then
-/// each character is a piece, unless `string` is empty.
+/// Returns an iterator over the pieces of `string` between occurrences of `separator`, in order. There is one more piece than there are
+/// separators, so some pieces can be empty. An empty separator splits between characters, so
+/// each character is a piece. An empty `string` gives one empty piece.
 pub fn split<H: Host>(h: &H, string: H::Str, separator: H::Str) -> Split<'_, H> {
     splitn(h, string, separator, usize::MAX)
 }
 
-/// Like [`split`], in at most `limit` pieces: the last holds the rest of `string`, separators and all.
+/// Like [`split`], but returns at most `limit` pieces. The last piece holds the rest of `string`, including any separators.
 pub fn splitn<H: Host>(h: &H, string: H::Str, separator: H::Str, limit: usize) -> Split<'_, H> {
     Split { h, s: string, separator, at: Some(0), limit }
 }
@@ -250,9 +261,9 @@ pub struct Split<'h, H: Host> {
     h: &'h H,
     s: H::Str,
     separator: H::Str,
-    /// Where the next piece starts, or `None` once the last is out.
+    /// The index where the next piece starts, or `None` once the last piece has been returned.
     at: Option<usize>,
-    /// How many more pieces there may be.
+    /// The maximum number of pieces still to return.
     limit: usize,
 }
 
@@ -279,7 +290,7 @@ impl<H: Host> Iterator for Split<'_, H> {
     }
 }
 
-/// The runs of `string` between whitespace, none empty.
+/// Returns an iterator over the runs of non-whitespace characters in `string`. No run is empty.
 pub fn split_whitespace<H: Host>(h: &H, string: H::Str) -> SplitWhitespace<'_, H> {
     SplitWhitespace { h, s: string, text: None, at: Some(0) }
 }
@@ -287,9 +298,9 @@ pub fn split_whitespace<H: Host>(h: &H, string: H::Str) -> SplitWhitespace<'_, H
 pub struct SplitWhitespace<'h, H: Host> {
     h: &'h H,
     s: H::Str,
-    /// `s` flattened, and its characters, once the first run is asked for.
+    /// The flattened `s` and its units. They are set when the first run is requested.
     text: Option<(H::Str, Units<'h>)>,
-    /// Where to look for the next run, or `None` once there are no more.
+    /// The index from which to look for the next run, or `None` once there are no more runs.
     at: Option<usize>,
 }
 
@@ -309,18 +320,23 @@ impl<H: Host> Iterator for SplitWhitespace<'_, H> {
             },
         };
         let n = units.len();
-        let space = |i| units.get(i).is_some_and(char::is_whitespace);
-        let Some(start) = (from..n).find(|&i| !space(i)) else {
+        let Some(start) = (from..n).find(|&i| !space(units, i)) else {
             self.at = None;
             return None;
         };
-        let end = (start..n).find(|&i| space(i)).unwrap_or(n);
+        let end = (start..n).find(|&i| space(units, i)).unwrap_or(n);
         self.at = Some(end);
         Some(h.charge((end - from) as u64).and_then(|()| substring(h, text, start, end)))
     }
 }
 
-/// `string` without whitespace at either end.
+/// Returns whether the character at index `i` of `units` is whitespace.
+#[inline(always)]
+fn space(units: Units<'_>, i: usize) -> bool {
+    units.get(i).is_some_and(char::is_whitespace)
+}
+
+/// Returns `string` without the whitespace at either end.
 pub fn trim<H: Host>(h: &H, string: H::Str) -> Res<H> {
     trimmed(h, string, true, true)
 }
@@ -337,9 +353,8 @@ fn trimmed<H: Host>(h: &H, string: H::Str, start: bool, end: bool) -> Res<H> {
     let text = flatten(h, string)?;
     let units = flat(h, text).expect("flattened");
     let n = units.len();
-    let space = |i| units.get(i).is_some_and(char::is_whitespace);
-    let from = if start { (0..n).find(|&i| !space(i)).unwrap_or(n) } else { 0 };
-    let to = if end { (from..n).rev().find(|&i| !space(i)).map_or(from, |i| i + 1) } else { n };
+    let from = if start { (0..n).find(|&i| !space(units, i)).unwrap_or(n) } else { 0 };
+    let to = if end { (from..n).rev().find(|&i| !space(units, i)).map_or(from, |i| i + 1) } else { n };
     h.charge((from + n - to) as u64)?;
     if from == 0 && to == n {
         return Ok(string);

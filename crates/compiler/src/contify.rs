@@ -58,7 +58,7 @@ pub(crate) fn contify<'id>(tree: &mut L3<'id, '_>, root: Id<'id>) {
             tree.set(at, Node::Jump(*var, args));
         }
     }
-    // Maps original node IDs to their replacement IDs within the new Join node's scope.
+    // Maps each node that became a `Join` to the copy of its original content, which is now the scope of the `Join`.
     let mut moved = HashMap::default();
     for (at, groups) in plan.at {
         let codes: Vec<JoinCode<'id>> = groups.iter().flatten().map(|&var| JoinCode { id: var, fun: plan.funs[&var] }).collect();
@@ -204,7 +204,9 @@ impl<'id> Survey<'_, 'id, '_> {
     /// Traverses child expressions of node `id`, pushing appropriate tail or non-tail worklist tasks.
     fn node(&mut self, id: Id<'id>, todo: &mut Vec<Task<'id>>) {
         let tree = self.tree;
-        let fresh = |ids: &[Id<'id>], todo: &mut Vec<Task<'id>>| todo.extend(ids.iter().map(|&child| Task::Fresh(child)));
+        fn fresh<'id>(ids: &[Id<'id>], todo: &mut Vec<Task<'id>>) {
+            todo.extend(ids.iter().map(|&child| Task::Fresh(child)));
+        }
         match tree[id] {
             Node::Quote(_) => {}
             Node::Ref(var) => self.unfit(var),
@@ -302,7 +304,8 @@ impl<'id> Survey<'_, 'id, '_> {
             let mut fits = true;
             'calls: for member in members {
                 for call in &self.candidates[member].calls {
-                    // If the call site is located inside another join body that was already placed, prepend its tail chain.
+                    // `chain[0]` is the node where the call's tail chain starts. If that node is the body of a function that was already placed as a join, the call is in tail position of the join body.
+                    // The call then continues the tail chain of the join's placement site, so prepend that chain and use its frame. Repeat, because the prepended chain may itself start at the body of another placed join.
                     let mut chain = call.chain.to_vec();
                     let mut frame = call.frame;
                     while let Some(join) = self.bodies.get(&chain[0]).and_then(|owner| placed.get(owner)) {

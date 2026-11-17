@@ -9,7 +9,7 @@ pub fn compare(x: Digits<'_>, y: Digits<'_>) -> Ordering {
     x.len().cmp(&y.len()).then_with(|| x.iter().rev().cmp(y.iter().rev()))
 }
 
-/// `z = x + y`. `z` needs `max(x, y) + 1` digits.
+/// Computes `z = x + y`. `z` needs one more digit than the longer of `x` and `y`.
 pub fn add(mut z: RWDigits<'_>, x: Digits<'_>, y: Digits<'_>) {
     let (x, y) = if x.len() >= y.len() { (x, y) } else { (y, x) };
     let mut carry = 0;
@@ -20,7 +20,7 @@ pub fn add(mut z: RWDigits<'_>, x: Digits<'_>, y: Digits<'_>) {
     z.offset(x.len() + 1).clear();
 }
 
-/// `z = x - y` for `x >= y`. `z` needs `x` digits, normalized.
+/// Computes `z = x - y` for `x >= y`. `z` needs as many digits as the normalized `x`.
 pub fn subtract(mut z: RWDigits<'_>, x: Digits<'_>, y: Digits<'_>) {
     let (x, y) = (x.normalize(), y.normalize());
     let mut borrow = 0;
@@ -31,7 +31,7 @@ pub fn subtract(mut z: RWDigits<'_>, x: Digits<'_>, y: Digits<'_>) {
     z.offset(x.len()).clear();
 }
 
-/// `z += x` in place, returning the carry out of `z`.
+/// Computes `z += x` in place and returns the carry out of `z`.
 pub fn add_and_return_carry(mut z: RWDigits<'_>, x: Digits<'_>) -> Digit {
     let mut carry = 0;
     for i in 0..z.len() {
@@ -43,7 +43,7 @@ pub fn add_and_return_carry(mut z: RWDigits<'_>, x: Digits<'_>) -> Digit {
     carry
 }
 
-/// `z -= x` in place, returning the borrow out of `z`.
+/// Computes `z -= x` in place and returns the borrow out of `z`.
 pub fn subtract_and_return_borrow(mut z: RWDigits<'_>, x: Digits<'_>) -> Digit {
     let mut borrow = 0;
     for i in 0..z.len() {
@@ -55,12 +55,12 @@ pub fn subtract_and_return_borrow(mut z: RWDigits<'_>, x: Digits<'_>) -> Digit {
     borrow
 }
 
-/// `z += digit` in place, returning the carry.
+/// Computes `z += digit` in place and returns the carry.
 pub fn add_digit(z: RWDigits<'_>, digit: Digit) -> Digit {
     add_and_return_carry(z, Digits::of_mut(&mut [digit]))
 }
 
-/// `z = x + 1`. `z` needs `x + 1` digits.
+/// Computes `z = x + 1`. `z` needs one more digit than `x`.
 pub fn add_one(mut z: RWDigits<'_>, x: Digits<'_>) {
     let mut carry = 1;
     for i in 0..x.len() {
@@ -70,7 +70,7 @@ pub fn add_one(mut z: RWDigits<'_>, x: Digits<'_>) {
     z.offset(x.len() + 1).clear();
 }
 
-/// `z = x - 1` for `x >= 1`. `z` needs `x` digits.
+/// Computes `z = x - 1` for `x >= 1`. `z` needs as many digits as `x`.
 pub fn subtract_one(mut z: RWDigits<'_>, x: Digits<'_>) {
     let mut borrow = 1;
     for i in 0..x.len() {
@@ -80,8 +80,8 @@ pub fn subtract_one(mut z: RWDigits<'_>, x: Digits<'_>) {
     z.offset(x.len()).clear();
 }
 
-/// `z = x + y` with signs, returning whether `z` is negative. `z` needs `max(x, y) + 1`
-/// digits.
+/// Computes `z = x + y` for signed operands and returns whether `z` is negative. `z` needs one more digit than the longer
+/// of `x` and `y`.
 pub fn add_signed(mut z: RWDigits<'_>, x: Digits<'_>, x_negative: bool, y: Digits<'_>, y_negative: bool) -> bool {
     if x_negative == y_negative {
         add(z.reborrow(), x, y);
@@ -99,12 +99,12 @@ pub fn add_signed(mut z: RWDigits<'_>, x: Digits<'_>, x_negative: bool, y: Digit
     }
 }
 
-/// `z = x - y` with signs, as [`add_signed`].
+/// Computes `z = x - y` for signed operands, with the conventions of [`add_signed`].
 pub fn subtract_signed(z: RWDigits<'_>, x: Digits<'_>, x_negative: bool, y: Digits<'_>, y_negative: bool) -> bool {
     add_signed(z, x, x_negative, y, !y_negative)
 }
 
-/// `z = x << shift`. `z` needs `x + shift / DIGIT_BITS + 1` digits.
+/// Computes `z = x << shift`. `z` needs `x.len() + shift / DIGIT_BITS + 1` digits.
 pub fn left_shift(mut z: RWDigits<'_>, x: Digits<'_>, shift: usize) {
     let (digits, bits) = (shift / DIGIT_BITS, shift % DIGIT_BITS);
     z.slice(0, digits).clear();
@@ -124,7 +124,7 @@ pub fn left_shift(mut z: RWDigits<'_>, x: Digits<'_>, shift: usize) {
     z.offset(digits + x.len() + 1).clear();
 }
 
-/// `z = x >> shift`, rounding toward zero. `z` needs `x - shift / DIGIT_BITS` digits.
+/// Computes `z = x >> shift`, rounding toward zero. `z` needs `x.len() - shift / DIGIT_BITS` digits.
 pub fn right_shift(mut z: RWDigits<'_>, x: Digits<'_>, shift: usize) {
     let (digits, bits) = (shift / DIGIT_BITS, shift % DIGIT_BITS);
     let n = x.len().saturating_sub(digits);
@@ -135,21 +135,21 @@ pub fn right_shift(mut z: RWDigits<'_>, x: Digits<'_>, shift: usize) {
     z.offset(n).clear();
 }
 
-/// Whether `x >> shift` drops any one bits, which makes a negative shift round down.
+/// Returns whether `x >> shift` drops any one bits. If it does, the right shift of a negative number rounds toward negative infinity, so the caller adds one to the shifted magnitude.
 pub fn shifts_out_ones(x: Digits<'_>, shift: usize) -> bool {
     let (digits, bits) = (shift / DIGIT_BITS, shift % DIGIT_BITS);
     x.slice(0, digits).iter().any(|digit| digit != 0) || (bits != 0 && x.get(digits) << (DIGIT_BITS - bits) != 0)
 }
 
-/// The magnitude as the nearest double, ties to even.
+/// Returns the `f64` nearest to the magnitude `x`, with ties to even.
 pub fn to_f64(x: Digits<'_>) -> f64 {
     let x = x.normalize();
     let bits = x.bit_len();
     if bits <= DIGIT_BITS {
         return x.get(0) as f64;
     }
-    // The top digit's worth of bits, with any lower one bit folded into the lowest bit, so
-    // the conversion rounds ties correctly.
+    // Take the top `DIGIT_BITS` bits of `x`. OR a sticky bit for any lower one bit into the lowest bit, so that
+    // the conversion to `f64` rounds ties correctly.
     let shift = bits - DIGIT_BITS;
     let (digit, bit_shift) = (shift / DIGIT_BITS, shift % DIGIT_BITS);
     let mut top = x.at(digit) >> bit_shift;

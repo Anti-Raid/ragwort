@@ -7,6 +7,7 @@ use ragwort_types::num::NumError;
 use ragwort_types::pair::{Pair, Pairs};
 use ragwort_types::string::StrError;
 use ragwort_types::table::TableError;
+use ragwort_types::vector::VectorError;
 
 use crate::frame::CLOSURE;
 use crate::objects::{self, BytecodeFields, ClosureFields, ModuleFields, SpillFields, Task};
@@ -48,15 +49,15 @@ named! {
         LoadAcc { dst: u8 } = "load-acc",
         /// Loads the values in the accumulator into register `dst` as a list, however many there are. Emitted after the call to the producer of a `collect`.
         LoadValues { dst: u8 } = "load-values",
-        /// Returns control to the caller with the accumulator as it is. The caller receives what the last call or operation returned, however many values that is.
+        /// Returns to the caller and leaves the accumulator unchanged. The caller receives the values that the last call or operation returned, whatever their number.
         ReturnReceived = "return-received",
-        /// Returns the values in `count` registers starting at `src` to the caller. This is `(values x ...)` in tail position. Any number of values other than one is returned as a list beside the accumulator, which only a receiving call or another return takes.
+        /// Returns the values in `count` registers starting at `src` to the caller. This is `(values x ...)` in tail position. Any number of values other than one is returned as the marker [`Value::VALUES`] in the accumulator, with a list of the values. Only a receiving call or another return accepts the marker.
         ReturnValues { src: u8, count: u8 } = "return-values",
-        /// Returns values as `ReturnValues` does, like `apply`: the values are those in the `args - 1` registers starting at `base`, followed by the elements of the list in the last of the `args` registers.
+        /// Returns values as `ReturnValues` does, with the last operand spread as in `apply`. The values are those in the first `args - 1` registers starting at `base`, followed by the elements of the list in the last of the `args` registers.
         ReturnSpread { base: u8, args: u8 } = "return-spread",
         /// Loads upvalue `index` of the current closure into register `dst`. Upvalues are populated upon closure creation; mutable variables are captured within indirection boxes accessed via box intrinsics.
         LoadUpvalue { dst: u8, index: u32 } = "load-upvalue",
-        /// Instantiates `count` closures from bytecode objects in constant pool indices `code..code + count` into registers `dst..dst + count`, then initializes each closure's upvalues according to its capture list. All closures are allocated before initializing upvalues, allowing mutually recursive procedures (such as from `letrec`) to capture each other via register references.
+        /// Creates `count` closures from the bytecode objects at constant pool indices `code..code + count`, and stores them in registers `dst..dst + count`. Then initializes each closure's upvalues according to its capture list. All closures are allocated before any upvalue is initialized. So mutually recursive procedures (such as from `letrec`) can capture each other through the registers.
         NewClosure { dst: u8, count: u8, code: u32 } = "new-closure",
         /// Invokes `intrinsic` on `args` operand registers starting at `base`, storing the result in the accumulator. Emitted by the compiler for non-rebound primitive procedures, enabling optimized execution paths such as in-place fixnum arithmetic.
         CallIntrinsic { base: u8, args: u8, intrinsic: Intrinsic } = "call-intrinsic",
@@ -68,17 +69,23 @@ named! {
         AddImm { dst: u8, a: u8, imm: i16 } = "add-imm",
         /// Reads field `k` from the structure in register `a` and stores it in `dst` (corresponding to `(struct-field a k)`). Emitted when static analysis confirms `a` is a struct containing field index `k`, avoiding a register for the field offset.
         StructField { dst: u8, a: u8, k: u16 } = "struct-field",
-        /// Reads field `k` from the structure in register `a` and stores it in `dst`, verifying that `a` is an instance of the struct type stored in constant pool index `kind` (corresponding to `(struct-ref a type k)`). Neither the type descriptor nor field index occupies a register.
+        /// Reads field `k` from the structure in register `a` and stores it in `dst`, as `(struct-ref a type k)` does. First verifies that `a` is an instance of the struct type at constant pool index `kind`. Neither the type descriptor nor the field index occupies a register.
         StructRef { dst: u8, a: u8, k: u8, kind: u32 } = "struct-ref",
         /// Executes ternary `intrinsic` on register operands `(a, b, c)` and writes the result into register `dst`.
         CallIntrinsic3 { dst: u8, a: u8, b: u8, c: u8, intrinsic: Intrinsic } = "call-intrinsic3",
+        /// `(table-ref table key default)` for a key that is compared by its value word, such as a symbol. Two such keys are the same key exactly when their words are equal. Writes the value of `key` in the table in register `table` into `dst`. If the table has no such key, writes the value of register `default`.
+        ///
+        /// Word `hint` of the code's hints holds the entry position where the key was last found. That position is tried first. See [`crate::objects::Hints`].
+        TableRefHinted { dst: u8, table: u8, key: u8, default: u8, hint: u16 } = "table-ref-hinted",
+        /// `(table-set! table key value)` for a key of the kind that `TableRefHinted` takes. Sets the value of `key` in the table in register `table`, and writes `#<void>` into `dst`. The hint is used as in `TableRefHinted`.
+        TableSetHinted { dst: u8, table: u8, key: u8, value: u8, hint: u16 } = "table-set-hinted",
         /// Executes `intrinsic` on the argument registers and immediately returns the result to the caller. Built-in procedures referenced as first-class values compile to a closure wrapping this single instruction.
         TailCallIntrinsic { base: u8, args: u8, intrinsic: Intrinsic } = "tail-call-intrinsic",
-        /// Dispatches runtime control operation `request` to the execution loop with `args` argument registers starting at `base`. For requests that invoke procedures (such as `call/cc`), execution resumes at this instruction upon return; `base` must therefore be positioned past the current frame's link slot.
+        /// Dispatches runtime control operation `request` to the execution loop with `args` argument registers starting at `base`. For requests that invoke procedures (such as `call/cc`), execution resumes after this instruction when the procedure returns. So `base` must be past the current frame's link slot.
         CallRequest { base: u8, args: u8, request: Request } = "call-request",
-        /// Tail-call variant of `CallRequest`: any procedure invoked by the request replaces the current frame and returns directly to the caller of the current frame (e.g. for `(call/cc f)` in tail position).
+        /// Tail-call variant of `CallRequest`. Any procedure that the request invokes replaces the current frame and returns directly to the current frame's caller. An example is `(call/cc f)` in tail position.
         TailCallRequest { base: u8, args: u8, request: Request } = "tail-call-request",
-        /// Executes `intrinsic` with variadic arguments like `apply`: preceding argument registers are passed positionally, and the final argument register provides a list containing the remaining arguments.
+        /// Executes `intrinsic` with its arguments spread as in `apply`. The registers before the last are passed as positional arguments. The last register holds a list of the remaining arguments.
         ApplyIntrinsic { base: u8, args: u8, intrinsic: Intrinsic } = "apply-intrinsic",
         /// Executes runtime control operation `request` with `apply`-style argument spreading, where the final register among the `args` contains a list of trailing arguments.
         ApplyRequest { base: u8, args: u8, request: Request } = "apply-request",
@@ -150,7 +157,7 @@ impl<'gc> Context<'_, 'gc> {
         Ok(())
     }
 
-    /// Puts the values of `count` registers from `first`, followed by the elements of the proper list `rest`, into the accumulator. Exactly one value goes there as it is. Any other number goes there as a list.
+    /// Stores the values of `count` registers starting at `first`, followed by the elements of the proper list `rest`, in the accumulator. Exactly one value is stored as that value. Any other number of values is stored as the marker and a list.
     #[inline(never)]
     fn set_values(&mut self, first: u8, count: u8, rest: Value<'gc>) -> Result<(), Fault> {
         let (mc, frame) = (self.mc, self.frame);
@@ -221,6 +228,10 @@ pub enum Control {
     Host { base: u8, args: u8, host: u32, tail: bool },
     /// Returns from the current frame to the caller, passing the accumulator value.
     Return,
+    /// Reads a table with the hint of the running code. See [`Op::TableRefHinted`].
+    TableRef { dst: u8, table: u8, key: u8, default: u8, hint: u16 },
+    /// Writes a table with the hint of the running code. See [`Op::TableSetHinted`].
+    TableSet { dst: u8, table: u8, key: u8, value: u8, hint: u16 },
 }
 
 /// Represents virtual machine runtime faults and errors. Non-fatal faults are raised within the Scheme program as [`crate::objects::Condition`] objects and terminate execution only if unhandled.
@@ -344,7 +355,7 @@ impl Fault {
         }
     }
 
-    /// Returns `true` if this fault is fatal (terminating the run immediately without raising an in-program condition), caused by corrupt bytecode, an exhausted heap, an already-finished task, or fuel exhaustion.
+    /// Returns `true` if this fault is fatal. A fatal fault ends the run immediately and is not raised as a condition in the program. The fatal faults are corrupt bytecode, an exhausted heap, an already-finished task, and fuel exhaustion.
     pub fn is_fatal(self) -> bool {
         matches!(self, Fault::Malformed | Fault::OutOfMemory | Fault::Finished | Fault::OutOfFuel)
     }
@@ -356,11 +367,23 @@ impl From<OutOfMemory> for Fault {
     }
 }
 
+impl From<VectorError> for Fault {
+    fn from(error: VectorError) -> Self {
+        match error {
+            VectorError::Immutable => Self::Immutable,
+            // The host of an external vector rejected the value. The program sees a value of the wrong type.
+            VectorError::Refused => Self::WrongType,
+            VectorError::OutOfRange => Self::OutOfRange,
+            VectorError::Arena(error) => error.into(),
+        }
+    }
+}
+
 impl From<TableError> for Fault {
     fn from(error: TableError) -> Self {
         match error {
             TableError::Immutable => Self::Immutable,
-            // A host that does not take a key or a value says so for what they are.
+            // The host of an external table rejected the key or the value. The program sees a value of the wrong type.
             TableError::Refused => Self::WrongType,
             TableError::Arena(error) => error.into(),
         }
@@ -530,6 +553,8 @@ impl Op {
                 let val = intrinsic.exec3(cx, first, second, third)?;
                 frame.set(dst, val);
             }
+            Op::TableRefHinted { dst, table, key, default, hint } => return Ok(Control::TableRef { dst, table, key, default, hint }),
+            Op::TableSetHinted { dst, table, key, value, hint } => return Ok(Control::TableSet { dst, table, key, value, hint }),
             Op::CallRequest { base, args, request } | Op::TailCallRequest { base, args, request } => {
                 if usize::from(base) + usize::from(args) > WINDOW || !request.takes(usize::from(args)) {
                     return Err(Fault::Malformed);

@@ -8,9 +8,10 @@
 
 use ragwort_alloc::{Arena, CollectIn, Vec as AVec};
 use ragwort_types::gc::{Gc, Mutation, Value, WINDOW};
+use ragwort_types::symbol::Symbol;
 use ragwort_types::vector::Vectors;
 use ragwort_vm::frame::{self, ARGS, CLOSURE, MAX_PARAMS, Shape};
-use ragwort_vm::objects::{self, Bytecode, BytecodeFields, Closure, ModuleFields, Sites, SitesFields};
+use ragwort_vm::objects::{self, Bytecode, BytecodeFields, Closure, Hints, ModuleFields, Sites, SitesFields};
 use ragwort_vm::report::{Line, Scope, Table};
 use ragwort_vm::{Capture, HostDef, Intrinsic, Op, Request};
 
@@ -48,7 +49,7 @@ pub(crate) fn emit<'gc>(mc: &Mutation<'gc>, owner: Option<Gc<'gc, objects::Modul
     Ok(Value::object(mc, Closure::new(mc, Some(code), 0, Value::VOID)?))
 }
 
-/// The physical storage location assigned to an SSA value (either a hardware register or a spill slot).
+/// The physical storage location assigned to an SSA value (either a frame register or a spill slot).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Loc {
     Reg(u8),
@@ -110,28 +111,42 @@ enum Imm<'gc> {
     FieldOf(Value<'gc>, u8),
 }
 
-/// Precomputes embedded immediate constants for each SSA instruction that supports immediate operands.
+/// The immediate operand of each instruction, indexed by the SSA value that the instruction defines. The entry is `None` for an instruction without an immediate operand.
 type Imms<'t, 'gc> = AVec<'t, Option<Imm<'gc>>>;
 
-fn imms<'t, 'gc>(arena: &'t Arena, function: &Function<'_, 'gc>) -> Imms<'t, 'gc> {
+/// Facts that the emitter derives from the constant arguments of each instruction of a function. Each vector is indexed by the SSA value that the instruction defines.
+struct Operands<'t, 'gc> {
+    imms: Imms<'t, 'gc>,
+    /// Marks each `table-ref` and `table-set!` whose key is a constant that its `Value` word identifies. Such a key is a symbol, or an immediate value such as a fixnum or a short string. Equal keys of these kinds always have the same word.
+    /// A marked instruction is emitted with a hint that records where the instruction last found its key. See [`Op::TableRefHinted`].
+    hinted: AVec<'t, bool>,
+}
+
+fn operands<'t, 'gc: 't>(arena: &'t Arena, function: &Function<'_, 'gc>) -> Operands<'t, 'gc> {
+    fn fixnum(constants: &[Option<Value<'_>>], value: &Val) -> Option<i64> {
+        constants[value.0 as usize].and_then(|constant| constant.as_fixnum())
+    }
     let mut constants: AVec<'t, Option<Value<'gc>>> = arena.vec_of(None, function.values as usize);
     let mut imms = arena.vec_of(None, function.values as usize);
+    let mut hinted = arena.vec_of(false, function.values as usize);
     for inst in function.blocks.iter().flat_map(|block| &block.insts) {
         match inst {
             Inst::Const(dst, value) => constants[dst.0 as usize] = Some(*value),
             Inst::Prim { dst, prim: Prim::Intrinsic(intrinsic), args, spread: false } => {
-                let fixnum = |value: &Val| constants[value.0 as usize].and_then(|constant| constant.as_fixnum());
                 imms[dst.0 as usize] = match (intrinsic, args.as_slice()) {
-                    (Intrinsic::Add, [_, addend]) => fixnum(addend).and_then(|number| i16::try_from(number).ok()).map(Imm::Add),
-                    (Intrinsic::StructField | Intrinsic::StructFixedField, [_, field]) => fixnum(field).and_then(|number| u16::try_from(number).ok()).map(Imm::Field),
-                    (Intrinsic::StructRef, [_, kind, field]) => constants[kind.0 as usize].zip(fixnum(field).and_then(|number| u8::try_from(number).ok())).map(|(kind, field)| Imm::FieldOf(kind, field)),
+                    (Intrinsic::Add, [_, addend]) => fixnum(&constants, addend).and_then(|number| i16::try_from(number).ok()).map(Imm::Add),
+                    (Intrinsic::StructField | Intrinsic::StructFixedField, [_, field]) => fixnum(&constants, field).and_then(|number| u16::try_from(number).ok()).map(Imm::Field),
+                    (Intrinsic::StructRef, [_, kind, field]) => constants[kind.0 as usize].zip(fixnum(&constants, field).and_then(|number| u8::try_from(number).ok())).map(|(kind, field)| Imm::FieldOf(kind, field)),
                     _ => None,
                 };
+                if let (Intrinsic::TableRef | Intrinsic::TableSet, [_, key, _]) = (intrinsic, args.as_slice()) {
+                    hinted[dst.0 as usize] = constants[key.0 as usize].is_some_and(|key| key.immediate().is_some() || Symbol::of(key).is_some());
+                }
             }
             _ => {}
         }
     }
-    imms
+    Operands { imms, hinted }
 }
 
 /// Iterates over every SSA value read by `inst` before its destination is assigned. Mutual closures
@@ -183,16 +198,16 @@ fn liveness<'t>(arena: &'t Arena, function: &Function<'_, '_>, imms: &Imms<'_, '
         block.params.iter().for_each(|param| home[param.0 as usize] = index as u32);
         block.insts.iter().flat_map(|inst| inst.defs()).for_each(|def| home[def.0 as usize] = index as u32);
     }
+    fn note(home: &[u32], exposed: &mut AVec<'_, (u32, u32)>, index: usize, value: Val) {
+        if home[value.0 as usize] != index as u32 {
+            exposed.push((value.0, index as u32));
+        }
+    }
     // Identifies upwards-exposed values: values used in a block before being defined in that block.
     let mut exposed = arena.vec();
     for (index, block) in function.blocks.iter().enumerate() {
-        let mut note = |value: Val| {
-            if home[value.0 as usize] != index as u32 {
-                exposed.push((value.0, index as u32));
-            }
-        };
-        block.insts.iter().for_each(|inst| each_read(inst, imms, &mut note));
-        block.end.each_use(&mut note);
+        block.insts.iter().for_each(|inst| each_read(inst, imms, |value| note(&home, &mut exposed, index, value)));
+        block.end.each_use(|value| note(&home, &mut exposed, index, value));
     }
     exposed.sort_unstable();
     // Tracks the most recent SSA value processed for each block's live-in and live-out sets to avoid redundant visits.
@@ -369,7 +384,7 @@ struct Module<'a, 'gc> {
     /// The owning runtime module whose imported variables and host function tables are accessed.
     owner: Option<Gc<'gc, objects::Module>>,
     names: &'a Origins<'gc>,
-    /// The position table rows of every function emitted so far, and the sources and names they refer to by index.
+    /// The position table rows of every function emitted so far. The rows refer to sources and procedure names by index into `items`.
     lines: Vec<Line>,
     items: Vec<Value<'gc>>,
     item_index: HashMap<u64, u32>,
@@ -391,7 +406,7 @@ impl<'a, 'gc> Module<'a, 'gc> {
         Ok(i)
     }
 
-    /// Returns the index of host function `def` in the module's host table, registering it if not yet present.
+    /// Returns the index of host function `def` in the host table of the owning module. Returns `CompileError::UnknownHost` if the table does not contain `def`.
     fn host(&self, def: &'static HostDef) -> Result<u32, CompileError> {
         let hosts = self.owner.and_then(|module| module.hosts(self.mc)).map_or(&[][..], |table| &table[..]);
         let i = hosts.iter().position(|&host| host == def).ok_or(CompileError::UnknownHost(def))?;
@@ -407,8 +422,6 @@ impl<'a, 'gc> Module<'a, 'gc> {
         Ok(slot)
     }
 
-    /// Emits bytecode for function `function`, fusing 1- and 2-argument intrinsic tests into conditional branches
-    /// unless jump targets exceed the 16-bit signed branch offset limit.
     /// Returns the index of `value` among the items of the position table, adding it if it is new.
     fn item(&mut self, value: Value<'gc>) -> u32 {
         let next = self.items.len() as u32;
@@ -428,7 +441,7 @@ impl<'a, 'gc> Module<'a, 'gc> {
     /// Builds the object that holds the position table of the functions emitted.
     fn sites(&mut self) -> Result<Value<'gc>, CompileError> {
         let mc = self.mc;
-        // Inlined calls keep their numbers: the compilation numbers an inlined call after the call that encloses it, and rows refer to those numbers.
+        // Each inlined call keeps its number, because rows refer to inlined calls by number. The compiler numbers an inlined call after the call that encloses it, so the enclosing call always has the smaller number.
         let mut scopes = Vec::with_capacity(self.names.sites.inlined.len());
         for i in 0..self.names.sites.inlined.len() {
             let Inlined { name, call } = self.names.sites.inlined[i];
@@ -445,6 +458,8 @@ impl<'a, 'gc> Module<'a, 'gc> {
         Ok(Value::object(mc, sites))
     }
 
+    /// Emits bytecode for function `function`, fusing 1- and 2-argument intrinsic tests into conditional branches
+    /// unless jump targets exceed the 16-bit signed branch offset limit.
     fn function(&mut self, function: &Function<'_, 'gc>, captures: &[Capture]) -> Result<Gc<'gc, Bytecode>, CompileError> {
         let (constants, codes, pending) = (self.constants.len(), self.codes.len(), self.pending.len());
         if let Some(code) = self.attempt(function, captures, true)? {
@@ -488,7 +503,7 @@ impl<'a, 'gc> Module<'a, 'gc> {
             function.rest.iter().for_each(|rest| fixed[rest.0 as usize] = Some(list));
             &function.params[keep..]
         };
-        let imms = imms(arena, function);
+        let Operands { imms, hinted } = operands(arena, function);
         let mut uses = arena.vec_of(0u32, values);
         for block in &function.blocks {
             block.insts.iter().for_each(|inst| each_read(inst, &imms, |value| uses[value.0 as usize] += 1));
@@ -521,6 +536,8 @@ impl<'a, 'gc> Module<'a, 'gc> {
             locs,
             uses,
             imms,
+            hinted,
+            hints: 0,
             to,
             at: arena.vec_of(0, live.words),
             seen: arena.vec(),
@@ -549,29 +566,33 @@ impl<'a, 'gc> Module<'a, 'gc> {
         for (i, &block) in order.iter().enumerate() {
             emitter.block(function, block, &live, order.get(i + 1).copied())?;
         }
-        let Emitter { mut ops, mut starts, mut jumps, mut sited, .. } = emitter;
+        let Emitter { mut ops, mut starts, mut jumps, mut sited, hints, .. } = emitter;
         // Eliminates redundant jumps to the immediately following instruction (e.g. blocks where parallel moves collapsed to no-ops).
         loop {
-            let gone: AVec<'_, usize> = jumps
-                .iter()
-                .filter(|&&(at, to)| starts[to.0 as usize] == at + 1 && matches!(ops[at], Op::Jump { .. } | Op::JumpIfFalse { .. }))
-                .map(|&(at, _)| at)
-                .collect_in(arena);
-            if gone.is_empty() {
+            // `gone[pc]` is set for each jump to remove. A flag for every instruction keeps one pass linear in the length of the function.
+            let mut gone = arena.vec_of(false, ops.len() + 1);
+            let mut removed = 0;
+            for &(at, to) in jumps.iter() {
+                if starts[to.0 as usize] == at + 1 && matches!(ops[at], Op::Jump { .. } | Op::JumpIfFalse { .. }) {
+                    gone[at] = true;
+                    removed += 1;
+                }
+            }
+            if removed == 0 {
                 break;
             }
             let mut moved = AVec::with_capacity_in(ops.len() + 1, arena);
             let mut left = 0;
             for i in 0..=ops.len() {
                 moved.push(i - left);
-                if gone.contains(&i) {
+                if gone[i] {
                     left += 1;
                 }
             }
-            ops = ops.into_iter().enumerate().filter(|(i, _)| !gone.contains(i)).map(|(_, op)| op).collect();
+            ops = ops.into_iter().enumerate().filter(|(i, _)| !gone[*i]).map(|(_, op)| op).collect();
             starts.iter_mut().for_each(|start| *start = moved[*start]);
             sited.iter_mut().for_each(|(pc, _)| *pc = moved[*pc]);
-            jumps = jumps.into_iter().filter(|(at, _)| !gone.contains(at)).map(|(at, to)| (moved[at], to)).collect_in(arena);
+            jumps = jumps.into_iter().filter(|(at, _)| !gone[*at]).map(|(at, to)| (moved[at], to)).collect_in(arena);
         }
         for (at, to) in jumps {
             let offset = i32::try_from(starts[to.0 as usize] as isize - (at as isize + 1)).expect("functions are shorter than 2^31 ops");
@@ -585,7 +606,7 @@ impl<'a, 'gc> Module<'a, 'gc> {
             }
         }
         let mc = self.mc;
-        // A function without a lambda ID is the code of a top-level form, which the trace of an error tells apart from a procedure.
+        // A function without a lambda ID is the code of a top-level form. Its name is `Value::VOID`, so that an error traceback can tell it apart from a procedure.
         let described = function.id.map(|id| self.names.get(id)).unwrap_or_default();
         let name = match function.id {
             Some(_) => described.name.unwrap_or(Value::FALSE),
@@ -599,7 +620,9 @@ impl<'a, 'gc> Module<'a, 'gc> {
             self.lines.push(Line { pc: pc as u32, source, offset, inlined });
         }
         let (lines_start, lines_len) = (lines_start as u32, (self.lines.len() - lines_start) as u32);
-        let code = Bytecode::new(mc, mc.frozen(Box::from(ops))?, Value::VOID, mc.frozen(Box::from(captures))?, arity, self.owner, name, source, start, Value::FALSE, lines_start, lines_len)?;
+        // Each hint starts at 0, the position of the first entry. A hint is only a guess that the instruction checks, so any starting value is valid.
+        let hints = if hints > 0 { Some(Hints::new(mc, usize::from(hints), 0)?) } else { None };
+        let code = Bytecode::new(mc, mc.frozen(Box::from(ops))?, Value::VOID, mc.frozen(Box::from(captures))?, arity, self.owner, name, source, start, Value::FALSE, lines_start, lines_len, hints)?;
         self.codes.push(code);
         Ok(Some(code))
     }
@@ -667,20 +690,22 @@ fn recurs(arena: &Arena, function: &Function<'_, '_>, to: &[usize], placed: &[bo
 
 /// Computes the effective jump target for each basic block, bypassing intermediate blocks that contain only an unconditional jump.
 fn forwards<'t>(arena: &'t Arena, function: &Function<'_, '_>) -> AVec<'t, usize> {
-    let on = |index: usize| match &function.blocks[index] {
-        block if index > 0 && block.params.is_empty() && block.insts.is_empty() => match &block.end {
-            End::Jump(to, args) if args.is_empty() => Some(to.0 as usize),
+    fn on(function: &Function<'_, '_>, index: usize) -> Option<usize> {
+        match &function.blocks[index] {
+            block if index > 0 && block.params.is_empty() && block.insts.is_empty() => match &block.end {
+                End::Jump(to, args) if args.is_empty() => Some(to.0 as usize),
+                _ => None,
+            },
             _ => None,
-        },
-        _ => None,
-    };
+        }
+    }
     (0..function.blocks.len())
         .map(|index| {
-            if on(index).is_none() {
+            if on(function, index).is_none() {
                 return index;
             }
             let (mut at, mut seen) = (index, ragwort_alloc::vec_in![arena; index]);
-            while let Some(to) = on(at) {
+            while let Some(to) = on(function, at) {
                 if seen.contains(&to) {
                     return index;
                 }
@@ -696,11 +721,15 @@ struct Emitter<'m, 'a, 't, 'gc> {
     module: &'m mut Module<'a, 'gc>,
     arena: &'t Arena,
     ops: Vec<Op>,
-    /// The instruction index where each run of instructions from one source site starts, with that site. Site 0 marks instructions with no known position.
+    /// Pairs of an instruction index and a source site. Each pair marks the start of a run of instructions that come from that site. Site 0 marks instructions with no known position.
     sited: Vec<(usize, u32)>,
     locs: AVec<'t, Option<Loc>>,
     uses: AVec<'t, u32>,
     imms: Imms<'t, 'gc>,
+    /// Marks the table instructions that are emitted with a hint. See [`Operands::hinted`].
+    hinted: AVec<'t, bool>,
+    /// The number of hints that the function has so far.
+    hints: u16,
     to: AVec<'t, usize>,
     /// Reusable scratch buffers retained across blocks and parallel move sequences.
     /// `at` is a bitset of values active during backward block scanning; `seen` records modified indices for rapid resetting.
@@ -824,10 +853,11 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
     /// so it can be emitted using a specialized tail-return opcode.
     fn tail<'b>(&self, block: &'b l5::BlockData<'_, 'gc>) -> Option<(Prim, &'b [Val], bool)> {
         let (Some(Inst::Prim { dst, prim, args, spread }), End::Return(returned)) = (block.insts.last(), &block.end) else { return None };
-        // Only `values` returns a spread list of its own, because it returns the elements as values.
+        // `values` has a tail-return form even with a spread argument list: `Op::ReturnSpread` returns the elements of the list as values. No other intrinsic has a tail-return form for a spread argument list.
         let tail = match prim {
             Prim::Intrinsic(Intrinsic::Values) => true,
-            Prim::Intrinsic(_) => !spread && self.imms[dst.0 as usize].is_none(),
+            // An instruction with an immediate operand or a table hint has no tail-return form. It is emitted as it is and followed by a return.
+            Prim::Intrinsic(_) => !spread && self.imms[dst.0 as usize].is_none() && !self.hinted[dst.0 as usize],
             _ => false,
         };
         (tail && dst == returned && self.uses[dst.0 as usize] == 1).then_some((*prim, args.as_slice(), *spread))
@@ -835,7 +865,7 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
 
     fn tail_prim(&mut self, prim: Prim, args: &[Val], spread: bool) -> Result<(), CompileError> {
         let count = args.len() as u8;
-        // `values` in tail position returns its arguments as values. One argument is an ordinary return.
+        // `values` in tail position returns its arguments as values. With one argument, this is an ordinary return.
         if prim == Prim::Intrinsic(Intrinsic::Values) {
             let op = match (self.stage(self.first, None, args, true), spread) {
                 (Some(base), false) => Op::ReturnValues { src: base, count },
@@ -1004,7 +1034,17 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
                 }
                 (Prim::Intrinsic(intrinsic), &[a0, a1, a2]) => {
                     let (first, second, third) = (self.read(a0, 0), self.read(a1, 1), self.read(a2, 2));
-                    self.write(dst, |dst| Op::CallIntrinsic3 { dst, a: first, b: second, c: third, intrinsic });
+                    // A function has room for 65,535 hints. A table instruction past that is emitted without one.
+                    let mut hint = None;
+                    if self.hinted[dst.0 as usize] && self.hints < u16::MAX {
+                        hint = Some(self.hints);
+                        self.hints += 1;
+                    }
+                    self.write(dst, |dst| match (hint, intrinsic) {
+                        (Some(hint), Intrinsic::TableRef) => Op::TableRefHinted { dst, table: first, key: second, default: third, hint },
+                        (Some(hint), Intrinsic::TableSet) => Op::TableSetHinted { dst, table: first, key: second, value: third, hint },
+                        _ => Op::CallIntrinsic3 { dst, a: first, b: second, c: third, intrinsic },
+                    });
                     return Ok(());
                 }
                 _ => {}
@@ -1110,31 +1150,33 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
     }
 
     fn captures(&self, captured: &[Captured], peers: &[(Val, u8)]) -> Vec<Capture> {
-        let capture = |&source: &Captured| match source {
-            Captured::Upvalue(index) => Capture::Upvalue(index),
-            Captured::Val(value) => match peers.iter().find(|&&(peer, _)| peer == value) {
-                Some(&(_, register)) => Capture::Register(register),
-                None => match self.loc(value) {
-                    Loc::Reg(register) => Capture::Register(register),
-                    Loc::Slot(slot) => Capture::Spill { spill: self.spill_reg(), slot },
+        captured
+            .iter()
+            .map(|&source| match source {
+                Captured::Upvalue(index) => Capture::Upvalue(index),
+                Captured::Val(value) => match peers.iter().find(|&&(peer, _)| peer == value) {
+                    Some(&(_, register)) => Capture::Register(register),
+                    None => match self.loc(value) {
+                        Loc::Reg(register) => Capture::Register(register),
+                        Loc::Slot(slot) => Capture::Spill { spill: self.spill_reg(), slot },
+                    },
                 },
-            },
-        };
-        captured.iter().map(capture).collect()
+            })
+            .collect()
     }
 
     /// Emits bytecode for block terminator `end`. If the target block matches `next`, redundant jumps can fall through.
     fn end(&mut self, function: &Function<'_, 'gc>, end: &End<'_>, next: Option<usize>) -> Result<(), CompileError> {
         match end {
             End::Return(value) => {
-                // A value that this block just took from the accumulator is returned from there. What a call returned is then returned as it is, however many values it is.
+                // If the last instruction of this block loaded the returned value from the accumulator, drop the load and return the accumulator with `Op::ReturnReceived`. The result of the call is then returned unchanged, even if it is several values.
                 let taken = match self.ops.last() {
                     Some(&Op::LoadAcc { dst }) => self.ops.len() > self.fence && self.loc(*value) == Loc::Reg(dst),
                     _ => false,
                 };
                 if taken {
                     self.ops.pop();
-                    // The return takes the place of the load, so nothing is emitted at the position the end of the block was recorded for.
+                    // The return replaces the load, so it keeps the site of the load. The `sited` entry recorded for the end of the block now points past the last instruction, so remove it.
                     if self.sited.last().is_some_and(|&(at, _)| at > self.ops.len()) {
                         self.sited.pop();
                     }
@@ -1230,7 +1272,7 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
         Some(base)
     }
 
-    /// Returns the starting register index if `vals` already occupy a contiguous sequence of hardware registers, or `None` otherwise.
+    /// Returns the starting register index if `vals` already occupy a contiguous sequence of frame registers, or `None` otherwise.
     fn row<'v>(&self, mut vals: impl Iterator<Item = &'v Val>) -> Option<u8> {
         let Loc::Reg(start) = self.loc(*vals.next()?) else { return None };
         let mut next = start;

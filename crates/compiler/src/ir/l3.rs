@@ -139,15 +139,15 @@ impl<'id, 'gc> L3<'id, 'gc> {
         let mut frames: Vec<HashMap<Var, usize>> = vec![HashMap::default()];
         let mut todo = vec![Task::Expr(root)];
         let mut then = Vec::new();
-        let mut own = |fun: Fun<'id>| {
+        fn own<'id>(tree: &L3<'id, '_>, funs: &mut [bool], fun: Fun<'id>) -> Result<(), String> {
             if std::mem::replace(&mut funs[fun.0 as usize], true) {
                 return Err(format!("{fun:?} has two parents"));
             }
-            if self[fun].optional as usize > self[self[fun].params].len() {
+            if tree[fun].optional as usize > tree[tree[fun].params].len() {
                 return Err(format!("{fun:?} has more optional parameters than parameters"));
             }
             Ok(())
-        };
+        }
         while let Some(task) = todo.pop() {
             let joins = frames.last_mut().expect("the code's frame is never left");
             match task {
@@ -160,7 +160,7 @@ impl<'id, 'gc> L3<'id, 'gc> {
                 Task::Unbind(var) => _ = locals.remove(&var),
                 Task::Joins(codes) => {
                     for code in &self[codes] {
-                        own(code.fun)?;
+                        own(self, &mut funs, code.fun)?;
                         let fun = self[code.fun];
                         if fun.optional != 0 || fun.rest.is_some() {
                             return Err(format!("join {:?} takes optional or rest values", code.id));
@@ -173,7 +173,7 @@ impl<'id, 'gc> L3<'id, 'gc> {
                 Task::Unjoin(codes) => self[codes].iter().for_each(|code| _ = joins.remove(&code.id)),
                 Task::Leave => _ = frames.pop(),
                 Task::Function(fun) => {
-                    own(fun)?;
+                    own(self, &mut funs, fun)?;
                     frames.push(HashMap::default());
                     todo.push(Task::Leave);
                     todo.extend(self.params(fun).map(Task::Unbind));

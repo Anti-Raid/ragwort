@@ -14,7 +14,7 @@ use crate::args::{Command, Source, USAGE};
 use crate::hosts::{flush, put};
 use crate::program::Program;
 
-/// Writes each of `errors` to the standard error, after what's been written so far.
+/// Flushes the standard output, then writes each of `errors` to the standard error. Returns the failure exit code.
 fn fail(errors: &[String]) -> ExitCode {
     flush();
     errors.iter().for_each(|error| eprintln!("{error}"));
@@ -28,7 +28,7 @@ fn finish(result: Result<(), Vec<String>>) -> ExitCode {
     }
 }
 
-/// The program `from` describes: one that starts from its image, if it has one.
+/// Creates the program that `from` describes. The program starts from the image if `from` names one.
 fn program(from: Source) -> Result<Program, Vec<String>> {
     let heap = from.heap.unwrap_or(program::HEAP);
     let Some(image) = from.image else { return Program::new(heap, from.modules) };
@@ -36,7 +36,7 @@ fn program(from: Source) -> Result<Program, Vec<String>> {
     Program::from_image(heap, from.modules, &bytes).map_err(|errors| errors.iter().map(|error| format!("{}: {error}", image.display())).collect())
 }
 
-/// Compiles the modules of `program` and `entry`, and writes their bytecode.
+/// Compiles the modules of `program` and the file `entry`, and writes their bytecode to the standard output.
 fn compile(mut program: Program, entry: Option<PathBuf>) -> ExitCode {
     program.list();
     let mut result = program.load_all();
@@ -49,10 +49,17 @@ fn compile(mut program: Program, entry: Option<PathBuf>) -> ExitCode {
     finish(result)
 }
 
-/// Compiles the modules of `program`, and saves it to the file at `to`.
+/// Compiles and runs the modules of `program`, and saves them as an image in the file at `to`.
 fn save(mut program: Program, to: &Path) -> ExitCode {
     let saved = program.load_all().and_then(|()| program.save_image());
     finish(saved.and_then(|bytes| std::fs::write(to, bytes).map_err(|error| vec![format!("{}: {error}", to.display())])))
+}
+
+/// The action that a command performs on its program, once the program is created.
+enum Task {
+    Compile(Option<PathBuf>),
+    Save(PathBuf),
+    Run(Option<PathBuf>),
 }
 
 fn main() -> ExitCode {
@@ -63,18 +70,23 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let (from, then): (Source, Box<dyn FnOnce(Program) -> ExitCode>) = match command {
+    let (from, task) = match command {
         Command::Help => {
             put(USAGE);
             return ExitCode::SUCCESS;
         }
-        Command::Compile { from, entry } => (from, Box::new(|program| compile(program, entry))),
-        Command::Save { from, to } => (from, Box::new(move |program| save(program, &to))),
-        Command::Run { from, entry: Some(entry) } => (from, Box::new(move |mut program| finish(program.run_file(&entry, true)))),
-        Command::Run { from, entry: None } => (from, Box::new(|mut program| repl::run(&mut program))),
+        Command::Compile { from, entry } => (from, Task::Compile(entry)),
+        Command::Save { from, to } => (from, Task::Save(to)),
+        Command::Run { from, entry } => (from, Task::Run(entry)),
     };
-    match program(from) {
-        Ok(program) => then(program),
-        Err(errors) => fail(&errors),
+    let mut program = match program(from) {
+        Ok(program) => program,
+        Err(errors) => return fail(&errors),
+    };
+    match task {
+        Task::Compile(entry) => compile(program, entry),
+        Task::Save(to) => save(program, &to),
+        Task::Run(Some(entry)) => finish(program.run_file(&entry, true)),
+        Task::Run(None) => repl::run(&mut program),
     }
 }

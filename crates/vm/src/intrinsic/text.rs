@@ -5,7 +5,7 @@ use ragwort_types::gc::{Mutation, ScratchVec, Value};
 use ragwort_types::pair::Pairs;
 use ragwort_types::string::{self, Str, StrError, Strings};
 use ragwort_types::symbol::{Keyword, Symbol, Symbols};
-use ragwort_types::vector::{AnyVector, Vectors};
+use ragwort_types::vector::{EveryVector, Vectors};
 
 use crate::op::Fuel;
 use crate::{Fault, equal};
@@ -16,11 +16,20 @@ impl Intrinsic {
     /// Evaluates advanced character and string manipulation intrinsics on `operands`.
     #[inline(never)]
     pub(super) fn text<'gc>(self, mc: &Mutation<'gc>, operands: impl Operands<'gc>, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
-        let strings = Strings::new(mc);
-        let string_of = |value: Value<'gc>| strings.string(value).ok_or(Fault::WrongType);
-        let char_of = |value: Value<'gc>| value.as_char().ok_or(Fault::WrongType);
+        #[inline(always)]
+        fn string_of<'gc>(strings: &Strings<'_, 'gc>, value: Value<'gc>) -> Result<Str<'gc>, Fault> {
+            strings.string(value).ok_or(Fault::WrongType)
+        }
+        #[inline(always)]
+        fn char_of(value: Value<'_>) -> Result<char, Fault> {
+            value.as_char().ok_or(Fault::WrongType)
+        }
         // Deducts VM fuel proportional to the string's character length for a full traversal.
-        let spend = |fuel: &mut Fuel, string| fuel.spend(string::len(&strings, string) as u64 / equal::PER_FUEL);
+        #[inline(always)]
+        fn spend<'gc>(fuel: &mut Fuel, strings: &Strings<'_, 'gc>, string: Str<'gc>) -> Result<(), Fault> {
+            fuel.spend(string::len(strings, string) as u64 / equal::PER_FUEL)
+        }
+        let strings = Strings::new(mc);
         let made_of = match self {
             Intrinsic::IsCharAlphabetic => return Ok(boolean(char_of(operands.get(0))?.is_alphabetic())),
             Intrinsic::IsCharNumeric => return Ok(boolean(string::digit_value(char_of(operands.get(0))?).is_some())),
@@ -59,8 +68,8 @@ impl Intrinsic {
                 string::from_chars(&strings, chars.iter().copied())?.value()
             }
             Intrinsic::StringUpcase | Intrinsic::StringDowncase | Intrinsic::StringFoldcase => {
-                let string = string_of(operands.get(0))?;
-                spend(fuel, string)?;
+                let string = string_of(&strings, operands.get(0))?;
+                spend(fuel, &strings, string)?;
                 let mapped = match self {
                     Intrinsic::StringUpcase => string::upcase(&strings, string)?,
                     Intrinsic::StringDowncase => string::downcase(&strings, string)?,
@@ -72,10 +81,10 @@ impl Intrinsic {
                 return Err(Fault::Arity);
             }
             Intrinsic::StringToVector | Intrinsic::StringToUtf8 => {
-                let string = string_of(operands.get(0))?;
+                let string = string_of(&strings, operands.get(0))?;
                 let (start, end) = range(string::len(&strings, string), operands)?;
                 let part = string::substring(&strings, string, start, end)?;
-                spend(fuel, part)?;
+                spend(fuel, &strings, part)?;
                 if self == Intrinsic::StringToVector {
                     let vector = Vectors::new(mc).make(end - start, Value::VOID)?;
                     let items = vector.items(mc);
@@ -93,12 +102,12 @@ impl Intrinsic {
                 }
             }
             Intrinsic::VectorToString => {
-                let vector = AnyVector::of(operands.get(0)).ok_or(Fault::WrongType)?;
+                let vector = EveryVector::of(operands.get(0)).ok_or(Fault::WrongType)?;
                 let (start, end) = range(vector.len(mc), operands)?;
                 fuel.spend((end - start) as u64 / equal::PER_FUEL)?;
                 let mut chars = ScratchVec::new(mc);
                 for i in start..end {
-                    chars.push(char_of(vector.get(mc, i).ok_or(Fault::OutOfRange)?)?)?;
+                    chars.push(char_of(vector.get(mc, i)?.ok_or(Fault::OutOfRange)?)?)?;
                 }
                 string::from_chars(&strings, chars.iter().copied())?.value()
             }
@@ -111,8 +120,8 @@ impl Intrinsic {
                 string::from_str(&strings, text)?.value()
             }
             Intrinsic::IsStringPrefix | Intrinsic::IsStringSuffix | Intrinsic::IsStringContains => {
-                let (string, part) = (string_of(operands.get(0))?, string_of(operands.get(1))?);
-                spend(fuel, string)?;
+                let (string, part) = (string_of(&strings, operands.get(0))?, string_of(&strings, operands.get(1))?);
+                spend(fuel, &strings, string)?;
                 return Ok(boolean(match self {
                     Intrinsic::IsStringPrefix => string::starts_with(&strings, string, part)?,
                     Intrinsic::IsStringSuffix => string::ends_with(&strings, string, part)?,
@@ -121,8 +130,8 @@ impl Intrinsic {
             }
             Intrinsic::StringFind | Intrinsic::StringFindLast if !(2..=3).contains(&operands.count()) => return Err(Fault::Arity),
             Intrinsic::StringFind | Intrinsic::StringFindLast => {
-                let (string, part) = (string_of(operands.get(0))?, string_of(operands.get(1))?);
-                spend(fuel, string)?;
+                let (string, part) = (string_of(&strings, operands.get(0))?, string_of(&strings, operands.get(1))?);
+                spend(fuel, &strings, string)?;
                 let found = if self == Intrinsic::StringFind {
                     string::find(&strings, string, part, if operands.count() == 3 { index(operands.get(2))? } else { 0 })?
                 } else {
@@ -131,21 +140,21 @@ impl Intrinsic {
                 return Ok(found.map_or(Value::FALSE, |position| fixnum(position as i64)));
             }
             Intrinsic::StringSplit => {
-                let string = string_of(operands.get(0))?;
-                let sep = if operands.get(1).is_false() { None } else { Some(string_of(operands.get(1))?) };
-                spend(fuel, string)?;
+                let string = string_of(&strings, operands.get(0))?;
+                let sep = if operands.get(1).is_false() { None } else { Some(string_of(&strings, operands.get(1))?) };
+                spend(fuel, &strings, string)?;
                 string_split(mc, string, sep, operands.get(2).is_true(), operands.get(3).is_true())?
             }
             Intrinsic::StringTrim => {
-                let string = string_of(operands.get(0))?;
-                let sep = if operands.get(1).is_false() { None } else { Some(string_of(operands.get(1))?) };
-                spend(fuel, string)?;
+                let string = string_of(&strings, operands.get(0))?;
+                let sep = if operands.get(1).is_false() { None } else { Some(string_of(&strings, operands.get(1))?) };
+                spend(fuel, &strings, string)?;
                 let (left, right, repeat) = (operands.get(2).is_true(), operands.get(3).is_true(), operands.get(4).is_true());
                 trimmed(&strings, string, sep, left, right, repeat)?.value()
             }
             Intrinsic::StringReplace => {
-                let (string, from, to) = (string_of(operands.get(0))?, string_of(operands.get(1))?, string_of(operands.get(2))?);
-                spend(fuel, string)?;
+                let (string, from, to) = (string_of(&strings, operands.get(0))?, string_of(&strings, operands.get(1))?, string_of(&strings, operands.get(2))?);
+                spend(fuel, &strings, string)?;
                 string_replace(mc, string, from, to, operands.get(3).is_true())?
             }
             _ => unreachable!("{self:?} isn't a text procedure"),
@@ -205,6 +214,11 @@ pub(super) fn compare_chars<'gc>(op: Intrinsic, xs: impl Iterator<Item = Value<'
 /// end (`right`) of string `string`, removing either a single instance or repeated contiguous
 /// instances if `repeat` is true.
 fn trimmed<'gc>(strings: &Strings<'_, 'gc>, string: Str<'gc>, sep: Option<Str<'gc>>, left: bool, right: bool, repeat: bool) -> Result<Str<'gc>, Fault> {
+    /// Returns whether the `width` characters of `string` from `offset` equal `sep`.
+    #[inline(always)]
+    fn at<'gc>(strings: &Strings<'_, 'gc>, string: Str<'gc>, sep: Str<'gc>, width: usize, offset: usize) -> Result<bool, Fault> {
+        Ok(string::equal(strings, string::substring(strings, string, offset, offset + width)?, sep)?)
+    }
     let Some(sep) = sep else {
         return Ok(match (left, right) {
             (true, true) => string::trim(strings, string)?,
@@ -217,15 +231,14 @@ fn trimmed<'gc>(strings: &Strings<'_, 'gc>, string: Str<'gc>, sep: Option<Str<'g
     if width == 0 {
         return Ok(string);
     }
-    let at = |offset: usize| -> Result<bool, Fault> { Ok(string::equal(strings, string::substring(strings, string, offset, offset + width)?, sep)?) };
     let (mut start, mut end) = (0, len);
-    while left && start + width <= end && at(start)? {
+    while left && start + width <= end && at(strings, string, sep, width, start)? {
         start += width;
         if !repeat {
             break;
         }
     }
-    while right && end >= start + width && at(end - width)? {
+    while right && end >= start + width && at(strings, string, sep, width, end - width)? {
         end -= width;
         if !repeat {
             break;

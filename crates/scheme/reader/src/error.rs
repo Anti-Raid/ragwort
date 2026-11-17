@@ -6,40 +6,40 @@ use ragwort_types::syntax::{SyntaxLocation, SyntaxSource};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
-    /// A `)` or `]` with no list open.
+    /// A `)` or `]` appeared with no list open.
     UnexpectedClose,
-    /// A list closed with the other bracket. It opened at byte `open`.
+    /// A list was closed with the wrong kind of bracket. The list opened at byte `open`.
     Mismatched { open: u32 },
-    /// The text ended inside the list, string, `|`-quoted identifier or block comment that
-    /// opened here.
+    /// The text ended inside a list, a string, a `|`-quoted identifier or a block comment. The
+    /// error's range is where that list, string, identifier or comment opened.
     Unclosed,
-    /// A quote, quasiquote, unquote, `#;` datum comment or `#n=` label with no datum after it.
+    /// An abbreviation such as a quote, a `#;` datum comment or a `#n=` label had no datum after it.
     EmptyQuote,
-    /// A `.` that doesn't sit between a list's items and exactly one last datum.
+    /// A `.` was misplaced. A `.` is valid only in a list, after at least one item and before exactly one last datum.
     BadDot,
-    /// Syntax the reader doesn't read: braces, and `#` forms other than those R7RS has.
+    /// The text used syntax that the reader does not support: a brace, or a `#` form that the lexer does not know.
     Unsupported,
-    /// A token that starts as a number does but isn't one, such as `1x` or `1/0`.
+    /// A token that must be a number is not a valid number, such as `1x` or `1/0`.
     BadNumber,
-    /// A `#\` character name that isn't one.
+    /// A `#\` was followed by a name that is not a character name.
     BadChar,
-    /// A backslash in a string or `|`-quoted identifier that doesn't start an escape.
+    /// A backslash in a string or a `|`-quoted identifier did not start a valid escape.
     BadEscape,
-    /// A bytevector item that isn't an exact integer from 0 to 255.
+    /// A bytevector item was not an exact integer from 0 to 255.
     BadByte,
-    /// A `#n#` with no `#n=` before it in the same top-level datum.
+    /// A `#n#` had no `#n=` before it in the same top-level datum.
     UnknownLabel,
-    /// A `#n=` or `#n#` whose `n` is too big to be a label.
+    /// The number `n` of a `#n=` or `#n#` was too large for a label, which is a `u64`.
     BadLabel,
-    /// A `#n#` inside the datum `#n=` labels, which would make it a cycle.
+    /// A `#n#` appeared inside the datum that `#n=` labels, which would create a cycle.
     CyclicLabel,
-    /// A second `#n=` of one `n` in one top-level datum.
+    /// One top-level datum had two `#n=` labels with the same `n`.
     DuplicateLabel,
-    /// The text isn't UTF-8 from here.
+    /// The text is not valid UTF-8. The error's range starts at the first invalid byte.
     InvalidUtf8,
     /// The session belongs to another arena.
     ForeignSession,
-    /// The arena couldn't make a value the reader needed: it ran out of memory, or a name was too
+    /// The arena could not create a value that the reader needed. Either it ran out of memory, or a name was too
     /// long for a string.
     Arena(Error),
 }
@@ -69,7 +69,7 @@ impl From<Error> for ErrorKind {
     }
 }
 
-/// What went wrong, and the bytes `start..end` of the text where.
+/// A read error: its kind, and the byte range `start..end` of the text where it occurred.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadError {
     pub kind: ErrorKind,
@@ -82,7 +82,7 @@ impl ReadError {
         Self { kind: kind.into(), start: start as u32, end: end as u32 }
     }
 
-    /// The line and column where the error starts.
+    /// Returns the line and column in `source` where the error starts.
     pub fn location<'gc>(&self, mc: &Mutation<'gc>, source: SyntaxSource<'gc>) -> Option<SyntaxLocation> {
         source.location(mc, self.start)
     }

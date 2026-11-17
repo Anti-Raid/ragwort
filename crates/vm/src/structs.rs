@@ -138,10 +138,9 @@ pub fn make_type<'gc>(
     }
     flags |= above & TypeFlags::IDENTITY;
     let (names, field_flags, count) = fields_of(mc, parent, fields, field_flags)?;
-    let made = |supertypes: usize, last: Value<'gc>| StructType::new(mc, name, names, field_flags, count, flags.bits(), supertypes, last);
-    let Some(parent) = parent else { return Ok(made(0, Value::VOID)?) };
+    let Some(parent) = parent else { return Ok(StructType::new(mc, name, names, field_flags, count, flags.bits(), 0, Value::VOID)?) };
     let above = parent.items(mc);
-    let kind = made(above.len() + 1, Value::object(mc, parent))?;
+    let kind = StructType::new(mc, name, names, field_flags, count, flags.bits(), above.len() + 1, Value::object(mc, parent))?;
     let supertypes = kind.items(mc);
     (0..above.len()).for_each(|i| supertypes.set(mc, i, above.get(i)));
     Ok(kind)

@@ -1,6 +1,6 @@
-//! What an object's field can hold, named as `objects!` declarations name it. Each kind knows
-//! which of the collector's masks its word belongs to, the Rust type it reads back as, and which
-//! barrier a write takes.
+//! The kinds of data that an object's field can hold, under the names that `objects!` declarations use. Each kind defines
+//! the descriptor mask that its field belongs to, the Rust type that a read returns, and the
+//! write barrier that a write applies.
 
 use std::any::Any;
 use std::marker::PhantomData;
@@ -9,29 +9,29 @@ use super::{AnyHostRef, FrozenRef, Gc, HostRef, Items, Mutation, OBJECT, Object,
 
 pub use core::primitive::{bool, f64, i64, u32, u64};
 
-/// A [`Value`](super::Value).
+/// A field that holds a [`Value`](super::Value).
 pub struct Value;
 
-/// An object of type `T`, or none. Reads check the target's type.
+/// A field that holds an object of type `T`, or no object. A read checks the target's type.
 pub struct Member<T>(PhantomData<fn() -> T>);
 
-/// Like [`Member`], but doesn't keep the target alive: it reads as none once the target dies.
+/// Like [`Member`], but does not keep the target alive. The field reads as `None` once the target dies.
 pub struct Weak<T>(PhantomData<fn() -> T>);
 
-/// Host data of type `T`, or none.
+/// A field that holds a host value of type `T`, or no host value.
 pub struct Host<T>(PhantomData<fn() -> T>);
 
-/// Host data of any type, or none.
+/// A field that holds a host value of any type, or no host value.
 pub struct AnyHost;
 
-/// A write-once `T` outside the region, read as `&'gc T`.
+/// A field that holds a frozen value: a write-once `T` stored outside the region, read as `&'gc T`.
 pub struct Frozen<T>(PhantomData<fn() -> T>);
 
-/// A key and a value, two words. The value is kept alive only while the key is reachable some
-/// other way; once the key dies, the field reads as none.
+/// A field that holds a key and a value, in two words. The value is kept alive only while the key is reachable in some
+/// other way. Once the key dies, the field reads as `None`.
 pub struct Ephemeron;
 
-/// What an item's word refers to, which decides its barrier.
+/// The kind of reference that an item's word holds. It decides the write barrier for the item.
 #[doc(hidden)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Refs {
@@ -52,7 +52,7 @@ impl Refs {
         }
     }
 
-    /// The object a word refers to.
+    /// Returns the index of the object that `word` refers to, or `None` if `word` refers to no object.
     #[inline]
     pub(super) fn target(self, word: u64) -> Option<u32> {
         match self {
@@ -68,7 +68,7 @@ impl Refs {
     }
 }
 
-/// Which of the collector's masks a field is in.
+/// The role of a field: the descriptor mask that the field belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     Word,
@@ -84,12 +84,12 @@ mod sealed {
     pub trait Sealed {}
 }
 
-/// A kind of field. Sealed: the collector traces only these.
+/// A kind of field. The trait is sealed, because the collector traces only these kinds.
 pub trait Slot: sealed::Sealed + 'static {
     const ROLE: Role;
-    /// What a read gives.
+    /// The type that a read returns.
     type Out<'gc>;
-    /// What a write takes.
+    /// The type that a write takes.
     type In<'gc>;
 
     #[doc(hidden)]
@@ -98,18 +98,18 @@ pub trait Slot: sealed::Sealed + 'static {
     #[doc(hidden)]
     fn set<'gc, T: Object>(gc: Gc<'gc, T>, mc: &Mutation<'gc>, field: usize, value: Self::In<'gc>);
 
-    /// Writes a new object's words for the field, all the words the role takes.
+    /// Writes `value` into `words`, the words of this field in a new object. `words` holds every word that the role takes.
     #[doc(hidden)]
     fn init(value: Self::In<'_>, words: &mut [u64]);
 }
 
-/// A kind of field that can also be an object's items: one word each.
+/// A kind of field that can also be the kind of an object's items. Each item takes one word.
 pub trait Item: Slot {
     const ITEMS: Items;
     #[doc(hidden)]
     const REFS: Refs;
 
-    /// Reads an item's word; `region` is for checking what an index refers to.
+    /// Converts the item word `word` to the type that a read returns. `region` is used to check the type of the object that an index refers to.
     #[doc(hidden)]
     fn load<'gc>(region: &'gc RegionWords, word: u64) -> Self::Out<'gc>;
 
@@ -270,7 +270,7 @@ impl<U: Object> Item for Weak<U> {
     const ITEMS: Items = Items::Weaks;
     const REFS: Refs = Refs::Weaks;
 
-    /// `None` once the target has died.
+    /// Returns `None` once the target has died.
     #[inline]
     fn load<'gc>(region: &'gc RegionWords, word: u64) -> Option<Gc<'gc, U>> {
         super::target(region, word as u32)
@@ -355,8 +355,8 @@ impl Slot for Ephemeron {
     }
 }
 
-/// A frozen value written into an object already marked, old or traced, would be missed by the
-/// collections that don't trace the object again, so it's marked now.
+/// Stores `word`, the word of a frozen value, in field `field`. If the object is already marked, the object is old or has been traced.
+/// The collections that do not trace the object again would miss the frozen value. So the frozen value is marked now.
 #[inline]
 fn set_frozen<'gc, T: Object>(gc: Gc<'gc, T>, mc: &Mutation<'gc>, field: usize, word: u64) {
     gc.set_word(mc, field, word);

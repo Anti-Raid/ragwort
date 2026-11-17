@@ -4,7 +4,7 @@ use ragwort_types::syntax::SyntaxLocation;
 
 use super::*;
 
-/// Root 0 holds the symbol table, and root 1 is free for a test.
+/// Creates an arena for a test. Root 0 holds the symbol table, and root 1 is free for the test to use.
 fn arena() -> Arena {
     let mut arena = Arena::new(64 << 20, 2);
     arena.mutate(|mc| mc.set_root(0, Symbols::with_seed(mc, 1).unwrap().value(mc)));
@@ -15,13 +15,13 @@ fn symbols<'gc>(mc: &Mutation<'gc>) -> Symbols<'gc> {
     Symbols::of(mc.root(0)).unwrap()
 }
 
-/// The datum a node reads as, written back out.
+/// Returns `node` written as text, without the `#<syntax ...>` wrapper.
 fn show<'gc>(mc: &Mutation<'gc>, node: Syntax<'gc>) -> String {
     let written = ragwort_printer_scheme::to_string(mc, node.value(mc), ragwort_printer_scheme::Mode::Write, usize::MAX).unwrap();
     written.strip_prefix("#<syntax ").and_then(|s| s.strip_suffix('>')).unwrap().to_string()
 }
 
-/// Every datum in `text`, written back out, or the error reading it.
+/// Reads every datum in `text` and returns each one written back as text, or returns the read error.
 fn read(text: &str) -> Result<Vec<String>, ReadError> {
     let mut arena = arena();
     arena.mutate(|mc| {
@@ -93,19 +93,21 @@ fn spans_cover_each_datum() {
         .mutate(|mc| {
             let session = SyntaxSession::new(mc, "foo\n  '(a [b] . c)").unwrap();
             let nodes = read_all(mc, symbols(mc), &session).unwrap();
-            let span = |node| (Syntax::span(node, mc).start(), Syntax::span(node, mc).end());
-            assert_eq!(span(nodes[0]), (0, 3));
-            assert_eq!(span(nodes[1]), (6, 18));
+            fn span<'gc>(mc: &Mutation<'gc>, node: Syntax<'gc>) -> (u32, u32) {
+                (node.span(mc).start(), node.span(mc).end())
+            }
+            assert_eq!(span(mc, nodes[0]), (0, 3));
+            assert_eq!(span(mc, nodes[1]), (6, 18));
             assert_eq!(nodes[1].span(mc).location(mc), Some(SyntaxLocation { line: 2, column: 3 }));
             let list = Syntax::of(nodes[1].datum(mc)).unwrap();
-            assert_eq!(span(list), (7, 18));
+            assert_eq!(span(mc, list), (7, 18));
             let pairs = Pairs::new(mc);
-            let items: Vec<_> = pairs.elements(list.datum(mc)).map(|v| span(Syntax::of(v).unwrap())).collect();
+            let items: Vec<_> = pairs.elements(list.datum(mc)).map(|v| span(mc, Syntax::of(v).unwrap())).collect();
             assert_eq!(items, [(8, 9), (10, 13)]);
             let mut elements = pairs.elements(list.datum(mc));
             elements.by_ref().for_each(drop);
             let tail = elements.rest();
-            assert_eq!(span(Syntax::of(tail).unwrap()), (16, 17));
+            assert_eq!(span(mc, Syntax::of(tail).unwrap()), (16, 17));
         });
 }
 
@@ -195,7 +197,7 @@ fn text_that_isnt_utf8_is_an_error() {
         });
 }
 
-/// Nesting far deeper than a recursive reader's stack would allow.
+/// Reads nesting far deeper than the native stack of a recursive reader would allow.
 #[test]
 fn deep_nesting_reads_without_recursion() {
     const DEPTH: usize = 200_000;
@@ -215,13 +217,13 @@ fn deep_nesting_reads_without_recursion() {
         });
 }
 
-/// The datum of a list node's first item.
+/// Returns the datum of the first item of the list node `list`.
 fn first<'gc>(mc: &Mutation<'gc>, list: Syntax<'gc>) -> Value<'gc> {
     let pairs = Pairs::new(mc);
     Syntax::of(pairs.pair(list.datum(mc)).unwrap().head(mc)).unwrap().datum(mc)
 }
 
-/// Nodes keep what they read alive and correct through collections that move them.
+/// Syntax nodes keep their data alive and correct through collections that move objects.
 #[test]
 fn read_syntax_survives_collection() {
     let mut arena = arena();
@@ -246,7 +248,7 @@ fn read_syntax_survives_collection() {
         });
 }
 
-/// R7RS lets case differ in everything but identifiers and character names.
+/// R7RS ignores case everywhere except in identifiers and character names.
 #[test]
 fn booleans_prefixes_and_infinities_ignore_case() {
     assert_eq!(read("#T #TRUE #False #X1A #E1.5 1E2").unwrap(), ["#t", "#t", "#f", "26", "3/2", "100.0"]);
@@ -254,7 +256,7 @@ fn booleans_prefixes_and_infinities_ignore_case() {
     assert_eq!(error(r"#\SPACE"), (ErrorKind::BadChar, 0, 7));
 }
 
-/// `\` then spaces or tabs, one line ending of any kind, and more spaces or tabs.
+/// A line continuation is a `\`, then spaces or tabs, then one line ending of any kind, then more spaces or tabs.
 #[test]
 fn line_continuations_take_one_line_ending() {
     for ending in ["\n", "\r\n", "\r"] {
@@ -263,7 +265,7 @@ fn line_continuations_take_one_line_ending() {
     }
     assert_eq!(read("\"a\\\n\nb\"").unwrap(), [r#""a\nb""#]);
     assert_eq!(read("\"a\\\r\n\r\nb\"").unwrap(), [r#""a\r\nb""#]);
-    // The first `\r` ends the line, so the rest stays.
+    // The first `\r` is the line ending, so the `\r\n` after it stays in the string.
     assert_eq!(read("\"a\\ \r \r\nb\"").unwrap(), [r#""a\r\nb""#]);
     assert_eq!(error("\"a\\  b\""), (ErrorKind::BadEscape, 2, 4));
     assert_eq!(error("\"a\\  "), (ErrorKind::Unclosed, 0, 1));
@@ -284,11 +286,11 @@ fn reads_complex_numbers() {
     let numbers = "1+2i 1-2i +i -i 1+i 3/4-1/2i +2i -2.5i #e1.5+2i #x10+ai 1e2+1e1i #i1+2i 1@0 +inf.0i -nan.0+i";
     let read_as = [
         "1+2i", "1-2i", "+1i", "-1i", "1+1i", "3/4-1/2i", "+2i", "-2.5i", "3/2+2i", "16+10i", "100.0+10.0i", "1.0+2.0i",
-        // Polar goes through floats, and an inexact part makes the other inexact, as in Racket.
+        // Polar form is computed with floats. An inexact part makes the other part inexact, as in Racket.
         "1.0", "+inf.0i", "+nan.0+1.0i",
     ];
     assert_eq!(read(numbers).unwrap(), read_as);
-    // Starting as a number does but not ending as one is an error; `+inf.0x` and `+in` are names.
+    // A token that starts as only a number can but is not a number is an error. `+inf.0x` and `+in` are identifiers.
     assert_eq!(read("+inf.0x +in +ix").unwrap(), ["+inf.0x", "+in", "+ix"]);
     for (text, end) in [("1+2", 3), ("2i", 2), ("1+2j", 4), ("1@", 2), ("1e+2i", 5), ("1+2i+3i", 7)] {
         assert_eq!(error(text), (ErrorKind::BadNumber, 0, end), "{text}");
@@ -344,7 +346,7 @@ fn datum_labels_share_what_they_label() {
     assert_eq!(error("#0=(a . #0#)"), (ErrorKind::CyclicLabel, 8, 11));
     assert_eq!(error("(#1#)"), (ErrorKind::UnknownLabel, 1, 4));
     assert_eq!(error("(#0=a #0=b)"), (ErrorKind::DuplicateLabel, 6, 9));
-    // A label is only in its top-level datum.
+    // A label is visible only within its own top-level datum.
     assert_eq!(error("#0=a #0#"), (ErrorKind::UnknownLabel, 5, 8));
     assert_eq!(error("(#0=)"), (ErrorKind::EmptyQuote, 1, 4));
     assert_eq!(error("#0="), (ErrorKind::EmptyQuote, 0, 3));

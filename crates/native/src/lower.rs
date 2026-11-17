@@ -1,4 +1,4 @@
-//! Lowering: native ragwort's syntax to core forms.
+//! Lowers native ragwort syntax to the compiler's core forms.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -20,40 +20,40 @@ use ragwort_vm::{HostDef, Intrinsic, Request};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LowerErrorKind {
-    /// A list that doesn't start with a form's name, such as a call not written as an `%app`.
+    /// A list did not start with a form's name. For example, a call was not written with `%app`.
     NotAForm,
-    /// A form whose parts aren't the ones it takes.
+    /// A form was malformed: it had the wrong number or the wrong kind of parts.
     BadShape,
-    /// A name bound twice by one `%let`, `%letrec` or `%lambda`, or a module that defines or
-    /// provides a name twice.
+    /// One `%let`, `%letrec` or `%lambda` bound a name twice, or a module defined or provided a
+    /// name twice. A repeated keyword and a repeated struct field are reported this way too.
     Duplicate,
-    /// A name that's no local, definition of the module's or import.
+    /// A name was not a local variable, a module variable or an import.
     Unbound,
-    /// A name the module both defines and requires, or requires as two different things.
+    /// The module both defined and required a name, or required one name as two different bindings.
     Conflict,
-    /// A `%set!` of an import, a struct's binding or a keyword procedure.
+    /// A `%set!` assigned an import, a binding that a struct form defines, or a keyword procedure.
     Immutable,
-    /// A `%define`, `%struct`, `%require` or `%provide` that isn't at the top level.
+    /// A `%define`, `%struct`, `%require` or `%provide` was not at the top level.
     Definition,
-    /// A module the resolver doesn't have, or one it gave that no [`ModuleBuilder`](ragwort_compiler::module::ModuleBuilder) built.
+    /// The resolver did not find a required module, or it returned a module that no [`ModuleBuilder`](ragwort_compiler::module::ModuleBuilder) built.
     Resolve,
-    /// A require of a name the module doesn't export.
+    /// A `%require` named a binding that the required module does not export.
     NotProvided,
-    /// A provide of a name the module doesn't define.
+    /// A `%provide` named a binding that the module does not define.
     NotDefined,
-    /// A reference to an export of a module that hasn't defined it yet.
+    /// The code referred to an export that its module has not defined yet.
     Uninitialized,
-    /// The name of a struct whose module provides it without its constructor, used as a value.
+    /// The code used a struct's name as a value, but the struct's module provides the struct without its constructor.
     NoConstructor,
-    /// An `%intrinsic` of a name that isn't one the code can name.
+    /// An `%intrinsic` or `%apply-intrinsic` named something that is not an intrinsic available to the code.
     UnknownIntrinsic,
-    /// A `%call-host` of a name that isn't one of the host functions the code was given.
+    /// A `%call-host` named something that is not one of the host functions given to the code.
     UnknownHost,
-    /// An `%intrinsic` or `%call-host` with a number of arguments it doesn't take.
+    /// An `%intrinsic` or `%call-host` had a number of arguments that the intrinsic or host function does not accept.
     Arity,
-    /// Syntax native ragwort doesn't have, such as a quasiquote outside a quoted datum.
+    /// The code used syntax that native ragwort does not have, such as a quasiquote outside a quoted datum.
     Unsupported,
-    /// The arena couldn't make a value lowering needed.
+    /// The arena could not create a value that lowering needed.
     Arena(Error),
 }
 
@@ -69,7 +69,7 @@ impl From<Error> for LowerErrorKind {
     }
 }
 
-/// What went wrong, and the bytes `start..end` of the text where.
+/// A lowering error: its kind, and the byte range `start..end` of the source text where it occurred.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LowerError {
     pub kind: LowerErrorKind,
@@ -183,27 +183,27 @@ const FORMS: [(&str, Form); 15] = [
     ("%call-host", Form::CallHost),
 ];
 
-/// Lowers the forms of a module's native files, each to an [`Item`] with [`Lowerer::item`]. The
-/// items make the module's [`Description`](ragwort_compiler::module::Description), or go to the
-/// builder of a module that has forms in other languages too.
+/// Lowers the top-level forms of a module's native files. [`Lowerer::item`] lowers each form to an
+/// [`Item`]. The items go into the module's [`Description`](ragwort_compiler::module::Description).
+/// For a module that also has files in other languages, the items go to that module's builder instead.
 pub struct Lowerer<'a, 'gc> {
     mc: &'a Mutation<'gc>,
     pairs: Pairs<'a, 'gc>,
     strings: Strings<'a, 'gc>,
-    /// The forms and the built-ins, by their names' words.
+    /// The forms and the primitives (intrinsics and requests). Each is keyed by the bits of the symbol that names it.
     forms: HashMap<u64, Form>,
     prims: HashMap<u64, Prim>,
-    /// The host functions, by their names' words.
+    /// The host functions. Each is keyed by the bits of the symbol that names it.
     hosts: HashMap<u64, &'static HostDef>,
-    /// The symbols each [`Abbreviation`] stands for, in order, for what they read
-    /// as in a quoted datum.
+    /// The symbol that each [`Abbreviation`] stands for, in the order of `Abbreviation::ALL`. A quoted
+    /// datum uses them: `'(a 'b)` is the datum `(a (quote b))`.
     abbreviations: Vec<Value<'gc>>,
-    /// The locals in scope of each name, innermost last.
+    /// The local variables in scope for each name, innermost last. The key is the bits of the name's symbol.
     scope: HashMap<u64, Vec<Var>>,
 }
 
-/// A `%lambda`'s formals: each parameter, its name and its default, if it has one, as they're
-/// written, and the rest parameter.
+/// The parsed formals of a `%lambda`. `params`, `names` and `defaults` are parallel: entry `i`
+/// describes parameter `i`, its name, and its default if it has one. The names and defaults are kept as syntax. `rest` is the rest parameter.
 struct Formals<'gc> {
     params: Vec<keyword::Param<'gc>>,
     names: Vec<Syntax<'gc>>,
@@ -218,31 +218,33 @@ impl Formals<'_> {
 }
 
 impl<'a, 'gc> Lowerer<'a, 'gc> {
-    /// A lowerer of code that calls the host functions `hosts`. The code's `%intrinsic`s name
-    /// [internal intrinsics](Intrinsic::is_internal) only if `internals`.
+    /// Creates a lowerer for code that can call the host functions in `hosts`. Names are interned in `symbols`.
+    /// An `%intrinsic` can name an [internal intrinsic](Intrinsic::is_internal) only if `internals` is true.
     pub fn new(mc: &'a Mutation<'gc>, symbols: Symbols<'gc>, hosts: &'static [HostDef], internals: bool) -> Result<Self, Error> {
         let strings = Strings::new(mc);
-        let symbol = |name: &str| symbols.intern_str(&strings, name).map(|interned| interned.value(mc));
+        fn symbol<'gc>(mc: &Mutation<'gc>, symbols: Symbols<'gc>, strings: &Strings<'_, 'gc>, name: &str) -> Result<Value<'gc>, Error> {
+            symbols.intern_str(strings, name).map(|interned| interned.value(mc))
+        }
         let mut forms = HashMap::new();
         for (name, form) in FORMS {
-            forms.insert(symbol(name)?.to_bits(), form);
+            forms.insert(symbol(mc, symbols, &strings, name)?.to_bits(), form);
         }
         let mut prims = HashMap::new();
         for &intrinsic in Intrinsic::ALL {
             if internals || !intrinsic.is_internal() {
-                prims.insert(symbol(intrinsic.name())?.to_bits(), Prim::Intrinsic(intrinsic));
+                prims.insert(symbol(mc, symbols, &strings, intrinsic.name())?.to_bits(), Prim::Intrinsic(intrinsic));
             }
         }
         for &request in Request::ALL {
-            prims.insert(symbol(request.name())?.to_bits(), Prim::Request(request));
+            prims.insert(symbol(mc, symbols, &strings, request.name())?.to_bits(), Prim::Request(request));
         }
         let mut named_hosts = HashMap::new();
         for def in hosts {
-            named_hosts.insert(symbol(def.name)?.to_bits(), def);
+            named_hosts.insert(symbol(mc, symbols, &strings, def.name)?.to_bits(), def);
         }
         let mut abbreviations = Vec::with_capacity(Abbreviation::ALL.len());
         for abbreviation in Abbreviation::ALL {
-            abbreviations.push(symbol(abbreviation.name())?);
+            abbreviations.push(symbol(mc, symbols, &strings, abbreviation.name())?);
         }
         Ok(Self {
             mc,
@@ -258,7 +260,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
 
     /// Lowers the top-level form `node` to an [`Item`]. Local variables are allocated from `locals`.
     ///
-    /// The item refers to module-level bindings by name: what it defines, requires, provides and uses. The module builder resolves those names.
+    /// The item refers to module-level bindings by name: the names that it defines, requires, provides and uses. The module builder resolves those names.
     pub fn item(&mut self, locals: &mut Locals<'gc>, node: Syntax<'gc>) -> Result<Item<'gc>, LowerError> {
         self.scope.clear();
         let items = match self.head(node) {
@@ -289,33 +291,31 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         }
     }
 
-    /// The declaration a `%struct` form makes: `node`, whose parts after its head are `parts`.
-    /// It's written as Scheme's `struct` is, and defines what that does, as [`structs`] says:
-    /// `(%struct name (field ...) option ...)`, with a supertype's name before the fields for a
-    /// subtype of it.
+    /// Parses the `%struct` form `node` into a struct declaration. `parts` are the parts of the form after its head.
+    /// The form has the syntax of Scheme's `struct` and defines the same bindings. See [`structs`].
+    /// It is written `(%struct name (field ...) option ...)`. A subtype puts the supertype's name
+    /// before the fields: `(%struct name super (field ...) option ...)`.
     fn struct_form(&self, node: Syntax<'gc>, parts: &[Syntax<'gc>]) -> Result<structs::Form<'gc>, LowerError> {
         let bad = LowerErrorKind::BadShape;
-        let is_name = |node: &Syntax<'gc>| node.kind(self.mc) == Some(SyntaxKind::Identifier);
-        let option = |node: Syntax<'gc>| self.keyword(node).map(|keyword| chars(&self.strings, keyword.symbol(self.mc).name(self.mc)).collect::<String>());
         let mut rest = parts.iter().copied();
-        let Some(name) = rest.next().filter(is_name) else { return Err(self.error(bad, node)) };
+        let Some(name) = rest.next().filter(|&part| self.is_name(part)) else { return Err(self.error(bad, node)) };
         let Some(mut next) = rest.next() else { return Err(self.error(bad, node)) };
         let mut parent = None;
-        if is_name(&next) {
+        if self.is_name(next) {
             parent = Some(next);
             next = rest.next().ok_or_else(|| self.error(bad, node))?;
         }
-        // Each field the form declares: its name, and whether it's mutable.
+        // The fields that the form declares. Each entry is the field's name and whether the field is mutable.
         let mut own: Vec<(Syntax<'gc>, bool)> = Vec::new();
         for spec in self.list(next)? {
-            if is_name(&spec) {
+            if self.is_name(spec) {
                 own.push((spec, false));
                 continue;
             }
             let written = self.list(spec)?;
             let mut options = written.iter().copied();
-            let Some(id) = options.next().filter(is_name) else { return Err(self.error(bad, spec)) };
-            if !options.all(|at| option(at).as_deref() == Some("mutable")) {
+            let Some(id) = options.next().filter(|&part| self.is_name(part)) else { return Err(self.error(bad, spec)) };
+            if !options.all(|at| self.keyword_name(at).as_deref() == Some("mutable")) {
                 return Err(self.error(bad, spec));
             }
             own.push((id, written.len() > 1));
@@ -323,31 +323,45 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         self.distinct(&own.iter().map(|&(id, _)| id).collect::<Vec<_>>())?;
         let (mut constructors, mut flags) = (Vec::new(), TypeFlags::empty());
         while let Some(at) = rest.next() {
-            match option(at).as_deref() {
+            match self.keyword_name(at).as_deref() {
                 Some("mutable") => own.iter_mut().for_each(|(_, mutable)| *mutable = true),
                 Some("identity-eq?") => flags |= TypeFlags::IDENTITY,
                 Some("sealed") => flags |= TypeFlags::SEALED,
                 Some("transparent") => {}
                 Some("constructor-name" | "extra-constructor-name") => {
-                    let Some(id) = rest.next().filter(is_name) else { return Err(self.error(bad, at)) };
+                    let Some(id) = rest.next().filter(|&part| self.is_name(part)) else { return Err(self.error(bad, at)) };
                     constructors.push(id);
                 }
                 _ => return Err(self.error(bad, at)),
             }
         }
-        let spanned = |node: Syntax<'gc>| (node.datum(self.mc), node.span(self.mc));
         Ok(structs::Form {
-            name: spanned(name),
+            name: self.spanned(name),
             span: node.span(self.mc),
-            parent: parent.map(spanned),
+            parent: parent.map(|parent| self.spanned(parent)),
             fields: own.iter().map(|&(id, mutable)| Declaration { name: id.datum(self.mc), mutable }).collect(),
             flags,
-            constructors: constructors.into_iter().map(spanned).collect(),
+            constructors: constructors.into_iter().map(|id| self.spanned(id)).collect(),
         })
     }
 
-    /// The parameters `formals` has: names, `[name default]`s and keywords before either, and a
-    /// rest parameter, as Racket's `lambda` takes them.
+    /// Returns whether `node` is an identifier.
+    fn is_name(&self, node: Syntax<'gc>) -> bool {
+        node.kind(self.mc) == Some(SyntaxKind::Identifier)
+    }
+
+    /// Returns the name of the keyword `node`, or `None` if `node` is not a keyword.
+    fn keyword_name(&self, node: Syntax<'gc>) -> Option<String> {
+        self.keyword(node).map(|keyword| chars(&self.strings, keyword.symbol(self.mc).name(self.mc)).collect::<String>())
+    }
+
+    /// Returns the datum of `node` and its span.
+    fn spanned(&self, node: Syntax<'gc>) -> (Value<'gc>, SyntaxSpan<'gc>) {
+        (node.datum(self.mc), node.span(self.mc))
+    }
+
+    /// Parses `formals`, the parameter list of a `%lambda`, which has the syntax of Racket's `lambda`. A parameter is a name or
+    /// `[name default]`, and a keyword may precede either. A rest parameter may follow a dot. If `formals` is a single name, that name is the rest parameter.
     fn formals(&self, formals: Syntax<'gc>) -> Result<Formals<'gc>, LowerError> {
         let mut parsed = Formals { params: Vec::new(), names: Vec::new(), defaults: Vec::new(), rest: None };
         let items = match formals.kind(self.mc) {
@@ -393,7 +407,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         Ok(parsed)
     }
 
-    /// The keyword `node` is, if it's one.
+    /// Returns the keyword that `node` is, or `None` if `node` is not a keyword.
     fn keyword(&self, node: Syntax<'gc>) -> Option<Keyword<'gc>> {
         if node.kind(self.mc) != Some(SyntaxKind::Literal) {
             return None;
@@ -401,7 +415,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         Keyword::of(node.datum(self.mc))
     }
 
-    /// The form `node` is, if it's a list that starts with one's name.
+    /// Returns the form that `node` is. Returns `None` unless `node` is a list that starts with a form's name.
     fn head(&self, node: Syntax<'gc>) -> Option<Form> {
         if node.kind(self.mc) != Some(SyntaxKind::List) {
             return None;
@@ -413,8 +427,8 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         self.forms.get(&head.datum(self.mc).to_bits()).copied()
     }
 
-    /// The require spec `spec`: its filters, outermost first as they're written, then the
-    /// module inside them.
+    /// Parses the require spec `spec`. The spec is written with its filters outermost first, around the module's name.
+    /// The returned filters are in the order in which they apply, innermost first.
     fn spec(&self, mut spec: Syntax<'gc>) -> Result<RequireSpec<SyntaxSpan<'gc>>, LowerError> {
         let mut filters = Vec::new();
         loop {
@@ -425,10 +439,9 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             let items = self.list(spec)?;
             let Some((&head, args)) = items.split_first() else { return Err(self.error(LowerErrorKind::BadShape, spec)) };
             let word = self.text(head).filter(|_| head.kind(self.mc) == Some(SyntaxKind::Identifier));
-            let named = |node: &Syntax<'gc>| -> Result<(String, SyntaxSpan<'gc>), LowerError> { Ok((self.identifier(*node)?, node.span(self.mc))) };
             let (filter, inner) = match (word.as_deref(), args) {
-                (Some("only-in"), &[inner, ref names @ ..]) => (Filter::Only(names.iter().map(named).collect::<Result<_, _>>()?), inner),
-                (Some("except-in"), &[inner, ref names @ ..]) => (Filter::Except(names.iter().map(named).collect::<Result<_, _>>()?), inner),
+                (Some("only-in"), &[inner, ref names @ ..]) => (Filter::Only(self.identifiers(names)?), inner),
+                (Some("except-in"), &[inner, ref names @ ..]) => (Filter::Except(self.identifiers(names)?), inner),
                 (Some("prefix-in"), &[prefix, inner]) => (Filter::Prefix(self.identifier(prefix)?), inner),
                 (Some("rename-in"), &[inner, ref renames @ ..]) => {
                     let renames = renames.iter().map(|&rename| self.pair_of_names(rename).map(|(old, new)| (old, new, rename.span(self.mc)))).collect::<Result<_, _>>()?;
@@ -441,7 +454,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         }
     }
 
-    /// Exports what the provide spec `spec` names.
+    /// Parses the provide spec `spec` and appends the exports that it names to `out`.
     fn provide_spec(&self, spec: Syntax<'gc>, out: &mut Vec<Provide<'gc>>) -> Result<(), LowerError> {
         let span = spec.span(self.mc);
         if spec.kind(self.mc) == Some(SyntaxKind::Identifier) {
@@ -475,7 +488,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         Ok(())
     }
 
-    /// The names in `(old new)`.
+    /// Returns the two names in `node`, which has the form `(old new)`.
     fn pair_of_names(&self, node: Syntax<'gc>) -> Result<(String, String), LowerError> {
         match self.list(node)?.as_slice() {
             &[old, new] => Ok((self.identifier(old)?, self.identifier(new)?)),
@@ -483,13 +496,22 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         }
     }
 
-    /// The name of the identifier `node`.
+    /// Returns the name and the span of each of the identifiers `nodes`.
+    fn identifiers(&self, nodes: &[Syntax<'gc>]) -> Result<Vec<(String, SyntaxSpan<'gc>)>, LowerError> {
+        let mut named = Vec::with_capacity(nodes.len());
+        for &node in nodes {
+            named.push((self.identifier(node)?, node.span(self.mc)));
+        }
+        Ok(named)
+    }
+
+    /// Returns the name of the identifier `node`. Fails with `BadShape` if `node` is not an identifier.
     fn identifier(&self, node: Syntax<'gc>) -> Result<String, LowerError> {
         self.name(node)?;
         self.text(node).ok_or_else(|| self.error(LowerErrorKind::BadShape, node))
     }
 
-    /// The text of `node`, if it's an identifier or a string.
+    /// Returns the text of `node` if `node` is an identifier or a string literal, and `None` otherwise.
     fn text(&self, node: Syntax<'gc>) -> Option<String> {
         let datum = node.datum(self.mc);
         let string = match node.kind(self.mc)? {
@@ -509,18 +531,18 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         steps::run(&mut Lowering { l: self, locals }, node, Lowering::expr)
     }
 
-    /// The quoted datum `root` reads as, without its syntax.
+    /// Returns the datum that the quoted syntax `root` denotes, with all syntax objects removed.
+    /// An abbreviation becomes a two-element list: `'a` becomes `(quote a)`.
     fn datum(&mut self, root: Syntax<'gc>) -> Result<Value<'gc>, LowerError> {
         enum Task<'gc> {
             Node(Syntax<'gc>),
-            /// A part of a list or vector, which is syntax.
+            /// An element of a list or vector, with the node that contains it. The element must be a syntax object.
             Item(Value<'gc>, Syntax<'gc>),
             Abbreviation(Value<'gc>, Syntax<'gc>),
             Vector(usize, Syntax<'gc>),
-            /// A list of so many items, and a tail if it's dotted.
+            /// A list with the given number of items. The flag says whether the list is dotted and so has a tail.
             List(usize, bool, Syntax<'gc>),
         }
-        let oom = |this: &Self, error: OutOfMemory, node| this.error(error, node);
         let mut todo = vec![Task::Node(root)];
         let mut done = Vec::new();
         while let Some(task) = todo.pop() {
@@ -529,18 +551,18 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
                 Task::Item(value, parent) => self.syntax(value, parent)?,
                 Task::Abbreviation(name, node) => {
                     let inner = done.pop().expect("an abbreviation's datum");
-                    done.push(self.pairs.list(&[name, inner]).map_err(|error| oom(self, error, node))?);
+                    done.push(self.pairs.list(&[name, inner]).map_err(|error| self.error(error, node))?);
                     continue;
                 }
                 Task::Vector(count, node) => {
                     let items = done.split_off(done.len() - count);
-                    done.push(Vectors::new(self.mc).immutable_from_slice(&items).map_err(|error| oom(self, error, node))?.value(self.mc));
+                    done.push(Vectors::new(self.mc).immutable_from_slice(&items).map_err(|error| self.error(error, node))?.value(self.mc));
                     continue;
                 }
                 Task::List(count, dotted, node) => {
                     let rest = if dotted { done.pop().expect("a list's tail") } else { Value::NULL };
                     let items = done.split_off(done.len() - count);
-                    done.push(self.pairs.list_with_tail(items, rest).map_err(|error| oom(self, error, node))?);
+                    done.push(self.pairs.list_with_tail(items, rest).map_err(|error| self.error(error, node))?);
                     continue;
                 }
             };
@@ -592,7 +614,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         }
     }
 
-    /// Fails on the second of any two `names` that are the same.
+    /// Fails with `Duplicate` if two of `names` are the same. The error points at the second of the two.
     fn distinct(&self, names: &[Syntax<'gc>]) -> Result<(), LowerError> {
         let mut seen = HashSet::new();
         match names.iter().find(|name| !seen.insert(name.datum(self.mc).to_bits())) {
@@ -601,7 +623,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         }
     }
 
-    /// `node`, if it's an identifier.
+    /// Returns `node` if it is an identifier, and fails with `BadShape` otherwise.
     fn name(&self, node: Syntax<'gc>) -> Result<Syntax<'gc>, LowerError> {
         match node.kind(self.mc) {
             Some(SyntaxKind::Identifier) => Ok(node),
@@ -609,7 +631,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         }
     }
 
-    /// The items of `node`, a proper list.
+    /// Returns the items of `node`. Fails with `BadShape` unless `node` is a proper list.
     fn list(&self, node: Syntax<'gc>) -> Result<Vec<Syntax<'gc>>, LowerError> {
         if node.kind(self.mc) != Some(SyntaxKind::List) {
             return Err(self.error(LowerErrorKind::BadShape, node));
@@ -622,12 +644,12 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         Ok(items)
     }
 
-    /// The datum `node` quotes.
+    /// Returns the syntax that the abbreviation `node` wraps: for `'x`, the node for `x`.
     fn inner(&self, node: Syntax<'gc>) -> Result<Syntax<'gc>, LowerError> {
         self.syntax(node.datum(self.mc), node)
     }
 
-    /// `value`, a part of `node`, as syntax, which the reader makes every part of a list.
+    /// Returns `value`, an element of `node`, as a syntax object. The reader wraps every element of a list in a syntax object, so any other value is reported as `Unsupported` at `node`.
     fn syntax(&self, value: Value<'gc>, node: Syntax<'gc>) -> Result<Syntax<'gc>, LowerError> {
         Syntax::of(value).ok_or_else(|| self.error(LowerErrorKind::Unsupported, node))
     }
@@ -638,15 +660,15 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
     }
 }
 
-/// A form being lowered by the lowerer: what [`steps`] works on, so lowering it takes no more of
-/// the machine's stack however deeply it nests.
+/// The state for lowering one expression. [`steps`] drives the lowering over this state, so a
+/// deeply nested form does not use more of the native stack.
 struct Lowering<'s, 'a, 'gc> {
     l: &'s mut Lowerer<'a, 'gc>,
     /// The module's allocator of local variables and lambda IDs.
     locals: &'s mut Locals<'gc>,
 }
 
-/// What lowering an expression does next. Each call lowers an expression.
+/// The next [`Step`] of lowering. A call is a syntax node to lower, and its result is the lowered [`Core`].
 type Lo<'s, 'a, 'gc> = Step<'s, Lowering<'s, 'a, 'gc>, Syntax<'gc>, Core<'gc>, LowerError>;
 
 /// The state of lowering a `%lambda` that has optional or keyword parameters. `params` holds the parameters bound so far, and `next` is the index of the next parameter to bind.
@@ -658,7 +680,7 @@ struct Optional<'gc> {
     next: usize,
 }
 
-/// A `%let*` being lowered: the bindings left, and the names bound so far, each with its `%let`.
+/// The state of lowering a `%let*`. `left` holds the bindings that are not lowered yet. `names` holds the names bound so far, and `lets` holds the variable and the lowered init of each.
 struct Sequential<'gc> {
     binds: Syntax<'gc>,
     left: std::vec::IntoIter<Syntax<'gc>>,
@@ -699,7 +721,7 @@ impl<'s, 'a, 'gc> Lowering<'s, 'a, 'gc> {
         match (form, &items[1..]) {
             (Form::Quote, &[datum]) => Ok(Step::Done(Core::Quote(lowerer.datum(datum)?))),
             (Form::If, &[test, then, other]) => steps::all(vec![test, then, other], |_, parts| {
-                let [test, then, other] = <[Core<'gc>; 3]>::try_from(parts).map_err(|_| ()).expect("three parts");
+                let [test, then, other] = <[Core<'gc>; 3]>::try_from(parts).expect("three parts");
                 Ok(Step::Done(Core::If(Box::new(test), Box::new(then), Box::new(other))))
             }),
             (Form::Let | Form::Letrec, &[binds, ref body @ ..]) => self.binding(matches!(form, Form::Letrec), node, binds, body.to_vec()),
@@ -728,7 +750,7 @@ impl<'s, 'a, 'gc> Lowering<'s, 'a, 'gc> {
         }
     }
 
-    /// A `%let`, or if `recursive`, a `%letrec`.
+    /// Lowers a `%let`, or a `%letrec` if `recursive` is true.
     fn binding(&mut self, recursive: bool, node: Syntax<'gc>, binds: Syntax<'gc>, body: Vec<Syntax<'gc>>) -> Result<Lo<'s, 'a, 'gc>, LowerError> {
         let lowerer = &mut *self.l;
         if body.is_empty() {
@@ -742,7 +764,7 @@ impl<'s, 'a, 'gc> Lowering<'s, 'a, 'gc> {
             inits.push(init);
         }
         lowerer.distinct(&names)?;
-        // A `%letrec`'s names are in scope in its inits, a `%let`'s only in its body.
+        // The names of a `%letrec` are in scope in its inits. The names of a `%let` are in scope only in its body.
         let vars = if recursive { self.bind(&names) } else { Vec::new() };
         steps::all(inits, move |this: &mut Self, inits: Vec<Core<'gc>>| {
             let vars = if recursive { vars } else { this.bind(&names) };
@@ -754,7 +776,7 @@ impl<'s, 'a, 'gc> Lowering<'s, 'a, 'gc> {
         })
     }
 
-    /// A `%let*`: nested `%let`s of one binding each, so each init sees the names before it.
+    /// Lowers a `%let*` to nested `%let`s of one binding each, so each init can refer to the names bound before it.
     fn sequential(&mut self, node: Syntax<'gc>, binds: Syntax<'gc>, body: Vec<Syntax<'gc>>) -> Result<Lo<'s, 'a, 'gc>, LowerError> {
         if body.is_empty() {
             return Err(self.l.error(LowerErrorKind::BadShape, node));
@@ -784,7 +806,7 @@ impl<'s, 'a, 'gc> Lowering<'s, 'a, 'gc> {
         }))
     }
 
-    /// A `%lambda`.
+    /// Lowers a `%lambda`.
     fn lambda(&mut self, node: Syntax<'gc>, formals: Syntax<'gc>, body: Vec<Syntax<'gc>>) -> Result<Lo<'s, 'a, 'gc>, LowerError> {
         let lowerer = &mut *self.l;
         if body.is_empty() {
@@ -861,8 +883,8 @@ impl<'s, 'a, 'gc> Lowering<'s, 'a, 'gc> {
         }))
     }
 
-    /// An `%intrinsic`, or if `spread`, an `%apply-intrinsic`, whose argument count is only known
-    /// as it runs.
+    /// Lowers an `%intrinsic`, or an `%apply-intrinsic` if `spread` is true. The argument count of
+    /// an `%apply-intrinsic` is known only at run time, so it is not checked here.
     fn intrinsic(&mut self, node: Syntax<'gc>, name: Syntax<'gc>, args: Vec<Syntax<'gc>>, spread: bool) -> Result<Lo<'s, 'a, 'gc>, LowerError> {
         let lowerer = &mut *self.l;
         lowerer.name(name)?;
@@ -882,7 +904,7 @@ impl<'s, 'a, 'gc> Lowering<'s, 'a, 'gc> {
         steps::all(args, move |this: &mut Self, args| Ok(Step::Done(Core::Intrinsic(prim, args, this.l.position(node)))))
     }
 
-    /// A `%call-host` of the host function named `name`.
+    /// Lowers a `%call-host` of the host function named `name`.
     fn call_host(&mut self, node: Syntax<'gc>, name: Syntax<'gc>, args: Vec<Syntax<'gc>>) -> Result<Lo<'s, 'a, 'gc>, LowerError> {
         let lowerer = &mut *self.l;
         lowerer.name(name)?;
@@ -893,14 +915,14 @@ impl<'s, 'a, 'gc> Lowering<'s, 'a, 'gc> {
         steps::all(args, move |this: &mut Self, args| Ok(Step::Done(Core::Intrinsic(Prim::Host(def), args, this.l.position(node)))))
     }
 
-    /// A body's expressions, in order, as one, to `then`.
+    /// Lowers `nodes`, the expressions of a body, in order. Combines them into one expression and passes it to `then`.
     fn body(&mut self, nodes: Vec<Syntax<'gc>>, then: impl FnOnce(&mut Self, Core<'gc>) -> Result<Lo<'s, 'a, 'gc>, LowerError> + 's) -> Result<Lo<'s, 'a, 'gc>, LowerError> {
         steps::all(nodes, move |this: &mut Self, mut cores| {
             let body = cores.pop().expect("bodies aren't empty");
             if cores.is_empty() {
                 return then(this, body);
             }
-            // One `let` of what the forms before the last return, however many there are.
+            // A single `let` binds the values of all the expressions before the last to unused variables, however many there are. The last expression is the `let`'s body.
             let binds = cores.into_iter().map(|core| (this.locals.fresh(), core)).collect();
             then(this, Core::Let(binds, Box::new(body)))
         })

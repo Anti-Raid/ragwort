@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use crate::int::{self, NumError};
 use crate::rational::{self, Round};
 use crate::real::*;
-use crate::testing::{Oracle, ROUNDS, Rng, TestError, TestHost, TestRational, TestReal, WIDTHS, error_token};
+use crate::testing::{Oracle, ROUNDS, Rng, TestError, TestHost, TestInt, TestRational, TestReal, WIDTHS, error_token};
 
 type Op = fn(&TestHost, TestReal, TestReal) -> Result<TestReal, TestError>;
 
@@ -45,7 +45,7 @@ fn comparisons_are_exact() {
             let ours = compare(&h, x, y).unwrap().map_or("nan".to_string(), |o| (o as i8).to_string());
             oracle.case("xcmp", &[h.show_real(x), h.show_real(y)], ours);
         }
-        // Integers just past 2^53, against the doubles they round to.
+        // Integers next to `2^k` for `k` from 53 to 62, compared with the `f64` values they round to.
         for k in 53..63 {
             for n in [(1i64 << k) + 1, -(1i64 << k) - 1, (1i64 << k) - 1] {
                 let (x, y) = (from_i64(&h, n).unwrap(), flo(n as f64));
@@ -77,7 +77,7 @@ fn rounding_parts_and_exactness() {
     oracle.check();
 }
 
-/// Mostly integers, exact and not, with a few that aren't.
+/// Returns a random real. Most are integers, exact or inexact, and a few are not integers.
 fn random_integer(h: &TestHost, rng: &mut Rng) -> TestReal {
     match rng.below(5) {
         0 => TestReal::Exact(TestRational::Int(h.random(rng, 2))),
@@ -113,15 +113,14 @@ fn flo(f: f64) -> TestReal {
     TestReal::Flonum(f)
 }
 
-/// The cases Racket's reference spells out.
+/// The cases that the Racket reference lists explicitly.
 #[test]
 fn exact_zero_stays_exact_where_racket_says() {
     let h = TestHost::new(64);
     let zero = ratio(&h, 0, 1);
-    let is_exact_zero = |x: Result<TestReal, TestError>| crate::real::is_exact_zero(&h, x.unwrap());
-    assert!(is_exact_zero(mul(&h, zero, flo(f64::INFINITY))));
-    assert!(is_exact_zero(mul(&h, flo(f64::NAN), zero)));
-    assert!(is_exact_zero(div(&h, zero, flo(0.0))));
+    assert!(is_exact_zero(&h, mul(&h, zero, flo(f64::INFINITY)).unwrap()));
+    assert!(is_exact_zero(&h, mul(&h, flo(f64::NAN), zero).unwrap()));
+    assert!(is_exact_zero(&h, div(&h, zero, flo(0.0)).unwrap()));
     assert_eq!(div(&h, flo(1.0), zero).unwrap_err(), TestError::Num(NumError::DivideByZero));
     assert_eq!(h.show_real(div(&h, flo(1.0), flo(0.0)).unwrap()), h.show_real(flo(f64::INFINITY)));
     assert_eq!(h.show_real(add(&h, zero, flo(1.5)).unwrap()), h.show_real(flo(1.5)));
@@ -140,9 +139,8 @@ fn exact_zero_stays_exact_where_racket_says() {
 #[test]
 fn eqv_tells_exactness_and_zero_signs_apart() {
     let h = TestHost::new(64);
-    let hash_of = |x| hash_of_in(&h, x);
     let other_nan = flo(f64::from_bits(f64::NAN.to_bits() ^ 1));
-    assert!(eqv(&h, flo(f64::NAN), other_nan) && hash_of(flo(f64::NAN)) == hash_of(other_nan));
+    assert!(eqv(&h, flo(f64::NAN), other_nan) && hash_of_in(&h, flo(f64::NAN)) == hash_of_in(&h, other_nan));
     assert!(eqv(&h, flo(f64::NAN), flo(-f64::NAN)));
     assert!(!eqv(&h, flo(0.0), flo(-0.0)));
     assert!(!eqv(&h, ratio(&h, 1, 1), flo(1.0)));
@@ -153,24 +151,26 @@ fn eqv_tells_exactness_and_zero_signs_apart() {
     for _ in 0..ROUNDS / 4 {
         let x = hosts[0].random_real(&mut rng, 3);
         assert!(eqv(&hosts[0], x, x));
-        // Rebuilt in a narrower host, an exact number takes other paths but hashes the same.
+        // An exact number rebuilt in a narrower host takes other code paths but must hash the same.
         let text = hosts[0].show_real(x);
         for other in &hosts[1..] {
             let y = match x {
                 TestReal::Flonum(f) => flo(f),
                 TestReal::Exact(r) => {
                     let (n, d) = (rational::numerator(&hosts[0], r), rational::denominator(&hosts[0], r).unwrap());
-                    let rebuild = |n| {
-                        let s = int::to_string(&hosts[0], n, 16).unwrap();
-                        let (neg, digits) = s.strip_prefix('-').map_or((false, s.as_str()), |rest| (true, rest));
-                        int::parse(other, digits.as_bytes(), 16, neg).unwrap().unwrap()
-                    };
-                    TestReal::Exact(rational::from_parts(other, rebuild(n), rebuild(d)).unwrap())
+                    TestReal::Exact(rational::from_parts(other, rebuild(&hosts[0], other, n), rebuild(&hosts[0], other, d)).unwrap())
                 }
             };
             assert_eq!(hash_of_in(other, y), hash_of_in(&hosts[0], x), "{text}");
         }
     }
+}
+
+/// Rebuilds the integer `n` of host `from` in host `to`.
+fn rebuild(from: &TestHost, to: &TestHost, n: TestInt) -> TestInt {
+    let text = int::to_string(from, n, 16).unwrap();
+    let (negative, digits) = text.strip_prefix('-').map_or((false, text.as_str()), |rest| (true, rest));
+    int::parse(to, digits.as_bytes(), 16, negative).unwrap().unwrap()
 }
 
 fn hash_of_in(h: &TestHost, x: TestReal) -> u64 {
@@ -179,8 +179,8 @@ fn hash_of_in(h: &TestHost, x: TestReal) -> u64 {
     std::hash::Hasher::finish(&state)
 }
 
-/// In a power-of-two radix, an inexact number is written digit for digit: the text's value is
-/// exactly the double's.
+/// In a power-of-two radix, an inexact number is written exactly. The value of the text
+/// equals the value of the `f64`.
 #[test]
 fn flonums_write_exactly_in_powers_of_two() {
     let h = TestHost::new(WIDTHS[0]);
@@ -197,7 +197,7 @@ fn flonums_write_exactly_in_powers_of_two() {
             let digits = format!("{whole}{fraction}");
             let n = int::parse(&h, digits.as_bytes(), radix, false).unwrap().expect("digits");
             let scale = int::expt(&h, int::from_i64(&h, radix as i64).unwrap(), fraction.len() as u64).unwrap();
-            // `n / scale` against `|f|` as `num / den`, crosswise.
+            // Compare `n / scale` with `|f| = num / den` by cross-multiplication.
             let q = rational::from_f64(&h, f.abs()).unwrap();
             let (num, den) = (rational::numerator(&h, q), rational::denominator(&h, q).unwrap());
             assert_eq!(int::compare(&h, int::mul(&h, n, den).unwrap(), int::mul(&h, num, scale).unwrap()), Ordering::Equal, "{f:e} in {radix}: {text}");

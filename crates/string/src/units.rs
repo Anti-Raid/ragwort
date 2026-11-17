@@ -1,4 +1,4 @@
-//! The characters of a flat string: one, two or four bytes each, as the widest needs.
+//! The units of a flat string. Each character takes one, two or four bytes, as the widest character in the string requires.
 
 use std::cell::Cell;
 use std::cmp::Ordering;
@@ -6,14 +6,14 @@ use std::ops::Range;
 
 use crate::word::{HIGH, SHORT, fingerprint, low_bytes, read_bytes, write_bytes};
 
-/// Bytes per character of a flat string. A flat string always has the narrowest width that
+/// The number of bytes per character in a flat string. A flat string always has the narrowest width that
 /// holds all its characters, so strings of different widths are never equal.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 #[repr(u8)]
 pub enum Width {
-    /// Up to U+00FF, Latin-1.
+    /// Code points up to U+00FF (Latin-1).
     One = 1,
-    /// Up to U+FFFF. Surrogates aren't characters, so never appear.
+    /// Code points up to U+FFFF. Surrogates are not characters, so they never appear.
     Two = 2,
     Four = 4,
 }
@@ -35,7 +35,7 @@ impl Width {
         self as usize
     }
 
-    /// Units that fit in a word.
+    /// Returns the number of units that fit in a 64-bit word.
     pub const fn per_word(self) -> usize {
         1 << self.per_word_log()
     }
@@ -65,7 +65,7 @@ impl Width {
     }
 }
 
-/// A flat string's characters, as its host stores them.
+/// The units of a flat string, in the representation that its host stores.
 #[derive(Clone, Copy, Debug)]
 pub enum Units<'a> {
     One(&'a [u8]),
@@ -75,7 +75,7 @@ pub enum Units<'a> {
     Inline(Inline),
 }
 
-/// Room for a new flat string's characters.
+/// The writable units of a new flat string.
 #[derive(Debug)]
 pub enum UnitsMut<'a> {
     One(&'a mut [u8]),
@@ -84,28 +84,28 @@ pub enum UnitsMut<'a> {
     Packed(PackedMut<'a>),
 }
 
-/// Units packed into words, [`Width::per_word`] to a word with the first lowest, as a host that
-/// stores words holds them. What's past the last unit is ignored.
+/// Units packed into 64-bit words, for a host that stores words. Each word holds [`Width::per_word`] units,
+/// with the first unit in the lowest bits. Bits past the last unit are ignored.
 #[derive(Clone, Copy, Debug)]
 pub struct Packed<'a> {
     words: &'a [Cell<u64>],
     len: usize,
-    /// Units to pass over in the first word.
+    /// The number of units to skip in the first word.
     skip: u8,
     width: Width,
 }
 
-/// Up to eight one-byte units in one word, the first lowest, which the host keeps in the string's
-/// handle rather than in memory. Bytes past the last unit are zero. Reads of single units take
-/// it as it is; the word-at-a-time paths it shares with [`Packed`] take it `anchored`.
+/// Up to eight one-byte units in one word, with the first unit in the lowest byte. The host keeps the word in the string's
+/// handle instead of in memory. Bytes past the last unit are zero. Reads of single units use the word directly.
+/// The word-at-a-time paths shared with [`Packed`] first convert it with `Units::anchored`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Inline {
     word: u64,
     len: u8,
 }
 
-/// Room for a new flat string's characters, packed as [`Packed`] reads them, in words the host
-/// zeroed.
+/// The writable units of a new flat string, in the layout that [`Packed`] reads. The host has
+/// zeroed the words.
 #[derive(Debug)]
 pub struct PackedMut<'a> {
     words: &'a [Cell<u64>],
@@ -114,7 +114,7 @@ pub struct PackedMut<'a> {
 }
 
 impl<'a> Packed<'a> {
-    /// The first `len` units in `words`, or as many as they hold.
+    /// Returns the first `len` units in `words`. If `words` holds fewer units, `len` is clamped to that number.
     #[inline]
     pub fn new(words: &'a [Cell<u64>], len: usize, width: Width) -> Self {
         Self { words, len: len.min(words.len() << width.per_word_log()), skip: 0, width }
@@ -141,7 +141,7 @@ impl<'a> Packed<'a> {
         ((self.words[j >> log].get() >> shift) & self.width.mask()) as u32
     }
 
-    /// Unit `i` of one-byte units.
+    /// Returns unit `i`. The units must be one byte wide.
     #[inline]
     pub(crate) fn byte(self, i: usize) -> u32 {
         debug_assert!(self.width == Width::One);
@@ -172,12 +172,12 @@ impl<'a> Packed<'a> {
         }
     }
 
-    /// Where the units' bytes start in the first word.
+    /// Returns the byte offset in the first word at which the units start.
     fn byte_start(self) -> usize {
         self.skip as usize * self.width.bytes()
     }
 
-    /// The units' bytes from unit `from`, as many as fill `out`.
+    /// Copies the units' bytes into `out`, starting at unit `from`, until `out` is full.
     #[inline]
     pub(crate) fn copy_bytes(self, from: usize, out: &mut [u8]) {
         let at = self.byte_start() + from * self.width.bytes();
@@ -193,19 +193,19 @@ impl<'a> Packed<'a> {
         }
     }
 
-    /// Whether these are one-byte units, all of them ASCII.
+    /// Returns whether the units are one byte wide and all ASCII.
     pub(crate) fn is_ascii(self) -> bool {
         self.width == Width::One && self.byte_words().fold(0, |seen, word| seen | word) & HIGH == 0
     }
 
-    /// The units' bytes, eight to a word, the last word holding what's left.
+    /// Returns the units' bytes as little-endian words of eight bytes. The last word holds the remaining bytes, zero-extended.
     #[inline]
     pub(crate) fn byte_words(self) -> impl Iterator<Item = u64> + Clone + 'a {
         let n = self.len * self.width.bytes();
         (0..n.div_ceil(8)).map(move |index| self.word_at(index, (n - 8 * index).min(8)))
     }
 
-    /// The `index`th 8 bytes of the units' bytes, or the `n` there are if fewer.
+    /// Returns `n` of the units' bytes as a little-endian word, starting at byte `8 * index`. `n` is 8, or the number of bytes left if fewer remain.
     #[inline]
     pub(crate) fn word_at(self, index: usize, n: usize) -> u64 {
         match self.skip {
@@ -214,8 +214,8 @@ impl<'a> Packed<'a> {
         }
     }
 
-    /// Orders two runs of the same length and width by code point, a word at a time, each word
-    /// passed through `map` first. Units pack lowest first, so the lowest differing bit is in
+    /// Compares two runs of the same length and width by code point, a word at a time. Each word
+    /// is passed through `map` first. Units are packed lowest first, so the lowest differing bit lies in
     /// the first differing unit.
     #[inline]
     pub(crate) fn compare_by(self, other: Packed<'_>, map: impl Fn(u64) -> u64) -> Ordering {
@@ -250,7 +250,7 @@ impl<'a> Packed<'a> {
         })
     }
 
-    /// Whether these are one-byte units equal to `bytes`, all of them ASCII.
+    /// Returns whether the units are one byte wide, equal to `bytes` and all ASCII.
     #[inline]
     pub(crate) fn equal_ascii(self, bytes: &[u8]) -> bool {
         if self.width != Width::One || self.len != bytes.len() {
@@ -261,7 +261,7 @@ impl<'a> Packed<'a> {
         }
         let (chunks, tail) = bytes.as_chunks::<8>();
         let Some(words) = self.words.get(..chunks.len() + !tail.is_empty() as usize) else { return false };
-        // Differences and high bits gather, so there's one branch whatever the length.
+        // OR the differences and the high bits together across all words. Then a single branch decides the result, whatever the length.
         let (mut diff, mut seen) = (0, 0);
         for (cell, chunk) in words.iter().zip(chunks) {
             let chunk = u64::from_le_bytes(*chunk);
@@ -279,7 +279,7 @@ impl<'a> Packed<'a> {
         diff | seen & HIGH == 0
     }
 
-    /// Whether these are one-byte units equal to `bytes`.
+    /// Returns whether the units are one byte wide and equal to `bytes`.
     pub(crate) fn equal_bytes(self, bytes: &[u8]) -> bool {
         let at = self.byte_start();
         self.width == Width::One
@@ -289,14 +289,14 @@ impl<'a> Packed<'a> {
 }
 
 impl Inline {
-    /// The first `len` bytes of `word`, up to eight.
+    /// Returns the first `len` bytes of `word` as units. `len` is clamped to eight.
     #[inline]
     pub fn new(word: u64, len: usize) -> Self {
         let len = len.min(8);
         Self { word: word & low_bytes(len), len: len as u8 }
     }
 
-    /// The `len` units, up to eight, that `init` writes, for a host's [`crate::Host::flat`].
+    /// Returns the `len` units that `init` writes, for use in a host's [`crate::Host::flat`]. `len` is at most eight.
     #[inline]
     pub fn filled(len: usize, init: impl FnOnce(UnitsMut<'_>)) -> Self {
         let word = [Cell::new(0)];
@@ -318,7 +318,7 @@ impl Inline {
         self.word
     }
 
-    /// The units, then zeros.
+    /// Returns the units as bytes, followed by zeros.
     #[inline]
     pub(crate) fn bytes(self) -> [u8; 8] {
         self.word.to_le_bytes()
@@ -334,7 +334,7 @@ impl Inline {
         u32::from(self.byte(i))
     }
 
-    /// Whether these are equal to `bytes`, all of them ASCII.
+    /// Returns whether the units are equal to `bytes` and all ASCII.
     #[inline]
     pub(crate) fn equal_ascii(self, bytes: &[u8]) -> bool {
         self.len() == bytes.len() && {
@@ -351,7 +351,7 @@ impl Inline {
 }
 
 impl<'a> PackedMut<'a> {
-    /// Room for `len` units in `words`, or as many as they hold.
+    /// Returns a writer for `len` units in `words`. If `words` holds fewer units, `len` is clamped to that number.
     #[inline]
     pub fn new(words: &'a [Cell<u64>], len: usize, width: Width) -> Self {
         Self { words, len: len.min(words.len() << width.per_word_log()), width }
@@ -366,7 +366,7 @@ impl<'a> PackedMut<'a> {
         cell.set(cell.get() & !(self.width.mask() << shift) | (code as u64 & self.width.mask()) << shift);
     }
 
-    /// Writes `src` from `at`, each character converted to this width, which must hold them.
+    /// Writes `src` starting at unit `at`. Each character is converted to this width, which must be wide enough to hold it.
     fn write(&self, at: usize, src: Units<'_>) {
         assert!(at + src.len() <= self.len, "writing past the end");
         let wb = self.width.bytes();
@@ -385,7 +385,7 @@ impl<'a> PackedMut<'a> {
         }
     }
 
-    /// Writes `n` units from `at`, the `i`th `unit(i)`, a word at a time.
+    /// Writes `n` units starting at unit `at`, a word at a time. Unit `i` of the run is `unit(i)`.
     #[inline]
     fn widen(&self, at: usize, n: usize, unit: impl Fn(usize) -> u32) {
         let (log, bits, mask) = (self.width.per_word_log(), self.width.bits(), self.width.mask());
@@ -404,7 +404,7 @@ impl<'a> PackedMut<'a> {
         }
     }
 
-    /// Writes `n` bytes from byte `to`, which `read(i, count)` gives `count` at a time from the `i`th.
+    /// Writes `n` bytes starting at byte `to`. `read(i, count)` returns `count` source bytes, starting at source byte `i`, in the low bytes of a word.
     #[inline]
     fn copy(&self, to: usize, n: usize, read: impl Fn(usize, usize) -> u64) {
         let mut i = 0;
@@ -416,8 +416,8 @@ impl<'a> PackedMut<'a> {
     }
 }
 
-/// Takes the variants that are slices to `$e`, and those in words, [`Packed`] and [`Inline`],
-/// to `$words`.
+/// Matches on a [`Units`] value. The slice variants evaluate `$e`. The word variants, [`Packed`] and [`Inline`],
+/// evaluate `$words`.
 macro_rules! each {
     ($units:expr, $s:ident => $e:expr, $w:ident => $words:expr) => {
         match $units {
@@ -444,9 +444,9 @@ macro_rules! each_mut {
 pub(crate) trait Unit: Copy + Ord {
     const BITS: u32;
     fn code(self) -> u32;
-    /// `code`, which must fit.
+    /// Converts `code` to a unit. `code` must fit in the unit.
     fn of(code: u32) -> Self;
-    /// Up to `64 / BITS` units, the first lowest.
+    /// Packs up to `64 / BITS` units into a word, with the first unit in the lowest bits.
     #[inline]
     fn pack(units: &[Self]) -> u64 {
         units.iter().rev().fold(0, |word, unit| word << Self::BITS | unit.code() as u64)
@@ -461,14 +461,17 @@ impl Unit for u8 {
     fn of(code: u32) -> Self {
         code as u8
     }
-    /// Reads overlap for a part word, ORing equal bytes into the same places.
+    /// For fewer than eight bytes, the reads overlap. Overlapping reads OR the same byte into the same position, so the result is exact.
     #[inline]
     fn pack(units: &[Self]) -> u64 {
+        #[inline(always)]
+        fn four(units: &[u8], i: usize) -> u64 {
+            u32::from_le_bytes(units[i..i + 4].try_into().expect("four bytes")) as u64
+        }
         let n = units.len();
-        let four = |i: usize| u32::from_le_bytes(units[i..i + 4].try_into().expect("four bytes")) as u64;
         match n {
             8 => u64::from_le_bytes(units.try_into().expect("eight bytes")),
-            4..=7 => four(0) | four(n - 4) << (8 * (n - 4)),
+            4..=7 => four(units, 0) | four(units, n - 4) << (8 * (n - 4)),
             1..=3 => units[0] as u64 | (units[n / 2] as u64) << (8 * (n / 2)) | (units[n - 1] as u64) << (8 * (n - 1)),
             _ => 0,
         }
@@ -495,7 +498,7 @@ impl Unit for u32 {
     }
 }
 
-/// A host can hand back any bits, so a unit that isn't a character reads as U+FFFD.
+/// Converts `code` to a character. A host can return arbitrary bits, so a unit that is not a valid character reads as U+FFFD.
 #[inline]
 fn to_char(code: u32) -> char {
     char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER)
@@ -506,7 +509,7 @@ fn widest<U: Unit>(units: &[U]) -> u32 {
 }
 
 impl<'a> Units<'a> {
-    /// The `index`th eight of these one-byte units in a little-endian word, or the ones left.
+    /// Returns eight units as a little-endian word, starting at unit `8 * index`, or the remaining units if fewer are left. The units must be one byte wide.
     #[inline]
     pub(crate) fn byte_chunk(self, index: usize) -> u64 {
         let n = (self.len() - 8 * index).min(8);
@@ -550,8 +553,8 @@ impl<'a> Units<'a> {
         }
     }
 
-    /// Always inlined: the rope walks slice on their hot path, and LLVM's own choice there flips
-    /// with code elsewhere in the program.
+    /// Returns the units in `range`. This is always inlined. The rope walks call it on their hot path, and LLVM's own
+    /// inlining decision there changes with unrelated code elsewhere in the program.
     #[inline(always)]
     pub fn slice(self, range: Range<usize>) -> Self {
         match self {
@@ -563,8 +566,8 @@ impl<'a> Units<'a> {
         }
     }
 
-    /// These units, inline ones moved into `cell` so they read as packed words, as the host's
-    /// stored ones do.
+    /// Returns these units in a form that the word-at-a-time paths can read. Inline units are copied into `cell`
+    /// and returned as [`Packed`] units over it. Other units are returned unchanged.
     #[inline]
     pub(crate) fn anchored<'b>(self, cell: &'b Cell<u64>) -> Units<'b>
     where
@@ -583,7 +586,7 @@ impl<'a> Units<'a> {
         (0..self.len()).map(move |i| self.get(i).expect("in range"))
     }
 
-    /// The characters, read a word at a time if they're packed.
+    /// Calls `visit` with each character, in order. Packed units are read a word at a time.
     #[inline]
     pub(crate) fn each_char(self, mut visit: impl FnMut(char)) {
         match self {
@@ -593,7 +596,7 @@ impl<'a> Units<'a> {
         }
     }
 
-    /// The narrowest width that holds these characters.
+    /// Returns the narrowest width that holds these characters.
     pub(crate) fn narrowest(self) -> Width {
         match self.width() {
             Width::One => Width::One,
@@ -606,7 +609,7 @@ impl<'a> Units<'a> {
         each!(self, slice => slice[i].code(), packed => packed.code(i))
     }
 
-    /// Orders two runs of the same length by code point.
+    /// Compares two runs of the same length by code point.
     pub(crate) fn compare(self, other: Units<'_>) -> Ordering {
         debug_assert_eq!(self.len(), other.len());
         let (this_cell, other_cell) = (Cell::new(0), Cell::new(0));
@@ -620,7 +623,7 @@ impl<'a> Units<'a> {
         }
     }
 
-    /// Whether these are the same characters, given both are at their narrowest width.
+    /// Returns whether the two runs hold the same characters. Both runs must be at their narrowest width.
     #[inline]
     pub(crate) fn equal(self, other: Units<'_>) -> bool {
         if let (Self::Inline(a), Units::Inline(b)) = (self, other) {
@@ -642,7 +645,7 @@ impl<'a> Units<'a> {
         }
     }
 
-    /// UTF-8 bytes these characters take.
+    /// Returns the number of bytes that these characters take in UTF-8.
     pub(crate) fn utf8_len(self) -> usize {
         match self {
             Self::One(bytes) => bytes.len() + bytes.iter().filter(|&&byte| byte >= 0x80).count(),
@@ -653,12 +656,12 @@ impl<'a> Units<'a> {
     }
 }
 
-/// Fills units from the start with runs of units, one after another, which are no wider and as
-/// long in all. Into one-byte units packed in words, it writes a word at a time.
+/// Fills `out` from the start with consecutive runs of units. The runs must be no wider than `out`, and their total length
+/// must equal the length of `out`. When `out` holds one-byte units packed in words, the writer stores a word at a time.
 pub(crate) struct RunWriter<'o, 'a> {
     out: &'o mut UnitsMut<'a>,
     at: usize,
-    /// The next word's bytes so far, `filled` bits of them, for one-byte packed units.
+    /// The bytes collected so far for the next word. `filled` is the number of bits collected. Both are used only for one-byte packed units.
     word: u64,
     filled: u32,
 }
@@ -714,8 +717,8 @@ impl UnitsMut<'_> {
         self.len() == 0
     }
 
-    /// Fills one-byte units from little-endian words, eight to a word, the last word's extra
-    /// bytes dropped.
+    /// Fills one-byte units from little-endian `words`, eight units to a word. Extra bytes in the
+    /// last word are ignored.
     pub(crate) fn write_words(&mut self, words: impl Iterator<Item = u64>) {
         match self {
             UnitsMut::Packed(packed) if packed.width == Width::One => packed.words.iter().zip(words).for_each(|(cell, word)| cell.set(word)),
@@ -724,7 +727,7 @@ impl UnitsMut<'_> {
         }
     }
 
-    /// Fills these units from `src`, which is as long and no wider.
+    /// Fills these units from `src`. `src` must have the same length and must be no wider.
     pub fn copy_from(&mut self, src: Units<'_>) {
         assert!(src.len() == self.len() && src.width() <= self.width(), "copying from a longer or wider string");
         self.write(0, src);
@@ -739,7 +742,7 @@ impl UnitsMut<'_> {
         }
     }
 
-    /// Writes `src` from `at`, each character converted to this width, which must hold them.
+    /// Writes `src` starting at unit `at`. Each character is converted to this width, which must be wide enough to hold it.
     pub(crate) fn write(&mut self, at: usize, src: Units<'_>) {
         let end = at + src.len();
         match (self, src) {
