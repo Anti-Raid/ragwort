@@ -1158,7 +1158,7 @@ impl fmt::Display for Block {
     }
 }
 
-struct Vals<'a>(&'a [Val]);
+pub(crate) struct Vals<'a>(pub(crate) &'a [Val]);
 
 impl fmt::Display for Vals<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1169,7 +1169,7 @@ impl fmt::Display for Vals<'_> {
     }
 }
 
-struct Constant<'a, 'gc>(&'a Value<'gc>);
+pub(crate) struct Constant<'a, 'gc>(pub(crate) &'a Value<'gc>);
 
 impl fmt::Display for Constant<'_, '_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1191,7 +1191,7 @@ impl fmt::Display for Constant<'_, '_> {
     }
 }
 
-struct PrimName(Prim);
+pub(crate) struct PrimName(pub(crate) Prim);
 
 impl fmt::Display for PrimName {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1212,11 +1212,11 @@ impl fmt::Display for PrimName {
     }
 }
 
-fn spread(spread: bool) -> &'static str {
+pub(crate) fn spread(spread: bool) -> &'static str {
     if spread { "apply " } else { "" }
 }
 
-fn args(args: &[Val]) -> String {
+pub(crate) fn args(args: &[Val]) -> String {
     if args.is_empty() { String::new() } else { format!(" {}", Vals(args)) }
 }
 

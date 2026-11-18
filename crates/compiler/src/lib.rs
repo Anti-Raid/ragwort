@@ -19,16 +19,22 @@
 //!    versus [`ir::VarRef::Upvalue`] and computing each closure's upvalue capture table.
 //! 7. `l5`: Lowers each function into a control flow graph of basic blocks in SSA form (`L4 -> L5`). Debug builds
 //!    verify SSA and block invariants across all compiled functions.
-//! 8. `emit`: Performs register allocation and bytecode emission from L5 CFGs (`L5 -> Closure`).
+//! 8. `select`: Chooses the VM instruction of every operation and the order of the blocks (`L5 -> L6`). It gives
+//!    constant operands to the instructions that take them, numbers the table hints, and fuses a test into the
+//!    branch on its result and an intrinsic into the return of its result.
+//! 9. `allocate`: Assigns a frame register or a spill slot to every value of an `L6` function.
+//! 10. `emit`: Writes the bytecode of an allocated `L6` function (`L6 -> Closure`): staged call arguments, parallel
+//!     moves, jump offsets, constants and the position table.
 //!
 //! Three optimizations run between these passes without changing the representation: `locals` replaces local
 //! structs with their fields and `letrec::prune` removes the bindings left unused, both on `L2` after `cp0`, and
-//! `merge` replaces redundant reads with earlier values on `L5` before `emit`.
+//! `merge` replaces redundant reads with earlier values on `L5` before `select`.
 //!
 //! Each IR is represented as a flat arena table of nodes. Every pass following `lower` processes expressions
 //! iteratively using its own explicit work stack, preventing machine call stack exhaustion regardless of expression
 //! nesting or inlining depth. In debug builds, invariant assertions validate the IR tables produced by each pass.
 
+mod allocate;
 mod assign;
 mod closure;
 mod contify;
@@ -38,11 +44,13 @@ mod hash;
 pub mod ir;
 pub mod keyword;
 mod l5;
+mod l6;
 mod letrec;
 mod locals;
 mod lower;
 mod merge;
 pub mod module;
+mod select;
 pub mod steps;
 pub mod structs;
 

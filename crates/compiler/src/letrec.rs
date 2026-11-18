@@ -18,7 +18,7 @@ use crate::ir::l2::{self, Bind, Fun, Id, L2, Node};
 use crate::ir::Supply;
 
 /// Maximum number of mutually recursive closures in a single `Fix` group. The emitter stages each closure of a group in one of its `STAGE` scratch registers, so a group cannot be larger than that.
-const MAX_FIX_GROUP: usize = crate::emit::STAGE;
+const MAX_FIX_GROUP: usize = crate::allocate::STAGE;
 
 /// Lowers `root` from `from` into `tree` with all `letrec` bindings fixed, returning the new root node ID and updated `Supply`.
 pub(crate) fn fix_letrec<'s, 'id, 'gc>(mc: &Mutation<'gc>, from: &L1<'s, 'gc>, root: l1::Id<'s>, tree: &mut L2<'id, 'gc>, mut supply: Supply) -> (Id<'id>, Supply) {
