@@ -76,6 +76,10 @@ impl<'gc> Symbols<'gc> {
     /// Returns the arena's intern table. If the arena has none yet, this creates it with a random
     /// hash seed, so that collisions between names cannot be predicted.
     pub fn of_arena(mc: &Mutation<'gc>) -> Result<Self, OutOfMemory> {
+        // A random seed is only made for the arena's first table. Making one takes far longer than finding the table.
+        if let Some(symbols) = Self::of(Value::from_bits(mc.interned().get())) {
+            return Ok(symbols);
+        }
         Self::with_seed(mc, RandomState::new().hash_one(0u8))
     }
 

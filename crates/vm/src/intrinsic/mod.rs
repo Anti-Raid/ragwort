@@ -606,6 +606,10 @@ named! {
         /// `(table key value ...)`: allocates a table with an entry for each `key` and `value`, in that
         /// order. A key given twice keeps its first position and takes its last value.
         MakeTableOf = ("table", any(TRUTHY)),
+        /// `(make-shaped-table shape value ...)`: allocates a table with the keys of `shape` and one
+        /// `value` for each key, in the order of the keys. The compiler emits it for a `table` call
+        /// whose keys are all constants. See `ragwort_types::table::Shape`.
+        MakeShapedTable = ("make-shaped-table", any(TRUTHY | INTERNAL)),
         /// `(table-ref t key default)`: returns the value of `key` in table `t`, or `default` if `t` has
         /// no such key.
         TableRef = ("table-ref", takes(3, 0)),
@@ -1305,6 +1309,7 @@ impl Intrinsic {
             Intrinsic::IsTable => boolean(Table::of(operands.get(0)).is_some()),
             Intrinsic::MakeTable
             | Intrinsic::MakeTableOf
+            | Intrinsic::MakeShapedTable
             | Intrinsic::TableRef
             | Intrinsic::TableSet
             | Intrinsic::TableDelete

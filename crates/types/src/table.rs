@@ -27,6 +27,31 @@
 //! order, the tombstones are dropped, and the new index is at most half full. So a table grows
 //! by doubling, and shrinks if most of its entries were removed.
 //!
+//! # Shapes
+//!
+//! Many tables have the same keys in the same order: the records of one kind that a program
+//! makes, or the events of one kind that a host passes in. A [`Shape`] is such a list of keys with
+//! its index, built once. [`Tables::shaped`] makes a table from a shape and a value for each key:
+//!
+//! - The table is one object that holds a reference to the shape and the values. It has no keys
+//!   and no index of its own, and nothing is hashed to make it. With six keys it takes about 90
+//!   bytes, where a table that is filled key by key takes 250 to 400.
+//! - A program uses the table like any other. It can change and remove entries in place. The
+//!   first key that is added moves the entries to an ordinary table, which the first table then
+//!   passes every call on to. The shape and the other tables made from it are never affected.
+//! - A key has the same position in every table of the shape. An instruction that reads a
+//!   constant key remembers the shape and the position where it found the key. In the next table
+//!   of that shape it reads the value at that position without comparing a key. See
+//!   [`Table::get_hinted`].
+//!
+//! A host can give an external table a shape as well, with [`Tables::external_shaped`]. The
+//! values read from the host are then cached by position, and the first read of a key of a new
+//! table costs little more than a later read. See [`ExternalTable::get_at`].
+//!
+//! The keys of a shape are compared by value: strings, symbols, numbers, characters, booleans and
+//! external references whose kind compares by value. A key that is compared by identity cannot
+//! be in a shape, because its hash changes when a collection moves it.
+//!
 //! # Hashes
 //!
 //! Hashes are seeded with the seed of the arena's symbol table. The seed is random unless the
@@ -105,6 +130,8 @@
 //! - The value that `get` returns for a key never changes, except through the table's own
 //!   `set`, `delete` and `clear`. For a type that is not writable it never changes at all.
 //! - No method calls back into the table it is called on.
+//! - A table made with [`Tables::external_shaped`] has no key outside its shape when it is made,
+//!   and `get_at` returns for a position what `get` returns for the key at that position.
 //!
 //! A broken promise makes the table return wrong or stale values. It cannot cause memory
 //! unsafety.
@@ -115,14 +142,13 @@
 
 use std::any::Any;
 use std::cell::{Ref, RefCell};
-use std::fmt::{self, Write};
 use std::hash::Hasher;
 
 use crate::Error;
 use crate::external::ExternalRef;
 use crate::gc::{Gc, Mutation, OutOfMemory, Slots, Value, slot};
 use crate::num::{Nums, complex, int};
-use crate::objects::{self, Data, ExternTableFields, TableEntriesFields, TableFields, TableIndexFields};
+use crate::objects::{self, Data, ExternTableFields, TableEntriesFields, TableFields, TableIndexFields, TableRecordFields, TableShapeFields};
 use crate::string::{self, Strings};
 use crate::symbol::{Symbol, Symbols};
 
@@ -163,6 +189,71 @@ impl From<OutOfMemory> for TableError {
     }
 }
 
+/// The reason that a list of keys cannot be a [`Shape`]. Each variant gives the position of the key at fault.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShapeError {
+    /// The key is the same key as an earlier one.
+    Duplicate(usize),
+    /// The key is compared by identity, so its hash changes when a collection moves it.
+    Identity(usize),
+    Arena(Error),
+}
+
+impl From<Error> for ShapeError {
+    fn from(error: Error) -> Self {
+        Self::Arena(error)
+    }
+}
+
+impl From<OutOfMemory> for ShapeError {
+    fn from(error: OutOfMemory) -> Self {
+        Self::Arena(error.into())
+    }
+}
+
+/// The keys that a group of tables has in common, in entry order, with the hash index that those tables share. See the [module docs](self).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Shape<'gc>(Gc<'gc, objects::TableShape>);
+
+impl<'gc> Shape<'gc> {
+    #[inline]
+    pub fn of(value: Value<'gc>) -> Option<Self> {
+        match Data::of(value) {
+            Some(Data::TableShape(shape)) => Some(Self(shape)),
+            _ => None,
+        }
+    }
+
+    pub fn value(self, mc: &Mutation<'gc>) -> Value<'gc> {
+        Value::object(mc, self.0)
+    }
+
+    /// Returns the number of keys.
+    pub fn len(self, mc: &Mutation<'gc>) -> usize {
+        self.0.pairs(mc).map_or(0, |pairs| pairs.items(mc).len() / 2)
+    }
+
+    pub fn is_empty(self, mc: &Mutation<'gc>) -> bool {
+        self.len(mc) == 0
+    }
+
+    /// Returns the key at `position`, or `None` if `position` is not below the number of keys.
+    pub fn key(self, mc: &Mutation<'gc>, position: usize) -> Option<Value<'gc>> {
+        let pairs = self.0.pairs(mc)?.items(mc);
+        (position < pairs.len() / 2).then(|| pairs.get(2 * position))
+    }
+
+    /// Returns the position of `key`, or `None` if the shape does not have the key. This is the entry number of `key` in every table made from the shape.
+    pub fn position(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<usize>, Error> {
+        let Some(parts) = self.parts(mc) else { return Ok(None) };
+        parts.find(mc, key, hash(mc, self.0.seed(mc), key)?.hash)
+    }
+
+    fn parts(self, mc: &Mutation<'gc>) -> Option<Parts<'gc>> {
+        Some(Parts { index: self.0.index(mc)?.items(mc), entries: self.0.pairs(mc)?.items(mc) })
+    }
+}
+
 /// A table. Its entries are stored in the arena or owned by the host. See the [module docs](self).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Table<'gc>(Kept<'gc>);
@@ -170,6 +261,7 @@ pub struct Table<'gc>(Kept<'gc>);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kept<'gc> {
     Inside(Inside<'gc>),
+    Record(Record<'gc>),
     Outside(Outside<'gc>),
 }
 
@@ -178,6 +270,7 @@ impl<'gc> Table<'gc> {
     pub fn of(value: Value<'gc>) -> Option<Self> {
         match Data::of(value) {
             Some(Data::Table(table)) => Some(Self(Kept::Inside(Inside(table)))),
+            Some(Data::TableRecord(table)) => Some(Self(Kept::Record(Record(table)))),
             Some(Data::ExternTable(table)) => Some(Self(Kept::Outside(Outside(table)))),
             _ => None,
         }
@@ -186,6 +279,7 @@ impl<'gc> Table<'gc> {
     pub fn value(self, mc: &Mutation<'gc>) -> Value<'gc> {
         match self.0 {
             Kept::Inside(table) => Value::object(mc, table.0),
+            Kept::Record(table) => Value::object(mc, table.0),
             Kept::Outside(table) => Value::object(mc, table.0),
         }
     }
@@ -198,7 +292,7 @@ impl<'gc> Table<'gc> {
     /// Returns whether the table can be modified. Only an external table can be read-only.
     pub fn is_writable(self, mc: &Mutation<'gc>) -> bool {
         match self.0 {
-            Kept::Inside(_) => true,
+            Kept::Inside(_) | Kept::Record(_) => true,
             Kept::Outside(table) => table.0.writable(mc),
         }
     }
@@ -213,7 +307,20 @@ impl<'gc> Table<'gc> {
     pub fn len(self, mc: &Mutation<'gc>) -> usize {
         match self.0 {
             Kept::Inside(table) => table.len(mc),
+            Kept::Record(table) => table.len(mc),
             Kept::Outside(table) => table.len(mc),
+        }
+    }
+
+    /// Returns the shape whose positions the table's entries are at, or `None` if the table has no shape. A table made from a shape loses it when a key outside the shape is added.
+    ///
+    /// The shape tells an instruction where to find a key in the next table of the same shape. See [`Table::get_hinted`].
+    #[inline]
+    pub fn shape(self, mc: &Mutation<'gc>) -> Option<Shape<'gc>> {
+        match self.0 {
+            Kept::Inside(_) => None,
+            Kept::Record(table) => table.0.shape(mc).map(Shape),
+            Kept::Outside(table) => table.0.shape(mc).map(Shape),
         }
     }
 
@@ -226,6 +333,7 @@ impl<'gc> Table<'gc> {
     pub fn get(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<Value<'gc>>, Error> {
         match self.0 {
             Kept::Inside(table) => table.get(mc, key),
+            Kept::Record(table) => table.get(mc, key),
             Kept::Outside(table) => table.get(mc, key),
         }
     }
@@ -246,7 +354,35 @@ impl<'gc> Table<'gc> {
     pub fn get_at(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize) -> Option<Value<'gc>> {
         match self.0 {
             Kept::Inside(table) => table.get_at(mc, key, position),
-            Kept::Outside(table) => Inside(table.0.memo(mc)?).get_at(mc, key, position),
+            Kept::Record(table) => table.get_at(mc, key, position),
+            Kept::Outside(table) => table.cached(mc)?.get_at(mc, key, position),
+        }
+    }
+
+    /// Works like [`Table::get_at`] for an instruction that also remembers the shape of the table in which it found `key` at `position`. `shape` is that shape's value, or any other value if the table had none.
+    ///
+    /// If the table has the same shape, `key` is at `position` and no key is compared. This is the usual case for code that reads one field of many records of one kind.
+    #[inline(always)]
+    pub fn get_hinted(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize, shape: Value<'gc>) -> Option<Value<'gc>> {
+        match self.0 {
+            Kept::Inside(table) => table.get_at(mc, key, position),
+            Kept::Record(table) => table.get_hinted(mc, key, position, shape),
+            Kept::Outside(table) => table.cached(mc)?.get_hinted(mc, key, position, shape),
+        }
+    }
+
+    /// Works like [`Table::find`], and tries `position` first. `position` is where `key` was found before, in this table or in another one.
+    ///
+    /// For an external table with a shape, this is the cheap way to read a key for the first time. If `key` is the key at `position` of the shape, the value is read from the host and cached at that position, and nothing is hashed.
+    pub fn find_from(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize) -> Result<Option<(usize, Value<'gc>)>, Error> {
+        match self.0 {
+            Kept::Inside(table) => table.find(mc, key),
+            Kept::Record(table) => table.find(mc, key),
+            Kept::Outside(table) => match table.find_at(mc, key, position)? {
+                AtPosition::Found(value) => Ok(Some((position, value))),
+                AtPosition::Absent => Ok(None),
+                AtPosition::Unknown => self.find(mc, key),
+            },
         }
     }
 
@@ -255,13 +391,8 @@ impl<'gc> Table<'gc> {
     pub fn find(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<(usize, Value<'gc>)>, Error> {
         match self.0 {
             Kept::Inside(table) => table.find(mc, key),
-            Kept::Outside(table) => {
-                // `get` caches the value in the memo table. The position is the entry's position in that table.
-                if table.get(mc, key)?.is_none() {
-                    return Ok(None);
-                }
-                table.memo(mc)?.find(mc, key)
-            }
+            Kept::Record(table) => table.find(mc, key),
+            Kept::Outside(table) => table.find(mc, key),
         }
     }
 
@@ -274,6 +405,17 @@ impl<'gc> Table<'gc> {
     pub fn set_at(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize, value: Value<'gc>) -> bool {
         match self.0 {
             Kept::Inside(table) => table.set_at(mc, key, position, value),
+            Kept::Record(table) => table.set_at(mc, key, position, value),
+            Kept::Outside(_) => false,
+        }
+    }
+
+    /// Works like [`Table::set_at`] for an instruction that also remembers the shape of the table in which it found `key`. See [`Table::get_hinted`].
+    #[inline(always)]
+    pub fn set_hinted(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize, shape: Value<'gc>, value: Value<'gc>) -> bool {
+        match self.0 {
+            Kept::Inside(table) => table.set_at(mc, key, position, value),
+            Kept::Record(table) => table.set_hinted(mc, key, position, shape, value),
             Kept::Outside(_) => false,
         }
     }
@@ -283,6 +425,7 @@ impl<'gc> Table<'gc> {
     pub fn has(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<bool, Error> {
         match self.0 {
             Kept::Inside(table) => Ok(table.get(mc, key)?.is_some()),
+            Kept::Record(table) => Ok(table.get(mc, key)?.is_some()),
             Kept::Outside(table) => table.has(mc, key),
         }
     }
@@ -305,6 +448,7 @@ impl<'gc> Table<'gc> {
     pub fn set_finding(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) -> Result<Option<usize>, TableError> {
         match self.0 {
             Kept::Inside(table) => Ok(Some(table.set(mc, key, value)?)),
+            Kept::Record(table) => Ok(Some(table.set(mc, key, value)?)),
             Kept::Outside(table) => table.set(mc, key, value).map(|()| None),
         }
     }
@@ -313,6 +457,7 @@ impl<'gc> Table<'gc> {
     pub fn delete(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<bool, TableError> {
         match self.0 {
             Kept::Inside(table) => Ok(table.delete(mc, key)?),
+            Kept::Record(table) => Ok(table.delete(mc, key)?),
             Kept::Outside(table) => table.delete(mc, key),
         }
     }
@@ -323,6 +468,7 @@ impl<'gc> Table<'gc> {
                 table.clear(mc);
                 Ok(())
             }
+            Kept::Record(table) => Ok(table.clear(mc)?),
             Kept::Outside(table) => table.clear(mc),
         }
     }
@@ -334,9 +480,10 @@ impl<'gc> Table<'gc> {
     pub fn entries(self, mc: &Mutation<'gc>) -> Result<Entries<'gc>, Error> {
         match self.0 {
             Kept::Inside(table) => Ok(table.entries(mc)),
+            Kept::Record(table) => Ok(table.entries(mc)),
             Kept::Outside(table) => {
                 let walk = table.walk(mc)?;
-                Ok(Entries { entries: Some(walk), at: 0, end: walk.len() / 2 })
+                Ok(Entries { entries: Some(walk), values: None, at: 0, end: walk.len() / 2 })
             }
         }
     }
@@ -351,6 +498,7 @@ impl<'gc> Table<'gc> {
     pub fn held(self, mc: &Mutation<'gc>, index: usize) -> Option<Value<'gc>> {
         match self.0 {
             Kept::Inside(table) => table.held(mc, index),
+            Kept::Record(table) => table.held(mc, index),
             Kept::Outside(table) => {
                 let walk = table.walk(mc).ok()?;
                 (index < walk.len()).then(|| walk.get(index))
@@ -364,6 +512,7 @@ impl<'gc> Table<'gc> {
     pub fn is_stale(self, mc: &Mutation<'gc>) -> bool {
         match self.0 {
             Kept::Inside(table) => table.is_stale(mc),
+            Kept::Record(table) => table.own(mc).is_some_and(|own| own.is_stale(mc)),
             Kept::Outside(_) => false,
         }
     }
@@ -460,7 +609,7 @@ impl<'gc> Inside<'gc> {
     }
 
     fn entries(self, mc: &Mutation<'gc>) -> Entries<'gc> {
-        Entries { entries: self.0.pairs(mc).map(|entries| entries.items(mc)), at: 0, end: self.0.used(mc) as usize }
+        Entries { entries: self.0.pairs(mc).map(|entries| entries.items(mc)), values: None, at: 0, end: self.0.used(mc) as usize }
     }
 
     fn held(self, mc: &Mutation<'gc>, index: usize) -> Option<Value<'gc>> {
@@ -538,7 +687,10 @@ impl<'gc> Inside<'gc> {
 /// or removed during iteration may or may not appear.
 #[derive(Clone, Copy)]
 pub struct Entries<'gc> {
+    /// The keys, each followed by a value slot.
     entries: Option<Slots<'gc>>,
+    /// The values of a record, one for each key. If this is `None`, the values are in `entries`.
+    values: Option<Slots<'gc>>,
     at: usize,
     end: usize,
 }
@@ -550,12 +702,268 @@ impl<'gc> Iterator for Entries<'gc> {
         let entries = self.entries?;
         while self.at < self.end {
             let key = entries.get(2 * self.at);
+            let value = match self.values {
+                Some(values) => values.get(self.at),
+                None => entries.get(2 * self.at + 1),
+            };
             self.at += 1;
-            if key != Value::BROKEN {
-                return Some((key, entries.get(2 * self.at - 1)));
+            // A removed entry has no key. A key that a record does not have has no value.
+            if key != Value::BROKEN && value != Value::BROKEN {
+                return Some((key, value));
             }
         }
         None
+    }
+}
+
+/// A table that holds only its values and takes its keys from a shape. See the [module docs](self).
+///
+/// A record that has grown past its shape keeps its entries in an ordinary table. Every method then passes the call on to that table.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Record<'gc>(Gc<'gc, objects::TableRecord>);
+
+impl<'gc> Record<'gc> {
+    /// Returns the ordinary table that holds the entries, if the record has grown past its shape.
+    #[inline]
+    fn own(self, mc: &Mutation<'gc>) -> Option<Inside<'gc>> {
+        self.0.own(mc).map(Inside)
+    }
+
+    /// Returns the value at `position`, or `None` if the record does not have the key at that position. The record must not have grown.
+    #[inline(always)]
+    fn value_at(self, mc: &Mutation<'gc>, position: usize) -> Option<Value<'gc>> {
+        let values = self.0.items(mc);
+        (position < values.len()).then(|| values.get(position)).filter(|&value| value != Value::BROKEN)
+    }
+
+    /// Returns the position of `key` in the record's shape, or `None` if the shape does not have the key or the record has grown.
+    fn position(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<usize>, Error> {
+        match self.0.shape(mc) {
+            Some(shape) => Shape(shape).position(mc, key),
+            None => Ok(None),
+        }
+    }
+
+    fn len(self, mc: &Mutation<'gc>) -> usize {
+        match self.own(mc) {
+            Some(own) => own.len(mc),
+            None => self.0.live(mc) as usize,
+        }
+    }
+
+    fn get(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<Value<'gc>>, Error> {
+        Ok(self.find(mc, key)?.map(|(_, value)| value))
+    }
+
+    fn find(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<(usize, Value<'gc>)>, Error> {
+        if let Some(own) = self.own(mc) {
+            return own.find(mc, key);
+        }
+        let Some(position) = self.position(mc, key)? else { return Ok(None) };
+        Ok(self.value_at(mc, position).map(|value| (position, value)))
+    }
+
+    #[inline(never)]
+    fn get_at(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize) -> Option<Value<'gc>> {
+        match self.0.shape(mc) {
+            Some(shape) if Shape(shape).key(mc, position) == Some(key) => self.value_at(mc, position),
+            Some(_) => None,
+            None => self.own(mc)?.get_at(mc, key, position),
+        }
+    }
+
+    /// Works like [`Record::get_at`]. If the record's shape is the object `shape`, the key at `position` is `key`, and no key is read.
+    #[inline(always)]
+    fn get_hinted(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize, shape: Value<'gc>) -> Option<Value<'gc>> {
+        match self.0.shape(mc) {
+            Some(own) if Value::object(mc, own) == shape => self.value_at(mc, position),
+            _ => self.get_at(mc, key, position),
+        }
+    }
+
+    /// Sets the value of `key`, and returns the position of its entry. A key that the record does not have moves the entries to an ordinary table first, so that the key is appended as the last entry.
+    fn set(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) -> Result<usize, Error> {
+        if let Some(own) = self.own(mc) {
+            return own.set(mc, key, value);
+        }
+        if let Some(position) = self.position(mc, key)?
+            && self.value_at(mc, position).is_some()
+        {
+            self.0.items(mc).set(mc, position, value);
+            return Ok(position);
+        }
+        self.grow(mc)?.set(mc, key, value)
+    }
+
+    #[inline(never)]
+    fn set_at(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize, value: Value<'gc>) -> bool {
+        match self.0.shape(mc) {
+            Some(shape) if Shape(shape).key(mc, position) == Some(key) => self.replace(mc, position, value),
+            Some(_) => false,
+            None => self.own(mc).is_some_and(|own| own.set_at(mc, key, position, value)),
+        }
+    }
+
+    #[inline(always)]
+    fn set_hinted(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize, shape: Value<'gc>, value: Value<'gc>) -> bool {
+        match self.0.shape(mc) {
+            Some(own) if Value::object(mc, own) == shape => self.replace(mc, position, value),
+            _ => self.set_at(mc, key, position, value),
+        }
+    }
+
+    /// Replaces the value at `position`, if the record has the key at that position. Returns whether it did.
+    #[inline(always)]
+    fn replace(self, mc: &Mutation<'gc>, position: usize, value: Value<'gc>) -> bool {
+        if self.value_at(mc, position).is_none() {
+            return false;
+        }
+        self.0.items(mc).set(mc, position, value);
+        true
+    }
+
+    /// Removes the entry of `key`. The record keeps its shape. If the key is set again, [`Record::set`] appends it as the last entry, as an ordinary table does.
+    fn delete(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<bool, Error> {
+        if let Some(own) = self.own(mc) {
+            return own.delete(mc, key);
+        }
+        let Some(position) = self.position(mc, key)? else { return Ok(false) };
+        if self.value_at(mc, position).is_none() {
+            return Ok(false);
+        }
+        self.0.items(mc).set(mc, position, Value::BROKEN);
+        self.0.set_live(mc, self.0.live(mc) - 1);
+        Ok(true)
+    }
+
+    fn clear(self, mc: &Mutation<'gc>) -> Result<(), Error> {
+        match self.own(mc) {
+            Some(own) => own.clear(mc),
+            None => self.move_to(mc, Tables::new(mc).inside(0)?),
+        }
+        Ok(())
+    }
+
+    fn entries(self, mc: &Mutation<'gc>) -> Entries<'gc> {
+        if let Some(own) = self.own(mc) {
+            return own.entries(mc);
+        }
+        let values = self.0.items(mc);
+        let keys = self.0.shape(mc).and_then(|shape| shape.pairs(mc)).map(|pairs| pairs.items(mc));
+        Entries { entries: keys, values: Some(values), at: 0, end: values.len() }
+    }
+
+    fn held(self, mc: &Mutation<'gc>, index: usize) -> Option<Value<'gc>> {
+        if let Some(own) = self.own(mc) {
+            return own.held(mc, index);
+        }
+        let values = self.0.items(mc);
+        let value = (index / 2 < values.len()).then(|| values.get(index / 2))?;
+        // A key that the record does not have reads as a removed entry: both its slots are `Value::BROKEN`.
+        if index % 2 == 1 || value == Value::BROKEN {
+            return Some(value);
+        }
+        Shape(self.0.shape(mc)?).key(mc, index / 2)
+    }
+
+    /// Moves the entries to an ordinary table with room for one more, and returns that table. The record then passes every call on to it.
+    #[cold]
+    #[inline(never)]
+    fn grow(self, mc: &Mutation<'gc>) -> Result<Inside<'gc>, Error> {
+        let table = Tables::new(mc).inside(self.0.live(mc) as usize + 1)?;
+        for (key, value) in self.entries(mc) {
+            table.set(mc, key, value)?;
+        }
+        self.move_to(mc, table);
+        Ok(table)
+    }
+
+    /// Makes `table` the table that holds the record's entries from now on.
+    fn move_to(self, mc: &Mutation<'gc>, table: Inside<'gc>) {
+        self.0.set_own(mc, Some(table.0));
+        self.0.set_shape(mc, None);
+        self.0.set_live(mc, 0);
+        // The record's own values are not read again. Clearing them lets the collector free what only they refer to.
+        let values = self.0.items(mc);
+        for position in 0..values.len() {
+            values.set(mc, position, Value::BROKEN);
+        }
+    }
+
+    /// Returns the slot at `position`: the value, or `Value::BROKEN` if the record does not have the key. Returns `None` if the record has grown or has no such position.
+    fn slot(self, mc: &Mutation<'gc>, position: usize) -> Option<Value<'gc>> {
+        self.0.shape(mc)?;
+        let values = self.0.items(mc);
+        (position < values.len()).then(|| values.get(position))
+    }
+
+    /// Stores `value` at `position`, whether or not the record has the key at that position yet. The record must not have grown. Unlike [`Record::set`], this does not treat a key that the record lacks as a new last entry. It is for a cache, where the order of the entries does not matter.
+    fn fill(self, mc: &Mutation<'gc>, position: usize, value: Value<'gc>) {
+        let values = self.0.items(mc);
+        if values.get(position) == Value::BROKEN {
+            self.0.set_live(mc, self.0.live(mc) + 1);
+        }
+        values.set(mc, position, value);
+    }
+}
+
+/// The cache of the values read from an external table: an ordinary table, or a record if the external table has a shape.
+#[derive(Clone, Copy)]
+enum Memo<'gc> {
+    Plain(Inside<'gc>),
+    Fields(Record<'gc>),
+}
+
+impl<'gc> Memo<'gc> {
+    fn get(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<Value<'gc>>, Error> {
+        match self {
+            Self::Plain(table) => table.get(mc, key),
+            Self::Fields(record) => record.get(mc, key),
+        }
+    }
+
+    fn find(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<(usize, Value<'gc>)>, Error> {
+        match self {
+            Self::Plain(table) => table.find(mc, key),
+            Self::Fields(record) => record.find(mc, key),
+        }
+    }
+
+    #[inline]
+    fn get_at(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize) -> Option<Value<'gc>> {
+        match self {
+            Self::Plain(table) => table.get_at(mc, key, position),
+            Self::Fields(record) => record.get_at(mc, key, position),
+        }
+    }
+
+    #[inline(always)]
+    fn get_hinted(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize, shape: Value<'gc>) -> Option<Value<'gc>> {
+        match self {
+            Self::Plain(table) => table.get_at(mc, key, position),
+            Self::Fields(record) => record.get_hinted(mc, key, position, shape),
+        }
+    }
+
+    fn delete(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<bool, Error> {
+        match self {
+            Self::Plain(table) => table.delete(mc, key),
+            Self::Fields(record) => record.delete(mc, key),
+        }
+    }
+
+    /// Caches `value` as the value of `key`, and returns the position of the entry. A record caches a key of its shape at the position of the shape.
+    fn cache(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) -> Result<usize, Error> {
+        match self {
+            Self::Plain(table) => table.set(mc, key, value),
+            Self::Fields(record) => {
+                if let Some(position) = record.position(mc, key)? {
+                    record.fill(mc, position, value);
+                    return Ok(position);
+                }
+                record.set(mc, key, value)
+            }
+        }
     }
 }
 
@@ -584,6 +992,52 @@ impl<'a, 'gc> Tables<'a, 'gc> {
         Ok(Table(Kept::Inside(self.inside(entries)?)))
     }
 
+    /// Returns a shape with `keys`, in order. See [`ShapeError`] for the keys that a shape cannot have.
+    pub fn shape(&self, keys: &[Value<'gc>]) -> Result<Shape<'gc>, ShapeError> {
+        let mc = self.mc;
+        let seed = Symbols::of_arena(mc)?.seed(mc);
+        let slots = keys.len().checked_mul(2).and_then(usize::checked_next_power_of_two).ok_or_else(|| mc.out_of_memory())?.max(MIN_SLOTS);
+        let index = objects::TableIndex::new(mc, slots, 0)?;
+        // The entries array holds the keys in order, each followed by a value slot that stays unused. The tables of the shape keep their values themselves.
+        let pairs = objects::TableEntries::new(mc, 2 * keys.len(), Value::BROKEN)?;
+        let parts = Parts { index: index.items(mc), entries: pairs.items(mc) };
+        for (position, &key) in keys.iter().enumerate() {
+            let hashed = hash(mc, seed, key)?;
+            if hashed.by_place || key == Value::BROKEN {
+                return Err(ShapeError::Identity(position));
+            }
+            if parts.find(mc, key, hashed.hash)?.is_some() {
+                return Err(ShapeError::Duplicate(position));
+            }
+            parts.entries.set(mc, 2 * position, key);
+            parts.link(mc, hashed.hash, position);
+        }
+        Ok(Shape(objects::TableShape::new(mc, Some(index), Some(pairs), seed)?))
+    }
+
+    /// Returns a table with the keys of `shape` and a value for each key, in the order of the keys. A `None` leaves its key out of the table, as if the key had been removed. Values past the number of keys are ignored, and keys without a value are left out.
+    ///
+    /// The table holds only the values. It takes its keys from `shape`. See the [module docs](self).
+    pub fn shaped(&self, shape: Shape<'gc>, values: impl Iterator<Item = Option<Value<'gc>>>) -> Result<Table<'gc>, Error> {
+        Ok(Table(Kept::Record(self.record(shape, values)?)))
+    }
+
+    fn record(&self, shape: Shape<'gc>, values: impl Iterator<Item = Option<Value<'gc>>>) -> Result<Record<'gc>, Error> {
+        let mc = self.mc;
+        let count = shape.len(mc);
+        let record = objects::TableRecord::new(mc, Some(shape.0), None, 0, count, Value::BROKEN)?;
+        let slots = record.items(mc);
+        let mut live = 0;
+        for (position, value) in values.take(count).enumerate() {
+            if let Some(value) = value {
+                slots.set(mc, position, value);
+                live += 1;
+            }
+        }
+        record.set_live(mc, live);
+        Ok(Record(record))
+    }
+
     fn inside(&self, entries: usize) -> Result<Inside<'gc>, Error> {
         let mc = self.mc;
         let seed = Symbols::of_arena(mc)?.seed(mc);
@@ -603,7 +1057,20 @@ impl<'a, 'gc> Tables<'a, 'gc> {
     pub fn external<T: ExternalTable>(&self, host: T, bytes: usize) -> Result<Table<'gc>, Error> {
         let mc = self.mc;
         let host: RefCell<Box<dyn Hosted>> = RefCell::new(Box::new(host));
-        let table = objects::ExternTable::new(mc, None, None, T::WRITABLE, mc.frozen_owning(host, bytes)?)?;
+        let table = objects::ExternTable::new(mc, None, None, None, None, T::WRITABLE, mc.frozen_owning(host, bytes)?)?;
+        Ok(Table(Kept::Outside(Outside(table))))
+    }
+
+    /// Returns a table whose entries are owned by `host` and whose keys are the keys of `shape`. It works like [`Tables::external`], and reads are cheaper:
+    ///
+    /// - The values read from the host are cached by position, in a table that shares the index of `shape`.
+    /// - An instruction that reads a constant key finds the key at the same position in every table of the shape. Its first read of a new table needs no hash, and asks the host by position if the host implements [`ExternalTable::get_at`].
+    ///
+    /// The host promises that the table has no key outside `shape` when it is made. The table can have fewer keys, and a writable table can gain other keys later.
+    pub fn external_shaped<T: ExternalTable>(&self, shape: Shape<'gc>, host: T, bytes: usize) -> Result<Table<'gc>, Error> {
+        let mc = self.mc;
+        let host: RefCell<Box<dyn Hosted>> = RefCell::new(Box::new(host));
+        let table = objects::ExternTable::new(mc, None, None, None, Some(shape.0), T::WRITABLE, mc.frozen_owning(host, bytes)?)?;
         Ok(Table(Kept::Outside(Outside(table))))
     }
 }
@@ -662,6 +1129,19 @@ pub trait ExternalTable: 'static {
         None::<std::iter::Empty<Result<(Key<'_>, Value<'gc>), Error>>>
     }
 
+    /// Returns the value of the key at `position` of the table's shape, or `Some(Ok(None))` if the
+    /// table has no entry for that key. It is only called for a table made with
+    /// [`Tables::external_shaped`], and it must agree with [`ExternalTable::get`] for the same key.
+    ///
+    /// Returns `None` if the host cannot look a value up by position. That is the default, and
+    /// the arena then calls `get` with the key. A host that stores its fields in the order of
+    /// the shape should implement this method. A read then needs no key, so nothing is hashed
+    /// and no key text is copied for the host.
+    fn get_at<'gc>(&self, mc: &Mutation<'gc>, position: usize) -> Option<Result<Option<Value<'gc>>, Error>> {
+        let _ = (mc, position);
+        None
+    }
+
     /// Sets the value of `key`. The host must copy the data it needs out of `value` during the
     /// call. It cannot keep `value` itself.
     fn set<'gc>(&mut self, mc: &Mutation<'gc>, key: Key<'_>, value: Value<'gc>) -> Result<(), Refused> {
@@ -684,6 +1164,7 @@ pub(crate) trait Hosted: 'static {
     fn count(&self) -> usize;
     fn contains(&self, key: Key<'_>) -> bool;
     fn fetch<'gc>(&self, mc: &Mutation<'gc>, key: Key<'_>) -> Result<Option<Value<'gc>>, Error>;
+    fn fetch_at<'gc>(&self, mc: &Mutation<'gc>, position: usize) -> Option<Result<Option<Value<'gc>>, Error>>;
     /// Appends every key to `listed`, as an arena value. If the host implements
     /// [`ExternalTable::entries`], each key is followed by its value, and this returns `true`.
     /// Otherwise this returns `false`.
@@ -705,6 +1186,10 @@ impl<T: ExternalTable> Hosted for T {
 
     fn fetch<'gc>(&self, mc: &Mutation<'gc>, key: Key<'_>) -> Result<Option<Value<'gc>>, Error> {
         self.get(mc, key)
+    }
+
+    fn fetch_at<'gc>(&self, mc: &Mutation<'gc>, position: usize) -> Option<Result<Option<Value<'gc>>, Error>> {
+        self.get_at(mc, position)
     }
 
     fn list<'gc>(&self, mc: &Mutation<'gc>, listed: &mut Vec<Value<'gc>>) -> Result<bool, Error> {
@@ -777,35 +1262,20 @@ struct Text {
 }
 
 impl Text {
-    fn copy(shown: impl fmt::Display) -> Self {
-        let mut text = Self { short: [0; SHORT], len: 0, long: String::new() };
-        write!(text, "{shown}").expect("copying text into memory does not fail");
-        text
+    fn copy<'gc>(strings: &Strings<'_, 'gc>, string: string::Str<'gc>) -> Self {
+        let mut short = [0; SHORT];
+        match string::copy_utf8(strings, string, &mut short) {
+            Some(len) => Self { short, len, long: String::new() },
+            None => Self { short, len: 0, long: string::display(strings, string).to_string() },
+        }
     }
 
     fn as_str(&self) -> &str {
         if self.long.is_empty() {
-            std::str::from_utf8(&self.short[..self.len]).expect("only whole strings are copied in")
+            std::str::from_utf8(&self.short[..self.len]).expect("a whole string was copied in")
         } else {
             &self.long
         }
-    }
-}
-
-impl fmt::Write for Text {
-    fn write_str(&mut self, part: &str) -> fmt::Result {
-        if !self.long.is_empty() {
-            self.long.push_str(part);
-        } else if let Some(room) = self.short.get_mut(self.len..self.len + part.len()) {
-            room.copy_from_slice(part.as_bytes());
-            self.len += part.len();
-        } else {
-            let start = std::str::from_utf8(&self.short[..self.len]).map_err(|_| fmt::Error)?;
-            self.long.reserve(start.len() + part.len());
-            self.long.push_str(start);
-            self.long.push_str(part);
-        }
-        Ok(())
     }
 }
 
@@ -825,10 +1295,10 @@ impl HostKey {
         }
         let strings = Strings::new(mc);
         if let Some(symbol) = Symbol::of(key) {
-            return Some(Self::Symbol(Text::copy(string::display(&strings, symbol.name(mc)))));
+            return Some(Self::Symbol(Text::copy(&strings, symbol.name(mc))));
         }
         if let Some(text) = strings.string(key) {
-            return Some(Self::String(Text::copy(string::display(&strings, text))));
+            return Some(Self::String(Text::copy(&strings, text)));
         }
         if let Some(character) = key.as_char() {
             return Some(Self::Plain(Key::Char(character)));
@@ -854,6 +1324,16 @@ impl HostKey {
     }
 }
 
+/// The result of reading a key of an external table at a position of the table's shape. See [`Outside::find_at`].
+enum AtPosition<'gc> {
+    /// The key has this value, which is now cached at the position.
+    Found(Value<'gc>),
+    /// The host has no entry for the key.
+    Absent,
+    /// The position does not answer the read. The table has no shape, the key is not at the position, or the host is asked by key. The key has to be found the general way.
+    Unknown,
+}
+
 /// A table whose entries are owned by the host.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Outside<'gc>(Gc<'gc, objects::ExternTable>);
@@ -863,35 +1343,100 @@ impl<'gc> Outside<'gc> {
         self.0.host(mc).and_then(|host| host.try_borrow().ok()).map_or(0, |host| host.count())
     }
 
-    /// Returns the memo table, which caches the values read from the host so far. Creates it if it does not exist yet.
-    fn memo(self, mc: &Mutation<'gc>) -> Result<Inside<'gc>, Error> {
-        if let Some(memo) = self.0.memo(mc) {
-            return Ok(Inside(memo));
+    /// Returns the cache of the values read from the host so far, or `None` if nothing has been cached yet.
+    #[inline(always)]
+    fn cached(self, mc: &Mutation<'gc>) -> Option<Memo<'gc>> {
+        match self.0.fields(mc) {
+            Some(fields) => Some(Memo::Fields(Record(fields))),
+            None => self.0.memo(mc).map(|memo| Memo::Plain(Inside(memo))),
         }
-        let memo = Tables::new(mc).inside(0)?;
-        self.0.set_memo(mc, Some(memo.0));
-        Ok(memo)
+    }
+
+    /// Returns the cache of the values read from the host so far. Creates it if it does not exist yet: a record for a table with a shape, and an ordinary table otherwise.
+    fn memo(self, mc: &Mutation<'gc>) -> Result<Memo<'gc>, Error> {
+        if let Some(memo) = self.cached(mc) {
+            return Ok(memo);
+        }
+        let tables = Tables::new(mc);
+        match self.0.shape(mc) {
+            Some(shape) => {
+                // The record starts without any of its keys. A key is added when its value is read.
+                let fields = tables.record(Shape(shape), std::iter::empty())?;
+                self.0.set_fields(mc, Some(fields.0));
+                Ok(Memo::Fields(fields))
+            }
+            None => {
+                let memo = tables.inside(0)?;
+                self.0.set_memo(mc, Some(memo.0));
+                Ok(Memo::Plain(memo))
+            }
+        }
+    }
+
+    /// Returns the cached value of `key`, or `None` if the value of `key` has not been read from the host.
+    fn known(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<Value<'gc>>, Error> {
+        match self.cached(mc) {
+            Some(memo) => memo.get(mc, key),
+            None => Ok(None),
+        }
+    }
+
+    /// Reads `key` at `position` of the table's shape, without hashing `key`. The value comes from the cache, or from the host by position.
+    fn find_at(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize) -> Result<AtPosition<'gc>, Error> {
+        let Some(shape) = self.0.shape(mc) else { return Ok(AtPosition::Unknown) };
+        if Shape(shape).key(mc, position) != Some(key) {
+            return Ok(AtPosition::Unknown);
+        }
+        // The cache is a record of the shape. It has a slot for the key at `position`, unless the program gave the table a key outside the shape and the record grew.
+        let Memo::Fields(fields) = self.memo(mc)? else { return Ok(AtPosition::Unknown) };
+        let Some(known) = fields.slot(mc, position) else { return Ok(AtPosition::Unknown) };
+        if known != Value::BROKEN {
+            return Ok(AtPosition::Found(known));
+        }
+        let Some(host) = self.0.host(mc) else { return Ok(AtPosition::Unknown) };
+        let Ok(host) = host.try_borrow() else { return Ok(AtPosition::Unknown) };
+        let fetched = host.fetch_at(mc, position);
+        drop(host);
+        // A host that does not look values up by position is asked by key. The value is cached at the position either way.
+        let value = match fetched {
+            Some(fetched) => fetched?,
+            None => self.fetch(mc, key)?,
+        };
+        let Some(value) = value else { return Ok(AtPosition::Absent) };
+        fields.fill(mc, position, value);
+        Ok(AtPosition::Found(value))
+    }
+
+    /// Reads the value of `key` from the host. Returns `None` if the host has no entry for `key`, or if `key` is of a kind that no external table has.
+    fn fetch(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<Value<'gc>>, Error> {
+        let (Some(host_key), Some(host)) = (HostKey::of(mc, key), self.0.host(mc)) else { return Ok(None) };
+        let Ok(host) = host.try_borrow() else { return Ok(None) };
+        host.fetch(mc, host_key.key())
+    }
+
+    /// Returns the position of `key` in the cache and the value of `key`. The value is read from the host and cached if it was not cached yet.
+    fn find(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<(usize, Value<'gc>)>, Error> {
+        if let Some(memo) = self.cached(mc)
+            && let Some(found) = memo.find(mc, key)?
+        {
+            return Ok(Some(found));
+        }
+        let Some(value) = self.fetch(mc, key)? else { return Ok(None) };
+        Ok(Some((self.memo(mc)?.cache(mc, key, value)?, value)))
     }
 
     fn get(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<Value<'gc>>, Error> {
-        if let Some(memo) = self.0.memo(mc)
-            && let Some(known) = Inside(memo).get(mc, key)?
-        {
+        if let Some(known) = self.known(mc, key)? {
             return Ok(Some(known));
         }
-        let (Some(host_key), Some(host)) = (HostKey::of(mc, key), self.0.host(mc)) else { return Ok(None) };
-        let Ok(host) = host.try_borrow() else { return Ok(None) };
-        let Some(value) = host.fetch(mc, host_key.key())? else { return Ok(None) };
-        drop(host);
+        let Some(value) = self.fetch(mc, key)? else { return Ok(None) };
         // Only present keys are cached. A missing key is requested from the host again on every read. Otherwise a program could fill the arena by reading an unbounded number of missing keys.
-        self.memo(mc)?.set(mc, key, value)?;
+        self.memo(mc)?.cache(mc, key, value)?;
         Ok(Some(value))
     }
 
     fn has(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<bool, Error> {
-        if let Some(memo) = self.0.memo(mc)
-            && Inside(memo).get(mc, key)?.is_some()
-        {
+        if self.known(mc, key)?.is_some() {
             return Ok(true);
         }
         let (Some(host_key), Some(host)) = (HostKey::of(mc, key), self.0.host(mc)) else { return Ok(false) };
@@ -906,7 +1451,7 @@ impl<'gc> Outside<'gc> {
         host.try_borrow_mut().map_err(|_| TableError::Refused)?.store(mc, host_key.key(), value).map_err(|Refused| TableError::Refused)?;
         self.0.set_walk(mc, None);
         // Cache the value that the program stored. A later read then returns that same value, as it does for a table in the arena.
-        self.memo(mc)?.set(mc, key, value)?;
+        self.memo(mc)?.cache(mc, key, value)?;
         Ok(())
     }
 
@@ -917,8 +1462,8 @@ impl<'gc> Outside<'gc> {
         let (Some(host_key), Some(host)) = (HostKey::of(mc, key), self.0.host(mc)) else { return Ok(false) };
         let removed = host.try_borrow_mut().map_err(|_| TableError::Refused)?.remove(host_key.key());
         self.0.set_walk(mc, None);
-        if let Some(memo) = self.0.memo(mc) {
-            Inside(memo).delete(mc, key)?;
+        if let Some(memo) = self.cached(mc) {
+            memo.delete(mc, key)?;
         }
         Ok(removed)
     }
@@ -932,6 +1477,7 @@ impl<'gc> Outside<'gc> {
         }
         self.0.set_walk(mc, None);
         self.0.set_memo(mc, None);
+        self.0.set_fields(mc, None);
         Ok(())
     }
 
@@ -958,10 +1504,10 @@ impl<'gc> Outside<'gc> {
             let memo = self.memo(mc)?;
             for &[key, given] in listed.as_chunks::<2>().0 {
                 // A value that is already cached takes precedence over the value the host just returned, so that a nested table keeps its identity. Any other value is cached as returned.
-                let value = match memo.get(mc, key)? {
+                let value = match self.known(mc, key)? {
                     Some(known) => known,
                     None => {
-                        memo.set(mc, key, given)?;
+                        memo.cache(mc, key, given)?;
                         given
                     }
                 };

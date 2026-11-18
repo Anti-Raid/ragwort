@@ -380,6 +380,22 @@ pub fn utf8_len<H: Host>(h: &H, string: H::Str) -> Result<usize, H::Error> {
     Ok(chunks(h, string).map(Units::utf8_len).sum())
 }
 
+/// Copies `string` into `out` as UTF-8. Returns the number of bytes written, or `None` if `out` is too short for the whole string.
+///
+/// This is the cheap way to get a short string as a `&str`: it allocates nothing and uses no formatter.
+pub fn copy_utf8<H: Host>(h: &H, string: H::Str, out: &mut [u8]) -> Option<usize> {
+    let mut written = 0;
+    match flat(h, string) {
+        Some(units) => units.copy_utf8(out, &mut written)?,
+        None => {
+            for chunk in chunks(h, string) {
+                chunk.copy_utf8(out, &mut written)?;
+            }
+        }
+    }
+    Some(written)
+}
+
 /// Returns a value that formats `string` as UTF-8, for use with `write!` or `to_string`.
 pub fn display<H: Host>(h: &H, string: H::Str) -> Display<'_, H> {
     Display { h, s: string }

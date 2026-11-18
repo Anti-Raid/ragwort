@@ -6,6 +6,7 @@ use crate::gc::Arena;
 use crate::num::int;
 use crate::pair::Pairs;
 use crate::string::{concat, from_str};
+use crate::symbol::Symbol;
 
 use super::*;
 
@@ -675,6 +676,377 @@ fn an_entry_is_read_and_set_at_the_position_it_was_found() {
         assert_eq!(table.get_at(mc, seen, 0), None);
         assert_eq!((table.find(mc, seen), table.get_at(mc, seen, 0)), (Ok(Some((0, fix(5)))), Some(fix(5))));
         assert_eq!((table.set_at(mc, seen, 0, fix(6)), table.set_finding(mc, seen, fix(7)), table.get(mc, seen)), (false, Ok(None), Ok(Some(fix(7)))));
+    });
+}
+
+const LONG_KEY: &str = "a string key that is too long to fit in a word";
+
+/// Returns one key of each kind that is compared by value.
+fn value_keys<'gc>(mc: &Mutation<'gc>) -> Vec<Value<'gc>> {
+    vec![symbol(mc, "id"), text(mc, LONG_KEY), fix(7), Value::char('x'), Value::TRUE, Value::flonum(mc, 1.5).unwrap()]
+}
+
+/// Returns a shape with the symbols `names` as its keys.
+fn shape_of<'gc>(mc: &Mutation<'gc>, names: &[&str]) -> Shape<'gc> {
+    let keys: Vec<Value<'gc>> = names.iter().map(|name| symbol(mc, name)).collect();
+    Tables::new(mc).shape(&keys).unwrap()
+}
+
+/// Returns a table of `shape` whose values are the numbers `values`, with `None` for a key that is left out.
+fn shaped<'gc>(mc: &Mutation<'gc>, shape: Shape<'gc>, values: &[Option<i64>]) -> Table<'gc> {
+    Tables::new(mc).shaped(shape, values.iter().map(|value| value.map(fix))).unwrap()
+}
+
+/// Returns the entries of `table` as names and numbers. The keys are symbols and the values are fixnums.
+fn named<'gc>(mc: &Mutation<'gc>, table: Table<'gc>) -> Vec<(String, i64)> {
+    let strings = Strings::new(mc);
+    entries(mc, table).into_iter().map(|(key, value)| (crate::string::display(&strings, Symbol::of(key).unwrap().name(mc)).to_string(), value.as_fixnum().unwrap())).collect()
+}
+
+fn pairs_of(entries: &[(&str, i64)]) -> Vec<(String, i64)> {
+    entries.iter().map(|&(name, number)| (name.to_string(), number)).collect()
+}
+
+/// A table made from a shape has the entries that setting each key in order gives, and every key is at its position in the shape.
+#[test]
+fn a_table_made_from_a_shape_has_the_entries_its_keys_and_values_make() {
+    arena().mutate(|mc| {
+        let tables = Tables::new(mc);
+        let keys = value_keys(mc);
+        let shape = tables.shape(&keys).unwrap();
+        assert_eq!((shape.len(mc), shape.is_empty(mc), shape.key(mc, 1), shape.key(mc, 6)), (6, false, Some(keys[1]), None));
+        let values: Vec<Value> = (10..16).map(fix).collect();
+        let made = tables.shaped(shape, values.iter().map(|&value| Some(value))).unwrap();
+        let plain = tables.make().unwrap();
+        for (&key, &value) in keys.iter().zip(&values) {
+            plain.set(mc, key, value).unwrap();
+        }
+        assert_eq!((entries(mc, made), made.len(mc)), (entries(mc, plain), 6));
+        // Keys are found by value: another string with the same characters, and another number with the same value.
+        assert_eq!((made.get(mc, text(mc, LONG_KEY)), made.get(mc, Value::flonum(mc, 1.5).unwrap()), made.has(mc, Value::char('x'))), (Ok(Some(fix(11))), Ok(Some(fix(15))), Ok(true)));
+        assert_eq!((made.get(mc, symbol(mc, "other")), made.get(mc, fix(8)), made.get(mc, Value::FALSE)), (Ok(None), Ok(None), Ok(None)));
+        for (position, &key) in keys.iter().enumerate() {
+            assert_eq!((shape.position(mc, key), made.find(mc, key)), (Ok(Some(position)), Ok(Some((position, values[position])))));
+        }
+        assert_eq!((shape.position(mc, symbol(mc, "other")), made.get_at(mc, keys[0], 0), made.get_at(mc, keys[2], 2), made.get_at(mc, keys[2], 0)), (Ok(None), Some(fix(10)), Some(fix(12)), None));
+        // A shape is not a table, and a table is not a shape.
+        assert!(Table::of(shape.value(mc)).is_none() && Shape::of(made.value(mc)).is_none() && Shape::of(shape.value(mc)) == Some(shape));
+    });
+}
+
+/// The tables of a shape share its index and nothing else. Whatever a program does to one of them, the others and the shape stay as they were.
+#[test]
+fn changes_to_a_table_of_a_shape_do_not_reach_the_others() {
+    arena().mutate(|mc| {
+        let shape = shape_of(mc, &["x", "y", "z"]);
+        let (first, second) = (shaped(mc, shape, &[Some(1), Some(2), Some(3)]), shaped(mc, shape, &[Some(4), Some(5), Some(6)]));
+        let (x, y, w) = (symbol(mc, "x"), symbol(mc, "y"), symbol(mc, "w"));
+        // A new value for a key stays in its table.
+        first.set(mc, y, fix(20)).unwrap();
+        assert_eq!((named(mc, first), named(mc, second)), (pairs_of(&[("x", 1), ("y", 20), ("z", 3)]), pairs_of(&[("x", 4), ("y", 5), ("z", 6)])));
+        // A new key is added at the end, as in any table.
+        first.set(mc, w, fix(4)).unwrap();
+        assert_eq!((named(mc, first), second.get(mc, w), second.len(mc)), (pairs_of(&[("x", 1), ("y", 20), ("z", 3), ("w", 4)]), Ok(None), 3));
+        // A removed key that is set again is a new entry at the end.
+        assert_eq!((first.delete(mc, x), first.get(mc, x)), (Ok(true), Ok(None)));
+        first.set(mc, x, fix(10)).unwrap();
+        assert_eq!(named(mc, first), pairs_of(&[("y", 20), ("z", 3), ("w", 4), ("x", 10)]));
+        assert_eq!((second.delete(mc, y), second.delete(mc, y)), (Ok(true), Ok(false)));
+        assert_eq!(named(mc, second), pairs_of(&[("x", 4), ("z", 6)]));
+        second.set(mc, y, fix(9)).unwrap();
+        assert_eq!(named(mc, second), pairs_of(&[("x", 4), ("z", 6), ("y", 9)]));
+        // Many more keys, and a table that is emptied, change nothing for the shape.
+        for extra in 0..500 {
+            first.set(mc, fix(extra), fix(extra)).unwrap();
+        }
+        second.clear(mc).unwrap();
+        second.set(mc, w, fix(1)).unwrap();
+        assert_eq!((first.len(mc), first.get(mc, fix(499)), first.get(mc, symbol(mc, "z")), named(mc, second)), (504, Ok(Some(fix(499))), Ok(Some(fix(3))), pairs_of(&[("w", 1)])));
+        // A table made from the shape afterwards is as the first ones were.
+        let third = shaped(mc, shape, &[Some(7), Some(8), Some(9)]);
+        assert_eq!((named(mc, third), third.find(mc, symbol(mc, "z")), third.get(mc, w)), (pairs_of(&[("x", 7), ("y", 8), ("z", 9)]), Ok(Some((2, fix(9)))), Ok(None)));
+    });
+}
+
+/// A key that is given no value is not in the table. Setting it later adds it at the end, as for any key that the table does not have.
+#[test]
+fn a_table_of_a_shape_leaves_out_the_keys_without_a_value() {
+    arena().mutate(|mc| {
+        let shape = shape_of(mc, &["x", "y", "z"]);
+        let (y, z) = (symbol(mc, "y"), symbol(mc, "z"));
+        let table = shaped(mc, shape, &[Some(1), None, Some(3)]);
+        assert_eq!((named(mc, table), table.len(mc), table.get(mc, y), table.has(mc, y), table.find(mc, z)), (pairs_of(&[("x", 1), ("z", 3)]), 2, Ok(None), Ok(false), Ok(Some((2, fix(3))))));
+        assert_eq!((table.get_at(mc, y, 1), table.delete(mc, y)), (None, Ok(false)));
+        table.set(mc, y, fix(2)).unwrap();
+        assert_eq!(named(mc, table), pairs_of(&[("x", 1), ("z", 3), ("y", 2)]));
+        // Keys past the values given are left out, and values past the keys are ignored.
+        assert_eq!(named(mc, shaped(mc, shape, &[Some(1)])), pairs_of(&[("x", 1)]));
+        assert_eq!(named(mc, shaped(mc, shape, &[Some(1), Some(2), Some(3), Some(4)])), pairs_of(&[("x", 1), ("y", 2), ("z", 3)]));
+        assert_eq!((shaped(mc, shape, &[]).len(mc), shaped(mc, shape, &[None, None, None]).len(mc)), (0, 0));
+        // A shape with no keys makes empty tables that grow like any other.
+        let empty = shape_of(mc, &[]);
+        let grown = shaped(mc, empty, &[]);
+        assert_eq!((empty.len(mc), empty.is_empty(mc), grown.len(mc), grown.get(mc, y)), (0, true, 0, Ok(None)));
+        grown.set(mc, y, fix(5)).unwrap();
+        assert_eq!(named(mc, grown), pairs_of(&[("y", 5)]));
+    });
+}
+
+/// The keys of a shape are different keys, and none of them is compared by identity.
+#[test]
+fn a_shape_takes_keys_that_are_compared_by_value_once_each() {
+    arena().mutate(|mc| {
+        let tables = Tables::new(mc);
+        let (x, y) = (symbol(mc, "x"), symbol(mc, "y"));
+        assert_eq!(tables.shape(&[x, y, x]).err(), Some(ShapeError::Duplicate(2)));
+        // Two strings with the same characters are one key, and so are two numbers with the same value.
+        assert_eq!(tables.shape(&[text(mc, LONG_KEY), x, text(mc, LONG_KEY)]).err(), Some(ShapeError::Duplicate(2)));
+        assert_eq!(tables.shape(&[Value::flonum(mc, 2.5).unwrap(), Value::flonum(mc, 2.5).unwrap()]).err(), Some(ShapeError::Duplicate(1)));
+        // The number 1 and the number 1.0 are two keys, and a symbol is not the string of its name.
+        assert!(tables.shape(&[fix(1), Value::flonum(mc, 1.0).unwrap(), x, text(mc, "x")]).is_ok());
+        let pair = Pairs::new(mc).cons(fix(1), Value::NULL).unwrap().value(mc);
+        assert_eq!(tables.shape(&[x, pair]).err(), Some(ShapeError::Identity(1)));
+        assert_eq!(tables.shape(&[tables.make().unwrap().value(mc)]).err(), Some(ShapeError::Identity(0)));
+        // An external reference is a key of a shape only if its kind compares by value.
+        assert!(tables.shape(&[user(mc, &USER_ID, 7), user(mc, &USER_ID, 8)]).is_ok());
+        assert_eq!(tables.shape(&[user(mc, &USER_ID, 7), user(mc, &USER_ID, 7)]).err(), Some(ShapeError::Duplicate(1)));
+        let handle = ExternalRefs::new(mc).make(&HANDLE, 1, 0, Value::NULL).unwrap().value(mc);
+        assert_eq!(tables.shape(&[handle]).err(), Some(ShapeError::Identity(0)));
+    });
+}
+
+/// A table of a shape takes less than half the memory of a table that is filled key by key, and it still finds its keys after a collection has moved every object.
+#[test]
+fn tables_of_a_shape_are_small_and_survive_moving_collections() {
+    const NAMES: [&str; 6] = ["id", "content", "author", "channel", "guild", "pinned"];
+    const COUNT: usize = 4000;
+    fn fill(arena: &mut Arena, with_shape: bool) -> usize {
+        arena.collect();
+        let before = arena.used();
+        arena.mutate(|mc| {
+            let tables = Tables::new(mc);
+            let shape = shape_of(mc, &NAMES);
+            let keep = crate::vector::Vectors::new(mc).make(COUNT + 1, Value::NULL).unwrap();
+            keep.items(mc).set(mc, COUNT, shape.value(mc));
+            for number in 0..COUNT {
+                let table = if with_shape {
+                    tables.shaped(shape, (0..NAMES.len()).map(|field| Some(fix((number * 10 + field) as i64)))).unwrap()
+                } else {
+                    let table = tables.make().unwrap();
+                    for (field, name) in NAMES.iter().enumerate() {
+                        table.set(mc, symbol(mc, name), fix((number * 10 + field) as i64)).unwrap();
+                    }
+                    table
+                };
+                keep.items(mc).set(mc, number, table.value(mc));
+            }
+            mc.set_root(1, keep.value(mc));
+        });
+        arena.collect();
+        arena.used() - before
+    }
+    let plain = fill(&mut arena(), false);
+    let mut arena = arena();
+    let small = fill(&mut arena, true);
+    assert!(small * 2 < plain, "{small} bytes with a shape, {plain} bytes without");
+    for round in 0..2 {
+        arena.set_evacuate_all(true);
+        arena.collect();
+        arena.mutate(|mc| {
+            let keep = crate::vector::AnyVector::of(mc.root(1)).unwrap();
+            let shape = Shape::of(keep.get(mc, COUNT).unwrap()).unwrap();
+            for number in (0..COUNT).step_by(37) {
+                let table = Table::of(keep.get(mc, number).unwrap()).unwrap();
+                assert!(!table.is_stale(mc), "round {round}");
+                for (field, name) in NAMES.iter().enumerate() {
+                    assert_eq!(table.find(mc, symbol(mc, name)), Ok(Some((field, fix((number * 10 + field) as i64)))), "round {round}");
+                }
+            }
+            assert_eq!(named(mc, shaped(mc, shape, &[Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)])).len(), 6);
+        });
+    }
+}
+
+/// A read that remembers the shape of the table in which it found its key reads the next table of that shape by position alone. For any other table it compares the key at the position.
+#[test]
+fn a_read_that_remembers_a_shape_finds_its_key_by_position() {
+    arena().mutate(|mc| {
+        let (first, second) = (shape_of(mc, &["x", "y", "z"]), shape_of(mc, &["y", "x"]));
+        let (x, y, w) = (symbol(mc, "x"), symbol(mc, "y"), symbol(mc, "w"));
+        let table = shaped(mc, first, &[Some(1), Some(2), None]);
+        assert_eq!((table.shape(mc), table.len(mc)), (Some(first), 2));
+        assert_eq!((table.get_hinted(mc, y, 1, first.value(mc)), table.get_hinted(mc, x, 0, first.value(mc))), (Some(fix(2)), Some(fix(1))));
+        // With the remembered shape the key is not looked at: the caller only ever passes the position it found that key at.
+        assert_eq!(table.get_hinted(mc, w, 1, first.value(mc)), Some(fix(2)));
+        // A key that the table does not have, and a position past the keys of the shape, have no value.
+        assert_eq!((table.get_hinted(mc, symbol(mc, "z"), 2, first.value(mc)), table.get_hinted(mc, y, 3, first.value(mc))), (None, None));
+        // A table of another shape is read at the position only if its key there is the key.
+        let other = shaped(mc, second, &[Some(10), Some(20)]);
+        assert_eq!((other.get_hinted(mc, y, 1, first.value(mc)), other.get_hinted(mc, y, 0, first.value(mc)), other.get_hinted(mc, x, 1, Value::FALSE)), (None, Some(fix(10)), Some(fix(20))));
+        // A write through a remembered shape replaces the value, and does not add a key that the table lacks.
+        assert_eq!((table.set_hinted(mc, y, 1, first.value(mc), fix(22)), table.set_hinted(mc, symbol(mc, "z"), 2, first.value(mc), fix(3)), other.set_hinted(mc, y, 1, first.value(mc), fix(5))), (true, false, false));
+        assert_eq!((named(mc, table), named(mc, other)), (pairs_of(&[("x", 1), ("y", 22)]), pairs_of(&[("y", 10), ("x", 20)])));
+        // An ordinary table has no shape. Its keys are compared whatever shape is passed.
+        let plain = Tables::new(mc).make().unwrap();
+        plain.set(mc, x, fix(7)).unwrap();
+        assert_eq!((plain.shape(mc), plain.get_hinted(mc, x, 0, first.value(mc)), plain.get_hinted(mc, y, 0, first.value(mc)), plain.set_hinted(mc, x, 0, first.value(mc), fix(8))), (None, Some(fix(7)), None, true));
+    });
+}
+
+/// A table of a shape keeps its shape while its keys are changed or removed. The first key that is added moves its entries to an ordinary table, and the table works on as before.
+#[test]
+fn a_table_of_a_shape_gives_up_its_shape_when_a_key_is_added() {
+    arena().mutate(|mc| {
+        let shape = shape_of(mc, &["x", "y", "z"]);
+        let (x, y, z, w) = (symbol(mc, "x"), symbol(mc, "y"), symbol(mc, "z"), symbol(mc, "w"));
+        let table = shaped(mc, shape, &[Some(1), Some(2), Some(3)]);
+        let value = table.value(mc);
+        table.set(mc, y, fix(20)).unwrap();
+        assert_eq!((table.delete(mc, x), table.shape(mc), table.len(mc)), (Ok(true), Some(shape), 2));
+        // Slots are read as keys and values in turn. Both slots of the removed key read as unused.
+        let held: Vec<_> = (0..7).map(|index| table.held(mc, index)).collect();
+        assert_eq!(held, [Some(Value::BROKEN), Some(Value::BROKEN), Some(y), Some(fix(20)), Some(z), Some(fix(3)), None]);
+        // The removed key comes back as a new last entry, which the shape cannot express.
+        table.set(mc, x, fix(10)).unwrap();
+        assert_eq!((table.shape(mc), named(mc, table), table.value(mc) == value, Table::of(value) == Some(table)), (None, pairs_of(&[("y", 20), ("z", 3), ("x", 10)]), true, true));
+        // Reads and writes that remember the old shape and positions still give right answers.
+        assert_eq!((table.get_hinted(mc, y, 1, shape.value(mc)), table.get_hinted(mc, y, 0, shape.value(mc)), table.get_at(mc, x, 2), table.find(mc, z)), (None, Some(fix(20)), Some(fix(10)), Ok(Some((1, fix(3))))));
+        assert_eq!((table.set_hinted(mc, z, 1, shape.value(mc), fix(30)), table.set_hinted(mc, z, 2, shape.value(mc), fix(31)), table.get(mc, z)), (true, false, Ok(Some(fix(30)))));
+        table.set(mc, w, fix(4)).unwrap();
+        assert_eq!((table.delete(mc, y), named(mc, table), table.len(mc), table.is_stale(mc)), (Ok(true), pairs_of(&[("z", 30), ("x", 10), ("w", 4)]), 3, false));
+        // An emptied table of a shape has no shape either, and takes new entries.
+        let emptied = shaped(mc, shape, &[Some(1), Some(2), Some(3)]);
+        emptied.clear(mc).unwrap();
+        assert_eq!((emptied.shape(mc), emptied.len(mc), emptied.get(mc, x), emptied.get_hinted(mc, x, 0, shape.value(mc)), emptied.held(mc, 0)), (None, 0, Ok(None), None, None));
+        emptied.set(mc, z, fix(9)).unwrap();
+        assert_eq!(named(mc, emptied), pairs_of(&[("z", 9)]));
+    });
+}
+
+/// An event with the fields `x`, `y` and `z`, whose values are 1, 2 and 3. It counts the reads by key and the reads by position. If `partial`, it has no `z`.
+struct Event {
+    by_key: Rc<Cell<usize>>,
+    by_position: Rc<Cell<usize>>,
+    positional: bool,
+    partial: bool,
+}
+
+impl Event {
+    const FIELDS: [&str; 3] = ["x", "y", "z"];
+
+    fn field<'gc>(&self, position: usize) -> Option<Value<'gc>> {
+        (position < if self.partial { 2 } else { 3 }).then(|| fix(position as i64 + 1))
+    }
+}
+
+impl ExternalTable for Event {
+    fn len(&self) -> usize {
+        if self.partial { 2 } else { 3 }
+    }
+
+    fn has(&self, key: Key<'_>) -> bool {
+        matches!(key, Key::Symbol(name) if Self::FIELDS.iter().position(|&field| field == name).is_some_and(|position| self.field(position).is_some()))
+    }
+
+    fn get<'gc>(&self, _: &Mutation<'gc>, key: Key<'_>) -> Result<Option<Value<'gc>>, Error> {
+        self.by_key.set(self.by_key.get() + 1);
+        let Key::Symbol(name) = key else { return Ok(None) };
+        Ok(Self::FIELDS.iter().position(|&field| field == name).and_then(|position| self.field(position)))
+    }
+
+    fn keys(&self) -> impl Iterator<Item = Key<'_>> {
+        Self::FIELDS.into_iter().take(self.len()).map(Key::Symbol)
+    }
+
+    fn get_at<'gc>(&self, _: &Mutation<'gc>, position: usize) -> Option<Result<Option<Value<'gc>>, Error>> {
+        if !self.positional {
+            return None;
+        }
+        self.by_position.set(self.by_position.get() + 1);
+        Some(Ok(self.field(position)))
+    }
+}
+
+/// The counters of an [`Event`]: reads by key, then reads by position.
+struct Reads(Rc<Cell<usize>>, Rc<Cell<usize>>);
+
+impl Reads {
+    fn counts(&self) -> (usize, usize) {
+        (self.0.get(), self.1.get())
+    }
+}
+
+fn event<'gc>(mc: &Mutation<'gc>, shape: Shape<'gc>, positional: bool, partial: bool) -> (Table<'gc>, Reads) {
+    let reads = Reads(Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+    let host = Event { by_key: reads.0.clone(), by_position: reads.1.clone(), positional, partial };
+    (Tables::new(mc).external_shaped(shape, host, 0).unwrap(), reads)
+}
+
+/// An external table with a shape caches what it reads at the positions of the shape. A read that names the position of its key asks the host by position and hashes nothing.
+#[test]
+fn an_external_table_of_a_shape_is_read_by_position() {
+    arena().mutate(|mc| {
+        let shape = shape_of(mc, &Event::FIELDS);
+        let (x, y, z, w) = (symbol(mc, "x"), symbol(mc, "y"), symbol(mc, "z"), symbol(mc, "w"));
+        let (table, reads) = event(mc, shape, true, false);
+        assert_eq!((table.is_external(), table.len(mc), table.get_at(mc, y, 1), reads.counts()), (true, 3, None, (0, 0)));
+        // The first read at the position of the key asks the host by position. Later reads ask nothing.
+        assert_eq!((table.find_from(mc, y, 1), reads.counts()), (Ok(Some((1, fix(2)))), (0, 1)));
+        assert_eq!((table.get_at(mc, y, 1), table.find_from(mc, y, 1), table.get(mc, y), table.find(mc, y), reads.counts()), (Some(fix(2)), Ok(Some((1, fix(2)))), Ok(Some(fix(2))), Ok(Some((1, fix(2)))), (0, 1)));
+        // A read that names another position finds the key the general way. A value that was read stays cached.
+        assert_eq!((table.find_from(mc, y, 0), table.find_from(mc, y, 9), reads.counts()), (Ok(Some((1, fix(2)))), Ok(Some((1, fix(2)))), (0, 1)));
+        assert_eq!((table.find_from(mc, z, 0), table.get_at(mc, z, 2), reads.counts()), (Ok(Some((2, fix(3)))), Some(fix(3)), (1, 1)));
+        // A read by key caches its value at the position of the shape as well.
+        assert_eq!((table.get(mc, x), table.get_at(mc, x, 0), table.has(mc, x), reads.counts()), (Ok(Some(fix(1))), Some(fix(1)), Ok(true), (2, 1)));
+        // A key outside the shape is asked for by key, every time, since the host has none.
+        assert_eq!((table.get(mc, w), table.find_from(mc, w, 1), table.has(mc, w), reads.counts()), (Ok(None), Ok(None), Ok(false), (4, 1)));
+        assert_eq!((named(mc, table), reads.counts()), (pairs_of(&[("x", 1), ("y", 2), ("z", 3)]), (4, 1)));
+        // Another table of the shape has its own cache.
+        let (other, other_reads) = event(mc, shape, true, false);
+        assert_eq!((other.get_at(mc, y, 1), other.find_from(mc, y, 1), other_reads.counts(), reads.counts()), (None, Ok(Some((1, fix(2)))), (0, 1), (4, 1)));
+    });
+    // A key of the shape that the host has no entry for is not in the table. It is asked for again on the next read.
+    arena().mutate(|mc| {
+        let shape = shape_of(mc, &Event::FIELDS);
+        let (y, z) = (symbol(mc, "y"), symbol(mc, "z"));
+        let (table, reads) = event(mc, shape, true, true);
+        assert_eq!((table.find_from(mc, z, 2), table.find_from(mc, z, 2), table.get_at(mc, z, 2), reads.counts()), (Ok(None), Ok(None), None, (0, 2)));
+        assert_eq!((table.get(mc, z), table.has(mc, z), table.len(mc), table.find_from(mc, y, 1), reads.counts()), (Ok(None), Ok(false), 2, Ok(Some((1, fix(2)))), (1, 3)));
+        assert_eq!(named(mc, table), pairs_of(&[("x", 1), ("y", 2)]));
+    });
+    // A host that does not look values up by position is asked by key. The value is still cached at the position of the shape.
+    arena().mutate(|mc| {
+        let shape = shape_of(mc, &Event::FIELDS);
+        let y = symbol(mc, "y");
+        let (table, reads) = event(mc, shape, false, false);
+        assert_eq!((table.find_from(mc, y, 1), table.get_at(mc, y, 1), table.find_from(mc, y, 1), reads.counts()), (Ok(Some((1, fix(2)))), Some(fix(2)), Ok(Some((1, fix(2)))), (1, 0)));
+    });
+}
+
+/// A writable external table with a shape takes every change that one without a shape takes. Its cache follows the changes.
+#[test]
+fn a_writable_external_table_of_a_shape_changes_like_any_other() {
+    arena().mutate(|mc| {
+        let tables = Tables::new(mc);
+        let (seen, sent, extra) = (text(mc, "seen"), text(mc, "sent"), text(mc, "extra"));
+        let shape = tables.shape(&[seen, sent]).unwrap();
+        let host = Counters(vec![(CounterKey::Name("seen".to_owned()), 5), (CounterKey::Name("sent".to_owned()), 6)]);
+        let table = tables.external_shaped(shape, host, 0).unwrap();
+        assert_eq!((table.find_from(mc, sent, 1), table.get_at(mc, sent, 1), table.get_at(mc, seen, 0)), (Ok(Some((1, fix(6)))), Some(fix(6)), None));
+        // A new value for a key of the shape is cached at its position. A key outside the shape is added after the keys of the shape.
+        table.set(mc, seen, fix(50)).unwrap();
+        table.set(mc, extra, fix(7)).unwrap();
+        assert_eq!((table.get_at(mc, seen, 0), table.find(mc, extra), table.get_at(mc, sent, 1), counts(mc, table)), (Some(fix(50)), Ok(Some((2, fix(7)))), Some(fix(6)), vec![50, 6, 7]));
+        // A removed key is not found at its position. When it is set again, it is found wherever the cache put it.
+        assert_eq!((table.delete(mc, seen), table.find_from(mc, seen, 0), table.get_at(mc, seen, 0), table.len(mc)), (Ok(true), Ok(None), None, 2));
+        table.set(mc, seen, fix(8)).unwrap();
+        let found = table.find_from(mc, seen, 0).unwrap().unwrap();
+        assert_eq!((found.1, table.get_at(mc, seen, found.0), table.get(mc, sent), counts(mc, table)), (fix(8), Some(fix(8)), Ok(Some(fix(6))), vec![6, 7, 8]));
+        // An emptied table has nothing at any position, and takes new entries.
+        table.clear(mc).unwrap();
+        assert_eq!((table.find_from(mc, sent, 1), table.get(mc, seen), table.len(mc)), (Ok(None), Ok(None), 0));
+        table.set(mc, sent, fix(1)).unwrap();
+        assert_eq!((table.find_from(mc, sent, 1), counts(mc, table)), (Ok(Some((1, fix(1)))), vec![1]));
     });
 }
 

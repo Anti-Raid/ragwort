@@ -2403,6 +2403,24 @@ fn the_default_prompt_tag_is_a_value_of_its_own() {
     assert_eq!(eval("(define (tagged [tag (make-continuation-prompt-tag)]) (eq? tag (default-continuation-prompt-tag))) (list (tagged) (tagged (default-continuation-prompt-tag)))"), "(#f #t)");
 }
 
+/// A `table` call with constant keys takes its keys from a shape that every table of the call shares. The tables are separate tables in every way a program can see.
+#[test]
+fn tables_made_by_one_call_are_separate_tables() {
+    let made = "(define (make n) (table 'id n 'name \"x\" 7 'seven))
+                (define a (make 1)) (define b (make 2))
+                (table-set! a 'id 10) (table-set! a 'extra #t) (table-delete! b 'name) (table-set! b 'name \"again\")
+                (list (table->list a) (table->list b) (table->list (make 3)) (equal? (make 4) (make 4)) (eq? (make 4) (make 4)) (table-length (make 5)) (make 6))";
+    assert_eq!(eval(made), "(((id . 10) (name . \"x\") (7 . seven) (extra . #t)) ((id . 2) (7 . seven) (name . \"again\")) ((id . 3) (name . \"x\") (7 . seven)) #t #f 3 #table((id . 6) (name . \"x\") (7 . seven)))");
+    // The values are evaluated in order, and a table made in a loop does not see the changes made to the one before it.
+    assert_eq!(eval("(define log '()) (define (note x) (set! log (cons x log)) x) (define t (table 'a (note 1) 'b (note 2) 'c (note 3))) (list (reverse log) (table->list t))"), "((1 2 3) ((a . 1) (b . 2) (c . 3)))");
+    assert_eq!(eval("(let loop ((i 0) (seen '())) (if (eqv? i 3) (reverse seen) (let ((t (table 'count 0 'tag 'new))) (table-set! t 'count (+ i 1)) (table-delete! t 'tag) (table-set! t i i) (loop (+ i 1) (cons (table->list t) seen)))))"), "(((count . 1) (0 . 0)) ((count . 2) (1 . 1)) ((count . 3) (2 . 2)))");
+    // A call whose keys cannot share a shape still makes its table: a key given twice, a key that is not a constant, and a key that is compared by identity.
+    assert_eq!(eval("(define k 'c) (list (table->list (table 'a 1 'a 2 'b 3)) (table->list (table 'a 1 k 2)) (table-length (table '(1 2) 'x \"s\" 'y)) (table-length (table)))"), "(((a . 2) (b . 3)) ((a . 1) (c . 2)) 2 0)");
+    assert_eq!(eval("(guard (e (#t (list (error-object-kind e) (error-object-who e)))) (table 'a 1 'b))"), "(arity table)");
+    // Keys of every kind that is compared by value, read back by equal keys that are other objects.
+    assert_eq!(eval("(define t (table \"a longer string, used as a key\" 1 2.5 2 #\\x 3 #t 4 (expt 10 30) 5 'sym 6)) (list (table-ref t (string-append \"a longer string, \" \"used as a key\")) (table-ref t (/ 5.0 2)) (table-ref t #\\x) (table-ref t #t) (table-ref t (* (expt 10 15) (expt 10 15))) (table-ref t 'sym) (table-ref t 2))"), "(1 2 3 4 5 6 #f)");
+}
+
 /// A variable that passed `null?`, `nil?` or `none?` is known to be that one value where the test held.
 #[test]
 fn a_variable_tested_for_one_value_is_that_value() {
@@ -3050,3 +3068,28 @@ fn inlined_procedures_keep_their_place_in_a_trace() {
         assert_eq!(ragwort_printer_scheme::render(mc, &report, usize::MAX), "error: car: wrong type of argument: 5\n  in helper [inlined]\n  in outer");
     });
 }
+
+/// One `table-ref` in a procedure reads tables of several shapes in turn. It remembers a few shapes and still reads every table right when there are more shapes than it remembers.
+#[test]
+fn one_read_serves_tables_of_many_shapes() {
+    let turns = "(define (id-of t) (table-ref t 'id 'none))
+                 (define (make kind n)
+                   (case kind
+                     ((0) (table 'id n 'a 1))
+                     ((1) (table 'a 1 'id n))
+                     ((2) (table 'a 1 'b 2 'id n))
+                     ((3) (table 'a 1 'b 2 'c 3 'id n))
+                     ((4) (table 'a 1 'b 2 'c 3 'd 4 'id n))
+                     ((5) (table 'x n))
+                     (else (let ((t (make-table))) (table-set! t 'z 0) (table-set! t 'id n) t))))
+                 (let loop ((n 0) (seen '()))
+                   (if (eqv? n 21) (reverse seen) (loop (+ n 1) (cons (id-of (make (modulo n 7) n)) seen))))";
+    assert_eq!(eval(turns), "(0 1 2 3 4 none 6 7 8 9 10 11 none 13 14 15 16 17 18 none 20)");
+    // A write through one instruction, to tables of two shapes and to one that grows past its shape.
+    let writes = "(define (bump! t) (table-set! t 'count (+ 1 (table-ref t 'count 0))))
+                  (define a (table 'count 0 'name \"a\")) (define b (table 'name \"b\" 'count 10)) (define c (table 'name \"c\"))
+                  (for-each (lambda (t) (bump! t) (bump! t)) (list a b c a b c))
+                  (map table->list (list a b c))";
+    assert_eq!(eval(writes), "(((count . 4) (name . \"a\")) ((name . \"b\") (count . 14)) ((name . \"c\") (count . 4)))");
+}
+

@@ -5,14 +5,14 @@
 use std::convert::Infallible;
 
 use ragwort_types::constant::Constants;
-use ragwort_types::gc::{Frame, Gc, Mutation, Slots, Stack, Value, WINDOW, slot};
+use ragwort_types::gc::{Frame, Gc, Mutation, Slots, Stack, Value, WINDOW};
 use ragwort_types::table::Table;
 use ragwort_types::pair::{Pair, Pairs};
 
 use crate::frame::{self, ARGS, CLOSURE, Kept, Link, MAX_PARAMS, SAVED_MARKS, Shape};
 use crate::op::Fuel;
 use crate::module::{Deferred, HostArgs, HostContext, HostDef, Reply};
-use crate::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Guard, HintsFields, KeywordProcedure, KeywordProcedureFields, ModuleFields, Task, TaskFields};
+use crate::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Guard, HINT_SLOTS, HINT_WAYS, HintsFields, KeywordProcedure, KeywordProcedureFields, ModuleFields, Task, TaskFields};
 use crate::prompts::{self, handler_key};
 use crate::segments;
 use crate::{Context, Control, Fault, Op, Request, coroutine};
@@ -431,28 +431,90 @@ impl<'s, 'gc> Run<'s, 'gc> {
         if tail { self.tail_call(call) } else { self.call(call, false) }
     }
 
-    /// Returns the hint words of the running code and the index of word `hint` in them. Fails with [`Fault::Malformed`] if the code has no such word.
-    fn hints(&self, hint: u16) -> Result<(Slots<'gc, slot::u64>, usize), Fault> {
+    /// Returns the hint slots of the running code and the index of the first slot of hint `hint`. Fails with [`Fault::Malformed`] if the code has no such hint. See [`crate::objects::Hints`].
+    fn hints(&self, hint: u16) -> Result<(Slots<'gc>, usize), Fault> {
         let hints = self.code.hints(self.cx.mc).ok_or(Fault::Malformed)?.items(self.cx.mc);
-        if usize::from(hint) < hints.len() { Ok((hints, usize::from(hint))) } else { Err(Fault::Malformed) }
+        let slot = HINT_SLOTS * usize::from(hint);
+        if slot + HINT_SLOTS <= hints.len() { Ok((hints, slot)) } else { Err(Fault::Malformed) }
     }
 
-    /// Reads a table entry for [`Op::TableRefHinted`]. The entry position stored in the hint word is
-    /// tried first. If the key is not at that position, the table is searched, and the hint word is
-    /// set to the position where the key was found.
+    /// Records in the hint at `slot` that the running instruction found its key at `position` of `table`. The new place becomes the first place of the hint.
+    ///
+    /// It replaces a place that is not used yet, or the place remembered for the same shape, which is now out of date. If there is neither, the oldest place is dropped.
+    fn remember(&self, hints: Slots<'gc>, slot: usize, table: Table<'gc>, position: usize) {
+        let mc = self.cx.mc;
+        let shape = table.shape(mc).map_or(Value::FALSE, |shape| shape.value(mc));
+        let position = Value::fixnum(position as i64).unwrap_or(Value::FALSE);
+        // Nothing is written if the first place already holds this shape and position.
+        if hints.get(slot) == shape && hints.get(slot + 1) == position {
+            return;
+        }
+        let mut replaced = HINT_WAYS - 1;
+        for way in 0..HINT_WAYS {
+            let place = slot + 2 * way;
+            let unused = hints.get(place + 1) == Value::FALSE;
+            let same_shape = shape != Value::FALSE && hints.get(place) == shape;
+            let same_place = hints.get(place) == shape && hints.get(place + 1) == position;
+            if unused || same_shape || same_place {
+                replaced = way;
+                break;
+            }
+        }
+        // The places before the replaced one move down by one.
+        for way in (1..=replaced).rev() {
+            let place = slot + 2 * way;
+            hints.set(mc, place, hints.get(place - 2));
+            hints.set(mc, place + 1, hints.get(place - 1));
+        }
+        hints.set(mc, slot, shape);
+        hints.set(mc, slot + 1, position);
+    }
+
+    /// Reads a table entry for [`Op::TableRefHinted`]. The first place of the hint is tried here. It has the key whenever the instruction reads tables of one shape, or one table, again and again.
     #[inline(never)]
     fn table_ref(&mut self, dst: u8, table: u8, key: u8, default: u8, hint: u16) -> Result<(), Fault> {
         let (mc, frame) = (self.cx.mc, self.cx.frame);
         let (table, key) = (Table::of(frame.get(table)).ok_or(Fault::WrongType)?, frame.get(key));
         let (hints, slot) = self.hints(hint)?;
-        if let Some(value) = table.get_at(mc, key, hints.get(slot) as usize) {
+        if let Some(value) = table.get_hinted(mc, key, remembered(hints.get(slot + 1)), hints.get(slot)) {
             frame.set(dst, value);
             return Ok(());
         }
+        self.table_ref_missed(dst, table, key, default, hints, slot)
+    }
+
+    /// Finishes [`Run::table_ref`] when the first place of the hint does not have the key. The other places are tried, then the table is searched, and the hint is set to where the key was found.
+    #[inline(never)]
+    fn table_ref_missed(&mut self, dst: u8, table: Table<'gc>, key: Value<'gc>, default: u8, hints: Slots<'gc>, slot: usize) -> Result<(), Fault> {
+        let (mc, frame) = (self.cx.mc, self.cx.frame);
+        let shape = table.shape(mc).map(|shape| shape.value(mc));
+        // The position that the hint remembers for the shape of this table. A new external table of that shape has the key there, though its value has not been read yet.
+        let mut known = None;
+        for way in 0..HINT_WAYS {
+            let place = slot + 2 * way;
+            // Places are filled from the first on, so the places after an unused one are unused too.
+            if hints.get(place + 1) == Value::FALSE {
+                break;
+            }
+            let position = remembered(hints.get(place + 1));
+            if way > 0
+                && let Some(value) = table.get_hinted(mc, key, position, hints.get(place))
+            {
+                frame.set(dst, value);
+                return Ok(());
+            }
+            if shape == Some(hints.get(place)) {
+                known = Some(position);
+                break;
+            }
+        }
         self.charge_rebuild(table)?;
-        let value = match table.find(mc, key)? {
+        let value = match table.find_from(mc, key, known.unwrap_or(0))? {
             Some((position, value)) => {
-                hints.set(mc, slot, position as u64);
+                // A place that already names this shape and position is left as it is.
+                if known != Some(position) {
+                    self.remember(hints, slot, table, position);
+                }
                 value
             }
             None => frame.get(default),
@@ -465,23 +527,41 @@ impl<'s, 'gc> Run<'s, 'gc> {
         Ok(())
     }
 
-    /// Writes a table entry for [`Op::TableSetHinted`]. The hint word is used as in [`Run::table_ref`].
+    /// Writes a table entry for [`Op::TableSetHinted`]. The first place of the hint is tried here, as in [`Run::table_ref`].
     #[inline(never)]
     fn table_set(&mut self, dst: u8, table: u8, key: u8, value: u8, hint: u16) -> Result<(), Fault> {
         let (mc, frame) = (self.cx.mc, self.cx.frame);
         let (table, key, value) = (Table::of(frame.get(table)).ok_or(Fault::WrongType)?, frame.get(key), frame.get(value));
         let (hints, slot) = self.hints(hint)?;
-        if !table.set_at(mc, key, hints.get(slot) as usize, value) {
-            self.charge_rebuild(table)?;
-            // A table in the arena keeps each entry at a fixed position, so the next write finds this entry through the hint. An external table returns no position.
-            if let Some(position) = table.set_finding(mc, key, value)? {
-                hints.set(mc, slot, position as u64);
-            }
-            if mc.step_due() {
-                self.cx.fuel.pause();
-            }
+        if !table.set_hinted(mc, key, remembered(hints.get(slot + 1)), hints.get(slot), value) {
+            self.table_set_missed(table, key, value, hints, slot)?;
         }
         frame.set(dst, Value::VOID);
+        Ok(())
+    }
+
+    /// Finishes [`Run::table_set`] when the first place of the hint does not have the key.
+    #[inline(never)]
+    fn table_set_missed(&mut self, table: Table<'gc>, key: Value<'gc>, value: Value<'gc>, hints: Slots<'gc>, slot: usize) -> Result<(), Fault> {
+        let mc = self.cx.mc;
+        for way in 1..HINT_WAYS {
+            let place = slot + 2 * way;
+            // Places are filled from the first on, so the places after an unused one are unused too.
+            if hints.get(place + 1) == Value::FALSE {
+                break;
+            }
+            if table.set_hinted(mc, key, remembered(hints.get(place + 1)), hints.get(place), value) {
+                return Ok(());
+            }
+        }
+        self.charge_rebuild(table)?;
+        // A table in the arena keeps each entry at a fixed position, so the next write finds this entry through the hint. An external table returns no position.
+        if let Some(position) = table.set_finding(mc, key, value)? {
+            self.remember(hints, slot, table, position);
+        }
+        if mc.step_due() {
+            self.cx.fuel.pause();
+        }
         Ok(())
     }
 
@@ -816,4 +896,10 @@ fn bind_spread<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, shape: Shape, mut
     }
     frame.set(ARGS + keep, rest);
     Ok(())
+}
+
+/// Returns the position that a hint slot holds. A slot that is not used yet holds no fixnum. It reads as a position that no table has, so an unused place never has the key.
+#[inline(always)]
+fn remembered(slot: Value<'_>) -> usize {
+    slot.as_fixnum().map_or(usize::MAX, |position| position as usize)
 }

@@ -24,6 +24,7 @@
 use crate::hash::{HashMap, HashSet};
 
 use ragwort_types::gc::{Gc, Mutation, Value};
+use ragwort_types::table::Tables;
 use ragwort_vm::objects::{StructType, StructTypeFields};
 use ragwort_vm::{Fuel, Intrinsic, Purity, Request, structs};
 
@@ -80,6 +81,7 @@ pub(crate) fn optimize<'s, 'd, 'gc>(mc: &Mutation<'gc>, src: &mut L2<'s, 'gc>, r
         single_use: HashMap::default(),
         small_bodies: Vec::new(),
         small_funcs: HashMap::default(),
+        shapes: HashMap::default(),
         lone_funcs: HashMap::default(),
         known_pairs: HashMap::default(),
         known_structs: HashMap::default(),
@@ -233,6 +235,8 @@ struct Cp0<'m, 't, 's, 'd, 'gc> {
     small_bodies: Vec<bool>,
     /// Small, unassigned, leaf lambdas (containing no nested lambdas) eligible for inlining via cloning at call sites.
     small_funcs: HashMap<Var, Fun<'d>>,
+    /// The shapes made for table literals, by the value words of their keys.
+    shapes: HashMap<Vec<u64>, Value<'gc>>,
     /// Unassigned variables bound to a lambda and referenced exactly once, each with its function and the index of the `let` frame that holds its binding. A rule that moves the function's body into another expression removes the binding. See `taken`.
     lone_funcs: HashMap<Var, (Fun<'d>, usize)>,
     /// Unassigned variables bound to `(cons a b)` where `a` and `b` are constants or unassigned variables.
@@ -1253,7 +1257,38 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         {
             self.learn(subject, kind, true);
         }
+        // Rule 8: A table literal whose keys are constants takes its keys from a shape. `(table 'id x 'name y)` becomes
+        // `(make-shaped-table shape x y)`, where `shape` is a constant that holds the keys and their index. See `ragwort_types::table::Shape`.
+        if intrinsic == Intrinsic::MakeTableOf
+            && let Some(shape) = self.shape_of(&args)
+        {
+            let shape = self.quote(shape);
+            let mut shaped = vec![shape];
+            shaped.extend(args.iter().skip(1).step_by(2));
+            return self.make(Prim::Intrinsic(Intrinsic::MakeShapedTable), shaped);
+        }
         self.make(prim, args)
+    }
+
+    /// Returns the shape of a `table` call with arguments `args`, a key and then a value for each entry. Returns `None` if a key is not a constant, or if the keys cannot be a shape: a key occurs twice, or a key is compared by identity.
+    ///
+    /// Table literals with the same constants as keys share one shape.
+    fn shape_of(&mut self, args: &[Id<'d>]) -> Option<Value<'gc>> {
+        if args.is_empty() || !args.len().is_multiple_of(2) {
+            return None;
+        }
+        let mut keys = Vec::with_capacity(args.len() / 2);
+        for &key in args.iter().step_by(2) {
+            let Node::Quote(key) = self.out[key] else { return None };
+            keys.push(key);
+        }
+        let words: Vec<u64> = keys.iter().map(|key| key.to_bits()).collect();
+        if let Some(&shape) = self.shapes.get(&words) {
+            return Some(shape);
+        }
+        let shape = Tables::new(self.mc).shape(&keys).ok()?.value(self.mc);
+        self.shapes.insert(words, shape);
+        Some(shape)
     }
 
     /// Checks whether expression `expr` satisfies type predicate `pred`, based on currently known type facts.

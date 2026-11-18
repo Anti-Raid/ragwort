@@ -1422,7 +1422,7 @@ fn what_the_host_raises_goes_to_the_raise_handler() {
 fn hinted<'gc>(mc: &Mutation<'gc>, constants: &[Value<'gc>], ops: &[Op], hints: Option<usize>) -> Gc<'gc, Bytecode> {
     let frozen_ops = mc.frozen(Box::from(ops)).unwrap();
     let captures = mc.frozen(Box::<[Capture]>::from([])).unwrap();
-    let hints = hints.map(|count| crate::objects::Hints::new(mc, count, 0).unwrap());
+    let hints = hints.map(|count| crate::objects::Hints::new(mc, crate::objects::HINT_SLOTS * count, Value::FALSE).unwrap());
     let code = Bytecode::new(mc, frozen_ops, Value::VOID, captures, 0, None, Value::FALSE, Value::FALSE, 0, Value::FALSE, 0, 0, hints).unwrap();
     code.set_constants(mc, Vectors::new(mc).immutable_from_slice(constants).unwrap().value(mc));
     code
@@ -1454,8 +1454,8 @@ fn hinted_table_instructions_keep_where_a_key_was_found() {
             Op::Return { src: 5 },
         ]
     }
-    fn word<'gc>(mc: &Mutation<'gc>, code: Gc<'gc, Bytecode>, hint: usize) -> u64 {
-        crate::objects::HintsFields::items(code.hints(mc).unwrap(), mc).get(hint)
+    fn word<'gc>(mc: &Mutation<'gc>, code: Gc<'gc, Bytecode>, hint: usize) -> i64 {
+        crate::objects::HintsFields::items(code.hints(mc).unwrap(), mc).get(crate::objects::HINT_SLOTS * hint + 1).as_fixnum().unwrap_or(0)
     }
     let write = [
         Op::LoadConst { dst: 2, index: 0 },

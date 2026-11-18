@@ -15,7 +15,7 @@ use ragwort_alloc::{Arena, CollectIn, Vec as AVec};
 use ragwort_types::gc::{Gc, Mutation, Value};
 use ragwort_types::vector::Vectors;
 use ragwort_vm::frame::{self, ARGS, MAX_PARAMS, Shape};
-use ragwort_vm::objects::{self, Bytecode, BytecodeFields, Closure, Hints, ModuleFields, Sites, SitesFields};
+use ragwort_vm::objects::{self, Bytecode, BytecodeFields, Closure, HINT_SLOTS, Hints, ModuleFields, Sites, SitesFields};
 use ragwort_vm::report::{Line, Scope, Table};
 use ragwort_vm::{Capture, HostDef, Intrinsic, Op, Request};
 
@@ -253,7 +253,8 @@ impl<'a, 'gc> Module<'a, 'gc> {
         }
         let (lines_start, lines_len) = (lines_start as u32, (self.lines.len() - lines_start) as u32);
         // Each hint starts at 0, the position of the first entry. A hint is only a guess that the instruction checks, so any starting value is valid.
-        let hints = if hints > 0 { Some(Hints::new(mc, usize::from(hints), 0)?) } else { None };
+        // Each hint remembers a few places where its instruction found its key, all unused at first.
+        let hints = if hints > 0 { Some(Hints::new(mc, HINT_SLOTS * usize::from(hints), Value::FALSE)?) } else { None };
         let code = Bytecode::new(mc, mc.frozen(Box::from(ops))?, Value::VOID, mc.frozen(Box::from(captures))?, arity, self.owner, name, source, start, Value::FALSE, lines_start, lines_len, hints)?;
         self.codes.push(code);
         Ok(Some(code))

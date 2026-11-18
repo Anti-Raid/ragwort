@@ -586,6 +586,29 @@ impl<'a> Units<'a> {
         (0..self.len()).map(move |i| self.get(i).expect("in range"))
     }
 
+    /// Copies the units into `out` as UTF-8, starting at `*at`, and advances `*at` past the bytes written. Returns `None` if `out` is too short. `out` may then hold part of the text.
+    pub(crate) fn copy_utf8(self, out: &mut [u8], at: &mut usize) -> Option<()> {
+        match self {
+            // ASCII text in one-byte units is its own UTF-8 encoding.
+            Units::One(bytes) if bytes.is_ascii() => {
+                out.get_mut(*at..*at + bytes.len())?.copy_from_slice(bytes);
+                *at += bytes.len();
+            }
+            Units::Packed(packed) if packed.width() == Width::One && packed.is_ascii() => {
+                packed.copy_bytes(0, out.get_mut(*at..*at + packed.len())?);
+                *at += packed.len();
+            }
+            _ => {
+                for character in self.chars() {
+                    let size = character.len_utf8();
+                    character.encode_utf8(out.get_mut(*at..*at + size)?);
+                    *at += size;
+                }
+            }
+        }
+        Some(())
+    }
+
     /// Calls `visit` with each character, in order. Packed units are read a word at a time.
     #[inline]
     pub(crate) fn each_char(self, mut visit: impl FnMut(char)) {

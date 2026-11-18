@@ -2,7 +2,7 @@
 
 use ragwort_types::gc::{Mutation, Value};
 use ragwort_types::string::{self, Strings};
-use ragwort_types::table::{Table, Tables};
+use ragwort_types::table::{Shape, Table, Tables};
 use ragwort_types::vector::Vectors;
 
 use crate::op::Fuel;
@@ -35,6 +35,20 @@ impl Intrinsic {
                     charge(mc, table, key, fuel)?;
                     table.set(mc, key, operands.get(position + 1))?;
                 }
+                made(mc, fuel, table.value(mc))
+            }
+            Intrinsic::MakeShapedTable => {
+                let count = operands.count();
+                if count == 0 {
+                    return Err(Fault::Arity);
+                }
+                let shape = Shape::of(operands.get(0)).ok_or(Fault::WrongType)?;
+                // The compiler passes exactly one value for each key of the shape.
+                if shape.len(mc) != count - 1 {
+                    return Err(Fault::Arity);
+                }
+                fuel.spend(count as u64 / equal::PER_FUEL)?;
+                let table = Tables::new(mc).shaped(shape, (1..count).map(|position| Some(operands.get(position))))?;
                 made(mc, fuel, table.value(mc))
             }
             Intrinsic::TableRef | Intrinsic::TableSet | Intrinsic::TableDelete | Intrinsic::TableHas => {

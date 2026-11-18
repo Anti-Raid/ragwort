@@ -67,8 +67,21 @@ crate::gc::objects! {
     /// A table whose entries are owned by the host, in `host`. `memo` is a table that caches the
     /// values read from the host so far, created on the first read. `walk` holds the keys and
     /// values in the host's order. It is created when the table is first iterated and dropped on
-    /// the next write. `writable` is whether programs can modify the table.
-    pub(crate) struct ExternTable { memo: Member<Table>, walk: Member<TableEntries>, writable: bool, host: Frozen<RefCell<Box<dyn Hosted>>> }
+    /// the next write. `shape` is the shape that the host declared for the table's keys, if any.
+    /// The values read from the host are then cached in `fields`, a record of that shape, and
+    /// `memo` stays unused. `writable` is whether programs can modify the table.
+    pub(crate) struct ExternTable { memo: Member<Table>, fields: Member<TableRecord>, walk: Member<TableEntries>, shape: Member<TableShape>, writable: bool, host: Frozen<RefCell<Box<dyn Hosted>>> }
+    /// A table that has the keys of `shape` and holds only its values, as its items: one value for
+    /// each key of the shape, in the order of the keys. An item is `Value::BROKEN` for a key that
+    /// the table does not have. `live` is the number of keys that the table has.
+    ///
+    /// A record cannot hold a key outside its shape. When a program adds one, the entries move to
+    /// an ordinary table in `own`, `shape` is cleared, and every operation goes to `own` from then on.
+    pub(crate) struct TableRecord { shape: Member<TableShape>, own: Member<Table>, live: u64 } items Value
+    /// The keys that a group of tables has in common. `pairs` holds the keys in entry order, each
+    /// followed by an unused value slot. `index` is the hash index over those keys. Every table
+    /// made from the shape shares `index` and copies the keys. `seed` is the hash seed of the index.
+    pub(crate) struct TableShape { index: Member<TableIndex>, pairs: Member<TableEntries>, seed: u64 }
     /// A table's index, a hash table with linear probing. A slot is 0 if it was never used.
     /// Otherwise its low half is an entry number plus one, and its high half is the high half of
     /// the key's hash.

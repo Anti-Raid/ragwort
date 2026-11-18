@@ -8,6 +8,11 @@ use crate::{Capture, Op};
 #[path = "tests/objects.rs"]
 mod tests;
 
+/// The number of places that a hinted table instruction remembers. See [`Hints`].
+pub const HINT_WAYS: usize = 4;
+/// The number of slots that one hinted table instruction has in a [`Hints`] object: a shape and a position for each place.
+pub const HINT_SLOTS: usize = 2 * HINT_WAYS;
+
 objects! {
     pub kind Vm;
 
@@ -29,11 +34,18 @@ objects! {
         /// The first row of this function in that table, and the number of rows it owns.
         lines_start: u32,
         lines_len: u32,
-        /// One word for each hinted table instruction of the code, or none if it has no such instruction. See [`Hints`].
+        /// [`HINT_SLOTS`] slots for each hinted table instruction of the code, or none if it has no such instruction. See [`Hints`].
         hints: Member<Hints>,
     }
-    /// The hint words of the hinted table instructions of one [`Bytecode`]. Each word holds the entry position where its instruction last found its key (see `Table::get_at`). The instructions of the code are immutable, so the hints are stored in this separate object. A hint is only a guess, and the instruction checks it, so every word value is valid.
-    pub struct Hints {} items u64
+    /// The hints of the hinted table instructions of one [`Bytecode`]. Each instruction has [`HINT_WAYS`] places where it found its key before, the most recent first. A place is two slots:
+    ///
+    /// - The shape of the table in which the key was found, or `#f` if that table had no shape.
+    /// - The position of the entry, as a fixnum. It is `#f` in a place that is not used yet.
+    ///
+    /// A table with a remembered shape has the key at the remembered position. See `Table::get_hinted`. Several places let one instruction read tables of several shapes in turn, such as events of different kinds, without searching each time.
+    ///
+    /// The instructions of the code are immutable and shared, so the hints are kept in this object and not in the instructions.
+    pub struct Hints {} items Value
     /// The source positions of code compiled together (see [`crate::report::Table`]). The items are the sources and procedure names that the table's rows refer to by index.
     pub struct Sites { table: Frozen<crate::report::Table> } items Value
     /// A compiled `syntax-case` pattern descriptor along with the literal identifiers and pattern data it references (see [`crate::syntax_case`]).

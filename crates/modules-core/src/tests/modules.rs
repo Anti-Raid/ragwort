@@ -976,3 +976,157 @@ fn struct_code_is_optimized() {
                     ((7 3 3 1 none) (2 4 dot 9 3 pair 8 other)))";
     assert_eq!(module_in(&mut arena, "runs", &[(Scheme, &run.replace("LONG", &long))]), Ok(Ok(expected.into())));
 }
+
+/// A `table` call whose keys are all constants is compiled to a call that takes its keys from a shape. A call with any other key stays as it is.
+#[test]
+fn a_table_call_with_constant_keys_takes_its_keys_from_a_shape() {
+    let mut arena = arena();
+    let shaped = "(provide a b c)
+                  (define (a x y) (table 'id x 'name y))
+                  (define (b x) (list (table 1 x \"two\" x #\\c x) (table 'id x 'name x)))
+                  (define (c) (table 'on #t))";
+    let ops = closure_ops(&mut arena, "shaped", shaped);
+    assert_eq!((count(&ops, "MakeShapedTable"), count(&ops, "MakeTableOf")), (4, 0), "{ops}");
+    let plain = "(provide a b c d)
+                 (define (a k x) (table k x))
+                 (define (b x) (table 'id x 'id x))
+                 (define (c x) (table '(1 2) x))
+                 (define (d) (table))";
+    let ops = closure_ops(&mut arena, "plain", plain);
+    assert_eq!((count(&ops, "MakeShapedTable"), count(&ops, "MakeTableOf")), (0, 4), "{ops}");
+}
+
+/// A shape is a constant of the code that uses it. An image keeps it, and the code makes working tables from it in another arena.
+#[test]
+fn an_image_keeps_the_shapes_of_table_calls() {
+    let library = "(provide fresh kept)
+                   (define (fresh n) (table 'id n \"a key that is too long to fit in a word\" 'long 2.5 'half))
+                   (define kept (fresh 1))";
+    let user = "(require library)
+                (list (table->list kept) (table->list (fresh 2)) (begin (table-set! kept 'more 3) (table-delete! kept 2.5) (table-keys kept))
+                      (table-ref (fresh 4) \"a key that is too long to fit in a word\") (table-ref (fresh 5) 'id) (equal? (fresh 6) (fresh 6)))";
+    let expected = "(((id . 1) (\"a key that is too long to fit in a word\" . long) (2.5 . half)) ((id . 2) (\"a key that is too long to fit in a word\" . long) (2.5 . half)) \
+                    (id \"a key that is too long to fit in a word\" more) long 5 #t)";
+    let mut arena = arena();
+    assert_eq!(module_in(&mut arena, "library", &[(Scheme, library)]).map(|ran| ran.is_ok()), Ok(true));
+    arena.collect();
+    let bytes = arena.mutate(|mc| image::save(mc, &[mc.root(0), mc.root(1), mc.root(2)])).unwrap();
+    assert_eq!(module_in(&mut arena, "user", &[(Scheme, user)]), Ok(Ok(expected.into())));
+    for _ in 0..2 {
+        let mut other = Arena::new(1 << 24, 3);
+        other.mutate(|mc| {
+            let roots = image::load(mc, &bytes, HOSTS.iter()).unwrap();
+            roots.iter().enumerate().for_each(|(i, &root)| mc.set_root(i, root));
+        });
+        other.collect();
+        assert_eq!(module_in(&mut other, "user", &[(Scheme, user)]), Ok(Ok(expected.into())));
+    }
+}
+
+mod shaped {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use ragwort_types::Error;
+    use ragwort_types::gc::Mutation;
+    use ragwort_types::table::{ExternalTable, Key, Shape, Tables};
+
+    use super::*;
+
+    const FIELDS: [&str; 3] = ["id", "channel", "pinned"];
+    /// The fields of a reaction, a second kind of event. It has `id` at another position than [`FIELDS`] has it.
+    const REACTION: [&str; 3] = ["emoji", "user", "id"];
+    /// The number of reads that asked an [`Event`] by key, and the number that asked it by position.
+    pub static BY_KEY: AtomicUsize = AtomicUsize::new(0);
+    pub static BY_POSITION: AtomicUsize = AtomicUsize::new(0);
+
+    /// An event whose fields are in the order of its shape. Field `position` of event `number` is `10 * number + position`. The second field is the list of its field names.
+    struct Event(i64, &'static [&'static str; 3]);
+
+    impl ExternalTable for Event {
+        fn len(&self) -> usize {
+            FIELDS.len()
+        }
+
+        fn has(&self, key: Key<'_>) -> bool {
+            matches!(key, Key::Symbol(name) if self.1.contains(&name))
+        }
+
+        fn get<'gc>(&self, _: &Mutation<'gc>, key: Key<'_>) -> Result<Option<Value<'gc>>, Error> {
+            BY_KEY.fetch_add(1, Ordering::Relaxed);
+            let Key::Symbol(name) = key else { return Ok(None) };
+            Ok(self.1.iter().position(|&field| field == name).and_then(|position| Value::fixnum(10 * self.0 + position as i64)))
+        }
+
+        fn keys(&self) -> impl Iterator<Item = Key<'_>> {
+            self.1.iter().copied().map(Key::Symbol)
+        }
+
+        fn get_at<'gc>(&self, _: &Mutation<'gc>, position: usize) -> Option<Result<Option<Value<'gc>>, Error>> {
+            BY_POSITION.fetch_add(1, Ordering::Relaxed);
+            Some(Ok((position < FIELDS.len()).then(|| Value::fixnum(10 * self.0 + position as i64)).flatten()))
+        }
+    }
+
+    /// Returns the field names of an event of kind `kind`: 0 for a message and anything else for a reaction.
+    fn fields(kind: Option<i64>) -> Result<&'static [&'static str; 3], Fault> {
+        match kind {
+            Some(0) => Ok(&FIELDS),
+            Some(_) => Ok(&REACTION),
+            None => Err(Fault::WrongType),
+        }
+    }
+
+    /// Makes the shape of the events of the kind that the caller passes. The module that binds the host functions calls it once for each kind and keeps the shapes in variables.
+    fn event_shape<'s, 'gc>(cx: &mut ragwort_vm::HostContext<'s, 'gc>, args: ragwort_vm::HostArgs<'s, 'gc>) -> Result<ragwort_vm::Reply<'gc>, Fault> {
+        let mc = cx.mc();
+        let symbols = Symbols::of_arena(mc)?;
+        let mut keys = Vec::new();
+        for name in fields(args.iter().next().and_then(|kind| kind.as_fixnum()))? {
+            keys.push(symbols.intern_str(&Strings::new(mc), name)?.value(mc));
+        }
+        Ok(ragwort_vm::Reply::Value(Tables::new(mc).shape(&keys).map_err(|_| Fault::OutOfMemory)?.value(mc)))
+    }
+
+    /// Makes event `number` of kind `kind` with the shape that the caller passes.
+    fn event<'s, 'gc>(cx: &mut ragwort_vm::HostContext<'s, 'gc>, args: ragwort_vm::HostArgs<'s, 'gc>) -> Result<ragwort_vm::Reply<'gc>, Fault> {
+        let mut args = args.iter();
+        let shape = args.next().and_then(Shape::of).ok_or(Fault::WrongType)?;
+        let names = fields(args.next().and_then(|kind| kind.as_fixnum()))?;
+        let number = args.next().and_then(|number| number.as_fixnum()).ok_or(Fault::WrongType)?;
+        Ok(ragwort_vm::Reply::Value(Tables::new(cx.mc()).external_shaped(shape, Event(number, names), 0)?.value(cx.mc())))
+    }
+
+    pub static HOSTS: [HostDef; 2] = [ragwort_vm::host!("event-shape", 1, ragwort_vm::Purity::Impure, event_shape), ragwort_vm::host!("event", 3, ragwort_vm::Purity::Impure, event)];
+}
+
+/// A program reads a new external table of a shape for each event. An instruction with a constant key remembers the position of its key from the first event, and from then on asks the host by position.
+#[test]
+fn programs_read_the_events_of_a_shape_by_position() {
+    use std::sync::atomic::Ordering;
+    let mut arena = arena();
+    let bindings = "(%define message-shape (%call-host event-shape 0)) (%define reaction-shape (%call-host event-shape 1))
+                    (%define event (%lambda (number) (%call-host event message-shape 0 number)))
+                    (%define reaction (%lambda (number) (%call-host event reaction-shape 1 number)))
+                    (%provide event reaction)";
+    assert_eq!(module_hosting(&mut arena, "shaped", &shaped::HOSTS, &[(Native, bindings)]), Ok(Ok("#<void>".into())));
+    let reading = "(require \"shaped\")
+                   (define (sum number) (let ((e (event number))) (+ (table-ref e 'id) (table-ref e 'pinned) (table-ref e 'pinned) (table-ref e 'missing 1000))))
+                   (define (by-name number key) (table-ref (event number) key))
+                   (list (map sum '(1 2 3 4)) (by-name 5 'channel) (table->list (event 6)) (table-length (event 7)) (equal? (event 8) (event 8)) (table? (event 9)))";
+    let (key_before, position_before) = (shaped::BY_KEY.load(Ordering::Relaxed), shaped::BY_POSITION.load(Ordering::Relaxed));
+    assert_eq!(module_in(&mut arena, "reading", &[(Scheme, reading)]), Ok(Ok("((1034 1064 1094 1124) 51 ((id . 60) (channel . 61) (pinned . 62)) 3 #t #t)".into())));
+    let (by_key, by_position) = (shaped::BY_KEY.load(Ordering::Relaxed) - key_before, shaped::BY_POSITION.load(Ordering::Relaxed) - position_before);
+    // The key `missing` is asked for by key, once for each of the four events. The two reads of `id` and `pinned` in the first event may ask by key before their positions are known. Every later read of them asks by position.
+    assert!(by_position >= 6, "{by_position} reads by position, {by_key} by key");
+    assert!((4..=4 + 2 + 1 + 3 + 6).contains(&by_key), "{by_position} reads by position, {by_key} by key");
+    // One procedure reads the `id` of messages and of reactions in turn. The two kinds have `id` at different positions. The read remembers both shapes, so only the first event of each kind can be asked by key.
+    let turns = "(require \"shaped\")
+                 (define (id-of e) (table-ref e 'id))
+                 (let loop ((n 0) (ids '()))
+                   (if (eqv? n 10) (reverse ids) (loop (+ n 1) (cons (id-of (if (even? n) (event n) (reaction n))) ids))))";
+    let (key_before, position_before) = (shaped::BY_KEY.load(Ordering::Relaxed), shaped::BY_POSITION.load(Ordering::Relaxed));
+    assert_eq!(module_in(&mut arena, "turns", &[(Scheme, turns)]), Ok(Ok("(0 12 20 32 40 52 60 72 80 92)".into())));
+    let (by_key, by_position) = (shaped::BY_KEY.load(Ordering::Relaxed) - key_before, shaped::BY_POSITION.load(Ordering::Relaxed) - position_before);
+    assert!(by_key <= 2 && by_position >= 8, "{by_position} reads by position, {by_key} by key");
+}
+
