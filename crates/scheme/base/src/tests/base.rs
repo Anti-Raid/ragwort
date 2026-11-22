@@ -3093,3 +3093,57 @@ fn one_read_serves_tables_of_many_shapes() {
     assert_eq!(eval(writes), "(((count . 4) (name . \"a\")) ((name . \"b\") (count . 14)) ((name . \"c\") (count . 4)))");
 }
 
+/// Tables that get the same field names in the same order have one shape, whichever way a program builds them. A table that is used as a map has none.
+#[test]
+fn tables_built_in_different_ways_share_a_shape() {
+    use ragwort_types::pair::Pairs;
+    use ragwort_types::table::Table;
+    let text = "(define (literal n) (table 'id n 'name \"x\"))
+                (define (stepwise n) (let ((t (make-table))) (table-set! t 'id n) (table-set! t 'name \"x\") t))
+                (define keys (list 'id 'name))
+                (define (put! t k v) (table-set! t k v))
+                (define (through-a-helper n) (let ((t (make-table))) (for-each (lambda (k) (put! t k n)) keys) (table-set! t 'name \"x\") t))
+                (define (from-a-list n) (list->table (list (cons 'id n) (cons 'name \"x\"))))
+                (define (copied n) (table-copy (literal n)))
+                (define (computed n) (table (car keys) n (cadr keys) \"x\"))
+                (define (grown n) (let ((t (table 'id n))) (table-set! t 'name \"x\") t))
+                (define (updated n) (let ((t (literal 0))) (table-update! t 'id (lambda (old) (+ old n))) (table-set! t 'name \"x\") t))
+                (define (mapped n) (let ((t (make-table))) (table-set! t (string-append \"i\" \"d\") n) (table-set! t 'name \"x\") t))
+                (define (numbered n) (let ((t (make-table))) (table-set! t n n) t))
+                (define (reordered n) (let ((t (make-table))) (table-set! t 'name \"x\") (table-set! t 'id n) t))
+                (list (literal 1) (stepwise 2) (through-a-helper 3) (from-a-list 4) (copied 5) (computed 6) (grown 7) (updated 8) (mapped 9) (numbered 10) (reordered 11))";
+    let mut arena = arena();
+    arena.mutate(|mc| {
+        let mut last = Value::VOID;
+        for thunk in load_text(mc, text).unwrap() {
+            last = run(mc, thunk).unwrap();
+        }
+        let tables: Vec<Table> = Pairs::new(mc).elements(last).map(|value| Table::of(value).unwrap()).collect();
+        let shape = tables[0].shape(mc).expect("a table literal has a shape");
+        assert_eq!(shape.len(mc), 2);
+        for (number, table) in tables[..8].iter().enumerate() {
+            assert_eq!((table.shape(mc), table.len(mc)), (Some(shape), 2), "table {number}");
+        }
+        // A key that is a computed string or number makes the table a map. Fields in another order have another shape.
+        assert_eq!((tables[8].shape(mc), tables[9].shape(mc), tables[8].len(mc)), (None, None, 2));
+        assert!(tables[10].shape(mc).is_some_and(|other| other != shape && other.len(mc) == 2));
+    });
+    // The tables read the same whichever way they were built.
+    let listed = format!("{text} (map table->list (list (literal 1) (stepwise 2) (through-a-helper 3) (from-a-list 4) (copied 5) (computed 6) (grown 7) (updated 8) (mapped 9) (numbered 10) (reordered 11)))");
+    assert_eq!(
+        eval(&listed),
+        "(((id . 1) (name . \"x\")) ((id . 2) (name . \"x\")) ((id . 3) (name . \"x\")) ((id . 4) (name . \"x\")) ((id . 5) (name . \"x\")) ((id . 6) (name . \"x\")) ((id . 7) (name . \"x\")) ((id . 8) (name . \"x\")) ((\"id\" . 9) (name . \"x\")) ((10 . 10)) ((name . \"x\") (id . 11)))"
+    );
+}
+
+/// A table that is filled field by field behaves as any table does when it outgrows its shape or loses and regains keys.
+#[test]
+fn a_table_filled_field_by_field_is_an_ordinary_table() {
+    // More fields than a shape holds, added by one loop and read back.
+    assert_eq!(eval("(define t (make-table)) (define names (let loop ((i 0) (acc '())) (if (eqv? i 100) (reverse acc) (loop (+ i 1) (cons (string->symbol (string-append \"f\" (number->string i))) acc))))) (for-each (lambda (name) (table-set! t name name)) names) (list (table-length t) (equal? (table-keys t) names) (table-ref t 'f0) (table-ref t 'f63) (table-ref t 'f64) (table-ref t 'f99) (table-ref t 'f100))"), "(100 #t f0 f63 f64 f99 #f)");
+    // A removed field that is set again becomes the last entry. Fields and map keys mix in one table.
+    assert_eq!(eval("(define t (make-table)) (table-set! t 'a 1) (table-set! t 'b 2) (table-set! t 'c 3) (table-delete! t 'a) (define before (table->list t)) (table-set! t 'a 4) (table-set! t \"s\" 5) (table-set! t 'd 6) (table-delete! t 'b) (list before (table->list t) (table-length t) (table-has? t 'b))"), "(((b . 2) (c . 3)) ((c . 3) (a . 4) (\"s\" . 5) (d . 6)) 4 #f)");
+    // Two tables built by the same code are equal and separate, and one write site serves tables at every stage of being filled.
+    assert_eq!(eval("(define (make n) (let ((t (make-table))) (table-set! t 'n n) (when (even? n) (table-set! t 'even #t)) (table-set! t 'last n) t)) (define made (map make '(1 2 3 4))) (table-set! (car made) 'n 100) (list (map table->list made) (equal? (make 6) (make 6)) (eq? (make 6) (make 6)))"), "((((n . 100) (last . 1)) ((n . 2) (even . #t) (last . 2)) ((n . 3) (last . 3)) ((n . 4) (even . #t) (last . 4))) #t #f)");
+}
+

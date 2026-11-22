@@ -160,6 +160,7 @@
 (%define table-length (%lambda (t) (%intrinsic table-length t)))
 (%define table-clear! (%lambda (t) (%intrinsic table-clear! t)))
 (%define table->vector (%lambda (t) (%intrinsic table->vector t)))
+(%define table-copy (%lambda (t) (%intrinsic table-copy t)))
 (%define table-update!
   (%lambda (t key f [default #f])
     (%intrinsic table-set! t key (%app f (%intrinsic table-ref t key default)))))
@@ -206,15 +207,6 @@
     (%lambda (f t)
       (%let ((entries (%intrinsic table->vector t)))
         (%app each f entries 0 (%intrinsic vector-length entries))))))
-(%define table-copy
-  (%letrec ((fill (%lambda (copy entries at end)
-                    (%if (%intrinsic = at end)
-                         copy
-                         (%let ((_ (%intrinsic table-set! copy (%intrinsic vector-ref entries at) (%intrinsic vector-ref entries (%intrinsic + at 1)))))
-                           (%app fill copy entries (%intrinsic + at 2) end))))))
-    (%lambda (t)
-      (%let ((entries (%intrinsic table->vector t)))
-        (%app fill (%intrinsic make-table (%intrinsic table-length t)) entries 0 (%intrinsic vector-length entries))))))
 
 (%define + (%lambda xs (%apply-intrinsic + xs)))
 (%define - (%lambda xs (%apply-intrinsic - xs)))

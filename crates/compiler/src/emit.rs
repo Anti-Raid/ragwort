@@ -15,7 +15,7 @@ use ragwort_alloc::{Arena, CollectIn, Vec as AVec};
 use ragwort_types::gc::{Gc, Mutation, Value};
 use ragwort_types::vector::Vectors;
 use ragwort_vm::frame::{self, ARGS, MAX_PARAMS, Shape};
-use ragwort_vm::objects::{self, Bytecode, BytecodeFields, Closure, HINT_SLOTS, Hints, ModuleFields, Sites, SitesFields};
+use ragwort_vm::objects::{self, Bytecode, BytecodeFields, Closure, HINT_KEY, HINT_SLOTS, Hints, HintsFields, ModuleFields, Sites, SitesFields};
 use ragwort_vm::report::{Line, Scope, Table};
 use ragwort_vm::{Capture, HostDef, Intrinsic, Op, Request};
 
@@ -198,7 +198,7 @@ impl<'a, 'gc> Module<'a, 'gc> {
             emitter.block(block, selected.order.get(i + 1).copied())?;
         }
         let Emitter { mut ops, mut starts, mut jumps, mut sited, .. } = emitter;
-        let hints = selected.hints;
+        let hint_keys = selected.hints.as_slice();
         // Eliminates redundant jumps to the immediately following instruction (e.g. blocks where parallel moves collapsed to no-ops).
         loop {
             // `gone[pc]` is set for each jump to remove. A flag for every instruction keeps one pass linear in the length of the function.
@@ -252,9 +252,16 @@ impl<'a, 'gc> Module<'a, 'gc> {
             self.lines.push(Line { pc: pc as u32, source, offset, inlined });
         }
         let (lines_start, lines_len) = (lines_start as u32, (self.lines.len() - lines_start) as u32);
-        // Each hint starts at 0, the position of the first entry. A hint is only a guess that the instruction checks, so any starting value is valid.
-        // Each hint remembers a few places where its instruction found its key, all unused at first.
-        let hints = if hints > 0 { Some(Hints::new(mc, HINT_SLOTS * usize::from(hints), Value::FALSE)?) } else { None };
+        // Each hint remembers a few places where its instruction found its key, all unused at first. It also holds the key.
+        let hints = if hint_keys.is_empty() {
+            None
+        } else {
+            let hints = Hints::new(mc, HINT_SLOTS * hint_keys.len(), Value::FALSE)?;
+            for (number, &key) in hint_keys.iter().enumerate() {
+                hints.items(mc).set(mc, HINT_SLOTS * number + HINT_KEY, key);
+            }
+            Some(hints)
+        };
         let code = Bytecode::new(mc, mc.frozen(Box::from(ops))?, Value::VOID, mc.frozen(Box::from(captures))?, arity, self.owner, name, source, start, Value::FALSE, lines_start, lines_len, hints)?;
         self.codes.push(code);
         Ok(Some(code))
@@ -348,15 +355,22 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
                 self.store(dst);
             }
             Kind::TableRef(hint) => {
-                let (table, key, default) = (self.read(args[0], 0), self.read(args[1], 1), self.read(args[2], 2));
-                let target = self.target(dst);
-                self.ops.push(Op::TableRefHinted { dst: target, table, key, default, hint });
+                let table = self.read(inst.head.expect("a table instruction has a table"), 0);
+                // A read whose default is `#f` has no default argument.
+                if let Some(&default) = args.first() {
+                    let default = self.read(default, 1);
+                    let target = self.target(dst);
+                    self.ops.push(Op::TableRefOrHinted { dst: target, table, default, hint });
+                } else {
+                    let target = self.target(dst);
+                    self.ops.push(Op::TableRefHinted { dst: target, table, hint });
+                }
                 self.store(dst);
             }
             Kind::TableSet(hint) => {
-                let (table, key, value) = (self.read(args[0], 0), self.read(args[1], 1), self.read(args[2], 2));
+                let (table, value) = (self.read(inst.head.expect("a table instruction has a table"), 0), self.read(args[0], 1));
                 let target = self.target(dst);
-                self.ops.push(Op::TableSetHinted { dst: target, table, key, value, hint });
+                self.ops.push(Op::TableSetHinted { dst: target, table, value, hint });
                 self.store(dst);
             }
             Kind::Slot(op, slot) => self.slot(dst, op, slot, args)?,

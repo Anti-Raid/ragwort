@@ -10,8 +10,10 @@ mod tests;
 
 /// The number of places that a hinted table instruction remembers. See [`Hints`].
 pub const HINT_WAYS: usize = 4;
-/// The number of slots that one hinted table instruction has in a [`Hints`] object: a shape and a position for each place.
-pub const HINT_SLOTS: usize = 2 * HINT_WAYS;
+/// The number of slots that one hinted table instruction has in a [`Hints`] object: a shape and a position for each place, and the key.
+pub const HINT_SLOTS: usize = 2 * HINT_WAYS + 1;
+/// The slot that holds the key of a hinted table instruction, counted from the first slot of the instruction.
+pub const HINT_KEY: usize = 2 * HINT_WAYS;
 
 objects! {
     pub kind Vm;
@@ -43,6 +45,8 @@ objects! {
     /// - The position of the entry, as a fixnum. It is `#f` in a place that is not used yet.
     ///
     /// A table with a remembered shape has the key at the remembered position. See `Table::get_hinted`. Several places let one instruction read tables of several shapes in turn, such as events of different kinds, without searching each time.
+    ///
+    /// The slot after the places holds the key of the instruction, which is a constant. The compiler stores it when it makes the code. An instruction needs the key only when no place has the shape of its table, so the key is kept here and not loaded into a register.
     ///
     /// The instructions of the code are immutable and shared, so the hints are kept in this object and not in the instructions.
     pub struct Hints {} items Value

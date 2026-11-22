@@ -1418,11 +1418,17 @@ fn what_the_host_raises_goes_to_the_raise_handler() {
     });
 }
 
-/// Creates the bytecode of a function of no arguments from `ops` and `constants`. If `hints` is `Some(count)`, the code has `count` hint words.
-fn hinted<'gc>(mc: &Mutation<'gc>, constants: &[Value<'gc>], ops: &[Op], hints: Option<usize>) -> Gc<'gc, Bytecode> {
+/// Creates the bytecode of a function of no arguments from `ops` and `constants`. If `keys` is `Some`, the code has one hint for each key.
+fn hinted<'gc>(mc: &Mutation<'gc>, constants: &[Value<'gc>], ops: &[Op], keys: Option<&[Value<'gc>]>) -> Gc<'gc, Bytecode> {
     let frozen_ops = mc.frozen(Box::from(ops)).unwrap();
     let captures = mc.frozen(Box::<[Capture]>::from([])).unwrap();
-    let hints = hints.map(|count| crate::objects::Hints::new(mc, crate::objects::HINT_SLOTS * count, Value::FALSE).unwrap());
+    let hints = keys.map(|keys| {
+        let hints = crate::objects::Hints::new(mc, crate::objects::HINT_SLOTS * keys.len(), Value::FALSE).unwrap();
+        for (number, &key) in keys.iter().enumerate() {
+            crate::objects::HintsFields::items(hints, mc).set(mc, crate::objects::HINT_SLOTS * number + crate::objects::HINT_KEY, key);
+        }
+        hints
+    });
     let code = Bytecode::new(mc, frozen_ops, Value::VOID, captures, 0, None, Value::FALSE, Value::FALSE, 0, Value::FALSE, 0, 0, hints).unwrap();
     code.set_constants(mc, Vectors::new(mc).immutable_from_slice(constants).unwrap().value(mc));
     code
@@ -1442,27 +1448,23 @@ fn failed<'gc>(mc: &Mutation<'gc>, code: Gc<'gc, Bytecode>) -> Fault {
     }
 }
 
-/// A hinted table instruction searches for its key the first time and writes the entry position into its hint word. Code that refers to a hint word it does not have is malformed.
+/// A hinted table instruction takes its key from its hint. It searches for the key the first time and writes the entry position into the hint. Code that refers to a hint it does not have is malformed.
 #[test]
 fn hinted_table_instructions_keep_where_a_key_was_found() {
-    fn read(key: u32, hint: u16) -> [Op; 5] {
-        [
-            Op::LoadConst { dst: 2, index: 0 },
-            Op::LoadConst { dst: 3, index: key },
-            Op::LoadConst { dst: 4, index: 3 },
-            Op::TableRefHinted { dst: 5, table: 2, key: 3, default: 4, hint },
-            Op::Return { src: 5 },
-        ]
+    fn read(hint: u16) -> [Op; 4] {
+        [Op::LoadConst { dst: 2, index: 0 }, Op::LoadConst { dst: 4, index: 1 }, Op::TableRefOrHinted { dst: 5, table: 2, default: 4, hint }, Op::Return { src: 5 }]
+    }
+    fn read_plain(hint: u16) -> [Op; 3] {
+        [Op::LoadConst { dst: 2, index: 0 }, Op::TableRefHinted { dst: 5, table: 2, hint }, Op::Return { src: 5 }]
     }
     fn word<'gc>(mc: &Mutation<'gc>, code: Gc<'gc, Bytecode>, hint: usize) -> i64 {
         crate::objects::HintsFields::items(code.hints(mc).unwrap(), mc).get(crate::objects::HINT_SLOTS * hint + 1).as_fixnum().unwrap_or(0)
     }
     let write = [
         Op::LoadConst { dst: 2, index: 0 },
-        Op::LoadConst { dst: 3, index: 1 },
-        Op::LoadConst { dst: 4, index: 3 },
-        Op::TableSetHinted { dst: 5, table: 2, key: 3, value: 4, hint: 1 },
-        Op::TableRefHinted { dst: 6, table: 2, key: 3, default: 3, hint: 0 },
+        Op::LoadConst { dst: 4, index: 1 },
+        Op::TableSetHinted { dst: 5, table: 2, value: 4, hint: 1 },
+        Op::TableRefOrHinted { dst: 6, table: 2, default: 2, hint: 0 },
         Op::Return { src: 6 },
     ];
     let mut arena = Arena::new(1 << 22, 0);
@@ -1471,25 +1473,31 @@ fn hinted_table_instructions_keep_where_a_key_was_found() {
         for key in 0..8 {
             table.set(mc, fix(key), fix(key * 10)).unwrap();
         }
-        // Constant 1 is a key that the table has at position 7. Constant 2 is a key that the table does not have.
-        let constants = [table.value(mc), fix(7), fix(99), fix(-1)];
-        let found = hinted(mc, &constants, &read(1, 0), Some(1));
+        // The table has the key 7 at position 7, and does not have the key 99. Constant 1 is the default of the reads and the value of the write.
+        let constants = [table.value(mc), fix(-1)];
+        let found = hinted(mc, &constants, &read(0), Some(&[fix(7)]));
         assert_eq!((word(mc, found, 0), ended(mc, found), word(mc, found, 0)), (0, Ok(Outcome::Done(fix(70))), 7));
         // The second run reads the entry at the hinted position.
         assert_eq!((ended(mc, found), word(mc, found, 0)), (Ok(Outcome::Done(fix(70))), 7));
-        // A read of a key that the table does not have returns the default and leaves the hint word unchanged.
-        let missing = hinted(mc, &constants, &read(2, 1), Some(2));
+        // A read of a key that the table does not have returns the default and leaves the hint unchanged.
+        let missing = hinted(mc, &constants, &read(1), Some(&[fix(7), fix(99)]));
         assert_eq!((ended(mc, missing), word(mc, missing, 1)), (Ok(Outcome::Done(fix(-1))), 0));
-        // A write sets the entry's value and keeps its position. A read of the same key through another hint word returns the new value.
-        let written = hinted(mc, &constants, &write, Some(2));
+        // The form without a default register returns `#f` for a key that the table does not have.
+        let plain = hinted(mc, &constants, &read_plain(0), Some(&[fix(7)]));
+        assert_eq!((ended(mc, plain), ended(mc, plain), word(mc, plain, 0)), (Ok(Outcome::Done(fix(70))), Ok(Outcome::Done(fix(70))), 7));
+        let plain_missing = hinted(mc, &constants, &read_plain(1), Some(&[fix(7), fix(99)]));
+        assert_eq!((ended(mc, plain_missing), word(mc, plain_missing, 1)), (Ok(Outcome::Done(Value::FALSE)), 0));
+        // A write sets the entry's value and keeps its position. A read of the same key through another hint returns the new value.
+        let written = hinted(mc, &constants, &write, Some(&[fix(7), fix(7)]));
         assert_eq!((ended(mc, written), word(mc, written, 1), word(mc, written, 0), table.get(mc, fix(7))), (Ok(Outcome::Done(fix(-1))), 7, 7, Ok(Some(fix(-1)))));
         // An operand that is not a table is a type error. It is detected before the hint is read.
-        let not_a_table = hinted(mc, &[fix(1), fix(7), fix(99), fix(-1)], &read(1, 0), Some(1));
+        let not_a_table = hinted(mc, &[fix(1), fix(-1)], &read(0), Some(&[fix(7)]));
         assert_eq!(failed(mc, not_a_table), Fault::WrongType);
-        // Code with no hint words, or with too few, is malformed.
-        assert_eq!(failed(mc, hinted(mc, &constants, &read(1, 0), None)), Fault::Malformed);
-        assert_eq!(failed(mc, hinted(mc, &constants, &read(1, 1), Some(1))), Fault::Malformed);
-        assert_eq!(failed(mc, hinted(mc, &constants, &write, Some(1))), Fault::Malformed);
+        // Code with no hints, or with too few, is malformed.
+        assert_eq!(failed(mc, hinted(mc, &constants, &read(0), None)), Fault::Malformed);
+        assert_eq!(failed(mc, hinted(mc, &constants, &read(1), Some(&[fix(7)]))), Fault::Malformed);
+        assert_eq!(failed(mc, hinted(mc, &constants, &read_plain(1), Some(&[fix(7)]))), Fault::Malformed);
+        assert_eq!(failed(mc, hinted(mc, &constants, &write, Some(&[fix(7)]))), Fault::Malformed);
     });
 }
 

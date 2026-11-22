@@ -90,7 +90,7 @@ impl<'gc> Symbols<'gc> {
         }
         let table = GcTable::<WeakObjects<objects::Sym>>::new(mc)?;
         let keywords = GcTable::<WeakObjects<objects::Keyword>>::new(mc)?;
-        let symbols = Self(objects::Interned::new(mc, seed, Some(table.head()), Some(keywords.head()))?);
+        let symbols = Self(objects::Interned::new(mc, seed, Some(table.head()), Some(keywords.head()), None)?);
         mc.interned().set(symbols.value(mc).to_bits());
         Ok(symbols)
     }
@@ -104,6 +104,15 @@ impl<'gc> Symbols<'gc> {
 
     pub fn value(self, mc: &Mutation<'gc>) -> Value<'gc> {
         Value::object(mc, self.0)
+    }
+
+    /// Returns the root of the arena's tree of table shapes, or `None` if no shape has been made yet. See [`crate::table::Shape`].
+    pub(crate) fn shapes(self, mc: &Mutation<'gc>) -> Option<Gc<'gc, objects::TableShape>> {
+        self.0.shapes(mc)
+    }
+
+    pub(crate) fn set_shapes(self, mc: &Mutation<'gc>, root: Gc<'gc, objects::TableShape>) {
+        self.0.set_shapes(mc, Some(root));
     }
 
     /// Returns the seed of the hashes that the symbols store.

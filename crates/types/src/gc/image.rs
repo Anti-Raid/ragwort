@@ -43,8 +43,8 @@ use std::any::Any;
 use std::collections::HashMap;
 
 use super::frozen::FROZEN_COST;
-use super::{Desc, Heap, Items, Mutation, OBJECT, Object, OutOfMemory, Phase, Role, TAG, TYPE_BITS, Value, mask};
-use crate::objects::{Interned, Sym};
+use super::{Desc, Gc, Heap, Items, Mutation, OBJECT, Object, OutOfMemory, Phase, Role, TAG, TYPE_BITS, Value, mask};
+use crate::objects::{Interned, Sym, TableShape, TableShapeFields};
 use crate::string::{Strings, chars};
 use crate::symbol::{Keyword, Symbol, Symbols};
 use crate::wire::{Malformed, Reader, Wire, Writer, mix, shape_of};
@@ -572,6 +572,20 @@ pub fn load<'gc>(mc: &Mutation<'gc>, stamp: u64, bytes: &[u8], descs: &[&'static
     for (place, entry) in entries.iter().enumerate() {
         if let &Entry::Plain(desc, len) = entry {
             loader.object(loader.indices[place], desc, len, &mut words)?;
+        }
+    }
+    // The image's tree of table shapes becomes the arena's, if the arena has none yet. Tables that are built in this arena then get the same shapes as the tables of the image's code. The shape without a parent is the root of the tree.
+    if symbols.shapes(mc).is_none() {
+        for (place, entry) in entries.iter().enumerate() {
+            if let &Entry::Plain(desc, _) = entry
+                && desc.number == TableShape::DESC.number
+            {
+                let shape: Gc<'gc, TableShape> = Gc::new(loader.indices[place]);
+                if shape.parent(mc).is_none() {
+                    symbols.set_shapes(mc, shape);
+                    break;
+                }
+            }
         }
     }
     let mut rooted = Reader::new(body.bytes()?, context);

@@ -628,6 +628,9 @@ named! {
         /// `(table->vector t)`: allocates a mutable vector of the keys and values of table `t`: each key
         /// followed by its value, in the order the entries were added.
         TableToVector = ("table->vector", takes(1, TRUTHY)),
+        /// `(table-copy t)`: allocates a table with the entries of table `t`, in the same order. The new
+        /// table can be changed, whatever `t` is. If `t` has a shape, the new table has it too.
+        TableCopy = ("table-copy", takes(1, TRUTHY)),
         /// `(box x)`: allocates and returns a newly created mutable box initialized with value `x`.
         MakeBox = ("box", takes(1, DISCARD | TRUTHY)),
         /// `(unbox b)`: dereferences box `b`, returning its current stored value.
@@ -1014,6 +1017,41 @@ impl Intrinsic {
         self.apply(cx.mc, Some(cx.task), operands, &mut cx.fuel)
     }
 
+    /// Returns the result of the intrinsic on two small integers, for the instructions that take
+    /// two operands. The intrinsics with this direct form are `+`, `-`, `*` and the numeric
+    /// comparisons.
+    ///
+    /// Returns `None` if the intrinsic has no direct form, if an operand is not a small integer,
+    /// or if the result is not one. The instruction then runs the intrinsic in the general way,
+    /// which gives the same result for small integers.
+    #[inline(always)]
+    pub(crate) fn small<'gc>(self, left: Value<'gc>, right: Value<'gc>) -> Option<Value<'gc>> {
+        match self {
+            Intrinsic::Add => left.fixnum_add(right),
+            Intrinsic::Sub => left.fixnum_sub(right),
+            Intrinsic::Mul => left.fixnum_mul(right),
+            _ => self.small_test(left, right).map(boolean),
+        }
+    }
+
+    /// Returns the result of a numeric comparison of two small integers. Returns `None` if the
+    /// intrinsic is not a numeric comparison, or if an operand is not a small integer. See
+    /// [`Intrinsic::small`].
+    #[inline(always)]
+    pub(crate) fn small_test(self, left: Value<'_>, right: Value<'_>) -> Option<bool> {
+        if !matches!(self, Intrinsic::NumEq | Intrinsic::Lt | Intrinsic::Gt | Intrinsic::Le | Intrinsic::Ge) {
+            return None;
+        }
+        let (left, right) = (left.as_fixnum()?, right.as_fixnum()?);
+        Some(match self {
+            Intrinsic::Lt => left < right,
+            Intrinsic::Gt => left > right,
+            Intrinsic::Le => left <= right,
+            Intrinsic::Ge => left >= right,
+            _ => left == right,
+        })
+    }
+
     /// Executes a binary intrinsic on operand registers `first` and `second`, assuming the caller
     /// has verified the intrinsic accepts exactly two arguments.
     #[inline(always)]
@@ -1316,7 +1354,8 @@ impl Intrinsic {
             | Intrinsic::TableHas
             | Intrinsic::TableLength
             | Intrinsic::TableClear
-            | Intrinsic::TableToVector => self.table(mc, operands, fuel)?,
+            | Intrinsic::TableToVector
+            | Intrinsic::TableCopy => self.table(mc, operands, fuel)?,
             Intrinsic::IsVector => boolean(EveryVector::of(operands.get(0)).is_some()),
             Intrinsic::MakeVector
             | Intrinsic::MakeVectorOf

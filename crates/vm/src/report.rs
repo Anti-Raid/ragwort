@@ -11,7 +11,7 @@ use ragwort_types::syntax::SyntaxSource;
 use ragwort_types::vector::{AnyVector, Vectors};
 
 use crate::frame::{self, CLOSURE, Link};
-use crate::objects::{Bytecode, BytecodeFields, Sites, SitesFields, Closure, ClosureFields, Condition, ConditionFields, FramesFields, KeywordProcedure, KeywordProcedureFields, ModuleFields, Prompt, PromptFields, Task, TaskFields};
+use crate::objects::{Bytecode, BytecodeFields, HINT_KEY, HINT_SLOTS, HintsFields, Sites, SitesFields, Closure, ClosureFields, Condition, ConditionFields, FramesFields, KeywordProcedure, KeywordProcedureFields, ModuleFields, Prompt, PromptFields, Task, TaskFields};
 use crate::segments::records;
 use crate::{Fault, HostDef, Intrinsic, Op, coroutine};
 
@@ -105,8 +105,9 @@ pub(crate) fn origin<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, code: Gc<'g
         Op::CallIntrinsic { base, args, intrinsic } | Op::TailCallIntrinsic { base, args, intrinsic } | Op::ApplyIntrinsic { base, args, intrinsic } => {
             (Some(Operation::Intrinsic(intrinsic)), list(mc, (0..args).map(|i| frame.get(base.wrapping_add(i))))?)
         }
-        Op::TableRefHinted { table, key, default, .. } => (Some(Operation::Intrinsic(Intrinsic::TableRef)), list(mc, [frame.get(table), frame.get(key), frame.get(default)].into_iter())?),
-        Op::TableSetHinted { table, key, value, .. } => (Some(Operation::Intrinsic(Intrinsic::TableSet)), list(mc, [frame.get(table), frame.get(key), frame.get(value)].into_iter())?),
+        Op::TableRefHinted { table, hint, .. } => (Some(Operation::Intrinsic(Intrinsic::TableRef)), list(mc, [frame.get(table), hint_key(mc, code, hint), Value::FALSE].into_iter())?),
+        Op::TableRefOrHinted { table, default, hint, .. } => (Some(Operation::Intrinsic(Intrinsic::TableRef)), list(mc, [frame.get(table), hint_key(mc, code, hint), frame.get(default)].into_iter())?),
+        Op::TableSetHinted { table, value, hint, .. } => (Some(Operation::Intrinsic(Intrinsic::TableSet)), list(mc, [frame.get(table), hint_key(mc, code, hint), frame.get(value)].into_iter())?),
         Op::AddImm { a: operand, imm, .. } => (Some(Operation::Intrinsic(Intrinsic::Add)), list(mc, [frame.get(operand), Value::fixnum(i64::from(imm)).unwrap_or(Value::VOID)].into_iter())?),
         Op::StructField { a: instance, .. } | Op::StructRef { a: instance, .. } => (None, list(mc, [frame.get(instance)].into_iter())?),
         Op::Call { base, args } if fault == Fault::Arity => (None, list(mc, [frame.get(base), count(args)].into_iter())?),
@@ -438,4 +439,12 @@ fn decoded<'gc>(mc: &Mutation<'gc>, raised: Value<'gc>) -> Raised<'gc> {
 pub(crate) fn who<'gc>(mc: &Mutation<'gc>, condition: Gc<'gc, Condition>) -> Result<Value<'gc>, Fault> {
     let Some(operation) = condition.failure(mc).and_then(|failure| failure.operation) else { return Ok(Value::FALSE) };
     Ok(ragwort_types::symbol::Symbols::of_arena(mc)?.intern_str(&Strings::new(mc), operation.name())?.value(mc))
+}
+
+/// Returns the key of hinted table instruction `hint` of `code`, or `#<void>` if the code has no such hint.
+fn hint_key<'gc>(mc: &Mutation<'gc>, code: Gc<'gc, Bytecode>, hint: u16) -> Value<'gc> {
+    let Some(hints) = code.hints(mc) else { return Value::VOID };
+    let hints = HintsFields::items(hints, mc);
+    let slot = HINT_SLOTS * usize::from(hint) + HINT_KEY;
+    if slot < hints.len() { hints.get(slot) } else { Value::VOID }
 }

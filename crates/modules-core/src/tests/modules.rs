@@ -295,13 +295,14 @@ fn constant_keys_compile_to_hinted_table_instructions() {
                   (define (d t v) (begin (table-set! t \"n\" v) (table-ref t 'name)))
                   (define (e t) (if (table-ref t 'on) (table-ref t 'a) (table-ref t 'b)))";
     let ops = closure_ops(&mut arena, "hinted", hinted);
-    assert_eq!((count(&ops, "TableRefHinted"), count(&ops, "TableSetHinted"), count(&ops, "TableRef"), count(&ops, "TableSet")), (8, 2, 0, 0), "{ops}");
+    // The read with the default 0 keeps a register for its default. The others have the default `#f`.
+    assert_eq!((count(&ops, "TableRefHinted"), count(&ops, "TableRefOrHinted"), count(&ops, "TableSetHinted"), count(&ops, "TableRef"), count(&ops, "TableSet")), (7, 1, 2, 0, 0), "{ops}");
     let plain = "(provide a b c)
                  (define (a t k) (table-ref t k))
                  (define (b t) (list (table-ref t \"a key that is too long to fit in a word\") (table-ref t 1.5e300) (table-ref t (expt 2 100))))
                  (define (c t k v) (table-set! t k v))";
     let ops = closure_ops(&mut arena, "plain", plain);
-    assert_eq!((count(&ops, "TableRefHinted"), count(&ops, "TableSetHinted"), count(&ops, "TableRef"), count(&ops, "TableSet")), (0, 0, 4, 1), "{ops}");
+    assert_eq!((count(&ops, "TableRefHinted"), count(&ops, "TableRefOrHinted"), count(&ops, "TableSetHinted"), count(&ops, "TableRef"), count(&ops, "TableSet")), (0, 0, 0, 4, 1), "{ops}");
 }
 
 /// Host-owned data exposed as external tables: an event that the host received, which programs read, and a set of counters, which programs also modify.

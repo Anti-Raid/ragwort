@@ -2,6 +2,7 @@
 
 use ragwort_types::gc::{Mutation, Value};
 use ragwort_types::string::{self, Strings};
+use ragwort_types::symbol::Symbol;
 use ragwort_types::table::{Shape, Table, Tables};
 use ragwort_types::vector::Vectors;
 
@@ -29,7 +30,9 @@ impl Intrinsic {
                     return Err(Fault::Arity);
                 }
                 fuel.spend(count as u64 / equal::PER_FUEL)?;
-                let table = Tables::new(mc).with_room(count / 2)?;
+                // A table whose first key is a symbol is likely a record, so it starts with a shape, which it keeps while its keys are symbols. Any other table gets room for its entries as a map.
+                let tables = Tables::new(mc);
+                let table = if count > 0 && Symbol::of(operands.get(0)).is_some() { tables.make()? } else { tables.with_room(count / 2)? };
                 for position in (0..count).step_by(2) {
                     let key = operands.get(position);
                     charge(mc, table, key, fuel)?;
@@ -85,6 +88,20 @@ impl Intrinsic {
                     items.set(mc, 2 * position + 1, value);
                 }
                 made(mc, fuel, vector.value(mc))
+            }
+            Intrinsic::TableCopy => {
+                let table = table_of(operands.get(0))?;
+                fuel.spend(table.len(mc) as u64 / equal::PER_FUEL)?;
+                // A table with a shape is copied without a look at its keys. Any other copy hashes every key, and hashing a string key reads all its characters.
+                if table.is_external() || table.shape(mc).is_none() {
+                    let strings = Strings::new(mc);
+                    for (key, _) in table.entries(mc)? {
+                        if let Some(text) = strings.string(key) {
+                            fuel.spend(string::len(&strings, text) as u64 / equal::PER_FUEL)?;
+                        }
+                    }
+                }
+                made(mc, fuel, table.copy(mc)?.value(mc))
             }
             _ => unreachable!("{self:?} isn't a table procedure"),
         })

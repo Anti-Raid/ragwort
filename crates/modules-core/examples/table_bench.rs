@@ -267,6 +267,10 @@ fn size(make: &str) -> f64 {
 fn main() {
     let read3 = "(+ (table-ref t 'id) (table-ref t 'author-id) (table-ref t 'channel-id))";
     let literal = "(table 'id 1 'content 2 'author-id 3 'channel-id 4 'guild-id 5 'pinned 6)";
+    let stepwise = "(let ((t (make-table))) (table-set! t 'id 1) (table-set! t 'content 2) (table-set! t 'author-id 3) (table-set! t 'channel-id 4) (table-set! t 'guild-id 5) (table-set! t 'pinned 6) t)";
+    let helped = "(let ((t (make-table))) (put! t 'id 1) (put! t 'content 2) (put! t 'author-id 3) (put! t 'channel-id 4) (put! t 'guild-id 5) (put! t 'pinned 6) t)";
+    let mapped = "(let ((t (make-table))) (table-set! t i 1) (table-set! t (+ i 1) 2) (table-set! t (+ i 2) 3) (table-set! t (+ i 3) 4) (table-set! t (+ i 4) 5) (table-set! t (+ i 5) 6) t)";
+    let roomy = "(let ((t (make-table 6))) (table-set! t i 1) (table-set! t (+ i 1) 2) (table-set! t (+ i 2) 3) (table-set! t (+ i 3) 4) (table-set! t (+ i 4) 5) (table-set! t (+ i 5) 6) t)";
     let base = time("", "(zero)");
     let lines = [
         ("external, made", String::new(), "(begin (message) 0)".to_string()),
@@ -285,6 +289,13 @@ fn main() {
         ("literal, made", String::new(), format!("(begin {literal} 0)")),
         ("literal, made and 3 fields read once", String::new(), format!("(let ((t {literal})) {read3})")),
         ("literal, 3 fields of the same table", format!("(define t {literal})"), read3.to_string()),
+        ("field by field, made", String::new(), format!("(begin {stepwise} 0)")),
+        ("field by field, made and 3 fields read once", String::new(), format!("(let ((t {stepwise})) {read3})")),
+        ("field by field through a helper, made", "(define (put! t k v) (table-set! t k v))".to_string(), format!("(begin {helped} 0)")),
+        ("copy of a literal, made", format!("(define t {literal})"), "(begin (table-copy t) 0)".to_string()),
+        ("copy of a literal, 3 fields read once", format!("(define source {literal})"), format!("(let ((t (table-copy source))) {read3})")),
+        ("map, 6 integer keys set", String::new(), format!("(begin {mapped} 0)")),
+        ("map made with room, 6 integer keys set", String::new(), format!("(begin {roomy} 0)")),
         (
             "literal, two kinds in turn",
             "(define (read t) (+ (table-ref t 'id) (table-ref t 'author-id) (table-ref t 'channel-id)))".to_string(),
@@ -310,6 +321,8 @@ fn main() {
         ("record", "(record)".to_string()),
         ("shaped record", "(shaped-record)".to_string()),
         ("literal", literal.to_string()),
+        ("field by field", stepwise.to_string()),
+        ("copy of a literal", format!("(table-copy {literal})")),
     ];
     for (name, make) in sizes {
         if !name.contains(&only) {

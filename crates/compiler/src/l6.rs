@@ -38,8 +38,8 @@ pub(crate) struct Function<'t, 'gc> {
     pub(crate) to: AVec<'t, usize>,
     /// The blocks to emit, in the order they are emitted.
     pub(crate) order: AVec<'t, usize>,
-    /// The number of table hints that the instructions of the function use.
-    pub(crate) hints: u16,
+    /// The key of each table hint that the instructions of the function use, indexed by hint number. The keys are constants.
+    pub(crate) hints: AVec<'t, Value<'gc>>,
 }
 
 pub(crate) struct BlockData<'t, 'gc> {
@@ -53,7 +53,7 @@ pub(crate) struct Inst<'t, 'gc> {
     pub(crate) kind: Kind<'t, 'gc>,
     /// The values the instruction defines. Only [`Kind::Closures`] defines more than one.
     pub(crate) defs: &'t [Val],
-    /// The procedure that a [`Kind::Call`] calls. It is read before `args`.
+    /// The procedure that a [`Kind::Call`] calls, or the table of a [`Kind::TableRef`] or [`Kind::TableSet`]. It is read before `args`.
     pub(crate) head: Option<Val>,
     /// The values the instruction reads, in operand order. A [`Kind::Closures`] reads its captures instead: see [`Inst::reads`].
     pub(crate) args: &'t [Val],
@@ -71,9 +71,11 @@ pub(crate) enum Kind<'t, 'gc> {
     Field(u16),
     /// `(struct-ref s type k)` with a constant struct type and field index, emitted as `Op::StructRef`.
     FieldOf(Value<'gc>, u8),
-    /// `(table-ref table key default)` with a constant key, emitted as `Op::TableRefHinted` with this hint number.
+    /// `(table-ref table key default)` with a constant key, with this hint number. The table is `head`, and the hint holds the key.
+    ///
+    /// `args` is empty if the default is the constant `#f`, and the instruction is emitted as `Op::TableRefHinted`. Otherwise `args` holds the default, and the instruction is emitted as `Op::TableRefOrHinted`.
     TableRef(u16),
-    /// `(table-set! table key value)` with a constant key, emitted as `Op::TableSetHinted` with this hint number.
+    /// `(table-set! table key value)` with a constant key, emitted as `Op::TableSetHinted` with this hint number. The table is `head`, the hint holds the key, and `args` holds the value.
     TableSet(u16),
     /// A read or write of a module variable.
     Slot(SlotOp, u32),
@@ -177,8 +179,8 @@ impl std::fmt::Display for Function<'_, '_> {
         if !self.unpacked.is_empty() {
             write!(formatter, ", unpacks {}", Vals(self.unpacked))?;
         }
-        if self.hints > 0 {
-            write!(formatter, ", {} hints", self.hints)?;
+        if !self.hints.is_empty() {
+            write!(formatter, ", {} hints", self.hints.len())?;
         }
         writeln!(formatter, ":")?;
         for (index, block) in self.blocks.iter().enumerate() {
@@ -200,8 +202,8 @@ impl std::fmt::Display for Function<'_, '_> {
                     Kind::AddImm(addend) => write!(formatter, "add-imm{} {addend}", args(inst.args))?,
                     Kind::Field(field) => write!(formatter, "field-imm{} {field}", args(inst.args))?,
                     Kind::FieldOf(kind, field) => write!(formatter, "field-of-imm{} {} {field}", args(inst.args), Constant(&kind))?,
-                    Kind::TableRef(hint) => write!(formatter, "table-ref-hinted{} hint {hint}", args(inst.args))?,
-                    Kind::TableSet(hint) => write!(formatter, "table-set-hinted{} hint {hint}", args(inst.args))?,
+                    Kind::TableRef(hint) => write!(formatter, "table-ref-hinted {}{} key {} hint {hint}", inst.head.expect("a table instruction has a table"), args(inst.args), Constant(&self.hints[usize::from(hint)]))?,
+                    Kind::TableSet(hint) => write!(formatter, "table-set-hinted {}{} key {} hint {hint}", inst.head.expect("a table instruction has a table"), args(inst.args), Constant(&self.hints[usize::from(hint)]))?,
                     Kind::Slot(op, slot) => write!(formatter, "{}{}", PrimName(Prim::Slot(op, slot)), args(inst.args))?,
                     Kind::Prim { prim, spread: applied } => write!(formatter, "{}{}{}", spread(applied), PrimName(prim), args(inst.args))?,
                     Kind::Call => write!(formatter, "call {}{}", inst.head.expect("a call has a procedure"), args(inst.args))?,

@@ -42,7 +42,7 @@ pub(crate) fn select<'t, 'gc>(arena: &'t Arena, function: &'t l5::Function<'t, '
     let mut uses = arena.vec_of(0u32, values);
     for block in &function.blocks {
         for inst in &block.insts {
-            count_reads(&mut uses, inst, &imms);
+            count_reads(&mut uses, inst, &imms, &hinted);
         }
         block.end.each_use(|value| uses[value.0 as usize] += 1);
     }
@@ -58,17 +58,16 @@ pub(crate) fn select<'t, 'gc>(arena: &'t Arena, function: &'t l5::Function<'t, '
     }
     let to = forwards(arena, function);
     let (order, inverted) = layout(arena, function, &to, &fusable);
-    // Hints are numbered in the order their instructions are emitted. A function has room for 65,535 hints. A table instruction past that gets none.
+    // Hints are numbered in the order their instructions are emitted. `operands` marks at most 65,535 instructions, so every number fits.
     let mut hint_of = arena.vec_of(None, values);
-    let mut hints: u16 = 0;
+    let mut hints = AVec::new_in(arena);
     for &index in order.iter() {
         for inst in &function.blocks[index].insts {
             if let l5::Inst::Prim { dst, .. } = inst
-                && hinted[dst.0 as usize]
-                && hints < u16::MAX
+                && let Some(hint) = hinted[dst.0 as usize]
             {
-                hint_of[dst.0 as usize] = Some(hints);
-                hints += 1;
+                hint_of[dst.0 as usize] = u16::try_from(hints.len()).ok();
+                hints.push(hint.key);
             }
         }
     }
@@ -78,7 +77,7 @@ pub(crate) fn select<'t, 'gc>(arena: &'t Arena, function: &'t l5::Function<'t, '
         let kept = block.insts.len() - usize::from(fused);
         let mut insts = AVec::with_capacity_in(kept, arena);
         for (inst, &site) in block.insts[..kept].iter().zip(&block.sites) {
-            insts.push(selected(inst, site, &imms, &hint_of));
+            insts.push(selected(inst, site, &imms, &hinted, &hint_of));
         }
         let end = match (block.insts.last(), &block.end) {
             (Some(l5::Inst::Prim { prim, args, spread, .. }), l5::End::Return(_)) if returned[index] => End::ReturnPrim { prim: *prim, args, spread: *spread },
@@ -99,7 +98,7 @@ pub(crate) fn select<'t, 'gc>(arena: &'t Arena, function: &'t l5::Function<'t, '
 }
 
 /// Returns the L6 form of `inst`.
-fn selected<'t, 'gc>(inst: &'t l5::Inst<'t, 'gc>, site: u32, imms: &[Option<Imm<'gc>>], hint_of: &[Option<u16>]) -> Inst<'t, 'gc> {
+fn selected<'t, 'gc>(inst: &'t l5::Inst<'t, 'gc>, site: u32, imms: &[Option<Imm<'gc>>], hinted: &[Option<Hinted<'gc>>], hint_of: &[Option<u16>]) -> Inst<'t, 'gc> {
     let defs = inst.defs();
     let (kind, head, args) = match inst {
         l5::Inst::Const(_, value) => (Kind::Const(*value), None, &[][..]),
@@ -110,8 +109,12 @@ fn selected<'t, 'gc>(inst: &'t l5::Inst<'t, 'gc>, site: u32, imms: &[Option<Imm<
             (Some(Imm::Add(addend)), _, _) => (Kind::AddImm(addend), None, &args[..1]),
             (Some(Imm::Field(field)), _, _) => (Kind::Field(field), None, &args[..1]),
             (Some(Imm::FieldOf(kind, field)), _, _) => (Kind::FieldOf(kind, field), None, &args[..1]),
-            (None, Some(hint), Prim::Intrinsic(Intrinsic::TableRef)) => (Kind::TableRef(hint), None, args.as_slice()),
-            (None, Some(hint), _) => (Kind::TableSet(hint), None, args.as_slice()),
+            // A hinted table instruction reads its table and its last argument. Its hint holds the key. A read whose default is `#f` reads only the table.
+            (None, Some(hint), Prim::Intrinsic(Intrinsic::TableRef)) => {
+                let plain = hinted[dst.0 as usize].is_some_and(|hinted| hinted.plain);
+                (Kind::TableRef(hint), Some(args[0]), if plain { &[][..] } else { &args[2..] })
+            }
+            (None, Some(hint), _) => (Kind::TableSet(hint), Some(args[0]), &args[2..]),
             (None, None, _) => (Kind::Prim { prim: *prim, spread: *spread }, None, args.as_slice()),
         },
         l5::Inst::Call { f: callee, args, .. } => (Kind::Call, Some(*callee), args.as_slice()),
@@ -135,9 +138,17 @@ enum Imm<'gc> {
 struct Operands<'t, 'gc> {
     /// The immediate operand of each instruction, or `None` for an instruction without one.
     imms: AVec<'t, Option<Imm<'gc>>>,
-    /// Marks each `table-ref` and `table-set!` whose key is a constant that compares by its value word: a symbol, or a value that needs no object, such as a fixnum or a short string.
-    /// Such an instruction is emitted with a hint of where it last found its key. See `Op::TableRefHinted`.
-    hinted: AVec<'t, bool>,
+    /// The constant operands of each `table-ref` and `table-set!` whose key is a constant that compares by its value word: a symbol, or a value that needs no object, such as a fixnum or a short string.
+    /// Such an instruction is emitted with a hint of where it last found its key. See `Op::TableRefHinted`. A function has room for 65,535 hints. A table instruction past that has `None` here.
+    hinted: AVec<'t, Option<Hinted<'gc>>>,
+}
+
+/// The constant operands of a table instruction that is emitted with a hint.
+#[derive(Clone, Copy)]
+struct Hinted<'gc> {
+    key: Value<'gc>,
+    /// Whether the instruction is a `table-ref` whose default is the constant `#f`. Such a read needs no register for its default.
+    plain: bool,
 }
 
 fn operands<'t, 'gc: 't>(arena: &'t Arena, function: &l5::Function<'_, 'gc>) -> Operands<'t, 'gc> {
@@ -146,7 +157,8 @@ fn operands<'t, 'gc: 't>(arena: &'t Arena, function: &l5::Function<'_, 'gc>) -> 
     }
     let mut constants: AVec<'t, Option<Value<'gc>>> = arena.vec_of(None, function.values as usize);
     let mut imms = arena.vec_of(None, function.values as usize);
-    let mut hinted = arena.vec_of(false, function.values as usize);
+    let mut hinted = arena.vec_of(None, function.values as usize);
+    let mut hints: u16 = 0;
     for inst in function.blocks.iter().flat_map(|block| &block.insts) {
         match inst {
             l5::Inst::Const(dst, value) => constants[dst.0 as usize] = Some(*value),
@@ -157,8 +169,14 @@ fn operands<'t, 'gc: 't>(arena: &'t Arena, function: &l5::Function<'_, 'gc>) -> 
                     (Intrinsic::StructRef, [_, kind, field]) => constants[kind.0 as usize].zip(fixnum(&constants, field).and_then(|number| u8::try_from(number).ok())).map(|(kind, field)| Imm::FieldOf(kind, field)),
                     _ => None,
                 };
-                if let (Intrinsic::TableRef | Intrinsic::TableSet, [_, key, _]) = (intrinsic, args.as_slice()) {
-                    hinted[dst.0 as usize] = constants[key.0 as usize].is_some_and(|key| key.immediate().is_some() || Symbol::of(key).is_some());
+                if let (Intrinsic::TableRef | Intrinsic::TableSet, [_, key, last]) = (intrinsic, args.as_slice())
+                    && let Some(key) = constants[key.0 as usize].filter(|key| key.immediate().is_some() || Symbol::of(*key).is_some())
+                    && hints < u16::MAX
+                {
+                    // The default has to be `#f` itself. Another false value, such as `#nil`, is a default like any other.
+                    let plain = *intrinsic == Intrinsic::TableRef && constants[last.0 as usize] == Some(Value::FALSE);
+                    hinted[dst.0 as usize] = Some(Hinted { key, plain });
+                    hints += 1;
                 }
             }
             _ => {}
@@ -167,10 +185,16 @@ fn operands<'t, 'gc: 't>(arena: &'t Arena, function: &l5::Function<'_, 'gc>) -> 
     Operands { imms, hinted }
 }
 
-/// Counts in `uses` the values that `inst` reads before it defines its own. An instruction with an immediate operand reads only its first argument. The closures of a group do not read each other.
-fn count_reads(uses: &mut [u32], inst: &l5::Inst<'_, '_>, imms: &[Option<Imm<'_>>]) {
+/// Counts in `uses` the values that `inst` reads before it defines its own. An instruction with an immediate operand reads only its first argument. A hinted table instruction does not read its key, and reads its last argument unless that is the default `#f`. The closures of a group do not read each other.
+fn count_reads(uses: &mut [u32], inst: &l5::Inst<'_, '_>, imms: &[Option<Imm<'_>>], hinted: &[Option<Hinted<'_>>]) {
     match inst {
         l5::Inst::Prim { dst, args, .. } if imms[dst.0 as usize].is_some() => uses[args[0].0 as usize] += 1,
+        l5::Inst::Prim { dst, args, .. } if let Some(hint) = hinted[dst.0 as usize] => {
+            uses[args[0].0 as usize] += 1;
+            if !hint.plain {
+                uses[args[2].0 as usize] += 1;
+            }
+        }
         l5::Inst::Closures { dsts, .. } => inst.each_use(|value| {
             if !dsts.contains(&value) {
                 uses[value.0 as usize] += 1;
@@ -181,13 +205,13 @@ fn count_reads(uses: &mut [u32], inst: &l5::Inst<'_, '_>, imms: &[Option<Imm<'_>
 }
 
 /// Returns whether `block` ends by returning the result of an intrinsic that has a tail-return form, and nothing else reads that result.
-fn fused_return(block: &l5::BlockData<'_, '_>, uses: &[u32], imms: &[Option<Imm<'_>>], hinted: &[bool]) -> bool {
+fn fused_return(block: &l5::BlockData<'_, '_>, uses: &[u32], imms: &[Option<Imm<'_>>], hinted: &[Option<Hinted<'_>>]) -> bool {
     let (Some(l5::Inst::Prim { dst, prim, spread, .. }), l5::End::Return(returned)) = (block.insts.last(), &block.end) else { return false };
     // `values` has a tail-return form even with a spread argument list: `Op::ReturnSpread` returns the elements of the list as values. No other intrinsic has a tail-return form for a spread argument list.
     let tail = match prim {
         Prim::Intrinsic(Intrinsic::Values) => true,
         // An instruction with an immediate operand or a table hint has no tail-return form. It is emitted as it is and followed by a return.
-        Prim::Intrinsic(_) => !spread && imms[dst.0 as usize].is_none() && !hinted[dst.0 as usize],
+        Prim::Intrinsic(_) => !spread && imms[dst.0 as usize].is_none() && hinted[dst.0 as usize].is_none(),
         _ => false,
     };
     tail && dst == returned && uses[dst.0 as usize] == 1

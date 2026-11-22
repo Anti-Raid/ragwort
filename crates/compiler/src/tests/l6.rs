@@ -113,27 +113,34 @@ b0:
 
 #[test]
 fn table_accesses_with_constant_keys_are_numbered_for_hints() {
-    // (begin (table-set! s0 7 s1) (cons (table-ref s0 7 0) (table-ref s0 s1 0))): the two accesses with the constant key 7 get hints, and the one with a key read from a variable does not.
+    // (begin (table-set! s0 7 s1) (cons (table-ref s0 7 0) (cons (table-ref s0 7 #f) (table-ref s0 s1 0)))): the three accesses with the constant key 7 get hints, and the one with a key read from a variable does not.
+    // A hinted access does not read its key, so the constant 7 is not loaded. The read whose default is #f does not read its default either.
     fn tables<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
-        let read = prim(Cons, vec![prim(TableRef, vec![slot(0), q(7), q(0)]), prim(TableRef, vec![slot(0), slot(1), q(0)])]);
+        let rest = prim(Cons, vec![prim(TableRef, vec![slot(0), q(7), Core::Quote(Value::FALSE)]), prim(TableRef, vec![slot(0), slot(1), q(0)])]);
+        let read = prim(Cons, vec![prim(TableRef, vec![slot(0), q(7), q(0)]), rest]);
         Core::Let(vec![(Var(0), prim(TableSet, vec![slot(0), q(7), slot(1)]))], Box::new(read))
     }
     assert_eq!(l6_of(tables, true), "\
-function () order b0, 2 hints:
+function () order b0, 3 hints:
 b0:
   v1 = load-slot 0
-  v2 = 7
+  v2 = 7 (unread)
   v3 = load-slot 1
-  v4 = table-set-hinted v1 v2 v3 hint 0 (unread)
+  v4 = table-set-hinted v1 v3 key 7 hint 0 (unread)
   v5 = load-slot 0
-  v6 = 7
+  v6 = 7 (unread)
   v7 = 0
-  v8 = table-ref-hinted v5 v6 v7 hint 1
+  v8 = table-ref-hinted v5 v7 key 7 hint 1
   v9 = load-slot 0
-  v10 = load-slot 1
-  v11 = 0
-  v12 = table-ref v9 v10 v11
-  return-of cons v8 v12
+  v10 = 7 (unread)
+  v11 = #f (unread)
+  v12 = table-ref-hinted v9 key 7 hint 2
+  v13 = load-slot 0
+  v14 = load-slot 1
+  v15 = 0
+  v16 = table-ref v13 v14 v15
+  v17 = cons v12 v16
+  return-of cons v8 v17
 ");
 }
 

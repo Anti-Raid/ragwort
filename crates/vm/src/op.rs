@@ -6,11 +6,11 @@ use ragwort_types::constant::Constants;
 use ragwort_types::num::NumError;
 use ragwort_types::pair::{Pair, Pairs};
 use ragwort_types::string::StrError;
-use ragwort_types::table::TableError;
+use ragwort_types::table::{Table, TableError};
 use ragwort_types::vector::VectorError;
 
 use crate::frame::CLOSURE;
-use crate::objects::{self, BytecodeFields, ClosureFields, ModuleFields, SpillFields, Task};
+use crate::objects::{self, BytecodeFields, ClosureFields, HINT_KEY, HINT_SLOTS, HintsFields, ModuleFields, SpillFields, Task};
 use crate::{Intrinsic, Request, structs};
 
 #[cfg(test)]
@@ -73,12 +73,14 @@ named! {
         StructRef { dst: u8, a: u8, k: u8, kind: u32 } = "struct-ref",
         /// Executes ternary `intrinsic` on register operands `(a, b, c)` and writes the result into register `dst`.
         CallIntrinsic3 { dst: u8, a: u8, b: u8, c: u8, intrinsic: Intrinsic } = "call-intrinsic3",
-        /// `(table-ref table key default)` for a key that is compared by its value word, such as a symbol. Two such keys are the same key exactly when their words are equal. Writes the value of `key` in the table in register `table` into `dst`. If the table has no such key, writes the value of register `default`.
+        /// `(table-ref table key #f)` for a constant key that is compared by its value word, such as a symbol. Two such keys are the same key exactly when their words are equal. Writes the value of the key in the table in register `table` into `dst`. If the table has no such key, writes `#f`.
         ///
-        /// Word `hint` of the code's hints holds the entry position where the key was last found. That position is tried first. See [`crate::objects::Hints`].
-        TableRefHinted { dst: u8, table: u8, key: u8, default: u8, hint: u16 } = "table-ref-hinted",
-        /// `(table-set! table key value)` for a key of the kind that `TableRefHinted` takes. Sets the value of `key` in the table in register `table`, and writes `#<void>` into `dst`. The hint is used as in `TableRefHinted`.
-        TableSetHinted { dst: u8, table: u8, key: u8, value: u8, hint: u16 } = "table-set-hinted",
+        /// Hint number `hint` of the code holds the key and the places where the key was last found. Those places are tried first. No register holds the key. See [`crate::objects::Hints`].
+        TableRefHinted { dst: u8, table: u8, hint: u16 } = "table-ref-hinted",
+        /// `(table-ref table key default)` for a key of the kind that `TableRefHinted` takes. Works like `TableRefHinted`. If the table has no such key, writes the value of register `default`.
+        TableRefOrHinted { dst: u8, table: u8, default: u8, hint: u16 } = "table-ref-or-hinted",
+        /// `(table-set! table key value)` for a key of the kind that `TableRefHinted` takes. Sets the value of the key in the table in register `table`, and writes `#<void>` into `dst`. The hint is used as in `TableRefHinted`.
+        TableSetHinted { dst: u8, table: u8, value: u8, hint: u16 } = "table-set-hinted",
         /// Executes `intrinsic` on the argument registers and immediately returns the result to the caller. Built-in procedures referenced as first-class values compile to a closure wrapping this single instruction.
         TailCallIntrinsic { base: u8, args: u8, intrinsic: Intrinsic } = "tail-call-intrinsic",
         /// Dispatches runtime control operation `request` to the execution loop with `args` argument registers starting at `base`. For requests that invoke procedures (such as `call/cc`), execution resumes after this instruction when the procedure returns. So `base` must be past the current frame's link slot.
@@ -132,6 +134,8 @@ pub struct Context<'s, 'gc> {
     pub frame: Frame<'s, 'gc>,
     /// The active module's constant pool table, indexed by `LoadConst` and struct instructions.
     pub constants: Constants<'gc>,
+    /// The running code. A hinted table instruction reads its hint from it. See [`objects::Hints`].
+    pub code: Gc<'gc, objects::Bytecode>,
     /// Captured upvalues belonging to the currently executing closure.
     pub upvalues: Slots<'gc>,
     pub acc: Value<'gc>,
@@ -141,6 +145,32 @@ pub struct Context<'s, 'gc> {
 }
 
 impl<'gc> Context<'_, 'gc> {
+    /// Returns the hint slots of the running code and the index of the first slot of hint `hint`. Returns `None` if the code has no such hint.
+    #[inline(always)]
+    pub(crate) fn hint(&self, hint: u16) -> Option<(Slots<'gc>, usize)> {
+        let hints = self.code.hints(self.mc)?.items(self.mc);
+        let slot = HINT_SLOTS * usize::from(hint);
+        (slot + HINT_SLOTS <= hints.len()).then_some((hints, slot))
+    }
+
+    /// Reads the key of hint `hint` in the table in register `table`, at the first place that the hint remembers. That place has the key whenever the instruction reads tables of one shape, or one table, again and again.
+    ///
+    /// Returns `None` if the place does not have the key. It also returns `None` if the register holds no table, or if the code has no such hint. The instruction then leaves the loop, and `Run::table_ref` searches the table or reports the fault.
+    #[inline(always)]
+    fn read_hinted(&self, table: u8, hint: u16) -> Option<Value<'gc>> {
+        let (hints, slot) = self.hint(hint)?;
+        let table = Table::of(self.frame.get(table))?;
+        table.get_hinted(self.mc, hints.get(slot + HINT_KEY), remembered(hints.get(slot + 1)), hints.get(slot))
+    }
+
+    /// Sets the value of the key of hint `hint` in the table in register `table`, at the first place that the hint remembers. Returns whether the value was set. If it was not, the instruction leaves the loop, as for [`Context::read_hinted`].
+    #[inline(always)]
+    fn write_hinted(&self, table: u8, value: u8, hint: u16) -> bool {
+        let Some((hints, slot)) = self.hint(hint) else { return false };
+        let Some(table) = Table::of(self.frame.get(table)) else { return false };
+        table.set_hinted(self.mc, hints.get(slot + HINT_KEY), remembered(hints.get(slot + 1)), hints.get(slot), self.frame.get(value))
+    }
+
     /// Loads the values in the accumulator into register `dst` as a list. Kept out of line, like [`Context::set_values`], so that the instruction loop stays small.
     #[inline(never)]
     fn load_values(&mut self, dst: u8) -> Result<(), Fault> {
@@ -228,10 +258,10 @@ pub enum Control {
     Host { base: u8, args: u8, host: u32, tail: bool },
     /// Returns from the current frame to the caller, passing the accumulator value.
     Return,
-    /// Reads a table with the hint of the running code. See [`Op::TableRefHinted`].
-    TableRef { dst: u8, table: u8, key: u8, default: u8, hint: u16 },
-    /// Writes a table with the hint of the running code. See [`Op::TableSetHinted`].
-    TableSet { dst: u8, table: u8, key: u8, value: u8, hint: u16 },
+    /// Finishes a hinted table read whose first remembered place did not have the key. `default` is the register of the value for a missing key, or `None` if that value is `#f`. See [`Op::TableRefHinted`].
+    TableRef { dst: u8, table: u8, default: Option<u8>, hint: u16 },
+    /// Finishes a hinted table write whose first remembered place did not have the key. See [`Op::TableSetHinted`].
+    TableSet { dst: u8, table: u8, value: u8, hint: u16 },
 }
 
 /// Represents virtual machine runtime faults and errors. Non-fatal faults are raised within the Scheme program as [`crate::objects::Condition`] objects and terminate execution only if unhandled.
@@ -429,11 +459,17 @@ impl Op {
                 }
             }
             Op::BranchIntrinsic2 { a: left, b: right, intrinsic, branch_if, offset } => {
-                if intrinsic.arity().is_some_and(|arity| arity != 2) {
-                    return Err(Fault::Malformed);
-                }
-                let val = intrinsic.exec2(cx, left, right)?;
-                if val.is_true() == branch_if {
+                // A comparison of two small integers is done here. Everything else goes to the intrinsic.
+                let holds = match intrinsic.small_test(frame.get(left), frame.get(right)) {
+                    Some(holds) => holds,
+                    None => {
+                        if intrinsic.arity().is_some_and(|arity| arity != 2) {
+                            return Err(Fault::Malformed);
+                        }
+                        intrinsic.exec2(cx, left, right)?.is_true()
+                    }
+                };
+                if holds == branch_if {
                     return Ok(Control::Jump(i32::from(offset)));
                 }
             }
@@ -511,10 +547,20 @@ impl Op {
                 }
             }
             Op::CallIntrinsic { base, args, intrinsic } | Op::TailCallIntrinsic { base, args, intrinsic } => {
-                if usize::from(base) + usize::from(args) > WINDOW || intrinsic.arity().is_some_and(|arity| arity != args) {
+                if usize::from(base) + usize::from(args) > WINDOW {
                     return Err(Fault::Malformed);
                 }
-                cx.acc = intrinsic.exec(cx, base, args)?;
+                // Arithmetic and comparison of two small integers is done here, as in `Op::CallIntrinsic2`. A procedure whose body is `(+ a b)` ends with this instruction.
+                let small = if args == 2 { intrinsic.small(frame.get(base), frame.get(base + 1)) } else { None };
+                cx.acc = match small {
+                    Some(value) => value,
+                    None => {
+                        if intrinsic.arity().is_some_and(|arity| arity != args) {
+                            return Err(Fault::Malformed);
+                        }
+                        intrinsic.exec(cx, base, args)?
+                    }
+                };
                 if matches!(self, Op::TailCallIntrinsic { .. }) {
                     return Ok(Control::Return);
                 }
@@ -527,10 +573,16 @@ impl Op {
                 frame.set(dst, val);
             }
             Op::CallIntrinsic2 { dst, a: left, b: right, intrinsic } => {
-                if intrinsic.arity().is_some_and(|arity| arity != 2) {
-                    return Err(Fault::Malformed);
-                }
-                let val = intrinsic.exec2(cx, left, right)?;
+                // Arithmetic and comparison of two small integers is done here. Everything else goes to the intrinsic.
+                let val = match intrinsic.small(frame.get(left), frame.get(right)) {
+                    Some(val) => val,
+                    None => {
+                        if intrinsic.arity().is_some_and(|arity| arity != 2) {
+                            return Err(Fault::Malformed);
+                        }
+                        intrinsic.exec2(cx, left, right)?
+                    }
+                };
                 frame.set(dst, val);
             }
             Op::AddImm { dst, a: operand, imm } => {
@@ -553,8 +605,21 @@ impl Op {
                 let val = intrinsic.exec3(cx, first, second, third)?;
                 frame.set(dst, val);
             }
-            Op::TableRefHinted { dst, table, key, default, hint } => return Ok(Control::TableRef { dst, table, key, default, hint }),
-            Op::TableSetHinted { dst, table, key, value, hint } => return Ok(Control::TableSet { dst, table, key, value, hint }),
+            // A hinted table instruction is finished here if the first place of its hint has the key. Otherwise it leaves the loop.
+            Op::TableRefHinted { dst, table, hint } => match cx.read_hinted(table, hint) {
+                Some(value) => frame.set(dst, value),
+                None => return Ok(Control::TableRef { dst, table, default: None, hint }),
+            },
+            Op::TableRefOrHinted { dst, table, default, hint } => match cx.read_hinted(table, hint) {
+                Some(value) => frame.set(dst, value),
+                None => return Ok(Control::TableRef { dst, table, default: Some(default), hint }),
+            },
+            Op::TableSetHinted { dst, table, value, hint } => {
+                if !cx.write_hinted(table, value, hint) {
+                    return Ok(Control::TableSet { dst, table, value, hint });
+                }
+                frame.set(dst, Value::VOID);
+            }
             Op::CallRequest { base, args, request } | Op::TailCallRequest { base, args, request } => {
                 if usize::from(base) + usize::from(args) > WINDOW || !request.takes(usize::from(args)) {
                     return Err(Fault::Malformed);
@@ -644,4 +709,10 @@ fn list<'gc>(mc: &Mutation<'gc>, mut list: Value<'gc>) -> Result<Vec<Value<'gc>>
         return Err(Fault::WrongType);
     }
     Ok(items)
+}
+
+/// Returns the position that a hint slot holds. A slot that is not used yet holds no fixnum. It reads as a position that no table has, so an unused place never has the key.
+#[inline(always)]
+pub(crate) fn remembered(slot: Value<'_>) -> usize {
+    slot.as_fixnum().map_or(usize::MAX, |position| position as usize)
 }

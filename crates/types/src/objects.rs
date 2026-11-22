@@ -17,7 +17,8 @@ crate::gc::objects! {
     /// A symbol. `name` is a flat string, and `hash` is the hash of the name.
     pub(crate) struct Sym { name: Value, hash: u64 }
     /// The intern table. `seed` seeds its hashes. `table` holds the symbols and `keywords` holds the keywords, both weakly.
-    pub(crate) struct Interned { seed: u64, table: Member<TableHead>, keywords: Member<TableHead> }
+    /// `shapes` is the root of the arena's tree of table shapes: the shape with no keys. It is created when the first shape is.
+    pub(crate) struct Interned { seed: u64, table: Member<TableHead>, keywords: Member<TableHead>, shapes: Member<TableShape> }
     /// A keyword, `#:name`. `symbol` is the symbol with the same name.
     pub(crate) struct Keyword { symbol: Member<Sym> }
     /// `length` is the length of the list that starts at this pair, or 0 if the chain of pairs does not end in `()`.
@@ -58,7 +59,11 @@ crate::gc::objects! {
     /// use, tombstones included. `seed` seeds the hashes. `epoch` is the number of moving
     /// collections that had run when the index was built, or `u64::MAX` while no key is hashed by
     /// its object word.
-    pub(crate) struct Table { index: Member<TableIndex>, pairs: Member<TableEntries>, live: u64, used: u64, seed: u64, epoch: u64 }
+    ///
+    /// A table with a `shape` is in shape mode. It takes its keys from the shape and has no index.
+    /// `pairs` then holds one value for each key position of the shape, and can have unused slots
+    /// after them. A slot is `Value::BROKEN` for a key that the table does not have.
+    pub(crate) struct Table { index: Member<TableIndex>, pairs: Member<TableEntries>, live: u64, used: u64, seed: u64, epoch: u64, shape: Member<TableShape> }
     /// A vector whose `count` elements are owned by the host, in `host`. `memo` caches the elements
     /// read from the host so far, and is created on the first read. It is one vector for a short
     /// external vector, and a vector of chunks for a long one (see `ExternVector::remembered`).
@@ -78,10 +83,20 @@ crate::gc::objects! {
     /// A record cannot hold a key outside its shape. When a program adds one, the entries move to
     /// an ordinary table in `own`, `shape` is cleared, and every operation goes to `own` from then on.
     pub(crate) struct TableRecord { shape: Member<TableShape>, own: Member<Table>, live: u64 } items Value
-    /// The keys that a group of tables has in common. `pairs` holds the keys in entry order, each
-    /// followed by an unused value slot. `index` is the hash index over those keys. Every table
-    /// made from the shape shares `index` and copies the keys. `seed` is the hash seed of the index.
-    pub(crate) struct TableShape { index: Member<TableIndex>, pairs: Member<TableEntries>, seed: u64 }
+    /// The keys that a group of tables has in common: the first `count` keys of `pairs`, which
+    /// holds keys in entry order, each followed by an unused value slot. `index` is the hash index
+    /// over the keys of `pairs`, and `seed` is its hash seed.
+    ///
+    /// Shapes form a tree. `parent` is the shape with one key fewer, and `key` is the key that
+    /// was added to it. The root shape has no keys and no parent. `children` holds the shapes with
+    /// one key more, weakly. A shape shares `pairs` and `index` with the first child that was made
+    /// from it, so `pairs` can hold more than `count` keys. Every read of a shape stops at `count`.
+    ///
+    /// The first `listed` slots of `children` are in use. A long list of children has `links`, a
+    /// hash index over the keys of the children. Its entry numbers are slots of `children`.
+    pub(crate) struct TableShape { index: Member<TableIndex>, pairs: Member<TableEntries>, seed: u64, count: u64, parent: Member<TableShape>, key: Value, children: Member<ShapeChildren>, links: Member<TableIndex>, listed: u64 }
+    /// The shapes that were made from one shape by adding a key. The items are weak, so a shape that nothing else uses is collected. A slot whose shape was collected stays unused until the list is rebuilt.
+    pub(crate) struct ShapeChildren {} items Weak<TableShape>
     /// A table's index, a hash table with linear probing. A slot is 0 if it was never used.
     /// Otherwise its low half is an entry number plus one, and its high half is the high half of
     /// the key's hash.

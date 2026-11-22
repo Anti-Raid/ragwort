@@ -31,18 +31,30 @@
 //!
 //! Many tables have the same keys in the same order: the records of one kind that a program
 //! makes, or the events of one kind that a host passes in. A [`Shape`] is such a list of keys with
-//! its index, built once. [`Tables::shaped`] makes a table from a shape and a value for each key:
+//! its index. A table with a shape holds only its values and takes its keys from the shape:
 //!
-//! - The table is one object that holds a reference to the shape and the values. It has no keys
-//!   and no index of its own, and nothing is hashed to make it. With six keys it takes about 90
-//!   bytes, where a table that is filled key by key takes 250 to 400.
-//! - A program uses the table like any other. It can change and remove entries in place. The
-//!   first key that is added moves the entries to an ordinary table, which the first table then
-//!   passes every call on to. The shape and the other tables made from it are never affected.
-//! - A key has the same position in every table of the shape. An instruction that reads a
-//!   constant key remembers the shape and the position where it found the key. In the next table
-//!   of that shape it reads the value at that position without comparing a key. See
-//!   [`Table::get_hinted`].
+//! - **One shape for each sequence of keys.** The shapes of an arena form a tree. The root has no
+//!   keys, and [`Shape::child`] leads from a shape to the shape with one key more. So two tables
+//!   that got the same keys in the same order have the same shape, however they were made. A
+//!   table with a shape lists the keys of the shape. For a long string, that is a string with the
+//!   same characters, and not always the object that the table was given.
+//! - **Tables made with all their values.** [`Tables::shaped`] makes a table from a shape and a
+//!   value for each key. The table is one object: a reference to the shape and the values. With
+//!   six keys it takes about 90 bytes, where a table with keys of its own takes 250 to 400.
+//! - **Tables filled field by field.** A table from [`Tables::make`] starts with the root shape.
+//!   A new key that is a field name moves the table to the child shape for that key. A symbol is
+//!   always a field name, and [`Table::set_field`] adds a key of any other kind as one. The
+//!   values are in an array that grows, so such a table is a little larger than one made with all
+//!   its values.
+//! - **Leaving the shape.** A table is used as a map when [`Table::set`] adds a key that is not a
+//!   symbol, such as a string or a number: it then gets keys and an index of its own. The same
+//!   happens for a key that a shape cannot hold. That is a key compared by identity, a key that
+//!   was removed and is set again, which has to become the last entry, and key number
+//!   [`SHAPE_KEYS`] or later. Programs see no difference.
+//! - **Reads by position.** A key has the same position in every table of a shape. An instruction
+//!   that reads a constant key remembers the shape and the position where it found the key. In
+//!   the next table of that shape it reads the value at that position without comparing a key.
+//!   See [`Table::get_hinted`].
 //!
 //! A host can give an external table a shape as well, with [`Tables::external_shaped`]. The
 //! values read from the host are then cached by position, and the first read of a key of a new
@@ -148,7 +160,7 @@ use crate::Error;
 use crate::external::ExternalRef;
 use crate::gc::{Gc, Mutation, OutOfMemory, Slots, Value, slot};
 use crate::num::{Nums, complex, int};
-use crate::objects::{self, Data, ExternTableFields, TableEntriesFields, TableFields, TableIndexFields, TableRecordFields, TableShapeFields};
+use crate::objects::{self, Data, ExternTableFields, ShapeChildrenFields, TableEntriesFields, TableFields, TableIndexFields, TableRecordFields, TableShapeFields};
 use crate::string::{self, Strings};
 use crate::symbol::{Symbol, Symbols};
 
@@ -158,6 +170,14 @@ mod tests;
 
 /// The minimum number of index slots in a table that has allocated its arrays.
 const MIN_SLOTS: usize = 8;
+/// The most keys that a [`Shape`] can have. A table that would need a shape with more keys keeps its keys itself, as a table without a shape does.
+pub const SHAPE_KEYS: usize = 64;
+/// The number of slots in the first list of a shape's children.
+const CHILDREN: usize = 2;
+/// The longest list of a shape's children that is searched from start to end. A longer list has a hash index.
+const CHILD_SCAN: usize = 8;
+/// The least number of value slots that a table in shape mode allocates.
+const SHAPED_ROOM: usize = 4;
 /// The `epoch` of a table in which no key is hashed by its object word. Such a table never rebuilds its index after a collection.
 const STILL: u64 = u64::MAX;
 /// Mask for the low half of an index slot, which holds an entry number plus one.
@@ -196,6 +216,8 @@ pub enum ShapeError {
     Duplicate(usize),
     /// The key is compared by identity, so its hash changes when a collection moves it.
     Identity(usize),
+    /// The key would be key number [`SHAPE_KEYS`] or later.
+    TooMany(usize),
     Arena(Error),
 }
 
@@ -215,6 +237,18 @@ impl From<OutOfMemory> for ShapeError {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Shape<'gc>(Gc<'gc, objects::TableShape>);
 
+/// Where a lookup found a key. An instruction remembers a place to read the same key again without a search. See [`Table::get_hinted`].
+///
+/// - **With a shape:** every table of that shape has the key at `position`, and no key has to be compared.
+/// - **Without a shape:** `position` is the number of an entry of the table that was searched. The entry at that position has the key only if its key is compared and found to be the same, in that table or in another one.
+///
+/// A lookup returns the place together with the value. So the shape of a place is always the layout that its position belongs to. Code that remembers a place must not ask the table for a shape afterwards and pair the two: for an external table, the cached values can have a layout of their own.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Place<'gc> {
+    pub shape: Option<Shape<'gc>>,
+    pub position: usize,
+}
+
 impl<'gc> Shape<'gc> {
     #[inline]
     pub fn of(value: Value<'gc>) -> Option<Self> {
@@ -229,8 +263,9 @@ impl<'gc> Shape<'gc> {
     }
 
     /// Returns the number of keys.
+    #[inline]
     pub fn len(self, mc: &Mutation<'gc>) -> usize {
-        self.0.pairs(mc).map_or(0, |pairs| pairs.items(mc).len() / 2)
+        self.0.count(mc) as usize
     }
 
     pub fn is_empty(self, mc: &Mutation<'gc>) -> bool {
@@ -240,13 +275,179 @@ impl<'gc> Shape<'gc> {
     /// Returns the key at `position`, or `None` if `position` is not below the number of keys.
     pub fn key(self, mc: &Mutation<'gc>, position: usize) -> Option<Value<'gc>> {
         let pairs = self.0.pairs(mc)?.items(mc);
-        (position < pairs.len() / 2).then(|| pairs.get(2 * position))
+        (position < self.len(mc)).then(|| pairs.get(2 * position))
     }
 
     /// Returns the position of `key`, or `None` if the shape does not have the key. This is the entry number of `key` in every table made from the shape.
     pub fn position(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<usize>, Error> {
+        self.position_hashed(mc, key, hash(mc, self.0.seed(mc), key)?.hash)
+    }
+
+    /// Works like [`Shape::position`] for a key whose hash is `hash_of_key`.
+    fn position_hashed(self, mc: &Mutation<'gc>, key: Value<'gc>, hash_of_key: u64) -> Result<Option<usize>, Error> {
         let Some(parts) = self.parts(mc) else { return Ok(None) };
-        parts.find(mc, key, hash(mc, self.0.seed(mc), key)?.hash)
+        // The arrays can hold the keys of shapes made from this one as well. Those keys are past `len`.
+        parts.find_below(mc, key, hash_of_key, self.len(mc))
+    }
+
+    /// Returns the shape with one key fewer, or `None` for the shape with no keys.
+    pub fn parent(self, mc: &Mutation<'gc>) -> Option<Self> {
+        self.0.parent(mc).map(Self)
+    }
+
+    /// Returns the shape with the keys of this shape and then `key`. There is one such shape in the arena, so two tables that get the same keys in the same order have the same shape.
+    ///
+    /// A string or a number is the same key as an equal one here, as it is in a table. The shape keeps the key that it was given first, and every table of the shape lists that key. So a table can list a string that is equal to the string it was given, and is another object. Strings and numbers cannot be changed, so the two differ in nothing else.
+    ///
+    /// An external reference is the same key only if it is the same object. A host can tell two equal references apart, so a table must list the reference that it was given.
+    ///
+    /// Fails with the position that `key` would have if the shape cannot take it. See [`ShapeError`].
+    pub fn child(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Self, ShapeError> {
+        let hashed = hash(mc, self.0.seed(mc), key)?;
+        if self.position_hashed(mc, key, hashed.hash)?.is_some() {
+            return Err(ShapeError::Duplicate(self.len(mc)));
+        }
+        self.child_absent(mc, key, &hashed)
+    }
+
+    /// Works like [`Shape::child`] for a key that the shape is known not to have. `hashed` is the hash of `key`.
+    fn child_absent(self, mc: &Mutation<'gc>, key: Value<'gc>, hashed: &Hashed) -> Result<Self, ShapeError> {
+        let count = self.len(mc);
+        if hashed.by_place || key == Value::BROKEN {
+            return Err(ShapeError::Identity(count));
+        }
+        if count >= SHAPE_KEYS {
+            return Err(ShapeError::TooMany(count));
+        }
+        if let Some(child) = self.found(mc, key, hashed.hash)? {
+            return Ok(child);
+        }
+        let child = self.extended(mc, key, hashed.hash)?;
+        self.adopt(mc, child, hashed.hash)?;
+        Ok(child)
+    }
+
+    /// Returns the living shape that was made from this one by adding `key`, if there is one. `hash_of_key` is the hash of `key`.
+    fn found(self, mc: &Mutation<'gc>, key: Value<'gc>, hash_of_key: u64) -> Result<Option<Self>, Error> {
+        let Some(children) = self.0.children(mc).map(|children| children.items(mc)) else { return Ok(None) };
+        let listed = self.0.listed(mc) as usize;
+        let Some(links) = self.0.links(mc).map(|links| links.items(mc)) else {
+            // A short list is searched from start to end.
+            for slot in 0..listed.min(children.len()) {
+                if let Some(child) = children.get(slot)
+                    && stands_for(mc, child.key(mc), key)?
+                {
+                    return Ok(Some(Self(child)));
+                }
+            }
+            return Ok(None);
+        };
+        let mask = links.len().wrapping_sub(1);
+        let tag = hash_of_key >> 32;
+        let mut at = hash_of_key as usize & mask;
+        for _ in 0..links.len() {
+            let word = links.get(at);
+            if word == 0 {
+                return Ok(None);
+            }
+            let slot = ((word & ENTRY) as usize).wrapping_sub(1);
+            if word >> 32 == tag
+                && slot < listed.min(children.len())
+                && let Some(child) = children.get(slot)
+                && stands_for(mc, child.key(mc), key)?
+            {
+                return Ok(Some(Self(child)));
+            }
+            at = (at + 1) & mask;
+        }
+        Ok(None)
+    }
+
+    /// Adds `child` to the list of the shapes made from this one. `hash_of_key` is the hash of the child's key.
+    ///
+    /// The child takes the next unused slot. A full list is replaced by one with the living children and room for as many again. So the time to add a child does not grow with the number of children, and the slots of collected children are reclaimed.
+    fn adopt(self, mc: &Mutation<'gc>, child: Self, hash_of_key: u64) -> Result<(), Error> {
+        let listed = self.0.listed(mc) as usize;
+        let children = self.0.children(mc).map(|children| children.items(mc));
+        if let Some(children) = children
+            && listed < children.len()
+        {
+            children.set(mc, listed, Some(child.0));
+            if let Some(links) = self.0.links(mc) {
+                link(mc, links.items(mc), hash_of_key, listed);
+            }
+            self.0.set_listed(mc, listed as u64 + 1);
+            return Ok(());
+        }
+        let mut living: usize = 0;
+        if let Some(children) = children {
+            for slot in 0..listed {
+                if children.get(slot).is_some() {
+                    living += 1;
+                }
+            }
+        }
+        let room = (living + 1).checked_mul(2).ok_or_else(|| mc.out_of_memory())?.max(CHILDREN);
+        let grown = objects::ShapeChildren::new(mc, room, None)?;
+        // The index is at most half full, so every probe ends at a slot that was never used.
+        let links = if room > CHILD_SCAN { Some(objects::TableIndex::new(mc, room.checked_mul(2).and_then(usize::checked_next_power_of_two).ok_or_else(|| mc.out_of_memory())?, 0)?) } else { None };
+        let slots = grown.items(mc);
+        let seed = self.0.seed(mc);
+        let mut kept = 0;
+        if let Some(children) = children {
+            for slot in 0..listed {
+                if let Some(sibling) = children.get(slot) {
+                    slots.set(mc, kept, Some(sibling));
+                    if let Some(links) = links {
+                        link(mc, links.items(mc), hash(mc, seed, sibling.key(mc))?.hash, kept);
+                    }
+                    kept += 1;
+                }
+            }
+        }
+        slots.set(mc, kept, Some(child.0));
+        if let Some(links) = links {
+            link(mc, links.items(mc), hash_of_key, kept);
+        }
+        self.0.set_children(mc, Some(grown));
+        self.0.set_links(mc, links);
+        self.0.set_listed(mc, kept as u64 + 1);
+        Ok(())
+    }
+
+    /// Makes the shape with the keys of this shape and then `key`, which this shape does not have. `hash` is the hash of `key`.
+    ///
+    /// The new shape shares the arrays of this shape if their next entry is unused, or holds `key` already: a shape made here earlier and collected since put it there. Otherwise another shape made from this one took that entry for another key, and the new shape gets a copy of the arrays.
+    fn extended(self, mc: &Mutation<'gc>, key: Value<'gc>, hash_of_key: u64) -> Result<Self, Error> {
+        let count = self.len(mc);
+        let seed = self.0.seed(mc);
+        let mut index = self.0.index(mc);
+        let mut pairs = self.0.pairs(mc);
+        let next = self.parts(mc).filter(|parts| count < parts.room()).map(|parts| parts.entries.get(2 * count));
+        let shared = match (self.parts(mc), next) {
+            (Some(parts), Some(held)) if held == Value::BROKEN => {
+                parts.entries.set(mc, 2 * count, key);
+                parts.link(mc, hash_of_key, count);
+                true
+            }
+            (Some(_), Some(held)) => stands_for(mc, held, key)?,
+            _ => false,
+        };
+        if !shared {
+            let fresh = arrays(mc, count + 1)?;
+            if let Some(parts) = self.parts(mc) {
+                for position in 0..count {
+                    let held = parts.entries.get(2 * position);
+                    fresh.parts.entries.set(mc, 2 * position, held);
+                    fresh.parts.link(mc, hash(mc, seed, held)?.hash, position);
+                }
+            }
+            fresh.parts.entries.set(mc, 2 * count, key);
+            fresh.parts.link(mc, hash_of_key, count);
+            index = Some(fresh.index);
+            pairs = Some(fresh.entries);
+        }
+        Ok(Self(objects::TableShape::new(mc, index, pairs, seed, count as u64 + 1, Some(self.0), key, None, None, 0)?))
     }
 
     fn parts(self, mc: &Mutation<'gc>) -> Option<Parts<'gc>> {
@@ -312,15 +513,15 @@ impl<'gc> Table<'gc> {
         }
     }
 
-    /// Returns the shape whose positions the table's entries are at, or `None` if the table has no shape. A table made from a shape loses it when a key outside the shape is added.
+    /// Returns the shape whose positions the table's entries are at, or `None` if the table has no shape. A table made from a shape loses it when a key outside the shape is added. For an external table, the entries are the cached values. See [`Table::find`].
     ///
     /// The shape tells an instruction where to find a key in the next table of the same shape. See [`Table::get_hinted`].
     #[inline]
     pub fn shape(self, mc: &Mutation<'gc>) -> Option<Shape<'gc>> {
         match self.0 {
-            Kept::Inside(_) => None,
-            Kept::Record(table) => table.0.shape(mc).map(Shape),
-            Kept::Outside(table) => table.0.shape(mc).map(Shape),
+            Kept::Inside(table) => table.0.shape(mc).map(Shape),
+            Kept::Record(table) => table.shape(mc),
+            Kept::Outside(table) => table.shape(mc),
         }
     }
 
@@ -365,7 +566,7 @@ impl<'gc> Table<'gc> {
     #[inline(always)]
     pub fn get_hinted(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize, shape: Value<'gc>) -> Option<Value<'gc>> {
         match self.0 {
-            Kept::Inside(table) => table.get_at(mc, key, position),
+            Kept::Inside(table) => table.get_hinted(mc, key, position, shape),
             Kept::Record(table) => table.get_hinted(mc, key, position, shape),
             Kept::Outside(table) => table.cached(mc)?.get_hinted(mc, key, position, shape),
         }
@@ -374,21 +575,24 @@ impl<'gc> Table<'gc> {
     /// Works like [`Table::find`], and tries `position` first. `position` is where `key` was found before, in this table or in another one.
     ///
     /// For an external table with a shape, this is the cheap way to read a key for the first time. If `key` is the key at `position` of the shape, the value is read from the host and cached at that position, and nothing is hashed.
-    pub fn find_from(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize) -> Result<Option<(usize, Value<'gc>)>, Error> {
+    pub fn find_from(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize) -> Result<Option<(Place<'gc>, Value<'gc>)>, Error> {
         match self.0 {
             Kept::Inside(table) => table.find(mc, key),
             Kept::Record(table) => table.find(mc, key),
             Kept::Outside(table) => match table.find_at(mc, key, position)? {
-                AtPosition::Found(value) => Ok(Some((position, value))),
+                AtPosition::Found(place, value) => Ok(Some((place, value))),
                 AtPosition::Absent => Ok(None),
                 AtPosition::Unknown => self.find(mc, key),
             },
         }
     }
 
-    /// Returns the position of the entry of `key` and the entry's value, or `None` if the table
-    /// has no such key. The position is for [`Table::get_at`] and [`Table::set_at`].
-    pub fn find(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<(usize, Value<'gc>)>, Error> {
+    /// Returns the place of the entry of `key` and the entry's value, or `None` if the table
+    /// has no such key. The place is for [`Table::get_hinted`] and [`Table::set_hinted`], and its
+    /// position for [`Table::get_at`] and [`Table::set_at`].
+    ///
+    /// For an external table, the place is one of the cached values.
+    pub fn find(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<(Place<'gc>, Value<'gc>)>, Error> {
         match self.0 {
             Kept::Inside(table) => table.find(mc, key),
             Kept::Record(table) => table.find(mc, key),
@@ -414,7 +618,7 @@ impl<'gc> Table<'gc> {
     #[inline(always)]
     pub fn set_hinted(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize, shape: Value<'gc>, value: Value<'gc>) -> bool {
         match self.0 {
-            Kept::Inside(table) => table.set_at(mc, key, position, value),
+            Kept::Inside(table) => table.set_hinted(mc, key, position, shape, value),
             Kept::Record(table) => table.set_hinted(mc, key, position, shape, value),
             Kept::Outside(_) => false,
         }
@@ -439,16 +643,41 @@ impl<'gc> Table<'gc> {
     ///
     /// An external table can reject the write. A table that is not writable always does. A
     /// writable table does for a key or a value that the host cannot accept.
+    ///
+    /// # Tables with a shape
+    ///
+    /// A table with a shape that does not have `key` takes it in one of two ways:
+    ///
+    /// - **A symbol is a field name.** The table moves to the shape with `key` added, which every
+    ///   table with the same keys in the same order shares. A host that fills a table from
+    ///   [`Tables::make`] with symbol keys so gets the same shape for every such table.
+    /// - **Any other key is the key of a map.** The table gets keys and an index of its own, and
+    ///   has no shape from then on. [`Table::set_field`] adds such a key as a field name instead.
     pub fn set(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) -> Result<(), TableError> {
         self.set_finding(mc, key, value).map(drop)
     }
 
-    /// Sets the value of `key` as [`Table::set`] does. Returns the position of the entry, for
-    /// [`Table::get_at`] and [`Table::set_at`]. Returns `None` for an external table.
-    pub fn set_finding(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) -> Result<Option<usize>, TableError> {
+    /// Sets the value of `key` as [`Table::set`] does. Returns the place of the entry, as
+    /// [`Table::find`] does. Returns `None` for an external table.
+    pub fn set_finding(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) -> Result<Option<Place<'gc>>, TableError> {
         match self.0 {
             Kept::Inside(table) => Ok(Some(table.set(mc, key, value)?)),
             Kept::Record(table) => Ok(Some(table.set(mc, key, value)?)),
+            Kept::Outside(table) => table.set(mc, key, value).map(|()| None),
+        }
+    }
+
+    /// Sets the value of `key` as [`Table::set`] does, and treats `key` as a field name whatever kind of value it is. Returns the place of the entry, as [`Table::set_finding`] does.
+    ///
+    /// Use it for a key that is not a symbol and is still one of a fixed set of names, such as the string keys of a JSON object whose fields are known. A table with a shape then keeps a shape when it gets such a key. A program's write with a constant key goes through this method.
+    ///
+    /// A table with a shape lists the keys of the shape. For a string key, that is a string with the same characters, and not always the object that was passed here. See [`Shape::child`].
+    ///
+    /// The table gets keys of its own, as it does in [`Table::set`], if a shape cannot take the key. See [`ShapeError`].
+    pub fn set_field(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) -> Result<Option<Place<'gc>>, TableError> {
+        match self.0 {
+            Kept::Inside(table) => Ok(Some(table.set_field(mc, key, value)?)),
+            Kept::Record(table) => Ok(Some(table.set_field(mc, key, value)?)),
             Kept::Outside(table) => table.set(mc, key, value).map(|()| None),
         }
     }
@@ -471,6 +700,32 @@ impl<'gc> Table<'gc> {
             Kept::Record(table) => Ok(table.clear(mc)?),
             Kept::Outside(table) => table.clear(mc),
         }
+    }
+
+    /// Returns a new table with the entries of this one, in the same order. The new table is held in the arena and can be changed, whatever this table is.
+    ///
+    /// The copy of a table with a shape has that shape, and is as small as a table from [`Tables::shaped`]. The copy of an external table with a shape gets its keys as fields, in the host's order. See [`Table::set_field`].
+    pub fn copy(self, mc: &Mutation<'gc>) -> Result<Self, Error> {
+        let tables = Tables::new(mc);
+        let shape = self.shape(mc);
+        if let Some(shape) = shape
+            && !self.is_external()
+        {
+            return tables.shaped(shape, (0..shape.len(mc)).map(|position| self.held(mc, 2 * position + 1).filter(|&value| value != Value::BROKEN)));
+        }
+        let fielded = shape.is_some();
+        let copy = tables.inside(if fielded { 0 } else { self.len(mc) })?;
+        if fielded {
+            copy.0.set_shape(mc, Some(tables.root()?.0));
+        }
+        for (key, value) in self.entries(mc)? {
+            if fielded {
+                copy.set_field(mc, key, value)?;
+            } else {
+                copy.set(mc, key, value)?;
+            }
+        }
+        Ok(Self(Kept::Inside(copy)))
     }
 
     /// Returns an iterator over the entries in the order they were added. For an external table,
@@ -527,8 +782,25 @@ impl<'gc> Inside<'gc> {
         self.0.live(mc) as usize
     }
 
+    /// Returns the value at `position` of a table in shape mode, or `None` if the table does not have the key at that position. The slots past the keys of the shape are unused, so a position past them has no value either.
+    #[inline(always)]
+    fn value_at(self, mc: &Mutation<'gc>, position: usize) -> Option<Value<'gc>> {
+        let values = self.0.pairs(mc)?.items(mc);
+        (position < values.len()).then(|| values.get(position)).filter(|&value| value != Value::BROKEN)
+    }
+
+    /// Finds `key` in a table in shape mode, whose shape is `shape`.
+    #[inline(never)]
+    fn find_shaped(self, mc: &Mutation<'gc>, shape: Shape<'gc>, key: Value<'gc>) -> Result<Option<(Place<'gc>, Value<'gc>)>, Error> {
+        let Some(position) = shape.position(mc, key)? else { return Ok(None) };
+        Ok(self.value_at(mc, position).map(|value| (Place { shape: Some(shape), position }, value)))
+    }
+
     #[inline]
     fn get(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<Value<'gc>>, Error> {
+        if let Some(shape) = self.0.shape(mc) {
+            return Ok(self.find_shaped(mc, Shape(shape), key)?.map(|(_, value)| value));
+        }
         let Some(parts) = self.settled(mc)? else { return Ok(None) };
         let hashed = hash(mc, self.0.seed(mc), key)?;
         Ok(parts.find(mc, key, hashed.hash)?.map(|entry| parts.entries.get(2 * entry + 1)))
@@ -539,34 +811,121 @@ impl<'gc> Inside<'gc> {
     /// So the check needs only the array length, not `used`.
     #[inline]
     fn get_at(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize) -> Option<Value<'gc>> {
+        match self.0.shape(mc) {
+            Some(shape) => self.get_at_shaped(mc, Shape(shape), key, position),
+            None => self.get_at_own(mc, key, position),
+        }
+    }
+
+    /// Does the work of [`Inside::get_at`] for a table with keys of its own: the key of the entry at `position` is compared with `key`.
+    #[inline(always)]
+    fn get_at_own(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize) -> Option<Value<'gc>> {
         let entries = self.0.pairs(mc)?.items(mc);
         let place = position.checked_mul(2)?;
         (place < entries.len() && entries.get(place) == key).then(|| entries.get(place + 1))
     }
 
+    /// Does the work of [`Inside::get_at`] for a table in shape mode, whose shape is `shape`: the key at `position` of the shape is compared with `key`.
+    #[inline(never)]
+    fn get_at_shaped(self, mc: &Mutation<'gc>, shape: Shape<'gc>, key: Value<'gc>, position: usize) -> Option<Value<'gc>> {
+        if shape.key(mc, position) == Some(key) { self.value_at(mc, position) } else { None }
+    }
+
+    /// Works like [`Inside::get_at`]. If the table is in shape mode and its shape is the object `shape`, the key at `position` is `key`, and no key is read.
+    #[inline(always)]
+    fn get_hinted(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize, shape: Value<'gc>) -> Option<Value<'gc>> {
+        match self.0.shape(mc) {
+            Some(own) if Value::object(mc, own) == shape => self.value_at(mc, position),
+            Some(own) => self.get_at_shaped(mc, Shape(own), key, position),
+            None => self.get_at_own(mc, key, position),
+        }
+    }
+
     #[inline]
     fn set_at(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize, value: Value<'gc>) -> bool {
+        if let Some(shape) = self.0.shape(mc) {
+            return Shape(shape).key(mc, position) == Some(key) && self.replace(mc, position, value);
+        }
         let Some(entries) = self.0.pairs(mc).map(|pairs| pairs.items(mc)) else { return false };
         let Some(place) = position.checked_mul(2).filter(|&place| place < entries.len() && entries.get(place) == key) else { return false };
         entries.set(mc, place + 1, value);
         true
     }
 
-    fn find(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<(usize, Value<'gc>)>, Error> {
-        let Some(parts) = self.settled(mc)? else { return Ok(None) };
-        let hashed = hash(mc, self.0.seed(mc), key)?;
-        Ok(parts.find(mc, key, hashed.hash)?.map(|entry| (entry, parts.entries.get(2 * entry + 1))))
+    /// Works like [`Inside::set_at`] for a write that remembers the shape `shape`. If that is the table's shape, the value at `position` is replaced without a look at the key. If it is the table's shape with `key` added, the write adds the key.
+    #[inline(always)]
+    fn set_hinted(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize, shape: Value<'gc>, value: Value<'gc>) -> bool {
+        match self.0.shape(mc) {
+            Some(own) if Value::object(mc, own) == shape => self.replace(mc, position, value),
+            Some(own) => self.set_extending(mc, Shape(own), key, position, shape, value),
+            None => self.set_at(mc, key, position, value),
+        }
     }
 
-    /// Sets the value of `key`, and returns the number of its entry.
-    fn set(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) -> Result<usize, Error> {
+    /// Finishes [`Inside::set_hinted`] for a table in shape mode whose shape `own` is not the remembered shape.
+    #[inline(never)]
+    fn set_extending(self, mc: &Mutation<'gc>, own: Shape<'gc>, key: Value<'gc>, position: usize, shape: Value<'gc>, value: Value<'gc>) -> bool {
+        // The remembered shape has `key` as its last key, at `position`. If the rest of it is this table's shape, the table lacks only that key, and gets it by moving to the remembered shape. If the values array cannot be made longer, the caller's search reports the failure.
+        if let Some(hinted) = Shape::of(shape)
+            && hinted.parent(mc) == Some(own)
+            && position + 1 == hinted.len(mc)
+            && let Ok(values) = self.room_for(mc, position + 1)
+        {
+            values.set(mc, position, value);
+            self.0.set_shape(mc, Some(hinted.0));
+            self.0.set_live(mc, self.0.live(mc) + 1);
+            return true;
+        }
+        own.key(mc, position) == Some(key) && self.replace(mc, position, value)
+    }
+
+    /// Replaces the value at `position` of a table in shape mode, if the table has the key at that position. Returns whether it did.
+    #[inline(always)]
+    fn replace(self, mc: &Mutation<'gc>, position: usize, value: Value<'gc>) -> bool {
+        if self.value_at(mc, position).is_none() {
+            return false;
+        }
+        if let Some(values) = self.0.pairs(mc) {
+            values.items(mc).set(mc, position, value);
+        }
+        true
+    }
+
+    fn find(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<(Place<'gc>, Value<'gc>)>, Error> {
+        if let Some(shape) = self.0.shape(mc) {
+            return self.find_shaped(mc, Shape(shape), key);
+        }
+        let Some(parts) = self.settled(mc)? else { return Ok(None) };
+        let hashed = hash(mc, self.0.seed(mc), key)?;
+        Ok(parts.find(mc, key, hashed.hash)?.map(|entry| (Place { shape: None, position: entry }, parts.entries.get(2 * entry + 1))))
+    }
+
+    /// Sets the value of `key`, and returns the place of its entry. See [`Table::set`] for what happens to a table in shape mode that does not have `key`.
+    #[inline]
+    fn set(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) -> Result<Place<'gc>, Error> {
+        self.put(mc, key, value, false)
+    }
+
+    /// Sets the value of `key` as [`Inside::set`] does, and treats `key` as a field name whatever kind of value it is. See [`Table::set_field`].
+    fn set_field(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) -> Result<Place<'gc>, Error> {
+        self.put(mc, key, value, true)
+    }
+
+    /// Sets the value of `key`, and returns the place of its entry. `field` says that the caller knows `key` to be a field name. A symbol is a field name in any case.
+    fn put(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>, field: bool) -> Result<Place<'gc>, Error> {
+        if let Some(shape) = self.0.shape(mc) {
+            if let Some(place) = self.put_shaped(mc, Shape(shape), key, value, field)? {
+                return Ok(place);
+            }
+            self.leave_shape(mc)?;
+        }
         let hashed = hash(mc, self.0.seed(mc), key)?;
         let parts = self.settled(mc)?;
         if let Some(parts) = parts
             && let Some(entry) = parts.find(mc, key, hashed.hash)?
         {
             parts.entries.set(mc, 2 * entry + 1, value);
-            return Ok(entry);
+            return Ok(Place { shape: None, position: entry });
         }
         let live = self.0.live(mc);
         let parts = match parts {
@@ -585,10 +944,84 @@ impl<'gc> Inside<'gc> {
         if hashed.by_place && self.0.epoch(mc) == STILL {
             self.0.set_epoch(mc, mc.moves());
         }
-        Ok(entry)
+        Ok(Place { shape: None, position: entry })
+    }
+
+    /// Sets the value of `key` in a table in shape mode, whose shape is `shape`. Returns the place of the key, or `None` if the table has to leave shape mode to take the key. The place has the shape of the table after the write.
+    ///
+    /// A key that the shape lacks is added if it is a field name: the table moves to the shape with `key` added. The table has to leave shape mode for a key that is not a field name, and for a key that the shape cannot take. See [`ShapeError`]. It also has to for a key that was removed from it earlier, because that key becomes the last entry.
+    fn put_shaped(self, mc: &Mutation<'gc>, shape: Shape<'gc>, key: Value<'gc>, value: Value<'gc>, field: bool) -> Result<Option<Place<'gc>>, Error> {
+        // The key is hashed once, for the search of the shape and for the search of the shapes made from it.
+        let hashed = hash(mc, shape.0.seed(mc), key)?;
+        if let Some(position) = shape.position_hashed(mc, key, hashed.hash)? {
+            return Ok(self.replace(mc, position, value).then_some(Place { shape: Some(shape), position }));
+        }
+        if !field && Symbol::of(key).is_none() {
+            return Ok(None);
+        }
+        let child = match shape.child_absent(mc, key, &hashed) {
+            Ok(child) => child,
+            Err(ShapeError::Arena(error)) => return Err(error),
+            Err(ShapeError::Duplicate(_) | ShapeError::Identity(_) | ShapeError::TooMany(_)) => return Ok(None),
+        };
+        let position = shape.len(mc);
+        let values = self.room_for(mc, position + 1)?;
+        values.set(mc, position, value);
+        self.0.set_shape(mc, Some(child.0));
+        self.0.set_live(mc, self.0.live(mc) + 1);
+        Ok(Some(Place { shape: Some(child), position }))
+    }
+
+    /// Returns the values array of a table in shape mode, with at least `count` slots. A larger array is allocated if the current one is too short.
+    fn room_for(self, mc: &Mutation<'gc>, count: usize) -> Result<Slots<'gc>, Error> {
+        let old = self.0.pairs(mc).map(|pairs| pairs.items(mc));
+        if let Some(values) = old
+            && values.len() >= count
+        {
+            return Ok(values);
+        }
+        let held = old.map_or(0, |values| values.len());
+        let grown = objects::TableEntries::new(mc, count.max(2 * held).max(SHAPED_ROOM), Value::BROKEN)?;
+        let values = grown.items(mc);
+        if let Some(old) = old {
+            for position in 0..held {
+                values.set(mc, position, old.get(position));
+            }
+        }
+        self.0.set_pairs(mc, Some(grown));
+        Ok(values)
+    }
+
+    /// Takes a table out of shape mode: gives it an index and an entries array of its own, with the entries it has, in order.
+    #[cold]
+    #[inline(never)]
+    fn leave_shape(self, mc: &Mutation<'gc>) -> Result<(), Error> {
+        let fresh = arrays(mc, self.0.live(mc) as usize + 1)?;
+        let seed = self.0.seed(mc);
+        let mut kept = 0;
+        for (key, value) in self.entries(mc) {
+            fresh.parts.entries.set(mc, 2 * kept, key);
+            fresh.parts.entries.set(mc, 2 * kept + 1, value);
+            fresh.parts.link(mc, hash(mc, seed, key)?.hash, kept);
+            kept += 1;
+        }
+        self.0.set_shape(mc, None);
+        self.0.set_index(mc, Some(fresh.index));
+        self.0.set_pairs(mc, Some(fresh.entries));
+        self.0.set_used(mc, kept as u64);
+        Ok(())
     }
 
     fn delete(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<bool, Error> {
+        if let Some(shape) = self.0.shape(mc) {
+            // The table keeps its shape. The slot of the key is marked unused.
+            let Some((place, _)) = self.find_shaped(mc, Shape(shape), key)? else { return Ok(false) };
+            if let Some(values) = self.0.pairs(mc) {
+                values.items(mc).set(mc, place.position, Value::BROKEN);
+            }
+            self.0.set_live(mc, self.0.live(mc) - 1);
+            return Ok(true);
+        }
         let Some(parts) = self.settled(mc)? else { return Ok(false) };
         let hashed = hash(mc, self.0.seed(mc), key)?;
         let Some(entry) = parts.find(mc, key, hashed.hash)? else { return Ok(false) };
@@ -599,8 +1032,9 @@ impl<'gc> Inside<'gc> {
         Ok(true)
     }
 
-    /// Removes every entry and releases both arrays.
+    /// Removes every entry and releases the arrays. The table is afterwards an empty table without a shape.
     fn clear(self, mc: &Mutation<'gc>) {
+        self.0.set_shape(mc, None);
         self.0.set_index(mc, None);
         self.0.set_pairs(mc, None);
         self.0.set_live(mc, 0);
@@ -609,10 +1043,25 @@ impl<'gc> Inside<'gc> {
     }
 
     fn entries(self, mc: &Mutation<'gc>) -> Entries<'gc> {
+        if let Some(shape) = self.0.shape(mc) {
+            let values = self.0.pairs(mc).map(|values| values.items(mc));
+            let keys = shape.pairs(mc).map(|keys| keys.items(mc));
+            let end = values.map_or(0, |values| values.len().min(Shape(shape).len(mc)));
+            return Entries { entries: keys.filter(|_| end > 0), values, at: 0, end };
+        }
         Entries { entries: self.0.pairs(mc).map(|entries| entries.items(mc)), values: None, at: 0, end: self.0.used(mc) as usize }
     }
 
     fn held(self, mc: &Mutation<'gc>, index: usize) -> Option<Value<'gc>> {
+        if let Some(shape) = self.0.shape(mc) {
+            let count = Shape(shape).len(mc);
+            let value = (index / 2 < count).then(|| self.value_at(mc, index / 2).unwrap_or(Value::BROKEN))?;
+            // A key that the table does not have reads as a removed entry: both its slots are `Value::BROKEN`.
+            if index % 2 == 1 || value == Value::BROKEN {
+                return Some(value);
+            }
+            return Shape(shape).key(mc, index / 2);
+        }
         let entries = self.0.pairs(mc)?.items(mc);
         (index < 2 * self.0.used(mc) as usize).then(|| entries.get(index))
     }
@@ -736,6 +1185,15 @@ impl<'gc> Record<'gc> {
         (position < values.len()).then(|| values.get(position)).filter(|&value| value != Value::BROKEN)
     }
 
+    /// Returns the shape that gives the positions of the record's entries, if they have one. For a record that has grown, this is the shape of the table that took its entries.
+    #[inline]
+    fn shape(self, mc: &Mutation<'gc>) -> Option<Shape<'gc>> {
+        match self.own(mc) {
+            Some(own) => own.0.shape(mc).map(Shape),
+            None => self.0.shape(mc).map(Shape),
+        }
+    }
+
     /// Returns the position of `key` in the record's shape, or `None` if the shape does not have the key or the record has grown.
     fn position(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<usize>, Error> {
         match self.0.shape(mc) {
@@ -755,12 +1213,13 @@ impl<'gc> Record<'gc> {
         Ok(self.find(mc, key)?.map(|(_, value)| value))
     }
 
-    fn find(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<(usize, Value<'gc>)>, Error> {
+    fn find(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<(Place<'gc>, Value<'gc>)>, Error> {
         if let Some(own) = self.own(mc) {
             return own.find(mc, key);
         }
-        let Some(position) = self.position(mc, key)? else { return Ok(None) };
-        Ok(self.value_at(mc, position).map(|value| (position, value)))
+        let Some(shape) = self.0.shape(mc).map(Shape) else { return Ok(None) };
+        let Some(position) = shape.position(mc, key)? else { return Ok(None) };
+        Ok(self.value_at(mc, position).map(|value| (Place { shape: Some(shape), position }, value)))
     }
 
     #[inline(never)]
@@ -777,20 +1236,56 @@ impl<'gc> Record<'gc> {
     fn get_hinted(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize, shape: Value<'gc>) -> Option<Value<'gc>> {
         match self.0.shape(mc) {
             Some(own) if Value::object(mc, own) == shape => self.value_at(mc, position),
-            _ => self.get_at(mc, key, position),
+            Some(_) => self.get_at(mc, key, position),
+            None => self.get_hinted_grown(mc, key, position, shape),
         }
     }
 
-    /// Sets the value of `key`, and returns the position of its entry. A key that the record does not have moves the entries to an ordinary table first, so that the key is appended as the last entry.
-    fn set(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) -> Result<usize, Error> {
+    /// Does the work of [`Record::get_hinted`] for a record that has grown. It is kept out of line, so that the read of a record that has not grown stays short.
+    #[inline(never)]
+    fn get_hinted_grown(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize, shape: Value<'gc>) -> Option<Value<'gc>> {
+        self.own(mc)?.get_hinted(mc, key, position, shape)
+    }
+
+    /// Sets the value of `key`, and returns the place of its entry. See [`Table::set`] for what happens to a record that does not have `key`.
+    fn set(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) -> Result<Place<'gc>, Error> {
+        self.put(mc, key, value, false)
+    }
+
+    /// Sets the value of `key` as [`Record::set`] does, and treats `key` as a field name whatever kind of value it is. See [`Table::set_field`].
+    fn set_field(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) -> Result<Place<'gc>, Error> {
+        self.put(mc, key, value, true)
+    }
+
+    /// Sets the value of `key`, and returns the place of its entry. `field` says that the caller knows `key` to be a field name. A symbol is a field name in any case.
+    ///
+    /// A record has no room for a key that its shape lacks. For a field name, its values move to a table in shape mode with the same shape, which then adds the key and keeps a shape. For any other key, and for a key that was removed earlier, its entries move to a table with keys of its own.
+    fn put(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>, field: bool) -> Result<Place<'gc>, Error> {
         if let Some(own) = self.own(mc) {
-            return own.set(mc, key, value);
+            return own.put(mc, key, value, field);
         }
-        if let Some(position) = self.position(mc, key)?
+        let position = self.position(mc, key)?;
+        if let Some(position) = position
             && self.value_at(mc, position).is_some()
         {
             self.0.items(mc).set(mc, position, value);
-            return Ok(position);
+            return Ok(Place { shape: self.0.shape(mc).map(Shape), position });
+        }
+        if position.is_none()
+            && (field || Symbol::of(key).is_some())
+            && let Some(shape) = self.0.shape(mc).map(Shape)
+        {
+            let table = Tables::new(mc).inside(0)?;
+            let count = shape.len(mc);
+            let values = table.room_for(mc, count + 1)?;
+            let held = self.0.items(mc);
+            for position in 0..count.min(held.len()) {
+                values.set(mc, position, held.get(position));
+            }
+            table.0.set_shape(mc, Some(shape.0));
+            table.0.set_live(mc, self.0.live(mc));
+            self.move_to(mc, table);
+            return table.put(mc, key, value, true);
         }
         self.grow(mc)?.set(mc, key, value)
     }
@@ -808,8 +1303,15 @@ impl<'gc> Record<'gc> {
     fn set_hinted(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize, shape: Value<'gc>, value: Value<'gc>) -> bool {
         match self.0.shape(mc) {
             Some(own) if Value::object(mc, own) == shape => self.replace(mc, position, value),
-            _ => self.set_at(mc, key, position, value),
+            Some(_) => self.set_at(mc, key, position, value),
+            None => self.set_hinted_grown(mc, key, position, shape, value),
         }
+    }
+
+    /// Does the work of [`Record::set_hinted`] for a record that has grown. See [`Record::get_hinted_grown`].
+    #[inline(never)]
+    fn set_hinted_grown(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize, shape: Value<'gc>, value: Value<'gc>) -> bool {
+        self.own(mc).is_some_and(|own| own.set_hinted(mc, key, position, shape, value))
     }
 
     /// Replaces the value at `position`, if the record has the key at that position. Returns whether it did.
@@ -922,7 +1424,7 @@ impl<'gc> Memo<'gc> {
         }
     }
 
-    fn find(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<(usize, Value<'gc>)>, Error> {
+    fn find(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<(Place<'gc>, Value<'gc>)>, Error> {
         match self {
             Self::Plain(table) => table.find(mc, key),
             Self::Fields(record) => record.find(mc, key),
@@ -940,7 +1442,8 @@ impl<'gc> Memo<'gc> {
     #[inline(always)]
     fn get_hinted(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize, shape: Value<'gc>) -> Option<Value<'gc>> {
         match self {
-            Self::Plain(table) => table.get_at(mc, key, position),
+            // The cache of a table without a shape is made without a shape, and never gets one.
+            Self::Plain(table) => table.get_at_own(mc, key, position),
             Self::Fields(record) => record.get_hinted(mc, key, position, shape),
         }
     }
@@ -952,14 +1455,14 @@ impl<'gc> Memo<'gc> {
         }
     }
 
-    /// Caches `value` as the value of `key`, and returns the position of the entry. A record caches a key of its shape at the position of the shape.
-    fn cache(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) -> Result<usize, Error> {
+    /// Caches `value` as the value of `key`, and returns the place of the entry. A record caches a key of its shape at the position of the shape.
+    fn cache(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) -> Result<Place<'gc>, Error> {
         match self {
             Self::Plain(table) => table.set(mc, key, value),
             Self::Fields(record) => {
                 if let Some(position) = record.position(mc, key)? {
                     record.fill(mc, position, value);
-                    return Ok(position);
+                    return Ok(Place { shape: record.0.shape(mc).map(Shape), position });
                 }
                 record.set(mc, key, value)
             }
@@ -983,36 +1486,41 @@ impl<'a, 'gc> Tables<'a, 'gc> {
     }
 
     /// Returns an empty table. It allocates its arrays when the first entry is added.
+    ///
+    /// The table starts with the shape that has no keys. It keeps a shape for as long as the keys it gets are field names: symbols, and keys added with [`Table::set_field`]. The first other key gives it keys and an index of its own. See [`Table::set`].
     pub fn make(&self) -> Result<Table<'gc>, Error> {
-        self.with_room(0)
+        let table = self.inside(0)?;
+        table.0.set_shape(self.mc, Some(self.root()?.0));
+        Ok(Table(Kept::Inside(table)))
     }
 
-    /// Returns an empty table that can hold `entries` entries before it has to grow.
+    /// Returns an empty table that can hold `entries` entries before it has to grow. With room for no entries, this is [`Tables::make`]. Otherwise the table has keys and an index of its own from the start, as suits a table that is used as a map.
     pub fn with_room(&self, entries: usize) -> Result<Table<'gc>, Error> {
+        if entries == 0 {
+            return self.make();
+        }
         Ok(Table(Kept::Inside(self.inside(entries)?)))
     }
 
-    /// Returns a shape with `keys`, in order. See [`ShapeError`] for the keys that a shape cannot have.
+    /// Returns the shape with `keys`, in order. It is the shape that [`Shape::child`] reaches from the shape with no keys, one key at a time. So a second call with equal keys returns the same shape. See [`ShapeError`] for the keys that a shape cannot have.
     pub fn shape(&self, keys: &[Value<'gc>]) -> Result<Shape<'gc>, ShapeError> {
-        let mc = self.mc;
-        let seed = Symbols::of_arena(mc)?.seed(mc);
-        let slots = keys.len().checked_mul(2).and_then(usize::checked_next_power_of_two).ok_or_else(|| mc.out_of_memory())?.max(MIN_SLOTS);
-        let index = objects::TableIndex::new(mc, slots, 0)?;
-        // The entries array holds the keys in order, each followed by a value slot that stays unused. The tables of the shape keep their values themselves.
-        let pairs = objects::TableEntries::new(mc, 2 * keys.len(), Value::BROKEN)?;
-        let parts = Parts { index: index.items(mc), entries: pairs.items(mc) };
-        for (position, &key) in keys.iter().enumerate() {
-            let hashed = hash(mc, seed, key)?;
-            if hashed.by_place || key == Value::BROKEN {
-                return Err(ShapeError::Identity(position));
-            }
-            if parts.find(mc, key, hashed.hash)?.is_some() {
-                return Err(ShapeError::Duplicate(position));
-            }
-            parts.entries.set(mc, 2 * position, key);
-            parts.link(mc, hashed.hash, position);
+        let mut shape = self.root()?;
+        for &key in keys {
+            shape = shape.child(self.mc, key)?;
         }
-        Ok(Shape(objects::TableShape::new(mc, Some(index), Some(pairs), seed)?))
+        Ok(shape)
+    }
+
+    /// Returns the shape with no keys, the root of the arena's tree of shapes. It is made on the first call and kept with the arena's symbol table.
+    pub fn root(&self) -> Result<Shape<'gc>, Error> {
+        let mc = self.mc;
+        let symbols = Symbols::of_arena(mc)?;
+        if let Some(root) = symbols.shapes(mc) {
+            return Ok(Shape(root));
+        }
+        let root = objects::TableShape::new(mc, None, None, symbols.seed(mc), 0, None, Value::BROKEN, None, None, 0)?;
+        symbols.set_shapes(mc, root);
+        Ok(Shape(root))
     }
 
     /// Returns a table with the keys of `shape` and a value for each key, in the order of the keys. A `None` leaves its key out of the table, as if the key had been removed. Values past the number of keys are ignored, and keys without a value are left out.
@@ -1038,10 +1546,11 @@ impl<'a, 'gc> Tables<'a, 'gc> {
         Ok(Record(record))
     }
 
+    /// Returns an empty table without a shape, with room for `entries` entries.
     fn inside(&self, entries: usize) -> Result<Inside<'gc>, Error> {
         let mc = self.mc;
         let seed = Symbols::of_arena(mc)?.seed(mc);
-        let table = objects::Table::new(mc, None, None, 0, 0, seed, STILL)?;
+        let table = objects::Table::new(mc, None, None, 0, 0, seed, STILL, None)?;
         if entries > 0 {
             let fresh = arrays(mc, entries)?;
             table.set_index(mc, Some(fresh.index));
@@ -1326,8 +1835,8 @@ impl HostKey {
 
 /// The result of reading a key of an external table at a position of the table's shape. See [`Outside::find_at`].
 enum AtPosition<'gc> {
-    /// The key has this value, which is now cached at the position.
-    Found(Value<'gc>),
+    /// The key has this value, which is now cached at this place.
+    Found(Place<'gc>, Value<'gc>),
     /// The host has no entry for the key.
     Absent,
     /// The position does not answer the read. The table has no shape, the key is not at the position, or the host is asked by key. The key has to be found the general way.
@@ -1339,6 +1848,17 @@ enum AtPosition<'gc> {
 struct Outside<'gc>(Gc<'gc, objects::ExternTable>);
 
 impl<'gc> Outside<'gc> {
+    /// Returns the shape that gives the positions of the cached values, if they have one.
+    ///
+    /// This is the shape that the host gave the table, until the program gives the table a key outside that shape. The cache then has a layout of its own. Its positions must not be remembered together with the host's shape: a position of the cache would be read in another table of that shape, where it belongs to another key.
+    #[inline]
+    fn shape(self, mc: &Mutation<'gc>) -> Option<Shape<'gc>> {
+        match self.0.fields(mc) {
+            Some(fields) => Record(fields).shape(mc),
+            None => self.0.shape(mc).map(Shape),
+        }
+    }
+
     fn len(self, mc: &Mutation<'gc>) -> usize {
         self.0.host(mc).and_then(|host| host.try_borrow().ok()).map_or(0, |host| host.count())
     }
@@ -1390,8 +1910,10 @@ impl<'gc> Outside<'gc> {
         // The cache is a record of the shape. It has a slot for the key at `position`, unless the program gave the table a key outside the shape and the record grew.
         let Memo::Fields(fields) = self.memo(mc)? else { return Ok(AtPosition::Unknown) };
         let Some(known) = fields.slot(mc, position) else { return Ok(AtPosition::Unknown) };
+        // The record has not grown, so the position is a position of the record's shape.
+        let place = Place { shape: fields.0.shape(mc).map(Shape), position };
         if known != Value::BROKEN {
-            return Ok(AtPosition::Found(known));
+            return Ok(AtPosition::Found(place, known));
         }
         let Some(host) = self.0.host(mc) else { return Ok(AtPosition::Unknown) };
         let Ok(host) = host.try_borrow() else { return Ok(AtPosition::Unknown) };
@@ -1404,7 +1926,7 @@ impl<'gc> Outside<'gc> {
         };
         let Some(value) = value else { return Ok(AtPosition::Absent) };
         fields.fill(mc, position, value);
-        Ok(AtPosition::Found(value))
+        Ok(AtPosition::Found(place, value))
     }
 
     /// Reads the value of `key` from the host. Returns `None` if the host has no entry for `key`, or if `key` is of a kind that no external table has.
@@ -1414,8 +1936,8 @@ impl<'gc> Outside<'gc> {
         host.fetch(mc, host_key.key())
     }
 
-    /// Returns the position of `key` in the cache and the value of `key`. The value is read from the host and cached if it was not cached yet.
-    fn find(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<(usize, Value<'gc>)>, Error> {
+    /// Returns the place of `key` in the cache and the value of `key`. The value is read from the host and cached if it was not cached yet.
+    fn find(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<(Place<'gc>, Value<'gc>)>, Error> {
         if let Some(memo) = self.cached(mc)
             && let Some(found) = memo.find(mc, key)?
         {
@@ -1562,6 +2084,12 @@ impl<'gc> Parts<'gc> {
     /// Returns the number of the live entry whose key is `key`, or `None` if there is none. `hash` is the hash of `key`.
     #[inline]
     fn find(self, mc: &Mutation<'gc>, key: Value<'gc>, hash: u64) -> Result<Option<usize>, Error> {
+        self.find_below(mc, key, hash, self.room())
+    }
+
+    /// Works like [`Parts::find`], and looks only at the entries with a number below `limit`.
+    #[inline]
+    fn find_below(self, mc: &Mutation<'gc>, key: Value<'gc>, hash: u64, limit: usize) -> Result<Option<usize>, Error> {
         let mask = self.index.len().wrapping_sub(1);
         let tag = hash >> 32;
         let mut at = hash as usize & mask;
@@ -1572,7 +2100,7 @@ impl<'gc> Parts<'gc> {
                 return Ok(None);
             }
             let entry = ((word & ENTRY) as usize).wrapping_sub(1);
-            if word >> 32 == tag && entry < self.room() {
+            if word >> 32 == tag && entry < limit {
                 let held = self.entries.get(2 * entry);
                 if held != Value::BROKEN && same(mc, held, key)? {
                     return Ok(Some(entry));
@@ -1585,15 +2113,20 @@ impl<'gc> Parts<'gc> {
 
     /// Records in the index that entry number `entry` has a key that hashes to `hash`.
     fn link(self, mc: &Mutation<'gc>, hash: u64, entry: usize) {
-        let mask = self.index.len().wrapping_sub(1);
-        let mut at = hash as usize & mask;
-        for _ in 0..self.index.len() {
-            if self.index.get(at) == 0 {
-                self.index.set(mc, at, hash >> 32 << 32 | (entry as u64 + 1));
-                return;
-            }
-            at = (at + 1) & mask;
+        link(mc, self.index, hash, entry);
+    }
+}
+
+/// Records in `index` that entry number `entry` has a key that hashes to `hash`.
+fn link<'gc>(mc: &Mutation<'gc>, index: Slots<'gc, slot::u64>, hash: u64, entry: usize) {
+    let mask = index.len().wrapping_sub(1);
+    let mut at = hash as usize & mask;
+    for _ in 0..index.len() {
+        if index.get(at) == 0 {
+            index.set(mc, at, hash >> 32 << 32 | (entry as u64 + 1));
+            return;
         }
+        at = (at + 1) & mask;
     }
 }
 
@@ -1635,6 +2168,17 @@ fn hash_other<'gc>(mc: &Mutation<'gc>, seed: u64, key: Value<'gc>) -> Hashed {
         return Hashed { hash: mix(hash ^ seed ^ EXTERNAL), by_place: false };
     }
     Hashed { hash: mix(key.to_bits() ^ seed), by_place: key.object_parts().is_some() }
+}
+
+/// Returns whether `held`, a key of a shape, is the key that the tables of the shape list for `key`. See [`Shape::child`].
+fn stands_for<'gc>(mc: &Mutation<'gc>, held: Value<'gc>, key: Value<'gc>) -> Result<bool, Error> {
+    if held == key {
+        return Ok(true);
+    }
+    if ExternalRef::of(key).is_some() {
+        return Ok(false);
+    }
+    same(mc, held, key)
 }
 
 /// Returns whether `held` and `key` are the same key. See the [module docs](self).
