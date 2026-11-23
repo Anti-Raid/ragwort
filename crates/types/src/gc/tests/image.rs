@@ -155,3 +155,42 @@ fn what_the_host_owns_is_not_saved() {
     assert_eq!(shape(&descs(), &kinds()), shape(&descs(), &kinds()));
     assert_ne!(shape(&descs(), &kinds()), shape(&descs(), &[]));
 }
+
+/// A string that was interned when it was saved is the interned string of its text after a load. If the arena already has that text interned, the loaded string is an ordinary string and the arena's string stays the interned one.
+#[test]
+fn interned_strings_are_interned_again_when_loaded() {
+    const FIRST: &str = "an interned string that the image holds";
+    const SECOND: &str = "a string that the image holds without interning it";
+    let mut saving = Arena::new(1 << 22, 0);
+    let bytes = saving.mutate(|mc| {
+        let strings = Strings::new(mc);
+        let first = strings.intern(string::from_str(&strings, FIRST).unwrap()).unwrap();
+        let second = string::from_str(&strings, SECOND).unwrap();
+        assert!(strings.is_interned(first) && !strings.is_interned(second));
+        save(mc, STAMP, &[first.value(), second.value()], &kinds()).unwrap()
+    });
+    // An arena that has not interned the text takes the loaded string as the interned one.
+    let mut fresh = Arena::new(1 << 22, 0);
+    fresh.mutate(|mc| {
+        let roots = load(mc, STAMP, &bytes, &descs(), &kinds(), &()).unwrap();
+        let strings = Strings::new(mc);
+        let (first, second) = (strings.string(roots[0]).unwrap(), strings.string(roots[1]).unwrap());
+        assert!(strings.is_interned(first) && !strings.is_interned(second));
+        assert_eq!((text(mc, roots[0]), text(mc, roots[1])), (FIRST.to_string(), SECOND.to_string()));
+        assert_eq!(strings.intern(string::from_str(&strings, FIRST).unwrap()), Ok(first));
+        assert_eq!((strings.interned(string::from_str(&strings, SECOND).unwrap()), strings.hash(first)), (Ok(None), strings.hash(string::from_str(&strings, FIRST).unwrap())));
+    });
+    // An arena with the same seed that interned the text before the load keeps its own string.
+    let seed = fresh.mutate(|mc| Symbols::of_arena(mc).unwrap().seed(mc));
+    let mut used = Arena::new(1 << 22, 0);
+    used.mutate(|mc| {
+        Symbols::with_seed(mc, seed).unwrap();
+        let strings = Strings::new(mc);
+        let own = strings.intern(string::from_str(&strings, FIRST).unwrap()).unwrap();
+        let roots = load(mc, STAMP, &bytes, &descs(), &kinds(), &()).unwrap();
+        let first = strings.string(roots[0]).unwrap();
+        assert!(first != own && !strings.is_interned(first) && strings.is_interned(own));
+        assert_eq!((strings.intern(first), strings.interned(first), text(mc, roots[0])), (Ok(own), Ok(Some(own)), FIRST.to_string()));
+    });
+}
+

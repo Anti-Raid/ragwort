@@ -18,7 +18,10 @@ crate::gc::objects! {
     pub(crate) struct Sym { name: Value, hash: u64 }
     /// The intern table. `seed` seeds its hashes. `table` holds the symbols and `keywords` holds the keywords, both weakly.
     /// `shapes` is the root of the arena's tree of table shapes: the shape with no keys. It is created when the first shape is.
-    pub(crate) struct Interned { seed: u64, table: Member<TableHead>, keywords: Member<TableHead>, shapes: Member<TableShape> }
+    ///
+    /// `narrow`, `wide` and `widest` hold the interned strings weakly: the flat string objects with units of one, two and four bytes.
+    /// Each is created when the first string of its width is interned. See `Strings::intern`.
+    pub(crate) struct Interned { seed: u64, table: Member<TableHead>, keywords: Member<TableHead>, shapes: Member<TableShape>, narrow: Member<TableHead>, wide: Member<TableHead>, widest: Member<TableHead> }
     /// A keyword, `#:name`. `symbol` is the symbol with the same name.
     pub(crate) struct Keyword { symbol: Member<Sym> }
     /// `length` is the length of the list that starts at this pair, or 0 if the chain of pairs does not end in `()`.

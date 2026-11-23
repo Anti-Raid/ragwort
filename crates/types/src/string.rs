@@ -23,6 +23,21 @@
 //!
 //! So a flat string has at most [`FLAT_MAX`] characters. A rope can be longer.
 //!
+//! # Interned strings
+//!
+//! [`Strings::intern`] returns the one string that stands for a text in the arena: the interned
+//! string. Interning two strings with the same characters returns the same string both times.
+//! So two interned strings have the same characters exactly when they are the same value.
+//!
+//! - A string in the value word is interned as it is. Equal ones are the same word already.
+//! - A flat string object is interned by being registered. Nothing is copied. Bit 31 of its
+//!   `chars` word marks it as interned.
+//! - A rope is interned as its flat copy.
+//! - An external string is not interned yet. [`Strings::intern`] returns it unchanged.
+//!
+//! The arena holds its interned strings weakly, in one table for each width of unit. An interned
+//! string that nothing else refers to is collected, and interning its text again registers a new string.
+//!
 //! The hash is seeded with the arena's seed, so it cannot be predicted from outside. An arena has
 //! one seed for its whole life, and an image is loaded only into an arena with the image's seed,
 //! so a hash that is kept in a string stays right.
@@ -30,7 +45,9 @@
 pub use ragwort_string::*;
 
 pub use crate::gc::Error;
-use crate::gc::{INLINE_STRING, Mutation, TAG, Value};
+use crate::gc::table::{Table as GcTable, WeakObjects};
+use crate::gc::{Gc, INLINE_STRING, Mutation, Object, TAG, Value};
+use crate::symbol::Symbols;
 
 #[cfg(test)]
 #[path = "tests/strings.rs"]
@@ -59,6 +76,8 @@ pub const FLAT_MAX: usize = (1 << 31) - 1;
 
 /// The bits of a flat string's `chars` word that hold the number of characters.
 const COUNT: u64 = FLAT_MAX as u64;
+/// The bit of a flat string's `chars` word that is set while the string is interned.
+const INTERNED: u64 = 1 << 31;
 /// The number of bits that the hash in a flat string's `chars` word is shifted up by.
 const HASH_SHIFT: u32 = 32;
 
@@ -158,18 +177,177 @@ impl<'a, 'gc> Strings<'a, 'gc> {
     #[inline(never)]
     fn hash_anew(&self, string: Str<'gc>) -> Result<u32, Error> {
         let mc = self.mc;
-        let seed = crate::symbol::Symbols::of_arena(mc)?.seed(mc);
+        let seed = Symbols::of_arena(mc)?.seed(mc);
         // 0 means that no hash is kept, so a hash of 0 becomes 1.
         let hash = u64::from((ragwort_string::hash(self, string, seed)? as u32).max(1));
         match Text::of(string.0) {
-            Some(Text::Str8(flat)) => flat.set_chars(mc, flat.chars(mc) & COUNT | hash << HASH_SHIFT),
-            Some(Text::Str16(flat)) => flat.set_chars(mc, flat.chars(mc) & COUNT | hash << HASH_SHIFT),
-            Some(Text::Str32(flat)) => flat.set_chars(mc, flat.chars(mc) & COUNT | hash << HASH_SHIFT),
+            Some(Text::Str8(flat)) => flat.set_chars(mc, flat.chars(mc) & (COUNT | INTERNED) | hash << HASH_SHIFT),
+            Some(Text::Str16(flat)) => flat.set_chars(mc, flat.chars(mc) & (COUNT | INTERNED) | hash << HASH_SHIFT),
+            Some(Text::Str32(flat)) => flat.set_chars(mc, flat.chars(mc) & (COUNT | INTERNED) | hash << HASH_SHIFT),
             Some(Text::Extern(external)) => external.set_hash(mc, hash),
             _ => {}
         }
         Ok(hash as u32)
     }
+
+    /// Returns the interned string with the characters of `string`. If there is none, `string` becomes it. See the [module docs](self).
+    pub fn intern(&self, string: Str<'gc>) -> Result<Str<'gc>, Error> {
+        match Text::of(string.0) {
+            Some(Text::Str8(flat)) => self.intern_flat(flat, string),
+            Some(Text::Str16(flat)) => self.intern_flat(flat, string),
+            Some(Text::Str32(flat)) => self.intern_flat(flat, string),
+            Some(Text::Rope(_)) => {
+                let flat = flatten(self, string)?;
+                self.intern(flat)
+            }
+            // A string in the value word is its own interned string. An external string is not interned yet.
+            Some(Text::Extern(_)) | None => Ok(string),
+        }
+    }
+
+    /// Returns the interned string with the characters of `string`, or `None` if no such string is interned. Nothing is registered, and a rope is not flattened.
+    pub fn interned(&self, string: Str<'gc>) -> Result<Option<Str<'gc>>, Error> {
+        if self.is_interned(string) {
+            return Ok(Some(string));
+        }
+        // An interned string with these characters has units of the same width, so one table can hold it.
+        let key = spread(self.hash(string)?);
+        match width(self, string) {
+            Width::One => self.twin::<Str8>(key, string),
+            Width::Two => self.twin::<Str16>(key, string),
+            Width::Four => self.twin::<Str32>(key, string),
+        }
+    }
+
+    /// Returns whether `string` is an interned string: a string in the value word, or a flat string object that [`Strings::intern`] has registered.
+    #[inline]
+    pub fn is_interned(&self, string: Str<'gc>) -> bool {
+        let mc = self.mc;
+        match Text::of(string.0) {
+            Some(Text::Str8(flat)) => flat.chars(mc) & INTERNED != 0,
+            Some(Text::Str16(flat)) => flat.chars(mc) & INTERNED != 0,
+            Some(Text::Str32(flat)) => flat.chars(mc) & INTERNED != 0,
+            Some(Text::Rope(_) | Text::Extern(_)) => false,
+            None => true,
+        }
+    }
+
+    /// Makes the flat string object `flat`, which is `string`, the interned string of its characters, unless another string is that already. Returns the interned string.
+    fn intern_flat<T: Object>(&self, flat: Gc<'gc, T>, string: Str<'gc>) -> Result<Str<'gc>, Error>
+    where
+        Gc<'gc, T>: Flat<'gc>,
+    {
+        let mc = self.mc;
+        if flat.count(mc) & INTERNED != 0 {
+            return Ok(string);
+        }
+        let key = spread(self.hash(string)?);
+        let symbols = Symbols::of_arena(mc)?;
+        let table = match symbols.strings(mc, <Gc<'gc, T> as Flat<'gc>>::WIDTH) {
+            Some(head) => GcTable::<WeakObjects<T>>::of(head),
+            None => {
+                let table = GcTable::<WeakObjects<T>>::new(mc)?;
+                symbols.set_strings(mc, <Gc<'gc, T> as Flat<'gc>>::WIDTH, table.head());
+                table
+            }
+        };
+        let found = table.find_or_insert(mc, key, |candidate: Gc<'gc, T>| equal(self, Str(Value::object(mc, candidate)), string), || Ok::<_, Error>(flat))?;
+        if found == flat {
+            flat.set_count(mc, flat.count(mc) | INTERNED);
+        }
+        Ok(Str(Value::object(mc, found)))
+    }
+
+    /// Returns the interned string of unit type `T` with the characters of `string`, if there is one. `key` is the table key of `string`.
+    fn twin<T: Object>(&self, key: u64, string: Str<'gc>) -> Result<Option<Str<'gc>>, Error>
+    where
+        Gc<'gc, T>: Flat<'gc>,
+    {
+        let mc = self.mc;
+        let Some(head) = Symbols::of_arena(mc)?.strings(mc, <Gc<'gc, T> as Flat<'gc>>::WIDTH) else { return Ok(None) };
+        let found = GcTable::<WeakObjects<T>>::of(head).find(mc, key, |candidate: Gc<'gc, T>| equal(self, Str(Value::object(mc, candidate)), string))?;
+        Ok(found.map(|found| Str(Value::object(mc, found))))
+    }
+
+    /// Registers `string` again after it was loaded from an image, if the image marked it as interned. A loaded string is in no table yet. If the arena already has an interned string with the same characters, `string` stays an ordinary string.
+    pub(crate) fn adopt(&self, string: Str<'gc>) -> Result<(), Error> {
+        let mc = self.mc;
+        match Text::of(string.0) {
+            Some(Text::Str8(flat)) if flat.chars(mc) & INTERNED != 0 => flat.set_chars(mc, flat.chars(mc) & !INTERNED),
+            Some(Text::Str16(flat)) if flat.chars(mc) & INTERNED != 0 => flat.set_chars(mc, flat.chars(mc) & !INTERNED),
+            Some(Text::Str32(flat)) if flat.chars(mc) & INTERNED != 0 => flat.set_chars(mc, flat.chars(mc) & !INTERNED),
+            _ => return Ok(()),
+        }
+        self.intern(string).map(drop)
+    }
+
+    /// Returns the number of interned string objects, for tests.
+    #[cfg(test)]
+    fn interned_count(&self) -> usize {
+        let mc = self.mc;
+        let symbols = Symbols::of_arena(mc).expect("an intern table");
+        let narrow = symbols.strings(mc, Width::One).map_or(0, |head| GcTable::<WeakObjects<Str8>>::of(head).entries(mc).count());
+        let wide = symbols.strings(mc, Width::Two).map_or(0, |head| GcTable::<WeakObjects<Str16>>::of(head).entries(mc).count());
+        let widest = symbols.strings(mc, Width::Four).map_or(0, |head| GcTable::<WeakObjects<Str32>>::of(head).entries(mc).count());
+        narrow + wide + widest
+    }
+}
+
+/// A flat string object of one of the three unit widths.
+trait Flat<'gc>: Copy + PartialEq {
+    /// The width of the units of this type of string.
+    const WIDTH: Width;
+
+    /// Returns the `chars` word: the number of characters, the interned flag and the hash.
+    fn count(self, mc: &Mutation<'gc>) -> u64;
+
+    fn set_count(self, mc: &Mutation<'gc>, word: u64);
+}
+
+impl<'gc> Flat<'gc> for Gc<'gc, Str8> {
+    const WIDTH: Width = Width::One;
+
+    fn count(self, mc: &Mutation<'gc>) -> u64 {
+        self.chars(mc)
+    }
+
+    fn set_count(self, mc: &Mutation<'gc>, word: u64) {
+        self.set_chars(mc, word);
+    }
+}
+
+impl<'gc> Flat<'gc> for Gc<'gc, Str16> {
+    const WIDTH: Width = Width::Two;
+
+    fn count(self, mc: &Mutation<'gc>) -> u64 {
+        self.chars(mc)
+    }
+
+    fn set_count(self, mc: &Mutation<'gc>, word: u64) {
+        self.set_chars(mc, word);
+    }
+}
+
+impl<'gc> Flat<'gc> for Gc<'gc, Str32> {
+    const WIDTH: Width = Width::Four;
+
+    fn count(self, mc: &Mutation<'gc>) -> u64 {
+        self.chars(mc)
+    }
+
+    fn set_count(self, mc: &Mutation<'gc>, word: u64) {
+        self.set_chars(mc, word);
+    }
+}
+
+/// Returns whether `desc` describes a flat string object: a [`Str8`], [`Str16`] or [`Str32`].
+pub(crate) fn is_flat_type(desc: &crate::gc::Desc) -> bool {
+    desc.number.is_some() && [Str8::DESC.number, Str16::DESC.number, Str32::DESC.number].contains(&desc.number)
+}
+
+/// Spreads a string's 32-bit hash over a whole word, as the key of the string in an intern table.
+fn spread(hash: u32) -> u64 {
+    u64::from(hash).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 impl<'gc> Strings<'_, 'gc> {

@@ -7,10 +7,10 @@
 use std::hash::{BuildHasher, RandomState};
 
 use crate::Error;
-use crate::gc::table::{Table as GcTable, WeakObjects};
+use crate::gc::table::{Table as GcTable, TableHead, WeakObjects};
 use crate::gc::{Gc, Mutation, OutOfMemory, Value};
 use crate::objects::{self, Data, InternedFields, KeywordFields, SymFields};
-use crate::string::{self, Str, Strings, Table};
+use crate::string::{self, Str, Strings, Table, Width};
 
 #[cfg(test)]
 #[path = "tests/symbol.rs"]
@@ -90,7 +90,7 @@ impl<'gc> Symbols<'gc> {
         }
         let table = GcTable::<WeakObjects<objects::Sym>>::new(mc)?;
         let keywords = GcTable::<WeakObjects<objects::Keyword>>::new(mc)?;
-        let symbols = Self(objects::Interned::new(mc, seed, Some(table.head()), Some(keywords.head()), None)?);
+        let symbols = Self(objects::Interned::new(mc, seed, Some(table.head()), Some(keywords.head()), None, None, None, None)?);
         mc.interned().set(symbols.value(mc).to_bits());
         Ok(symbols)
     }
@@ -113,6 +113,24 @@ impl<'gc> Symbols<'gc> {
 
     pub(crate) fn set_shapes(self, mc: &Mutation<'gc>, root: Gc<'gc, objects::TableShape>) {
         self.0.set_shapes(mc, Some(root));
+    }
+
+    /// Returns the table of the interned strings whose units have `width`, or `None` if no such string has been interned.
+    pub(crate) fn strings(self, mc: &Mutation<'gc>, width: Width) -> Option<Gc<'gc, TableHead>> {
+        match width {
+            Width::One => self.0.narrow(mc),
+            Width::Two => self.0.wide(mc),
+            Width::Four => self.0.widest(mc),
+        }
+    }
+
+    /// Sets the table of the interned strings whose units have `width`.
+    pub(crate) fn set_strings(self, mc: &Mutation<'gc>, width: Width, table: Gc<'gc, TableHead>) {
+        match width {
+            Width::One => self.0.set_narrow(mc, Some(table)),
+            Width::Two => self.0.set_wide(mc, Some(table)),
+            Width::Four => self.0.set_widest(mc, Some(table)),
+        }
     }
 
     /// Returns the seed of the hashes that the symbols store.

@@ -363,3 +363,92 @@ fn a_flat_string_has_a_longest_length() {
     });
 }
 
+/// Interning gives one string for each text. A string that is interned first becomes that string as it is, and an equal string interned later is answered with it.
+#[test]
+fn interning_gives_one_string_for_a_text() {
+    const LONG: &str = "a string that is long enough to be an object";
+    let mut arena = arena(1 << 22);
+    arena.mutate(|mc| {
+        let h = Strings::new(mc);
+        let (first, second) = (string(&h, LONG), string(&h, LONG));
+        assert!(first != second && !h.is_interned(first));
+        assert_eq!((h.interned(first), h.interned_count()), (Ok(None), 0));
+        assert_eq!((h.intern(first), h.is_interned(first), h.is_interned(second)), (Ok(first), true, false));
+        // The second string is not registered. Looking it up and interning it both give the first.
+        assert_eq!((h.interned(second), h.intern(second), h.is_interned(second), h.intern(first), h.interned_count()), (Ok(Some(first)), Ok(first), false, Ok(first), 1));
+        assert_eq!((h.interned(string(&h, &LONG[1..])), h.interned_count()), (Ok(None), 1));
+        // A string in the value word is interned as it is, and takes no place in a table.
+        let short = string(&h, "id");
+        assert_eq!((h.is_interned(short), h.intern(short), h.interned(short), h.interned_count()), (true, Ok(short), Ok(Some(short)), 1));
+        // Strings of each width of unit are interned apart. A text has one width, so it is never looked for in two tables.
+        let texts = ["Ārvīds and the others, in two-byte units", "an emoji 😀 makes the units four bytes wide", LONG];
+        for (number, text) in texts.iter().enumerate() {
+            let (made, again) = (string(&h, text), string(&h, text));
+            let interned = h.intern(made).unwrap();
+            assert_eq!((h.intern(again), h.interned(again), h.is_interned(interned)), (Ok(interned), Ok(Some(interned)), true), "{text}");
+            assert_eq!(h.interned_count(), (number + 2).min(3));
+        }
+        // Interning leaves the string as it reads, and its hash is the hash of any string with its characters.
+        assert_eq!((display(&h, first).to_string(), len(&h, first), h.hash(first)), (LONG.to_string(), LONG.len(), h.hash(string(&h, LONG))));
+    });
+}
+
+/// A rope is interned as its flat copy. A lookup finds the interned string of a rope's text without flattening the rope. An external string is not interned yet.
+#[test]
+fn ropes_and_external_strings_meet_the_interned_strings() {
+    let mut arena = arena(1 << 22);
+    arena.mutate(|mc| {
+        let h = Strings::new(mc);
+        let (head, tail) = ("x".repeat(600), "y".repeat(40));
+        let rope = concat(&h, string(&h, &head), string(&h, &tail)).unwrap();
+        assert!(!is_flat(&h, rope) && !h.is_interned(rope));
+        assert_eq!(h.interned(rope), Ok(None));
+        assert_eq!(chunks(&h, rope).count(), 2, "a lookup does not flatten the rope");
+        let interned = h.intern(rope).unwrap();
+        assert!(is_flat(&h, interned) && h.is_interned(interned) && interned != rope);
+        assert_eq!((display(&h, interned).to_string(), h.interned_count()), (format!("{head}{tail}"), 1));
+        // The rope itself stays a rope. It and every equal string lead to the one interned string.
+        let other = concat(&h, string(&h, &head[..300]), concat(&h, string(&h, &head[300..]), string(&h, &tail)).unwrap()).unwrap();
+        assert_eq!((h.intern(rope), h.interned(rope), h.interned(other), h.intern(string(&h, &format!("{head}{tail}"))), h.interned_count()), (Ok(interned), Ok(Some(interned)), Ok(Some(interned)), Ok(interned), 1));
+        assert!(!h.is_interned(rope) && !is_flat(&h, other));
+        // An external string is returned as it is. A lookup still finds an interned string with its characters.
+        let text: Arc<str> = Arc::from("external text of a length that is kept outside the arena, well past the limit");
+        let outside = h.external(ExternalText::new(text.clone())).unwrap();
+        assert!(h.is_external(outside));
+        assert_eq!((h.interned(outside), h.intern(outside), h.is_interned(outside), h.interned_count()), (Ok(None), Ok(outside), false, 1));
+        let inside = h.intern(string(&h, &text)).unwrap();
+        assert_eq!((h.interned(outside), h.interned_count()), (Ok(Some(inside)), 2));
+    });
+}
+
+/// The arena holds its interned strings weakly. An interned string that nothing refers to is collected, and one that is kept stays interned when it is moved.
+#[test]
+fn interned_strings_are_held_weakly() {
+    const KEPT: &str = "an interned string that the root keeps";
+    const DROPPED: &str = "an interned string that nothing keeps";
+    let mut arena = arena(1 << 22);
+    arena.mutate(|mc| {
+        let h = Strings::new(mc);
+        let kept = h.intern(string(&h, KEPT)).unwrap();
+        h.intern(string(&h, DROPPED)).unwrap();
+        for number in 0..200 {
+            h.intern(string(&h, &format!("a string that is interned and dropped, number {number}"))).unwrap();
+        }
+        assert_eq!(h.interned_count(), 202);
+        root(mc).push(mc, kept.value()).unwrap();
+    });
+    for _ in 0..2 {
+        arena.set_evacuate_all(true);
+        arena.collect();
+        arena.mutate(|mc| {
+            let h = Strings::new(mc);
+            let kept = h.string(root(mc).get(mc, 0).unwrap()).unwrap();
+            assert_eq!((h.interned_count(), h.is_interned(kept), display(&h, kept).to_string()), (1, true, KEPT.to_string()));
+            assert_eq!((h.intern(string(&h, KEPT)), h.interned(string(&h, KEPT)), h.interned(string(&h, DROPPED))), (Ok(kept), Ok(Some(kept)), Ok(None)));
+            // The dropped text is interned again, as a new string.
+            let again = h.intern(string(&h, DROPPED)).unwrap();
+            assert_eq!((h.is_interned(again), h.interned_count(), h.intern(string(&h, DROPPED))), (true, 2, Ok(again)));
+        });
+    }
+}
+

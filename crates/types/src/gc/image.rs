@@ -574,6 +574,15 @@ pub fn load<'gc>(mc: &Mutation<'gc>, stamp: u64, bytes: &[u8], descs: &[&'static
             loader.object(loader.indices[place], desc, len, &mut words)?;
         }
     }
+    // A string that was interned when it was saved is registered in this arena's tables, unless the arena has an interned string with the same characters.
+    for (place, entry) in entries.iter().enumerate() {
+        if let &Entry::Plain(desc, _) = entry
+            && crate::string::is_flat_type(desc)
+            && let Some(string) = strings.string(Value::from_bits(u64::from(loader.indices[place]) << 32 | u64::from(desc.number.unwrap_or(0)) << 16 | OBJECT))
+        {
+            strings.adopt(string).map_err(|_| LoadError::OutOfMemory)?;
+        }
+    }
     // The image's tree of table shapes becomes the arena's, if the arena has none yet. Tables that are built in this arena then get the same shapes as the tables of the image's code. The shape without a parent is the root of the tree.
     if symbols.shapes(mc).is_none() {
         for (place, entry) in entries.iter().enumerate() {
