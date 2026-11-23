@@ -184,6 +184,8 @@ const STILL: u64 = u64::MAX;
 const ENTRY: u64 = u32::MAX as u64;
 /// Mixed into a symbol's hash, so that a symbol and the string of its name hash differently.
 const SYMBOL: u64 = 0x5851_F42D_4C95_7F2D;
+/// Mixed into a string's hash before it is spread over a whole word. A string keeps 32 bits of hash.
+const STRING: u64 = 0xD6E8_FEB8_6659_FD93;
 /// Mixed into the hash that a host returns for an external value, so that the value and a number hash differently.
 const EXTERNAL: u64 = 0x1405_7B7E_F767_814F;
 
@@ -2189,9 +2191,10 @@ fn hash<'gc>(mc: &Mutation<'gc>, seed: u64, key: Value<'gc>) -> Result<Hashed, E
     if let Some(symbol) = Symbol::of(key) {
         return Ok(Hashed { hash: mix(symbol.hash(mc) ^ SYMBOL), by_place: false });
     }
+    // A string keeps its hash, which is seeded with the arena's seed. That is the seed of every table of the arena.
     let strings = Strings::new(mc);
     if let Some(text) = strings.string(key) {
-        return Ok(Hashed { hash: string::hash(&strings, text, seed)?, by_place: false });
+        return Ok(Hashed { hash: mix(u64::from(strings.hash(text)?) ^ STRING), by_place: false });
     }
     Ok(hash_other(mc, seed, key))
 }

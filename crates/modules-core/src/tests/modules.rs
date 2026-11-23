@@ -284,7 +284,7 @@ fn a_test_of_a_variable_known_to_be_false_is_compiled_away() {
     assert_eq!((count(&ops, "JumpIfFalse"), count(&ops, "BranchIntrinsic1")), (1, 1), "{ops}");
 }
 
-/// A table read or write whose key is a constant symbol, fixnum, character or short string is compiled to an instruction with a hint. Any other key uses the plain operation.
+/// A table read or write whose key is a constant is compiled to an instruction with a hint, whatever kind of value the key is. A key that is computed uses the plain operation.
 #[test]
 fn constant_keys_compile_to_hinted_table_instructions() {
     let mut arena = arena();
@@ -297,12 +297,13 @@ fn constant_keys_compile_to_hinted_table_instructions() {
     let ops = closure_ops(&mut arena, "hinted", hinted);
     // The read with the default 0 keeps a register for its default. The others have the default `#f`.
     assert_eq!((count(&ops, "TableRefHinted"), count(&ops, "TableRefOrHinted"), count(&ops, "TableSetHinted"), count(&ops, "TableRef"), count(&ops, "TableSet")), (7, 1, 2, 0, 0), "{ops}");
+    // A long string, a large float and a bignum are objects. As constant keys they are hinted too. Only the keys read from a variable are not.
     let plain = "(provide a b c)
                  (define (a t k) (table-ref t k))
                  (define (b t) (list (table-ref t \"a key that is too long to fit in a word\") (table-ref t 1.5e300) (table-ref t (expt 2 100))))
                  (define (c t k v) (table-set! t k v))";
     let ops = closure_ops(&mut arena, "plain", plain);
-    assert_eq!((count(&ops, "TableRefHinted"), count(&ops, "TableRefOrHinted"), count(&ops, "TableSetHinted"), count(&ops, "TableRef"), count(&ops, "TableSet")), (0, 0, 0, 4, 1), "{ops}");
+    assert_eq!((count(&ops, "TableRefHinted"), count(&ops, "TableRefOrHinted"), count(&ops, "TableSetHinted"), count(&ops, "TableRef"), count(&ops, "TableSet")), (3, 0, 0, 1, 1), "{ops}");
 }
 
 /// Host-owned data exposed as external tables: an event that the host received, which programs read, and a set of counters, which programs also modify.

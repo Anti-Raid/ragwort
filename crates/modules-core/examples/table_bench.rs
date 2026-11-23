@@ -271,6 +271,12 @@ fn main() {
     let helped = "(let ((t (make-table))) (put! t 'id 1) (put! t 'content 2) (put! t 'author-id 3) (put! t 'channel-id 4) (put! t 'guild-id 5) (put! t 'pinned 6) t)";
     let mapped = "(let ((t (make-table))) (table-set! t i 1) (table-set! t (+ i 1) 2) (table-set! t (+ i 2) 3) (table-set! t (+ i 3) 4) (table-set! t (+ i 4) 5) (table-set! t (+ i 5) 6) t)";
     let roomy = "(let ((t (make-table 6))) (table-set! t i 1) (table-set! t (+ i 1) 2) (table-set! t (+ i 2) 3) (table-set! t (+ i 3) 4) (table-set! t (+ i 4) 5) (table-set! t (+ i 5) 6) t)";
+    // The same tables with string keys. Two of the three keys that are read are too long to be held in a value word.
+    let read3_worded = "(+ (table-ref t \"id\") (table-ref t \"author-identity\") (table-ref t \"channel-identity\"))";
+    let worded = "(table \"id\" 1 \"content\" 2 \"author-identity\" 3 \"channel-identity\" 4 \"guild-identity\" 5 \"pinned\" 6)";
+    let stepwise_worded = "(let ((t (make-table))) (table-set! t \"id\" 1) (table-set! t \"content\" 2) (table-set! t \"author-identity\" 3) (table-set! t \"channel-identity\" 4) (table-set! t \"guild-identity\" 5) (table-set! t \"pinned\" 6) t)";
+    // A table with keys of its own: the keys are set with strings that are made at run time, so they are other objects than the constants of the reads.
+    let fill_worded = "(table-set! t (string-append \"i\" \"d\") 1) (table-set! t (string-append \"author\" \"-identity\") 3) (table-set! t (string-append \"channel\" \"-identity\") 4)";
     let base = time("", "(zero)");
     let lines = [
         ("external, made", String::new(), "(begin (message) 0)".to_string()),
@@ -294,6 +300,16 @@ fn main() {
         ("field by field through a helper, made", "(define (put! t k v) (table-set! t k v))".to_string(), format!("(begin {helped} 0)")),
         ("copy of a literal, made", format!("(define t {literal})"), "(begin (table-copy t) 0)".to_string()),
         ("copy of a literal, 3 fields read once", format!("(define source {literal})"), format!("(let ((t (table-copy source))) {read3})")),
+        ("string keys, literal, 3 fields of the same table", format!("(define t {worded})"), read3_worded.to_string()),
+        ("string keys, literal, made and 3 fields read once", String::new(), format!("(let ((t {worded})) {read3_worded})")),
+        ("string keys, field by field, made", String::new(), format!("(begin {stepwise_worded} 0)")),
+        ("string keys, map, 3 fields of the same table", format!("(define t (let ((t (make-table 8))) {fill_worded} t))"), read3_worded.to_string()),
+        ("string keys, map, key from a variable", format!("(define t {worded}) (define key (string-append \"author\" \"-identity\"))"), "(table-ref t key)".to_string()),
+        (
+            "string keys, long key from a variable",
+            "(define t (table \"a field name that is a good deal longer than the usual ones are\" 1 \"id\" 2)) (define key (string-append \"a field name that is a good deal \" \"longer than the usual ones are\"))".to_string(),
+            "(table-ref t key)".to_string(),
+        ),
         ("map, 6 integer keys set", String::new(), format!("(begin {mapped} 0)")),
         ("map made with room, 6 integer keys set", String::new(), format!("(begin {roomy} 0)")),
         (

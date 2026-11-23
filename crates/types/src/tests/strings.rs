@@ -310,3 +310,56 @@ fn external_characters_stored_wide_are_refused() {
         assert!(h.is_external(h.external(Wide(vec![0x1F600; 100])).unwrap()));
     });
 }
+
+/// A string's hash depends on its characters only, and is kept in a flat string object and in an external string without changing what the string reads as.
+#[test]
+fn a_string_keeps_its_hash() {
+    const LONG: &str = "a string that is long enough to be an object, with é and more";
+    let mut arena = arena(1 << 22);
+    arena.mutate(|mc| {
+        let h = Strings::new(mc);
+        // The same characters stored five ways: in the word, as an object, as a rope, outside the arena, and wide.
+        let object = string(&h, LONG);
+        let again = string(&h, LONG);
+        let rope = concat(&h, repeat(&h, 'x', 600).unwrap(), object).unwrap();
+        let same_rope = concat(&h, string(&h, &"x".repeat(300)), concat(&h, string(&h, &"x".repeat(300)), again).unwrap()).unwrap();
+        let padded: Arc<str> = Arc::from(format!("{LONG}{}", " ".repeat(40)));
+        let outside = h.external(ExternalText::new(padded.clone())).unwrap();
+        let inside = string(&h, &padded);
+        assert!(h.is_external(outside) && !h.is_external(inside) && object != again);
+        assert_eq!((h.hash(object), h.hash(outside), h.hash(rope)), (h.hash(again), h.hash(inside), h.hash(same_rope)));
+        assert_eq!((h.hash(string(&h, "id")), h.hash(string(&h, "wide ← text"))), (h.hash(string(&h, "id")), h.hash(string(&h, "wide ← text"))));
+        // Strings with other characters have other hashes, and no hash is 0.
+        let hashes = [h.hash(object), h.hash(outside), h.hash(rope), h.hash(string(&h, "id")), h.hash(string(&h, "")), h.hash(string(&h, &LONG[1..]))].map(Result::unwrap);
+        for (index, hash) in hashes.iter().enumerate() {
+            assert!(*hash != 0 && !hashes[..index].contains(hash), "{hashes:?}");
+        }
+        // A string that has been hashed reads as before: the hash is beside its length, not in it.
+        for (text, expected) in [(object, LONG), (again, LONG), (outside, &*padded), (inside, &*padded)] {
+            assert_eq!((len(&h, text), display(&h, text).to_string(), h.hash(text) == h.hash(text)), (expected.chars().count(), expected.to_string(), true));
+        }
+        assert_eq!(equal(&h, object, again), Ok(true));
+        root(mc).push(mc, object.value()).unwrap();
+        root(mc).push(mc, outside.value()).unwrap();
+    });
+    // The hash moves with the string.
+    arena.set_evacuate_all(true);
+    arena.collect();
+    arena.mutate(|mc| {
+        let h = Strings::new(mc);
+        let (object, outside) = (h.string(root(mc).get(mc, 0).unwrap()).unwrap(), h.string(root(mc).get(mc, 1).unwrap()).unwrap());
+        assert_eq!((h.hash(object), display(&h, object).to_string(), len(&h, outside)), (h.hash(string(&h, LONG)), LONG.to_string(), LONG.chars().count() + 40));
+    });
+}
+
+/// A flat string cannot be longer than its length field holds. The request fails before anything is allocated.
+#[test]
+fn a_flat_string_has_a_longest_length() {
+    let mut arena = arena(1 << 20);
+    arena.mutate(|mc| {
+        let h = Strings::new(mc);
+        assert_eq!(h.flat(Width::One, FLAT_MAX + 1, |_| {}).err(), Some(Error::Str(StrError::TooLong)));
+        assert_eq!(h.flat(Width::Four, FLAT_MAX + 1, |_| {}).err(), Some(Error::Str(StrError::TooLong)));
+    });
+}
+
