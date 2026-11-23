@@ -51,6 +51,8 @@ pub enum LowerErrorKind {
     UnknownHost,
     /// An `%intrinsic` or `%call-host` had a number of arguments that the intrinsic or host function does not accept.
     Arity,
+    /// A `%break` or `%continue` named a loop that is not around it.
+    Label,
     /// The code used syntax that native ragwort does not have, such as a quasiquote outside a quoted datum.
     Unsupported,
     /// The arena could not create a value that lowering needed.
@@ -126,6 +128,7 @@ impl fmt::Display for LowerErrorKind {
             LowerErrorKind::UnknownIntrinsic => "an intrinsic the code can't name",
             LowerErrorKind::UnknownHost => "a host function the module wasn't given",
             LowerErrorKind::Arity => "an intrinsic or host call with the wrong number of arguments",
+            LowerErrorKind::Label => "a break or continue of a loop that isn't around it",
             LowerErrorKind::Unsupported => "syntax native ragwort doesn't have",
             LowerErrorKind::Arena(_) => "running out of memory",
         })
@@ -163,9 +166,12 @@ enum Form {
     Intrinsic,
     ApplyIntrinsic,
     CallHost,
+    Loop,
+    Break,
+    Continue,
 }
 
-const FORMS: [(&str, Form); 15] = [
+const FORMS: [(&str, Form); 18] = [
     ("%struct", Form::Struct),
     ("%quote", Form::Quote),
     ("%if", Form::If),
@@ -181,6 +187,9 @@ const FORMS: [(&str, Form); 15] = [
     ("%intrinsic", Form::Intrinsic),
     ("%apply-intrinsic", Form::ApplyIntrinsic),
     ("%call-host", Form::CallHost),
+    ("%loop", Form::Loop),
+    ("%break", Form::Break),
+    ("%continue", Form::Continue),
 ];
 
 /// Lowers the top-level forms of a module's native files. [`Lowerer::item`] lowers each form to an
@@ -200,6 +209,8 @@ pub struct Lowerer<'a, 'gc> {
     abbreviations: Vec<Value<'gc>>,
     /// The local variables in scope for each name, innermost last. The key is the bits of the name's symbol.
     scope: HashMap<u64, Vec<Var>>,
+    /// The labels of the loops around the form being lowered, for each loop name, innermost last. The key is the bits of the name's symbol. Loop names are apart from variable names.
+    labels: HashMap<u64, Vec<Var>>,
 }
 
 /// The parsed formals of a `%lambda`. `params`, `names` and `defaults` are parallel: entry `i`
@@ -255,6 +266,7 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             hosts: named_hosts,
             abbreviations,
             scope: HashMap::new(),
+            labels: HashMap::new(),
         })
     }
 
@@ -746,6 +758,21 @@ impl<'s, 'a, 'gc> Lowering<'s, 'a, 'gc> {
             (Form::Intrinsic, &[name, ref args @ ..]) => self.intrinsic(node, name, args.to_vec(), false),
             (Form::ApplyIntrinsic, &[name, ref args @ ..]) if !args.is_empty() => self.intrinsic(node, name, args.to_vec(), true),
             (Form::CallHost, &[name, ref args @ ..]) => self.call_host(node, name, args.to_vec()),
+            // `(%loop name body ...)` runs its body again and again. `(%break name)` leaves the loop of that name, and `(%continue name)` starts its next round.
+            (Form::Loop, &[name, ref body @ ..]) if !body.is_empty() => {
+                let key = lowerer.name(name)?.datum(lowerer.mc).to_bits();
+                let label = self.locals.fresh();
+                self.l.labels.entry(key).or_default().push(label);
+                self.body(body.to_vec(), move |this, body| {
+                    this.l.labels.get_mut(&key).and_then(Vec::pop);
+                    Ok(Step::Done(Core::Loop(label, Box::new(body))))
+                })
+            }
+            (Form::Break | Form::Continue, &[name]) => {
+                let key = lowerer.name(name)?.datum(lowerer.mc).to_bits();
+                let Some(&label) = lowerer.labels.get(&key).and_then(|labels| labels.last()) else { return Err(lowerer.error(LowerErrorKind::Label, name)) };
+                Ok(Step::Done(if form == Form::Break { Core::Break(label) } else { Core::Continue(label) }))
+            }
             _ => Err(lowerer.error(LowerErrorKind::BadShape, node)),
         }
     }

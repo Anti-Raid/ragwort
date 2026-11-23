@@ -224,13 +224,35 @@ pub enum Core<'gc> {
     Global(Value<'gc>, SyntaxSpan<'gc>),
     /// An assignment to a module variable by name. The fields are the variable's name (a symbol), the new value, and the span of the name.
     SetGlobal(Value<'gc>, Box<Core<'gc>>, SyntaxSpan<'gc>),
+    /// A loop. The body is evaluated again and again, until a [`Core::Break`] of the loop is evaluated. The loop then evaluates to `#<void>`.
+    ///
+    /// The variable is the label of the loop. It is a variable of its own, which no other form binds and no [`Core::Ref`] reads. [`Core::Break`] and [`Core::Continue`] name the loop by it, so they can leave or restart an outer loop from inside an inner one.
+    ///
+    /// # Where a break or a continue can be
+    ///
+    /// A `Break` or `Continue` is a statement of the loop body: after it, nothing of the body is evaluated for its value. It can be in these places, and in no others:
+    ///
+    /// - the body of the loop itself;
+    /// - a branch of an `If` that is in such a place;
+    /// - the body of a `Let` or `Letrec` that is in such a place;
+    /// - the initial value of a `Let` binding, if the `Let` is in such a place. A sequence of statements is a `Let` that binds each statement to a variable nobody reads, so this is how a statement before the end of a block can leave the loop;
+    /// - the body of an inner `Loop` that is in such a place.
+    ///
+    /// It cannot be in the test of an `If`, in an argument of a call, in an assigned value, or in a lambda inside the loop. The compiler rejects those with [`CompileError::Jump`].
+    ///
+    /// The loop runs in the frame of the procedure that contains it. Variables that the body assigns stay in registers, unless a closure captures them.
+    Loop(Var, Box<Core<'gc>>),
+    /// Leaves the loop with this label. See [`Core::Loop`].
+    Break(Var),
+    /// Starts the next round of the loop with this label. See [`Core::Loop`].
+    Continue(Var),
     /// A reference to a binding imported from another module. The compiler reads the value from that module. A call of an imported procedure is inlined if the procedure has an inline template.
     Import(module::Import<'gc>),
 }
 
 impl Core<'_> {
     fn is_leaf(&self) -> bool {
-        matches!(self, Core::Quote(_) | Core::Ref(_) | Core::Import(_) | Core::Global(..))
+        matches!(self, Core::Quote(_) | Core::Ref(_) | Core::Import(_) | Core::Global(..) | Core::Break(_) | Core::Continue(_))
     }
 
     /// Extracts non-leaf child expressions from `self` and pushes them onto `out`, replacing them with leaf placeholder nodes.
@@ -241,7 +263,8 @@ impl Core<'_> {
             }
         }
         match self {
-            Core::Quote(_) | Core::Ref(_) | Core::Import(_) | Core::Global(..) => {}
+            Core::Quote(_) | Core::Ref(_) | Core::Import(_) | Core::Global(..) | Core::Break(_) | Core::Continue(_) => {}
+            Core::Loop(_, body) => take(body, out),
             Core::If(test, consequent, other) => [test, consequent, other].into_iter().for_each(|part| take(part, out)),
             Core::Let(binds, body) | Core::Letrec(binds, body) => {
                 binds.iter_mut().for_each(|(_, init)| take(init, out));
@@ -309,6 +332,8 @@ pub enum CompileError {
     Import(module::Unusable),
     /// A module-level name is used incorrectly. The name is at bytes `start..end` of its source.
     Global { kind: GlobalError, start: u32, end: u32 },
+    /// A [`Core::Break`] or [`Core::Continue`] of the loop with this label is in a place where it cannot be. Either no loop with the label encloses it in the same procedure, or it is in a part of the loop body that is evaluated for its value. See [`Core::Loop`].
+    Jump(Var),
     OutOfMemory,
 }
 
@@ -349,6 +374,7 @@ impl fmt::Display for CompileError {
             Self::TooManyOptional(id) => write!(formatter, "lambda {id} has more optional parameters than parameters"),
             Self::Formals(id) => write!(formatter, "lambda {id} repeats a keyword, or has a required parameter after an optional one"),
             Self::SameKeyword => write!(formatter, "a call passes the same keyword twice"),
+            Self::Jump(label) => write!(formatter, "a break or continue of loop {} outside the loop, or where a value is needed", label.0),
             Self::Arity(Prim::Intrinsic(intrinsic)) => write!(formatter, "wrong number of arguments to {}", intrinsic.name()),
             Self::Arity(Prim::Request(request)) => write!(formatter, "wrong number of arguments to {}", request.name()),
             Self::Arity(Prim::Host(host)) => write!(formatter, "wrong number of arguments to host function {}", host.name),

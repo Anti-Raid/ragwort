@@ -23,7 +23,6 @@ mod tests;
 
 use ragwort_alloc::{Arena, CollectIn, Vec as AVec};
 use ragwort_types::gc::Value;
-use ragwort_types::symbol::Symbol;
 use ragwort_vm::Intrinsic;
 use ragwort_vm::frame::MAX_PARAMS;
 
@@ -138,7 +137,7 @@ enum Imm<'gc> {
 struct Operands<'t, 'gc> {
     /// The immediate operand of each instruction, or `None` for an instruction without one.
     imms: AVec<'t, Option<Imm<'gc>>>,
-    /// The constant operands of each `table-ref` and `table-set!` whose key is a constant that compares by its value word: a symbol, or a value that needs no object, such as a fixnum or a short string.
+    /// The constant operands of each `table-ref` and `table-set!` whose key is a constant. The key can be of any kind: a symbol, a number, or a string of any length.
     /// Such an instruction is emitted with a hint of where it last found its key. See `Op::TableRefHinted`. A function has room for 65,535 hints. A table instruction past that has `None` here.
     hinted: AVec<'t, Option<Hinted<'gc>>>,
 }
@@ -170,7 +169,7 @@ fn operands<'t, 'gc: 't>(arena: &'t Arena, function: &l5::Function<'_, 'gc>) -> 
                     _ => None,
                 };
                 if let (Intrinsic::TableRef | Intrinsic::TableSet, [_, key, last]) = (intrinsic, args.as_slice())
-                    && let Some(key) = constants[key.0 as usize].filter(|key| key.immediate().is_some() || Symbol::of(*key).is_some())
+                    && let Some(key) = constants[key.0 as usize]
                     && hints < u16::MAX
                 {
                     // The default has to be `#f` itself. Another false value, such as `#nil`, is a default like any other.

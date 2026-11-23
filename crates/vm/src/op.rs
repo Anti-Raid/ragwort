@@ -73,7 +73,9 @@ named! {
         StructRef { dst: u8, a: u8, k: u8, kind: u32 } = "struct-ref",
         /// Executes ternary `intrinsic` on register operands `(a, b, c)` and writes the result into register `dst`.
         CallIntrinsic3 { dst: u8, a: u8, b: u8, c: u8, intrinsic: Intrinsic } = "call-intrinsic3",
-        /// `(table-ref table key #f)` for a constant key that is compared by its value word, such as a symbol. Two such keys are the same key exactly when their words are equal. Writes the value of the key in the table in register `table` into `dst`. If the table has no such key, writes `#f`.
+        /// `(table-ref table key #f)` for a constant key of any kind. Writes the value of the key in the table in register `table` into `dst`. If the table has no such key, writes `#f`.
+        ///
+        /// A table with a remembered shape is read at the remembered position, and no key is compared. That holds for every kind of key, because the shape was remembered when this key was found in a table of that shape. A table without a shape is read at the remembered position only if the key there is the same value word as the constant. A key that is an object, such as a long string, can be an equal object with another word. The instruction then leaves the loop, and the key is compared by value there.
         ///
         /// Hint number `hint` of the code holds the key and the places where the key was last found. Those places are tried first. No register holds the key. See [`crate::objects::Hints`].
         TableRefHinted { dst: u8, table: u8, hint: u16 } = "table-ref-hinted",

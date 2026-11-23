@@ -671,3 +671,64 @@ fn native_code_calls_the_host_and_wraps_it_for_other_code() {
     assert_eq!(error("(%call-host)"), (BadShape, "(%call-host)"));
     assert_eq!(error("(%call-host (add) 1)"), (BadShape, "(add)"));
 }
+
+/// A `%loop` runs its body until a `%break` of it. A `%break` or `%continue` can be any statement of the body, and names the loop it means.
+#[test]
+fn loops_break_and_continue() {
+    let counted = "(%let ((i 0) (sum 0))
+                     (%loop top
+                       (%if (%intrinsic < i 5)
+                            (%let () (%set! sum (%intrinsic + sum i)) (%set! i (%intrinsic + i 1)))
+                            (%break top)))
+                     sum)";
+    assert_eq!(eval(counted), "10");
+    // A statement in the middle of the body leaves the loop or starts the next round. The statements after it are skipped.
+    let skipping = "(%let ((i 0) (seen '()))
+                      (%loop top
+                        (%set! i (%intrinsic + i 1))
+                        (%if (%intrinsic < 6 i) (%break top) #f)
+                        (%if (%intrinsic eq? i 3) (%continue top) #f)
+                        (%set! seen (%intrinsic cons i seen)))
+                      seen)";
+    assert_eq!(eval(skipping), "(6 5 4 2 1)");
+    // An inner loop leaves or restarts an outer loop by its name. A loop name is apart from a variable of the same name.
+    let nested = "(%let ((outer 0) (pairs '()))
+                    (%loop outer
+                      (%set! outer (%intrinsic + outer 1))
+                      (%if (%intrinsic < 4 outer) (%break outer) #f)
+                      (%let ((inner 0))
+                        (%loop inner
+                          (%set! inner (%intrinsic + inner 1))
+                          (%if (%intrinsic < 2 inner) (%break inner) #f)
+                          (%if (%intrinsic eq? outer 2) (%continue outer) #f)
+                          (%if (%intrinsic eq? outer 4) (%break outer) #f)
+                          (%set! pairs (%intrinsic cons (%intrinsic cons outer inner) pairs)))
+                        (%set! pairs (%intrinsic cons 'done pairs))))
+                    pairs)";
+    assert_eq!(eval(nested), "(done (3 . 2) (3 . 1) done (1 . 2) (1 . 1))");
+    // A loop is an expression, and its value is void.
+    assert_eq!(eval("(%intrinsic cons (%loop once (%break once)) 'after)"), "(#<void> . after)");
+    // A lambda made in a loop keeps the variables of its round.
+    let made = "(%let ((i 0) (made '()))
+                  (%loop top
+                    (%if (%intrinsic eq? i 3) (%break top) #f)
+                    (%let ((round i)) (%set! made (%intrinsic cons (%lambda () round) made)))
+                    (%set! i (%intrinsic + i 1)))
+                  (%intrinsic cons (%app (%intrinsic car made)) (%app (%intrinsic car (%intrinsic cdr made)))))";
+    assert_eq!(eval(made), "(2 . 1)");
+}
+
+#[test]
+fn bad_loops_and_jumps() {
+    assert_eq!(error("(%break nowhere)"), (Label, "nowhere"));
+    assert_eq!(error("(%loop top (%continue other))"), (Label, "other"));
+    assert_eq!(error("(%let ((x 1)) (%loop top (%break top)) (%break top))").0, Label);
+    assert_eq!(error("(%loop top)"), (BadShape, "(%loop top)"));
+    assert_eq!(error("(%loop 5 'a)"), (BadShape, "5"));
+    assert_eq!(error("(%break)"), (BadShape, "(%break)"));
+    // A jump where a value is needed, or in a lambda inside the loop, is found by the compiler.
+    for text in ["(%loop top (%intrinsic cons 'a (%break top)))", "(%loop top (%if (%break top) 'a 'b))", "(%loop top (%app (%lambda () (%break top))) (%break top))"] {
+        assert!(matches!(eval_in(&mut arena(), text), Err(Error::Compile(ragwort_compiler::CompileError::Jump(_)))), "{text}");
+    }
+}
+

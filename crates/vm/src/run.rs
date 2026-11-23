@@ -477,8 +477,9 @@ impl<'s, 'gc> Run<'s, 'gc> {
     /// Does the work of [`Run::table_ref`]. The other places of the hint are tried, then the table is searched, and the hint is set to where the key was found.
     fn table_ref_missed(&mut self, dst: u8, table: Table<'gc>, key: Value<'gc>, default: Option<u8>, hints: Slots<'gc>, slot: usize) -> Result<(), Fault> {
         let (mc, frame) = (self.cx.mc, self.cx.frame);
-        let shape = table.shape(mc).map(|shape| shape.value(mc));
-        // The position that the hint remembers for the shape of this table. A new external table of that shape has the key there, though its value has not been read yet.
+        // A table without a shape is `#f` here, as a place without a shape is.
+        let shape = table.shape(mc).map_or(Value::FALSE, |shape| shape.value(mc));
+        // The position that the hint remembers for the shape of this table. A new external table of that shape has the key there, though its value has not been read yet. For a table without a shape, it is the position where the key was in the last such table. The search tries it first and compares the key by value, so a long string key that is another object than the constant is found without hashing.
         let mut known = None;
         for way in 0..HINT_WAYS {
             let place = slot + 2 * way;
@@ -493,7 +494,7 @@ impl<'s, 'gc> Run<'s, 'gc> {
                 frame.set(dst, value);
                 return Ok(());
             }
-            if shape == Some(hints.get(place)) {
+            if hints.get(place) == shape {
                 known = Some(position);
                 break;
             }

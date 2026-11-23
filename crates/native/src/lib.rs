@@ -17,10 +17,28 @@
 //! (%intrinsic name arg ...)
 //! (%apply-intrinsic name arg ... list)
 //! (%call-host name arg ...)
+//! (%loop name body ...)
+//! (%break name)   (%continue name)
 //! ```
 //!
 //! The last argument of `%apply-intrinsic` is a list of further arguments:
 //! `(%apply-intrinsic + 1 2 '(3 4))` computes the same as `(%intrinsic + 1 2 3 4)`.
+//!
+//! `%loop` evaluates its body again and again, and has the value `#<void>` when it ends.
+//! `(%break name)` ends the loop of that name, and `(%continue name)` starts its next round.
+//! Both can be any statement of the loop body, also inside an `%if`, a `%let` or an inner loop:
+//!
+//! ```text
+//! (%let ((i 0))
+//!   (%loop count
+//!     (%set! i (%intrinsic + i 1))
+//!     (%if (%intrinsic eq? i 3) (%continue count) #f)
+//!     (%if (%intrinsic < 5 i) (%break count) #f)
+//!     (%app show i)))
+//! ```
+//!
+//! They cannot be where a value is needed, such as an argument of a call, and not in a `%lambda`
+//! inside the loop. A loop name is apart from the variables: a loop and a variable can have the same name.
 //!
 //! `%call-host` calls one of the [`HostDef`]s that the code was loaded with. Only native ragwort
 //! can call a host function directly. Other code calls a native procedure that wraps the host call.

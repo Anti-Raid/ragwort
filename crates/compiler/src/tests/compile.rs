@@ -2104,3 +2104,169 @@ fn argument_hazards_are_found_among_many_assigned_variables() {
     assert!(boxes(read_then_set));
     assert!(!boxes(set_then_read));
 }
+
+fn loop_<'gc>(label: u32, body: Core<'gc>) -> Core<'gc> {
+    Core::Loop(Var(label), Box::new(body))
+}
+
+fn break_<'gc>(label: u32) -> Core<'gc> {
+    Core::Break(Var(label))
+}
+
+fn continue_<'gc>(label: u32) -> Core<'gc> {
+    Core::Continue(Var(label))
+}
+
+fn less<'gc>(a: Core<'gc>, b: Core<'gc>) -> Core<'gc> {
+    prim(Intrinsic::Lt, vec![a, b])
+}
+
+fn void<'gc>() -> Core<'gc> {
+    Core::Quote(Value::VOID)
+}
+
+/// Builds a block of statements: a `let` for each statement but the last, which binds the statement to a variable that nothing reads. The variables are numbered from `first`.
+fn block<'gc>(first: u32, mut statements: Vec<Core<'gc>>) -> Core<'gc> {
+    let mut built = statements.pop().expect("a block has a statement");
+    while let Some(statement) = statements.pop() {
+        built = seq(first + statements.len() as u32, statement, built);
+    }
+    built
+}
+
+/// Compiles the expression from `build`, checks that its code makes no closure and calls nothing, and returns its fixnum result.
+fn looped(build: impl for<'gc> FnOnce(&Mutation<'gc>) -> Core<'gc>) -> i64 {
+    let mut arena = Arena::new(1 << 24, 0);
+    arena.mutate(|mc| {
+        let thunk = compile(mc, None, &build(mc)).unwrap();
+        let ops = all_ops(mc, thunk);
+        let outside = ops.iter().filter(|op| matches!(op, Op::NewClosure { .. } | Op::Call { .. } | Op::TailCall { .. })).count();
+        assert_eq!(outside, 0, "{ops:?}");
+        assert!(ops.iter().any(|op| matches!(op, Op::Jump { offset } if *offset < 0)), "{ops:?}");
+        let mut machine = Machine::new(mc, MIN_SEGMENT, thunk, &[]).unwrap();
+        let Outcome::Done(value) = machine.run(mc).unwrap() else { panic!("the loop did not finish") };
+        value.as_fixnum().unwrap()
+    })
+}
+
+/// A loop runs its body until a break, in the frame of the procedure that contains it: its code makes no closure and has no call.
+#[test]
+fn loops_run_their_body_until_a_break() {
+    // i = 0; sum = 0; while i < 5 do sum = sum + i; i = i + 1 end; sum
+    fn counted<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
+        let body = when(less(var(0), q(5)), block(20, vec![set(1, add(var(1), var(0))), set(0, add(var(0), q(1)))]), break_(10));
+        let_(vec![(0, q(0)), (1, q(0))], seq(2, loop_(10, body), var(1)))
+    }
+    assert_eq!(looped(counted), 10);
+    // A loop is an expression whose value is void, and can be anywhere a value is needed.
+    eval(|_| prim(Cons, vec![loop_(10, break_(10)), q(1)]), |mc, result| assert_eq!(Pair::of(result.unwrap()).unwrap().head(mc), Value::VOID));
+    // The same loop as the last statement of a procedure, with the test at the end: repeat sum = sum + i; i = i + 1 until i == 4.
+    fn repeated<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
+        let body = block(20, vec![set(1, add(var(1), var(0))), set(0, add(var(0), q(1))), when(eq(var(0), q(4)), break_(10), void())]);
+        let_(vec![(0, q(0)), (1, q(100))], seq(2, loop_(10, body), var(1)))
+    }
+    assert_eq!(looped(repeated), 106);
+}
+
+/// A break or a continue can be a statement in the middle of a block. The statements after it run only if it is not reached.
+#[test]
+fn a_break_or_a_continue_can_be_in_the_middle_of_a_block() {
+    // i = 0; sum = 0; loop: i = i + 1; if 8 < i then break; if i == 3 then continue; sum = sum + i
+    fn skipping<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
+        let body = block(
+            20,
+            vec![set(0, add(var(0), q(1))), when(less(q(8), var(0)), break_(10), void()), when(eq(var(0), q(3)), continue_(10), void()), set(1, add(var(1), var(0)))],
+        );
+        let_(vec![(0, q(0)), (1, q(0))], seq(2, loop_(10, body), var(1)))
+    }
+    assert_eq!(looped(skipping), 1 + 2 + 4 + 5 + 6 + 7 + 8);
+    // A block inside a branch, with a variable of its own and a jump in the middle: the code after the branch runs for the other rounds.
+    fn scoped<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
+        let inner = let_(vec![(3, add(var(0), var(0)))], block(30, vec![set(1, add(var(1), var(3))), when(less(q(4), var(3)), break_(10), void()), set(1, add(var(1), q(1000)))]));
+        let body = block(20, vec![set(0, add(var(0), q(1))), when(less(var(0), q(100)), inner, void()), set(1, add(var(1), q(10)))]);
+        let_(vec![(0, q(0)), (1, q(0))], seq(2, loop_(10, body), var(1)))
+    }
+    // Rounds 1 and 2 add 2 + 1000 + 10 and 4 + 1000 + 10. Round 3 adds 6 and breaks.
+    assert_eq!(looped(scoped), 2 + 1010 + 4 + 1010 + 6);
+}
+
+/// A break or a continue names its loop, so an inner loop can leave or restart an outer one.
+#[test]
+fn jumps_reach_outer_loops_by_label() {
+    // count = 0; i = 0
+    // outer: i = i + 1; if 4 < i then break outer; j = 0
+    //   inner: j = j + 1; if 3 < j then break inner
+    //          if i == 2 and j == 2 then continue outer; if i == 4 and j == 1 then break outer; count = count + 1
+    //   count = count + 100
+    fn nested<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
+        let inner = block(
+            40,
+            vec![
+                set(3, add(var(3), q(1))),
+                when(less(q(3), var(3)), break_(11), void()),
+                when(eq(var(0), q(2)), when(eq(var(3), q(2)), continue_(10), void()), void()),
+                when(eq(var(0), q(4)), when(eq(var(3), q(1)), break_(10), void()), void()),
+                set(1, add(var(1), q(1))),
+            ],
+        );
+        let outer = block(20, vec![set(0, add(var(0), q(1))), when(less(q(4), var(0)), break_(10), void()), set(3, q(0)), loop_(11, inner), set(1, add(var(1), q(100)))]);
+        let_(vec![(0, q(0)), (1, q(0)), (3, q(0))], seq(2, loop_(10, outer), var(1)))
+    }
+    // i = 1 and i = 3 count three and then 100. i = 2 counts one and restarts the outer loop. i = 4 leaves it.
+    assert_eq!(looped(nested), 103 + 1 + 103);
+}
+
+/// A lambda in a loop body captures the variables of the round it is made in, and cannot jump to the loop.
+#[test]
+fn lambdas_in_a_loop_capture_and_cannot_jump() {
+    // i = 0; made = '(); while i < 3 do local copy = i; made = (cons (lambda () copy) made); i = i + 1 end
+    fn capturing<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
+        fn nth<'gc>(skip: usize) -> Core<'gc> {
+            let mut list = var(1);
+            for _ in 0..skip {
+                list = prim(Intrinsic::Cdr, vec![list]);
+            }
+            app(prim(Car, vec![list]), vec![])
+        }
+        let round = let_(vec![(3, var(0))], block(20, vec![set(1, prim(Cons, vec![lambda(&[], None, var(3)), var(1)])), set(0, add(var(0), q(1)))]));
+        let body = when(less(var(0), q(3)), round, break_(10));
+        let sum = add(prim(Intrinsic::Mul, vec![nth(0), q(100)]), add(prim(Intrinsic::Mul, vec![nth(1), q(10)]), nth(2)));
+        let_(vec![(0, q(0)), (1, Core::Quote(Value::NULL))], seq(2, loop_(10, body), sum))
+    }
+    assert_eq!(number(capturing), Ok(210));
+    assert_eq!(error(|_| loop_(10, seq(1, app(lambda(&[], None, break_(10)), vec![]), break_(10)))), CompileError::Jump(Var(10)));
+    assert_eq!(error(|_| loop_(10, seq(1, lambda(&[], None, loop_(11, continue_(10))), break_(10)))), CompileError::Jump(Var(10)));
+}
+
+/// A break or a continue outside its loop, or in a part that is evaluated for its value, does not compile.
+#[test]
+fn misplaced_jumps_dont_compile() {
+    assert_eq!(error(|_| break_(10)), CompileError::Jump(Var(10)));
+    assert_eq!(error(|_| seq(1, loop_(10, break_(10)), continue_(10))), CompileError::Jump(Var(10)));
+    assert_eq!(error(|_| loop_(10, continue_(11))), CompileError::Jump(Var(11)));
+    assert_eq!(error(|_| loop_(10, add(q(1), break_(10)))), CompileError::Jump(Var(10)));
+    assert_eq!(error(|_| loop_(10, when(continue_(10), q(1), break_(10)))), CompileError::Jump(Var(10)));
+    assert_eq!(error(|_| let_(vec![(0, q(0))], loop_(10, set(0, break_(10))))), CompileError::Jump(Var(10)));
+    assert_eq!(error(|_| let_(vec![(0, q(0))], loop_(10, app(var(0), vec![break_(10)])))), CompileError::Jump(Var(10)));
+    // A label is a variable of its own.
+    assert_eq!(error(|_| loop_(10, loop_(10, break_(10)))), CompileError::Rebound(Var(10)));
+    assert_eq!(error(|_| let_(vec![(10, q(0))], loop_(10, break_(10)))), CompileError::Rebound(Var(10)));
+}
+
+/// A loop body of thousands of statements, each of which can leave the loop, compiles without deep recursion.
+#[test]
+fn long_loop_bodies_compile() {
+    const STATEMENTS: u32 = 3000;
+    // i = 0; loop: i = i + 1; if i == 5000 then break; ... 3000 statements of `if i == k then continue` ...; break
+    fn long<'gc>(_: &Mutation<'gc>) -> Core<'gc> {
+        let mut statements = vec![set(0, add(var(0), q(1)))];
+        for number in 0..STATEMENTS {
+            statements.push(when(eq(var(0), q(i64::from(number) + 1)), continue_(10), void()));
+        }
+        statements.push(break_(10));
+        let_(vec![(0, q(0))], seq(2, loop_(10, block(100, statements)), var(0)))
+    }
+    // Each of the first 3000 rounds continues at its own statement. Round 3001 reaches the break.
+    assert_eq!(number(long), Ok(i64::from(STATEMENTS) + 1));
+}
+

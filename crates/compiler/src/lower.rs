@@ -1,6 +1,31 @@
 //! Pass 1 (`Core -> L1`): Validates the input AST structure, resolves top-level bindings and imports,
 //! expands optional/keyword lambdas and calls, expands struct and cross-module inline templates,
 //! and lowers module-level variable references (`Place::Slot`) into explicit slot access primitives.
+//!
+//! # Loops
+//!
+//! A [`Core::Loop`] is lowered to forms that `L1` already has. The loop becomes a local procedure
+//! of no parameters that is bound by a `letrec` and called once. Its body ends with a call of
+//! itself. All the calls are tail calls:
+//!
+//! ```text
+//! (loop L body)   =>   (letrec ((L (lambda () body' (L)))) (L))
+//! (continue L)    =>   (L)
+//! (break L)       =>   #<void>, as the value of the loop procedure
+//! ```
+//!
+//! A `Break` or a `Continue` can be a statement in the middle of a block, where code follows it.
+//! That code is the rest of a `let` whose binding holds the statement. It is put into a local
+//! procedure, a *join*, and every way out of the statement that is not a jump calls the join:
+//!
+//! ```text
+//! (let ((x (if c (break L) 1))) rest)   =>   (let ((j (lambda (x) rest'))) (if c #<void> (j 1)))
+//! ```
+//!
+//! Every call that these rules add is a tail call of a local procedure, so the contification pass
+//! turns the procedures into code of the enclosing frame, and the calls into jumps. No closure is
+//! made and no frame is pushed. A front end could write the same `letrec` forms itself. The loop
+//! forms spare it from that.
 
 use ragwort_types::gc::{Mutation, Value};
 use ragwort_types::pair::Pairs;
@@ -46,6 +71,8 @@ pub(crate) fn lower<'id, 'gc>(
         max_lambda: 0,
         keyword_procedures: HashMap::default(),
         keyword_cores: HashSet::default(),
+        loops: HashMap::default(),
+        hidden: Vec::new(),
     };
     let mut vals = Vec::new();
     // Each task carries the source site of the expression it belongs to. The nodes that the task adds are recorded with that site.
@@ -92,6 +119,46 @@ pub(crate) fn lower<'id, 'gc>(
                 let node = pass.make(core, &mut vals)?;
                 vals.push(pass.tree.add(node));
             }
+            Task::Tail(core, exit) => {
+                pass.tail(core, exit, &mut vals, &mut then)?;
+                todo.extend(then.drain(..).rev().map(|task| (task, site)));
+            }
+            Task::Bindings(binds, body, exit) => {
+                pass.bindings(binds, body, exit, &mut then);
+                todo.extend(then.drain(..).rev().map(|task| (task, site)));
+            }
+            Task::Bound(var, init) => {
+                let rest = vals.pop().expect("the rest of a let is lowered");
+                let value = vals.pop().expect("an initial value is lowered");
+                pass.scope.remove(&var);
+                pass.name_bound(var, init);
+                let binds = pass.tree.list([(var, value)]);
+                vals.push(pass.tree.add(Node::Let(binds, rest)));
+            }
+            Task::Joined { join, param } => {
+                let rest = vals.pop().expect("the rest of a let is lowered");
+                let value = vals.pop().expect("an initial value is lowered");
+                pass.scope.remove(&param);
+                let params = pass.tree.list([param]);
+                let code = pass.procedure_of(params, rest);
+                let binds = pass.tree.list([(join, code)]);
+                vals.push(pass.tree.add(Node::Let(binds, value)));
+            }
+            Task::Leave(exit) => {
+                let value = vals.pop().expect("a part of a loop body is lowered");
+                vals.push(pass.leave(exit, value));
+            }
+            Task::Looped(label) => {
+                let body = vals.pop().expect("a loop body is lowered");
+                pass.loops.remove(&label);
+                let params = pass.tree.list([]);
+                let code = pass.procedure_of(params, body);
+                let start = pass.again(label);
+                let binds = pass.tree.list([(label, code)]);
+                vals.push(pass.tree.add(Node::Letrec(binds, start)));
+            }
+            Task::Frame(true) => pass.hidden.push(std::mem::take(&mut pass.loops)),
+            Task::Frame(false) => pass.loops = pass.hidden.pop().expect("a lambda in a loop hid the loops"),
         }
     }
     let supply = Supply { next_var: pass.max_var, next_lambda: pass.max_lambda };
@@ -132,6 +199,36 @@ enum Task<'c, 'gc> {
     /// The list has one entry per argument, in written order: the argument's keyword, or `None` for a positional argument.
     Keyword(Vec<Option<Keyword<'gc>>>, Option<Direct<'gc>>),
     Make(&'c Core<'gc>),
+    /// Lowers a part of a loop body that is in a place where a `Break` or a `Continue` can be. A part that ends with a value goes on as the [`Exit`] says. See the [module docs](self).
+    Tail(&'c Core<'gc>, Exit),
+    /// Lowers a `let` in such a place, one binding at a time. The fields are the bindings that are left, the body, and how the `let` goes on.
+    Bindings(&'c [(Var, Core<'gc>)], &'c Core<'gc>, Exit),
+    /// Builds a `let` of one binding. Runs after the initial value and the rest of the `let` are lowered. The fields are the variable and its initial value as written.
+    Bound(Var, &'c Core<'gc>),
+    /// Builds a join for the rest of a `let`. Runs after the initial value and the rest of the `let` are lowered. The initial value calls `join` where it ends with a value, and the join binds that value to `param`.
+    Joined { join: Var, param: Var },
+    /// Makes the lowered value go on as the [`Exit`] says.
+    Leave(Exit),
+    /// Builds the loop with this label. Runs after its body is lowered.
+    Looped(Var),
+    /// Hides the loops being lowered while a lambda inside one of them is lowered, if the field is `true`. Brings them back if it is `false`. A lambda runs in a frame of its own, so it cannot jump to a loop outside it.
+    Frame(bool),
+}
+
+/// How a part of a loop body goes on when it ends with a value. A `Break` or a `Continue` in the part goes elsewhere.
+#[derive(Clone, Copy)]
+enum Exit {
+    /// The value is the value of the enclosing expression.
+    Return,
+    /// The value is passed to this join, a local procedure that holds the code after the part.
+    Call(Var),
+    /// The value is dropped, and the loop with this label starts its next round.
+    Again(Var),
+}
+
+/// Returns whether `core` is a form that can hold a `Break` or a `Continue` as a statement. See [`Core::Loop`].
+fn jumps(core: &Core<'_>) -> bool {
+    matches!(core, Core::If(..) | Core::Let(..) | Core::Letrec(..) | Core::Loop(..) | Core::Break(_) | Core::Continue(_))
 }
 
 /// The module-level meaning of the callee expression of a call.
@@ -186,6 +283,10 @@ struct Lower<'t, 'id, 'gc> {
     keyword_procedures: HashMap<Var, (Var, CallShape<'gc>)>,
     /// The lambda IDs of the procedures in `keyword_procedures`. Each of these lambdas is lowered to its core procedure only.
     keyword_cores: HashSet<u32>,
+    /// The loops whose bodies are being lowered, by label. The value is how the loop itself goes on when it ends, which is where a `Break` of it goes.
+    loops: HashMap<Var, Exit>,
+    /// The values of `loops` set aside while lambdas inside loops are lowered, innermost last. See [`Task::Frame`].
+    hidden: Vec<HashMap<Var, Exit>>,
 }
 
 impl<'id, 'gc> Lower<'_, 'id, 'gc> {
@@ -205,6 +306,13 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
                 let op = if *checked { SlotOp::LoadChecked } else { SlotOp::Load };
                 return Ok(Some(Node::Intrinsic(Prim::Slot(op, *slot), self.tree.list([]))));
             }
+            // A loop is a statement of its own body, and ends with `#<void>` as its value.
+            Core::Loop(..) => {
+                then.push(Task::Tail(core, Exit::Return));
+                return Ok(None);
+            }
+            // A jump that is reached here is in a part that is evaluated for its value, or in no loop at all.
+            Core::Break(label) | Core::Continue(label) => return Err(CompileError::Jump(*label)),
             Core::If(test, consequent, other) => then.extend([Task::Expr(test), Task::Expr(consequent), Task::Expr(other)]),
             Core::Let(binds, body) => {
                 for &(var, _) in binds {
@@ -302,6 +410,10 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
                     return Err(CompileError::SameLambda(lambda.id));
                 }
                 self.max_lambda = self.max_lambda.max(lambda.id.saturating_add(1));
+                let framed = !self.loops.is_empty();
+                if framed {
+                    then.push(Task::Frame(true));
+                }
                 let mut optional = false;
                 for (index, formal) in lambda.params.iter().enumerate() {
                     let repeated = formal.keyword.is_some() && lambda.params[..index].iter().any(|other| other.keyword == formal.keyword);
@@ -319,7 +431,11 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
                     self.reserve_var(rest)?;
                     then.push(Task::Bind(rest));
                 }
-                then.extend([Task::Expr(&lambda.body), Task::Optional(lambda)]);
+                then.push(Task::Expr(&lambda.body));
+                if framed {
+                    then.push(Task::Frame(false));
+                }
+                then.push(Task::Optional(lambda));
                 return Ok(None);
             }
             Core::KeywordApp(function, args, _) => {
@@ -350,7 +466,11 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
                     self.reserve_var(var)?;
                     self.scope.insert(var);
                 }
-                then.push(Task::Expr(&lambda.body));
+                if self.loops.is_empty() {
+                    then.push(Task::Expr(&lambda.body));
+                } else {
+                    then.extend([Task::Frame(true), Task::Expr(&lambda.body), Task::Frame(false)]);
+                }
             }
             Core::Intrinsic(prim, args, _) => {
                 let takes = match *prim {
@@ -393,17 +513,7 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
                 let mut made = Vec::with_capacity(binds.len());
                 for ((var, init), id) in binds.iter().zip(ids) {
                     self.scope.remove(var);
-                    // An unnamed lambda takes the name of the variable that it is bound to.
-                    let unnamed = match init {
-                        Core::Lambda(lambda) if lambda.name.is_none() => Some(lambda.id),
-                        Core::OptionalLambda(lambda) if lambda.name.is_none() => Some(lambda.id),
-                        _ => None,
-                    };
-                    if let Some(lambda) = unnamed
-                        && let Some(name) = self.unit.and_then(|unit| unit.local_name(*var))
-                    {
-                        self.names.name(lambda, name);
-                    }
+                    self.name_bound(*var, init);
                     // For a keyword procedure, `id` is the core procedure. Bind the core first so that calls can reach it, then build the keyword procedure around it.
                     let core = match init {
                         Core::OptionalLambda(lambda) if self.keyword_cores.contains(&lambda.id) => self.keyword_procedures.get(var).cloned(),
@@ -462,7 +572,121 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
             }
             Core::Quote(_) | Core::Ref(_) | Core::Import(_) | Core::Global(..) => unreachable!("leaves are lowered as they're reached"),
             Core::OptionalLambda(_) | Core::KeywordApp(..) => unreachable!("optional lambdas and keyword calls have tasks of their own"),
+            Core::Loop(..) | Core::Break(_) | Core::Continue(_) => unreachable!("loops and jumps have tasks of their own"),
         })
+    }
+
+    /// Names the lambda `init` after the variable `var` that it is bound to, if the lambda has no name of its own.
+    fn name_bound(&mut self, var: Var, init: &Core<'gc>) {
+        let unnamed = match init {
+            Core::Lambda(lambda) if lambda.name.is_none() => Some(lambda.id),
+            Core::OptionalLambda(lambda) if lambda.name.is_none() => Some(lambda.id),
+            _ => None,
+        };
+        if let Some(lambda) = unnamed
+            && let Some(name) = self.unit.and_then(|unit| unit.local_name(var))
+        {
+            self.names.name(lambda, name);
+        }
+    }
+
+    /// Starts lowering `core`, a part of a loop body in a place where a `Break` or a `Continue` can be. Pushes the tasks for it onto `then`, or its lowered node onto `vals`. See [`Task::Tail`].
+    fn tail<'c>(&mut self, core: &'c Core<'gc>, exit: Exit, vals: &mut Vec<Id<'id>>, then: &mut Vec<Task<'c, 'gc>>) -> Result<(), CompileError> {
+        match core {
+            Core::Break(label) => {
+                let out = *self.loops.get(label).ok_or(CompileError::Jump(*label))?;
+                let void = self.tree.add(Node::Quote(Value::VOID));
+                let left = self.leave(out, void);
+                vals.push(left);
+            }
+            Core::Continue(label) => {
+                if !self.loops.contains_key(label) {
+                    return Err(CompileError::Jump(*label));
+                }
+                let again = self.again(*label);
+                vals.push(again);
+            }
+            Core::If(test, consequent, other) => then.extend([Task::Expr(test), Task::Tail(consequent, exit), Task::Tail(other, exit), Task::Make(core)]),
+            Core::Let(binds, body) => {
+                for &(var, _) in binds {
+                    self.reserve_var(var)?;
+                }
+                if binds.iter().any(|(_, init)| jumps(init)) {
+                    then.push(Task::Bindings(binds, body, exit));
+                } else {
+                    then.extend(binds.iter().map(|(_, init)| Task::Expr(init)));
+                    then.extend([Task::Scope(binds), Task::Tail(body, exit), Task::Make(core)]);
+                }
+            }
+            Core::Letrec(binds, body) => {
+                if binds.iter().any(|(_, init)| matches!(init, Core::OptionalLambda(_))) {
+                    self.scan();
+                }
+                for &(var, _) in binds {
+                    self.reserve_var(var)?;
+                    self.scope.insert(var);
+                }
+                then.extend(binds.iter().map(|(_, init)| Task::Expr(init)));
+                then.extend([Task::Tail(body, exit), Task::Make(core)]);
+            }
+            Core::Loop(label, body) => {
+                self.reserve_var(*label)?;
+                // A `Break` of the loop goes where the loop itself goes when it ends.
+                self.loops.insert(*label, exit);
+                then.extend([Task::Tail(body, Exit::Again(*label)), Task::Looped(*label)]);
+            }
+            _ => then.extend([Task::Expr(core), Task::Leave(exit)]),
+        }
+        Ok(())
+    }
+
+    /// Continues a `let` in a loop body with its next binding. See [`Task::Bindings`].
+    ///
+    /// The bindings are nested, one `let` each. That keeps their order, and it is the same program: every variable of the expression is bound once, so an initial value cannot refer to a variable of an earlier binding by accident.
+    fn bindings<'c>(&mut self, binds: &'c [(Var, Core<'gc>)], body: &'c Core<'gc>, exit: Exit, then: &mut Vec<Task<'c, 'gc>>) {
+        let Some(((var, init), rest)) = binds.split_first() else {
+            then.push(Task::Tail(body, exit));
+            return;
+        };
+        if jumps(init) {
+            // The initial value can hold a jump. The rest of the `let` becomes a join that the initial value calls where it ends with a value.
+            let join = self.fresh_var();
+            then.extend([Task::Tail(init, Exit::Call(join)), Task::Bind(*var), Task::Bindings(rest, body, exit), Task::Joined { join, param: *var }]);
+        } else {
+            then.extend([Task::Expr(init), Task::Bind(*var), Task::Bindings(rest, body, exit), Task::Bound(*var, init)]);
+        }
+    }
+
+    /// Returns the node that makes the lowered `value` go on as `exit` says.
+    fn leave(&mut self, exit: Exit, value: Id<'id>) -> Id<'id> {
+        match exit {
+            Exit::Return => value,
+            Exit::Call(join) => {
+                let callee = self.tree.add(Node::Ref(join));
+                let args = self.tree.list([value]);
+                self.tree.add(Node::App(callee, args))
+            }
+            Exit::Again(label) => {
+                let unused = self.fresh_var();
+                let again = self.again(label);
+                let binds = self.tree.list([(unused, value)]);
+                self.tree.add(Node::Let(binds, again))
+            }
+        }
+    }
+
+    /// Returns a call of the loop procedure with label `label`, which starts the next round of the loop.
+    fn again(&mut self, label: Var) -> Id<'id> {
+        let callee = self.tree.add(Node::Ref(label));
+        let args = self.tree.list([]);
+        self.tree.add(Node::App(callee, args))
+    }
+
+    /// Returns a lambda with the parameters `params` and the lowered `body`. It is the code of a loop or of a join.
+    fn procedure_of(&mut self, params: crate::ir::l1::Span<'id, Var>, body: Id<'id>) -> Id<'id> {
+        let id = self.fresh_lambda();
+        let fun = self.tree.function(Function { id, params, optional: 0, rest: None, body });
+        self.tree.add(Node::Lambda(fun))
     }
 
     /// Builds the node for a reference to `import`. The node is a constant if the exporting module never assigns the variable, and a read of the variable otherwise.
@@ -764,7 +988,11 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
         let mut todo = vec![self.root];
         while let Some(core) = todo.pop() {
             match core {
-                Core::Quote(_) | Core::Ref(_) | Core::Import(_) | Core::Global(..) => {}
+                Core::Quote(_) | Core::Ref(_) | Core::Import(_) | Core::Global(..) | Core::Break(_) | Core::Continue(_) => {}
+                Core::Loop(label, body) => {
+                    vars = vars.max(label.0.saturating_add(1));
+                    todo.push(body);
+                }
                 Core::SetGlobal(_, value, _) => todo.push(value),
                 Core::If(test, then, other) => todo.extend([&**test, &**then, &**other]),
                 Core::Let(binds, body) | Core::Letrec(binds, body) => {

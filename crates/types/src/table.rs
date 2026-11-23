@@ -290,6 +290,14 @@ impl<'gc> Shape<'gc> {
         parts.find_below(mc, key, hash_of_key, self.len(mc))
     }
 
+    /// Returns whether the key at `position` is `key`, compared by value. Nothing is hashed.
+    fn has_at(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize) -> Result<bool, Error> {
+        match self.key(mc, position) {
+            Some(held) => same(mc, held, key),
+            None => Ok(false),
+        }
+    }
+
     /// Returns the shape with one key fewer, or `None` for the shape with no keys.
     pub fn parent(self, mc: &Mutation<'gc>) -> Option<Self> {
         self.0.parent(mc).map(Self)
@@ -574,11 +582,13 @@ impl<'gc> Table<'gc> {
 
     /// Works like [`Table::find`], and tries `position` first. `position` is where `key` was found before, in this table or in another one.
     ///
-    /// For an external table with a shape, this is the cheap way to read a key for the first time. If `key` is the key at `position` of the shape, the value is read from the host and cached at that position, and nothing is hashed.
+    /// The key at `position` is compared with `key` by value, as a search compares keys. If it is the same key, nothing is hashed. That matters for a long string key, whose hash reads every character. It is how a read with a constant string key finds its entry again in a table without a shape, where [`Table::get_at`] does not: the table can hold an equal string that is another object.
+    ///
+    /// For an external table with a shape, this is the cheap way to read a key for the first time. If `key` is the key at `position` of the shape, the value is read from the host and cached at that position.
     pub fn find_from(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize) -> Result<Option<(Place<'gc>, Value<'gc>)>, Error> {
         match self.0 {
-            Kept::Inside(table) => table.find(mc, key),
-            Kept::Record(table) => table.find(mc, key),
+            Kept::Inside(table) => table.find_from(mc, key, position),
+            Kept::Record(table) => table.find_from(mc, key, position),
             Kept::Outside(table) => match table.find_at(mc, key, position)? {
                 AtPosition::Found(place, value) => Ok(Some((place, value))),
                 AtPosition::Absent => Ok(None),
@@ -889,6 +899,26 @@ impl<'gc> Inside<'gc> {
             values.items(mc).set(mc, position, value);
         }
         true
+    }
+
+    /// Works like [`Inside::find`], and tries `position` first. See [`Table::find_from`].
+    fn find_from(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize) -> Result<Option<(Place<'gc>, Value<'gc>)>, Error> {
+        if let Some(shape) = self.0.shape(mc).map(Shape) {
+            if shape.has_at(mc, key, position)? {
+                return Ok(self.value_at(mc, position).map(|value| (Place { shape: Some(shape), position }, value)));
+            }
+            return self.find_shaped(mc, shape, key);
+        }
+        // The entry at `position` of a table with keys of its own. A removed entry has no key.
+        if let Some(entries) = self.0.pairs(mc).map(|pairs| pairs.items(mc))
+            && let Some(place) = position.checked_mul(2).filter(|&place| place < entries.len())
+        {
+            let held = entries.get(place);
+            if held != Value::BROKEN && same(mc, held, key)? {
+                return Ok(Some((Place { shape: None, position }, entries.get(place + 1))));
+            }
+        }
+        self.find(mc, key)
     }
 
     fn find(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<(Place<'gc>, Value<'gc>)>, Error> {
@@ -1211,6 +1241,19 @@ impl<'gc> Record<'gc> {
 
     fn get(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<Value<'gc>>, Error> {
         Ok(self.find(mc, key)?.map(|(_, value)| value))
+    }
+
+    /// Works like [`Record::find`], and tries `position` first. See [`Table::find_from`].
+    fn find_from(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize) -> Result<Option<(Place<'gc>, Value<'gc>)>, Error> {
+        if let Some(own) = self.own(mc) {
+            return own.find_from(mc, key, position);
+        }
+        if let Some(shape) = self.0.shape(mc).map(Shape)
+            && shape.has_at(mc, key, position)?
+        {
+            return Ok(self.value_at(mc, position).map(|value| (Place { shape: Some(shape), position }, value)));
+        }
+        self.find(mc, key)
     }
 
     fn find(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Option<(Place<'gc>, Value<'gc>)>, Error> {
@@ -1901,10 +1944,10 @@ impl<'gc> Outside<'gc> {
         }
     }
 
-    /// Reads `key` at `position` of the table's shape, without hashing `key`. The value comes from the cache, or from the host by position.
+    /// Reads `key` at `position` of the table's shape, without hashing `key`. The key at that position is compared with `key` by value. The value comes from the cache, or from the host by position.
     fn find_at(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize) -> Result<AtPosition<'gc>, Error> {
         let Some(shape) = self.0.shape(mc) else { return Ok(AtPosition::Unknown) };
-        if Shape(shape).key(mc, position) != Some(key) {
+        if !Shape(shape).has_at(mc, key, position)? {
             return Ok(AtPosition::Unknown);
         }
         // The cache is a record of the shape. It has a slot for the key at `position`, unless the program gave the table a key outside the shape and the record grew.
