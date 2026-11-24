@@ -19,13 +19,11 @@ crate::gc::objects! {
     /// The intern table. `seed` seeds its hashes. `table` holds the symbols and `keywords` holds the keywords, both weakly.
     /// `shapes` is the root of the arena's tree of table shapes: the shape with no keys. It is created when the first shape is.
     ///
-    /// `narrow`, `wide` and `widest` hold the interned strings weakly: the flat string objects with units of one, two and four bytes.
-    /// Each is created when the first string of its width is made. See the string module.
-    pub(crate) struct Interned { seed: u64, table: Member<TableHead>, keywords: Member<TableHead>, shapes: Member<TableShape>, narrow: Member<Interns>, wide: Member<Interns>, widest: Member<Interns> }
-    /// A table of the interned strings of one width. `array` is an array of one word for each slot, or `#f` while the table is empty.
-    /// A slot holds a weak reference to a string in its lower half and the string's hash in its upper half.
-    /// `used` is the number of slots that have held a string since the array was made. A slot whose string has died still counts.
-    pub(crate) struct Interns { array: Value, used: u64 }
+    /// `strings` is the table of the interned strings, which it holds weakly. It is `None` until the first string object is made. See the string module.
+    /// `used` is the number of slots of `strings` that have held a string since the array was made. A slot whose string has died still counts.
+    pub(crate) struct Interned { seed: u64, table: Member<TableHead>, keywords: Member<TableHead>, shapes: Member<TableShape>, strings: Member<InternSlots>, used: u64 }
+    /// The slots of the table of interned strings. A slot holds a weak reference to a string object in its lower half and the string's hash in its upper half.
+    pub(crate) struct InternSlots {} items Tagged
     /// A keyword, `#:name`. `symbol` is the symbol with the same name.
     pub(crate) struct Keyword { symbol: Member<Sym> }
     /// `length` is the length of the list that starts at this pair, or 0 if the chain of pairs does not end in `()`.

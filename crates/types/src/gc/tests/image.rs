@@ -192,3 +192,45 @@ fn loaded_strings_are_the_interned_strings_of_the_arena() {
         assert_eq!((items[0], items[2], text(mc, items[1])), (own.value(), own.value(), SECOND.to_string()));
     });
 }
+
+/// A rope that is an interned string is saved as its text, so it is loaded as the arena's interned string with that text. A rope that is not interned is loaded as a rope.
+#[test]
+fn an_interned_rope_is_loaded_as_the_interned_string() {
+    let (head, tail) = ("a piece that ropes share. ".repeat(30), "the end of the first rope");
+    let whole = format!("{head}{tail}");
+    let mut saving = Arena::new(1 << 22, 0);
+    let bytes = saving.mutate(|mc| {
+        let (strings, pairs) = (Strings::new(mc), Pairs::new(mc));
+        let piece = string::from_str(&strings, &head).unwrap();
+        let interned = string::concat(&strings, piece, string::from_str(&strings, tail).unwrap()).unwrap();
+        assert_eq!((strings.intern(interned), string::is_flat(&strings, interned)), (Ok(interned), false));
+        // The second rope has the same characters, and reads as the first once the two are compared. The third is never interned.
+        let twin = string::concat(&strings, piece, string::from_str(&strings, tail).unwrap()).unwrap();
+        assert_eq!((string::equal(&strings, twin, interned), twin == interned), (Ok(true), false));
+        let plain = string::concat(&strings, piece, string::from_str(&strings, "the end of a rope that is not interned").unwrap()).unwrap();
+        save(mc, STAMP, &[pairs.list(&[interned.value(), twin.value(), plain.value(), interned.value()]).unwrap()], &kinds()).unwrap()
+    });
+    let mut fresh = Arena::new(1 << 22, 0);
+    fresh.mutate(|mc| {
+        let roots = load(mc, STAMP, &bytes, &descs(), &kinds(), &()).unwrap();
+        let (strings, pairs) = (Strings::new(mc), Pairs::new(mc));
+        let items: Vec<Value> = pairs.elements(roots[0]).collect();
+        let (interned, twin, plain) = (strings.string(items[0]).unwrap(), strings.string(items[1]).unwrap(), strings.string(items[2]).unwrap());
+        assert_eq!((text(mc, items[0]), text(mc, items[1]), text(mc, items[2]), items[0] == items[3]), (whole.clone(), whole.clone(), format!("{head}the end of a rope that is not interned"), true));
+        assert!(strings.is_interned(interned) && !strings.is_interned(plain) && !string::is_flat(&strings, plain));
+        assert_eq!((string::from_str(&strings, &whole), strings.intern(twin), string::equal(&strings, twin, interned)), (Ok(interned), Ok(interned), Ok(true)));
+    });
+    // An arena whose interned string of the text is a rope keeps that rope, and the loaded data refers to it.
+    let seed = fresh.mutate(|mc| Symbols::of_arena(mc).unwrap().seed(mc));
+    let mut used = Arena::new(1 << 22, 0);
+    used.mutate(|mc| {
+        Symbols::with_seed(mc, seed).unwrap();
+        let (strings, pairs) = (Strings::new(mc), Pairs::new(mc));
+        let own = string::concat(&strings, string::from_str(&strings, &head).unwrap(), string::from_str(&strings, tail).unwrap()).unwrap();
+        assert_eq!(strings.intern(own), Ok(own));
+        let roots = load(mc, STAMP, &bytes, &descs(), &kinds(), &()).unwrap();
+        let items: Vec<Value> = pairs.elements(roots[0]).collect();
+        assert_eq!((items[0], items[3], strings.intern(strings.string(items[1]).unwrap()), text(mc, items[0])), (own.value(), own.value(), Ok(own), whole.clone()));
+    });
+}
+

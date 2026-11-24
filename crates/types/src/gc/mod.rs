@@ -851,6 +851,16 @@ fn target<'gc, U: Object>(region: &RegionWords, index: u32) -> Option<Gc<'gc, U>
     Some(Gc::new(index))
 }
 
+/// Returns the value that refers to the object at `index`, or `None` for index 0. The type number of the value is read from the object.
+#[inline]
+fn object_at<'gc>(region: &RegionWords, index: u32) -> Option<Value<'gc>> {
+    if index == 0 {
+        return None;
+    }
+    let ty = region[mask(index as usize)].get() & TYPE_BITS;
+    Some(Value::from_bits(u64::from(index) << 32 | ty << 16 | OBJECT))
+}
+
 #[cold]
 #[inline(never)]
 fn wrong_target(index: u32, ty: u16) -> ! {

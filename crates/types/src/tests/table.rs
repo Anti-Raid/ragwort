@@ -1126,8 +1126,9 @@ fn equal_strings_are_one_key_of_a_shape() {
         let (fielded, mapped) = (tables.make().unwrap(), tables.with_room(4).unwrap());
         fielded.set_field(mc, rope.value(), fix(1)).unwrap();
         mapped.set(mc, rope.value(), fix(2)).unwrap();
+        // The rope is the interned string of its characters, so a flat string that is made with them is the rope.
         let flat = text(mc, &format!("{head}{tail}"));
-        assert!(flat != rope.value() && strings.is_interned(strings.string(flat).unwrap()));
+        assert!(flat == rope.value() && strings.is_interned(rope));
         assert_eq!((entries(mc, fielded), entries(mc, mapped), tables.shape(&[rope.value()]).ok()), (vec![(flat, fix(1))], vec![(flat, fix(2))], fielded.shape(mc)));
         let again = concat(&strings, strings.string(text(mc, &head[..330])).unwrap(), strings.string(text(mc, &format!("{}{tail}", &head[330..]))).unwrap()).unwrap();
         assert!(!string::is_flat(&strings, again));

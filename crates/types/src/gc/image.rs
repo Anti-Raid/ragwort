@@ -56,7 +56,7 @@ const PLAIN: u8 = 0;
 const SYMBOL: u8 = 1;
 const KEYWORD: u8 = 2;
 const SYMBOLS: u8 = 3;
-/// A flat string object. It is saved as its text, and loaded as the arena's interned string with that text.
+/// A flat string object, or a rope that is an interned string. It is saved as its text, and loaded as the arena's interned string with that text.
 const STRING: u8 = 4;
 
 /// A kind of frozen value that can be saved.
@@ -301,7 +301,7 @@ impl<'gc> Saver<'_, 'gc> {
                 table.u32((symbol >> 32) as u32);
             } else if ty == number_of::<Interned>() {
                 table.u8(SYMBOLS);
-            } else if let Some(string) = Strings::new(self.mc).string(object).filter(|&string| Strings::new(self.mc).is_object(string)) {
+            } else if let Some(string) = Strings::new(self.mc).string(object).filter(|&string| Strings::new(self.mc).is_object(string) || Strings::new(self.mc).is_interned(string)) {
                 table.u8(STRING);
                 let text: String = chars(&Strings::new(self.mc), string).collect();
                 table.bytes(text.as_bytes());

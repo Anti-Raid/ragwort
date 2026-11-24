@@ -153,7 +153,7 @@ impl Parse for Field {
 
 fn slot(ty: &Type) -> syn::Result<Slot> {
     fn err(ty: &Type) -> Error {
-        let kinds = "Value, Member<T>, Weak<T>, Host<T>, AnyHost, Frozen<T>, Ephemeron, u64, i64, u32, f64 or bool";
+        let kinds = "Value, Member<T>, Weak<T>, Tagged, Host<T>, AnyHost, Frozen<T>, Ephemeron, u64, i64, u32, f64 or bool";
         Error::new_spanned(ty, format!("expected {kinds}"))
     }
     let krate = krate();
@@ -180,6 +180,10 @@ fn slot(ty: &Type) -> syn::Result<Slot> {
         ("Member" | "Weak", Some(inner)) => {
             let out = quote!(::core::option::Option<#krate::Gc<'gc, #inner>>);
             Slot::new(quote!(#krate::slot::#ident<#inner>), out.clone(), out, Class::Reference)
+        }
+        ("Tagged", None) => {
+            let out = quote!((::core::option::Option<#value>, ::core::primitive::u32));
+            Slot::new(quote!(#krate::slot::Tagged), out.clone(), out, Class::Reference)
         }
         ("Host", Some(inner)) => {
             let out = quote!(::core::option::Option<#krate::HostRef<'gc, #inner>>);

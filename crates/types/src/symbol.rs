@@ -10,7 +10,7 @@ use crate::Error;
 use crate::gc::table::{Table as GcTable, WeakObjects};
 use crate::gc::{Gc, Mutation, OutOfMemory, Value};
 use crate::objects::{self, Data, InternedFields, KeywordFields, SymFields};
-use crate::string::{self, Str, Strings, Table, Width};
+use crate::string::{self, Str, Strings, Table};
 
 #[cfg(test)]
 #[path = "tests/symbol.rs"]
@@ -91,7 +91,7 @@ impl<'gc> Symbols<'gc> {
         }
         let table = GcTable::<WeakObjects<objects::Sym>>::new(mc)?;
         let keywords = GcTable::<WeakObjects<objects::Keyword>>::new(mc)?;
-        let symbols = Self(objects::Interned::new(mc, seed, Some(table.head()), Some(keywords.head()), None, None, None, None)?);
+        let symbols = Self(objects::Interned::new(mc, seed, Some(table.head()), Some(keywords.head()), None, None, 0)?);
         mc.interned().set(symbols.value(mc).to_bits());
         Ok(symbols)
     }
@@ -116,23 +116,27 @@ impl<'gc> Symbols<'gc> {
         self.0.set_shapes(mc, Some(root));
     }
 
-    /// Returns the table of the interned strings whose units have `width`, or `None` if no such string has been interned.
+    /// Returns the slots of the table of interned strings, or `None` if no string object has been made.
     #[inline]
-    pub(crate) fn strings(self, mc: &Mutation<'gc>, width: Width) -> Option<Gc<'gc, objects::Interns>> {
-        match width {
-            Width::One => self.0.narrow(mc),
-            Width::Two => self.0.wide(mc),
-            Width::Four => self.0.widest(mc),
-        }
+    pub(crate) fn strings(self, mc: &Mutation<'gc>) -> Option<Gc<'gc, objects::InternSlots>> {
+        self.0.strings(mc)
     }
 
-    /// Sets the table of the interned strings whose units have `width`.
-    pub(crate) fn set_strings(self, mc: &Mutation<'gc>, width: Width, table: Gc<'gc, objects::Interns>) {
-        match width {
-            Width::One => self.0.set_narrow(mc, Some(table)),
-            Width::Two => self.0.set_wide(mc, Some(table)),
-            Width::Four => self.0.set_widest(mc, Some(table)),
-        }
+    /// Sets the slots of the table of interned strings to `slots`, of which `used` hold a string.
+    pub(crate) fn set_strings(self, mc: &Mutation<'gc>, slots: Gc<'gc, objects::InternSlots>, used: usize) {
+        self.0.set_strings(mc, Some(slots));
+        self.0.set_used(mc, used as u64);
+    }
+
+    /// Returns the number of slots of the table of interned strings that have held a string since its array was made.
+    #[inline]
+    pub(crate) fn strings_used(self, mc: &Mutation<'gc>) -> usize {
+        self.0.used(mc) as usize
+    }
+
+    /// Counts one more used slot of the table of interned strings.
+    pub(crate) fn count_string(self, mc: &Mutation<'gc>) {
+        self.0.set_used(mc, self.0.used(mc) + 1);
     }
 
     /// Returns the seed of the hashes that the symbols store.
@@ -171,37 +175,26 @@ impl<'gc> Symbols<'gc> {
         Interner { mc, seed: self.0.seed(mc), table }
     }
 
-    /// Returns the number of objects that the arena's intern record is made of: the record, its tables and their arrays. Returns 0 if the arena has no intern record. Tests that count the live objects of an arena use it.
-    #[cfg(test)]
-    pub(crate) fn objects_of(mc: &Mutation<'gc>) -> usize {
-        let Some(symbols) = Self::of(Value::from_bits(mc.interned().get())) else { return 0 };
-        // A table of symbols or keywords is one object, and has two arrays once it has held an entry.
-        fn objects<'gc, U: crate::gc::Object>(mc: &Mutation<'gc>, head: Option<Gc<'gc, crate::gc::table::TableHead>>) -> usize {
-            match head {
-                Some(head) if GcTable::<WeakObjects<U>>::of(head).capacity(mc) > 0 => 3,
-                Some(_) => 1,
-                None => 0,
-            }
-        }
-        // A table of strings is one object, and has one array once it has held a string.
-        fn strings<'gc>(mc: &Mutation<'gc>, head: Option<Gc<'gc, objects::Interns>>) -> usize {
-            match head {
-                Some(head) if objects::InternsFields::array(head, mc) != Value::FALSE => 2,
-                Some(_) => 1,
-                None => 0,
-            }
-        }
-        1 + objects::<objects::Sym>(mc, symbols.0.table(mc))
-            + objects::<objects::Keyword>(mc, symbols.0.keywords(mc))
-            + strings(mc, symbols.0.narrow(mc))
-            + strings(mc, symbols.0.wide(mc))
-            + strings(mc, symbols.0.widest(mc))
-    }
-
     #[cfg(test)]
     fn capacity(self, mc: &Mutation<'gc>) -> usize {
         self.interner(&Strings::new(mc)).table.capacity(mc)
     }
+}
+
+/// Returns the number of objects that the arena's intern record is made of: the record, its tables and their arrays. Returns 0 if the arena has no intern record. Tests that count the live objects of an arena use it.
+#[cfg(test)]
+pub(crate) fn objects_of(mc: &Mutation<'_>) -> usize {
+    let Some(symbols) = Symbols::of(Value::from_bits(mc.interned().get())) else { return 0 };
+    // A table of symbols or keywords is one object, and has two arrays once it has held an entry.
+    fn objects<'gc, U: crate::gc::Object>(mc: &Mutation<'gc>, head: Option<Gc<'gc, crate::gc::table::TableHead>>) -> usize {
+        match head {
+            Some(head) if GcTable::<WeakObjects<U>>::of(head).capacity(mc) > 0 => 3,
+            Some(_) => 1,
+            None => 0,
+        }
+    }
+    // The table of strings is one array.
+    1 + objects::<objects::Sym>(mc, symbols.0.table(mc)) + objects::<objects::Keyword>(mc, symbols.0.keywords(mc)) + usize::from(symbols.0.strings(mc).is_some())
 }
 
 /// The intern table as an implementation of [`Table`]. It is private, so that only interning can modify the table.

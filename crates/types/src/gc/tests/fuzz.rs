@@ -625,7 +625,7 @@ fn model_fuzz() {
         let hosts = live.iter().filter(|x| world.objs[x].host).count();
         let live_hosts = arena.meta.hosts.borrow().iter().filter(|s| s.value.is_some()).count();
         // The strings are gone. The tables that held them as interned strings stay.
-        let interning = arena.mutate(|mc| crate::symbol::Symbols::objects_of(mc));
+        let interning = arena.mutate(crate::symbol::objects_of);
         assert_eq!((arena.objects(), live_hosts, arena.frozen_values()), (1 + live.len() + interning, hosts, live.len()));
         let (majors, minors) = arena.collections();
         assert!(majors > 0 && minors > 0);

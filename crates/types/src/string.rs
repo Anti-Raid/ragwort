@@ -9,43 +9,57 @@
 //! # Hashes
 //!
 //! [`Strings::hash`] returns a hash of a string's characters, for hash tables. A flat string
-//! object and an external string keep the hash once it is computed, so the characters of a string
-//! that is hashed again and again are read once.
+//! object, a rope and an external string keep the hash once it is computed, so the characters of a
+//! string that is hashed again and again are read once.
 //!
-//! The hash costs a flat string no memory. A flat string object has one word for its number of
+//! The hash costs a string no memory. A flat string object has one word for its number of
 //! characters, and the hash is in the upper half of that word:
 //!
 //! ```text
 //! bits 0 to 30    the number of characters
-//! bit 31          not used yet
+//! bit 31          set while the string is interned
 //! bits 32 to 63   the hash, or 0 if it has not been computed
 //! ```
+//!
+//! A rope has the same layout in its `reads` word, with the number of reads by index in bits 0 to 30.
 //!
 //! So a flat string has at most [`FLAT_MAX`] characters. A rope can be longer.
 //!
 //! # Interned strings
 //!
-//! The arena has one flat string for each text: the interned string. So two flat strings have the
+//! The arena has one string for each text: the interned string. So two interned strings have the
 //! same characters exactly when they are the same value, and comparing them reads no character.
 //!
 //! - A string in the value word is interned as it is. Equal ones are the same word already.
 //! - A flat string object is interned when it is made. If the arena already has a string with
-//!   the same characters, that string is returned and the new object is dropped. Bit 31 of the
-//!   `chars` word marks an interned object.
+//!   the same characters, that string is returned and the new object is dropped.
 //! - A rope is not interned when it is made, so that joining strings stays cheap. It is interned
-//!   as its flat copy the first time it is compared with a string of the same length, or used as
-//!   the key of a table. The rope then keeps the flat copy and lets go of its two halves.
+//!   the first time it is compared with a string of the same length, or used as the key of a
+//!   table. Its hash is computed from its pieces, and nothing is copied.
 //! - An external string is not interned yet. [`Strings::intern`] returns it unchanged, and it is
 //!   compared by its characters.
 //!
-//! The arena holds its interned strings weakly, in one table for each width of unit. An interned
-//! string that nothing else refers to is collected, and making its text again registers a new string.
+//! ## Interned ropes
 //!
-//! ## The tables
+//! Interning a rope has one of two results:
 //!
-//! An intern table is a hash table with linear probing, in one array of words. A slot is one word:
+//! - No string with its characters is interned. The rope itself becomes the interned string. It
+//!   keeps its two halves, so the pieces that it shares with other strings stay shared.
+//! - Another string is the interned string already. The rope then keeps that string in `flat`
+//!   and lets go of its halves, and it is read as that string from then on.
+//!
+//! A rope that is the interned string stays the interned string when it is flattened. The flat
+//! copy belongs to the rope alone: it is not interned, and no other value refers to it. So every
+//! flat string object that a program can hold is interned.
+//!
+//! ## The table
+//!
+//! The arena holds its interned strings weakly, in one table. An interned string that nothing
+//! else refers to is collected, and making its text again registers a new string.
+//!
+//! The table is a hash table with linear probing, in one array of words. A slot is one word:
 //! the string's hash in the upper half, and a weak reference to the string in the lower half. So a
-//! string costs 8 bytes for each slot, and a table is kept between a quarter and three quarters full.
+//! string costs 8 bytes for each slot, and the table is kept between a quarter and three quarters full.
 //!
 //! - A slot of 0 was never used, and ends a probe.
 //! - A slot with a hash and no reference held a string that has died. A probe goes on past it, and
@@ -56,7 +70,8 @@
 //!
 //! A new string of up to [`BUILD`] words is written into a buffer on the stack first. It is hashed
 //! and looked up there. Only a text that the arena does not have yet is allocated. A longer string
-//! is allocated first and looked up afterwards.
+//! is allocated first and looked up afterwards. If the interned string with its characters is a
+//! rope, the new object becomes the flat copy of that rope, and the rope is returned.
 //!
 //! The hash is seeded with the arena's seed, so it cannot be predicted from outside. An arena has
 //! one seed for its whole life, and an image is loaded only into an arena with the image's seed,
@@ -67,10 +82,8 @@ pub use ragwort_string::*;
 pub use crate::gc::Error;
 use std::cell::Cell;
 
-use crate::gc::raw::Raw;
-use crate::gc::table::WeakSlots;
 use crate::gc::{Gc, INLINE_STRING, Mutation, Object, Slots, TAG, Value, slot};
-use crate::objects::{Interns, InternsFields};
+use crate::objects::{InternSlots, InternSlotsFields};
 use crate::symbol::Symbols;
 
 #[cfg(test)]
@@ -88,9 +101,10 @@ crate::gc::objects! {
     /// A flat string with at least one character above U+FFFF, packed two to an item. `chars` is as in [`Str8`].
     pub struct Str32 { chars: u64 } items u64
     /// The concatenation of two nonempty strings, `left` then `right`. `info` is the packed `Info`
-    /// of the rope. `flat` is the flat copy once the rope has been flattened, and `#f` until then.
-    /// A flattened rope has `#f` for `left` and `right`: it is read as its flat copy.
-    /// `reads` counts the reads of the rope by character index.
+    /// of the rope. `flat` is the string that the rope is read as, and `#f` while the rope is read as its halves.
+    /// It is the flat copy of a rope that has been flattened, or the interned string of a rope that is not the interned string itself.
+    /// A rope with a `flat` has `#f` for `left` and `right`.
+    /// `reads` holds the number of reads of the rope by character index, the interned flag and the hash. See the [module docs](self).
     pub struct Rope { left: Value, right: Value, info: u64, flat: Value, reads: u64 }
     /// A flat string whose characters are stored outside the arena, in `owner`. `owner` is dropped once the string is unreachable. `hash` is the hash of the characters, or 0 if it has not been computed.
     pub struct Extern { owner: Frozen<Box<dyn External>>, hash: u64 }
@@ -99,11 +113,11 @@ crate::gc::objects! {
 /// The most characters that a flat string object can have. Its word for the number of characters also holds the hash. See the [module docs](self).
 pub const FLAT_MAX: usize = (1 << 31) - 1;
 
-/// The bits of a flat string's `chars` word that hold the number of characters.
+/// The bits of a flat string's `chars` word that hold the number of characters. The same bits of a rope's `reads` word hold the number of reads.
 const COUNT: u64 = FLAT_MAX as u64;
-/// The bit of a flat string's `chars` word that is set while the string is interned.
+/// The bit of a flat string's `chars` word, or of a rope's `reads` word, that is set while the string is interned.
 const INTERNED: u64 = 1 << 31;
-/// The number of bits that the hash in a flat string's `chars` word is shifted up by.
+/// The number of bits that the hash in a `chars` or `reads` word is shifted up by.
 const HASH_SHIFT: u32 = 32;
 /// The number of words of the buffer in which a new flat string is built before it is looked up. See the [module docs](self).
 pub const BUILD: usize = 64;
@@ -187,7 +201,7 @@ impl<'a, 'gc> Strings<'a, 'gc> {
 
     /// Returns a hash of the characters of `string`, seeded with the arena's seed. Two strings with the same characters have the same hash, however they are stored. The hash is never 0.
     ///
-    /// A flat string object and an external string keep the hash, so it is computed from their characters once. A string in the value word is hashed in a few steps each time. A rope is hashed from its pieces each time, without being flattened.
+    /// A flat string object, a rope and an external string keep the hash, so it is computed from their characters once. A string in the value word is hashed in a few steps each time. A rope is hashed from its pieces each time, without being flattened.
     #[inline]
     pub fn hash(&self, string: Str<'gc>) -> Result<u32, Error> {
         let mc = self.mc;
@@ -195,8 +209,9 @@ impl<'a, 'gc> Strings<'a, 'gc> {
             Some(Text::Str8(flat)) => flat.chars(mc) >> HASH_SHIFT,
             Some(Text::Str16(flat)) => flat.chars(mc) >> HASH_SHIFT,
             Some(Text::Str32(flat)) => flat.chars(mc) >> HASH_SHIFT,
+            Some(Text::Rope(rope)) => rope.reads(mc) >> HASH_SHIFT,
             Some(Text::Extern(external)) => external.hash(mc),
-            _ => 0,
+            None => 0,
         };
         if kept != 0 {
             return Ok(kept as u32);
@@ -214,46 +229,40 @@ impl<'a, 'gc> Strings<'a, 'gc> {
             Some(Text::Str8(flat)) => flat.set_chars(mc, flat.chars(mc) & (COUNT | INTERNED) | hash << HASH_SHIFT),
             Some(Text::Str16(flat)) => flat.set_chars(mc, flat.chars(mc) & (COUNT | INTERNED) | hash << HASH_SHIFT),
             Some(Text::Str32(flat)) => flat.set_chars(mc, flat.chars(mc) & (COUNT | INTERNED) | hash << HASH_SHIFT),
+            Some(Text::Rope(rope)) => rope.set_reads(mc, rope.reads(mc) & (COUNT | INTERNED) | hash << HASH_SHIFT),
             Some(Text::Extern(external)) => external.set_hash(mc, hash),
-            _ => {}
+            None => {}
         }
         Ok(hash as u32)
     }
 
-    /// Returns the interned string with the characters of `string`. A flat string is interned already, so this returns it. A rope is flattened, and its flat copy is returned. See the [module docs](self).
+    /// Returns the interned string with the characters of `string`. A flat string that a program holds is interned already, so this returns it. A rope is interned without a copy. See the [module docs](self).
     pub fn intern(&self, string: Str<'gc>) -> Result<Str<'gc>, Error> {
         match Text::of(string.0) {
             Some(Text::Str8(flat)) => self.intern_flat(flat, string),
             Some(Text::Str16(flat)) => self.intern_flat(flat, string),
             Some(Text::Str32(flat)) => self.intern_flat(flat, string),
-            Some(Text::Rope(rope)) => {
-                let flat = rope.flat(self.mc);
-                if flat != Value::FALSE {
-                    return Ok(Str(flat));
-                }
-                // The flat copy is interned when it is made, and the rope keeps it.
-                flatten(self, string)
-            }
+            Some(Text::Rope(rope)) => self.intern_rope(rope, string),
             // A string in the value word is its own interned string. An external string is not interned yet.
             Some(Text::Extern(_)) | None => Ok(string),
         }
     }
 
-    /// Returns the interned string with the characters of `string`, or `None` if no such string is interned. Nothing is registered, and a rope is not flattened.
+    /// Returns the interned string with the characters of `string`, or `None` if no such string is interned. Nothing is registered, and a rope is left as it is.
     pub fn interned(&self, string: Str<'gc>) -> Result<Option<Str<'gc>>, Error> {
         if let Some(known) = self.known(string) {
             return Ok(Some(known));
         }
-        // An interned string with these characters has units of the same width, so one table can hold it.
         let hash = self.hash(string)?;
-        match width(self, string) {
-            Width::One => self.twin::<Str8>(hash, string),
-            Width::Two => self.twin::<Str16>(hash, string),
-            Width::Four => self.twin::<Str32>(hash, string),
+        for candidate in Probe::new(self.mc, Symbols::of_arena(self.mc)?, hash) {
+            if same_chars(self, candidate, string)? {
+                return Ok(Some(candidate));
+            }
         }
+        Ok(None)
     }
 
-    /// Returns whether `string` is an interned string: a string in the value word, or a flat string object that [`Strings::intern`] has registered.
+    /// Returns whether `string` is an interned string: a string in the value word, or a flat string object or a rope that is registered as the string of its characters.
     #[inline]
     pub fn is_interned(&self, string: Str<'gc>) -> bool {
         let mc = self.mc;
@@ -261,12 +270,15 @@ impl<'a, 'gc> Strings<'a, 'gc> {
             Some(Text::Str8(flat)) => flat.chars(mc) & INTERNED != 0,
             Some(Text::Str16(flat)) => flat.chars(mc) & INTERNED != 0,
             Some(Text::Str32(flat)) => flat.chars(mc) & INTERNED != 0,
-            Some(Text::Rope(_) | Text::Extern(_)) => false,
+            Some(Text::Rope(rope)) => rope.reads(mc) & INTERNED != 0,
+            Some(Text::Extern(_)) => false,
             None => true,
         }
     }
 
     /// Makes the flat string object `flat`, which is `string`, the interned string of its characters, unless another string is that already. Returns the interned string.
+    ///
+    /// If the interned string is a rope, the rope takes `flat` as its flat copy and is returned. The result is then read as a flat string too.
     fn intern_flat<T: Object>(&self, flat: Gc<'gc, T>, string: Str<'gc>) -> Result<Str<'gc>, Error>
     where
         Gc<'gc, T>: Flat<'gc>,
@@ -277,17 +289,51 @@ impl<'a, 'gc> Strings<'a, 'gc> {
         }
         let hash = self.hash(string)?;
         let symbols = Symbols::of_arena(mc)?;
-        let head = symbols.strings(mc, <Gc<'gc, T> as Flat<'gc>>::WIDTH);
-        let mut probe = Probe::<T>::new(mc, head, hash);
+        let mut probe = Probe::new(mc, symbols, hash);
         for candidate in probe.by_ref() {
-            let candidate = Str(Value::object(mc, candidate));
             if same_chars(self, candidate, string)? {
+                if let Some(Text::Rope(rope)) = Text::of(candidate.0)
+                    && rope.flat(mc) == Value::FALSE
+                {
+                    self.flattened(candidate, string);
+                }
                 return Ok(candidate);
             }
         }
-        self.insert(symbols, head, &probe, flat)?;
+        self.insert(symbols, &probe, string)?;
         flat.set_count(mc, flat.count(mc) | INTERNED);
         Ok(string)
+    }
+
+    /// Returns the interned string with the characters of the rope `rope`, which is `string`. If no string is that yet, the rope becomes it, as it is.
+    fn intern_rope(&self, rope: Gc<'gc, Rope>, string: Str<'gc>) -> Result<Str<'gc>, Error> {
+        let mc = self.mc;
+        if let Some(known) = self.known(string) {
+            return Ok(known);
+        }
+        let hash = self.hash(string)?;
+        let symbols = Symbols::of_arena(mc)?;
+        let mut probe = Probe::new(mc, symbols, hash);
+        for candidate in probe.by_ref() {
+            if same_chars(self, candidate, string)? {
+                // The rope is read as the interned string from now on. That is done only if it makes the rope no deeper: the ropes that contain this rope were balanced for the depth that it has.
+                if self.depth(candidate) <= Info::from_bits(rope.info(mc)).depth {
+                    self.flattened(string, candidate);
+                }
+                return Ok(candidate);
+            }
+        }
+        self.insert(symbols, &probe, string)?;
+        rope.set_reads(mc, rope.reads(mc) | INTERNED);
+        Ok(string)
+    }
+
+    /// Returns the depth of `string` as a rope. A flat string and a rope that is read as a flat string have a depth of 0.
+    fn depth(&self, string: Str<'gc>) -> u8 {
+        match self.view(string) {
+            StrView::Flat(_) => 0,
+            StrView::Rope { info, .. } => info.depth,
+        }
     }
 
     /// Returns the interned string with the characters in `built`, which are the `len` characters of a string that is not allocated yet. If the arena has no such string, a string is allocated for them and interned.
@@ -299,44 +345,35 @@ impl<'a, 'gc> Strings<'a, 'gc> {
         let width = <Gc<'gc, T> as Flat<'gc>>::WIDTH;
         let symbols = Symbols::of_arena(mc)?;
         let hash = narrowed(hash_units(Units::Packed(Packed::new(built, len, width)), symbols.seed(mc)));
-        let head = symbols.strings(mc, width);
-        let mut probe = Probe::<T>::new(mc, head, hash);
+        let mut probe = Probe::new(mc, symbols, hash);
         for candidate in probe.by_ref() {
-            // Two strings of one width with the same number of characters and the same words have the same characters.
-            if candidate.count(mc) & COUNT == len as u64 && candidate.words(mc).iter().zip(built).all(|(held, new)| held.get() == new.get()) {
-                return Ok(Str(Value::object(mc, candidate)));
+            // A string that fits in the buffer is never a rope, so only a flat string of this width can have these characters.
+            // Two such strings with the same number of characters and the same words have the same characters.
+            let Some(held) = Text::of(candidate.0).and_then(<Gc<'gc, T> as Flat<'gc>>::cast) else { continue };
+            if held.count(mc) & COUNT == len as u64 && held.words(mc).iter().zip(built).all(|(word, new)| word.get() == new.get()) {
+                return Ok(candidate);
             }
         }
         let object = mc.alloc_zeroed::<T, 1>([len as u64 | INTERNED | u64::from(hash) << HASH_SHIFT], built.len())?;
         for (word, new) in object.words(mc).iter().zip(built) {
             word.set(new.get());
         }
-        self.insert(symbols, head, &probe, object)?;
-        Ok(Str(Value::object(mc, object)))
+        let string = Str(Value::object(mc, object));
+        self.insert(symbols, &probe, string)?;
+        Ok(string)
     }
 
-    /// Puts `object` into the intern table `head`, in the slot where `probe` ended. `probe` has found no string with the characters of `object`. The table and its array are made if they do not exist, and the array is made anew if it is too full.
-    fn insert<T: Object>(&self, symbols: Symbols<'gc>, head: Option<Gc<'gc, Interns>>, probe: &Probe<'gc, T>, object: Gc<'gc, T>) -> Result<(), Error>
-    where
-        Gc<'gc, T>: Flat<'gc>,
-    {
+    /// Puts the string object `string` into the table of interned strings, in the slot where `probe` ended. `probe` has found no string with the characters of `string`. The array of the table is made if it does not exist, and made anew if it is too full.
+    fn insert(&self, symbols: Symbols<'gc>, probe: &Probe<'gc>, string: Str<'gc>) -> Result<(), Error> {
         let mc = self.mc;
-        let head = match head {
-            Some(head) => head,
-            None => {
-                let head = Interns::new(mc, Value::FALSE, 0)?;
-                symbols.set_strings(mc, <Gc<'gc, T> as Flat<'gc>>::WIDTH, head);
-                head
-            }
-        };
-        let used = head.used(mc) as usize;
+        let used = symbols.strings_used(mc);
         // The slot of a string that has died is taken as it is. A slot that was never used is taken while the table stays at most three quarters used.
         if let (Some(slots), Some(index)) = (probe.slots, probe.free)
             && (!probe.fresh || (used + 1) * 4 <= slots.len() * 3)
         {
-            slots.set(mc, index, (Some(object), probe.hash));
+            slots.set(mc, index, (Some(string.0), probe.hash));
             if probe.fresh {
-                head.set_used(mc, used as u64 + 1);
+                symbols.count_string(mc);
             }
             return Ok(());
         }
@@ -348,8 +385,8 @@ impl<'a, 'gc> Strings<'a, 'gc> {
             }
         }
         let len = (2 * (living + 1)).next_power_of_two().max(MIN_SLOTS);
-        let array = mc.alloc_items::<WeakSlots<T>, 0>([], len, Value::from_bits(0))?;
-        let slots = array.item_slots::<slot::Tagged<T>>(mc);
+        let array = InternSlots::new(mc, len, (None, 0))?;
+        let slots = array.items(mc);
         if let Some(old) = probe.slots {
             for index in 0..old.len() {
                 if let (Some(held), hash) = old.get(index) {
@@ -357,26 +394,9 @@ impl<'a, 'gc> Strings<'a, 'gc> {
                 }
             }
         }
-        place(mc, slots, probe.hash, object);
-        head.set_array(mc, Value::object(mc, array));
-        head.set_used(mc, living as u64 + 1);
+        place(mc, slots, probe.hash, string.0);
+        symbols.set_strings(mc, array, living + 1);
         Ok(())
-    }
-
-    /// Returns the interned string of unit type `T` with the characters of `string`, if there is one. `hash` is the hash of `string`.
-    fn twin<T: Object>(&self, hash: u32, string: Str<'gc>) -> Result<Option<Str<'gc>>, Error>
-    where
-        Gc<'gc, T>: Flat<'gc>,
-    {
-        let mc = self.mc;
-        let head = Symbols::of_arena(mc)?.strings(mc, <Gc<'gc, T> as Flat<'gc>>::WIDTH);
-        for candidate in Probe::<T>::new(mc, head, hash) {
-            let candidate = Str(Value::object(mc, candidate));
-            if same_chars(self, candidate, string)? {
-                return Ok(Some(candidate));
-            }
-        }
-        Ok(None)
     }
 
     /// Returns whether `string` is a flat string object in the arena, and not a string in the value word, a rope or an external string.
@@ -387,20 +407,15 @@ impl<'a, 'gc> Strings<'a, 'gc> {
     /// Returns the number of interned string objects, for tests.
     #[cfg(test)]
     fn interned_count(&self) -> usize {
-        fn living<'gc, T: Object>(mc: &Mutation<'gc>, head: Option<Gc<'gc, Interns>>) -> usize {
-            let Some(slots) = Probe::<T>::new(mc, head, 1).slots else { return 0 };
-            (0..slots.len()).filter(|&index| slots.get(index).0.is_some()).count()
-        }
-        let mc = self.mc;
-        let symbols = Symbols::of_arena(mc).expect("an intern table");
-        living::<Str8>(mc, symbols.strings(mc, Width::One)) + living::<Str16>(mc, symbols.strings(mc, Width::Two)) + living::<Str32>(mc, symbols.strings(mc, Width::Four))
+        let Some(slots) = Probe::new(self.mc, Symbols::of_arena(self.mc).expect("an intern table"), 1).slots else { return 0 };
+        (0..slots.len()).filter(|&index| slots.get(index).0.is_some()).count()
     }
 }
 
-/// A search of an intern table for the strings with one hash. It yields each interned string with that hash, in the order of the slots. Once it has ended, `free` is the slot that a new string with the hash can take, if the search passed one.
-struct Probe<'gc, T: Object> {
+/// A search of the table of interned strings for the strings with one hash. It yields each interned string with that hash, in the order of the slots. Once it has ended, `free` is the slot that a new string with the hash can take, if the search passed one.
+struct Probe<'gc> {
     /// The slots of the table, or `None` if the table has no array yet.
-    slots: Option<Slots<'gc, slot::Tagged<T>>>,
+    slots: Option<Slots<'gc, slot::Tagged>>,
     hash: u32,
     /// The next slot to look at, and the number of slots that are left to look at.
     at: usize,
@@ -410,18 +425,20 @@ struct Probe<'gc, T: Object> {
     fresh: bool,
 }
 
-impl<'gc, T: Object> Probe<'gc, T> {
-    fn new(mc: &Mutation<'gc>, head: Option<Gc<'gc, Interns>>, hash: u32) -> Self {
-        let slots = head.and_then(|head| head.array(mc).downcast::<WeakSlots<T>>(mc)).map(|array| array.item_slots::<slot::Tagged<T>>(mc));
+impl<'gc> Probe<'gc> {
+    #[inline]
+    fn new(mc: &Mutation<'gc>, symbols: Symbols<'gc>, hash: u32) -> Self {
+        let slots = symbols.strings(mc).map(|array| array.items(mc));
         let len = slots.map_or(0, |slots| slots.len());
         Self { slots, hash, at: hash as usize & len.wrapping_sub(1), left: len, free: None, fresh: false }
     }
 }
 
-impl<'gc, T: Object> Iterator for Probe<'gc, T> {
-    type Item = Gc<'gc, T>;
+impl<'gc> Iterator for Probe<'gc> {
+    type Item = Str<'gc>;
 
-    fn next(&mut self) -> Option<Gc<'gc, T>> {
+    #[inline]
+    fn next(&mut self) -> Option<Str<'gc>> {
         let slots = self.slots?;
         let mask = slots.len().wrapping_sub(1);
         while self.left > 0 {
@@ -429,7 +446,7 @@ impl<'gc, T: Object> Iterator for Probe<'gc, T> {
             self.at = (index + 1) & mask;
             self.left -= 1;
             match slots.get(index) {
-                (Some(held), hash) if hash == self.hash => return Some(held),
+                (Some(held), hash) if hash == self.hash => return Some(Str(held)),
                 (Some(_), _) => {}
                 // A slot that was never used ends the search.
                 (None, 0) => {
@@ -447,7 +464,7 @@ impl<'gc, T: Object> Iterator for Probe<'gc, T> {
 }
 
 /// Puts `object`, whose hash is `hash`, into the first slot of `slots` that was never used, starting at the slot of its hash. `slots` is a new array, which has such a slot.
-fn place<'gc, T: Object>(mc: &Mutation<'gc>, slots: Slots<'gc, slot::Tagged<T>>, hash: u32, object: Gc<'gc, T>) {
+fn place<'gc>(mc: &Mutation<'gc>, slots: Slots<'gc, slot::Tagged>, hash: u32, object: Value<'gc>) {
     let mask = slots.len().wrapping_sub(1);
     let mut at = hash as usize & mask;
     for _ in 0..slots.len() {
@@ -477,6 +494,9 @@ trait Flat<'gc>: Copy + PartialEq {
 
     /// Returns the words that hold the characters.
     fn words(self, mc: &Mutation<'gc>) -> &'gc [Cell<u64>];
+
+    /// Returns `text` as a flat string of this type, or `None` if it is a string of another kind.
+    fn cast(text: Text<'gc>) -> Option<Self>;
 }
 
 impl<'gc> Flat<'gc> for Gc<'gc, Str8> {
@@ -495,6 +515,13 @@ impl<'gc> Flat<'gc> for Gc<'gc, Str8> {
     #[inline]
     fn words(self, mc: &Mutation<'gc>) -> &'gc [Cell<u64>] {
         self.items(mc).words()
+    }
+    #[inline]
+    fn cast(text: Text<'gc>) -> Option<Self> {
+        match text {
+            Text::Str8(flat) => Some(flat),
+            _ => None,
+        }
     }
 }
 
@@ -515,6 +542,13 @@ impl<'gc> Flat<'gc> for Gc<'gc, Str16> {
     fn words(self, mc: &Mutation<'gc>) -> &'gc [Cell<u64>] {
         self.items(mc).words()
     }
+    #[inline]
+    fn cast(text: Text<'gc>) -> Option<Self> {
+        match text {
+            Text::Str16(flat) => Some(flat),
+            _ => None,
+        }
+    }
 }
 
 impl<'gc> Flat<'gc> for Gc<'gc, Str32> {
@@ -534,6 +568,13 @@ impl<'gc> Flat<'gc> for Gc<'gc, Str32> {
     fn words(self, mc: &Mutation<'gc>) -> &'gc [Cell<u64>] {
         self.items(mc).words()
     }
+    #[inline]
+    fn cast(text: Text<'gc>) -> Option<Self> {
+        match text {
+            Text::Str32(flat) => Some(flat),
+            _ => None,
+        }
+    }
 }
 
 impl<'gc> Strings<'_, 'gc> {
@@ -543,7 +584,7 @@ impl<'gc> Strings<'_, 'gc> {
         let mc = self.mc;
         match Text::of(string.0) {
             Some(Text::Rope(rope)) => {
-                // A rope that has been flattened is read as its flat copy. It has let go of its halves.
+                // A rope with a `flat` is read as that string. It has let go of its halves.
                 let flat = rope.flat(mc);
                 if flat != Value::FALSE {
                     return self.view(Str(flat));
@@ -628,8 +669,11 @@ impl<'gc> Host for Strings<'_, 'gc> {
             Some(Text::Str8(flat)) => (flat.chars(mc) & INTERNED != 0).then_some(string),
             Some(Text::Str16(flat)) => (flat.chars(mc) & INTERNED != 0).then_some(string),
             Some(Text::Str32(flat)) => (flat.chars(mc) & INTERNED != 0).then_some(string),
-            // A rope that has been flattened stands for its flat copy, which is interned.
+            // A rope is the interned string itself, or it keeps the interned string in `flat`. The flat copy of an interned rope is not interned.
             Some(Text::Rope(rope)) => {
+                if rope.reads(mc) & INTERNED != 0 {
+                    return Some(string);
+                }
                 let flat = rope.flat(mc);
                 (flat != Value::FALSE).then_some(Str(flat))
             }
@@ -651,8 +695,12 @@ impl<'gc> Host for Strings<'_, 'gc> {
     }
 
     fn flattened(&self, rope: Str<'gc>, flat: Str<'gc>) {
+        // An interned rope that is flattened has taken its flat copy already, and is its own flat string.
+        if rope == flat {
+            return;
+        }
         if let Some(Text::Rope(object)) = Text::of(rope.0) {
-            // The rope is read as its flat copy from now on, so it lets go of its halves. The characters are then held once.
+            // The rope is read as `flat` from now on, so it lets go of its halves. The characters are then held once.
             object.set_flat(self.mc, flat.0);
             object.set_left(self.mc, Value::FALSE);
             object.set_right(self.mc, Value::FALSE);
@@ -661,8 +709,9 @@ impl<'gc> Host for Strings<'_, 'gc> {
 
     fn count_read(&self, rope: Str<'gc>) -> u64 {
         let Some(Text::Rope(object)) = Text::of(rope.0) else { return 0 };
-        let reads = object.reads(self.mc) + 1;
-        object.set_reads(self.mc, reads);
+        let word = object.reads(self.mc);
+        let reads = ((word & COUNT) + 1).min(COUNT);
+        object.set_reads(self.mc, word & !COUNT | reads);
         reads
     }
 }

@@ -282,17 +282,19 @@ impl<U: Object> Item for Weak<U> {
     }
 }
 
-/// An item that refers weakly to an object of type `U`, with a 32-bit tag beside the reference. A hash table of weak references keeps a part of each entry's hash in the tag.
+/// An item that refers weakly to an object of any type, with a 32-bit tag beside the reference. A hash table of weak references keeps a part of each entry's hash in the tag.
 ///
 /// The collector moves the reference with the object and leaves the tag as it is. When the object dies, the reference is cleared and the tag stays. So an item that never held anything reads as `(None, 0)`, and an item whose object has died reads as `(None, tag)`.
-pub struct Tagged<U>(PhantomData<fn() -> U>);
+///
+/// A read returns the object as a value, with the type that the object has. A value that refers to no object is stored as no reference.
+pub struct Tagged;
 
-impl<U: Object> sealed::Sealed for Tagged<U> {}
+impl sealed::Sealed for Tagged {}
 
-impl<U: Object> Slot for Tagged<U> {
+impl Slot for Tagged {
     const ROLE: Role = Role::Weak;
-    type Out<'gc> = (Option<Gc<'gc, U>>, u32);
-    type In<'gc> = (Option<Gc<'gc, U>>, u32);
+    type Out<'gc> = (Option<super::Value<'gc>>, u32);
+    type In<'gc> = (Option<super::Value<'gc>>, u32);
 
     #[inline]
     fn get<'gc, T: Object>(gc: Gc<'gc, T>, mc: &Mutation<'gc>, field: usize) -> Self::Out<'gc> {
@@ -312,18 +314,19 @@ impl<U: Object> Slot for Tagged<U> {
     }
 }
 
-impl<U: Object> Item for Tagged<U> {
+impl Item for Tagged {
     const ITEMS: Items = Items::Weaks;
     const REFS: Refs = Refs::Weaks;
 
     #[inline]
     fn load<'gc>(region: &'gc RegionWords, word: u64) -> Self::Out<'gc> {
-        (super::target(region, word as u32), (word >> 32) as u32)
+        (super::object_at(region, word as u32), (word >> 32) as u32)
     }
 
     #[inline]
     fn store((object, tag): Self::In<'_>) -> u64 {
-        u64::from(tag) << 32 | object.map_or(0, Raw::to_word)
+        let index = object.and_then(super::Value::object_parts).map_or(0, |(_, index)| index);
+        u64::from(tag) << 32 | u64::from(index)
     }
 }
 
