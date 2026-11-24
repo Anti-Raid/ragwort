@@ -49,13 +49,15 @@ use crate::string::{Strings, chars};
 use crate::symbol::{Keyword, Symbol, Symbols};
 use crate::wire::{Malformed, Reader, Wire, Writer, mix, shape_of};
 
-const MAGIC: &[u8; 8] = b"ragwort\x01";
+const MAGIC: &[u8; 8] = b"ragwort\x02";
 
 /// The tag of an object's entry in the image's object table. It tells how the object is saved.
 const PLAIN: u8 = 0;
 const SYMBOL: u8 = 1;
 const KEYWORD: u8 = 2;
 const SYMBOLS: u8 = 3;
+/// A flat string object. It is saved as its text, and loaded as the arena's interned string with that text.
+const STRING: u8 = 4;
 
 /// A kind of frozen value that can be saved.
 #[derive(Clone, Copy)]
@@ -299,6 +301,10 @@ impl<'gc> Saver<'_, 'gc> {
                 table.u32((symbol >> 32) as u32);
             } else if ty == number_of::<Interned>() {
                 table.u8(SYMBOLS);
+            } else if let Some(string) = Strings::new(self.mc).string(object).filter(|&string| Strings::new(self.mc).is_object(string)) {
+                table.u8(STRING);
+                let text: String = chars(&Strings::new(self.mc), string).collect();
+                table.bytes(text.as_bytes());
             } else {
                 let desc = self.heap.desc(header).filter(|desc| desc.number.is_some()).ok_or(SaveError::Unnumbered)?;
                 table.u8(PLAIN);
@@ -474,6 +480,7 @@ enum Entry {
     /// A keyword, with the position of its symbol.
     Keyword(u32),
     Symbols,
+    String,
 }
 
 /// Rebuilds the objects serialized in `bytes`, which [`save`] wrote, and returns the roots that `save` was given.
@@ -551,6 +558,15 @@ pub fn load<'gc>(mc: &Mutation<'gc>, stamp: u64, bytes: &[u8], descs: &[&'static
                 let name = std::str::from_utf8(table.bytes()?).map_err(|_| Malformed)?;
                 (Entry::Symbol, index_of(symbols.intern_str(&strings, name)?.value(mc)))
             }
+            STRING => {
+                let text = std::str::from_utf8(table.bytes()?).map_err(|_| Malformed)?;
+                let string = crate::string::from_str(&strings, text)?.value();
+                // A text that was saved as an object is too long for the value word, so it is an object again.
+                if string.to_bits() & TAG != OBJECT {
+                    return Err(LoadError::Malformed);
+                }
+                (Entry::String, index_of(string))
+            }
             // The keyword is created in the next loop, once its symbol exists.
             KEYWORD => (Entry::Keyword(table.u32()?), 0),
             SYMBOLS => (Entry::Symbols, index_of(symbols.value(mc))),
@@ -572,15 +588,6 @@ pub fn load<'gc>(mc: &Mutation<'gc>, stamp: u64, bytes: &[u8], descs: &[&'static
     for (place, entry) in entries.iter().enumerate() {
         if let &Entry::Plain(desc, len) = entry {
             loader.object(loader.indices[place], desc, len, &mut words)?;
-        }
-    }
-    // A string that was interned when it was saved is registered in this arena's tables, unless the arena has an interned string with the same characters.
-    for (place, entry) in entries.iter().enumerate() {
-        if let &Entry::Plain(desc, _) = entry
-            && crate::string::is_flat_type(desc)
-            && let Some(string) = strings.string(Value::from_bits(u64::from(loader.indices[place]) << 32 | u64::from(desc.number.unwrap_or(0)) << 16 | OBJECT))
-        {
-            strings.adopt(string).map_err(|_| LoadError::OutOfMemory)?;
         }
     }
     // The image's tree of table shapes becomes the arena's, if the arena has none yet. Tables that are built in this arena then get the same shapes as the tables of the image's code. The shape without a parent is the root of the tree.

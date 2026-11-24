@@ -249,19 +249,21 @@ fn time(setup: &str, body: &str) -> Duration {
     best
 }
 
-/// Returns the bytes charged to an arena that holds `count` tables, after a collection. `make` is an expression that makes a table and uses it as the program would.
-fn held(make: &str, count: usize) -> usize {
+/// Returns the bytes of the pages that hold objects in an arena that holds `count` values, after a collection, and the number of live objects. `make` is an expression that makes a value, such as a table, and uses it as the program would. It can refer to `i`, the number of the value. `setup` is a sequence of definitions that run first.
+fn held(setup: &str, make: &str, count: usize) -> (usize, usize) {
     let mut arena = arena();
-    let text = format!("(require \"events\") (define keep (make-vector {count} #f)) (let loop ((i 0)) (if (< i {count}) (begin (vector-set! keep i {make}) (loop (+ i 1))) #t))");
+    let text = format!("(require \"events\") {setup} (define keep (make-vector {count} #f)) (let loop ((i 0)) (if (< i {count}) (begin (vector-set! keep i {make}) (loop (+ i 1))) #t))");
     let mut machine = loaded(&mut arena, "keep", Language::Scheme, &text);
     finish(&mut arena, &mut machine);
     arena.collect();
-    arena.used()
+    arena.collect();
+    (arena.occupied_bytes(), arena.objects())
 }
 
 /// Returns the number of bytes that one table takes while a program holds it. The arena charges whole pages, so the size is the difference between holding four times [`HELD`] tables and holding eight times as many.
-fn size(make: &str) -> f64 {
-    (held(make, 8 * HELD) - held(make, 4 * HELD)) as f64 / (4 * HELD) as f64
+fn size(setup: &str, make: &str) -> (f64, f64) {
+    let (more, less) = (held(setup, make, 8 * HELD), held(setup, make, 4 * HELD));
+    ((more.0 - less.0) as f64 / (4 * HELD) as f64, (more.1 - less.1) as f64 / (4 * HELD) as f64)
 }
 
 fn main() {
@@ -344,6 +346,23 @@ fn main() {
         if !name.contains(&only) {
             continue;
         }
-        println!("{name:<42} {:6.0} bytes per table", size(&make));
+        let (bytes, objects) = size("", &make);
+        println!("{name:<42} {bytes:6.0} bytes per table, in {objects:.1} objects");
+    }
+    println!();
+    // Strings that a program holds. Each text is about 36 characters, or about 606 for the long ones.
+    let piece = "(define piece (make-string 600 #\\x)) (define other (string-append piece \"zzzzzz\"))";
+    let strings = [
+        ("string, a different text each", "", "(string-append \"a string that is kept, number \" (number->string (+ 100000 i)))"),
+        ("string, the same text each time", "", "(string-append \"a string that is the same \" \"every time\")"),
+        ("long string on a shared piece", piece, "(string-append piece (number->string (+ 100000 i)))"),
+        ("long string on a shared piece, compared", piece, "(let ((s (string-append piece (number->string (+ 100000 i))))) (string=? s other) s)"),
+    ];
+    for (name, setup, make) in strings {
+        if !name.contains(&only) {
+            continue;
+        }
+        let (bytes, objects) = size(setup, make);
+        println!("{name:<42} {bytes:6.0} bytes per string, in {objects:.1} objects");
     }
 }

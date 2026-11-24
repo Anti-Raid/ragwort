@@ -3,7 +3,7 @@ use crate::gc::table::{Strong, Table, TableHead};
 use crate::gc::{Arena, HostRef, objects};
 use crate::num::{Nums, int};
 use crate::pair::{Pair, Pairs};
-use crate::string;
+use crate::string::{self, Str};
 use crate::syntax::{Syntax, SyntaxSession, SyntaxSpan};
 use crate::vector::Vectors;
 
@@ -156,41 +156,39 @@ fn what_the_host_owns_is_not_saved() {
     assert_ne!(shape(&descs(), &kinds()), shape(&descs(), &[]));
 }
 
-/// A string that was interned when it was saved is the interned string of its text after a load. If the arena already has that text interned, the loaded string is an ordinary string and the arena's string stays the interned one.
+/// A string in an image is loaded as the arena's interned string with its characters. If the arena already has that text, the loaded string is the arena's own.
 #[test]
-fn interned_strings_are_interned_again_when_loaded() {
-    const FIRST: &str = "an interned string that the image holds";
-    const SECOND: &str = "a string that the image holds without interning it";
+fn loaded_strings_are_the_interned_strings_of_the_arena() {
+    const FIRST: &str = "a string that the image holds";
+    const SECOND: &str = "another string of the image, with two-byte characters: Ārvīds";
     let mut saving = Arena::new(1 << 22, 0);
     let bytes = saving.mutate(|mc| {
-        let strings = Strings::new(mc);
-        let first = strings.intern(string::from_str(&strings, FIRST).unwrap()).unwrap();
-        let second = string::from_str(&strings, SECOND).unwrap();
-        assert!(strings.is_interned(first) && !strings.is_interned(second));
-        save(mc, STAMP, &[first.value(), second.value()], &kinds()).unwrap()
+        let (strings, pairs) = (Strings::new(mc), Pairs::new(mc));
+        let first = string::from_str(&strings, FIRST).unwrap().value();
+        let second = string::from_str(&strings, SECOND).unwrap().value();
+        // The first string is saved from two places.
+        save(mc, STAMP, &[pairs.list(&[first, second, first]).unwrap()], &kinds()).unwrap()
     });
-    // An arena that has not interned the text takes the loaded string as the interned one.
+    // An arena that has not made the texts takes the loaded strings as its interned strings.
     let mut fresh = Arena::new(1 << 22, 0);
     fresh.mutate(|mc| {
         let roots = load(mc, STAMP, &bytes, &descs(), &kinds(), &()).unwrap();
-        let strings = Strings::new(mc);
-        let (first, second) = (strings.string(roots[0]).unwrap(), strings.string(roots[1]).unwrap());
-        assert!(strings.is_interned(first) && !strings.is_interned(second));
-        assert_eq!((text(mc, roots[0]), text(mc, roots[1])), (FIRST.to_string(), SECOND.to_string()));
-        assert_eq!(strings.intern(string::from_str(&strings, FIRST).unwrap()), Ok(first));
-        assert_eq!((strings.interned(string::from_str(&strings, SECOND).unwrap()), strings.hash(first)), (Ok(None), strings.hash(string::from_str(&strings, FIRST).unwrap())));
+        let (strings, pairs) = (Strings::new(mc), Pairs::new(mc));
+        let items: Vec<Value> = pairs.elements(roots[0]).collect();
+        assert_eq!((text(mc, items[0]), text(mc, items[1]), items[0] == items[2]), (FIRST.to_string(), SECOND.to_string(), true));
+        let first = strings.string(items[0]).unwrap();
+        assert!(strings.is_interned(first) && strings.is_interned(strings.string(items[1]).unwrap()));
+        assert_eq!((string::from_str(&strings, FIRST), string::from_str(&strings, SECOND).map(Str::value)), (Ok(first), Ok(items[1])));
     });
-    // An arena with the same seed that interned the text before the load keeps its own string.
+    // An arena with the same seed that made the first text before the load keeps its own string, and the loaded data refers to it.
     let seed = fresh.mutate(|mc| Symbols::of_arena(mc).unwrap().seed(mc));
     let mut used = Arena::new(1 << 22, 0);
     used.mutate(|mc| {
         Symbols::with_seed(mc, seed).unwrap();
-        let strings = Strings::new(mc);
-        let own = strings.intern(string::from_str(&strings, FIRST).unwrap()).unwrap();
+        let (strings, pairs) = (Strings::new(mc), Pairs::new(mc));
+        let own = string::from_str(&strings, FIRST).unwrap();
         let roots = load(mc, STAMP, &bytes, &descs(), &kinds(), &()).unwrap();
-        let first = strings.string(roots[0]).unwrap();
-        assert!(first != own && !strings.is_interned(first) && strings.is_interned(own));
-        assert_eq!((strings.intern(first), strings.interned(first), text(mc, roots[0])), (Ok(own), Ok(Some(own)), FIRST.to_string()));
+        let items: Vec<Value> = pairs.elements(roots[0]).collect();
+        assert_eq!((items[0], items[2], text(mc, items[1])), (own.value(), own.value(), SECOND.to_string()));
     });
 }
-

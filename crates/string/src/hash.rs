@@ -184,6 +184,12 @@ fn rope_hash<H: Host>(h: &H, string: H::Str, seed: u64) -> Result<u64, H::Error>
     })
 }
 
+/// Returns the hash that [`hash`] gives a flat string with the units `units`, which must be at their narrowest width. A host uses it to hash characters that are not in a string yet.
+#[inline]
+pub fn hash_units(units: Units<'_>, seed: u64) -> u64 {
+    hash_flat(units, seed)
+}
+
 /// Returns the hash of a flat string's units, which are at their narrowest width.
 #[inline]
 fn hash_flat(units: Units<'_>, seed: u64) -> u64 {

@@ -28,7 +28,7 @@ use std::fmt;
 pub use case::{compare_ci, downcase, downcase_char, foldcase, foldcase_char, upcase, upcase_char};
 pub use digit::digit_value;
 pub use external::{External, ExternalText, check_external};
-pub use hash::{hash, hash_str};
+pub use hash::{hash, hash_str, hash_units};
 pub use intern::{Table, intern, intern_str};
 pub use iter::{Chars, Chunks};
 pub use rope::{concat, concat_all, flatten, substring};
@@ -89,7 +89,23 @@ pub trait Host {
 
     /// Allocates a flat string of `len` characters at `width`. The units start zeroed, and `init` fills them in.
     /// Views of other strings stay valid while `init` runs.
+    ///
+    /// A host that interns its strings can return a string that it already has with the same characters.
     fn flat(&self, width: Width, len: usize, init: impl FnOnce(UnitsMut<'_>)) -> Result<Self::Str, Self::Error>;
+
+    /// Returns the interned string of `string`, if the host interns its strings and already knows it for this handle. Finding it must take no work that grows with the length of the string.
+    ///
+    /// Two strings that this returns have the same characters exactly when they are the same handle. The default returns `None`: the host interns nothing.
+    fn known(&self, string: Self::Str) -> Option<Self::Str> {
+        let _ = string;
+        None
+    }
+
+    /// Returns the interned string of `string`, and interns `string` if that is needed to find it. Returns `None` if the host does not intern this string. See [`Host::known`].
+    fn canonical(&self, string: Self::Str) -> Result<Option<Self::Str>, Self::Error> {
+        let _ = string;
+        Ok(None)
+    }
 
     /// Allocates a rope node of `left` followed by `right`. Both are nonempty, and `info` describes the new node.
     fn rope(&self, left: Self::Str, right: Self::Str, info: Info) -> Result<Self::Str, Self::Error>;
@@ -273,6 +289,10 @@ pub fn equal<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<bool, H::Error> {
     if a == b {
         return Ok(true);
     }
+    // Two interned strings are compared as handles. No character is read.
+    if let (Some(first), Some(second)) = (h.known(a), h.known(b)) {
+        return Ok(first == second);
+    }
     if let (Some(units_a), Some(units_b)) = (flat(h, a), flat(h, b)) {
         if units_a.len() != units_b.len() || units_a.width() != units_b.width() {
             return Ok(false);
@@ -280,17 +300,32 @@ pub fn equal<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<bool, H::Error> {
         h.charge(units_a.len() as u64)?;
         return Ok(units_a.equal(units_b));
     }
-    rope_equal(h, a, b)
+    rope_equal(h, a, b, true)
 }
 
+/// Returns whether `a` and `b` have the same characters, by reading the characters. Unlike [`equal`], this interns nothing and leaves a rope as it is. A host that interns its strings uses it to look a string up among them.
+pub fn same_chars<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<bool, H::Error> {
+    if a == b {
+        return Ok(true);
+    }
+    rope_equal(h, a, b, false)
+}
+
+/// Compares two strings of which at least one is not flat, or which are compared by their characters. If `intern` is true, a host that interns its strings interns the two and compares the interned strings.
 #[inline(never)]
-fn rope_equal<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<bool, H::Error> {
+fn rope_equal<H: Host>(h: &H, a: H::Str, b: H::Str, intern: bool) -> Result<bool, H::Error> {
     let (ia, fa) = summary(h, a);
     let (ib, fb) = summary(h, b);
     if ia.len != ib.len || ia.width != ib.width {
         return Ok(false);
     }
     h.charge(ia.len as u64)?;
+    // The two interned strings are compared as handles, now and from now on.
+    if intern
+        && let (Some(first), Some(second)) = (h.canonical(a)?, h.canonical(b)?)
+    {
+        return Ok(first == second);
+    }
     if let (Some(units_a), Some(units_b)) = (fa, fb) {
         return Ok(units_a.equal(units_b));
     }

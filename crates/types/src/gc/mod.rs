@@ -2695,12 +2695,13 @@ impl<'a> Heap<'a> {
         }
     }
 
-    /// Sets the weak slot `slot` to 0 if its target was not marked.
+    /// Clears the reference in the weak slot `slot` if its target was not marked. The reference is the lower half of the word. The upper half is left as it is: a [`slot::Tagged`] item keeps a tag there, which marks the slot as used after its object has died.
     #[inline]
     fn clear_dead(self, slot: &Cell<u64>) {
-        let target = slot.get() as u32;
+        let word = slot.get();
+        let target = word as u32;
         if target != 0 && !self.has_bit(target as usize, |page| &page.marks) {
-            slot.set(0);
+            slot.set(word & !0xFFFF_FFFF);
         }
     }
 

@@ -1106,23 +1106,32 @@ fn a_copy_keeps_the_entries_and_the_shape() {
     });
 }
 
-/// Tables that are given equal strings as field names share a shape, also when the strings are separate objects. They list the string of the shape. External references are shared as keys only if they are the same object.
+/// Equal strings are one string, so tables that are given the same text as a field name share a shape. A rope is stored as its interned string. External references are shared as keys only if they are the same object.
 #[test]
 fn equal_strings_are_one_key_of_a_shape() {
     arena().mutate(|mc| {
         let tables = Tables::new(mc);
         let strings = Strings::new(mc);
         let (first_key, second_key) = (text(mc, LONG_KEY), text(mc, LONG_KEY));
-        assert!(first_key != second_key);
+        assert!(first_key == second_key);
         let (first, second) = (tables.make().unwrap(), tables.make().unwrap());
         first.set_field(mc, first_key, fix(1)).unwrap();
         second.set_field(mc, second_key, fix(2)).unwrap();
         assert!(first.shape(mc).is_some() && first.shape(mc) == second.shape(mc));
-        assert_eq!((tables.shape(&[text(mc, LONG_KEY)]).ok(), first.get(mc, second_key), second.get(mc, first_key), second.len(mc)), (first.shape(mc), Ok(Some(fix(1))), Ok(Some(fix(2))), 1));
-        // The second table lists the string that the shape was given first. It has the characters of the string that the table was given.
-        let listed = entries(mc, second);
-        assert_eq!(listed, vec![(first_key, fix(2))]);
-        assert_eq!(string::equal(&strings, strings.string(listed[0].0).unwrap(), strings.string(second_key).unwrap()), Ok(true));
+        assert_eq!((tables.shape(&[text(mc, LONG_KEY)]).ok(), first.get(mc, second_key), entries(mc, second)), (first.shape(mc), Ok(Some(fix(1))), vec![(first_key, fix(2))]));
+        // A key that is a rope is stored as its interned string, in a table with a shape and in a table with keys of its own. The rope and every string with its characters find the entry.
+        let (head, tail) = ("a long key ".repeat(60), "that is a rope".to_string());
+        let rope = concat(&strings, strings.string(text(mc, &head)).unwrap(), strings.string(text(mc, &tail)).unwrap()).unwrap();
+        assert!(!string::is_flat(&strings, rope));
+        let (fielded, mapped) = (tables.make().unwrap(), tables.with_room(4).unwrap());
+        fielded.set_field(mc, rope.value(), fix(1)).unwrap();
+        mapped.set(mc, rope.value(), fix(2)).unwrap();
+        let flat = text(mc, &format!("{head}{tail}"));
+        assert!(flat != rope.value() && strings.is_interned(strings.string(flat).unwrap()));
+        assert_eq!((entries(mc, fielded), entries(mc, mapped), tables.shape(&[rope.value()]).ok()), (vec![(flat, fix(1))], vec![(flat, fix(2))], fielded.shape(mc)));
+        let again = concat(&strings, strings.string(text(mc, &head[..330])).unwrap(), strings.string(text(mc, &format!("{}{tail}", &head[330..]))).unwrap()).unwrap();
+        assert!(!string::is_flat(&strings, again));
+        assert_eq!((fielded.get(mc, rope.value()), mapped.get(mc, again.value()), mapped.get(mc, flat), mapped.has(mc, text(mc, &head))), (Ok(Some(fix(1))), Ok(Some(fix(2))), Ok(Some(fix(2))), Ok(false)));
         // Numbers that are objects are shared by value as well.
         let (third, fourth) = (tables.make().unwrap(), tables.make().unwrap());
         third.set_field(mc, Value::flonum(mc, 2.5).unwrap(), fix(3)).unwrap();

@@ -95,7 +95,8 @@ fn sub<H: Host>(h: &H, string: H::Str, start: usize, end: usize) -> Res<H> {
 /// Returns `string` as one flat string. A new flat copy of a rope is passed to [`Host::flattened`], so that the rope can keep it for later reads.
 pub fn flatten<H: Host>(h: &H, string: H::Str) -> Res<H> {
     match h.view(string) {
-        StrView::Flat(_) => Ok(string),
+        // A host can read a flattened rope as a flat string. The flat copy is then the string that it knows for the rope.
+        StrView::Flat(_) => Ok(h.known(string).unwrap_or(string)),
         StrView::Rope { flat: Some(flat), .. } => Ok(flat),
         StrView::Rope { info, .. } => {
             let flat = copy_range(h, string, 0, info.len)?;

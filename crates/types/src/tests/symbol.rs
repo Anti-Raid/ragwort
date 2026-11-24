@@ -99,9 +99,9 @@ fn unreachable_symbols_are_collected() {
     });
     arena.collect();
     arena.collect();
-    // The live objects are the kept symbols, their names, and a few containers.
+    // The live objects are the kept symbols, their names, and a few containers: the roots and the intern tables.
     let live = arena.objects();
-    assert!((2 * 1000..2 * 1000 + 10).contains(&live), "{live} objects");
+    assert!((2 * 1000..2 * 1000 + 20).contains(&live), "{live} objects");
     arena.mutate(|mc| {
         let (symbols, kept) = roots(mc);
         let h = Strings::new(mc);

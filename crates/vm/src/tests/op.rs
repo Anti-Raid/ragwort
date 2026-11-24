@@ -271,10 +271,16 @@ fn equality_goes_as_deep_as_it_should() {
         assert!(!test(cx, equal, fix(2), Value::flonum(mc, 2.0).unwrap()));
         assert!(!test(cx, Intrinsic::Eq, big(mc, 1), big(mc, 1)));
 
-        // Strings with equivalent character sequences compare `equal?`, but satisfy `eqv?` only when referencing the exact same heap allocation.
+        // A text has one flat string in the arena. So two strings that are made with the same characters are the same value, and are `eq?`, `eqv?` and `equal?`.
         let long = "a string too long to fit in a value";
-        assert!(!test(cx, eqv, text(mc, long), text(mc, long)));
+        assert!(test(cx, eqv, text(mc, long), text(mc, long)) && test(cx, Intrinsic::Eq, text(mc, long), text(mc, long)));
         assert!(test(cx, equal, text(mc, long), text(mc, long)));
+        // A string that was joined from two long parts is a rope: another object with the same characters as its flat string. It is `equal?` to that string, and not `eqv?`.
+        let strings = ragwort_types::string::Strings::new(mc);
+        let (head, tail) = ("x".repeat(600), "y".repeat(40));
+        let joined = ragwort_types::string::concat(&strings, strings.string(text(mc, &head)).unwrap(), strings.string(text(mc, &tail)).unwrap()).unwrap().value();
+        let whole = text(mc, &format!("{head}{tail}"));
+        assert!(!test(cx, eqv, joined, whole) && test(cx, equal, joined, whole) && !test(cx, equal, joined, text(mc, &head)));
         assert!(!test(cx, equal, text(mc, long), text(mc, "a string too long to fit in a value!")));
         assert!(!test(cx, equal, text(mc, "1"), fix(1)));
 

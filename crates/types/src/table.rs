@@ -313,6 +313,7 @@ impl<'gc> Shape<'gc> {
     ///
     /// Fails with the position that `key` would have if the shape cannot take it. See [`ShapeError`].
     pub fn child(self, mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Self, ShapeError> {
+        let key = stored(mc, key)?;
         let hashed = hash(mc, self.0.seed(mc), key)?;
         if self.position_hashed(mc, key, hashed.hash)?.is_some() {
             return Err(ShapeError::Duplicate(self.len(mc)));
@@ -672,6 +673,7 @@ impl<'gc> Table<'gc> {
     /// Sets the value of `key` as [`Table::set`] does. Returns the place of the entry, as
     /// [`Table::find`] does. Returns `None` for an external table.
     pub fn set_finding(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) -> Result<Option<Place<'gc>>, TableError> {
+        let key = stored(mc, key)?;
         match self.0 {
             Kept::Inside(table) => Ok(Some(table.set(mc, key, value)?)),
             Kept::Record(table) => Ok(Some(table.set(mc, key, value)?)),
@@ -687,6 +689,7 @@ impl<'gc> Table<'gc> {
     ///
     /// The table gets keys of its own, as it does in [`Table::set`], if a shape cannot take the key. See [`ShapeError`].
     pub fn set_field(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) -> Result<Option<Place<'gc>>, TableError> {
+        let key = stored(mc, key)?;
         match self.0 {
             Kept::Inside(table) => Ok(Some(table.set_field(mc, key, value)?)),
             Kept::Record(table) => Ok(Some(table.set_field(mc, key, value)?)),
@@ -2214,6 +2217,15 @@ fn hash_other<'gc>(mc: &Mutation<'gc>, seed: u64, key: Value<'gc>) -> Hashed {
         return Hashed { hash: mix(hash ^ seed ^ EXTERNAL), by_place: false };
     }
     Hashed { hash: mix(key.to_bits() ^ seed), by_place: key.object_parts().is_some() }
+}
+
+/// Returns the key that a table or a shape stores for `key`. A rope is stored as its interned string, so the string keys that are held in the arena are interned strings, and two of them are the same key exactly when they are the same value. Any other key is stored as it is.
+fn stored<'gc>(mc: &Mutation<'gc>, key: Value<'gc>) -> Result<Value<'gc>, Error> {
+    let strings = Strings::new(mc);
+    match strings.string(key) {
+        Some(text) => Ok(strings.intern(text)?.value()),
+        None => Ok(key),
+    }
 }
 
 /// Returns whether `held`, a key of a shape, is the key that the tables of the shape list for `key`. See [`Shape::child`].
