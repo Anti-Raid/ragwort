@@ -466,7 +466,7 @@ impl<'gc> Printer<'_, 'gc> {
         } else if let Some(symbol) = Symbol::of(value) {
             self.symbol(symbol, write)?;
         } else if let Some(keyword) = Keyword::of(value) {
-            let name = string::display(&self.strings, keyword.symbol(self.mc).name(self.mc)).to_string();
+            let name = string::to_string(&self.strings, keyword.symbol(self.mc).name(self.mc));
             self.out.push_str("#:");
             let bars = name.is_empty() || name.bytes().any(ends_name) || name.chars().any(|character| character.is_control() || character.is_whitespace());
             if write && bars { self.write_text(name.chars(), '|') } else { self.out.push_str(&name) }
@@ -476,6 +476,8 @@ impl<'gc> Printer<'_, 'gc> {
             } else {
                 self.out.push(character);
             }
+        } else if let Some((offset, _)) = value.as_cursor() {
+            write!(self.out, "#<string-cursor {offset}>")?;
         } else if let Some(number) = self.nums.number(value) {
             self.number(number)?;
         } else if let Some(bytes) = Bytevectors::new(mc).bytevector(value) {
@@ -524,7 +526,7 @@ impl<'gc> Printer<'_, 'gc> {
     }
 
     fn symbol(&mut self, symbol: Symbol<'gc>, write: bool) -> Result<(), PrintError> {
-        let name = string::display(&self.strings, symbol.name(self.mc)).to_string();
+        let name = string::to_string(&self.strings, symbol.name(self.mc));
         if write && self.needs_bars(&name) {
             self.write_text(name.chars(), '|');
         } else {

@@ -20,6 +20,7 @@ pub mod gc;
 pub mod num;
 mod objects;
 pub mod pair;
+pub mod store;
 pub mod string;
 pub mod symbol;
 pub mod syntax;

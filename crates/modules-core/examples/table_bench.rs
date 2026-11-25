@@ -357,6 +357,9 @@ fn main() {
         ("string, the same text each time", "", "(string-append \"a string that is the same \" \"every time\")"),
         ("long string on a shared piece", piece, "(string-append piece (number->string (+ 100000 i)))"),
         ("long string on a shared piece, compared", piece, "(let ((s (string-append piece (number->string (+ 100000 i))))) (string=? s other) s)"),
+        // Text with an emoji, as chat messages have: about 38 characters, and a message of about 100.
+        ("string with an emoji, a different text each", "", "(string-append \"a string 😀 that is kept, number \" (number->string (+ 100000 i)))"),
+        ("message of 100 characters with an emoji", "", "(string-append \"😀 \" (number->string (+ 100000 i)) \" \" (make-string 90 #\\a))"),
     ];
     for (name, setup, make) in strings {
         if !name.contains(&only) {

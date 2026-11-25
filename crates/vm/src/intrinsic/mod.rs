@@ -340,9 +340,10 @@ named! {
         /// shared immutable representations for long strings to avoid copying.
         StringAppend = ("string-append", any(TRUTHY)),
         /// `(substring s start [end])`: extracts a substring of `s` over index range `[start, end)`
-        /// (defaulting `end` to the length of `s`).
+        /// (defaulting `end` to the length of `s`). `start` and `end` are character indices or string cursors.
         Substring = ("substring", any(TRUTHY)),
         /// `(string-ref s k)`: returns the `k`th character (zero-indexed Unicode scalar value) of string `s`.
+        /// `k` can also be a string cursor, which gives the character at the cursor.
         StringRef = ("string-ref", takes(2, FOLD | TRUTHY)),
         /// `(string=? s1 s2 ...)`: returns `#t` if all string arguments contain identical sequences
         /// of characters; all arguments are checked for correct types even if a comparison fails.
@@ -470,11 +471,44 @@ named! {
         /// string `s`, and `#f` otherwise.
         IsStringContains = ("string-contains?", takes(2, FOLD)),
         /// `(string-find s part [start])`: returns the character index of the first occurrence of
-        /// `part` in `s` at or after `start`, or `#f` if not found.
+        /// `part` in `s` at or after `start`, or `#f` if not found. `start` is a character index or a string cursor.
         StringFind = ("string-find", any(FOLD)),
         /// `(string-find-last s part [end])`: returns the character index of the last occurrence of
-        /// `part` in `s` ending before index `end`, or `#f` if not found.
+        /// `part` in `s` ending before index `end`, or `#f` if not found. `end` is a character index or a string cursor.
         StringFindLast = ("string-find-last", any(FOLD)),
+        /// `(string-find-cursor s part [start])`: like `string-find`, but returns a string cursor at the occurrence.
+        /// No characters are counted, so the search takes the same time in any text.
+        StringFindCursor = ("string-find-cursor", any(0)),
+        /// `(string-find-last-cursor s part [end])`: like `string-find-last`, but returns a string cursor at the occurrence.
+        StringFindLastCursor = ("string-find-last-cursor", any(0)),
+        /// `(string-cursor? x)`: returns `#t` if `x` is a string cursor, and `#f` otherwise. A string cursor is a position in a string
+        /// that takes constant time to use, whatever characters the string has. A cursor belongs to the text of the string that it was made for:
+        /// every procedure that takes a cursor raises an error if it is given with a string that has other characters.
+        IsStringCursor = ("string-cursor?", takes(1, FOLD | DISCARD | PREDICATE)),
+        /// `(string-cursor-start s)`: returns the cursor at the first character of string `s`.
+        StringCursorStart = ("string-cursor-start", takes(1, TRUTHY)),
+        /// `(string-cursor-end s)`: returns the cursor after the last character of string `s`.
+        StringCursorEnd = ("string-cursor-end", takes(1, TRUTHY)),
+        /// `(string-cursor-next s cursor)`: returns the cursor one character after `cursor` in string `s`. It is an error at the end of `s`.
+        StringCursorNext = ("string-cursor-next", takes(2, TRUTHY)),
+        /// `(string-cursor-prev s cursor)`: returns the cursor one character before `cursor` in string `s`. It is an error at the start of `s`.
+        StringCursorPrev = ("string-cursor-prev", takes(2, TRUTHY)),
+        /// `(string-cursor->index s cursor)`: returns the character index of `cursor` in string `s`. The characters before it are counted.
+        StringCursorToIndex = ("string-cursor->index", takes(2, TRUTHY)),
+        /// `(string-index->cursor s k)`: returns the cursor at character index `k` of string `s`. The characters before it are counted.
+        StringIndexToCursor = ("string-index->cursor", takes(2, TRUTHY)),
+        /// `(string-cursor=? a b)`: returns `#t` if cursors `a` and `b` are the same position of the same text. `eqv?` gives the same answer for two cursors.
+        StringCursorEq = ("string-cursor=?", takes(2, 0)),
+        /// `(string-cursor<? a b)`: returns `#t` if cursor `a` is before cursor `b`. It is an error if the two were made for different texts.
+        StringCursorLt = ("string-cursor<?", takes(2, 0)),
+        /// `(string-cursor-offset cursor)`: returns the byte offset that `cursor` holds, as an exact integer.
+        StringCursorOffset = ("string-cursor-offset", takes(1, TRUTHY)),
+        /// `(string-offset->cursor s offset)`: returns the cursor at byte offset `offset` of string `s`. It is an error if no character starts there.
+        StringOffsetToCursor = ("string-offset->cursor", takes(2, TRUTHY)),
+        /// `(string-byte-length s)`: returns the number of bytes that string `s` takes as UTF-8.
+        StringByteLength = ("string-byte-length", takes(1, FOLD | TRUTHY)),
+        /// `(string-byte-ref s offset)`: returns the byte at byte offset `offset` of the UTF-8 of string `s`, as an exact integer.
+        StringByteRef = ("string-byte-ref", takes(2, FOLD | TRUTHY)),
         /// `(string-split s sep trim? repeat?)`: splits `s` by delimiter string `sep` (or runs of
         /// whitespace if `sep` is `#f`), returning a list of substrings with optional boundary trimming
         /// (`trim?`) and collapsing of repeated delimiters (`repeat?`).
@@ -1168,13 +1202,21 @@ impl Intrinsic {
             Intrinsic::Substring | Intrinsic::StringToList => {
                 let strings = Strings::new(mc);
                 let string = strings.string(operands.get(0)).ok_or(Fault::WrongType)?;
-                let start = if operands.count() > 1 { index(operands.get(1))? } else { 0 };
-                let end = if operands.count() > 2 { index(operands.get(2))? } else { string::len(&strings, string) };
-                let part = if (start, end) == (0, string::len(&strings, string)) { string } else { string::substring(&strings, string, start, end)? };
+                let cursors = operands.count() > 1 && operands.get(1).as_cursor().is_some() || operands.count() > 2 && operands.get(2).as_cursor().is_some();
+                let part = if cursors {
+                    // With a cursor at either end, both ends are taken as byte offsets. No characters are counted for a cursor.
+                    let start = text::offset(&strings, string, operands.get(1))?;
+                    let end = if operands.count() > 2 { text::offset(&strings, string, operands.get(2))? } else { string::byte_len(&strings, string) };
+                    string::substring_bytes(&strings, string, start, end)?
+                } else {
+                    let start = if operands.count() > 1 { index(operands.get(1))? } else { 0 };
+                    let end = if operands.count() > 2 { index(operands.get(2))? } else { string::len(&strings, string) };
+                    if (start, end) == (0, string::len(&strings, string)) { string } else { string::substring(&strings, string, start, end)? }
+                };
                 if self == Intrinsic::Substring {
                     made(mc, fuel, part.value())
                 } else {
-                    fuel.spend((end - start) as u64 / equal::PER_FUEL)?;
+                    fuel.spend(string::len(&strings, part) as u64 / equal::PER_FUEL)?;
                     let mut chars = ScratchVec::new(mc);
                     for character in string::chars(&strings, part) {
                         chars.push(Value::char(character))?;
@@ -1184,7 +1226,12 @@ impl Intrinsic {
             }
             Intrinsic::StringRef => {
                 let strings = Strings::new(mc);
-                Value::char(string::char_at(&strings, strings.string(operands.get(0)).ok_or(Fault::WrongType)?, index(operands.get(1))?)?)
+                let string = strings.string(operands.get(0)).ok_or(Fault::WrongType)?;
+                if operands.get(1).as_cursor().is_some() {
+                    Value::char(string::char_at_byte(&strings, string, text::cursor_in(&strings, string, operands.get(1))?)?.0)
+                } else {
+                    Value::char(string::char_at(&strings, string, index(operands.get(1))?)?)
+                }
             }
             Intrinsic::StringEq | Intrinsic::StringLt | Intrinsic::StringGt | Intrinsic::StringLe | Intrinsic::StringGe if operands.count() == 0 => {
                 return Err(Fault::Arity);
@@ -1315,6 +1362,21 @@ impl Intrinsic {
             | Intrinsic::IsStringContains
             | Intrinsic::StringFind
             | Intrinsic::StringFindLast
+            | Intrinsic::StringFindCursor
+            | Intrinsic::StringFindLastCursor
+            | Intrinsic::IsStringCursor
+            | Intrinsic::StringCursorStart
+            | Intrinsic::StringCursorEnd
+            | Intrinsic::StringCursorNext
+            | Intrinsic::StringCursorPrev
+            | Intrinsic::StringCursorToIndex
+            | Intrinsic::StringIndexToCursor
+            | Intrinsic::StringCursorEq
+            | Intrinsic::StringCursorLt
+            | Intrinsic::StringCursorOffset
+            | Intrinsic::StringOffsetToCursor
+            | Intrinsic::StringByteLength
+            | Intrinsic::StringByteRef
             | Intrinsic::StringSplit
             | Intrinsic::StringTrim
             | Intrinsic::StringReplace => self.text(mc, operands, fuel)?,

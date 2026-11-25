@@ -23,7 +23,7 @@ fn arena(limit: usize) -> Arena {
     arena
 }
 
-/// Flat strings of each width and ropes over them survive collections that move them.
+/// Flat strings with characters of each size and ropes over them survive collections that move them.
 #[test]
 fn strings_live_in_the_arena() {
     let mut arena = arena(8 << 20);
@@ -32,8 +32,8 @@ fn strings_live_in_the_arena() {
     let expected = arena.mutate(|mc| {
         let h = Strings::new(mc);
         let flats: Vec<_> = pieces.iter().map(|p| from_str(&h, p).unwrap()).collect();
-        let widths: Vec<_> = flats.iter().map(|&s| width(&h, s)).collect();
-        assert_eq!(widths, [Width::One, Width::One, Width::One, Width::Two, Width::Four]);
+        let sizes: Vec<_> = flats.iter().map(|&s| (byte_len(&h, s), len(&h, s))).collect();
+        assert_eq!(sizes, [(0, 0), (11, 11), (5, 4), (18, 10), (15, 12)]);
         let long = repeat(&h, 'x', 2000).unwrap();
         let mut rope = long;
         for &s in flats.iter().cycle().take(40) {
@@ -63,7 +63,8 @@ fn strings_live_in_the_arena() {
             }
             let flat = flatten(&h, s).unwrap();
             assert_eq!(equal(&h, s, flat), Ok(true));
-            assert_eq!(flatten(&h, s), Ok(flat));
+            let again = flatten(&h, s).unwrap();
+            assert_eq!((is_flat(&h, again), equal(&h, again, flat)), (true, Ok(true)));
         }
     });
 }
@@ -105,13 +106,13 @@ fn text_operations_work_on_every_kind_of_string() {
     });
 }
 
-/// A Latin-1 string of up to seven characters is an immediate value, not an object. Creating one
+/// A string of up to seven bytes is an immediate value, not an object. Creating one
 /// allocates nothing, equal ones are the same value, and it reads like any other flat string.
 #[test]
 fn short_strings_live_in_the_word() {
     let mut arena = arena(8 << 20);
     arena.set_evacuate_all(true);
-    let texts = ["", "a", "!ping", "café", "1234567", "ÿÿÿÿÿÿÿ"];
+    let texts = ["", "a", "!ping", "café", "1234567", "ÿÿÿa", "😀é", "日本"];
     arena.fail_after(Some(0));
     arena.mutate(|mc| {
         let h = Strings::new(mc);
@@ -131,7 +132,8 @@ fn short_strings_live_in_the_word() {
         for &t in &texts {
             root(mc).push(mc, string(&h, t).value()).unwrap();
         }
-        for t in ["12345678", "Ā", "日本"] {
+        // A string of eight bytes or more is an object, however few characters it has.
+        for t in ["12345678", "ÿÿÿÿ", "日本語", "😀😀"] {
             assert!(string(&h, t).value().immediate().is_none(), "{t:?}");
         }
         let long = string(&h, &format!("!ban user42 7d spam {}", "and links ".repeat(300)));
@@ -245,8 +247,8 @@ fn errors_come_back_as_the_crate_error() {
 struct Watched(ExternalText<Arc<str>>, Rc<Cell<bool>>);
 
 impl External for Watched {
-    fn units(&self) -> Units<'_> {
-        self.0.units()
+    fn text(&self) -> &str {
+        self.0.text()
     }
 }
 
@@ -295,19 +297,22 @@ fn external_strings_keep_their_owner_while_reachable() {
     assert_eq!(dropped.each_ref().map(|d| d.get()), [false, true], "the second owner went with its strings");
 }
 
+/// An external string holds text of any characters as the host has it. Its characters are counted when it is first read.
 #[test]
-fn external_characters_stored_wide_are_refused() {
-    struct Wide(Vec<u32>);
-    impl External for Wide {
-        fn units(&self) -> Units<'_> {
-            Units::Four(&self.0)
-        }
-    }
+fn external_text_of_any_characters_stays_outside() {
     let mut arena = arena(1 << 20);
     arena.mutate(|mc| {
         let h = Strings::new(mc);
-        assert_eq!(h.external(Wide(vec![0x41; 100])), Err(Error::Str(StrError::NotNarrowest)));
-        assert!(h.is_external(h.external(Wide(vec![0x1F600; 100])).unwrap()));
+        let text: Arc<str> = Arc::from("😀 é ".repeat(20));
+        let outside = h.external(ExternalText::new(text.clone())).unwrap();
+        assert!(h.is_external(outside));
+        assert_eq!((len(&h, outside), byte_len(&h, outside), display(&h, outside).to_string()), (80, 160, text.to_string()));
+        assert_eq!((char_at(&h, outside, 0), char_at(&h, outside, 2), char_at(&h, outside, 78), char_at(&h, outside, 80).is_err()), (Ok('😀'), Ok('é'), Ok('é'), true));
+        assert_eq!(substring(&h, outside, 4, 8).map(|part| display(&h, part).to_string()), Ok("😀 é ".to_string()));
+        // The host gets the text of an external string back as it is, with no copy. A string in the arena is copied out.
+        let inside = string(&h, "text that the arena holds");
+        assert_eq!((h.as_str(outside), h.as_str(inside), h.as_str(string(&h, "id"))), (Some(&*text), None, None));
+        assert_eq!((to_string(&h, outside), to_string(&h, inside)), (text.to_string(), "text that the arena holds".to_string()));
     });
 }
 
@@ -359,8 +364,8 @@ fn a_flat_string_has_a_longest_length() {
     let mut arena = arena(1 << 20);
     arena.mutate(|mc| {
         let h = Strings::new(mc);
-        assert_eq!(h.flat(Width::One, FLAT_MAX + 1, |_| {}).err(), Some(Error::Str(StrError::TooLong)));
-        assert_eq!(h.flat(Width::Four, FLAT_MAX + 1, |_| {}).err(), Some(Error::Str(StrError::TooLong)));
+        assert_eq!(h.flat(FLAT_MAX + 1, FLAT_MAX + 1, |_| {}).err(), Some(Error::Str(StrError::TooLong)));
+        assert_eq!(h.flat(FLAT_MAX + 1, 1, |_| {}).err(), Some(Error::Str(StrError::TooLong)));
     });
 }
 
@@ -417,10 +422,13 @@ fn ropes_and_external_strings_meet_the_interned_strings() {
         assert_eq!((h.interned(other), h.is_interned(other), other == rope), (Ok(Some(rope)), false, false));
         assert_eq!((equal(&h, other, rope), h.intern(other), h.interned(other), chunks(&h, other).count(), h.interned_count()), (Ok(true), Ok(rope), Ok(Some(rope)), 2, before + 1));
         assert_eq!((display(&h, other).to_string(), h.hash(other)), (format!("{head}{tail}"), h.hash(rope)));
-        // A flat string that is made with these characters becomes the flat copy of the rope. The rope stays the interned string, and reads as a flat string from then on.
+        // A long flat string that is made with these characters is a string of its own, outside the arena. It is not interned until it is compared, and then it leads to the rope.
         let made = string(&h, &format!("{head}{tail}"));
-        assert!(made == rope && is_flat(&h, rope) && is_flat(&h, other) && h.is_interned(rope));
-        assert_eq!((h.interned_count(), flatten(&h, rope), flatten(&h, other), equal(&h, other, made), display(&h, rope).to_string()), (before + 1, Ok(rope), Ok(rope), Ok(true), format!("{head}{tail}")));
+        assert!(made != rope && is_flat(&h, made) && h.is_external(made) && !h.is_interned(made));
+        assert_eq!((h.interned(made), equal(&h, made, rope), h.intern(made), h.is_interned(made), h.interned_count()), (Ok(Some(rope)), Ok(true), Ok(rope), false, before + 1));
+        // The rope stays the interned string when it is flattened, and reads as a flat string from then on.
+        assert_eq!((flatten(&h, rope).map(|flat| is_flat(&h, flat)), is_flat(&h, rope), is_flat(&h, other), h.is_interned(rope), h.intern(rope)), (Ok(true), true, true, true, Ok(rope)));
+        assert_eq!((h.interned_count(), equal(&h, other, made), display(&h, rope).to_string()), (before + 1, Ok(true), format!("{head}{tail}")));
         // A rope that is deeper than the interned string reads as it too. A rope with other characters of the same length does not.
         let deeper = concat(&h, string(&h, &head[..300]), concat(&h, string(&h, &head[300..]), string(&h, &tail)).unwrap()).unwrap();
         let unlike = concat(&h, string(&h, &head), string(&h, &"z".repeat(40))).unwrap();
@@ -455,24 +463,27 @@ fn ropes_and_external_strings_meet_the_interned_strings() {
 }
 
 /// An interned rope keeps its halves until it is flattened. Once it is flattened, the halves are collected if nothing else holds them, and the rope is still the interned string.
+/// The halves and the flat copy are long strings, so each has a store outside the arena. The number of stores shows which of them are alive.
 #[test]
 fn a_flattened_rope_keeps_its_characters_once() {
     let mut arena = arena(1 << 22);
-    let before = arena.mutate(|mc| {
+    arena.mutate(|mc| {
         let h = Strings::new(mc);
         let rope = concat(&h, string(&h, &"left ".repeat(200)), string(&h, &"right ".repeat(200))).unwrap();
         assert!(!is_flat(&h, rope));
         root(mc).push(mc, rope.value()).unwrap();
-        h.interned_count()
+        // Long strings are not interned when they are made.
+        assert_eq!(h.interned_count(), 0);
     });
-    assert_eq!(before, 2);
     arena.collect();
-    // The rope and its two halves are alive.
-    arena.mutate(|mc| assert_eq!(Strings::new(mc).interned_count(), 2));
+    arena.collect();
+    arena.mutate(|_| {});
+    // The two halves are alive.
+    assert_eq!(arena.frozen_values(), 2);
     arena.mutate(|mc| {
         let h = Strings::new(mc);
         let rope = h.string(root(mc).get(mc, 0).unwrap()).unwrap();
-        assert_eq!((h.intern(rope), len(&h, rope), h.interned_count(), is_flat(&h, rope)), (Ok(rope), 2200, 3, false));
+        assert_eq!((h.intern(rope), len(&h, rope), h.interned_count(), is_flat(&h, rope)), (Ok(rope), 2200, 1, false));
     });
     arena.collect();
     arena.collect();
@@ -480,20 +491,23 @@ fn a_flattened_rope_keeps_its_characters_once() {
         let h = Strings::new(mc);
         let rope = h.string(root(mc).get(mc, 0).unwrap()).unwrap();
         // The interned rope has kept its halves.
-        assert_eq!((h.interned_count(), is_flat(&h, rope), h.is_interned(rope)), (3, false, true));
+        assert_eq!((h.interned_count(), is_flat(&h, rope), h.is_interned(rope)), (1, false, true));
         // The flat copy belongs to the rope. It is not one more interned string.
-        assert_eq!((flatten(&h, rope), is_flat(&h, rope), h.interned_count()), (Ok(rope), true, 3));
+        assert_eq!((flatten(&h, rope).map(|flat| is_flat(&h, flat)), is_flat(&h, rope), h.interned_count()), (Ok(true), true, 1));
     });
     arena.set_evacuate_all(true);
     arena.collect();
     arena.collect();
+    arena.mutate(|_| {});
+    // Only the store of the flat copy is left.
+    assert_eq!(arena.frozen_values(), 1);
     arena.mutate(|mc| {
         let h = Strings::new(mc);
         let rope = h.string(root(mc).get(mc, 0).unwrap()).unwrap();
         let text = format!("{}{}", "left ".repeat(200), "right ".repeat(200));
-        // Only the rope is left in the table, and it reads as before. A string that is made with its characters is the rope.
+        // The rope is still the interned string, and it reads as before. A string that is made with its characters leads to it.
         assert_eq!((h.interned_count(), len(&h, rope), display(&h, rope).to_string(), h.is_interned(rope)), (1, 2200, text.clone(), true));
-        assert_eq!((string(&h, &text), h.interned(rope), h.interned_count()), (rope, Ok(Some(rope)), 1));
+        assert_eq!((h.intern(string(&h, &text)), h.interned(rope), h.interned_count()), (Ok(rope), Ok(Some(rope)), 1));
     });
 }
 
@@ -545,15 +559,16 @@ fn interned_strings_outlive_their_neighbors() {
             // The strings that the rounds before have kept are still the strings of their texts.
             for index in 0..kept.len(mc) {
                 let held = h.string(kept.get(mc, index).unwrap()).unwrap();
-                let again = string(&h, &display(&h, held).to_string());
+                let again = h.intern(string(&h, &display(&h, held).to_string())).unwrap();
                 assert!(again == held && h.is_interned(held), "round {round}, string {index}");
             }
             let before = h.interned_count();
             assert_eq!(before, kept.len(mc), "round {round}");
             // Every third new string is kept. The others die at the next collection.
+            // A short string is interned when it is made. A long one, which lives outside the arena, is interned here.
             for number in 0..COUNT {
-                let made = string(&h, &text(number, round));
-                assert_eq!(string(&h, &text(number, round)), made);
+                let made = h.intern(string(&h, &text(number, round))).unwrap();
+                assert_eq!(h.intern(string(&h, &text(number, round))), Ok(made));
                 if number.is_multiple_of(3) {
                     kept.push(mc, made.value()).unwrap();
                 }
@@ -570,6 +585,9 @@ fn interned_strings_outlive_their_neighbors() {
         // A text whose string died is made again, once.
         let made = string(&h, &text(1, 0));
         assert_eq!((string(&h, &text(1, 0)), h.interned_count()), (made, 4 * COUNT / 3 + 1));
+        // The same holds for a long text, once it is interned.
+        let long = h.intern(string(&h, &text(8, 0))).unwrap();
+        assert_eq!((h.intern(string(&h, &text(8, 0))), h.interned_count()), (Ok(long), 4 * COUNT / 3 + 2));
     });
 }
 
@@ -596,6 +614,124 @@ fn a_flat_string_hashes_as_its_text() {
             other[index] ^= 1;
             assert_ne!(h.hash(string(&h, std::str::from_utf8(&other).unwrap())), h.hash(string(&h, text)), "character {index}");
         }
+    });
+}
+
+/// A long flat string lives in a store outside the arena, and is a view of it. A large part of it is a view of the same store, and a small part is copied.
+#[test]
+fn long_strings_are_views_of_a_store() {
+    let mut arena = arena(1 << 22);
+    let text = format!("{} ünd 😀 {}", "a long line of text. ".repeat(60), "the end of it. ".repeat(40));
+    arena.mutate(|mc| {
+        let h = Strings::new(mc);
+        let whole = string(&h, &text);
+        assert!(h.is_external(whole) && is_flat(&h, whole) && !h.is_interned(whole));
+        assert_eq!((h.as_str(whole), len(&h, whole), byte_len(&h, whole)), (Some(&*text), text.chars().count(), text.len()));
+        root(mc).push(mc, whole.value()).unwrap();
+        // More than half of the string: a view of the same store. Its characters are found from character positions.
+        let chars: Vec<char> = text.chars().collect();
+        let large = substring(&h, whole, 100, chars.len() - 50).unwrap();
+        let expected: String = chars[100..chars.len() - 50].iter().collect();
+        assert!(h.is_external(large));
+        assert_eq!((h.as_str(large), len(&h, large), char_at(&h, large, 3)), (Some(&*expected), expected.chars().count(), Ok(chars[103])));
+        root(mc).push(mc, large.value()).unwrap();
+        // A part of a part shares too, while it is at least half of the store.
+        let inner = substring(&h, large, 10, len(&h, large) - 10).unwrap();
+        assert!(h.is_external(inner) && equal_str(&h, inner, &expected.chars().skip(10).take(expected.chars().count() - 20).collect::<String>()) == Ok(true));
+        root(mc).push(mc, inner.value()).unwrap();
+        // Less than half: a copy. A short copy is a string in the arena, and a long one gets a store of its own.
+        let short = substring(&h, whole, 0, 40).unwrap();
+        let third = substring(&h, whole, 0, chars.len() / 3).unwrap();
+        assert!(!h.is_external(short) && h.is_interned(short) && h.is_external(third));
+        assert_eq!((display(&h, short).to_string(), display(&h, third).to_string()), (chars[..40].iter().collect::<String>(), chars[..chars.len() / 3].iter().collect::<String>()));
+        root(mc).push(mc, third.value()).unwrap();
+    });
+    arena.set_evacuate_all(true);
+    arena.collect();
+    arena.collect();
+    arena.mutate(|_| {});
+    // Two stores: the one of the whole string, which its two parts share, and the one of the copied third.
+    assert_eq!(arena.frozen_values(), 2);
+    arena.mutate(|mc| {
+        let h = Strings::new(mc);
+        let whole = h.string(root(mc).get(mc, 0).unwrap()).unwrap();
+        let large = h.string(root(mc).get(mc, 1).unwrap()).unwrap();
+        assert_eq!((h.as_str(whole), display(&h, large).to_string() == text.chars().skip(100).take(text.chars().count() - 150).collect::<String>()), (Some(&*text), true));
+        // The whole string is dropped. Its store stays, because the parts read from it.
+        root(mc).set(mc, 0, Value::FALSE);
+    });
+    arena.collect();
+    arena.collect();
+    arena.mutate(|_| {});
+    assert_eq!(arena.frozen_values(), 2);
+    arena.mutate(|mc| {
+        let h = Strings::new(mc);
+        let large = h.string(root(mc).get(mc, 1).unwrap()).unwrap();
+        assert!(h.as_str(large).is_some_and(|part| text.contains(part)));
+    });
+}
+
+/// A text that the arena is given twice is kept once: when the second string meets the first, it is pointed at the same store, and its own store is freed.
+#[test]
+fn equal_long_strings_come_to_share_a_store() {
+    let mut arena = arena(1 << 22);
+    let text: Arc<str> = Arc::from("the same payload text, given to the arena twice. ".repeat(30));
+    arena.mutate(|mc| {
+        let h = Strings::new(mc);
+        let first = h.external(ExternalText::new(text.clone())).unwrap();
+        let second = h.external(ExternalText::new(text.clone())).unwrap();
+        let made = string(&h, &text);
+        for kept in [first, second, made] {
+            root(mc).push(mc, kept.value()).unwrap();
+        }
+        assert_eq!((equal(&h, first, second), equal(&h, made, first), h.intern(second), h.intern(made), h.interned_count()), (Ok(true), Ok(true), Ok(first), Ok(first), 1));
+        // The three are still three strings, and each reads the text.
+        assert!(first != second && second != made && h.is_interned(first) && !h.is_interned(second));
+        assert_eq!((h.as_str(first), h.as_str(second), h.as_str(made), equal(&h, second, made)), (Some(&*text), Some(&*text), Some(&*text), Ok(true)));
+    });
+    arena.collect();
+    arena.collect();
+    arena.mutate(|_| {});
+    assert_eq!(arena.frozen_values(), 1);
+    arena.mutate(|mc| {
+        let h = Strings::new(mc);
+        for index in 0..3 {
+            let kept = h.string(root(mc).get(mc, index).unwrap()).unwrap();
+            assert_eq!((h.as_str(kept), len(&h, kept)), (Some(&*text), text.len()));
+        }
+    });
+}
+
+/// The text in a large part of an external bytevector becomes a string without a copy: the string reads from the store of the bytevector. A small part is copied, and bytes that are no text are refused.
+#[test]
+fn text_in_an_external_bytevector_is_shared() {
+    use crate::bytevector::Bytevectors;
+    let mut arena = arena(1 << 22);
+    let payload: Vec<u8> = format!("{{\"content\": \"{}\", \"tail\": \"é😀\"}}", "words of a message ".repeat(20)).into_bytes();
+    arena.mutate(|mc| {
+        let h = Strings::new(mc);
+        let bytes = Bytevectors::new(mc).external(payload.clone()).unwrap();
+        let whole = h.from_utf8_of(bytes, 0, payload.len()).unwrap();
+        let content = h.from_utf8_of(bytes, 13, payload.len() - 20).unwrap();
+        let key = h.from_utf8_of(bytes, 2, 9).unwrap();
+        assert!(h.is_external(whole) && h.is_external(content) && !h.is_external(key));
+        assert_eq!((h.as_str(whole), h.as_str(content), display(&h, key).to_string()), (std::str::from_utf8(&payload).ok(), std::str::from_utf8(&payload[13..payload.len() - 20]).ok(), "content".to_string()));
+        assert_eq!((len(&h, whole), byte_len(&h, whole)), (std::str::from_utf8(&payload).unwrap().chars().count(), payload.len()));
+        // A range that cuts the last character holds no text.
+        assert_eq!(h.from_utf8_of(bytes, 0, payload.len() - 4).err(), Some(Error::Str(StrError::NotUtf8)));
+        for kept in [whole, content] {
+            root(mc).push(mc, kept.value()).unwrap();
+        }
+    });
+    arena.collect();
+    arena.collect();
+    arena.mutate(|_| {});
+    // The bytevector is gone, and its store is alive: the two strings read from it.
+    assert_eq!(arena.frozen_values(), 1);
+    arena.mutate(|mc| {
+        let h = Strings::new(mc);
+        let content = h.string(root(mc).get(mc, 1).unwrap()).unwrap();
+        assert_eq!(h.as_str(content), std::str::from_utf8(&payload[13..payload.len() - 20]).ok());
     });
 }
 

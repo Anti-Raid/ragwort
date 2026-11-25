@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use crate::testing::{Rng, TestError, TestHost, TestStr};
+use crate::testing::{Rng, TestError, TestHost, TestStr, Width, shapes};
 use crate::*;
 
 fn make(h: &TestHost, text: &[char]) -> TestStr {
@@ -19,8 +19,7 @@ fn hash_of(h: &TestHost, s: TestStr) -> u64 {
 fn agrees(h: &TestHost, rng: &mut Rng, s: TestStr, want: &[char]) {
     h.check(s);
     assert_eq!(len(h, s), want.len());
-    let widest = want.iter().map(|&c| Width::of(c)).max().unwrap_or(Width::One);
-    assert_eq!(width(h, s), widest);
+    assert_eq!(byte_len(h, s), want.iter().map(|character| character.len_utf8()).sum::<usize>());
     assert!(chars(h, s).eq(want.iter().copied()));
     for _ in 0..20.min(want.len()) {
         let i = rng.below(want.len());
@@ -131,16 +130,27 @@ fn shape_doesnt_change_what_a_string_is() {
     assert_eq!(equal(&h, ropes[0], other), Ok(text[4999] == '\u{100}'));
 }
 
+/// A string takes the bytes of its UTF-8 encoding, and a substring takes the bytes of its own characters.
 #[test]
-fn widths_are_the_narrowest() {
+fn a_string_takes_its_utf8_bytes() {
     let h = TestHost::new();
-    for (text, want) in [("", Width::One), ("abc", Width::One), ("café", Width::One), ("Ā", Width::Two), ("日本", Width::Two), ("😀", Width::Four)] {
-        assert_eq!(width(&h, from_str(&h, text).unwrap()), want, "{text}");
+    for (text, want) in [("", 0), ("abc", 3), ("café", 5), ("Ā", 2), ("日本", 6), ("😀", 4)] {
+        let made = from_str(&h, text).unwrap();
+        assert_eq!((byte_len(&h, made), len(&h, made)), (want, text.chars().count()), "{text}");
     }
     let wide = from_str(&h, "😀abc").unwrap();
     let tail = substring(&h, wide, 1, 4).unwrap();
-    assert_eq!(width(&h, tail), Width::One);
+    assert_eq!((byte_len(&h, tail), len(&h, tail)), (3, 3));
     assert_eq!(equal(&h, tail, from_str(&h, "abc").unwrap()), Ok(true));
+    // Positions count characters, wherever the bytes of a character end.
+    let mixed = from_str(&h, "aé日😀z").unwrap();
+    for (index, character) in "aé日😀z".chars().enumerate() {
+        assert_eq!(char_at(&h, mixed, index), Ok(character));
+        assert_eq!(display(&h, substring(&h, mixed, index, index + 1).unwrap()).to_string(), character.to_string());
+    }
+    assert_eq!(find(&h, mixed, from_str(&h, "😀").unwrap(), 0), Ok(Some(3)));
+    assert_eq!(find(&h, mixed, from_str(&h, "z").unwrap(), 4), Ok(Some(4)));
+    assert_eq!(rfind(&h, mixed, from_str(&h, "é").unwrap(), 5), Ok(Some(1)));
 }
 
 /// Building a string a piece at a time, at either end, gives nearly full flat strings in a
@@ -169,7 +179,8 @@ fn piece_at_a_time_stays_shallow() {
             let depth = crate::info(&h, s).depth as f64;
             assert!(depth <= 1.45 * (leaves as f64 + 2.0).log2(), "depth {depth} for {leaves} leaves");
             // Flat strings fill to about 512 bytes. Without merging at the edges, they would fill to about half of that.
-            assert!(want.len() / leaves >= 384, "{leaves} leaves for {} characters", want.len());
+            let bytes = byte_len(&h, s);
+            assert!(bytes / leaves >= 384, "{leaves} leaves for {bytes} bytes");
         }
     }
 }
@@ -213,30 +224,10 @@ fn ranges_are_checked() {
     assert_eq!(concat_all(&h, &[]).map(|s| len(&h, s)), Ok(0));
 }
 
+/// An external string holds the text of the host as it is, whatever characters it has.
 #[test]
-fn info_round_trips() {
-    for info in [
-        Info { len: 0, width: Width::One, depth: 0 },
-        Info { len: MAX_LEN, width: Width::Four, depth: 95 },
-        Info { len: 12345, width: Width::Two, depth: 3 },
-    ] {
-        assert_eq!(Info::from_bits(info.to_bits()), info);
-    }
-}
-
-
-#[test]
-fn external_characters_must_be_narrowest() {
-    struct Wide(Vec<u16>);
-    impl External for Wide {
-        fn units(&self) -> Units<'_> {
-            Units::Two(&self.0)
-        }
-    }
+fn external_text_is_read_as_it_is() {
     let h = TestHost::new();
-    assert_eq!(h.external(Wide(vec![0x61, 0x62])), Err(TestError::Str(StrError::NotNarrowest)));
-    let s = h.external(Wide(vec![0x61, 0x101])).unwrap();
-    assert_eq!(display(&h, s).to_string(), "a\u{101}");
     for text in ["", "ascii only", "café", "日本語", "mixed 😀 width"] {
         let s = h.external(ExternalText::new(text)).unwrap();
         assert_eq!(display(&h, s).to_string(), text);
@@ -244,17 +235,21 @@ fn external_characters_must_be_narrowest() {
     }
 }
 
-/// Reading a rope by index often enough flattens it once, and later reads use the flat copy.
+/// Reading an ASCII rope by index often enough flattens it once, and later reads use the flat copy. A rope with other characters is never flattened by reads:
+/// its nodes count the characters of each piece, which a flat copy cannot do.
 #[test]
 fn reads_by_position_flatten_a_rope() {
     let h = TestHost::with_capacity(1 << 20);
     let mut rng = Rng(3);
-    let mut s = empty(&h).unwrap();
-    let mut want = Vec::new();
+    let (mut s, mut mixed) = (empty(&h).unwrap(), empty(&h).unwrap());
+    let (mut want, mut mixed_want) = (Vec::new(), Vec::new());
     for _ in 0..400 {
-        let text: Vec<char> = (0..50).map(|_| rng.char(Width::Two)).collect();
+        let text: Vec<char> = (0..50).map(|_| char::from(b' ' + rng.below(95) as u8)).collect();
         s = concat(&h, s, make(&h, &text)).unwrap();
         want.extend(text);
+        let text: Vec<char> = (0..50).map(|_| rng.char(Width::Two)).collect();
+        mixed = concat(&h, mixed, make(&h, &text)).unwrap();
+        mixed_want.extend(text);
     }
     let shared = concat(&h, s, from_str(&h, &"z".repeat(600)).unwrap()).unwrap();
     assert!(!h.is_flattened(s));
@@ -263,9 +258,12 @@ fn reads_by_position_flatten_a_rope() {
         let i = rng.below(want.len());
         assert_eq!(char_at(&h, s, i), Ok(want[i]));
         assert_eq!(h.is_flattened(s), n + 1 >= reads, "after {} reads", n + 1);
+        assert_eq!(char_at(&h, mixed, i), Ok(mixed_want[i]));
+        assert!(!h.is_flattened(mixed), "after {} reads", n + 1);
     }
     h.check(s);
     h.check(shared);
+    h.check(mixed);
     let flat = flatten(&h, s).unwrap();
     assert_eq!(flatten(&h, s), Ok(flat), "the copy is kept");
     assert!(chars(&h, s).eq(want.iter().copied()));
@@ -442,6 +440,82 @@ fn id_strings_spread_over_the_buckets() {
                 assert!((statistic - BUCKETS as f64).abs() < 6.0 * 362.0, "{name}, seed {seed:#x}, bits from {shift}: {statistic}");
             }
         }
+    }
+}
+
+/// The procedures that take byte offsets agree with the ones that take character indices, in every shape of string. An offset inside a character is refused.
+#[test]
+fn byte_offsets_agree_with_character_indices() {
+    let h = TestHost::with_capacity(1 << 20);
+    let mut rng = Rng(21);
+    for round in 0..300 {
+        let text = rng.text();
+        let string: String = text.iter().collect();
+        let starts: Vec<usize> = string.char_indices().map(|(offset, _)| offset).chain([string.len()]).collect();
+        for s in shapes(&h, &text, rng.below(text.len().max(1))) {
+            assert_eq!(byte_len(&h, s), string.len());
+            for _ in 0..8 {
+                let index = rng.below(text.len() + 1);
+                let offset = starts[index];
+                assert_eq!((byte_offset_of(&h, s, index), char_index(&h, s, offset), is_boundary(&h, s, offset)), (Ok(offset), Ok(index), true), "round {round}");
+                if index < text.len() {
+                    assert_eq!(char_at_byte(&h, s, offset), Ok((text[index], text[index].len_utf8())));
+                    assert_eq!((byte_at(&h, s, offset), byte_before(&h, s, starts[index + 1])), (Ok(string.as_bytes()[offset]), Ok(offset)));
+                    // The bytes inside a character are no positions.
+                    for inside in offset + 1..starts[index + 1] {
+                        assert!(!is_boundary(&h, s, inside));
+                        assert_eq!(char_at_byte(&h, s, inside), Err(TestError::Str(StrError::OutOfRange)));
+                        assert_eq!(char_index(&h, s, inside), Err(TestError::Str(StrError::OutOfRange)));
+                        assert_eq!(substring_bytes(&h, s, 0, inside).err(), Some(TestError::Str(StrError::OutOfRange)));
+                        assert_eq!(byte_before(&h, s, inside), Err(TestError::Str(StrError::OutOfRange)));
+                    }
+                }
+                let other = rng.below(text.len() + 1);
+                let (first, last) = (index.min(other), index.max(other));
+                let by_bytes = substring_bytes(&h, s, starts[first], starts[last]).unwrap();
+                h.check(by_bytes);
+                assert_eq!(equal(&h, by_bytes, substring(&h, s, first, last).unwrap()), Ok(true));
+                // A search by offset finds what a search by index finds.
+                if last > first {
+                    let pattern = make(&h, &text[first..(first + 3).min(last)]);
+                    let from = rng.below(first + 1);
+                    assert_eq!(find_bytes(&h, s, pattern, starts[from]), find(&h, s, pattern, from).map(|found| found.map(|index| starts[index])));
+                    assert_eq!(rfind_bytes(&h, s, pattern, starts[last]), rfind(&h, s, pattern, last).map(|found| found.map(|index| starts[index])));
+                }
+            }
+            assert_eq!((byte_before(&h, s, 0), char_at_byte(&h, s, string.len()), is_boundary(&h, s, string.len() + 1)), (Err(TestError::Str(StrError::OutOfRange)), Err(TestError::Str(StrError::OutOfRange)), false));
+            assert_eq!((byte_offset_of(&h, s, text.len() + 1), byte_at(&h, s, string.len())), (Err(TestError::Str(StrError::OutOfRange)), Err(TestError::Str(StrError::OutOfRange))));
+        }
+    }
+}
+
+/// A string goes out to the host as its bytes, in every shape: as a `String`, appended to a buffer, and a part at a time. Bytes that are text come in as a string, and other bytes are refused.
+#[test]
+fn text_crosses_to_the_host_as_bytes() {
+    let h = TestHost::with_capacity(1 << 20);
+    let mut rng = Rng(34);
+    for _ in 0..200 {
+        let text = rng.text();
+        let string: String = text.iter().collect();
+        let starts: Vec<usize> = string.char_indices().map(|(offset, _)| offset).chain([string.len()]).collect();
+        for s in shapes(&h, &text, rng.below(text.len().max(1))) {
+            assert_eq!(to_string(&h, s), string);
+            let mut buffer = b"before ".to_vec();
+            append_utf8(&h, s, &mut buffer);
+            assert_eq!(buffer, [b"before ", string.as_bytes()].concat());
+            let (first, second) = (rng.below(text.len() + 1), rng.below(text.len() + 1));
+            let (from, to) = (starts[first.min(second)], starts[first.max(second)]);
+            let mut part = vec![0; to - from];
+            copy_bytes(&h, s, from, to, &mut part);
+            assert_eq!(part, &string.as_bytes()[from..to]);
+        }
+        let back = from_utf8(&h, string.as_bytes()).unwrap();
+        h.check(back);
+        assert_eq!((len(&h, back), byte_len(&h, back), equal_str(&h, back, &string)), (text.len(), string.len(), Ok(true)));
+    }
+    // Bytes that are no text: a byte that starts nothing, a character cut short, and a code that is too long for its character.
+    for bytes in [&[0x68, 0xFF][..], &[0xE6, 0x97], &[0xC0, 0xAF], &[0xED, 0xA0, 0x80]] {
+        assert_eq!(from_utf8(&h, bytes).err(), Some(TestError::Str(StrError::NotUtf8)), "{bytes:?}");
     }
 }
 

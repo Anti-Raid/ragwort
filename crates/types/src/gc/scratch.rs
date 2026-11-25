@@ -46,6 +46,16 @@ impl<'gc, T> ScratchVec<'gc, T> {
         Ok(())
     }
 
+    /// Appends `additional` copies of `value`. Fails as an allocation does if the budget cannot cover the growth.
+    pub fn extend_with(&mut self, additional: usize, value: T) -> Result<(), OutOfMemory>
+    where
+        T: Clone,
+    {
+        self.reserve(additional)?;
+        self.items.resize(self.items.len() + additional, value);
+        Ok(())
+    }
+
     pub fn pop(&mut self) -> Option<T> {
         self.items.pop()
     }

@@ -3,7 +3,7 @@
 use ragwort_types::bytevector::{AnyBytevector, Bytevectors};
 use ragwort_types::gc::{Mutation, ScratchVec, Value};
 use ragwort_types::pair::Pairs;
-use ragwort_types::string::{self, Str, StrError, Strings};
+use ragwort_types::string::{self, Str, Strings};
 use ragwort_types::symbol::{Keyword, Symbol, Symbols};
 use ragwort_types::vector::{EveryVector, Vectors};
 
@@ -80,26 +80,26 @@ impl Intrinsic {
             Intrinsic::StringToVector | Intrinsic::VectorToString | Intrinsic::StringToUtf8 | Intrinsic::Utf8ToString if !(1..=3).contains(&operands.count()) => {
                 return Err(Fault::Arity);
             }
-            Intrinsic::StringToVector | Intrinsic::StringToUtf8 => {
+            Intrinsic::StringToUtf8 => {
+                let string = string_of(&strings, operands.get(0))?;
+                let (start, end) = range(string::len(&strings, string), operands)?;
+                // A string is stored as UTF-8, so its bytes are copied as they are. Nothing is encoded.
+                let (from, to) = (string::byte_offset_of(&strings, string, start)?, string::byte_offset_of(&strings, string, end)?);
+                fuel.spend((to - from) as u64 / equal::PER_FUEL)?;
+                let mut bytes = ScratchVec::new(mc);
+                bytes.extend_with(to - from, 0)?;
+                string::copy_bytes(&strings, string, from, to, &mut bytes);
+                Bytevectors::new(mc).from_slice(&bytes)?.value(mc)
+            }
+            Intrinsic::StringToVector => {
                 let string = string_of(&strings, operands.get(0))?;
                 let (start, end) = range(string::len(&strings, string), operands)?;
                 let part = string::substring(&strings, string, start, end)?;
                 spend(fuel, &strings, part)?;
-                if self == Intrinsic::StringToVector {
-                    let vector = Vectors::new(mc).make(end - start, Value::VOID)?;
-                    let items = vector.items(mc);
-                    string::chars(&strings, part).enumerate().for_each(|(i, character)| items.set(mc, i, Value::char(character)));
-                    vector.value(mc)
-                } else {
-                    let mut bytes = ScratchVec::new(mc);
-                    let mut buffer = [0; 4];
-                    for character in string::chars(&strings, part) {
-                        for &byte in character.encode_utf8(&mut buffer).as_bytes() {
-                            bytes.push(byte)?;
-                        }
-                    }
-                    Bytevectors::new(mc).from_slice(&bytes)?.value(mc)
-                }
+                let vector = Vectors::new(mc).make(end - start, Value::VOID)?;
+                let items = vector.items(mc);
+                string::chars(&strings, part).enumerate().for_each(|(i, character)| items.set(mc, i, Value::char(character)));
+                vector.value(mc)
             }
             Intrinsic::VectorToString => {
                 let vector = EveryVector::of(operands.get(0)).ok_or(Fault::WrongType)?;
@@ -115,9 +115,8 @@ impl Intrinsic {
                 let bytes = AnyBytevector::of(operands.get(0)).ok_or(Fault::WrongType)?;
                 let (start, end) = range(bytes.len(mc), operands)?;
                 fuel.spend((end - start) as u64 / equal::PER_FUEL)?;
-                let part = bytes.bytes(mc, start, end);
-                let text = std::str::from_utf8(&part).map_err(|_| Fault::Str(StrError::NotUtf8))?;
-                string::from_str(&strings, text)?.value()
+                // The bytes are checked once. A large part of an external bytevector is not copied: the string reads the same bytes.
+                strings.from_utf8_of(bytes, start, end)?.value()
             }
             Intrinsic::IsStringPrefix | Intrinsic::IsStringSuffix | Intrinsic::IsStringContains => {
                 let (string, part) = (string_of(&strings, operands.get(0))?, string_of(&strings, operands.get(1))?);
@@ -128,8 +127,10 @@ impl Intrinsic {
                     _ => string::find(&strings, string, part, 0)?.is_some(),
                 }));
             }
-            Intrinsic::StringFind | Intrinsic::StringFindLast if !(2..=3).contains(&operands.count()) => return Err(Fault::Arity),
-            Intrinsic::StringFind | Intrinsic::StringFindLast => {
+            Intrinsic::StringFind | Intrinsic::StringFindLast | Intrinsic::StringFindCursor | Intrinsic::StringFindLastCursor if !(2..=3).contains(&operands.count()) => {
+                return Err(Fault::Arity);
+            }
+            Intrinsic::StringFind | Intrinsic::StringFindLast if operands.count() == 2 || operands.get(2).as_cursor().is_none() => {
                 let (string, part) = (string_of(&strings, operands.get(0))?, string_of(&strings, operands.get(1))?);
                 spend(fuel, &strings, string)?;
                 let found = if self == Intrinsic::StringFind {
@@ -138,6 +139,77 @@ impl Intrinsic {
                     string::rfind(&strings, string, part, if operands.count() == 3 { index(operands.get(2))? } else { string::len(&strings, string) })?
                 };
                 return Ok(found.map_or(Value::FALSE, |position| fixnum(position as i64)));
+            }
+            // A search from a cursor, or one that returns a cursor, runs over byte offsets. Characters are counted only to return an index.
+            Intrinsic::StringFind | Intrinsic::StringFindLast | Intrinsic::StringFindCursor | Intrinsic::StringFindLastCursor => {
+                let (string, part) = (string_of(&strings, operands.get(0))?, string_of(&strings, operands.get(1))?);
+                spend(fuel, &strings, string)?;
+                let forward = matches!(self, Intrinsic::StringFind | Intrinsic::StringFindCursor);
+                let found = if forward {
+                    string::find_bytes(&strings, string, part, if operands.count() == 3 { offset(&strings, string, operands.get(2))? } else { 0 })?
+                } else {
+                    string::rfind_bytes(&strings, string, part, if operands.count() == 3 { offset(&strings, string, operands.get(2))? } else { string::byte_len(&strings, string) })?
+                };
+                let Some(found) = found else { return Ok(Value::FALSE) };
+                if matches!(self, Intrinsic::StringFindCursor | Intrinsic::StringFindLastCursor) {
+                    return cursor_at(&strings, string, found);
+                }
+                return Ok(fixnum(string::char_index(&strings, string, found)? as i64));
+            }
+            Intrinsic::IsStringCursor => return Ok(boolean(operands.get(0).as_cursor().is_some())),
+            Intrinsic::StringCursorStart => return cursor_at(&strings, string_of(&strings, operands.get(0))?, 0),
+            Intrinsic::StringCursorEnd => {
+                let string = string_of(&strings, operands.get(0))?;
+                return cursor_at(&strings, string, string::byte_len(&strings, string));
+            }
+            Intrinsic::StringCursorNext => {
+                let string = string_of(&strings, operands.get(0))?;
+                let at = cursor_in(&strings, string, operands.get(1))?;
+                // The new cursor is for the same text, so it carries the same hash.
+                let (_, text) = cursor_of(operands.get(1))?;
+                return Value::cursor(at + string::char_at_byte(&strings, string, at)?.1, text).ok_or(Fault::OutOfRange);
+            }
+            Intrinsic::StringCursorPrev => {
+                let string = string_of(&strings, operands.get(0))?;
+                let at = cursor_in(&strings, string, operands.get(1))?;
+                let (_, text) = cursor_of(operands.get(1))?;
+                return Value::cursor(string::byte_before(&strings, string, at)?, text).ok_or(Fault::OutOfRange);
+            }
+            Intrinsic::StringCursorToIndex => {
+                let string = string_of(&strings, operands.get(0))?;
+                spend(fuel, &strings, string)?;
+                return Ok(fixnum(string::char_index(&strings, string, cursor_in(&strings, string, operands.get(1))?)? as i64));
+            }
+            Intrinsic::StringIndexToCursor => {
+                let string = string_of(&strings, operands.get(0))?;
+                spend(fuel, &strings, string)?;
+                return cursor_at(&strings, string, string::byte_offset_of(&strings, string, index(operands.get(1))?)?);
+            }
+            Intrinsic::StringCursorEq => {
+                let (first, second) = (cursor_of(operands.get(0))?, cursor_of(operands.get(1))?);
+                return Ok(boolean(first == second));
+            }
+            Intrinsic::StringCursorLt => {
+                let ((first, first_text), (second, second_text)) = (cursor_of(operands.get(0))?, cursor_of(operands.get(1))?);
+                // Positions in two different texts have no order.
+                if first_text != second_text {
+                    return Err(Fault::OutOfRange);
+                }
+                return Ok(boolean(first < second));
+            }
+            Intrinsic::StringCursorOffset => return Ok(fixnum(cursor_of(operands.get(0))?.0 as i64)),
+            Intrinsic::StringOffsetToCursor => {
+                let string = string_of(&strings, operands.get(0))?;
+                let at = index(operands.get(1))?;
+                if !string::is_boundary(&strings, string, at) {
+                    return Err(Fault::OutOfRange);
+                }
+                return cursor_at(&strings, string, at);
+            }
+            Intrinsic::StringByteLength => return Ok(fixnum(string::byte_len(&strings, string_of(&strings, operands.get(0))?) as i64)),
+            Intrinsic::StringByteRef => {
+                let string = string_of(&strings, operands.get(0))?;
+                return Ok(fixnum(i64::from(string::byte_at(&strings, string, index(operands.get(1))?)?)));
             }
             Intrinsic::StringSplit => {
                 let string = string_of(&strings, operands.get(0))?;
@@ -187,6 +259,39 @@ impl Intrinsic {
 
 /// Verifies that all elements in `xs` are characters and evaluates whether relational operator
 /// `op` holds pairwise across consecutive character elements.
+/// Returns the byte offset that the cursor `value` holds and the hash of the text that it was made for, or [`Fault::WrongType`] if `value` is not a string cursor.
+fn cursor_of(value: Value<'_>) -> Result<(usize, u32), Fault> {
+    value.as_cursor().ok_or(Fault::WrongType)
+}
+
+/// Returns the cursor at byte offset `at` of `string`. The cursor holds the hash of the string's text. A string keeps its hash, so the text is read at most once for it.
+fn cursor_at<'gc>(strings: &Strings<'_, 'gc>, string: Str<'gc>, at: usize) -> Result<Value<'gc>, Fault> {
+    Value::cursor(at, strings.hash(string)?).ok_or(Fault::OutOfRange)
+}
+
+/// Returns the byte offset that the cursor `value` holds, after checking that the cursor was made for the text of `string`.
+/// A cursor of a string with other characters is refused with [`Fault::OutOfRange`], wherever it points.
+pub(super) fn cursor_in<'gc>(strings: &Strings<'_, 'gc>, string: Str<'gc>, value: Value<'gc>) -> Result<usize, Fault> {
+    let (at, text) = cursor_of(value)?;
+    if text != strings.hash(string)? {
+        return Err(Fault::OutOfRange);
+    }
+    Ok(at)
+}
+
+/// Returns the byte offset in `string` of the position `value`, which is a character index or a string cursor.
+/// A cursor must be one that was made for the text of `string`. For an index, the characters before it are counted.
+pub(super) fn offset<'gc>(strings: &Strings<'_, 'gc>, string: Str<'gc>, value: Value<'gc>) -> Result<usize, Fault> {
+    if value.as_cursor().is_none() {
+        return Ok(string::byte_offset_of(strings, string, index(value)?)?);
+    }
+    let at = cursor_in(strings, string, value)?;
+    if !string::is_boundary(strings, string, at) {
+        return Err(Fault::OutOfRange);
+    }
+    Ok(at)
+}
+
 pub(super) fn compare_chars<'gc>(op: Intrinsic, xs: impl Iterator<Item = Value<'gc>>) -> Result<bool, Fault> {
     let (mut before, mut so_far) = (None, true);
     for value in xs {

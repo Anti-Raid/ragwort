@@ -1126,10 +1126,10 @@ fn equal_strings_are_one_key_of_a_shape() {
         let (fielded, mapped) = (tables.make().unwrap(), tables.with_room(4).unwrap());
         fielded.set_field(mc, rope.value(), fix(1)).unwrap();
         mapped.set(mc, rope.value(), fix(2)).unwrap();
-        // The rope is the interned string of its characters, so a flat string that is made with them is the rope.
+        // The rope is the interned string of its characters, so it is the key that the tables hold. A flat string that is made with them is another object, and finds the entries.
         let flat = text(mc, &format!("{head}{tail}"));
-        assert!(flat == rope.value() && strings.is_interned(rope));
-        assert_eq!((entries(mc, fielded), entries(mc, mapped), tables.shape(&[rope.value()]).ok()), (vec![(flat, fix(1))], vec![(flat, fix(2))], fielded.shape(mc)));
+        assert!(flat != rope.value() && strings.is_interned(rope));
+        assert_eq!((entries(mc, fielded), entries(mc, mapped), tables.shape(&[rope.value()]).ok()), (vec![(rope.value(), fix(1))], vec![(rope.value(), fix(2))], fielded.shape(mc)));
         let again = concat(&strings, strings.string(text(mc, &head[..330])).unwrap(), strings.string(text(mc, &format!("{}{tail}", &head[330..]))).unwrap()).unwrap();
         assert!(!string::is_flat(&strings, again));
         assert_eq!((fielded.get(mc, rope.value()), mapped.get(mc, again.value()), mapped.get(mc, flat), mapped.has(mc, text(mc, &head))), (Ok(Some(fix(1))), Ok(Some(fix(2))), Ok(Some(fix(2))), Ok(false)));
@@ -1459,7 +1459,7 @@ fn an_external_string_is_a_key_as_itself() {
         let flat = text(mc, &name);
         let rope = concat(&strings, strings.string(text(mc, &name[..300])).unwrap(), strings.string(text(mc, &name[300..])).unwrap()).unwrap();
         let second = strings.external(crate::string::ExternalText::new(name.clone())).unwrap();
-        assert!(flat == outside.value() && rope != outside && second != outside);
+        assert!(flat != outside.value() && rope != outside && second != outside);
         assert_eq!((fielded.get(mc, flat), mapped.get(mc, rope.value()), mapped.get(mc, second.value()), fielded.get(mc, second.value())), (Ok(Some(fix(1))), Ok(Some(fix(2))), Ok(Some(fix(2))), Ok(Some(fix(1)))));
         // A write through another form changes the entry, and the key stays the first external string.
         mapped.set(mc, second.value(), fix(3)).unwrap();

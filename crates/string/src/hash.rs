@@ -1,8 +1,7 @@
-//! A fast seeded hash of a string's characters. The hash reads the characters as units of the string's width,
-//! packed into 64-bit words. So every representation of the same characters has the same hash, and so does a `&str` of the
+//! A fast seeded hash of a string's bytes. Every representation of the same text has the same hash, and so does a `&str` of the
 //! same text.
 //!
-//! The hash has three forms, chosen by the number of bytes that the units take:
+//! The hash has three forms, chosen by the number of bytes:
 //!
 //! - Up to [`SHORT`] bytes, such as most names: one multiplication, then the last one.
 //! - Up to [`MEDIUM`] bytes: one multiplication over the first 16 bytes, one over the last 16 bytes on the result of the first, then the last one.
@@ -12,55 +11,40 @@
 //! wyhash combines one side of each multiplication with a constant that is public unless the caller makes its own. Here both sides are combined
 //! with values that come from the seed, so no input makes a multiplication come out the same under every seed.
 
-use crate::units::Unit;
-use crate::word::{HIGH, MEDIUM, SHORT, fingerprint};
-use crate::{Host, Info, Packed, Units, Width, chunks, flat, summary};
+use crate::word::{MEDIUM, SHORT, fingerprint, pack};
+use crate::{Host, Info, Packed, Units, chunks, flat, summary};
 
 const K0: u64 = 0x243f_6a88_85a3_08d3;
 const K1: u64 = 0x1319_8a2e_0370_7344;
 const K2: u64 = 0xa409_3822_299f_31d0;
 
-/// Returns the hash of a short string of `len` characters at `width`. `(a, b)` is the [`fingerprint`] of the bytes of its units.
+/// Returns the hash of a string of `len` bytes, at most [`SHORT`]. `(a, b)` is the [`fingerprint`] of the bytes.
 #[inline]
-fn short((a, b): (u64, u64), seed: u64, len: usize, width: Width) -> u64 {
+fn short((a, b): (u64, u64), seed: u64, len: usize) -> u64 {
     let key = seed.rotate_left(29) ^ K1;
-    mix(mix(a ^ seed ^ K0, b ^ key) ^ (len as u64 | (width as u64) << 48), K2 ^ key)
+    mix(mix(a ^ seed ^ K0, b ^ key) ^ len as u64, K2 ^ key)
 }
 
-/// Returns the hash of a string of `len` characters at `width` whose units take more than [`SHORT`] and at most [`MEDIUM`] bytes. `first` is the first 16 of those bytes and `last` is the last 16, each as two little-endian words. The two overlap in a string of fewer than 32 bytes.
+/// Returns the hash of a string of `len` bytes, more than [`SHORT`] and at most [`MEDIUM`]. `first` is the first 16 bytes and `last` is the last 16, each as two little-endian words. The two overlap in a string of fewer than 32 bytes.
 #[inline]
-fn medium(first: (u64, u64), last: (u64, u64), seed: u64, len: usize, width: Width) -> u64 {
+fn medium(first: (u64, u64), last: (u64, u64), seed: u64, len: usize) -> u64 {
     let key = seed.rotate_left(29) ^ K1;
     let chained = mix(first.0 ^ seed ^ K0, first.1 ^ key);
-    mix(mix(last.0 ^ chained, last.1 ^ key) ^ (len as u64 | (width as u64) << 48), K2 ^ key)
+    mix(mix(last.0 ^ chained, last.1 ^ key) ^ len as u64, K2 ^ key)
 }
 
-/// Returns the hash of a string of `len` characters at `width` whose units are `bytes`, which are at most [`MEDIUM`] bytes.
+/// Returns the hash of a string whose bytes are `bytes`, which are at most [`MEDIUM`] bytes.
 #[inline]
-fn compact(bytes: &[u8], seed: u64, len: usize, width: Width) -> u64 {
+fn compact(bytes: &[u8], seed: u64) -> u64 {
     #[inline(always)]
     fn word(bytes: &[u8], at: usize) -> u64 {
         u64::from_le_bytes(bytes[at..at + 8].try_into().expect("eight bytes"))
     }
     let n = bytes.len();
     if n <= SHORT {
-        return short(fingerprint(bytes), seed, len, width);
+        return short(fingerprint(bytes), seed, n);
     }
-    medium((word(bytes, 0), word(bytes, 8)), (word(bytes, n - 16), word(bytes, n - 8)), seed, len, width)
-}
-
-/// Writes `codes` as `width`-byte little-endian units into `buf`, starting at index `at`. Returns the index after the last byte written.
-fn gather(buf: &mut [u8], mut at: usize, codes: impl Iterator<Item = u32>, width: Width) -> usize {
-    let size = width.bytes();
-    for code in codes {
-        buf[at..at + size].copy_from_slice(&code.to_le_bytes()[..size]);
-        at += size;
-    }
-    at
-}
-
-fn codes(units: Units<'_>) -> impl Iterator<Item = u32> + '_ {
-    (0..units.len()).map(move |i| units.code(i))
+    medium((word(bytes, 0), word(bytes, 8)), (word(bytes, n - 16), word(bytes, n - 8)), seed, n)
 }
 
 #[inline]
@@ -74,17 +58,16 @@ fn mix(a: u64, b: u64) -> u64 {
 struct State {
     acc: u64,
     key: u64,
-    width: Width,
     /// The first word of a pair, held until the second word arrives.
     half: Option<u64>,
-    /// The word that is being packed from units. `bits` is the number of its bits filled so far.
+    /// The word that is being packed from bytes. `bits` is the number of its bits filled so far.
     packing: u64,
     bits: u32,
 }
 
 impl State {
-    fn new(seed: u64, width: Width) -> Self {
-        Self { acc: seed ^ K0, key: seed.rotate_left(29) ^ K1, width, half: None, packing: 0, bits: 0 }
+    fn new(seed: u64) -> Self {
+        Self { acc: seed ^ K0, key: seed.rotate_left(29) ^ K1, half: None, packing: 0, bits: 0 }
     }
 
     #[inline]
@@ -96,9 +79,9 @@ impl State {
     }
 
     #[inline]
-    fn unit(&mut self, code: u32) {
-        self.packing |= (code as u64) << self.bits;
-        self.bits += 8 * self.width.bytes() as u32;
+    fn byte(&mut self, byte: u8) {
+        self.packing |= u64::from(byte) << self.bits;
+        self.bits += 8;
         if self.bits == 64 {
             let word = self.packing;
             (self.packing, self.bits) = (0, 0);
@@ -109,28 +92,22 @@ impl State {
     #[inline]
     fn units(&mut self, units: Units<'_>) {
         match units {
-            Units::One(slice) => self.run(slice),
-            Units::Two(slice) => self.run(slice),
-            Units::Four(slice) => self.run(slice),
+            Units::Slice(bytes) => self.run(bytes),
             Units::Packed(packed) => self.packed(packed),
             Units::Inline(inline) => self.run(&inline.bytes()[..inline.len()]),
         }
     }
 
-    /// Hashes packed units. Units of the hash's width first complete the partly packed word, and then whole words are hashed directly. Units of another width are hashed one at a time.
+    /// Hashes packed bytes. Bytes first complete the partly packed word, and then whole words are hashed directly.
     #[inline]
     fn packed(&mut self, packed: Packed<'_>) {
-        if packed.width() != self.width {
-            (0..packed.len()).for_each(|i| self.unit(packed.code(i)));
-            return;
-        }
         let mut i = 0;
         while self.bits != 0 && i < packed.len() {
-            self.unit(packed.code(i));
+            self.byte(packed.byte(i));
             i += 1;
         }
         let packed = if i == 0 { packed } else { packed.slice(i..packed.len()) };
-        let bytes = packed.len() * packed.width().bytes();
+        let bytes = packed.len();
         let (whole, rest) = (bytes / 8, bytes % 8);
         let mut word_index = 0;
         if self.half.is_some() && whole > 0 {
@@ -151,40 +128,34 @@ impl State {
         }
     }
 
-    /// Hashes a slice of units. Units narrower than the string's width are widened one at a time. Units of the string's width
-    /// first complete the partly packed word, and then whole words are hashed directly.
-    fn run<U: Unit>(&mut self, mut slice: &[U]) {
-        if U::BITS != 8 * self.width.bytes() as u32 {
-            slice.iter().for_each(|unit| self.unit(unit.code()));
-            return;
-        }
+    /// Hashes a slice of bytes. Bytes first complete the partly packed word, and then whole words are hashed directly.
+    fn run(&mut self, mut slice: &[u8]) {
         while self.bits != 0
-            && let [unit, rest @ ..] = slice
+            && let [byte, rest @ ..] = slice
         {
-            self.unit(unit.code());
+            self.byte(*byte);
             slice = rest;
         }
-        let per = (64 / U::BITS) as usize;
-        if self.half.is_some() && slice.len() >= per {
-            self.word(U::pack(&slice[..per]));
-            slice = &slice[per..];
+        if self.half.is_some() && slice.len() >= 8 {
+            self.word(pack(&slice[..8]));
+            slice = &slice[8..];
         }
-        let mut pairs = slice.chunks_exact(2 * per);
+        let mut pairs = slice.chunks_exact(16);
         for pair in &mut pairs {
-            self.acc = mix(U::pack(&pair[..per]) ^ self.acc, U::pack(&pair[per..]) ^ self.key);
+            self.acc = mix(pack(&pair[..8]) ^ self.acc, pack(&pair[8..]) ^ self.key);
         }
         let mut rest = pairs.remainder();
-        if rest.len() >= per {
-            self.word(U::pack(&rest[..per]));
-            rest = &rest[per..];
+        if rest.len() >= 8 {
+            self.word(pack(&rest[..8]));
+            rest = &rest[8..];
         }
         // The loop above either completed the partly packed word or consumed all of `slice`. So `packing` is empty here, or `rest` is.
         if !rest.is_empty() {
-            (self.packing, self.bits) = (U::pack(rest), rest.len() as u32 * U::BITS);
+            (self.packing, self.bits) = (pack(rest), rest.len() as u32 * 8);
         }
     }
 
-    /// Returns the hash. The last step mixes in `len` and the width, which determine how many words were hashed and how the units were packed into them.
+    /// Returns the hash. The last step mixes in `len`, the number of bytes, which determines how many words were hashed.
     fn finish(mut self, len: usize) -> u64 {
         if self.bits != 0 {
             self.word(self.packing);
@@ -192,11 +163,11 @@ impl State {
         if let Some(a) = self.half {
             self.acc = mix(a ^ self.acc, self.key);
         }
-        mix(self.acc ^ (len as u64 | (self.width as u64) << 48), K2 ^ self.key)
+        mix(self.acc ^ len as u64, K2 ^ self.key)
     }
 }
 
-/// Hashes the characters of `string` with `seed`.
+/// Hashes the bytes of `string` with `seed`.
 #[inline]
 pub fn hash<H: Host>(h: &H, string: H::Str, seed: u64) -> Result<u64, H::Error> {
     if let Some(units) = flat(h, string) {
@@ -209,105 +180,64 @@ pub fn hash<H: Host>(h: &H, string: H::Str, seed: u64) -> Result<u64, H::Error> 
 #[inline(never)]
 fn rope_hash<H: Host>(h: &H, string: H::Str, seed: u64) -> Result<u64, H::Error> {
     let (info, flat) = summary(h, string);
-    h.charge(info.len as u64)?;
+    h.charge(info.bytes as u64)?;
     Ok(match flat {
         Some(units) => hash_flat(units, seed),
         None => hash_chunks(h, string, info, seed),
     })
 }
 
-/// Returns the hash that [`hash`] gives a flat string with the units `units`, which must be at their narrowest width. A host uses it to hash characters that are not in a string yet.
+/// Returns the hash that [`hash`] gives a flat string with the bytes `units`. A host uses it to hash bytes that are not in a string yet.
 #[inline]
 pub fn hash_units(units: Units<'_>, seed: u64) -> u64 {
     hash_flat(units, seed)
 }
 
-/// Returns the hash of a flat string's units, which are at their narrowest width.
+/// Returns the hash of a flat string's bytes.
 #[inline]
 fn hash_flat(units: Units<'_>, seed: u64) -> u64 {
-    let (len, width) = (units.len(), units.width());
-    let n = len * width.bytes();
+    let n = units.len();
     if n > MEDIUM {
-        let mut state = State::new(seed, width);
+        let mut state = State::new(seed);
         state.units(units);
-        return state.finish(len);
+        return state.finish(n);
     }
-    let mut buf = [0; MEDIUM];
     match units {
-        Units::One(bytes) => return compact(bytes, seed, len, width),
-        Units::Inline(inline) => return short(fingerprint(&inline.bytes()[..len]), seed, len, width),
-        // Packed units of more than `SHORT` bytes are read as words where they are.
-        Units::Packed(packed) if n > SHORT => {
-            return medium((packed.bytes_at(0), packed.bytes_at(8)), (packed.bytes_at(n - 16), packed.bytes_at(n - 8)), seed, len, width);
+        Units::Slice(bytes) => compact(bytes, seed),
+        Units::Inline(inline) => short(fingerprint(&inline.bytes()[..n]), seed, n),
+        // Packed bytes of more than `SHORT` bytes are read as words where they are.
+        Units::Packed(packed) if n > SHORT => medium((packed.bytes_at(0), packed.bytes_at(8)), (packed.bytes_at(n - 16), packed.bytes_at(n - 8)), seed, n),
+        Units::Packed(packed) => {
+            let mut buf = [0; SHORT];
+            packed.copy_bytes(0, &mut buf[..n]);
+            compact(&buf[..n], seed)
         }
-        Units::Packed(packed) => packed.copy_bytes(0, &mut buf[..n]),
-        _ => _ = gather(&mut buf, 0, codes(units), width),
     }
-    compact(&buf[..n], seed, len, width)
 }
 
 #[inline(never)]
 fn hash_chunks<H: Host>(h: &H, string: H::Str, info: Info, seed: u64) -> u64 {
-    if info.len * info.width.bytes() <= MEDIUM {
+    if info.bytes <= MEDIUM {
         let mut buf = [0; MEDIUM];
-        let n = chunks(h, string).fold(0, |at, units| gather(&mut buf, at, codes(units), info.width));
-        return compact(&buf[..n], seed, info.len, info.width);
+        let mut at = 0;
+        for units in chunks(h, string) {
+            units.copy_to(&mut buf[at..]);
+            at += units.len();
+        }
+        return compact(&buf[..at], seed);
     }
-    let mut state = State::new(seed, info.width);
+    let mut state = State::new(seed);
     chunks(h, string).for_each(|units| state.units(units));
-    state.finish(info.len)
+    state.finish(info.bytes)
 }
 
 /// Returns the hash that [`hash`] gives a string with the characters of `string`.
 pub fn hash_str(string: &str, seed: u64) -> u64 {
     let bytes = string.as_bytes();
-    if bytes.len() <= SHORT {
-        let words = fingerprint(bytes);
-        if (words.0 | words.1) & HIGH == 0 {
-            return short(words, seed, bytes.len(), Width::One);
-        }
-    } else if string.is_ascii() {
-        if bytes.len() <= MEDIUM {
-            return compact(bytes, seed, bytes.len(), Width::One);
-        }
-        let mut state = State::new(seed, Width::One);
-        state.run(bytes);
-        return state.finish(bytes.len());
+    if bytes.len() <= MEDIUM {
+        return compact(bytes, seed);
     }
-    // Every byte that is not a continuation byte starts a character. The largest byte gives the width: a lead byte of 0xC4 or more encodes a character above U+00FF, and 0xF0 or more encodes one above U+FFFF.
-    let len = string.bytes().filter(|&byte| byte as i8 >= -0x40).count();
-    let width = match string.bytes().max().unwrap_or(0) {
-        0xF0.. => Width::Four,
-        0xC4.. => Width::Two,
-        _ => Width::One,
-    };
-    if len * width.bytes() <= MEDIUM {
-        let mut buf = [0; MEDIUM];
-        let n = gather(&mut buf, 0, string.chars().map(|character| character as u32), width);
-        return compact(&buf[..n], seed, len, width);
-    }
-    let mut state = State::new(seed, width);
-    match width {
-        Width::One => state.decoded::<u8>(string),
-        Width::Two => state.decoded::<u16>(string),
-        Width::Four => state.decoded::<u32>(string),
-    }
-    state.finish(len)
-}
-
-impl State {
-    /// Hashes the characters of `string` as units of type `U`, a buffer at a time. Every character must fit in `U`.
-    fn decoded<U: Unit + Default>(&mut self, string: &str) {
-        let mut buf = [U::default(); 64];
-        let mut n = 0;
-        for character in string.chars() {
-            buf[n] = U::of(character as u32);
-            n += 1;
-            if n == buf.len() {
-                self.run(&buf);
-                n = 0;
-            }
-        }
-        self.run(&buf[..n]);
-    }
+    let mut state = State::new(seed);
+    state.run(bytes);
+    state.finish(bytes.len())
 }

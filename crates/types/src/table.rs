@@ -1823,7 +1823,7 @@ impl Text {
         let mut short = [0; SHORT];
         match string::copy_utf8(strings, string, &mut short) {
             Some(len) => Self { short, len, long: String::new() },
-            None => Self { short, len: 0, long: string::display(strings, string).to_string() },
+            None => Self { short, len: 0, long: string::to_string(strings, string) },
         }
     }
 

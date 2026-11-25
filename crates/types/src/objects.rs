@@ -4,7 +4,8 @@
 
 use std::cell::RefCell;
 
-use crate::bytevector::{ExternalBuffer, ExternalBufferMut};
+use crate::bytevector::ExternalBufferMut;
+use crate::store::Store;
 use crate::external::Held;
 use crate::table::Hosted;
 use crate::vector::HostedVector;
@@ -33,9 +34,9 @@ crate::gc::objects! {
     /// A bytevector of `bytes` bytes. The items pack eight bytes to a word, with the first byte in the lowest bits.
     pub(crate) struct Bytevector { bytes: u64 } items u64
     pub(crate) struct ImmutableBytevector { bytes: u64 } items u64
-    /// A bytevector whose `bytes` bytes are stored outside the arena, in `owner`. `owner` is dropped
-    /// once the bytevector is unreachable. The bytes never change in number or in value.
-    pub(crate) struct ExternBytevector { bytes: u64, owner: Frozen<Box<dyn ExternalBuffer>> }
+    /// A bytevector whose bytes are a part of the store `owner`, outside the arena. `bytes` holds the start of the part in its upper half and the length in its lower half.
+    /// The store is dropped once nothing reads from it. The bytes never change in number or in value.
+    pub(crate) struct ExternBytevector { bytes: u64, owner: Frozen<Store> }
     /// A writable bytevector whose bytes are stored outside the arena, in `buffer`. The buffer stays `bytes` bytes long.
     pub(crate) struct ExternMutBytevector { bytes: u64, buffer: Frozen<RefCell<Box<dyn ExternalBufferMut>>> }
     /// Source bytes, in no particular encoding.

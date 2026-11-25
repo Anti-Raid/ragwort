@@ -311,7 +311,7 @@ fn place<'gc>(mc: &Mutation<'gc>, source: Value<'gc>, offset: u32) -> (Option<St
     let strings = Strings::new(mc);
     // If `source` is a string, it is the file name and `offset` is already a line number. Code inlined from another module records its origin this way.
     if let Some(name) = strings.string(source) {
-        return (Some(string::display(&strings, name).to_string()), offset);
+        return (Some(string::to_string(&strings, name)), offset);
     }
     let Some(source) = SyntaxSource::of(source) else { return (None, 0) };
     let file = source.name(mc).map(|name| String::from_utf8_lossy(name.bytes(mc)).into_owned());
@@ -326,7 +326,7 @@ pub fn trace<'gc>(mc: &Mutation<'gc>, raised: Value<'gc>) -> Trace {
     let (entries, truncated) = recorded(mc, condition);
     let mut contexts = Vec::with_capacity(entries.len());
     for entry in entries {
-        let procedure = Symbol::of(entry.name).map(|symbol| string::display(&strings, symbol.name(mc)).to_string());
+        let procedure = Symbol::of(entry.name).map(|symbol| string::to_string(&strings, symbol.name(mc)));
         let (file, line) = place(mc, entry.source, entry.offset);
         contexts.push(Context { procedure, top_level: entry.name == Value::VOID, file, line, inlined: entry.inlined });
     }

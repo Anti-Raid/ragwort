@@ -19,7 +19,8 @@ use std::cell::{RefCell, RefMut};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::gc::{Gc, Mutation, OutOfMemory, Slots, Value, slot};
+use crate::gc::{FrozenRef, Gc, Mutation, OutOfMemory, Slots, Value, slot};
+use crate::store::{STORE_MAX, Store, range_of, range_word};
 use crate::objects::{self, BytevectorFields, Data, ExternBytevectorFields, ExternMutBytevectorFields, ImmutableBytevectorFields};
 
 #[cfg(test)]
@@ -164,10 +165,16 @@ const COPY_EXTERNAL: usize = 64;
 pub struct ExternalBytevector<'gc>(Gc<'gc, objects::ExternBytevector>);
 
 impl<'gc> ExternalBytevector<'gc> {
-    /// Returns the bytes, limited to the length they had when the bytevector was created.
+    /// Returns the bytes: the part of the store that the bytevector is a view of.
     fn bytes(self, mc: &Mutation<'gc>) -> &'gc [u8] {
-        let bytes = self.0.owner(mc).map_or(&[][..], |owner| (**owner).as_ref());
-        &bytes[..bytes.len().min(self.0.bytes(mc) as usize)]
+        let (start, len) = range_of(self.0.bytes(mc));
+        self.0.owner(mc).and_then(|store| store.bytes().get(start..start + len)).unwrap_or(&[])
+    }
+
+    /// Returns the store that the bytevector reads from, the start of its part in the store, and the number of bytes of the whole store.
+    pub(crate) fn store(self, mc: &Mutation<'gc>) -> Option<(FrozenRef<'gc, Store>, usize, usize)> {
+        let store = self.0.frozen_ref(mc, objects::ExternBytevector::OWNER)?;
+        Some((store, range_of(self.0.bytes(mc)).0, self.0.owner(mc)?.bytes().len()))
     }
 }
 
@@ -213,7 +220,7 @@ impl<'gc> AnyBytevector<'gc> {
             Self::Mutable(Bytevector(Kept::Inside(bytevector))) => bytevector.bytes(mc) as usize,
             Self::Mutable(Bytevector(Kept::Outside(bytevector))) => bytevector.bytes(mc) as usize,
             Self::Immutable(bytevector) => bytevector.0.bytes(mc) as usize,
-            Self::External(bytevector) => bytevector.0.bytes(mc) as usize,
+            Self::External(bytevector) => range_of(bytevector.0.bytes(mc)).1,
         }
     }
 
@@ -374,7 +381,8 @@ impl<'a, 'gc> Bytevectors<'a, 'gc> {
             return self.immutable_from_slice(bytes.as_ref());
         }
         let owner: Box<dyn ExternalBuffer> = Box::new(bytes);
-        let bytevector = objects::ExternBytevector::new(self.mc, len as u64, self.mc.frozen_owning(owner, len)?)?;
+        let len = len.min(STORE_MAX);
+        let bytevector = objects::ExternBytevector::new(self.mc, range_word(0, len), self.mc.frozen_owning(Store::Bytes(owner), len)?)?;
         Ok(AnyBytevector::External(ExternalBytevector(bytevector)))
     }
 

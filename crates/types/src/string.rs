@@ -1,30 +1,35 @@
-//! Strings in the arena, for `ragwort-string`. A string is stored in one of these ways:
+//! Strings in the arena, for `ragwort-string`. A string is UTF-8. It is stored in one of these ways:
 //!
-//! - A flat string of up to [`INLINE_CHARS`] Latin-1 characters is stored inline in the value word.
-//! - A longer flat string is a [`Str8`], [`Str16`] or [`Str32`] object, chosen by its widest
-//!   character. The characters are packed into the object's items.
+//! - A flat string of up to [`INLINE_BYTES`] bytes is stored inline in the value word.
+//! - A flat string of up to [`BUILD`] words is a [`Flat`] object. Its bytes are packed into the object's items, eight to an item.
+//! - A longer flat string is an [`Extern`] object: a view of a [`Store`], which holds the bytes outside the arena.
+//!   The store is text that the host handed over, or bytes that the arena made for the string. Several strings can be views of one store.
 //! - A rope is a [`Rope`] object.
-//! - A flat string whose characters are owned by the host is an [`Extern`] object.
+//!
+//! # Lengths
+//!
+//! A string has a number of bytes and a number of characters, and keeps both. The two are equal
+//! exactly when the string is ASCII. A position that a program gives is a character index. In an
+//! ASCII string it is used as a byte offset. In another string the characters before it are counted.
 //!
 //! # Hashes
 //!
-//! [`Strings::hash`] returns a hash of a string's characters, for hash tables. A flat string
-//! object, a rope and an external string keep the hash once it is computed, so the characters of a
+//! [`Strings::hash`] returns a hash of a string's bytes, for hash tables. A flat string
+//! object, a rope and an external string keep the hash once it is computed, so the bytes of a
 //! string that is hashed again and again are read once.
 //!
-//! The hash costs a string no memory. A flat string object has one word for its number of
-//! characters, and the hash is in the upper half of that word:
+//! The hash costs a string no memory. A flat string object has one word beside its bytes:
 //!
 //! ```text
-//! bits 0 to 30    the number of characters
+//! bits 0 to 27    the number of characters
+//! bits 28 to 30   the number of unused bytes in the last item
 //! bit 31          set while the string is interned
 //! bits 32 to 63   the hash, or 0 if it has not been computed
 //! ```
 //!
-//! A rope has the same layout in its `reads` word, with the number of reads by index in bits 0 to 30.
-//! An external string has it in its `hash` word, where bits 0 to 30 are not used.
-//!
-//! So a flat string has at most [`FLAT_MAX`] characters. A rope can be longer.
+//! A rope has bits 31 to 63 of that layout in its `reads` word, with the number of reads by index in bits 0 to 30.
+//! A view of a store has them in its `hash` word. Bits 0 to 30 of that word hold one more than the number of characters,
+//! or 0 until the characters have been counted. So a flat string has at most [`FLAT_MAX`] bytes. A rope can be longer.
 //!
 //! # Interned strings
 //!
@@ -33,22 +38,21 @@
 //!
 //! - A string in the value word is interned as it is. Equal ones are the same word already.
 //! - A flat string object is interned when it is made. If the arena already has a string with
-//!   the same characters, that string is returned and the new object is dropped.
+//!   the same characters, that string is returned and no object is made.
 //! - A rope is not interned when it is made, so that joining strings stays cheap. It is interned
 //!   the first time it is compared with a string of the same length, or used as the key of a
 //!   table. Its hash is computed from its pieces, and nothing is copied.
-//! - An external string is not interned when it is made either, so that handing a string to the
-//!   arena reads none of its characters. It is interned at the same two moments as a rope.
+//! - A view of a store is not interned when it is made either, so that handing a long text to the
+//!   arena reads none of it. It is interned at the same two moments as a rope.
 //!
-//! ## Interned external strings
+//! ## Interned views
 //!
-//! If no string with its characters is interned, the external string itself becomes the interned
-//! string. Its characters stay outside the arena. A flat string that is made with the same
-//! characters afterwards is the external string.
+//! If no string with its characters is interned, the view itself becomes the interned
+//! string. Its bytes stay in its store.
 //!
-//! If another string is the interned string already, the external string stays as it is. It has
-//! no field to keep that string in, so each comparison looks the interned string up by the kept
-//! hash and compares the characters.
+//! If another string is the interned string already, the view stays as it is and is not the interned string.
+//! If that other string is a view too, the first view is pointed at the same part of the same store, and lets go of its own.
+//! The two then read the same bytes, so a later comparison of them reads none, and a text that the arena was given twice is kept once.
 //!
 //! ## Interned ropes
 //!
@@ -56,12 +60,11 @@
 //!
 //! - No string with its characters is interned. The rope itself becomes the interned string. It
 //!   keeps its two halves, so the pieces that it shares with other strings stay shared.
-//! - Another string is the interned string already. The rope then keeps that string in `flat`
-//!   and lets go of its halves, and it is read as that string from then on.
+//! - Another string is the interned string already. The rope then keeps that string in place
+//!   of its two halves, and it is read as that string from then on.
 //!
 //! A rope that is the interned string stays the interned string when it is flattened. The flat
-//! copy belongs to the rope alone: it is not interned, and no other value refers to it. So every
-//! flat string object that a program can hold is interned.
+//! copy belongs to the rope alone, and is not interned.
 //!
 //! ## The table
 //!
@@ -81,8 +84,7 @@
 //!
 //! A new string of up to [`BUILD`] words is written into a buffer on the stack first. It is hashed
 //! and looked up there. Only a text that the arena does not have yet is allocated. A longer string
-//! is allocated first and looked up afterwards. If the interned string with its characters is a
-//! rope, the new object becomes the flat copy of that rope, and the rope is returned.
+//! is written into a store of its own outside the arena, and is a view of that store.
 //!
 //! The hash is seeded with the arena's seed, so it cannot be predicted from outside. An arena has
 //! one seed for its whole life, and an image is loaded only into an arena with the image's seed,
@@ -93,8 +95,12 @@ pub use ragwort_string::*;
 pub use crate::gc::Error;
 use std::cell::Cell;
 
-use crate::gc::{Gc, INLINE_STRING, Mutation, Object, Slots, TAG, Value, slot};
+use crate::gc::{Gc, INLINE_STRING, Mutation, Slots, TAG, Value, slot};
+use crate::bytevector::AnyBytevector;
+use crate::gc::FrozenRef;
 use crate::objects::{InternSlots, InternSlotsFields};
+pub use crate::store::Store;
+use crate::store::{STORE_MAX, range_of, range_word, shares};
 use crate::symbol::Symbols;
 
 #[cfg(test)]
@@ -105,31 +111,39 @@ crate::gc::objects! {
     /// Every kind of string object.
     pub kind Text after crate::gc::table::Containers;
 
-    /// A flat string of characters, none above U+00FF, packed eight to an item. `chars` holds the number of characters and the hash. See the [module docs](self).
-    pub struct Str8 { chars: u64 } items u64
-    /// A flat string of characters, none above U+FFFF and at least one above U+00FF, packed four to an item. `chars` is as in [`Str8`].
-    pub struct Str16 { chars: u64 } items u64
-    /// A flat string with at least one character above U+FFFF, packed two to an item. `chars` is as in [`Str8`].
-    pub struct Str32 { chars: u64 } items u64
-    /// The concatenation of two nonempty strings, `left` then `right`. `info` is the packed `Info`
-    /// of the rope. `flat` is the string that the rope is read as, and `#f` while the rope is read as its halves.
-    /// It is the flat copy of a rope that has been flattened, or the interned string of a rope that is not the interned string itself.
-    /// A rope with a `flat` has `#f` for `left` and `right`.
+    /// A flat string of UTF-8 bytes, packed eight to an item. `chars` holds the number of characters, the number of unused bytes in the last item, the interned flag and the hash. See the [module docs](self).
+    pub struct Flat { chars: u64 } items u64
+    /// The concatenation of two nonempty strings, `left` then `right`. `info` holds the number of bytes in its low 48 bits and the depth in its high 8 bits.
+    /// `chars` is the number of characters.
+    /// A rope whose `right` is `#f` is read as the string in `left`, and has let go of its two halves. That string is the flat copy of a rope that has been flattened, or the interned string of a rope that is not the interned string itself.
     /// `reads` holds the number of reads of the rope by character index, the interned flag and the hash. See the [module docs](self).
-    pub struct Rope { left: Value, right: Value, info: u64, flat: Value, reads: u64 }
-    /// A flat string whose characters are stored outside the arena, in `owner`. `owner` is dropped once the string is unreachable. `hash` holds the interned flag and the hash of the characters. See the [module docs](self).
-    pub struct Extern { owner: Frozen<Box<dyn External>>, hash: u64 }
+    pub struct Rope { left: Value, right: Value, info: u64, chars: u64, reads: u64 }
+    /// A flat string whose bytes are a part of the store `owner`, outside the arena. The store is dropped once nothing reads from it.
+    /// `hash` holds the number of characters, the interned flag and the hash. `range` holds the start of the part in its upper half and the length in its lower half. See the [module docs](self).
+    pub struct Extern { owner: Frozen<Store>, hash: u64, range: u64 }
 }
 
-/// The most characters that a flat string object can have. Its word for the number of characters also holds the hash. See the [module docs](self).
-pub const FLAT_MAX: usize = (1 << 31) - 1;
+/// The most bytes that a flat string can have. A view of a store keeps its start, its length and its number of characters in 31 bits each. See the [module docs](self).
+pub const FLAT_MAX: usize = STORE_MAX;
 
-/// The bits of a flat string's `chars` word that hold the number of characters. The same bits of a rope's `reads` word hold the number of reads.
-const COUNT: u64 = FLAT_MAX as u64;
+/// The bits of a flat string's `chars` word that hold the number of characters.
+const COUNT: u64 = (1 << 28) - 1;
+/// The bits of a view's `hash` word that hold one more than the number of characters, or 0 if the characters have not been counted.
+const COUNTED: u64 = (1 << 31) - 1;
+/// The low half of a `chars` or `hash` word: everything but the hash.
+const LOW: u64 = (1 << 32) - 1;
+/// The number of bits that the count of unused bytes in a flat string's `chars` word is shifted up by. The count takes three bits.
+const UNUSED_SHIFT: u32 = 28;
+/// The bits of a flat string's `chars` word that describe its bytes: the number of characters and the number of unused bytes.
+const SHAPE: u64 = (1 << 31) - 1;
+/// The bits of a rope's `reads` word that hold the number of reads.
+const READS: u64 = (1 << 31) - 1;
 /// The bit of a flat string's `chars` word, of a rope's `reads` word or of an external string's `hash` word that is set while the string is interned.
 const INTERNED: u64 = 1 << 31;
 /// The number of bits that the hash in one of those words is shifted up by.
 const HASH_SHIFT: u32 = 32;
+/// The number of bits that the depth in a rope's `info` word is shifted up by.
+const DEPTH_SHIFT: u32 = 56;
 /// The number of words of the buffer in which a new flat string is built before it is looked up. See the [module docs](self).
 pub const BUILD: usize = 64;
 /// The number of words of the smaller buffer, which a string that fits in it is built in. Clearing it takes less time.
@@ -140,9 +154,9 @@ const MIN_SLOTS: usize = 8;
 /// External strings of fewer bytes than this are copied into the arena. Keeping them outside would cost more than their characters.
 const COPY_EXTERNAL: usize = 64;
 
-/// A string of up to this many Latin-1 characters is stored inline in the value word. Creating
+/// A string of up to this many bytes is stored inline in the value word. Creating
 /// one allocates nothing, and equal inline strings are the same value.
-pub const INLINE_CHARS: usize = 7;
+pub const INLINE_BYTES: usize = 7;
 
 #[inline]
 fn is_inline(value: Value<'_>) -> bool {
@@ -185,19 +199,53 @@ impl<'a, 'gc> Strings<'a, 'gc> {
         self.mc
     }
 
-    /// Returns a string whose characters are stored outside the arena, in `chars`, such as an
-    /// [`ExternalText`]. The characters must never change in number or in value, because strings
-    /// are immutable. A string of fewer than 64 bytes is copied into the arena instead.
-    pub fn external(&self, chars: impl External) -> Result<Str<'gc>, Error> {
-        let units = chars.units();
-        check_external(units)?;
-        let bytes = units.len() * units.width().bytes();
+    /// Returns a string whose text is stored outside the arena, in `text`, such as an
+    /// [`ExternalText`]. The text must never change, because strings
+    /// are immutable. Text of fewer than 64 bytes is copied into the arena instead.
+    pub fn external(&self, text: impl External) -> Result<Str<'gc>, Error> {
+        let bytes = text.text().len();
+        check_external(text.text())?;
         if bytes < COPY_EXTERNAL {
-            return self.flat(units.width(), units.len(), |mut target| target.copy_from(units));
+            return from_str(self, text.text());
         }
-        let owner: Box<dyn External> = Box::new(chars);
-        let external = Extern::new(self.mc, self.mc.frozen_owning(owner, bytes)?, 0)?;
-        Ok(Str(Value::object(self.mc, external)))
+        if bytes > FLAT_MAX {
+            return Err(StrError::TooLong.into());
+        }
+        let store = self.mc.frozen_owning(Store::Text(Box::new(text)), bytes)?;
+        self.view_of(store, 0, bytes, None)
+    }
+
+    /// Returns a string that is a view of `len` bytes of `store` from byte `start`. `chars` is the number of characters in them, if the caller knows it.
+    fn view_of(&self, store: FrozenRef<'gc, Store>, start: usize, len: usize, chars: Option<usize>) -> Result<Str<'gc>, Error> {
+        let counted = chars.map_or(0, |chars| chars as u64 + 1);
+        Ok(Str(Value::object(self.mc, Extern::new(self.mc, store, counted, range_word(start, len))?)))
+    }
+
+    /// Returns a string with the text that the bytes of `bytevector` from `start` up to `end` hold. Fails with [`StrError::NotUtf8`] if they hold no text.
+    ///
+    /// The bytes are checked once. If `bytevector` reads from a store and the part is large enough to share, the string reads from the same store and nothing is copied.
+    pub fn from_utf8_of(&self, bytevector: AnyBytevector<'gc>, start: usize, end: usize) -> Result<Str<'gc>, Error> {
+        if let AnyBytevector::External(external) = bytevector
+            && let Some((store, from, whole)) = external.store(self.mc)
+            && shares(end - start, whole)
+        {
+            let part = bytevector.bytes(self.mc, start, end);
+            let text = std::str::from_utf8(&part).map_err(|_| StrError::NotUtf8)?;
+            return self.view_of(store, from + start, end - start, Some(text.chars().count()));
+        }
+        from_utf8(self, &bytevector.bytes(self.mc, start, end))
+    }
+
+    /// Returns the text of `string` without copying it, if `string` is a view of a store: a long string, or text that the host handed over. Text of the host is
+    /// returned without a check. Returns `None` for any other string, whose text is in the arena and has to be copied out, as [`to_string`] and [`append_utf8`] do.
+    pub fn as_str(&self, string: Str<'gc>) -> Option<&'gc str> {
+        match Text::of(string.0) {
+            Some(Text::Extern(external)) => {
+                let (start, len) = range_of(external.range(self.mc));
+                external.owner(self.mc)?.text(start..start + len)
+            }
+            _ => None,
+        }
     }
 
     pub fn is_external(&self, string: Str<'gc>) -> bool {
@@ -217,9 +265,7 @@ impl<'a, 'gc> Strings<'a, 'gc> {
     pub fn hash(&self, string: Str<'gc>) -> Result<u32, Error> {
         let mc = self.mc;
         let kept = match Text::of(string.0) {
-            Some(Text::Str8(flat)) => flat.chars(mc) >> HASH_SHIFT,
-            Some(Text::Str16(flat)) => flat.chars(mc) >> HASH_SHIFT,
-            Some(Text::Str32(flat)) => flat.chars(mc) >> HASH_SHIFT,
+            Some(Text::Flat(flat)) => flat.chars(mc) >> HASH_SHIFT,
             Some(Text::Rope(rope)) => rope.reads(mc) >> HASH_SHIFT,
             Some(Text::Extern(external)) => external.hash(mc) >> HASH_SHIFT,
             None => 0,
@@ -237,22 +283,19 @@ impl<'a, 'gc> Strings<'a, 'gc> {
         let seed = Symbols::of_arena(mc)?.seed(mc);
         let hash = u64::from(narrowed(ragwort_string::hash(self, string, seed)?));
         match Text::of(string.0) {
-            Some(Text::Str8(flat)) => flat.set_chars(mc, flat.chars(mc) & (COUNT | INTERNED) | hash << HASH_SHIFT),
-            Some(Text::Str16(flat)) => flat.set_chars(mc, flat.chars(mc) & (COUNT | INTERNED) | hash << HASH_SHIFT),
-            Some(Text::Str32(flat)) => flat.set_chars(mc, flat.chars(mc) & (COUNT | INTERNED) | hash << HASH_SHIFT),
-            Some(Text::Rope(rope)) => rope.set_reads(mc, rope.reads(mc) & (COUNT | INTERNED) | hash << HASH_SHIFT),
-            Some(Text::Extern(external)) => external.set_hash(mc, external.hash(mc) & INTERNED | hash << HASH_SHIFT),
+            Some(Text::Flat(flat)) => flat.set_chars(mc, flat.chars(mc) & (SHAPE | INTERNED) | hash << HASH_SHIFT),
+            Some(Text::Rope(rope)) => rope.set_reads(mc, rope.reads(mc) & (READS | INTERNED) | hash << HASH_SHIFT),
+            Some(Text::Extern(external)) => external.set_hash(mc, external.hash(mc) & LOW | hash << HASH_SHIFT),
             None => {}
         }
         Ok(hash as u32)
     }
 
-    /// Returns the interned string with the characters of `string`. A flat string that a program holds is interned already, so this returns it. A rope or an external string is interned without a copy. See the [module docs](self).
+    /// Returns the interned string with the characters of `string`. A flat string object is interned already, so this returns it. A rope or a view of a store is interned without a copy. See the [module docs](self).
     pub fn intern(&self, string: Str<'gc>) -> Result<Str<'gc>, Error> {
         match Text::of(string.0) {
-            Some(Text::Str8(flat)) => self.intern_flat(flat, string),
-            Some(Text::Str16(flat)) => self.intern_flat(flat, string),
-            Some(Text::Str32(flat)) => self.intern_flat(flat, string),
+            // A flat string object is interned when it is made.
+            Some(Text::Flat(_)) => Ok(string),
             Some(Text::Rope(rope)) => self.intern_rope(rope, string),
             Some(Text::Extern(external)) => self.intern_extern(external, string),
             // A string in the value word is its own interned string.
@@ -279,42 +322,11 @@ impl<'a, 'gc> Strings<'a, 'gc> {
     pub fn is_interned(&self, string: Str<'gc>) -> bool {
         let mc = self.mc;
         match Text::of(string.0) {
-            Some(Text::Str8(flat)) => flat.chars(mc) & INTERNED != 0,
-            Some(Text::Str16(flat)) => flat.chars(mc) & INTERNED != 0,
-            Some(Text::Str32(flat)) => flat.chars(mc) & INTERNED != 0,
+            Some(Text::Flat(flat)) => flat.chars(mc) & INTERNED != 0,
             Some(Text::Rope(rope)) => rope.reads(mc) & INTERNED != 0,
             Some(Text::Extern(external)) => external.hash(mc) & INTERNED != 0,
             None => true,
         }
-    }
-
-    /// Makes the flat string object `flat`, which is `string`, the interned string of its characters, unless another string is that already. Returns the interned string.
-    ///
-    /// If the interned string is a rope, the rope takes `flat` as its flat copy and is returned. The result is then read as a flat string too.
-    fn intern_flat<T: Object>(&self, flat: Gc<'gc, T>, string: Str<'gc>) -> Result<Str<'gc>, Error>
-    where
-        Gc<'gc, T>: Flat<'gc>,
-    {
-        let mc = self.mc;
-        if flat.count(mc) & INTERNED != 0 {
-            return Ok(string);
-        }
-        let hash = self.hash(string)?;
-        let symbols = Symbols::of_arena(mc)?;
-        let mut probe = Probe::new(mc, symbols, hash);
-        for candidate in probe.by_ref() {
-            if same_chars(self, candidate, string)? {
-                if let Some(Text::Rope(rope)) = Text::of(candidate.0)
-                    && rope.flat(mc) == Value::FALSE
-                {
-                    self.flattened(candidate, string);
-                }
-                return Ok(candidate);
-            }
-        }
-        self.insert(symbols, &probe, string)?;
-        flat.set_count(mc, flat.count(mc) | INTERNED);
-        Ok(string)
     }
 
     /// Returns the interned string with the characters of the rope `rope`, which is `string`. If no string is that yet, the rope becomes it, as it is.
@@ -329,7 +341,7 @@ impl<'a, 'gc> Strings<'a, 'gc> {
         for candidate in probe.by_ref() {
             if same_chars(self, candidate, string)? {
                 // The rope is read as the interned string from now on. That is done only if it makes the rope no deeper: the ropes that contain this rope were balanced for the depth that it has.
-                if self.depth(candidate) <= Info::from_bits(rope.info(mc)).depth {
+                if self.depth(candidate) <= (rope.info(mc) >> DEPTH_SHIFT) as u8 {
                     self.flattened(string, candidate);
                 }
                 return Ok(candidate);
@@ -340,7 +352,8 @@ impl<'a, 'gc> Strings<'a, 'gc> {
         Ok(string)
     }
 
-    /// Returns the interned string with the characters of the external string `external`, which is `string`. If no string is that yet, the external string becomes it, as it is.
+    /// Returns the interned string with the characters of the view `external`, which is `string`. If no string is that yet, the view becomes it, as it is.
+    /// If another view is that already, `external` is pointed at the bytes of that view and lets go of its own.
     fn intern_extern(&self, external: Gc<'gc, Extern>, string: Str<'gc>) -> Result<Str<'gc>, Error> {
         let mc = self.mc;
         if external.hash(mc) & INTERNED != 0 {
@@ -350,7 +363,23 @@ impl<'a, 'gc> Strings<'a, 'gc> {
         let symbols = Symbols::of_arena(mc)?;
         let mut probe = Probe::new(mc, symbols, hash);
         for candidate in probe.by_ref() {
+            let held = match Text::of(candidate.0) {
+                Some(Text::Extern(held)) => Some(held),
+                _ => None,
+            };
+            // Two views of the same part of one store have the same characters. No byte is read.
+            if let Some(held) = held
+                && same_part(mc, held, external)
+            {
+                return Ok(candidate);
+            }
             if same_chars(self, candidate, string)? {
+                if let Some(held) = held
+                    && let Some(store) = held.frozen_ref(mc, Extern::OWNER)
+                {
+                    external.set_owner(mc, store);
+                    external.set_range(mc, held.range(mc));
+                }
                 return Ok(candidate);
             }
         }
@@ -362,39 +391,57 @@ impl<'a, 'gc> Strings<'a, 'gc> {
     /// Returns the depth of `string` as a rope. A flat string and a rope that is read as a flat string have a depth of 0.
     fn depth(&self, string: Str<'gc>) -> u8 {
         match self.view(string) {
-            StrView::Flat(_) => 0,
+            StrView::Flat { .. } => 0,
             StrView::Rope { info, .. } => info.depth,
         }
     }
 
-    /// Returns the interned string with the characters in `built`, which are the `len` characters of a string that is not allocated yet. If the arena has no such string, a string is allocated for them and interned.
-    fn settle<T: Object>(&self, built: &[Cell<u64>], len: usize) -> Result<Str<'gc>, Error>
-    where
-        Gc<'gc, T>: Flat<'gc>,
-    {
+    /// Returns the bytes of the flat string `string` from byte `start` up to byte `end` as a view of the same store, if `string` reads from a store and the part is large enough to share.
+    /// `chars` is the number of characters in the part, if the caller knows it.
+    fn shared(&self, string: Str<'gc>, start: usize, end: usize, chars: Option<usize>) -> Result<Option<Str<'gc>>, Error> {
         let mc = self.mc;
-        let width = <Gc<'gc, T> as Flat<'gc>>::WIDTH;
+        let external = match Text::of(string.0) {
+            Some(Text::Extern(external)) => external,
+            // A rope that is read as another string shares what that string shares.
+            Some(Text::Rope(rope)) if rope.right(mc) == Value::FALSE => return self.shared(Str(rope.left(mc)), start, end, chars),
+            _ => return Ok(None),
+        };
+        let (Some(store), Some(whole)) = (external.frozen_ref(mc, Extern::OWNER), external.owner(mc)) else { return Ok(None) };
+        if !shares(end - start, whole.bytes().len()) {
+            return Ok(None);
+        }
+        let (from, _) = range_of(external.range(mc));
+        self.view_of(store, from + start, end - start, chars).map(Some)
+    }
+
+    /// Returns the interned string with the bytes in `built`, which are the `bytes` bytes of a string that is not allocated yet. `shape` is the low half of the `chars` word of that string. If the arena has no such string, a string is allocated for the bytes and interned.
+    fn settle(&self, built: &[Cell<u64>], bytes: usize, shape: u64) -> Result<Str<'gc>, Error> {
+        let mc = self.mc;
         let symbols = Symbols::of_arena(mc)?;
-        let hash = narrowed(hash_units(Units::Packed(Packed::new(built, len, width)), symbols.seed(mc)));
+        let units = Units::Packed(Packed::new(built, bytes));
+        let hash = narrowed(hash_units(units, symbols.seed(mc)));
         let mut probe = Probe::new(mc, symbols, hash);
         for candidate in probe.by_ref() {
-            // A string that fits in the buffer is never a rope. So a flat string of this width or an external string can have these characters.
-            let Some(text) = Text::of(candidate.0) else { continue };
-            if let Text::Extern(_) = text {
-                let StrView::Flat(units) = self.view(candidate) else { continue };
-                if units.len() == len && units.width() == width && units.equal(Units::Packed(Packed::new(built, len, width))) {
-                    return Ok(candidate);
+            // A string that fits in the buffer is never a rope. So a flat string object or an external string can have these bytes.
+            match Text::of(candidate.0) {
+                Some(Text::Extern(_)) => {
+                    let StrView::Flat { units: held, .. } = self.view(candidate) else { continue };
+                    if held.len() == bytes && held.equal(units) {
+                        return Ok(candidate);
+                    }
                 }
-                continue;
-            }
-            // Two flat strings of one width with the same number of characters and the same words have the same characters.
-            let Some(held) = <Gc<'gc, T> as Flat<'gc>>::cast(text) else { continue };
-            if held.count(mc) & COUNT == len as u64 && held.words(mc).iter().zip(built).all(|(word, new)| word.get() == new.get()) {
-                return Ok(candidate);
+                // Two flat string objects with the same number of bytes and the same words have the same bytes. The bits past the last byte are 0 in both.
+                Some(Text::Flat(held)) => {
+                    let words = held.items(mc).words();
+                    if held.chars(mc) & SHAPE == shape && words.len() == built.len() && words.iter().zip(built).all(|(word, new)| word.get() == new.get()) {
+                        return Ok(candidate);
+                    }
+                }
+                _ => {}
             }
         }
-        let object = mc.alloc_zeroed::<T, 1>([len as u64 | INTERNED | u64::from(hash) << HASH_SHIFT], built.len())?;
-        for (word, new) in object.words(mc).iter().zip(built) {
+        let object = mc.alloc_zeroed::<Flat, 1>([shape | INTERNED | u64::from(hash) << HASH_SHIFT], built.len())?;
+        for (word, new) in object.items(mc).words().iter().zip(built) {
             word.set(new.get());
         }
         let string = Str(Value::object(mc, object));
@@ -438,9 +485,9 @@ impl<'a, 'gc> Strings<'a, 'gc> {
         Ok(())
     }
 
-    /// Returns whether `string` is a flat string object in the arena, and not a string in the value word, a rope or an external string.
+    /// Returns whether `string` is a flat string object in the arena, and not a string in the value word, a rope or a view of a store.
     pub(crate) fn is_object(&self, string: Str<'gc>) -> bool {
-        matches!(Text::of(string.0), Some(Text::Str8(_) | Text::Str16(_) | Text::Str32(_)))
+        matches!(Text::of(string.0), Some(Text::Flat(_)))
     }
 
     /// Returns the number of interned string objects, for tests.
@@ -521,101 +568,6 @@ fn narrowed(hash: u64) -> u32 {
     (hash as u32).max(1)
 }
 
-/// A flat string object of one of the three unit widths.
-trait Flat<'gc>: Copy + PartialEq {
-    /// The width of the units of this type of string.
-    const WIDTH: Width;
-
-    /// Returns the `chars` word: the number of characters, the interned flag and the hash.
-    fn count(self, mc: &Mutation<'gc>) -> u64;
-
-    fn set_count(self, mc: &Mutation<'gc>, word: u64);
-
-    /// Returns the words that hold the characters.
-    fn words(self, mc: &Mutation<'gc>) -> &'gc [Cell<u64>];
-
-    /// Returns `text` as a flat string of this type, or `None` if it is a string of another kind.
-    fn cast(text: Text<'gc>) -> Option<Self>;
-}
-
-impl<'gc> Flat<'gc> for Gc<'gc, Str8> {
-    const WIDTH: Width = Width::One;
-
-    #[inline]
-    fn count(self, mc: &Mutation<'gc>) -> u64 {
-        self.chars(mc)
-    }
-
-    #[inline]
-    fn set_count(self, mc: &Mutation<'gc>, word: u64) {
-        self.set_chars(mc, word);
-    }
-
-    #[inline]
-    fn words(self, mc: &Mutation<'gc>) -> &'gc [Cell<u64>] {
-        self.items(mc).words()
-    }
-    #[inline]
-    fn cast(text: Text<'gc>) -> Option<Self> {
-        match text {
-            Text::Str8(flat) => Some(flat),
-            _ => None,
-        }
-    }
-}
-
-impl<'gc> Flat<'gc> for Gc<'gc, Str16> {
-    const WIDTH: Width = Width::Two;
-
-    #[inline]
-    fn count(self, mc: &Mutation<'gc>) -> u64 {
-        self.chars(mc)
-    }
-
-    #[inline]
-    fn set_count(self, mc: &Mutation<'gc>, word: u64) {
-        self.set_chars(mc, word);
-    }
-
-    #[inline]
-    fn words(self, mc: &Mutation<'gc>) -> &'gc [Cell<u64>] {
-        self.items(mc).words()
-    }
-    #[inline]
-    fn cast(text: Text<'gc>) -> Option<Self> {
-        match text {
-            Text::Str16(flat) => Some(flat),
-            _ => None,
-        }
-    }
-}
-
-impl<'gc> Flat<'gc> for Gc<'gc, Str32> {
-    const WIDTH: Width = Width::Four;
-
-    #[inline]
-    fn count(self, mc: &Mutation<'gc>) -> u64 {
-        self.chars(mc)
-    }
-
-    #[inline]
-    fn set_count(self, mc: &Mutation<'gc>, word: u64) {
-        self.set_chars(mc, word);
-    }
-
-    #[inline]
-    fn words(self, mc: &Mutation<'gc>) -> &'gc [Cell<u64>] {
-        self.items(mc).words()
-    }
-    #[inline]
-    fn cast(text: Text<'gc>) -> Option<Self> {
-        match text {
-            Text::Str32(flat) => Some(flat),
-            _ => None,
-        }
-    }
-}
-
 impl<'gc> Strings<'_, 'gc> {
     /// Returns the view of a rope or an external string. It is kept out of line so that the views of flat strings inline.
     #[inline(never)]
@@ -623,17 +575,44 @@ impl<'gc> Strings<'_, 'gc> {
         let mc = self.mc;
         match Text::of(string.0) {
             Some(Text::Rope(rope)) => {
-                // A rope with a `flat` is read as that string. It has let go of its halves.
-                let flat = rope.flat(mc);
-                if flat != Value::FALSE {
-                    return self.view(Str(flat));
+                // A rope without a right half is read as the string in `left`.
+                let right = rope.right(mc);
+                if right == Value::FALSE {
+                    return self.view(Str(rope.left(mc)));
                 }
-                StrView::Rope { left: Str(rope.left(mc)), right: Str(rope.right(mc)), info: Info::from_bits(rope.info(mc)), flat: None }
+                StrView::Rope { left: Str(rope.left(mc)), right: Str(right), info: rope_info(mc, rope), flat: None }
             }
-            Some(Text::Extern(external)) => StrView::Flat(external.owner(mc).map_or(Units::One(&[]), |owner| owner.units())),
+            Some(Text::Extern(external)) => {
+                let (start, len) = range_of(external.range(mc));
+                let bytes = external.owner(mc).and_then(|store| store.bytes().get(start..start + len)).unwrap_or(&[]);
+                let units = Units::Slice(bytes);
+                // The characters are counted the first time the string is read, and not when the host hands it over.
+                let word = external.hash(mc);
+                let chars = if word & COUNTED == 0 {
+                    let chars = units.count_chars();
+                    external.set_hash(mc, word | (chars as u64 + 1).min(COUNTED));
+                    chars
+                } else {
+                    (word & COUNTED) as usize - 1
+                };
+                StrView::Flat { units, chars }
+            }
             _ => panic!("strings are flat, ropes or external"),
         }
     }
+}
+
+/// Returns whether the views `first` and `second` read the same part of the same store.
+fn same_part<'gc>(mc: &Mutation<'gc>, first: Gc<'gc, Extern>, second: Gc<'gc, Extern>) -> bool {
+    let stores = (first.frozen_ref(mc, Extern::OWNER).map(FrozenRef::to_word), second.frozen_ref(mc, Extern::OWNER).map(FrozenRef::to_word));
+    stores.0.is_some() && stores.0 == stores.1 && first.range(mc) == second.range(mc)
+}
+
+/// Returns the info of `rope`, which is read as its two halves.
+#[inline]
+fn rope_info<'gc>(mc: &Mutation<'gc>, rope: Gc<'gc, Rope>) -> Info {
+    let word = rope.info(mc);
+    Info { bytes: (word & MAX_LEN as u64) as usize, chars: rope.chars(mc) as usize, depth: (word >> DEPTH_SHIFT) as u8 }
 }
 
 impl<'gc> Host for Strings<'_, 'gc> {
@@ -644,27 +623,45 @@ impl<'gc> Host for Strings<'_, 'gc> {
     fn view(&self, string: Str<'gc>) -> StrView<'_, Str<'gc>> {
         let mc = self.mc;
         match Text::of(string.0) {
-            Some(Text::Str8(flat)) => StrView::Flat(Units::Packed(Packed::new(flat.items(mc).words(), (flat.chars(mc) & COUNT) as usize, Width::One))),
-            Some(Text::Str16(flat)) => StrView::Flat(Units::Packed(Packed::new(flat.items(mc).words(), (flat.chars(mc) & COUNT) as usize, Width::Two))),
-            Some(Text::Str32(flat)) => StrView::Flat(Units::Packed(Packed::new(flat.items(mc).words(), (flat.chars(mc) & COUNT) as usize, Width::Four))),
+            Some(Text::Flat(flat)) => {
+                let (word, words) = (flat.chars(mc), flat.items(mc).words());
+                let bytes = (words.len() * 8).saturating_sub((word >> UNUSED_SHIFT & 7) as usize);
+                StrView::Flat { units: Units::Packed(Packed::new(words, bytes)), chars: (word & COUNT) as usize }
+            }
             None => {
                 debug_assert!(is_inline(string.0), "a string that's no object is inline");
-                StrView::Flat(Units::Inline(inline_units(string.0)))
+                let inline = inline_units(string.0);
+                StrView::Flat { units: Units::Inline(inline), chars: inline.chars() }
             }
             _ => self.view_rest(string),
         }
     }
 
-    fn flat(&self, width: Width, len: usize, init: impl FnOnce(UnitsMut<'_>)) -> Result<Str<'gc>, Error> {
-        if width == Width::One && len <= INLINE_CHARS {
-            return Ok(Str(inline_value(Inline::filled(len, init))));
+    #[inline(always)]
+    fn info(&self, string: Str<'gc>) -> Info {
+        // A rope that is read as its two halves keeps its info in two words. Reading them takes less than a view of the rope.
+        if let Some(Text::Rope(rope)) = Text::of(string.0)
+            && rope.right(self.mc) != Value::FALSE
+        {
+            return rope_info(self.mc, rope);
         }
-        if len > FLAT_MAX {
+        match self.view(string) {
+            StrView::Flat { units, chars } => Info { bytes: units.len(), chars, depth: 0 },
+            StrView::Rope { info, .. } => info,
+        }
+    }
+
+    fn flat(&self, bytes: usize, chars: usize, init: impl FnOnce(UnitsMut<'_>)) -> Result<Str<'gc>, Error> {
+        if bytes <= INLINE_BYTES {
+            return Ok(Str(inline_value(Inline::filled(bytes, init))));
+        }
+        if bytes > FLAT_MAX {
             return Err(StrError::TooLong.into());
         }
         let mc = self.mc;
-        let (chars, words) = (len as u64, len.div_ceil(width.per_word()));
-        // A short string is built on the stack and looked up there. It is allocated only if the arena does not have its characters yet.
+        let words = bytes.div_ceil(8);
+        let shape = chars as u64 | ((words * 8 - bytes) as u64) << UNUSED_SHIFT;
+        // A short string is built on the stack and looked up there. It is allocated only if the arena does not have its bytes yet.
         if words <= BUILD {
             let (short, long);
             let built = if words <= BUILD_SHORT {
@@ -674,47 +671,35 @@ impl<'gc> Host for Strings<'_, 'gc> {
                 long = [const { Cell::new(0) }; BUILD];
                 &long[..words]
             };
-            init(UnitsMut::Packed(PackedMut::new(built, len, width)));
-            return match width {
-                Width::One => self.settle::<Str8>(built, len),
-                Width::Two => self.settle::<Str16>(built, len),
-                Width::Four => self.settle::<Str32>(built, len),
-            };
+            init(UnitsMut::Packed(PackedMut::new(built, bytes)));
+            return self.settle(built, bytes, shape);
         }
-        // A long string is filled in place and then interned. If the arena has a string with the same characters, that string is returned, and the new object is left for the collector.
-        match width {
-            Width::One => {
-                let object = mc.alloc_zeroed::<Str8, 1>([chars], words)?;
-                init(UnitsMut::Packed(PackedMut::new(object.items(mc).words(), len, width)));
-                self.intern_flat(object, Str(Value::object(mc, object)))
-            }
-            Width::Two => {
-                let object = mc.alloc_zeroed::<Str16, 1>([chars], words)?;
-                init(UnitsMut::Packed(PackedMut::new(object.items(mc).words(), len, width)));
-                self.intern_flat(object, Str(Value::object(mc, object)))
-            }
-            Width::Four => {
-                let object = mc.alloc_zeroed::<Str32, 1>([chars], words)?;
-                init(UnitsMut::Packed(PackedMut::new(object.items(mc).words(), len, width)));
-                self.intern_flat(object, Str(Value::object(mc, object)))
-            }
-        }
+        // A long string gets a store of its own outside the arena, and is a view of all of it. It is interned when it is first compared or used as a key.
+        mc.ensure(bytes)?;
+        let mut buffer = vec![0; bytes];
+        init(UnitsMut::Slice(&mut buffer));
+        let store = mc.frozen_owning(Store::Owned(buffer.into_boxed_slice()), bytes)?;
+        self.view_of(store, 0, bytes, Some(chars))
+    }
+
+    fn slice(&self, string: Str<'gc>, start: usize, end: usize, chars: Option<usize>) -> Result<Option<Str<'gc>>, Error> {
+        self.shared(string, start, end, chars)
     }
 
     #[inline]
     fn known(&self, string: Str<'gc>) -> Option<Str<'gc>> {
         let mc = self.mc;
         match Text::of(string.0) {
-            Some(Text::Str8(flat)) => (flat.chars(mc) & INTERNED != 0).then_some(string),
-            Some(Text::Str16(flat)) => (flat.chars(mc) & INTERNED != 0).then_some(string),
-            Some(Text::Str32(flat)) => (flat.chars(mc) & INTERNED != 0).then_some(string),
-            // A rope is the interned string itself, or it keeps the interned string in `flat`. The flat copy of an interned rope is not interned.
+            Some(Text::Flat(flat)) => (flat.chars(mc) & INTERNED != 0).then_some(string),
+            // A rope is the interned string itself, or it is read as another string, which can be the interned string. The flat copy of an interned rope is not interned.
             Some(Text::Rope(rope)) => {
                 if rope.reads(mc) & INTERNED != 0 {
                     return Some(string);
                 }
-                let flat = rope.flat(mc);
-                (flat != Value::FALSE).then_some(Str(flat))
+                if rope.right(mc) != Value::FALSE {
+                    return None;
+                }
+                self.known(Str(rope.left(mc)))
             }
             Some(Text::Extern(external)) => (external.hash(mc) & INTERNED != 0).then_some(string),
             None => Some(string),
@@ -726,7 +711,7 @@ impl<'gc> Host for Strings<'_, 'gc> {
     }
 
     fn rope(&self, left: Str<'gc>, right: Str<'gc>, info: Info) -> Result<Str<'gc>, Error> {
-        let rope = Rope::new(self.mc, left.0, right.0, info.to_bits(), Value::FALSE, 0)?;
+        let rope = Rope::new(self.mc, left.0, right.0, info.bytes as u64 | u64::from(info.depth) << DEPTH_SHIFT, info.chars as u64, 0)?;
         Ok(Str(Value::object(self.mc, rope)))
     }
 
@@ -737,8 +722,7 @@ impl<'gc> Host for Strings<'_, 'gc> {
         }
         if let Some(Text::Rope(object)) = Text::of(rope.0) {
             // The rope is read as `flat` from now on, so it lets go of its halves. The characters are then held once.
-            object.set_flat(self.mc, flat.0);
-            object.set_left(self.mc, Value::FALSE);
+            object.set_left(self.mc, flat.0);
             object.set_right(self.mc, Value::FALSE);
         }
     }
@@ -746,8 +730,8 @@ impl<'gc> Host for Strings<'_, 'gc> {
     fn count_read(&self, rope: Str<'gc>) -> u64 {
         let Some(Text::Rope(object)) = Text::of(rope.0) else { return 0 };
         let word = object.reads(self.mc);
-        let reads = ((word & COUNT) + 1).min(COUNT);
-        object.set_reads(self.mc, word & !COUNT | reads);
+        let reads = ((word & READS) + 1).min(READS);
+        object.set_reads(self.mc, word & !READS | reads);
         reads
     }
 }

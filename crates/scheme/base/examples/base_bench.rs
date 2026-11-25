@@ -220,6 +220,23 @@ fn main() {
         let text = format!("(define s \"!ping someone about something\") (define (count n) (if (eqv? n 0) 0 (begin {body} (count (- n 1))))) (count {N})");
         println!("{name:<30} {:.1} ns per iteration", per(time(&text, false, true)));
     }
+    // The same kinds of operation on text with an accented letter and an emoji, as chat messages have. `long` is a message of 200 characters.
+    for (name, body) in [
+        ("emoji text, substring of 5", "(substring s 8 13)"),
+        ("emoji text, string-ref", "(string-ref s 20)"),
+        ("emoji text, string-length", "(string-length s)"),
+        ("emoji text, string=? of a copy", "(string=? s (string-append \"!ping 😀 sömeone \" \"about something\"))"),
+        ("emoji text, string-append", "(string-append s \"!\")"),
+        ("emoji text, string->list of 29", "(string->list s)"),
+        ("emoji text, string-find", "(string-find s \"about\")"),
+        ("emoji text, string-upcase", "(string-upcase s)"),
+        ("long emoji text, string-ref at 190", "(string-ref long 190)"),
+        ("long emoji text, substring of 90", "(substring long 100 190)"),
+        ("long emoji text, string-find", "(string-find long \"bbb\")"),
+    ] {
+        let text = format!("(define s \"!ping 😀 sömeone about something\") (define long (string-append (make-string 150 #\\a) \"😀 é \" (make-string 46 #\\b))) (define (count n) (if (eqv? n 0) 0 (begin {body} (count (- n 1))))) (count {N})");
+        println!("{name:<36} {:.1} ns per iteration", per(time(&text, false, true)));
+    }
     fn command(body: &str) -> String {
         format!("(define cmd '(\"!echo\" \"a\" \"b\")) (define (count n acc) (if (eqv? n 0) acc (count (- n 1) (+ acc {body})))) (count {N} 0)")
     }

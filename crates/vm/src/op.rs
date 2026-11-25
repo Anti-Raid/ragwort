@@ -363,7 +363,7 @@ impl Fault {
     /// Returns the integer index corresponding to this fault in [`Fault::KINDS`].
     pub fn kind(self) -> usize {
         match self {
-            Fault::Malformed | Fault::Str(StrError::NotNarrowest) => 0,
+            Fault::Malformed => 0,
             Fault::OutOfMemory => 1,
             Fault::WrongType => 2,
             Fault::OutOfRange | Fault::Str(StrError::OutOfRange) => 3,

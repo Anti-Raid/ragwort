@@ -4,13 +4,12 @@
 //! uppercase of the lowercase, with two exceptions: dotless `ı` stays as it is, and Cherokee folds to
 //! uppercase.
 
-use std::cell::Cell;
 use std::cmp::Ordering;
 use std::char::{ToLowercase, ToUppercase};
 use std::iter::FlatMap;
 
 use crate::word::{HIGH, ONES};
-use crate::{Host, Res, Units, Width, chars, flat, from_chars, len};
+use crate::{Host, Res, byte_len, chars, flat_counted, from_chars};
 
 #[cfg(test)]
 #[path = "tests/case.rs"]
@@ -55,15 +54,21 @@ pub fn compare_ci<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<Ordering, H::E
     if a == b {
         return Ok(Ordering::Equal);
     }
-    h.charge((len(h, a) + len(h, b)) as u64)?;
-    let (cell_a, cell_b) = (Cell::new(0), Cell::new(0));
-    let (units_a, units_b) = (flat(h, a).map(|units| units.anchored(&cell_a)), flat(h, b).map(|units| units.anchored(&cell_b)));
-    if let (Some(Units::Packed(packed_a)), Some(Units::Packed(packed_b))) = (units_a, units_b)
-        && packed_a.is_ascii()
-        && packed_b.is_ascii()
-    {
-        let n = packed_a.len().min(packed_b.len());
-        return Ok(packed_a.slice(0..n).compare_by(packed_b.slice(0..n), |word| Case::Fold.ascii(word)).then(packed_a.len().cmp(&packed_b.len())));
+    h.charge((byte_len(h, a) + byte_len(h, b)) as u64)?;
+    // A flat string is ASCII exactly when it has as many characters as bytes. Two ASCII strings are folded and compared a word at a time, however they are stored.
+    let (ascii_a, ascii_b) = (flat_counted(h, a).filter(|(units, chars)| units.len() == *chars), flat_counted(h, b).filter(|(units, chars)| units.len() == *chars));
+    if let (Some((units_a, _)), Some((units_b, _))) = (ascii_a, ascii_b) {
+        let n = units_a.len().min(units_b.len());
+        let (head_a, head_b) = (units_a.slice(0..n), units_b.slice(0..n));
+        for index in 0..n.div_ceil(8) {
+            let (x, y) = (Case::Fold.ascii(head_a.byte_chunk(index)), Case::Fold.ascii(head_b.byte_chunk(index)));
+            if x != y {
+                // The first byte of a word is in its lowest bits, so the lowest differing bit lies in the first differing byte.
+                let shift = (x ^ y).trailing_zeros() / 8 * 8;
+                return Ok((x >> shift & 0xFF).cmp(&(y >> shift & 0xFF)));
+            }
+        }
+        return Ok(units_a.len().cmp(&units_b.len()));
     }
     Ok(chars(h, a).flat_map(|character| Case::Fold.map(character)).cmp(chars(h, b).flat_map(|character| Case::Fold.map(character))))
 }
@@ -125,16 +130,15 @@ impl Case {
 
 /// Returns `string` mapped by `case`, or `string` itself if the mapping changes nothing.
 fn map_case<H: Host>(h: &H, string: H::Str, case: Case) -> Res<H> {
-    h.charge(len(h, string) as u64)?;
-    let cell = Cell::new(0);
-    if let Some(Units::Packed(packed)) = flat(h, string).map(|units| units.anchored(&cell))
-        && packed.is_ascii()
-    {
-        let words = packed.byte_words();
+    h.charge(byte_len(h, string) as u64)?;
+    // ASCII text is mapped a word at a time, however it is stored.
+    if let Some((units, _)) = flat_counted(h, string).filter(|(units, chars)| units.len() == *chars) {
+        let n = units.len();
+        let words = (0..n.div_ceil(8)).map(move |index| units.byte_chunk(index));
         if words.clone().all(|word| case.ascii(word) == word) {
             return Ok(string);
         }
-        return h.flat(Width::One, packed.len(), |mut out| out.write_words(words.map(|word| case.ascii(word))));
+        return h.flat(n, n, |mut out| out.write_words(words.map(|word| case.ascii(word))));
     }
     if chars(h, string).all(|character| case.map(character).eq([character])) {
         return Ok(string);

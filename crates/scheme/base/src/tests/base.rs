@@ -1024,6 +1024,12 @@ fn strings_past_the_basics() {
     assert_eq!(eval(vectors), r#"(#(#\a #\b #\c) #(#\b #\c) "abc" "bc")"#);
     let utf8 = "(list (string->utf8 \"aé\") (utf8->string #u8(104 105)) (utf8->string (string->utf8 \"λx\")) (string->utf8 \"abc\" 1))";
     assert_eq!(eval(utf8), r#"(#u8(97 195 169) "hi" "λx" #u8(98 99))"#);
+    // A range of a string counts characters, and a range of a bytevector counts bytes. A range of bytes that cuts a character is no text.
+    let ranges = "(define s \"aé日😀z\")
+                  (list (string->utf8 s 1 3) (string->utf8 s 3) (string->utf8 s 5) (utf8->string (string->utf8 s) 1 6) (utf8->string (string->utf8 s) 6)
+                        (string-byte-length (utf8->string (string->utf8 (make-string 300 #\\é)))))";
+    assert_eq!(eval(ranges), r#"(#u8(195 169 230 151 165) #u8(240 159 152 128 122) #u8() "é日" "😀z" 600)"#);
+    assert_eq!(eval_in(&mut arena(), "(utf8->string (string->utf8 \"aé\") 0 2)"), Ok(Err(Fault::Str(ragwort_types::string::StrError::NotUtf8))));
     let mapped = "(list (string-map char-upcase \"abc\") (string-map (lambda (a b) (if (char<? a b) a b)) \"adc\" \"bbbb\")
                         (let ((n 0)) (string-for-each (lambda (c) (set! n (+ n 1))) \"hello\") n))";
     assert_eq!(eval(mapped), r#"("ABC" "abb" 5)"#);
@@ -3145,5 +3151,80 @@ fn a_table_filled_field_by_field_is_an_ordinary_table() {
     assert_eq!(eval("(define t (make-table)) (table-set! t 'a 1) (table-set! t 'b 2) (table-set! t 'c 3) (table-delete! t 'a) (define before (table->list t)) (table-set! t 'a 4) (table-set! t \"s\" 5) (table-set! t 'd 6) (table-delete! t 'b) (list before (table->list t) (table-length t) (table-has? t 'b))"), "(((b . 2) (c . 3)) ((c . 3) (a . 4) (\"s\" . 5) (d . 6)) 4 #f)");
     // Two tables built by the same code are equal and separate, and one write site serves tables at every stage of being filled.
     assert_eq!(eval("(define (make n) (let ((t (make-table))) (table-set! t 'n n) (when (even? n) (table-set! t 'even #t)) (table-set! t 'last n) t)) (define made (map make '(1 2 3 4))) (table-set! (car made) 'n 100) (list (map table->list made) (equal? (make 6) (make 6)) (eq? (make 6) (make 6)))"), "((((n . 100) (last . 1)) ((n . 2) (even . #t) (last . 2)) ((n . 3) (last . 3)) ((n . 4) (even . #t) (last . 4))) #t #f)");
+}
+
+/// String cursors name positions without counting characters. Every procedure that takes a position takes a cursor too, and a cursor that does not fit the string is an error.
+#[test]
+fn string_cursors() {
+    // "aé日😀z" takes 1, 2, 3, 4 and 1 bytes for its characters.
+    let walk = "(define s \"aé日😀z\")
+                (let loop ((c (string-cursor-start s)) (seen '()))
+                  (if (string-cursor=? c (string-cursor-end s))
+                      (list (reverse seen) (string-cursor-offset c) (string-length s) (string-byte-length s))
+                      (loop (string-cursor-next s c) (cons (list (string-ref s c) (string-cursor-offset c) (string-cursor->index s c)) seen))))";
+    assert_eq!(eval(walk), r"(((#\a 0 0) (#\é 1 1) (#\日 3 2) (#\😀 6 3) (#\z 10 4)) 11 5 11)");
+    let back = "(define s \"aé日😀z\")
+                (let loop ((c (string-cursor-end s)) (seen '()))
+                  (if (string-cursor=? c (string-cursor-start s)) seen (let ((before (string-cursor-prev s c))) (loop before (cons (string-ref s before) seen)))))";
+    assert_eq!(eval(back), r"(#\a #\é #\日 #\😀 #\z)");
+    let parts = "(define s \"aé日😀z\")
+                 (define mid (string-index->cursor s 2))
+                 (list (substring s mid) (substring s (string-cursor-start s) mid) (substring s 1 mid) (substring s mid 4) (string->list s mid)
+                       (string-cursor? mid) (string-cursor? 2) (string-cursor<? (string-cursor-start s) mid) (string-cursor<? mid mid)
+                       (string-cursor->index s (string-offset->cursor s 6)) (string-byte-ref s 1) (string-byte-ref s 2))";
+    assert_eq!(eval(parts), r#"("日😀z" "aé" "é" "日😀" (#\日 #\😀 #\z) #t #f #t #f 3 195 169)"#);
+    // A search returns an index or a cursor, and starts from either.
+    let found = "(define s \"né😀 one né two\")
+                 (define first (string-find-cursor s \"né\"))
+                 (define second (string-find-cursor s \"né\" (string-cursor-next s first)))
+                 (list (string-cursor-offset first) (string-cursor-offset second) (string-cursor->index s second) (string-find s \"né\" (string-cursor-next s first))
+                       (string-find s \"né\" 1) (string-cursor-offset (string-find-last-cursor s \"né\")) (string-cursor-offset (string-find-last-cursor s \"né\" second))
+                       (string-find-last s \"né\" second) (string-find-cursor s \"zz\") (string-find-last-cursor s \"zz\") (substring s second (string-find-cursor s \" two\")))";
+    assert_eq!(eval(found), r#"(0 12 8 8 8 12 0 0 #f #f "né")"#);
+    assert_eq!(eval("(list (string-cursor-start \"\") (string-cursor-end \"héllo\"))"), "(#<string-cursor 0> #<string-cursor 6>)");
+    // A cursor into the middle of a character, or past the end, is refused by every procedure. So is stepping off either end.
+    let range = Ok(Err(Fault::Str(ragwort_types::string::StrError::OutOfRange)));
+    for wrong in [
+        "(string-ref \"é\" (string-offset->cursor \"ab\" 1))",
+        "(substring \"é\" (string-offset->cursor \"ab\" 1))",
+        "(string-cursor-next \"é\" (string-offset->cursor \"ab\" 1))",
+        "(string-cursor-prev \"é\" (string-offset->cursor \"ab\" 1))",
+        "(string-cursor->index \"é\" (string-offset->cursor \"ab\" 1))",
+        "(string-find \"é\" \"x\" (string-offset->cursor \"ab\" 1))",
+        "(string-find-cursor \"é\" \"x\" (string-offset->cursor \"ab\" 1))",
+        "(string-cursor-next \"ab\" (string-cursor-end \"ab\"))",
+        "(string-cursor-prev \"ab\" (string-cursor-start \"ab\"))",
+        "(string-ref \"ab\" (string-cursor-end \"ab\"))",
+        "(string-ref \"a\" (string-cursor-end \"abc\"))",
+        "(string-index->cursor \"ab\" 3)",
+        "(string-byte-ref \"ab\" 2)",
+    ] {
+        assert!(eval_in(&mut arena(), wrong) == range || eval_in(&mut arena(), wrong) == Ok(Err(Fault::OutOfRange)), "{wrong}");
+    }
+    assert_eq!(eval_in(&mut arena(), "(string-offset->cursor \"é\" 1)"), Ok(Err(Fault::OutOfRange)));
+    // A cursor belongs to its text. On a string with other characters it is refused, also where its offset would be a position: in ASCII text of the same length, in a changed copy, and in a longer string that starts the same.
+    for wrong in [
+        "(string-ref \"xy\" (string-cursor-start \"ab\"))",
+        "(substring \"hello world\" (string-find-cursor \"HELLO WORLD\" \"WORLD\"))",
+        "(string-ref \"  padded\" (string-find-cursor (string-trim \"  padded\") \"dd\"))",
+        "(string-cursor-next \"abc\" (string-cursor-start \"ab\"))",
+        "(string-cursor-prev \"abc\" (string-cursor-end \"ab\"))",
+        "(string-cursor->index \"abcd\" (string-cursor-end \"abc\"))",
+        "(string-find \"abcabc\" \"c\" (string-cursor-start \"abc\"))",
+        "(string-find-last-cursor \"abcabc\" \"c\" (string-cursor-end \"abc\"))",
+        "(string->list \"abcd\" (string-cursor-start \"abc\"))",
+        "(string-cursor<? (string-cursor-start \"ab\") (string-cursor-end \"cd\"))",
+    ] {
+        assert_eq!(eval_in(&mut arena(), wrong), Ok(Err(Fault::OutOfRange)), "{wrong}");
+    }
+    // It is good for every string with the same characters, however that string was made.
+    let same = "(define made (string-append \"né\" \"e 😀 \" (number->string 42)))
+                (define c (string-find-cursor \"née 😀 42\" \"😀\"))
+                (list (string-ref made c) (substring made c) (eqv? c (string-find-cursor made \"😀\")) (string-cursor=? c (string-cursor-start made))
+                      (eqv? (string-cursor-start \"ab\") (string-cursor-start \"cd\")))";
+    assert_eq!(eval(same), r#"(#\😀 "😀 42" #t #f #f)"#);
+    for wrong in ["(string-cursor-next \"ab\" 0)", "(string-cursor-offset 1)", "(string-cursor=? 1 1)", "(string-cursor-start 5)", "(+ (string-cursor-start \"a\") 1)"] {
+        assert_eq!(eval_in(&mut arena(), wrong), Ok(Err(Fault::WrongType)), "{wrong}");
+    }
 }
 

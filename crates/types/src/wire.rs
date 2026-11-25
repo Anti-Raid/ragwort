@@ -402,4 +402,4 @@ macro_rules! places {
 }
 
 places!(ragwort_num::NumError: DivideByZero, NoExactValue, NotInteger);
-places!(ragwort_string::StrError: OutOfRange, TooLong, NotNarrowest, NotUtf8);
+places!(ragwort_string::StrError: OutOfRange, TooLong, NotUtf8);

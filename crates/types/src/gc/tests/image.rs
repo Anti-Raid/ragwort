@@ -218,7 +218,8 @@ fn an_interned_rope_is_loaded_as_the_interned_string() {
         let (interned, twin, plain) = (strings.string(items[0]).unwrap(), strings.string(items[1]).unwrap(), strings.string(items[2]).unwrap());
         assert_eq!((text(mc, items[0]), text(mc, items[1]), text(mc, items[2]), items[0] == items[3]), (whole.clone(), whole.clone(), format!("{head}the end of a rope that is not interned"), true));
         assert!(strings.is_interned(interned) && !strings.is_interned(plain) && !string::is_flat(&strings, plain));
-        assert_eq!((string::from_str(&strings, &whole), strings.intern(twin), string::equal(&strings, twin, interned)), (Ok(interned), Ok(interned), Ok(true)));
+        let made = string::from_str(&strings, &whole).unwrap();
+        assert_eq!((strings.intern(made), strings.intern(twin), string::equal(&strings, twin, interned)), (Ok(interned), Ok(interned), Ok(true)));
     });
     // An arena whose interned string of the text is a rope keeps that rope, and the loaded data refers to it.
     let seed = fresh.mutate(|mc| Symbols::of_arena(mc).unwrap().seed(mc));
@@ -253,6 +254,28 @@ fn an_interned_external_string_is_loaded_as_text() {
         let loaded = strings.string(items[0]).unwrap();
         assert!(items[0] == items[1] && strings.is_interned(loaded) && !strings.is_external(loaded));
         assert_eq!((text(mc, items[0]), string::from_str(&strings, &name)), (name.to_string(), Ok(loaded)));
+    });
+}
+
+/// A long flat string, which lives outside the arena, is saved as its text whether it is interned or not. So a program with a long string in it can be saved.
+#[test]
+fn a_long_string_is_saved_as_its_text() {
+    let long = "a line of a long text that a program holds. ".repeat(40);
+    let mut saving = Arena::new(1 << 22, 0);
+    let bytes = saving.mutate(|mc| {
+        let (strings, pairs) = (Strings::new(mc), Pairs::new(mc));
+        let held = string::from_str(&strings, &long).unwrap();
+        assert!(strings.is_external(held) && !strings.is_interned(held));
+        save(mc, STAMP, &[pairs.list(&[held.value(), held.value()]).unwrap()], &kinds()).unwrap()
+    });
+    let mut fresh = Arena::new(1 << 22, 0);
+    fresh.mutate(|mc| {
+        let roots = load(mc, STAMP, &bytes, &descs(), &kinds(), &()).unwrap();
+        let (strings, pairs) = (Strings::new(mc), Pairs::new(mc));
+        let items: Vec<Value> = pairs.elements(roots[0]).collect();
+        let loaded = strings.string(items[0]).unwrap();
+        assert!(items[0] == items[1] && strings.is_external(loaded) && strings.is_interned(loaded));
+        assert_eq!((text(mc, items[0]), strings.as_str(loaded)), (long.clone(), Some(&*long)));
     });
 }
 

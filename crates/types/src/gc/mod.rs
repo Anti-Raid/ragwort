@@ -277,9 +277,11 @@ const CONSTANT: u64 = 0b1101;
 const FALSE_IDS: u64 = (8 | 16) << 32;
 /// The bit of a constant's id that makes it a character.
 const CHAR: u64 = 1 << 31;
-/// The tag of an inline string, which holds at most [`crate::string::INLINE_CHARS`] Latin-1 characters. The next
-/// four bits hold the length. One byte per character follows, with the first character in the lowest byte.
+/// The tag of an inline string, which holds at most [`crate::string::INLINE_BYTES`] bytes of UTF-8. The next
+/// four bits hold the number of bytes. The bytes follow, with the first byte lowest.
 pub(crate) const INLINE_STRING: u64 = 0b0101;
+/// The tag of a string cursor: a position in a string, as a byte offset. The offset is in bits 4 to 31, and the hash of the string's text is in bits 32 to 63.
+const CURSOR: u64 = 0b1001;
 /// The low two bits of an inline flonum. An inline flonum is a double with two redundant exponent bits dropped.
 const FLONUM: u64 = 0b11;
 /// The special doubles: ±0, ±infinity, and the default NaNs of ARM and x86. Their words are the words of the six smallest inline doubles,
@@ -600,6 +602,28 @@ impl<'gc> Value<'gc> {
         char::from_u32((id & !CHAR) as u32)
     }
 
+    /// The largest byte offset that a string cursor can hold.
+    pub const MAX_CURSOR: usize = (1 << 28) - 1;
+
+    /// Returns a string cursor at byte offset `offset` of a string whose text has the hash `text`. Returns `None` if `offset` is more than [`Value::MAX_CURSOR`].
+    ///
+    /// A cursor names a position in a string without a count of the characters before it. It is an immediate value, so making one allocates nothing.
+    /// It holds no reference to the string. It holds the hash of the string's text, and a procedure that takes a cursor compares that with the hash of the string that it is given.
+    /// So a cursor is good for every string with the same text, and for no other.
+    #[inline]
+    pub const fn cursor(offset: usize, text: u32) -> Option<Self> {
+        if offset > Self::MAX_CURSOR {
+            return None;
+        }
+        Some(Self::from_bits((text as u64) << 32 | (offset as u64) << 4 | CURSOR))
+    }
+
+    /// Returns the byte offset of a string cursor and the hash of the text that it was made for, or `None` if the value is not a cursor.
+    #[inline]
+    pub const fn as_cursor(self) -> Option<(usize, u32)> {
+        if self.word & TAG == CURSOR { Some(((self.word as u32 >> 4) as usize, (self.word >> 32) as u32)) } else { None }
+    }
+
     /// Returns the value with the bits `word`. Every word is a valid value. An object reference that matches no object reads as some other object or as no object.
     pub const fn from_bits(word: u64) -> Self {
         Self { word, _brand: PhantomData }
@@ -787,6 +811,13 @@ impl<'gc, T: Object> Gc<'gc, T> {
     #[doc(hidden)]
     pub const fn forge(index: u32) -> Self {
         Self::new(index)
+    }
+
+    /// Returns a reference to the frozen value that `field` holds, or `None` if it holds none. Another object can then hold the same value: store the
+    /// reference in it during this step. The value lives while any object that holds it lives.
+    pub fn frozen_ref<U: Any>(self, mc: &Mutation<'gc>, field: Field<T, slot::Frozen<U>>) -> Option<FrozenRef<'gc, U>> {
+        let id = (self.word(mc, field.index) as u32).checked_sub(1)?;
+        Some(FrozenRef::new(id))
     }
 
     #[inline]

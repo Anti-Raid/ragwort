@@ -56,7 +56,7 @@ const PLAIN: u8 = 0;
 const SYMBOL: u8 = 1;
 const KEYWORD: u8 = 2;
 const SYMBOLS: u8 = 3;
-/// A flat string object, or a rope or an external string that is an interned string. It is saved as its text, and loaded as the arena's interned string with that text.
+/// A flat string, or a rope that is an interned string. It is saved as its text, and loaded as a string of the arena with that text: the interned string, if the text is short enough to be interned when it is made.
 const STRING: u8 = 4;
 
 /// A kind of frozen value that can be saved.
@@ -301,7 +301,7 @@ impl<'gc> Saver<'_, 'gc> {
                 table.u32((symbol >> 32) as u32);
             } else if ty == number_of::<Interned>() {
                 table.u8(SYMBOLS);
-            } else if let Some(string) = Strings::new(self.mc).string(object).filter(|&string| Strings::new(self.mc).is_object(string) || Strings::new(self.mc).is_interned(string)) {
+            } else if let Some(string) = Strings::new(self.mc).string(object).filter(|&string| Strings::new(self.mc).is_object(string) || Strings::new(self.mc).is_external(string) || Strings::new(self.mc).is_interned(string)) {
                 table.u8(STRING);
                 let text: String = chars(&Strings::new(self.mc), string).collect();
                 table.bytes(text.as_bytes());
@@ -560,7 +560,8 @@ pub fn load<'gc>(mc: &Mutation<'gc>, stamp: u64, bytes: &[u8], descs: &[&'static
             }
             STRING => {
                 let text = std::str::from_utf8(table.bytes()?).map_err(|_| Malformed)?;
-                let string = crate::string::from_str(&strings, text)?.value();
+                // A long text is not interned when it is made. It is interned here, because the image can hold it where only an interned string is found again, such as the key of a table.
+                let string = strings.intern(crate::string::from_str(&strings, text)?)?.value();
                 // A text that was saved as an object is too long for the value word, so it is an object again.
                 if string.to_bits() & TAG != OBJECT {
                     return Err(LoadError::Malformed);
