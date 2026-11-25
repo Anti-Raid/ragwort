@@ -455,8 +455,8 @@ named! {
         /// `(vector->string v [start [end]])`: constructs a string from the characters in vector `v`
         /// within index range `[start, end)`.
         VectorToString = ("vector->string", any(TRUTHY)),
-        /// `(string->utf8 s [start [end]])`: encodes the characters of `s` in range `[start, end)` into
-        /// a newly allocated bytevector containing UTF-8 bytes.
+        /// `(string->utf8 s [start [end]])`: returns the UTF-8 bytes of the characters of `s` in range `[start, end)`
+        /// as a read-only bytevector. A large part of a long string is not copied. `bytevector-copy` gives bytes that can be written.
         StringToUtf8 = ("string->utf8", any(TRUTHY)),
         /// `(utf8->string bv [start [end]])`: decodes the bytes of bytevector `bv` in range `[start, end)`
         /// into a string, raising a fault if the bytes do not form valid UTF-8.
@@ -604,6 +604,13 @@ named! {
         MakeBytevector = ("make-bytevector", any(TRUTHY)),
         /// `(bytevector-length bv)`: returns the length in bytes of bytevector `bv`.
         BytevectorLength = ("bytevector-length", takes(1, FOLD | TRUTHY)),
+        /// `(bytevector-copy bv [start [end]])`: returns a new mutable bytevector with the bytes of `bv` in range `[start, end)`.
+        /// It is the way to get bytes that can be written from a read-only bytevector, such as the result of `string->utf8` or 
+        /// an immutable external bytevector.
+        BytevectorCopy = ("bytevector-copy", any(TRUTHY)),
+        /// `(bytevector-mutable? bv)`: returns `#t` if the bytes of bytevector `bv` can be written, and `#f` if `bv` is read-only:
+        /// a literal, the result of `string->utf8`, or bytes that the host handed over as read-only.
+        IsBytevectorMutable = ("bytevector-mutable?", takes(1, FOLD)),
         /// `(bytevector-int-ref bv k big kind)`: decodes an integer starting at byte offset `k` in
         /// bytevector `bv`; `big` specifies endianness (`#t` for big-endian, `#f` for little-endian), and
         /// `kind` indicates byte width (1 to 8), with negative values indicating signed integers and
@@ -1403,6 +1410,8 @@ impl Intrinsic {
             Intrinsic::Void => Value::VOID,
             Intrinsic::IsBytevector
             | Intrinsic::MakeBytevector
+            | Intrinsic::BytevectorCopy
+            | Intrinsic::IsBytevectorMutable
             | Intrinsic::BytevectorLength
             | Intrinsic::BytevectorRef
             | Intrinsic::BytevectorSet => self.bytevector(mc, operands, fuel)?,

@@ -9,7 +9,7 @@ use ragwort_types::vector::{EveryVector, ExternVector, Vectors};
 use crate::op::Fuel;
 use crate::{Fault, equal};
 
-use super::{Intrinsic, Operands, boolean, fixnum, index, made, not_fixnum};
+use super::{Intrinsic, Operands, boolean, fixnum, index, made, not_fixnum, range};
 
 /// Implements `(vector-ref vector k)` for a `vector` that is not a vector in the arena. Returns element `k` of an external vector. The first read of an element fetches it from the host.
 #[inline(never)]
@@ -86,6 +86,16 @@ impl Intrinsic {
                 };
                 made(mc, fuel, Bytevectors::new(mc).make(index(operands.get(0))?, fill)?.value(mc))
             }
+            Intrinsic::BytevectorCopy => {
+                if !(1..=3).contains(&operands.count()) {
+                    return Err(Fault::Arity);
+                }
+                let bytes = AnyBytevector::of(operands.get(0)).ok_or(Fault::WrongType)?;
+                let (start, end) = range(bytes.len(mc), operands)?;
+                fuel.spend((end - start) as u64 / equal::PER_FUEL)?;
+                made(mc, fuel, Bytevectors::new(mc).from_slice(&bytes.bytes(mc, start, end))?.value(mc))
+            }
+            Intrinsic::IsBytevectorMutable => boolean(AnyBytevector::of(operands.get(0)).ok_or(Fault::WrongType)?.is_mutable()),
             Intrinsic::BytevectorLength => {
                 let len = AnyBytevector::of(operands.get(0)).ok_or(Fault::WrongType)?.len(mc);
                 Value::fixnum(len as i64).expect("lengths are fixnums")

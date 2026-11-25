@@ -1,6 +1,6 @@
 //! Character, string, symbol and keyword intrinsics.
 
-use ragwort_types::bytevector::{AnyBytevector, Bytevectors};
+use ragwort_types::bytevector::AnyBytevector;
 use ragwort_types::gc::{Mutation, ScratchVec, Value};
 use ragwort_types::pair::Pairs;
 use ragwort_types::string::{self, Str, Strings};
@@ -86,10 +86,8 @@ impl Intrinsic {
                 // A string is stored as UTF-8, so its bytes are copied as they are. Nothing is encoded.
                 let (from, to) = (string::byte_offset_of(&strings, string, start)?, string::byte_offset_of(&strings, string, end)?);
                 fuel.spend((to - from) as u64 / equal::PER_FUEL)?;
-                let mut bytes = ScratchVec::new(mc);
-                bytes.extend_with(to - from, 0)?;
-                string::copy_bytes(&strings, string, from, to, &mut bytes);
-                Bytevectors::new(mc).from_slice(&bytes)?.value(mc)
+                // The result is read-only, so a large part of a long string is not copied: the bytevector reads the bytes of the string.
+                strings.utf8_of(string, from, to)?.value(mc)
             }
             Intrinsic::StringToVector => {
                 let string = string_of(&strings, operands.get(0))?;

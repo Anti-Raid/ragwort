@@ -363,6 +363,12 @@ impl<'a, 'gc> Bytevectors<'a, 'gc> {
         Ok(Bytevector(Kept::Inside(bytevector)))
     }
 
+    /// Returns a read-only bytevector that is a view of `len` bytes of `store` from byte `start`. Nothing is copied.
+    pub(crate) fn view(&self, store: FrozenRef<'gc, Store>, start: usize, len: usize) -> Result<AnyBytevector<'gc>, OutOfMemory> {
+        let bytevector = objects::ExternBytevector::new(self.mc, range_word(start, len), store)?;
+        Ok(AnyBytevector::External(ExternalBytevector(bytevector)))
+    }
+
     pub fn immutable_from_slice(&self, bytes: &[u8]) -> Result<AnyBytevector<'gc>, OutOfMemory> {
         let bytevector = objects::ImmutableBytevector::new(self.mc, bytes.len() as u64, words(bytes.len()), 0)?;
         pack(self.mc, bytevector.items(self.mc), bytes);

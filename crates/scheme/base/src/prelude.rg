@@ -56,6 +56,8 @@
 (%define bytevector? (%lambda (x) (%intrinsic bytevector? x)))
 (%define make-bytevector (%lambda (k . fill) (%apply-intrinsic make-bytevector k fill)))
 (%define bytevector-length (%lambda (bv) (%intrinsic bytevector-length bv)))
+(%define bytevector-copy (%lambda (bv . range) (%apply-intrinsic bytevector-copy bv range)))
+(%define bytevector-mutable? (%lambda (bv) (%intrinsic bytevector-mutable? bv)))
 ; Each procedure below reads or writes an integer at byte index k. The last two arguments of the intrinsic
 ; give the byte order (#t for big-endian) and the size in bytes (negative for a signed integer).
 (%define bytevector-u8-ref (%lambda (bv k) (%intrinsic bytevector-int-ref bv k #f 1)))

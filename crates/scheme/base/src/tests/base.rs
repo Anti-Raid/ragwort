@@ -1030,6 +1030,21 @@ fn strings_past_the_basics() {
                         (string-byte-length (utf8->string (string->utf8 (make-string 300 #\\é)))))";
     assert_eq!(eval(ranges), r#"(#u8(195 169 230 151 165) #u8(240 159 152 128 122) #u8() "é日" "😀z" 600)"#);
     assert_eq!(eval_in(&mut arena(), "(utf8->string (string->utf8 \"aé\") 0 2)"), Ok(Err(Fault::Str(ragwort_types::string::StrError::NotUtf8))));
+    // The bytes of a string are read-only, whatever its length. A copy of them can be written, and a copy takes a range of bytes.
+    let copies = "(define short (string->utf8 \"aé\")) (define long (string->utf8 (make-string 700 #\\x)))
+                  (define copy (bytevector-copy short)) (bytevector-u8-set! copy 0 98)
+                  (define tail (bytevector-copy long 698)) (bytevector-u8-set! tail 1 33)
+                  (list short copy (utf8->string copy) tail (bytevector-length (bytevector-copy long 100 600)) (bytevector-copy short 1 3) (bytevector-copy #u8(1 2 3) 3))";
+    assert_eq!(eval(copies), r#"(#u8(97 195 169) #u8(98 195 169) "bé" #u8(120 33) 500 #u8(195 169) #u8())"#);
+    for wrong in ["(bytevector-u8-set! (string->utf8 \"aé\") 0 98)", "(bytevector-u8-set! (string->utf8 (make-string 700 #\\x)) 0 98)"] {
+        assert_eq!(eval_in(&mut arena(), wrong), Ok(Err(Fault::Immutable)), "{wrong}");
+    }
+    assert_eq!(eval_in(&mut arena(), "(bytevector-copy #u8(1 2 3) 2 1)"), Ok(Err(Fault::OutOfRange)));
+    assert_eq!(eval_in(&mut arena(), "(bytevector-copy \"abc\")"), Ok(Err(Fault::WrongType)));
+    let mutable = "(list (bytevector-mutable? (make-bytevector 3)) (bytevector-mutable? #u8(1 2 3)) (bytevector-mutable? (string->utf8 \"aé\"))
+                         (bytevector-mutable? (string->utf8 (make-string 700 #\\x))) (bytevector-mutable? (bytevector-copy (string->utf8 \"aé\"))) (bytevector-mutable? (bytevector-copy #u8())))";
+    assert_eq!(eval(mutable), "(#t #f #f #f #t #t)");
+    assert_eq!(eval_in(&mut arena(), "(bytevector-mutable? \"abc\")"), Ok(Err(Fault::WrongType)));
     let mapped = "(list (string-map char-upcase \"abc\") (string-map (lambda (a b) (if (char<? a b) a b)) \"adc\" \"bbbb\")
                         (let ((n 0)) (string-for-each (lambda (c) (set! n (+ n 1))) \"hello\") n))";
     assert_eq!(eval(mapped), r#"("ABC" "abb" 5)"#);

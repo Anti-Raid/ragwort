@@ -735,3 +735,37 @@ fn text_in_an_external_bytevector_is_shared() {
     });
 }
 
+/// The UTF-8 of a large part of a long string is a read-only bytevector that reads the bytes of the string: no store is made for it. A small part, and the bytes of a string in the arena, are copied.
+#[test]
+fn the_bytes_of_a_long_string_are_shared() {
+    use crate::bytevector::AnyBytevector;
+    let mut arena = arena(1 << 22);
+    let text = format!("{} é😀", "the body of a long message. ".repeat(40));
+    arena.mutate(|mc| {
+        let h = Strings::new(mc);
+        let long = string(&h, &text);
+        let (whole, most, few) = (h.utf8_of(long, 0, text.len()).unwrap(), h.utf8_of(long, 28, text.len()).unwrap(), h.utf8_of(long, 0, 28).unwrap());
+        assert!(matches!(whole, AnyBytevector::External(_)) && matches!(most, AnyBytevector::External(_)) && matches!(few, AnyBytevector::Immutable(_)));
+        assert!(!whole.is_mutable() && !most.is_mutable() && !few.is_mutable());
+        assert_eq!((whole.to_vec(mc), most.to_vec(mc), few.to_vec(mc)), (text.as_bytes().to_vec(), text.as_bytes()[28..].to_vec(), text.as_bytes()[..28].to_vec()));
+        let short = h.utf8_of(string(&h, "a string in the arena, é"), 2, 25).unwrap();
+        assert!(matches!(short, AnyBytevector::Immutable(_)));
+        assert_eq!(short.to_vec(mc), "string in the arena, é".as_bytes());
+        // The bytes of a rope are copied, because no one store holds them.
+        let rope = concat(&h, long, string(&h, &"z".repeat(600))).unwrap();
+        assert!(matches!(h.utf8_of(rope, 0, byte_len(&h, rope)).unwrap(), AnyBytevector::Immutable(_)));
+        for kept in [whole, most] {
+            root(mc).push(mc, kept.value(mc)).unwrap();
+        }
+    });
+    arena.collect();
+    arena.collect();
+    arena.mutate(|_| {});
+    // The string is gone. Its store is alive, because the two bytevectors read from it, and it is the only store.
+    assert_eq!(arena.frozen_values(), 1);
+    arena.mutate(|mc| {
+        let most = AnyBytevector::of(root(mc).get(mc, 1).unwrap()).unwrap();
+        assert_eq!(most.to_vec(mc), text.as_bytes()[28..].to_vec());
+    });
+}
+

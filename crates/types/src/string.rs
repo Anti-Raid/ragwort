@@ -96,8 +96,8 @@ pub use crate::gc::Error;
 use std::cell::Cell;
 
 use crate::gc::{Gc, INLINE_STRING, Mutation, Slots, TAG, Value, slot};
-use crate::bytevector::AnyBytevector;
-use crate::gc::FrozenRef;
+use crate::bytevector::{AnyBytevector, Bytevectors};
+use crate::gc::{FrozenRef, ScratchVec};
 use crate::objects::{InternSlots, InternSlotsFields};
 pub use crate::store::Store;
 use crate::store::{STORE_MAX, range_of, range_word, shares};
@@ -399,19 +399,38 @@ impl<'a, 'gc> Strings<'a, 'gc> {
     /// Returns the bytes of the flat string `string` from byte `start` up to byte `end` as a view of the same store, if `string` reads from a store and the part is large enough to share.
     /// `chars` is the number of characters in the part, if the caller knows it.
     fn shared(&self, string: Str<'gc>, start: usize, end: usize, chars: Option<usize>) -> Result<Option<Str<'gc>>, Error> {
-        let mc = self.mc;
-        let external = match Text::of(string.0) {
-            Some(Text::Extern(external)) => external,
-            // A rope that is read as another string shares what that string shares.
-            Some(Text::Rope(rope)) if rope.right(mc) == Value::FALSE => return self.shared(Str(rope.left(mc)), start, end, chars),
-            _ => return Ok(None),
-        };
-        let (Some(store), Some(whole)) = (external.frozen_ref(mc, Extern::OWNER), external.owner(mc)) else { return Ok(None) };
-        if !shares(end - start, whole.bytes().len()) {
+        let Some((store, from, whole)) = self.store_of(string) else { return Ok(None) };
+        if !shares(end - start, whole) {
             return Ok(None);
         }
-        let (from, _) = range_of(external.range(mc));
         self.view_of(store, from + start, end - start, chars).map(Some)
+    }
+
+    /// Returns the store that the flat string `string` reads from, the start of its part in the store, and the number of bytes of the whole store. Returns `None` for a string that reads from no store.
+    fn store_of(&self, string: Str<'gc>) -> Option<(FrozenRef<'gc, Store>, usize, usize)> {
+        let mc = self.mc;
+        match Text::of(string.0) {
+            Some(Text::Extern(external)) => Some((external.frozen_ref(mc, Extern::OWNER)?, range_of(external.range(mc)).0, external.owner(mc)?.bytes().len())),
+            // A rope that is read as another string reads from the store of that string.
+            Some(Text::Rope(rope)) if rope.right(mc) == Value::FALSE => self.store_of(Str(rope.left(mc))),
+            _ => None,
+        }
+    }
+
+    /// Returns the bytes of `string` from byte offset `start` up to, but not including, byte offset `end` as a read-only bytevector. The bytes are the UTF-8 of the characters in that part.
+    ///
+    /// If `string` reads from a store and the part is large enough to share, the bytevector reads from the same store and nothing is copied. Otherwise the bytes are copied into the arena.
+    pub fn utf8_of(&self, string: Str<'gc>, start: usize, end: usize) -> Result<AnyBytevector<'gc>, Error> {
+        let mc = self.mc;
+        if let Some((store, from, whole)) = self.store_of(string)
+            && shares(end - start, whole)
+        {
+            return Ok(Bytevectors::new(mc).view(store, from + start, end - start)?);
+        }
+        let mut bytes = ScratchVec::new(mc);
+        bytes.extend_with(end - start, 0)?;
+        copy_bytes(self, string, start, end, &mut bytes);
+        Ok(Bytevectors::new(mc).immutable_from_slice(&bytes)?)
     }
 
     /// Returns the interned string with the bytes in `built`, which are the `bytes` bytes of a string that is not allocated yet. `shape` is the low half of the `chars` word of that string. If the arena has no such string, a string is allocated for the bytes and interned.

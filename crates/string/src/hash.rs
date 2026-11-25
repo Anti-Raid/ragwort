@@ -140,11 +140,10 @@ impl State {
             self.word(pack(&slice[..8]));
             slice = &slice[8..];
         }
-        let mut pairs = slice.chunks_exact(16);
-        for pair in &mut pairs {
+        let (pairs, mut rest) = slice.as_chunks::<16>();
+        for pair in pairs {
             self.acc = mix(pack(&pair[..8]) ^ self.acc, pack(&pair[8..]) ^ self.key);
         }
-        let mut rest = pairs.remainder();
         if rest.len() >= 8 {
             self.word(pack(&rest[..8]));
             rest = &rest[8..];
