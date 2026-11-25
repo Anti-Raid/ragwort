@@ -22,6 +22,7 @@
 //! ```
 //!
 //! A rope has the same layout in its `reads` word, with the number of reads by index in bits 0 to 30.
+//! An external string has it in its `hash` word, where bits 0 to 30 are not used.
 //!
 //! So a flat string has at most [`FLAT_MAX`] characters. A rope can be longer.
 //!
@@ -36,8 +37,18 @@
 //! - A rope is not interned when it is made, so that joining strings stays cheap. It is interned
 //!   the first time it is compared with a string of the same length, or used as the key of a
 //!   table. Its hash is computed from its pieces, and nothing is copied.
-//! - An external string is not interned yet. [`Strings::intern`] returns it unchanged, and it is
-//!   compared by its characters.
+//! - An external string is not interned when it is made either, so that handing a string to the
+//!   arena reads none of its characters. It is interned at the same two moments as a rope.
+//!
+//! ## Interned external strings
+//!
+//! If no string with its characters is interned, the external string itself becomes the interned
+//! string. Its characters stay outside the arena. A flat string that is made with the same
+//! characters afterwards is the external string.
+//!
+//! If another string is the interned string already, the external string stays as it is. It has
+//! no field to keep that string in, so each comparison looks the interned string up by the kept
+//! hash and compares the characters.
 //!
 //! ## Interned ropes
 //!
@@ -106,7 +117,7 @@ crate::gc::objects! {
     /// A rope with a `flat` has `#f` for `left` and `right`.
     /// `reads` holds the number of reads of the rope by character index, the interned flag and the hash. See the [module docs](self).
     pub struct Rope { left: Value, right: Value, info: u64, flat: Value, reads: u64 }
-    /// A flat string whose characters are stored outside the arena, in `owner`. `owner` is dropped once the string is unreachable. `hash` is the hash of the characters, or 0 if it has not been computed.
+    /// A flat string whose characters are stored outside the arena, in `owner`. `owner` is dropped once the string is unreachable. `hash` holds the interned flag and the hash of the characters. See the [module docs](self).
     pub struct Extern { owner: Frozen<Box<dyn External>>, hash: u64 }
 }
 
@@ -115,9 +126,9 @@ pub const FLAT_MAX: usize = (1 << 31) - 1;
 
 /// The bits of a flat string's `chars` word that hold the number of characters. The same bits of a rope's `reads` word hold the number of reads.
 const COUNT: u64 = FLAT_MAX as u64;
-/// The bit of a flat string's `chars` word, or of a rope's `reads` word, that is set while the string is interned.
+/// The bit of a flat string's `chars` word, of a rope's `reads` word or of an external string's `hash` word that is set while the string is interned.
 const INTERNED: u64 = 1 << 31;
-/// The number of bits that the hash in a `chars` or `reads` word is shifted up by.
+/// The number of bits that the hash in one of those words is shifted up by.
 const HASH_SHIFT: u32 = 32;
 /// The number of words of the buffer in which a new flat string is built before it is looked up. See the [module docs](self).
 pub const BUILD: usize = 64;
@@ -210,7 +221,7 @@ impl<'a, 'gc> Strings<'a, 'gc> {
             Some(Text::Str16(flat)) => flat.chars(mc) >> HASH_SHIFT,
             Some(Text::Str32(flat)) => flat.chars(mc) >> HASH_SHIFT,
             Some(Text::Rope(rope)) => rope.reads(mc) >> HASH_SHIFT,
-            Some(Text::Extern(external)) => external.hash(mc),
+            Some(Text::Extern(external)) => external.hash(mc) >> HASH_SHIFT,
             None => 0,
         };
         if kept != 0 {
@@ -230,21 +241,22 @@ impl<'a, 'gc> Strings<'a, 'gc> {
             Some(Text::Str16(flat)) => flat.set_chars(mc, flat.chars(mc) & (COUNT | INTERNED) | hash << HASH_SHIFT),
             Some(Text::Str32(flat)) => flat.set_chars(mc, flat.chars(mc) & (COUNT | INTERNED) | hash << HASH_SHIFT),
             Some(Text::Rope(rope)) => rope.set_reads(mc, rope.reads(mc) & (COUNT | INTERNED) | hash << HASH_SHIFT),
-            Some(Text::Extern(external)) => external.set_hash(mc, hash),
+            Some(Text::Extern(external)) => external.set_hash(mc, external.hash(mc) & INTERNED | hash << HASH_SHIFT),
             None => {}
         }
         Ok(hash as u32)
     }
 
-    /// Returns the interned string with the characters of `string`. A flat string that a program holds is interned already, so this returns it. A rope is interned without a copy. See the [module docs](self).
+    /// Returns the interned string with the characters of `string`. A flat string that a program holds is interned already, so this returns it. A rope or an external string is interned without a copy. See the [module docs](self).
     pub fn intern(&self, string: Str<'gc>) -> Result<Str<'gc>, Error> {
         match Text::of(string.0) {
             Some(Text::Str8(flat)) => self.intern_flat(flat, string),
             Some(Text::Str16(flat)) => self.intern_flat(flat, string),
             Some(Text::Str32(flat)) => self.intern_flat(flat, string),
             Some(Text::Rope(rope)) => self.intern_rope(rope, string),
-            // A string in the value word is its own interned string. An external string is not interned yet.
-            Some(Text::Extern(_)) | None => Ok(string),
+            Some(Text::Extern(external)) => self.intern_extern(external, string),
+            // A string in the value word is its own interned string.
+            None => Ok(string),
         }
     }
 
@@ -262,7 +274,7 @@ impl<'a, 'gc> Strings<'a, 'gc> {
         Ok(None)
     }
 
-    /// Returns whether `string` is an interned string: a string in the value word, or a flat string object or a rope that is registered as the string of its characters.
+    /// Returns whether `string` is an interned string: a string in the value word, or a string object that is registered as the string of its characters.
     #[inline]
     pub fn is_interned(&self, string: Str<'gc>) -> bool {
         let mc = self.mc;
@@ -271,7 +283,7 @@ impl<'a, 'gc> Strings<'a, 'gc> {
             Some(Text::Str16(flat)) => flat.chars(mc) & INTERNED != 0,
             Some(Text::Str32(flat)) => flat.chars(mc) & INTERNED != 0,
             Some(Text::Rope(rope)) => rope.reads(mc) & INTERNED != 0,
-            Some(Text::Extern(_)) => false,
+            Some(Text::Extern(external)) => external.hash(mc) & INTERNED != 0,
             None => true,
         }
     }
@@ -328,6 +340,25 @@ impl<'a, 'gc> Strings<'a, 'gc> {
         Ok(string)
     }
 
+    /// Returns the interned string with the characters of the external string `external`, which is `string`. If no string is that yet, the external string becomes it, as it is.
+    fn intern_extern(&self, external: Gc<'gc, Extern>, string: Str<'gc>) -> Result<Str<'gc>, Error> {
+        let mc = self.mc;
+        if external.hash(mc) & INTERNED != 0 {
+            return Ok(string);
+        }
+        let hash = self.hash(string)?;
+        let symbols = Symbols::of_arena(mc)?;
+        let mut probe = Probe::new(mc, symbols, hash);
+        for candidate in probe.by_ref() {
+            if same_chars(self, candidate, string)? {
+                return Ok(candidate);
+            }
+        }
+        self.insert(symbols, &probe, string)?;
+        external.set_hash(mc, external.hash(mc) | INTERNED);
+        Ok(string)
+    }
+
     /// Returns the depth of `string` as a rope. A flat string and a rope that is read as a flat string have a depth of 0.
     fn depth(&self, string: Str<'gc>) -> u8 {
         match self.view(string) {
@@ -347,9 +378,17 @@ impl<'a, 'gc> Strings<'a, 'gc> {
         let hash = narrowed(hash_units(Units::Packed(Packed::new(built, len, width)), symbols.seed(mc)));
         let mut probe = Probe::new(mc, symbols, hash);
         for candidate in probe.by_ref() {
-            // A string that fits in the buffer is never a rope, so only a flat string of this width can have these characters.
-            // Two such strings with the same number of characters and the same words have the same characters.
-            let Some(held) = Text::of(candidate.0).and_then(<Gc<'gc, T> as Flat<'gc>>::cast) else { continue };
+            // A string that fits in the buffer is never a rope. So a flat string of this width or an external string can have these characters.
+            let Some(text) = Text::of(candidate.0) else { continue };
+            if let Text::Extern(_) = text {
+                let StrView::Flat(units) = self.view(candidate) else { continue };
+                if units.len() == len && units.width() == width && units.equal(Units::Packed(Packed::new(built, len, width))) {
+                    return Ok(candidate);
+                }
+                continue;
+            }
+            // Two flat strings of one width with the same number of characters and the same words have the same characters.
+            let Some(held) = <Gc<'gc, T> as Flat<'gc>>::cast(text) else { continue };
             if held.count(mc) & COUNT == len as u64 && held.words(mc).iter().zip(built).all(|(word, new)| word.get() == new.get()) {
                 return Ok(candidate);
             }
@@ -677,15 +716,12 @@ impl<'gc> Host for Strings<'_, 'gc> {
                 let flat = rope.flat(mc);
                 (flat != Value::FALSE).then_some(Str(flat))
             }
-            Some(Text::Extern(_)) => None,
+            Some(Text::Extern(external)) => (external.hash(mc) & INTERNED != 0).then_some(string),
             None => Some(string),
         }
     }
 
     fn canonical(&self, string: Str<'gc>) -> Result<Option<Str<'gc>>, Error> {
-        if self.is_external(string) {
-            return Ok(None);
-        }
         self.intern(string).map(Some)
     }
 

@@ -56,7 +56,7 @@ const PLAIN: u8 = 0;
 const SYMBOL: u8 = 1;
 const KEYWORD: u8 = 2;
 const SYMBOLS: u8 = 3;
-/// A flat string object, or a rope that is an interned string. It is saved as its text, and loaded as the arena's interned string with that text.
+/// A flat string object, or a rope or an external string that is an interned string. It is saved as its text, and loaded as the arena's interned string with that text.
 const STRING: u8 = 4;
 
 /// A kind of frozen value that can be saved.

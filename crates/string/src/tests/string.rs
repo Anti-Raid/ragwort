@@ -319,14 +319,14 @@ fn near_misses_compare_by_their_characters() {
     }
 }
 
-/// A string short enough to hash in one step has the same hash as a flat string, as a rope cut at any index and as a `&str`.
-/// This holds at every width and on both sides of the length cutoff. Each string also compares equal to its text.
+/// A string short enough to hash from at most 32 bytes has the same hash as a flat string, as a rope cut at any index and as a `&str`.
+/// This holds at every width and on both sides of each length cutoff. Each string also compares equal to its text.
 #[test]
 fn short_strings_hash_alike_in_every_shape() {
     let h = TestHost::with_capacity(1 << 20);
     let mut rng = Rng(9);
     for widest in [Width::One, Width::Two, Width::Four] {
-        for n in 0..=20 {
+        for n in 0..=36 {
             let text: Vec<char> = (0..n).map(|i| if i == n / 2 { rng.char(widest) } else { rng.char(Width::One) }).collect();
             let string: String = text.iter().collect();
             let flat = make(&h, &text);
@@ -407,3 +407,41 @@ fn hashes_follow_the_characters() {
         }
     }
 }
+
+/// Strings that look like Discord ids spread evenly over the buckets of a table, under several seeds. The ids are 18 to 20 digits, which the hash takes in its form for 17 to 32 bytes. They differ in the ways that real ids do: by one, by a multiple of 2^22, and in their first digits only.
+#[test]
+fn id_strings_spread_over_the_buckets() {
+    const COUNT: u64 = 1 << 18;
+    const BUCKETS: usize = 1 << 16;
+    /// Returns the chi-squared statistic of `hashes` over `BUCKETS` buckets, taken from the hash bits from `shift` up.
+    fn spread(hashes: &[u64], shift: u32) -> f64 {
+        let mut loads = vec![0u32; BUCKETS];
+        for hash in hashes {
+            loads[(hash >> shift) as usize % BUCKETS] += 1;
+        }
+        let expected = hashes.len() as f64 / BUCKETS as f64;
+        loads.iter().map(|&load| (f64::from(load) - expected).powi(2) / expected).sum()
+    }
+    let families: [(&str, u64, u64); 4] = [
+        ("ids that differ by one", 1_187_000_000_000_000_000, 1),
+        ("ids that differ by 2^22", 1_187_000_000_000_000_000, 1 << 22),
+        ("ids of 18 digits", 187_000_000_000_000_000, 1 << 22 | 1),
+        ("ids that differ in their first digits", 10_000_000_000_000_000_007, 30_000_000_000_000),
+    ];
+    for seed in [SEED, 0, 1, u64::MAX, 0x9E37_79B9_7F4A_7C15] {
+        for (name, start, step) in families {
+            let hashes: Vec<u64> = (0..COUNT).map(|index| hash_str(&(start + index * step).to_string(), seed)).collect();
+            let distinct: std::collections::HashSet<u64> = hashes.iter().copied().collect();
+            assert_eq!(distinct.len(), hashes.len(), "{name}, seed {seed:#x}");
+            // A string keeps the low 32 bits of its hash. About 8 pairs of 2^18 random 32-bit numbers are equal, so far fewer than 40 are.
+            let kept: std::collections::HashSet<u32> = hashes.iter().map(|&hash| hash as u32).collect();
+            assert!(hashes.len() - kept.len() < 40, "{name}, seed {seed:#x}: {} strings share their kept hash", hashes.len() - kept.len());
+            // With evenly spread hashes the statistic is near the number of buckets, and its standard deviation is about 362. The bound is six of them.
+            for shift in [0, 16] {
+                let statistic = spread(&hashes, shift);
+                assert!((statistic - BUCKETS as f64).abs() < 6.0 * 362.0, "{name}, seed {seed:#x}, bits from {shift}: {statistic}");
+            }
+        }
+    }
+}
+

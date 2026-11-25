@@ -1,9 +1,19 @@
 //! A fast seeded hash of a string's characters. The hash reads the characters as units of the string's width,
 //! packed into 64-bit words. So every representation of the same characters has the same hash, and so does a `&str` of the
-//! same text. A string whose units fit in [`SHORT`] bytes, such as most names, is hashed in one step.
+//! same text.
+//!
+//! The hash has three forms, chosen by the number of bytes that the units take:
+//!
+//! - Up to [`SHORT`] bytes, such as most names: one multiplication, then the last one.
+//! - Up to [`MEDIUM`] bytes: one multiplication over the first 16 bytes, one over the last 16 bytes on the result of the first, then the last one.
+//! - Longer: one multiplication for each 16 bytes, each on the result of the one before, then the last one.
+//!
+//! The first two forms read the bytes as wyhash does, and all three chain their multiplications as wyhash does. One thing differs on purpose.
+//! wyhash combines one side of each multiplication with a constant that is public unless the caller makes its own. Here both sides are combined
+//! with values that come from the seed, so no input makes a multiplication come out the same under every seed.
 
 use crate::units::Unit;
-use crate::word::{HIGH, SHORT, fingerprint};
+use crate::word::{HIGH, MEDIUM, SHORT, fingerprint};
 use crate::{Host, Info, Packed, Units, Width, chunks, flat, summary};
 
 const K0: u64 = 0x243f_6a88_85a3_08d3;
@@ -17,8 +27,30 @@ fn short((a, b): (u64, u64), seed: u64, len: usize, width: Width) -> u64 {
     mix(mix(a ^ seed ^ K0, b ^ key) ^ (len as u64 | (width as u64) << 48), K2 ^ key)
 }
 
+/// Returns the hash of a string of `len` characters at `width` whose units take more than [`SHORT`] and at most [`MEDIUM`] bytes. `first` is the first 16 of those bytes and `last` is the last 16, each as two little-endian words. The two overlap in a string of fewer than 32 bytes.
+#[inline]
+fn medium(first: (u64, u64), last: (u64, u64), seed: u64, len: usize, width: Width) -> u64 {
+    let key = seed.rotate_left(29) ^ K1;
+    let chained = mix(first.0 ^ seed ^ K0, first.1 ^ key);
+    mix(mix(last.0 ^ chained, last.1 ^ key) ^ (len as u64 | (width as u64) << 48), K2 ^ key)
+}
+
+/// Returns the hash of a string of `len` characters at `width` whose units are `bytes`, which are at most [`MEDIUM`] bytes.
+#[inline]
+fn compact(bytes: &[u8], seed: u64, len: usize, width: Width) -> u64 {
+    #[inline(always)]
+    fn word(bytes: &[u8], at: usize) -> u64 {
+        u64::from_le_bytes(bytes[at..at + 8].try_into().expect("eight bytes"))
+    }
+    let n = bytes.len();
+    if n <= SHORT {
+        return short(fingerprint(bytes), seed, len, width);
+    }
+    medium((word(bytes, 0), word(bytes, 8)), (word(bytes, n - 16), word(bytes, n - 8)), seed, len, width)
+}
+
 /// Writes `codes` as `width`-byte little-endian units into `buf`, starting at index `at`. Returns the index after the last byte written.
-fn gather(buf: &mut [u8; SHORT], mut at: usize, codes: impl Iterator<Item = u32>, width: Width) -> usize {
+fn gather(buf: &mut [u8], mut at: usize, codes: impl Iterator<Item = u32>, width: Width) -> usize {
     let size = width.bytes();
     for code in codes {
         buf[at..at + size].copy_from_slice(&code.to_le_bytes()[..size]);
@@ -194,28 +226,32 @@ pub fn hash_units(units: Units<'_>, seed: u64) -> u64 {
 #[inline]
 fn hash_flat(units: Units<'_>, seed: u64) -> u64 {
     let (len, width) = (units.len(), units.width());
-    if len * width.bytes() > SHORT {
+    let n = len * width.bytes();
+    if n > MEDIUM {
         let mut state = State::new(seed, width);
         state.units(units);
         return state.finish(len);
     }
-    let mut buf = [0; SHORT];
-    let n = len * width.bytes();
+    let mut buf = [0; MEDIUM];
     match units {
-        Units::One(bytes) => return short(fingerprint(bytes), seed, len, width),
+        Units::One(bytes) => return compact(bytes, seed, len, width),
         Units::Inline(inline) => return short(fingerprint(&inline.bytes()[..len]), seed, len, width),
+        // Packed units of more than `SHORT` bytes are read as words where they are.
+        Units::Packed(packed) if n > SHORT => {
+            return medium((packed.bytes_at(0), packed.bytes_at(8)), (packed.bytes_at(n - 16), packed.bytes_at(n - 8)), seed, len, width);
+        }
         Units::Packed(packed) => packed.copy_bytes(0, &mut buf[..n]),
         _ => _ = gather(&mut buf, 0, codes(units), width),
     }
-    short(fingerprint(&buf[..n]), seed, len, width)
+    compact(&buf[..n], seed, len, width)
 }
 
 #[inline(never)]
 fn hash_chunks<H: Host>(h: &H, string: H::Str, info: Info, seed: u64) -> u64 {
-    if info.len * info.width.bytes() <= SHORT {
-        let mut buf = [0; SHORT];
+    if info.len * info.width.bytes() <= MEDIUM {
+        let mut buf = [0; MEDIUM];
         let n = chunks(h, string).fold(0, |at, units| gather(&mut buf, at, codes(units), info.width));
-        return short(fingerprint(&buf[..n]), seed, info.len, info.width);
+        return compact(&buf[..n], seed, info.len, info.width);
     }
     let mut state = State::new(seed, info.width);
     chunks(h, string).for_each(|units| state.units(units));
@@ -231,6 +267,9 @@ pub fn hash_str(string: &str, seed: u64) -> u64 {
             return short(words, seed, bytes.len(), Width::One);
         }
     } else if string.is_ascii() {
+        if bytes.len() <= MEDIUM {
+            return compact(bytes, seed, bytes.len(), Width::One);
+        }
         let mut state = State::new(seed, Width::One);
         state.run(bytes);
         return state.finish(bytes.len());
@@ -242,10 +281,10 @@ pub fn hash_str(string: &str, seed: u64) -> u64 {
         0xC4.. => Width::Two,
         _ => Width::One,
     };
-    if len * width.bytes() <= SHORT {
-        let mut buf = [0; SHORT];
+    if len * width.bytes() <= MEDIUM {
+        let mut buf = [0; MEDIUM];
         let n = gather(&mut buf, 0, string.chars().map(|character| character as u32), width);
-        return short(fingerprint(&buf[..n]), seed, len, width);
+        return compact(&buf[..n], seed, len, width);
     }
     let mut state = State::new(seed, width);
     match width {

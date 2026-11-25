@@ -11,6 +11,9 @@ pub(crate) const ONES: u64 = 0x0101_0101_0101_0101;
 /// The maximum length, in bytes, of a slice that [`fingerprint`] accepts.
 pub(crate) const SHORT: usize = 16;
 
+/// The maximum length, in bytes, of the units of a string that is hashed from its first 16 and its last 16 bytes. See the hash module.
+pub(crate) const MEDIUM: usize = 32;
+
 /// Returns a mask with the low `n` bytes set, for `n` up to 8.
 #[inline]
 pub(crate) fn low_bytes(n: usize) -> u64 {

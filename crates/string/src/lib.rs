@@ -298,6 +298,10 @@ pub fn equal<H: Host>(h: &H, a: H::Str, b: H::Str) -> Result<bool, H::Error> {
             return Ok(false);
         }
         h.charge(units_a.len() as u64)?;
+        // A host that interns its strings interns the two. They are compared as handles, now and from now on.
+        if let (Some(first), Some(second)) = (h.canonical(a)?, h.canonical(b)?) {
+            return Ok(first == second);
+        }
         return Ok(units_a.equal(units_b));
     }
     rope_equal(h, a, b, true)

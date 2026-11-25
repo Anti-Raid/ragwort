@@ -428,13 +428,29 @@ fn ropes_and_external_strings_meet_the_interned_strings() {
         assert_eq!((equal(&h, deeper, rope), h.intern(deeper), is_flat(&h, deeper), h.interned_count()), (Ok(true), Ok(rope), true, count));
         assert_eq!((equal(&h, unlike, rope), h.intern(unlike), is_flat(&h, unlike), h.interned_count()), (Ok(false), Ok(unlike), false, count + 1));
         let interned = rope;
-        // An external string is returned as it is, and is compared by its characters. A lookup finds an interned string with its characters.
+        // An external string is not interned when it is made. A lookup finds nothing and leaves it as it is.
         let text: Arc<str> = Arc::from("external text of a length that is kept outside the arena, well past the limit");
         let outside = h.external(ExternalText::new(text.clone())).unwrap();
+        let count = h.interned_count();
         assert!(h.is_external(outside));
-        assert_eq!((h.interned(outside), h.intern(outside), h.is_interned(outside)), (Ok(None), Ok(outside), false));
-        let inside = string(&h, &text);
-        assert_eq!((h.interned(outside), equal(&h, outside, inside), equal(&h, outside, interned), inside == outside), (Ok(Some(inside)), Ok(true), Ok(false), false));
+        assert_eq!((h.interned(outside), h.is_interned(outside), equal(&h, outside, interned), h.is_interned(outside), h.interned_count()), (Ok(None), false, Ok(false), false, count));
+        // Interned, it is the interned string itself, and its characters stay outside. A flat string that is made with them afterwards is the external string.
+        assert_eq!((h.intern(outside), h.is_interned(outside), h.is_external(outside), h.interned_count()), (Ok(outside), true, true, count + 1));
+        assert_eq!((string(&h, &text), h.interned(outside), h.interned_count()), (outside, Ok(Some(outside)), count + 1));
+        // A second external string with the same characters leads to the first, and stays as it is.
+        let second = h.external(ExternalText::new(text.clone())).unwrap();
+        assert_eq!((equal(&h, second, outside), h.intern(second), h.interned(second), h.is_interned(second), second == outside, h.interned_count()), (Ok(true), Ok(outside), Ok(Some(outside)), false, false, count + 1));
+        // Where the flat string was made first, it is the interned string, and a comparison with an external string finds it.
+        let other: Arc<str> = Arc::from("another external text, which the arena has as a flat string before it arrives");
+        let inside = string(&h, &other);
+        let late = h.external(ExternalText::new(other.clone())).unwrap();
+        assert_eq!((equal(&h, late, inside), h.intern(late), h.is_interned(late), equal(&h, late, outside), h.interned_count()), (Ok(true), Ok(inside), false, Ok(false), count + 2));
+        // A comparison of an external string with a string of its length interns it. A rope with its characters then reads as it.
+        let long: Arc<str> = Arc::from(format!("{head}{}", "w".repeat(40)));
+        let wide = h.external(ExternalText::new(long.clone())).unwrap();
+        assert_eq!((equal(&h, wide, rope), h.is_interned(wide)), (Ok(false), true));
+        let joined = concat(&h, string(&h, &head), string(&h, &"w".repeat(40))).unwrap();
+        assert_eq!((equal(&h, joined, wide), h.intern(joined), is_flat(&h, joined), display(&h, joined).to_string()), (Ok(true), Ok(wide), true, long.to_string()));
     });
 }
 
@@ -554,6 +570,32 @@ fn interned_strings_outlive_their_neighbors() {
         // A text whose string died is made again, once.
         let made = string(&h, &text(1, 0));
         assert_eq!((string(&h, &text(1, 0)), h.interned_count()), (made, 4 * COUNT / 3 + 1));
+    });
+}
+
+/// A flat string object has the hash that its text has as a `&str`, at every length around the limits between the three forms of the hash, and at each width of unit.
+#[test]
+fn a_flat_string_hashes_as_its_text() {
+    let mut arena = arena(1 << 22);
+    arena.mutate(|mc| {
+        let h = Strings::new(mc);
+        let seed = Symbols::of_arena(mc).unwrap().seed(mc);
+        let mut seen = std::collections::HashSet::new();
+        for widest in ['w', 'é', 'Ā', '😀'] {
+            for count in 8..=70 {
+                let text: String = (0..count).map(|index| if index == count / 2 { widest } else { char::from(b'a' + (index % 26) as u8) }).collect();
+                let made = string(&h, &text);
+                assert_eq!(h.hash(made), Ok(narrowed(hash_str(&text, seed))), "{count} characters with {widest}");
+                assert!(seen.insert(h.hash(made).unwrap()), "{count} characters with {widest}");
+            }
+        }
+        // Changing any one character of a string of 17 to 32 bytes changes the hash.
+        let text = "seventeen to thirty-two bytes";
+        for index in 0..text.len() {
+            let mut other = text.as_bytes().to_vec();
+            other[index] ^= 1;
+            assert_ne!(h.hash(string(&h, std::str::from_utf8(&other).unwrap())), h.hash(string(&h, text)), "character {index}");
+        }
     });
 }
 

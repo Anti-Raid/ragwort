@@ -234,3 +234,25 @@ fn an_interned_rope_is_loaded_as_the_interned_string() {
     });
 }
 
+/// An external string that is an interned string is saved as its text, and is loaded as a string of the arena.
+#[test]
+fn an_interned_external_string_is_loaded_as_text() {
+    let name: std::sync::Arc<str> = std::sync::Arc::from("a text of the host that is long enough to be kept outside the arena");
+    let mut saving = Arena::new(1 << 22, 0);
+    let bytes = saving.mutate(|mc| {
+        let (strings, pairs) = (Strings::new(mc), Pairs::new(mc));
+        let outside = strings.external(string::ExternalText::new(name.clone())).unwrap();
+        assert_eq!((strings.intern(outside), strings.is_external(outside)), (Ok(outside), true));
+        save(mc, STAMP, &[pairs.list(&[outside.value(), outside.value()]).unwrap()], &kinds()).unwrap()
+    });
+    let mut fresh = Arena::new(1 << 22, 0);
+    fresh.mutate(|mc| {
+        let roots = load(mc, STAMP, &bytes, &descs(), &kinds(), &()).unwrap();
+        let (strings, pairs) = (Strings::new(mc), Pairs::new(mc));
+        let items: Vec<Value> = pairs.elements(roots[0]).collect();
+        let loaded = strings.string(items[0]).unwrap();
+        assert!(items[0] == items[1] && strings.is_interned(loaded) && !strings.is_external(loaded));
+        assert_eq!((text(mc, items[0]), string::from_str(&strings, &name)), (name.to_string(), Ok(loaded)));
+    });
+}
+

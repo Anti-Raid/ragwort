@@ -1441,3 +1441,29 @@ fn held_values_are_read_by_position() {
         assert_eq!(held, [Some(fix(0)), Some(fix(10)), Some(Value::BROKEN), Some(Value::BROKEN), Some(fix(2)), Some(fix(12)), None]);
     });
 }
+
+/// A key that is an external string is stored as it is: the table keeps the string of the host, and copies no character. A flat string, a rope and another external string with its characters find the entry.
+#[test]
+fn an_external_string_is_a_key_as_itself() {
+    arena().mutate(|mc| {
+        let (tables, strings) = (Tables::new(mc), Strings::new(mc));
+        let name: std::sync::Arc<str> = std::sync::Arc::from(format!("{} of the host", "a key that is kept outside the arena, ".repeat(16)));
+        let outside = strings.external(crate::string::ExternalText::new(name.clone())).unwrap();
+        assert!(strings.is_external(outside) && !strings.is_interned(outside));
+        let (fielded, mapped) = (tables.make().unwrap(), tables.with_room(4).unwrap());
+        fielded.set_field(mc, outside.value(), fix(1)).unwrap();
+        mapped.set(mc, outside.value(), fix(2)).unwrap();
+        assert!(strings.is_interned(outside) && strings.is_external(outside));
+        assert_eq!((entries(mc, fielded), entries(mc, mapped), tables.shape(&[outside.value()]).ok()), (vec![(outside.value(), fix(1))], vec![(outside.value(), fix(2))], fielded.shape(mc)));
+        // The same text in three other forms.
+        let flat = text(mc, &name);
+        let rope = concat(&strings, strings.string(text(mc, &name[..300])).unwrap(), strings.string(text(mc, &name[300..])).unwrap()).unwrap();
+        let second = strings.external(crate::string::ExternalText::new(name.clone())).unwrap();
+        assert!(flat == outside.value() && rope != outside && second != outside);
+        assert_eq!((fielded.get(mc, flat), mapped.get(mc, rope.value()), mapped.get(mc, second.value()), fielded.get(mc, second.value())), (Ok(Some(fix(1))), Ok(Some(fix(2))), Ok(Some(fix(2))), Ok(Some(fix(1)))));
+        // A write through another form changes the entry, and the key stays the first external string.
+        mapped.set(mc, second.value(), fix(3)).unwrap();
+        assert_eq!((entries(mc, mapped), mapped.has(mc, text(mc, &name[1..]))), (vec![(outside.value(), fix(3))], Ok(false)));
+    });
+}
+

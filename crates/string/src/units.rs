@@ -205,6 +205,12 @@ impl<'a> Packed<'a> {
         (0..n.div_ceil(8)).map(move |index| self.word_at(index, (n - 8 * index).min(8)))
     }
 
+    /// Returns eight of the units' bytes as a little-endian word, starting at byte `at`. All eight must be bytes of the units.
+    #[inline]
+    pub(crate) fn bytes_at(self, at: usize) -> u64 {
+        read_bytes(self.words, self.byte_start() + at, 8)
+    }
+
     /// Returns `n` of the units' bytes as a little-endian word, starting at byte `8 * index`. `n` is 8, or the number of bytes left if fewer remain.
     #[inline]
     pub(crate) fn word_at(self, index: usize, n: usize) -> u64 {
@@ -648,7 +654,7 @@ impl<'a> Units<'a> {
 
     /// Returns whether the two runs hold the same characters. Both runs must be at their narrowest width.
     #[inline]
-    pub(crate) fn equal(self, other: Units<'_>) -> bool {
+    pub fn equal(self, other: Units<'_>) -> bool {
         if let (Self::Inline(a), Units::Inline(b)) = (self, other) {
             return a == b;
         }
@@ -694,7 +700,7 @@ impl<'o, 'a> RunWriter<'o, 'a> {
         Self { out, at: 0, word: 0, filled: 0 }
     }
 
-    #[inline]
+    #[inline(always)]
     pub(crate) fn push(&mut self, run: Units<'_>) {
         let n = run.len();
         let UnitsMut::Packed(packed) = &*self.out else {

@@ -34,7 +34,7 @@ pub fn concat<H: Host>(h: &H, a: H::Str, b: H::Str) -> Res<H> {
         return Err(StrError::TooLong.into());
     }
     if fits(len, ia.width.max(ib.width)) {
-        return copy(h, &[a, b]);
+        return copy(h, &[a, b], len, ia.width.max(ib.width));
     }
     join(h, a, b)
 }
@@ -54,7 +54,7 @@ pub fn concat_all<H: Host>(h: &H, parts: &[H::Str]) -> Res<H> {
         return Err(StrError::TooLong.into());
     }
     if fits(len, width) {
-        return copy(h, parts);
+        return copy(h, parts, len, width);
     }
     let (left, right) = parts.split_at(parts.len() / 2);
     let left = concat_all(h, left)?;
@@ -131,14 +131,8 @@ fn copy_units<H: Host>(h: &H, units: Units<'_>) -> Res<H> {
     h.flat(units.narrowest(), units.len(), |mut out| out.write(0, units))
 }
 
-/// Returns `parts` joined into one flat string.
-fn copy<H: Host>(h: &H, parts: &[H::Str]) -> Res<H> {
-    let (mut n, mut width) = (0, Width::One);
-    for &part in parts {
-        let part_info = info(h, part);
-        n += part_info.len;
-        width = width.max(part_info.width);
-    }
+/// Returns `parts` joined into one flat string. `n` is the number of characters of the parts together, and `width` is the width of the widest part.
+fn copy<H: Host>(h: &H, parts: &[H::Str], n: usize, width: Width) -> Res<H> {
     h.charge(n as u64)?;
     if width == Width::One && n <= 8 {
         // The result is at most eight one-byte units, which is common. Shift the parts into one word.
@@ -231,7 +225,7 @@ fn pair<H: Host>(h: &H, a: H::Str, b: H::Str) -> Res<H> {
     }
     let (ia, ib) = (info(h, a), info(h, b));
     if ia.depth == 0 && ib.depth == 0 && merge(ia, ib) {
-        return copy(h, &[a, b]);
+        return copy(h, &[a, b], ia.len + ib.len, ia.width.max(ib.width));
     }
     // Here one side is a flat string and the other side is a rope whose adjacent child is flat. The merged string is flat,
     // like the child that it replaces, so the depth of the node does not change.
@@ -240,7 +234,8 @@ fn pair<H: Host>(h: &H, a: H::Str, b: H::Str) -> Res<H> {
         && depth(h, right) == 0
         && merge(info(h, right), ib)
     {
-        let right = copy(h, &[right, b])?;
+        let right_info = info(h, right);
+        let right = copy(h, &[right, b], right_info.len + ib.len, right_info.width.max(ib.width))?;
         return node(h, left, right);
     }
     if ia.depth == 0
@@ -248,7 +243,8 @@ fn pair<H: Host>(h: &H, a: H::Str, b: H::Str) -> Res<H> {
         && depth(h, left) == 0
         && merge(ia, info(h, left))
     {
-        let left = copy(h, &[a, left])?;
+        let left_info = info(h, left);
+        let left = copy(h, &[a, left], ia.len + left_info.len, ia.width.max(left_info.width))?;
         return node(h, left, right);
     }
     node(h, a, b)
