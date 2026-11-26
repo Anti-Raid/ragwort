@@ -13,6 +13,7 @@ members = [
     "crates/types",
     "crates/vm",
     "crates/scheme/*",
+    "crates/embedding/*",
 ]
 resolver = "3"
 

@@ -31,3 +31,9 @@ ragwort uses a segmented stack model to model its stack frames. This enables for
 - `syn`
 - `memmap2` (gc region)
 - `libc` (gc region)
+
+## (Key/Highlighted) Deviations from Scheme
+
+TODO: Fully document the std lib
+
+- `string->utf8` returns an immutable bytevector

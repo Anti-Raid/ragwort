@@ -187,7 +187,8 @@ pub use budget::Charge;
 use raw::Raw;
 pub use ragwort_derive::objects;
 use root::{ROOT_COST, RootRecord};
-pub use root::{ForeignRoot, Root, ValueRoot};
+use root::RootTable;
+pub use root::{ForeignRoot, Handle, Root, ValueRoot, WeakHandle};
 use slot::{Item, Refs, Role, Slot};
 use stack::{STACK_COST, StackRecord};
 pub use scratch::ScratchVec;
@@ -1431,6 +1432,8 @@ struct Meta {
     roots: Box<[Cell<u64>]>,
     stacks: RefCell<Vec<Rc<StackRecord>>>,
     handles: RefCell<Vec<Rc<RootRecord>>>,
+    /// The values that [`Handle`]s keep alive. Each handle holds the table too.
+    rooted: Rc<RootTable>,
     /// An id that is unique to this arena. A handle that lives outside the arena stores it, to check that it is used with its own arena.
     id: u64,
     hosts: RefCell<Vec<HostSlot>>,
@@ -1577,6 +1580,7 @@ impl Arena {
         // to copy every object.
         let pages = (limit / (PAGE * 8)).clamp(1, PAGES / 2 - 1);
         let count = 2 * pages + 2;
+        let id = NEXT_ARENA.fetch_add(1, Ordering::Relaxed);
         let meta = Meta {
             pages: (0..count).map(|_| Page::default()).collect(),
             used: Cell::new(1),
@@ -1608,7 +1612,8 @@ impl Arena {
             roots: vec![Cell::new(Value::NULL.word); roots + 1].into_boxed_slice(),
             stacks: RefCell::new(Vec::new()),
             handles: RefCell::new(Vec::new()),
-            id: NEXT_ARENA.fetch_add(1, Ordering::Relaxed),
+            rooted: Rc::new(RootTable::new(id)),
+            id,
             hosts: RefCell::new(Vec::new()),
             free_hosts: RefCell::new(Vec::new()),
             dead_hosts: RefCell::new(Vec::new()),
@@ -1669,6 +1674,7 @@ impl Arena {
             + meta.dead_hosts.borrow().capacity() * size_of::<Box<dyn Any>>()
             + meta.stacks.borrow().capacity() * size_of::<Rc<StackRecord>>()
             + meta.handles.borrow().capacity() * size_of::<Rc<RootRecord>>()
+            + meta.rooted.bytes()
             + meta.frozen.table_bytes();
         let before = meta.tables.replace(bytes);
         if bytes > before {
@@ -1821,6 +1827,17 @@ impl Arena {
 
     pub fn hosts(&self) -> usize {
         self.meta.hosts.borrow().len()
+    }
+
+    /// Returns the number of values that [`Handle`]s keep alive in the arena's root table. A value with several handles counts once for each.
+    pub fn handles(&self) -> usize {
+        self.meta.rooted.held()
+    }
+
+    /// Returns the bytes that the root table takes, for tests that check that it does not grow.
+    #[cfg(test)]
+    pub(crate) fn root_table_bytes(&self) -> usize {
+        self.meta.rooted.bytes()
     }
 
     /// Returns the number of frozen values not yet freed. The count includes values that a collection found dead and
@@ -2660,6 +2677,10 @@ impl<'a> Heap<'a> {
         for handle in handles.iter() {
             self.visit(&handle.word, work);
         }
+        // A free slot holds 0, which refers to no object.
+        for slot in self.m.rooted.slots().iter() {
+            self.visit(slot, work);
+        }
     }
 
     /// Sweeps all young pages at once and clears the dirty cards, for a minor collection. The
@@ -2724,6 +2745,13 @@ impl<'a> Heap<'a> {
         for &(from, to) in &work.weak_runs {
             for slot in self.words.get(from as usize..to as usize).unwrap_or(&[]) {
                 self.clear_dead(slot);
+            }
+        }
+        // A weak handle holds a value word. Its slot is emptied if the object was not marked.
+        for slot in self.m.rooted.weak_slots().iter() {
+            let word = slot.get();
+            if word & TAG == OBJECT && !self.has_bit((word >> 32) as usize, |page| &page.marks) {
+                slot.set(0);
             }
         }
         for &holder in &work.ephemerons {
@@ -2973,6 +3001,12 @@ impl<'a> Heap<'a> {
         }
         for handle in self.m.handles.borrow().iter() {
             self.fix_value(&handle.word);
+        }
+        for slot in self.m.rooted.slots().iter() {
+            self.fix_value(slot);
+        }
+        for slot in self.m.rooted.weak_slots().iter() {
+            self.fix_value(slot);
         }
         // `at` is the slot's word offset from the header, so the slot is field or item `at - 1`. A number at or past `desc.fields` is an item.
         // A member or weak slot holds a bare index. Every other recorded slot holds a value.

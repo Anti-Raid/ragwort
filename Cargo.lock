@@ -166,6 +166,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ragwort-static-types"
+version = "0.1.0"
+
+[[package]]
 name = "ragwort-string"
 version = "0.1.0"
 
