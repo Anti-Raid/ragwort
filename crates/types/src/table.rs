@@ -154,6 +154,7 @@
 
 use std::any::Any;
 use std::cell::{Ref, RefCell};
+use std::collections::HashMap;
 use std::hash::Hasher;
 
 use crate::Error;
@@ -277,7 +278,7 @@ impl<'gc> Shape<'gc> {
     /// Returns the key at `position`, or `None` if `position` is not below the number of keys.
     pub fn key(self, mc: &Mutation<'gc>, position: usize) -> Option<Value<'gc>> {
         let pairs = self.0.pairs(mc)?.items(mc);
-        (position < self.len(mc)).then(|| pairs.get(2 * position))
+        if position < self.len(mc) { Some(pairs.get(2 * position)) } else { None }
     }
 
     /// Returns the position of `key`, or `None` if the shape does not have the key. This is the entry number of `key` in every table made from the shape.
@@ -771,7 +772,7 @@ impl<'gc> Table<'gc> {
             Kept::Record(table) => table.held(mc, index),
             Kept::Outside(table) => {
                 let walk = table.walk(mc).ok()?;
-                (index < walk.len()).then(|| walk.get(index))
+                if index < walk.len() { Some(walk.get(index)) } else { None }
             }
         }
     }
@@ -801,7 +802,11 @@ impl<'gc> Inside<'gc> {
     #[inline(always)]
     fn value_at(self, mc: &Mutation<'gc>, position: usize) -> Option<Value<'gc>> {
         let values = self.0.pairs(mc)?.items(mc);
-        (position < values.len()).then(|| values.get(position)).filter(|&value| value != Value::BROKEN)
+        if position >= values.len() {
+            return None;
+        }
+        let value = values.get(position);
+        if value == Value::BROKEN { None } else { Some(value) }
     }
 
     /// Finds `key` in a table in shape mode, whose shape is `shape`.
@@ -837,7 +842,7 @@ impl<'gc> Inside<'gc> {
     fn get_at_own(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize) -> Option<Value<'gc>> {
         let entries = self.0.pairs(mc)?.items(mc);
         let place = position.checked_mul(2)?;
-        (place < entries.len() && entries.get(place) == key).then(|| entries.get(place + 1))
+        if place < entries.len() && entries.get(place) == key { Some(entries.get(place + 1)) } else { None }
     }
 
     /// Does the work of [`Inside::get_at`] for a table in shape mode, whose shape is `shape`: the key at `position` of the shape is compared with `key`.
@@ -989,7 +994,7 @@ impl<'gc> Inside<'gc> {
         // The key is hashed once, for the search of the shape and for the search of the shapes made from it.
         let hashed = hash(mc, shape.0.seed(mc), key)?;
         if let Some(position) = shape.position_hashed(mc, key, hashed.hash)? {
-            return Ok(self.replace(mc, position, value).then_some(Place { shape: Some(shape), position }));
+            return Ok(if self.replace(mc, position, value) { Some(Place { shape: Some(shape), position }) } else { None });
         }
         if !field && Symbol::of(key).is_none() {
             return Ok(None);
@@ -1090,7 +1095,10 @@ impl<'gc> Inside<'gc> {
     fn held(self, mc: &Mutation<'gc>, index: usize) -> Option<Value<'gc>> {
         if let Some(shape) = self.0.shape(mc) {
             let count = Shape(shape).len(mc);
-            let value = (index / 2 < count).then(|| self.value_at(mc, index / 2).unwrap_or(Value::BROKEN))?;
+            if index / 2 >= count {
+                return None;
+            }
+            let value = self.value_at(mc, index / 2).unwrap_or(Value::BROKEN);
             // A key that the table does not have reads as a removed entry: both its slots are `Value::BROKEN`.
             if index % 2 == 1 || value == Value::BROKEN {
                 return Some(value);
@@ -1098,7 +1106,7 @@ impl<'gc> Inside<'gc> {
             return Shape(shape).key(mc, index / 2);
         }
         let entries = self.0.pairs(mc)?.items(mc);
-        (index < 2 * self.0.used(mc) as usize).then(|| entries.get(index))
+        if index < 2 * self.0.used(mc) as usize { Some(entries.get(index)) } else { None }
     }
 
     #[inline]
@@ -1217,7 +1225,11 @@ impl<'gc> Record<'gc> {
     #[inline(always)]
     fn value_at(self, mc: &Mutation<'gc>, position: usize) -> Option<Value<'gc>> {
         let values = self.0.items(mc);
-        (position < values.len()).then(|| values.get(position)).filter(|&value| value != Value::BROKEN)
+        if position >= values.len() {
+            return None;
+        }
+        let value = values.get(position);
+        if value == Value::BROKEN { None } else { Some(value) }
     }
 
     /// Returns the shape that gives the positions of the record's entries, if they have one. For a record that has grown, this is the shape of the table that took its entries.
@@ -1408,7 +1420,10 @@ impl<'gc> Record<'gc> {
             return own.held(mc, index);
         }
         let values = self.0.items(mc);
-        let value = (index / 2 < values.len()).then(|| values.get(index / 2))?;
+        if index / 2 >= values.len() {
+            return None;
+        }
+        let value = values.get(index / 2);
         // A key that the record does not have reads as a removed entry: both its slots are `Value::BROKEN`.
         if index % 2 == 1 || value == Value::BROKEN {
             return Some(value);
@@ -1444,7 +1459,7 @@ impl<'gc> Record<'gc> {
     fn slot(self, mc: &Mutation<'gc>, position: usize) -> Option<Value<'gc>> {
         self.0.shape(mc)?;
         let values = self.0.items(mc);
-        (position < values.len()).then(|| values.get(position))
+        if position < values.len() { Some(values.get(position)) } else { None }
     }
 
     /// Stores `value` at `position`, whether or not the record has the key at that position yet. The record must not have grown. Unlike [`Record::set`], this does not treat a key that the record lacks as a new last entry. It is for a cache, where the order of the entries does not matter.
@@ -2163,6 +2178,60 @@ impl<'gc> Parts<'gc> {
     fn link(self, mc: &Mutation<'gc>, hash: u64, entry: usize) {
         link(mc, self.index, hash, entry);
     }
+}
+
+/// Gives a table that was loaded from an image the hash seed `seed`, which is the seed of the arena, and rebuilds its index with it.
+/// The index was built with the seed of the arena that saved the image, and the hashes of the loaded keys are those of this arena.
+pub(crate) fn reseed_table<'gc>(mc: &Mutation<'gc>, table: Gc<'gc, objects::Table>, seed: u64) -> Result<(), Error> {
+    table.set_seed(mc, seed);
+    let still = table.epoch(mc) == STILL;
+    // A table in shape mode has no index of its own.
+    if table.shape(mc).is_none() {
+        Inside(table).reindex(mc)?;
+    }
+    // Rebuilding the index marks the table as one that hashes keys by their place. A table that has no such key stays unmarked.
+    if still {
+        table.set_epoch(mc, STILL);
+    }
+    Ok(())
+}
+
+/// Gives a table shape that was loaded from an image the hash seed `seed`, as [`reseed_table`] does for a table. A shape shares its index
+/// with other shapes. `rebuilt` maps each index that has been rebuilt to its replacement, so every shape that shared an index shares the
+/// new one.
+pub(crate) fn reseed_shape<'gc>(mc: &Mutation<'gc>, shape: Gc<'gc, objects::TableShape>, seed: u64, rebuilt: &mut HashMap<u64, Gc<'gc, objects::TableIndex>>) -> Result<(), Error> {
+    shape.set_seed(mc, seed);
+    if let (Some(index), Some(pairs)) = (shape.index(mc), shape.pairs(mc)) {
+        let old = Value::object(mc, index).to_bits();
+        let fresh = match rebuilt.get(&old) {
+            Some(&fresh) => fresh,
+            None => {
+                let fresh = objects::TableIndex::new(mc, index.items(mc).len(), 0)?;
+                let entries = pairs.items(mc);
+                // The array holds the keys of every shape that shares it. A slot that no shape has used holds `Value::BROKEN`.
+                for position in 0..entries.len() / 2 {
+                    let key = entries.get(2 * position);
+                    if key != Value::BROKEN {
+                        link(mc, fresh.items(mc), hash(mc, seed, key)?.hash, position);
+                    }
+                }
+                rebuilt.insert(old, fresh);
+                fresh
+            }
+        };
+        shape.set_index(mc, Some(fresh));
+    }
+    if let (Some(links), Some(children)) = (shape.links(mc), shape.children(mc)) {
+        let fresh = objects::TableIndex::new(mc, links.items(mc).len(), 0)?;
+        let slots = children.items(mc);
+        for slot in 0..shape.listed(mc) as usize {
+            if let Some(child) = slots.get(slot) {
+                link(mc, fresh.items(mc), hash(mc, seed, child.key(mc))?.hash, slot);
+            }
+        }
+        shape.set_links(mc, Some(fresh));
+    }
+    Ok(())
 }
 
 /// Records in `index` that entry number `entry` has a key that hashes to `hash`.

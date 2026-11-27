@@ -176,7 +176,7 @@ impl Host for TestHost {
 
     fn small(&self, n: i64) -> Option<TestInt> {
         let fits = self.bits >= 64 || (-(1i64 << (self.bits - 1))..1i64 << (self.bits - 1)).contains(&n);
-        fits.then_some(TestInt::Small(n))
+        if fits { Some(TestInt::Small(n)) } else { None }
     }
 
     fn big(&self, negative: bool, len: usize, init: impl FnOnce(RWDigits<'_>) -> usize) -> Result<TestInt, TestError> {
@@ -210,7 +210,7 @@ impl TestHost {
             let all = self.bigs[at].get().expect("made by this host");
             assert!(all.len() <= 2 * digits.len(), "{} digits kept of {}", digits.len(), all.len());
             assert!(all[digits.len()..].iter().all(|digit| digit.get() == 0), "digits left past those kept");
-            let value = (digits.len() == 1).then(|| if negative { (digits[0].get() as i64).wrapping_neg() } else { digits[0].get() as i64 });
+            let value = if digits.len() == 1 { Some(if negative { (digits[0].get() as i64).wrapping_neg() } else { digits[0].get() as i64 }) } else { None };
             let small = value.filter(|&number| (number < 0) == negative && number != 0).and_then(|number| self.small(number));
             assert!(small.is_none(), "{x:?} should be small");
         }

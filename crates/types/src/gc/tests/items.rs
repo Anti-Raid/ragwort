@@ -44,7 +44,7 @@ fn member_items_keep_their_targets_and_follow_moves() {
         }
         mc.set_root(0, Value::object(mc, array));
     });
-    let expected: Vec<_> = (0..1000).map(|i| (i % 3 != 0).then_some(i as i64)).collect();
+    let expected: Vec<_> = (0..1000).map(|i| if i % 3 != 0 { Some(i as i64) } else { None }).collect();
     arena.collect();
     assert_eq!(arena.mutate(|mc| numbers(mc, nodes(mc, 0).items(mc))), expected);
     arena.set_evacuate_all(true);
@@ -102,7 +102,7 @@ fn weak_items_clear_once_their_targets_die() {
         mc.set_root(0, Value::object(mc, weak));
         mc.set_root(1, Value::object(mc, strong));
     });
-    let expected: Vec<_> = (0..1000).map(|i| (i % 2 == 0).then_some(i as i64)).collect();
+    let expected: Vec<_> = (0..1000).map(|i| if i % 2 == 0 { Some(i as i64) } else { None }).collect();
     arena.collect();
     arena.mutate(churn);
     assert_eq!(arena.mutate(|mc| numbers(mc, weaks(mc, 0).items(mc))), expected);
@@ -148,7 +148,7 @@ fn weak_items_on_dirty_cards_clear_in_minor_collections() {
         churn(mc);
         let items = weaks(mc, 0).items(mc);
         for (k, &i) in stores.iter().enumerate() {
-            assert_eq!(items.get(i).map(|n| n.n(mc)), (k % 2 == 0).then_some(i as i64), "item {i}");
+            assert_eq!(items.get(i).map(|n| n.n(mc)), if k % 2 == 0 { Some(i as i64) } else { None }, "item {i}");
         }
         assert_eq!(items.get(1).map(|n| n.n(mc)), Some(-1));
     });

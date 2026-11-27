@@ -99,7 +99,7 @@ impl Kind for Strong {
     fn entry<'gc>(mc: &Mutation<'gc>, buf: Gc<'gc, Pairs>, index: usize) -> Option<Self::Entry<'gc>> {
         let items = buf.items(mc);
         let key = items.get(2 * index);
-        (key != Value::BROKEN).then(|| (key, items.get(2 * index + 1)))
+        if key != Value::BROKEN { Some((key, items.get(2 * index + 1))) } else { None }
     }
 
     #[inline]
@@ -382,7 +382,10 @@ impl<'gc, K: Kind> Table<'gc, K> {
         self.head.set_used(mc, live as u64);
         let Some((old_keys, old_buf)) = old else { return Ok(()) };
         for j in 0..old_keys.len() {
-            let Some(entry) = (old_keys.get(j) != 0).then(|| K::entry(mc, old_buf, j)).flatten() else { continue };
+            if old_keys.get(j) == 0 {
+                continue;
+            }
+            let Some(entry) = K::entry(mc, old_buf, j) else { continue };
             let key = if rehash { key_of(eq_hash(K::identity(mc, entry))) } else { old_keys.get(j) };
             if let Some(index) = self.unused_slot(mc, key) {
                 keys.items(mc).set(mc, index, key);

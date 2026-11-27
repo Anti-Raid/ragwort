@@ -117,7 +117,7 @@ impl<'gc> ImmutableVector<'gc> {
     #[inline]
     pub fn get(self, mc: &Mutation<'gc>, index: usize) -> Option<Value<'gc>> {
         let items = self.0.items(mc);
-        (index < items.len()).then(|| items.get(index))
+        if index < items.len() { Some(items.get(index)) } else { None }
     }
 }
 
@@ -156,7 +156,7 @@ impl<'gc> AnyVector<'gc> {
     #[inline]
     pub fn get(self, mc: &Mutation<'gc>, index: usize) -> Option<Value<'gc>> {
         let items = self.items(mc);
-        (index < items.len()).then(|| items.get(index))
+        if index < items.len() { Some(items.get(index)) } else { None }
     }
 
     pub fn is_mutable(self) -> bool {
@@ -329,7 +329,7 @@ impl<'gc> ExternVector<'gc> {
     fn remembered(self, mc: &Mutation<'gc>, index: usize) -> Option<Value<'gc>> {
         let memo = self.0.memo(mc)?.items(mc);
         let known = if self.len(mc) <= CHUNK { memo.get(index) } else { Vector::of(memo.get(index / CHUNK))?.items(mc).get(index % CHUNK) };
-        (known != Value::BROKEN).then_some(known)
+        if known != Value::BROKEN { Some(known) } else { None }
     }
 
     /// Caches `value` as the element at `index`. `index` must be less than the length. See [`ExternVector::remembered`].

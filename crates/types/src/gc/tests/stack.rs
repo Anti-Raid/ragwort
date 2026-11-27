@@ -20,17 +20,18 @@ fn read<'gc>(mc: &Mutation<'gc>, v: Value<'gc>) -> Option<i64> {
 }
 
 /// Returns the number of objects in the heap: every object allocated and not freed by a sweep.
-fn objects(arena: &Arena) -> usize {
-    let m = &arena.meta;
-    m.pages[..m.used.get()].iter().flat_map(|p| &p.starts).map(|w| w.get().count_ones() as usize).sum()
+fn objects(arena: &mut Arena) -> usize {
+    let heap = arena.heap();
+    (0..heap.m.used.get()).flat_map(|page| heap.bitmap(page, Bits::Starts)).map(|w| w.get().count_ones() as usize).sum()
 }
 
-fn dirty_cards(arena: &Arena) -> u32 {
-    arena.meta.pages.iter().map(|p| p.cards.get().count_ones()).sum()
+fn dirty_cards(arena: &mut Arena) -> u32 {
+    let heap = arena.heap();
+    (0..heap.m.used.get()).filter_map(|page| heap.cards(page)).map(|cards| cards.get().count_ones()).sum()
 }
 
 fn is_marked(arena: &mut Arena, index: u32) -> bool {
-    arena.heap().has_bit(index as usize, |p| &p.marks)
+    arena.heap().has_bit(index as usize, Bits::Marks)
 }
 
 fn new_stack(arena: &mut Arena, len: usize) -> Stack {
@@ -107,7 +108,7 @@ fn frame_writes_skip_the_barrier_and_minor_collections_see_them() {
     let segment = segment_index(&mut arena, &stack);
     assert!(is_marked(&mut arena, segment));
     fill(&mut arena, &stack, 0, 16, 100);
-    assert_eq!(dirty_cards(&arena), 0, "frame writes dirtied cards");
+    assert_eq!(dirty_cards(&mut arena), 0, "frame writes dirtied cards");
     arena.collect_minor();
     churn(&mut arena);
     assert_eq!(frame_values(&mut arena, &stack, 0, 16), expected(16, 100));
@@ -130,7 +131,7 @@ fn frame_writes_while_marking_are_traced_before_the_cycle_ends() {
     arena.collect_slice(1);
     assert_eq!(arena.phase(), Phase::Marking);
     let pair = arena.mutate(|mc| mc.root(0).downcast::<Pair>(mc).unwrap().index);
-    assert!(arena.heap().has_bit(segment as usize, |p| &p.marks));
+    assert!(arena.heap().has_bit(segment as usize, Bits::Marks));
     assert!(arena.meta.work.borrow().gray.contains(&pair), "the pair was traced first");
     arena.mutate(|mc| {
         let pair = mc.root(0).downcast::<Pair>(mc).unwrap();
@@ -150,9 +151,9 @@ fn slots_above_top_are_voided_by_collections() {
     arena.collect();
     fill(&mut arena, &stack, 0, 20, 0);
     stack.set_top(10);
-    let before = objects(&arena);
+    let before = objects(&mut arena);
     arena.collect_minor();
-    assert_eq!(objects(&arena), before - 10);
+    assert_eq!(objects(&mut arena), before - 10);
     let values = frame_values(&mut arena, &stack, 0, 20);
     assert_eq!(values[..10], expected(10, 0)[..]);
     assert!(values[10..].iter().all(Option::is_none));
@@ -255,7 +256,7 @@ fn switching_segments_retires_the_old_one() {
     stack.set_top(8);
     arena.mutate(|mc| stack.switch(mc, Segment::new(mc, 300).unwrap()));
     assert_eq!((stack.base(), stack.top()), (0, 300));
-    assert!(dirty_cards(&arena) > 0, "retiring didn't take the barrier");
+    assert!(dirty_cards(&mut arena) > 0, "retiring didn't take the barrier");
     arena.collect_minor();
     churn(&mut arena);
     assert_eq!(rooted_segment(&mut arena, 0..8), expected(8, 10));

@@ -258,7 +258,7 @@ impl<'gc> Outer<'_, 'gc> {
         stack.set_top(base);
         // If base is 0, no continuation records hold frames on this segment, so the entire segment can be
         // reclaimed.
-        let freed = (base == 0).then(|| stack.segment(mc));
+        let freed = if base == 0 { Some(stack.segment(mc)) } else { None };
         task.set_state(mc, state);
         task.set_resumer(mc, Value::FALSE);
         prompts::empty(mc, task);

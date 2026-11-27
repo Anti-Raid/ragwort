@@ -160,7 +160,7 @@ fn to_small(negative: bool, digits: Digits<'_>) -> Option<i64> {
     debug_assert_eq!(digits.normalize().len(), digits.len());
     match digits.len() {
         0 => Some(0),
-        1 if negative => (digits.at(0) <= 1 << 63).then(|| (digits.at(0) as i64).wrapping_neg()),
+        1 if negative => if digits.at(0) <= 1 << 63 { Some((digits.at(0) as i64).wrapping_neg()) } else { None },
         1 => i64::try_from(digits.at(0)).ok(),
         _ => None,
     }
@@ -209,7 +209,7 @@ pub fn from_i128<H: Host>(h: &H, n: i128) -> Res<H> {
 pub fn to_u64<H: Host>(h: &H, x: H::Int) -> Option<u64> {
     match h.view(x) {
         IntView::Small(n) => u64::try_from(n).ok(),
-        IntView::Big { negative, digits } => (!negative && digits.len() == 1).then(|| digits.at(0)),
+        IntView::Big { negative, digits } => if !negative && digits.len() == 1 { Some(digits.at(0)) } else { None },
     }
 }
 
@@ -405,8 +405,9 @@ pub fn divide<H: Host>(
                 quotient -= 1;
                 remainder += b;
             }
-            let quotient = want_q.then(|| from_i128(h, quotient)).transpose()?;
-            return Ok((quotient, want_r.then(|| from_i128(h, remainder)).transpose()?));
+            let quotient = if want_q { Some(from_i128(h, quotient)?) } else { None };
+            let remainder = if want_r { Some(from_i128(h, remainder)?) } else { None };
+            return Ok((quotient, remainder));
         }
         (xv, yv) => (Signed::new(xv, &mut bx), Signed::new(yv, &mut by)),
     };
@@ -423,7 +424,7 @@ pub fn divide<H: Host>(
         } else {
             (from_i64(h, -1)?, make(h, ys.negative, yd.len(), |z| bigint::subtract(z, yd, xd))?)
         };
-        return Ok((want_q.then_some(quotient), want_r.then_some(remainder)));
+        return Ok((if want_q { Some(quotient) } else { None }, if want_r { Some(remainder) } else { None }));
     }
 
     if yd.len() == 1 {
@@ -455,7 +456,7 @@ pub fn divide<H: Host>(
     let mut buf = vec![0; len];
     let (quotient_digits, rest) = buf.split_at_mut(q_len);
     let (remainder_digits, scratch) = rest.split_at_mut(r_len);
-    let q_out = want_q.then(|| RWDigits::new(&mut quotient_digits[..q_len - 1]));
+    let q_out = if want_q { Some(RWDigits::new(&mut quotient_digits[..q_len - 1])) } else { None };
     bigint::divide(q_out, Some(RWDigits::new(remainder_digits)), xd, yd, RWDigits::new(scratch));
     let adjust = adjust && !Digits::of_mut(remainder_digits).is_zero();
     let quotient = if want_q {

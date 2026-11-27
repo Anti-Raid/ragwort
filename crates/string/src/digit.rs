@@ -15,9 +15,9 @@ const ZEROS: [u32; 77] = [
 pub fn digit_value(character: char) -> Option<u32> {
     let code = u32::from(character);
     if code < 0x80 {
-        return (0x30..0x3A).contains(&code).then(|| code - 0x30);
+        return if (0x30..0x3A).contains(&code) { Some(code - 0x30) } else { None };
     }
     let run = ZEROS.partition_point(|&zero| zero <= code).checked_sub(1)?;
     let value = code - ZEROS[run];
-    (value < 10).then_some(value)
+    if value < 10 { Some(value) } else { None }
 }

@@ -851,7 +851,7 @@ impl<'s, 'a, 'gc> Lowering<'s, 'a, 'gc> {
         let mut vars = self.bind(&names);
         self.body(body, move |this, body| {
             this.l.unbind(&names);
-            let rest = (vars.len() > params).then(|| vars.pop()).flatten();
+            let rest = if vars.len() > params { vars.pop() } else { None };
             let id = this.locals.lambda();
             Ok(Step::Done(Core::Lambda(Lambda { id, params: vars, optional: 0, rest, body: Box::new(body), name: None, at: Position::of(this.l.mc, node.span(this.l.mc)) })))
         })

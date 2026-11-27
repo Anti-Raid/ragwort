@@ -91,7 +91,7 @@ impl<'a, 'gc> Pairs<'a, 'gc> {
     pub fn list_len(&self, value: Value<'gc>) -> Option<u64> {
         match Pair::of(value) {
             Some(pair) => pair.list_len(self.mc),
-            None => (value == Value::NULL).then_some(0),
+            None => if value == Value::NULL { Some(0) } else { None },
         }
     }
 

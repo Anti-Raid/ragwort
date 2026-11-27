@@ -206,5 +206,5 @@ pub fn derives<'gc>(mc: &Mutation<'gc>, kind: Gc<'gc, StructType>, from: Gc<'gc,
 #[inline]
 pub fn of<'gc>(mc: &Mutation<'gc>, value: Value<'gc>, kind: Gc<'gc, StructType>) -> Option<Gc<'gc, Struct>> {
     let made = value.downcast::<Struct>(mc)?;
-    derives(mc, made.kind(mc)?, kind).then_some(made)
+    if derives(mc, made.kind(mc)?, kind) { Some(made) } else { None }
 }

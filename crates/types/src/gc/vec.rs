@@ -94,7 +94,7 @@ impl<'gc, S: Item> GcVec<'gc, S> {
     #[inline]
     pub fn get(self, mc: &Mutation<'gc>, index: usize) -> Option<S::Out<'gc>> {
         let (slots, len) = self.parts(mc)?;
-        (index < len).then(|| slots.get(index))
+        if index < len { Some(slots.get(index)) } else { None }
     }
 
     /// Sets item `index` to `value`. Returns whether `index` was in bounds. If it was not, nothing is written.

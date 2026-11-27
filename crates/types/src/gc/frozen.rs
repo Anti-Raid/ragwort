@@ -5,6 +5,13 @@
 //! that is set once. Only `Arena::finish` empties the slots of the values that a collection found dead, and it borrows the arena mutably.
 //! So the borrow checker rules out a reference that outlives its value.
 //!
+//! # Shared values
+//!
+//! An arena that loads an [image template](crate::gc::image::Template) holds the template's frozen values without copies of them: its table
+//! refers to the template's list of values, which every such arena shares. The lowest ids are the values of that list, in order, and the
+//! arena's own values come after them. A shared value is not freed while the arena lives, even when no object holds it any more. It takes none
+//! of the arena's memory, so nothing is lost.
+//!
 //! A frozen value is live while a live object holds it. Tracing finds these values. A minor collection
 //! frees the values created since the last collection that no surviving object holds. A major collection
 //! frees every value that no live object holds.
@@ -12,12 +19,48 @@
 use std::any::Any;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::marker::PhantomData;
+use std::rc::Rc;
 
 use crate::gc::budget::Budget;
 use crate::gc::{Brand, OutOfMemory};
 
-/// Slots per chunk of the table.
-const CHUNK: usize = 1024;
+#[cfg(test)]
+#[path = "tests/frozen_table.rs"]
+mod tests;
+
+/// The number of slots in the first chunk of the table. Each of the next chunks is twice as large as the one before it, up to `LARGEST`
+/// slots. Every chunk after that has `LARGEST` slots.
+///
+/// So an arena with few frozen values has a small table, and the table of an arena with many values grows in steps of bounded size.
+const FIRST: usize = 64;
+/// The number of chunks that are smaller than `LARGEST`, counted from the first.
+const DOUBLING: usize = 7;
+const LARGEST: usize = FIRST << DOUBLING;
+/// The number of slots in the chunks that are smaller than `LARGEST`.
+const SMALL: usize = LARGEST - FIRST;
+
+/// Returns the chunk that holds slot `number`, and the place of the slot in the chunk.
+#[inline]
+fn place(number: usize) -> (usize, usize) {
+    if number < SMALL {
+        // Chunk `k` holds the slots from `(FIRST << k) - FIRST` up to `(FIRST << (k + 1)) - FIRST`.
+        let shifted = number + FIRST;
+        let chunk = (shifted / FIRST).ilog2() as usize;
+        (chunk, shifted - (FIRST << chunk))
+    } else {
+        (DOUBLING + (number - SMALL) / LARGEST, (number - SMALL) % LARGEST)
+    }
+}
+
+/// Returns the number of slots in chunk `chunk`.
+fn size(chunk: usize) -> usize {
+    if chunk < DOUBLING { FIRST << chunk } else { LARGEST }
+}
+
+/// Returns the number of the first slot of chunk `chunk`.
+fn first(chunk: usize) -> usize {
+    if chunk < DOUBLING { (FIRST << chunk) - FIRST } else { SMALL + (chunk - DOUBLING) * LARGEST }
+}
 /// The bytes charged for a frozen value beyond its own size. They cover its slot and the allocation's header.
 pub(crate) const FROZEN_COST: usize = size_of::<Slot>() + 16;
 
@@ -53,8 +96,19 @@ impl<T> FrozenRef<'_, T> {
     }
 }
 
+/// A frozen value that arenas share, with the bytes that each of them is charged for it.
+pub(crate) struct Shared {
+    pub(crate) value: Box<dyn Any>,
+    pub(crate) cost: usize,
+}
+
 /// The table of frozen values. It is made of chunks that are allocated as they are needed, so a slot never moves.
 pub(crate) struct FrozenTable {
+    /// The values that the arena shares with others, if it loaded a template. Their ids are their positions in the list. The id of one of the
+    /// arena's own values is the number of shared values plus the number of its slot.
+    shared: OnceCell<Rc<[Shared]>>,
+    /// The bytes charged for the shared values.
+    shared_cost: Cell<usize>,
     chunks: Box<[OnceCell<Box<[Slot]>>]>,
     /// One past the highest id handed out.
     next: Cell<usize>,
@@ -63,8 +117,10 @@ pub(crate) struct FrozenTable {
     young: RefCell<Vec<u32>>,
     /// The ids of the values that a collection found dead. `free_dead` empties their slots.
     dead: RefCell<Vec<u32>>,
-    /// The number of chunks allocated so far, kept for charging. Counting the chunks instead would take a pass over the table after
-    /// every step.
+    /// The most slots that the table can have.
+    room: usize,
+    /// The number of slots in the chunks allocated so far, kept for charging. Counting them instead would take a pass over the table
+    /// after every step.
     made: Cell<usize>,
     /// The bytes charged for the old values: the values that survived a collection and have not been found dead since.
     /// Young values are not included, because a minor collection can free them.
@@ -76,9 +132,13 @@ pub(crate) struct FrozenTable {
 impl FrozenTable {
     /// Creates a table with room for as many values as `limit` bytes can pay for.
     pub(crate) fn new(limit: usize) -> Self {
-        let max = (limit / FROZEN_COST).clamp(CHUNK, u32::MAX as usize - 1);
+        let room = (limit / FROZEN_COST).clamp(LARGEST, u32::MAX as usize - 1);
+        let (last, _) = place(room - 1);
         Self {
-            chunks: (0..max.div_ceil(CHUNK)).map(|_| OnceCell::new()).collect(),
+            shared: OnceCell::new(),
+            shared_cost: Cell::new(0),
+            chunks: (0..=last).map(|_| OnceCell::new()).collect(),
+            room,
             next: Cell::new(0),
             free: RefCell::default(),
             young: RefCell::default(),
@@ -89,57 +149,106 @@ impl FrozenTable {
         }
     }
 
+    /// Returns the values that the arena shares with others.
     #[inline]
-    fn slot(&self, word: u64) -> Option<&Slot> {
-        let id = (word as u32).checked_sub(1)? as usize;
-        self.chunks.get(id / CHUNK)?.get()?.get(id % CHUNK)
+    fn shared(&self) -> &[Shared] {
+        match self.shared.get() {
+            Some(shared) => shared,
+            None => &[],
+        }
+    }
+
+    /// Returns the slot of the arena's own value with the id `id`, or `None` if the id is of a shared value or of no value.
+    #[inline]
+    fn slot(&self, id: usize) -> Option<&Slot> {
+        self.own(id.checked_sub(self.shared().len())?)
+    }
+
+    /// Returns the arena's own slot with the number `number`, or `None` if its chunk has not been allocated.
+    #[inline]
+    fn own(&self, number: usize) -> Option<&Slot> {
+        let (chunk, at) = place(number);
+        self.chunks.get(chunk)?.get()?.get(at)
     }
 
     /// Returns the value that the frozen field word `word` refers to, or `None` if `word` does not refer to a `T`.
     #[inline]
     pub(crate) fn get<T: Any>(&self, word: u64) -> Option<&T> {
-        self.slot(word)?.value.get()?.downcast_ref()
+        let id = (word as u32).checked_sub(1)? as usize;
+        match self.shared().get(id) {
+            Some(shared) => shared.value.downcast_ref(),
+            None => self.slot(id)?.value.get()?.downcast_ref(),
+        }
     }
 
     /// Returns the value that the frozen field word `word` refers to, whatever its type, and the bytes charged for it.
     pub(crate) fn any(&self, word: u64) -> Option<(&dyn Any, usize)> {
-        let slot = self.slot(word)?;
+        let id = (word as u32).checked_sub(1)? as usize;
+        if let Some(shared) = self.shared().get(id) {
+            return Some((&*shared.value, shared.cost));
+        }
+        let slot = self.slot(id)?;
         Some((&**slot.value.get()?, slot.cost.get()))
     }
 
-    pub(crate) fn alloc<T: Any>(&self, budget: &Budget, marked: bool, value: T, owned: usize) -> Result<u32, OutOfMemory> {
-        budget.count_allocation()?;
-        let cost = (size_of::<T>() + FROZEN_COST).saturating_add(owned);
-        budget.ensure(cost)?;
-        let id = match self.free.borrow_mut().pop() {
-            Some(id) => id,
-            None => {
-                let id = self.next.get();
-                if id >= self.chunks.len() * CHUNK {
-                    return Err(budget.fail());
-                }
-                self.next.set(id + 1);
-                id as u32
-            }
-        };
-        let chunk = self.chunks[id as usize / CHUNK].get_or_init(|| {
-            self.made.set(self.made.get() + 1);
-            (0..CHUNK).map(|_| Slot::default()).collect()
-        });
-        let slot = &chunk[id as usize % CHUNK];
-        if slot.value.set(Box::new(value)).is_err() {
-            unreachable!("a free frozen slot is empty");
+    /// Makes `shared` the values that the arena shares with others, and charges the arena for them. Returns the number of values. The table
+    /// must hold no value yet, because the shared values take the lowest ids. Returns `None` if it holds one.
+    pub(crate) fn share(&self, budget: &Budget, shared: &Rc<[Shared]>) -> Result<Option<usize>, OutOfMemory> {
+        if self.next.get() != 0 || self.shared.get().is_some() {
+            return Ok(None);
         }
-        slot.marked.set(marked);
-        slot.cost.set(cost);
+        let cost = shared.iter().fold(0usize, |total, value| total.saturating_add(value.cost));
+        budget.count_allocation()?;
+        budget.ensure(cost)?;
+        if self.shared.set(shared.clone()).is_err() {
+            unreachable!("the table has no shared values yet");
+        }
         budget.force(cost);
-        self.young.borrow_mut().push(id);
-        self.young_bytes.set(self.young_bytes.get() + cost);
-        Ok(id)
+        self.shared_cost.set(cost);
+        Ok(Some(shared.len()))
     }
 
+    pub(crate) fn alloc<T: Any>(&self, budget: &Budget, marked: bool, value: T, owned: usize) -> Result<u32, OutOfMemory> {
+        let cost = (size_of::<T>() + FROZEN_COST).saturating_add(owned);
+        self.alloc_boxed(budget, marked, Box::new(value), cost)
+    }
+
+    /// Stores `value` as one of the arena's own values, and charges `cost` bytes for it.
+    pub(crate) fn alloc_boxed(&self, budget: &Budget, marked: bool, value: Box<dyn Any>, cost: usize) -> Result<u32, OutOfMemory> {
+        budget.count_allocation()?;
+        budget.ensure(cost)?;
+        let slot = match self.free.borrow_mut().pop() {
+            Some(slot) => slot as usize,
+            None => {
+                let slot = self.next.get();
+                if slot >= self.room {
+                    return Err(budget.fail());
+                }
+                self.next.set(slot + 1);
+                slot
+            }
+        };
+        let (chunk, at) = place(slot);
+        let slots = self.chunks[chunk].get_or_init(|| {
+            self.made.set(self.made.get() + size(chunk));
+            (0..size(chunk)).map(|_| Slot::default()).collect()
+        });
+        let held = &slots[at];
+        if held.value.set(value).is_err() {
+            unreachable!("a free frozen slot is empty");
+        }
+        held.marked.set(marked);
+        held.cost.set(cost);
+        budget.force(cost);
+        self.young.borrow_mut().push(slot as u32);
+        self.young_bytes.set(self.young_bytes.get() + cost);
+        Ok((slot + self.shared().len()) as u32)
+    }
+
+    /// Marks the value that the frozen field word `word` refers to. A shared value needs no mark.
     pub(crate) fn mark(&self, word: u64) {
-        if let Some(slot) = self.slot(word) {
+        let Some(id) = (word as u32).checked_sub(1) else { return };
+        if let Some(slot) = self.slot(id as usize) {
             slot.marked.set(true);
         }
     }
@@ -155,12 +264,13 @@ impl FrozenTable {
     pub(crate) fn sweep_young(&self) {
         let mut dead = self.dead.borrow_mut();
         let mut live = self.live.get();
-        for id in self.young.borrow_mut().drain(..) {
-            let Some(slot) = self.slot(u64::from(id) + 1) else { continue };
+        // The young list and the dead list hold slot numbers.
+        for number in self.young.borrow_mut().drain(..) {
+            let Some(slot) = self.own(number as usize) else { continue };
             if slot.marked.get() {
                 live += slot.cost.get();
             } else {
-                dead.push(id);
+                dead.push(number);
             }
         }
         self.live.set(live);
@@ -182,7 +292,7 @@ impl FrozenTable {
                 if slot.marked.get() {
                     live += slot.cost.get();
                 } else {
-                    dead.push((chunk_index * CHUNK + i) as u32);
+                    dead.push((first(chunk_index) + i) as u32);
                 }
             }
         }
@@ -197,7 +307,8 @@ impl FrozenTable {
         let (free, dead) = (self.free.get_mut(), self.dead.get_mut());
         let keep = dead.len().saturating_sub(max);
         for id in dead.drain(keep..) {
-            let slot = self.chunks.get_mut(id as usize / CHUNK).and_then(OnceCell::get_mut).and_then(|chunk| chunk.get_mut(id as usize % CHUNK));
+            let (chunk, at) = place(id as usize);
+            let slot = self.chunks.get_mut(chunk).and_then(OnceCell::get_mut).and_then(|slots| slots.get_mut(at));
             if let Some(slot) = slot
                 && slot.value.take().is_some()
             {
@@ -210,11 +321,12 @@ impl FrozenTable {
     /// Returns the bytes charged for the values not yet freed.
     #[cfg(test)]
     pub(crate) fn charged(&self) -> usize {
-        self.chunks.iter().filter_map(OnceCell::get).flat_map(|chunk| chunk.iter()).map(|slot| slot.cost.get()).sum()
+        self.chunks.iter().filter_map(OnceCell::get).flat_map(|chunk| chunk.iter()).map(|slot| slot.cost.get()).sum::<usize>() + self.shared_cost.get()
     }
 
+    /// Returns the bytes charged for the old values and for the shared values.
     pub(crate) fn live(&self) -> usize {
-        self.live.get()
+        self.live.get() + self.shared_cost.get()
     }
 
     /// Returns the bytes charged for the values created since the last collection.
@@ -222,14 +334,15 @@ impl FrozenTable {
         self.young_bytes.get()
     }
 
+    /// Returns the number of values that the arena holds: its own values not yet freed, and the shared values.
     pub(crate) fn count(&self) -> usize {
-        self.next.get() - self.free.borrow().len()
+        self.next.get() - self.free.borrow().len() + self.shared().len()
     }
 
     /// Returns the bytes that the table and its lists take, beyond the charges of the values themselves.
     pub(crate) fn table_bytes(&self) -> usize {
         self.chunks.len() * size_of::<OnceCell<Box<[Slot]>>>()
-            + self.made.get() * CHUNK * size_of::<Slot>()
+            + self.made.get() * size_of::<Slot>()
             + (self.free.borrow().capacity() + self.young.borrow().capacity() + self.dead.borrow().capacity()) * size_of::<u32>()
     }
 }

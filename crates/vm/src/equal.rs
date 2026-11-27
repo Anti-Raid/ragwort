@@ -207,7 +207,7 @@ impl<'gc> Compound<'gc> {
         }
         // Struct instances belonging to an identity type compare `equal?` strictly by pointer identity (`eq?`).
         if let Some(made) = value.downcast::<objects::Struct>(mc) {
-            return made.kind(mc).is_some_and(|kind| !structs::type_flags(mc, kind).contains(TypeFlags::IDENTITY)).then_some(Compound::Struct(made));
+            return if made.kind(mc).is_some_and(|kind| !structs::type_flags(mc, kind).contains(TypeFlags::IDENTITY)) { Some(Compound::Struct(made)) } else { None };
         }
         value.downcast::<objects::Box>(mc).map(Compound::Box)
     }

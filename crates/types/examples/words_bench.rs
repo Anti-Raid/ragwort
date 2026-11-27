@@ -41,6 +41,12 @@ fn build(arena: &mut Arena, n: i64) {
 }
 
 fn time(name: &str, runs: usize, mut f: impl FnMut() -> Duration) {
+    // With an argument, only the lines whose name contains it are run.
+    if let Some(filter) = std::env::args().nth(1)
+        && !name.contains(&filter)
+    {
+        return;
+    }
     let mut times: Vec<Duration> = (0..runs).map(|_| f()).collect();
     times.sort();
     println!("{name:<28} {:>9.2} ms", times[runs / 2].as_secs_f64() * 1e3);

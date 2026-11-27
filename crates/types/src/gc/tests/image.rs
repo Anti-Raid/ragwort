@@ -122,13 +122,6 @@ fn bytes_that_are_not_an_image_do_not_load() {
         let expected = if (8..16).contains(&at) { LoadError::Stamp } else { LoadError::Malformed };
         assert_eq!(loaded(&changed, STAMP), Err(expected), "changed at {at}");
     }
-    // An arena whose symbols are hashed with another seed cannot load the image.
-    let mut arena = Arena::new(1 << 22, 0);
-    let other = arena.mutate(|mc| {
-        Symbols::with_seed(mc, 12345).unwrap();
-        load(mc, STAMP, &bytes, &descs(), &kinds(), &()).map(|roots| roots.len())
-    });
-    assert_eq!(other, Err(LoadError::Symbols));
     // An arena that is too small reports `OutOfMemory`.
     let small = Arena::new(1 << 12, 0).mutate(|mc| load(mc, STAMP, &bytes, &descs(), &kinds(), &()).map(|roots| roots.len()));
     assert_eq!(small, Err(LoadError::OutOfMemory));
@@ -277,5 +270,165 @@ fn a_long_string_is_saved_as_its_text() {
         assert!(items[0] == items[1] && strings.is_external(loaded) && strings.is_interned(loaded));
         assert_eq!((text(mc, items[0]), strings.as_str(loaded)), (long.clone(), Some(&*long)));
     });
+}
+
+/// Arenas that load one template refer to the template's frozen values, and have no copies of them. Their objects are their own. An
+/// arena lets go of the values when it is dropped.
+#[test]
+fn arenas_that_load_a_template_share_its_frozen_values() {
+    let template = Template::new(STAMP, &saved(), &kinds(), &()).unwrap();
+    let count = template.frozen_values();
+    assert!(count >= 2, "{count} frozen values");
+    assert_eq!(Rc::strong_count(&template.frozen), 1);
+    let (mut first, mut second) = (Arena::new(1 << 22, 1), Arena::new(1 << 22, 1));
+    for (arena, holders) in [(&mut first, 2), (&mut second, 3)] {
+        arena.mutate(|mc| {
+            let roots = template.load(mc, &descs()).unwrap();
+            assert_eq!((roots.len(), roots[1]), (2, fix(9)));
+            mc.set_root(0, roots[0]);
+        });
+        assert_eq!(Rc::strong_count(&template.frozen), holders);
+        // The arena has no slot of its own for a shared value, and is charged for each as if it had a copy.
+        assert_eq!((arena.frozen_values(), arena.meta.frozen.table_bytes() < 4096), (count, true));
+        assert_eq!(arena.meta.frozen.charged(), template.frozen.iter().map(|value| value.cost).sum::<usize>());
+    }
+    // A change of an object in one arena is not seen in the other.
+    first.mutate(|mc| {
+        let items: Vec<Value> = Pairs::new(mc).elements(mc.root(0)).collect();
+        Vectors::new(mc).mutable(items[5]).unwrap().items(mc).set(mc, 0, fix(77));
+    });
+    for (arena, expected) in [(&mut first, Some(77)), (&mut second, None)] {
+        arena.set_evacuate_all(true);
+        arena.collect();
+        arena.mutate(|mc| {
+            let items: Vec<Value> = Pairs::new(mc).elements(mc.root(0)).collect();
+            assert_eq!(Vectors::new(mc).vector(items[5]).unwrap().get(mc, 0).unwrap().as_fixnum(), expected);
+            // Both read the shared values.
+            let source = Syntax::of(items[7]).unwrap().span(mc).source().unwrap();
+            assert_eq!((source.name(mc).unwrap().bytes(mc), source.line_starts(mc)), (&b"file.rg"[..], &[0, 4, 8][..]));
+        });
+    }
+    // An arena makes frozen values of its own beside the shared ones. A collection frees them, and never a shared value.
+    second.mutate(|mc| {
+        let own = SyntaxSession::named(mc, "other.rg", "four\nfive").unwrap();
+        assert_eq!(own.source(mc).unwrap().line_starts(mc), &[0, 5]);
+        let items: Vec<Value> = Pairs::new(mc).elements(mc.root(0)).collect();
+        assert_eq!(Syntax::of(items[7]).unwrap().span(mc).source().unwrap().line_starts(mc), &[0, 4, 8]);
+    });
+    assert!(second.frozen_values() > count);
+    second.mutate(|mc| mc.set_root(0, Value::NULL));
+    second.collect();
+    assert_eq!((second.frozen_values(), Rc::strong_count(&template.frozen)), (count, 3));
+    // The arena saves its shared values like its own, and the image loads into an arena that shares nothing.
+    let again = first.mutate(|mc| save(mc, STAMP, &[mc.root(0)], &kinds())).unwrap();
+    let mut plain = Arena::new(1 << 22, 1);
+    plain.mutate(|mc| {
+        let roots = load(mc, STAMP, &again, &descs(), &kinds(), &()).unwrap();
+        let items: Vec<Value> = Pairs::new(mc).elements(roots[0]).collect();
+        assert_eq!(Syntax::of(items[7]).unwrap().span(mc).source().unwrap().line_starts(mc), &[0, 4, 8]);
+        // An arena that holds frozen values already cannot share a template's.
+        assert_eq!(template.load(mc, &descs()).err(), Some(LoadError::Used));
+    });
+    drop((first, second));
+    assert_eq!(Rc::strong_count(&template.frozen), 1);
+    // An image of another build makes no template.
+    assert_eq!(Template::new(STAMP + 1, &saved(), &kinds(), &()).err(), Some(LoadError::Stamp));
+}
+
+/// Returns a list of tables for [`an_arena_that_loads_an_image_hashes_with_its_own_seed`]: a table with strings, numbers and a symbol as
+/// keys, a table with a pair as a key, that pair, and 40 tables in shape mode whose shapes add one key each to a common shape.
+fn keyed<'gc>(mc: &Mutation<'gc>) -> Value<'gc> {
+    let (symbols, strings, tables, pairs) = (Symbols::of_arena(mc).unwrap(), Strings::new(mc), crate::table::Tables::new(mc), Pairs::new(mc));
+    let plain = tables.make().unwrap();
+    for number in 0..200 {
+        let text = string::from_str(&strings, &format!("a key with the number {number}")).unwrap().value();
+        plain.set(mc, text, fix(number)).unwrap();
+        plain.set(mc, fix(number), fix(-number)).unwrap();
+    }
+    let pair = pairs.cons(fix(1), fix(2)).unwrap().value(mc);
+    plain.set(mc, symbols.intern_str(&strings, "name").unwrap().value(mc), fix(1000)).unwrap();
+    plain.set(mc, Value::flonum(mc, 1.5).unwrap(), fix(2000)).unwrap();
+    // A key that is hashed by its place is in a table of its own. Such a table rebuilds its index after every collection that moves objects,
+    // and the first table must be found right without that.
+    let placed = tables.make().unwrap();
+    placed.set(mc, pair, fix(3000)).unwrap();
+    placed.set(mc, string::from_str(&strings, "beside the pair").unwrap().value(), fix(4000)).unwrap();
+    let common = tables.shape(&[symbols.intern_str(&strings, "first").unwrap().value(mc), symbols.intern_str(&strings, "second").unwrap().value(mc)]).unwrap();
+    let mut items = vec![plain.value(mc), placed.value(mc), pair];
+    for number in 0..40 {
+        let field = symbols.intern_str(&strings, &format!("field-{number}")).unwrap().value(mc);
+        let shape = common.child(mc, field).unwrap();
+        items.push(tables.shaped(shape, [Some(fix(1)), Some(fix(2)), Some(fix(number))].into_iter()).unwrap().value(mc));
+    }
+    pairs.list(&items).unwrap()
+}
+
+/// An image does not hold the hash seed of the arena that saved it. An arena that loads the image hashes with a seed of its own, and
+/// finds every key of the loaded tables and shapes.
+#[test]
+fn an_arena_that_loads_an_image_hashes_with_its_own_seed() {
+    let mut saving = Arena::new(1 << 22, 0);
+    let bytes = saving.mutate(|mc| {
+        Symbols::with_seed(mc, 777).unwrap();
+        save(mc, STAMP, &[keyed(mc)], &kinds()).unwrap()
+    });
+    let template = Template::new(STAMP, &bytes, &kinds(), &()).unwrap();
+    let mut seeds = Vec::new();
+    // The first two arenas are new, and load the image and the template. The third has symbols already, and keeps their seed.
+    for way in 0..3 {
+        let mut arena = Arena::new(1 << 22, 1);
+        let seed = arena.mutate(|mc| {
+            let roots = match way {
+                0 => load(mc, STAMP, &bytes, &descs(), &kinds(), &()).unwrap(),
+                1 => template.load(mc, &descs()).unwrap(),
+                _ => {
+                    Symbols::with_seed(mc, 12345).unwrap();
+                    load(mc, STAMP, &bytes, &descs(), &kinds(), &()).unwrap()
+                }
+            };
+            mc.set_root(0, roots[0]);
+            Symbols::of_arena(mc).unwrap().seed(mc)
+        });
+        seeds.push(seed);
+        // The tables are read as they were loaded, and again after a collection that moves objects.
+        for moved in [false, true] {
+            if moved {
+                arena.set_evacuate_all(true);
+                arena.collect();
+            }
+            arena.mutate(|mc| read_keyed(mc, moved));
+        }
+    }
+    assert!(seeds[0] != 777 && seeds[1] != 777 && seeds[0] != seeds[1], "{seeds:?}");
+    assert_eq!(seeds[2], 12345);
+}
+
+/// Checks the tables that [`keyed`] made, in an arena that loaded them. `again` is whether this arena has checked them before.
+fn read_keyed<'gc>(mc: &Mutation<'gc>, again: bool) {
+    let (symbols, strings, tables, pairs) = (Symbols::of_arena(mc).unwrap(), Strings::new(mc), crate::table::Tables::new(mc), Pairs::new(mc));
+    let items: Vec<Value> = pairs.elements(mc.root(0)).collect();
+    let plain = tables.table(items[0]).unwrap();
+    assert_eq!(plain.len(mc), if again { 403 } else { 402 });
+    for number in 0..200 {
+        let text = string::from_str(&strings, &format!("a key with the number {number}")).unwrap().value();
+        assert_eq!((plain.get(mc, text).unwrap(), plain.get(mc, fix(number)).unwrap()), (Some(fix(number)), Some(fix(-number))));
+    }
+    assert_eq!(plain.get(mc, symbols.intern_str(&strings, "name").unwrap().value(mc)).unwrap(), Some(fix(1000)));
+    assert_eq!(plain.get(mc, Value::flonum(mc, 1.5).unwrap()).unwrap(), Some(fix(2000)));
+    let placed = tables.table(items[1]).unwrap();
+    assert_eq!(placed.get(mc, items[2]).unwrap(), Some(fix(3000)));
+    assert_eq!(placed.get(mc, string::from_str(&strings, "beside the pair").unwrap().value()).unwrap(), Some(fix(4000)));
+    assert_eq!(plain.get(mc, string::from_str(&strings, "a key that is not there").unwrap().value()).unwrap(), None);
+    plain.set(mc, string::from_str(&strings, "a key added after the load").unwrap().value(), fix(7)).unwrap();
+    assert_eq!(plain.len(mc), 403);
+    let (first, second) = (symbols.intern_str(&strings, "first").unwrap().value(mc), symbols.intern_str(&strings, "second").unwrap().value(mc));
+    for number in 0..40 {
+        let field = symbols.intern_str(&strings, &format!("field-{number}")).unwrap().value(mc);
+        let shaped = tables.table(items[3 + number as usize]).unwrap();
+        assert_eq!((shaped.get(mc, first).unwrap(), shaped.get(mc, second).unwrap(), shaped.get(mc, field).unwrap()), (Some(fix(1)), Some(fix(2)), Some(fix(number))));
+        assert_eq!(shaped.get(mc, symbols.intern_str(&strings, "field-40").unwrap().value(mc)).unwrap(), None);
+        // The shape that this arena makes for the same keys is the loaded one: the loaded shapes find their children.
+        assert_eq!(tables.shape(&[first, second, field]).unwrap(), shaped.shape(mc).unwrap(), "shape {number}");
+    }
 }
 

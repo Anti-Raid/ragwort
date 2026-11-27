@@ -151,6 +151,11 @@ impl<'a> Reader<'a> {
         self.bytes.is_empty()
     }
 
+    /// Returns the number of bytes not read yet.
+    pub fn remaining(&self) -> usize {
+        self.bytes.len()
+    }
+
     /// Returns the context that the reader was created with. Fails if the context is not a `T`.
     pub fn context<T: Any>(&self) -> Result<&'a T, Malformed> {
         self.context.downcast_ref().ok_or(Malformed)

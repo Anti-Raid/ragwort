@@ -384,7 +384,7 @@ fn optional_parameters_are_unsupplied_when_left_out() {
     // in two ways: directly, where cp0 sees the lambda, and through `apply`, where the VM binds the parameters.
     fn f<'gc>(rest: bool) -> Core<'gc> {
         let missing = eq(var(1), Core::Quote(Value::UNSUPPLIED));
-        optional_lambda(&[0, 1], 1, rest.then_some(2), when(missing, add(var(0), q(100)), add(var(0), var(1))))
+        optional_lambda(&[0, 1], 1, if rest { Some(2) } else { None }, when(missing, add(var(0), q(100)), add(var(0), var(1))))
     }
     for rest in [false, true] {
         for (args, expect) in [(vec![1], Ok(101)), (vec![1, 2], Ok(3)), (vec![], Err(Fault::Arity)), (vec![1, 2, 3], if rest { Ok(3) } else { Err(Fault::Arity) })] {
@@ -1477,7 +1477,7 @@ struct OnlyLib<'gc>(Gc<'gc, ragwort_vm::objects::Module>);
 
 impl<'gc> crate::module::Resolver<'gc> for OnlyLib<'gc> {
     fn resolve(&mut self, _: &Mutation<'gc>, name: &str, _: Value<'gc>) -> Option<Gc<'gc, ragwort_vm::objects::Module>> {
-        (name == "lib").then_some(self.0)
+        if name == "lib" { Some(self.0) } else { None }
     }
 }
 

@@ -632,7 +632,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                         && let Some(kind) = self.struct_type(kind) =>
                 {
                     let truthy = match subject {
-                        Subject::Local(var) => self.truthy_vars.insert(var).then_some(var),
+                        Subject::Local(var) => if self.truthy_vars.insert(var) { Some(var) } else { None },
                         Subject::Slot(_) => None,
                     };
                     then.extend([Task::ArmOf(consequent, subject, kind, true), Task::DerivedElse { truthy, subject, kind, other, test }]);

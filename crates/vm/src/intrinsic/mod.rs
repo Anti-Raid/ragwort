@@ -1247,7 +1247,7 @@ impl Intrinsic {
                 boolean(compare_strings(mc, self, operands.from(0), fuel)?)
             }
             Intrinsic::StringJoin if !(1..=2).contains(&operands.count()) => return Err(Fault::Arity),
-            Intrinsic::StringJoin => string_join(mc, operands.get(0), (operands.count() == 2).then(|| operands.get(1)), fuel)?,
+            Intrinsic::StringJoin => string_join(mc, operands.get(0), if operands.count() == 2 { Some(operands.get(1)) } else { None }, fuel)?,
             Intrinsic::IsChar => boolean(operands.get(0).as_char().is_some()),
             Intrinsic::CharToInteger => fixnum(i64::from(u32::from(operands.get(0).as_char().ok_or(Fault::WrongType)?))),
             Intrinsic::IntegerToChar => {
@@ -1511,7 +1511,7 @@ fn fixnum<'gc>(integer: i64) -> Value<'gc> {
 
 /// Returns whether value `value` is callable as a procedure (a closure, a continuation, or a
 /// keyword procedure).
-pub(crate) fn is_procedure<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> bool {
+pub fn is_procedure<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> bool {
     value.downcast::<objects::Closure>(mc).is_some()
         || value.downcast::<objects::Continuation>(mc).is_some()
         || value.downcast::<objects::KeywordProcedure>(mc).is_some()

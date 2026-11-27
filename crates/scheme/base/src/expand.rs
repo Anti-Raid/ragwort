@@ -548,7 +548,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 let lambda = matches!(self.tree.view(value)?, View::List(items, None) if items.first().is_some_and(|&head| {
                     self.is_id(head) && matches!(self.resolve(head), Ok(Binding::Keyword(Keyword::Form(Form::Lambda))))
                 }));
-                self.defining = lambda.then_some(slot);
+                self.defining = if lambda { Some(slot) } else { None };
                 let value = self.expand_now(value);
                 self.defining = None;
                 Ok(module::Form::Define(slot, value?))

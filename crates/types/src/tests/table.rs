@@ -115,7 +115,7 @@ fn entries_stay_in_the_order_they_were_added() {
             table.set(mc, fix(extra), Value::NULL).unwrap();
         }
         let kept = keys.iter().filter(|&&key| key % 10 == 0 && key != keys[3]).map(|&key| fix(key));
-        let last = (keys[3] % 10 == 0).then_some(fix(keys[3]));
+        let last = if keys[3] % 10 == 0 { Some(fix(keys[3])) } else { None };
         let expected: Vec<_> = kept.chain(last).chain((5000..9000).map(fix)).collect();
         assert_eq!(table.entries(mc).unwrap().map(|(key, _)| key).collect::<Vec<_>>(), expected);
         assert_eq!(table.len(mc), expected.len());
@@ -1313,7 +1313,7 @@ impl Event {
     const FIELDS: [&str; 3] = ["x", "y", "z"];
 
     fn field<'gc>(&self, position: usize) -> Option<Value<'gc>> {
-        (position < if self.partial { 2 } else { 3 }).then(|| fix(position as i64 + 1))
+        if position < if self.partial { 2 } else { 3 } { Some(fix(position as i64 + 1)) } else { None }
     }
 }
 

@@ -17,7 +17,7 @@ use std::cell::RefCell;
 use crate::hash::{HashMap, HashSet};
 
 use ragwort_types::Wire;
-use ragwort_types::gc::image::{Kind, LoadError, freeze};
+use ragwort_types::gc::image::{Kind, LoadError};
 use ragwort_types::gc::{Gc, Immediate, Mutation, OutOfMemory, Value};
 use ragwort_types::wire::{Malformed, Reader, Writer, mix, shape_of};
 use ragwort_types::string::{Strings, chars};
@@ -92,17 +92,18 @@ fn save_interface(value: &dyn std::any::Any, out: &mut Writer) -> bool {
     }
 }
 
-fn load_interface<'gc>(mc: &Mutation<'gc>, input: &mut Reader<'_>, cost: usize) -> Result<u64, LoadError> {
+fn read_interface(input: &mut Reader<'_>) -> Result<Box<dyn std::any::Any>, LoadError> {
     let held: Box<dyn std::any::Any> = match input.u8()? {
         0 => Box::new(()),
         1 => Box::new(Interface::read(input)?),
         _ => return Err(LoadError::Malformed),
     };
-    Ok(freeze(mc, held, cost)?)
+    // A module's interface field holds a boxed value of any type, so the frozen value is itself a box.
+    Ok(Box::new(held))
 }
 
 /// The GC image serialization descriptor for frozen module interfaces; see [`ragwort_types::gc::image`].
-pub const INTERFACE: Kind = Kind { save: save_interface, load: load_interface, shape: SHAPE };
+pub const INTERFACE: Kind = Kind { save: save_interface, read: read_interface, shape: SHAPE };
 
 /// Type shape hash for [`Interface`], updated whenever the binary wire format of any interface type changes.
 const SHAPE: u64 = {
@@ -239,7 +240,7 @@ impl<'gc> Import<'gc> {
     pub(crate) fn inlined(self, mc: &Mutation<'gc>, args: usize) -> Option<&'gc Inline> {
         let inline = self.export.inline.as_ref()?;
         let fits = inline.inlines(args) && self.variable(mc, self.export.slot).is_some() && inline.slots().all(|slot| self.variable(mc, slot).is_some());
-        fits.then_some(inline)
+        if fits { Some(inline) } else { None }
     }
 
     /// Returns the struct definition metadata and runtime type descriptor if this import represents a struct constructor or type name.
@@ -251,7 +252,11 @@ impl<'gc> Import<'gc> {
     /// Retrieves the value stored in the module's variable `slot`, returning `None` if the slot is out of bounds or still undefined.
     pub(crate) fn variable(self, mc: &Mutation<'gc>, slot: u32) -> Option<Value<'gc>> {
         let items = self.module.items(mc);
-        (slot as usize).lt(&items.len()).then(|| items.get(slot as usize)).filter(|&value| value != Value::UNDEFINED)
+        if slot as usize >= items.len() {
+            return None;
+        }
+        let value = items.get(slot as usize);
+        if value == Value::UNDEFINED { None } else { Some(value) }
     }
 }
 
@@ -1295,13 +1300,13 @@ impl<'gc> ModuleBuilder<'gc> {
     fn struct_call(&self, slot: u32, form: u32) -> Option<Call<'gc>> {
         let (inline, kind) = self.procedures.get(&slot)?;
         let defined = self.defined_by.get(slot as usize).is_some_and(|&by| by < form);
-        Some(Call::new(inline.clone(), *kind, (!defined).then_some(Place::Slot { slot, checked: true })))
+        Some(Call::new(inline.clone(), *kind, if !defined { Some(Place::Slot { slot, checked: true }) } else { None }))
     }
 
     /// Returns the constant value of variable `slot` in form `form` if it has already been initialized (such as a struct type descriptor defined in an earlier form).
     pub fn constant(&self, slot: u32, form: u32) -> Option<Value<'gc>> {
         let (kind, _) = self.kinds.get(&slot)?;
-        self.defined_by.get(slot as usize).is_some_and(|&by| by < form).then_some(*kind)
+        if self.defined_by.get(slot as usize).is_some_and(|&by| by < form) { Some(*kind) } else { None }
     }
 
     /// Marks variable `slot` as mutated. Returns an error if the variable is immutable: a keyword procedure, or a binding of a struct declaration.
@@ -1402,7 +1407,7 @@ impl<'gc> ModuleBuilder<'gc> {
                 // For a keyword procedure, the lambda is lowered to the core procedure, and the core has its own slot.
                 let procedure = matches!(value, Core::Lambda(_) | Core::OptionalLambda(_));
                 let defined = self.cores.get(&slot).map_or(slot, |&(core, _)| core);
-                (Core::Set(Place::Slot { slot, checked: false }, Box::new(value)), procedure.then_some(defined))
+                (Core::Set(Place::Slot { slot, checked: false }, Box::new(value)), if procedure { Some(defined) } else { None })
             }
         };
         let unit = Unit { builder: self, form, defining, assigned: RefCell::default() };

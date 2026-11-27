@@ -3,6 +3,10 @@
 //! [`save`] serializes the objects reachable from `roots`. [`load`] rebuilds them in an arena
 //! and returns the roots. The loaded objects are copies: the two arenas share nothing.
 //!
+//! A [`Template`] is an image that is ready to be loaded into many arenas. It reads the image's frozen values once, and every arena
+//! that loads the template refers to those same values. The objects are still copies. Frozen values never change, so an arena cannot tell
+//! that it shares them. For code, they are most of what an image holds: the instructions, the position tables and the interfaces of the modules.
+//!
 //! ```text
 //! let bytes = arena.mutate(|mc| image::save(mc, STAMP, &[library], &kinds))?;
 //! // Later, or in another process:
@@ -15,6 +19,8 @@
 //!   that refers to an object is saved as that object's position in the image. So the loaded objects can be
 //!   anywhere in the arena.
 //! - A symbol is saved as its name, and a keyword as its symbol. Each is loaded as the arena's interned symbol or keyword of that name.
+//! - The hash seed of the arena is not saved. Each arena that loads an image hashes with its own seed, and the loader rebuilds the
+//!   indexes of the loaded tables with it. So the arenas that load one image do not share a seed, and a saved image does not fix one.
 //! - A frozen value is saved by the [`Kind`] that matches its type, in the format that [`Wire`] writes.
 //!
 //! # What can't be
@@ -41,8 +47,9 @@ mod tests;
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::rc::Rc;
 
-use super::frozen::FROZEN_COST;
+use super::frozen::Shared;
 use super::{Desc, Gc, Heap, Items, Mutation, OBJECT, Object, OutOfMemory, Phase, Role, TAG, TYPE_BITS, Value, mask};
 use crate::objects::{Interned, Sym, TableShape, TableShapeFields};
 use crate::string::{Strings, chars};
@@ -64,9 +71,8 @@ const STRING: u8 = 4;
 pub struct Kind {
     /// Writes the value and returns true, if the value is of this kind. Returns false otherwise.
     pub save: fn(&dyn Any, &mut Writer) -> bool,
-    /// Reads a value and freezes it. The last argument is the total number of bytes to charge for the value. Returns the word that a frozen field holds
-    /// for the value.
-    pub load: for<'gc> fn(&Mutation<'gc>, &mut Reader<'_>, usize) -> Result<u64, LoadError>,
+    /// Reads a value. The loader freezes it in the arena that loads the image, or shares it among the arenas that load a [`Template`].
+    pub read: fn(&mut Reader<'_>) -> Result<Box<dyn Any>, LoadError>,
     /// A number that changes when the serialized format of the kind changes.
     pub shape: u64,
 }
@@ -74,7 +80,7 @@ pub struct Kind {
 impl Kind {
     /// Returns the kind for frozen values of type `T`, which are saved in the format that [`Wire`] writes.
     pub const fn of<T: Wire + Any>() -> Self {
-        Self { save: save_as::<T>, load: load_as::<T>, shape: T::SHAPE }
+        Self { save: save_as::<T>, read: read_as::<T>, shape: T::SHAPE }
     }
 }
 
@@ -88,16 +94,8 @@ fn save_as<T: Wire + Any>(value: &dyn Any, out: &mut Writer) -> bool {
     }
 }
 
-fn load_as<'gc, T: Wire + Any>(mc: &Mutation<'gc>, input: &mut Reader<'_>, cost: usize) -> Result<u64, LoadError> {
-    let value = T::read(input)?;
-    Ok(freeze(mc, value, cost)?)
-}
-
-/// Freezes `value` with a total charge of `cost` bytes, which is the charge of the value that it is a copy of. Returns the word that a
-/// frozen field holds for the value.
-pub fn freeze<'gc, T: Any>(mc: &Mutation<'gc>, value: T, cost: usize) -> Result<u64, OutOfMemory> {
-    let owned = cost.saturating_sub(size_of::<T>() + FROZEN_COST);
-    Ok(mc.frozen_owning(value, owned)?.to_word())
+fn read_as<T: Wire + Any>(input: &mut Reader<'_>) -> Result<Box<dyn Any>, LoadError> {
+    Ok(Box::new(T::read(input)?))
 }
 
 /// The kinds of frozen value that this crate's own objects hold.
@@ -148,10 +146,10 @@ pub enum LoadError {
     Malformed,
     /// Another build wrote the image: its stamp differs.
     Stamp,
-    /// The arena already has symbols, and their hash seed differs from the image's.
-    Symbols,
     /// A major collection cycle is in progress.
     Busy,
+    /// The arena already holds frozen values, so it cannot share those of a [`Template`].
+    Used,
     OutOfMemory,
 }
 
@@ -236,7 +234,7 @@ impl<'gc> Saver<'_, 'gc> {
 
     /// Writes the words of the object at `at`, whose header is `header`.
     fn object(&mut self, at: usize, header: u64, desc: &Desc, out: &mut Writer) -> Result<(), SaveError> {
-        let (words, ty) = (self.heap.words, (header & TYPE_BITS) as u16);
+        let (words, ty) = (self.heap.words(), (header & TYPE_BITS) as u16);
         for field in 0..desc.fields as usize {
             let word = words[mask(at + 1 + field)].get();
             match desc.role(field) {
@@ -285,7 +283,7 @@ impl<'gc> Saver<'_, 'gc> {
         while let Some(&index) = self.order.get(next) {
             next += 1;
             let at = index as usize;
-            let header = self.heap.words[mask(at)].get();
+            let header = self.heap.words()[mask(at)].get();
             if header & super::FORWARDED != 0 {
                 return Err(SaveError::Busy);
             }
@@ -334,7 +332,6 @@ pub fn save<'gc>(mc: &Mutation<'gc>, stamp: u64, roots: &[Value<'gc>], kinds: &[
     let (mut table, mut words) = (Writer::new(), Writer::new());
     saver.objects(&mut table, &mut words)?;
     let mut body = Writer::new();
-    body.u64(Symbols::of(Value::from_bits(mc.interned().get())).map_or(0, |symbols| symbols.seed(mc)));
     body.u64(heap.m.evacuations.get());
     body.length(saver.frozen.len());
     body.bytes(&saver.frozen_out.finish());
@@ -389,7 +386,7 @@ impl Loader<'_> {
         if index == 0 {
             return Err(Malformed);
         }
-        let ty = self.heap.words[mask(index as usize)].get() & TYPE_BITS;
+        let ty = self.heap.words()[mask(index as usize)].get() & TYPE_BITS;
         Ok(u64::from(index) << 32 | ty << 16 | OBJECT)
     }
 
@@ -401,10 +398,10 @@ impl Loader<'_> {
         while field < desc.fields as usize {
             let slot = start + field;
             match desc.role(field) {
-                Some(Role::Word) => heap.words[mask(slot)].set(input.u64()?),
+                Some(Role::Word) => heap.words()[mask(slot)].set(input.u64()?),
                 Some(Role::Value) | None => {
                     let word = self.value(input.u64()?)?;
-                    heap.words[mask(slot)].set(word);
+                    heap.words()[mask(slot)].set(word);
                     heap.barrier(slot, at, word);
                 }
                 Some(Role::Ephemeron) => {
@@ -414,13 +411,13 @@ impl Loader<'_> {
                 }
                 Some(Role::Member) => {
                     let index = self.index(input.u32()?)?;
-                    heap.words[mask(slot)].set(u64::from(index));
+                    heap.words()[mask(slot)].set(u64::from(index));
                     if index != 0 {
                         heap.barrier_ref(slot, at, index);
                     }
                 }
                 Some(Role::Weak) => {
-                    heap.words[mask(slot)].set(u64::from(self.index(input.u32()?)?));
+                    heap.words()[mask(slot)].set(u64::from(self.index(input.u32()?)?));
                     heap.dirty(slot);
                 }
                 Some(Role::Host) => {
@@ -431,7 +428,7 @@ impl Loader<'_> {
                 Some(Role::Frozen) => {
                     let place = input.u32()? as usize;
                     let word = if place == 0 { 0 } else { *self.frozen.get(place - 1).ok_or(Malformed)? };
-                    heap.words[mask(slot)].set(word);
+                    heap.words()[mask(slot)].set(word);
                 }
             }
             field += 1;
@@ -441,10 +438,10 @@ impl Loader<'_> {
         while slot < items + len {
             match desc.items {
                 Items::None => return Err(Malformed),
-                Items::Words => heap.words[mask(slot)].set(input.u64()?),
+                Items::Words => heap.words()[mask(slot)].set(input.u64()?),
                 Items::Values => {
                     let word = self.value(input.u64()?)?;
-                    heap.words[mask(slot)].set(word);
+                    heap.words()[mask(slot)].set(word);
                     heap.barrier(slot, at, word);
                 }
                 Items::Ephemerons => {
@@ -457,13 +454,13 @@ impl Loader<'_> {
                 }
                 Items::Members => {
                     let index = self.index(input.u32()?)?;
-                    heap.words[mask(slot)].set(u64::from(index));
+                    heap.words()[mask(slot)].set(u64::from(index));
                     if index != 0 {
                         heap.barrier_ref(slot, at, index);
                     }
                 }
                 Items::Weaks => {
-                    heap.words[mask(slot)].set(u64::from(self.index(input.u32()?)?));
+                    heap.words()[mask(slot)].set(u64::from(self.index(input.u32()?)?));
                     heap.dirty(slot);
                 }
             }
@@ -494,52 +491,121 @@ enum Entry {
 /// the same seed. So load into a new arena, or into an arena whose intern table was created by a load
 /// of an image with the same seed.
 pub fn load<'gc>(mc: &Mutation<'gc>, stamp: u64, bytes: &[u8], descs: &[&'static Desc], kinds: &[Kind], context: &dyn Any) -> Result<Vec<Value<'gc>>, LoadError> {
+    let head = Head::read(stamp, bytes, kinds, context)?;
+    let frozen = &mc.heap.m.frozen;
+    let mut words = Vec::with_capacity(head.frozen.len());
+    for value in head.frozen {
+        words.push(u64::from(frozen.alloc_boxed(&mc.heap.m.budget, false, value.value, value.cost)?) + 1);
+    }
+    build(mc, head.moved, &words, &bytes[head.rest..], descs)
+}
+
+/// An image that is ready to be loaded into many arenas of one thread.
+///
+/// Its frozen values are read once, when the template is made. Every arena that loads the template refers to those values, and has no
+/// copies of them. The objects of the image are copied into each arena as [`load`] copies them. Each arena is still charged for the frozen
+/// values in full, so its limit means the same as it does without a template.
+pub struct Template {
+    moved: u64,
+    frozen: Rc<[Shared]>,
+    /// The part of the image after the frozen values: the object table, the words of the objects and the roots.
+    rest: Box<[u8]>,
+}
+
+impl Template {
+    /// Reads the image in `bytes`, which [`save`] wrote. `stamp`, `kinds` and `context` are as for [`load`].
+    pub fn new(stamp: u64, bytes: &[u8], kinds: &[Kind], context: &dyn Any) -> Result<Self, LoadError> {
+        let head = Head::read(stamp, bytes, kinds, context)?;
+        Ok(Self { moved: head.moved, rest: bytes[head.rest..].into(), frozen: head.frozen.into() })
+    }
+
+    /// Rebuilds the image's objects in the arena and returns the roots that the image was saved with. See [`load`].
+    ///
+    /// The arena must be new: it must hold no frozen value yet. Otherwise the load fails with [`LoadError::Used`].
+    pub fn load<'gc>(&self, mc: &Mutation<'gc>, descs: &[&'static Desc]) -> Result<Vec<Value<'gc>>, LoadError> {
+        let count = mc.heap.m.frozen.share(&mc.heap.m.budget, &self.frozen)?.ok_or(LoadError::Used)?;
+        // A shared value's id is its position in the template, and a frozen field holds the id plus one.
+        let words: Vec<u64> = (1..=count as u64).collect();
+        build(mc, self.moved, &words, &self.rest, descs)
+    }
+
+    /// Returns the number of frozen values that the arenas loading the template share.
+    pub fn frozen_values(&self) -> usize {
+        self.frozen.len()
+    }
+}
+
+/// What an image holds before its objects.
+struct Head {
+    /// The evacuation count of the arena that saved the image.
+    moved: u64,
+    /// The frozen values in the order of their positions, each with the bytes to charge for it.
+    frozen: Vec<Shared>,
+    /// Where the rest of the image starts in its bytes.
+    rest: usize,
+}
+
+impl Head {
+    /// Checks that `bytes` is an image of this build, and reads its frozen values.
+    fn read(stamp: u64, bytes: &[u8], kinds: &[Kind], context: &dyn Any) -> Result<Self, LoadError> {
+        let mut head = Reader::new(bytes, context);
+        for &byte in MAGIC {
+            if head.u8()? != byte {
+                return Err(LoadError::Malformed);
+            }
+        }
+        if head.u64()? != stamp {
+            return Err(LoadError::Stamp);
+        }
+        let sum = head.u64()?;
+        let body_bytes = &bytes[MAGIC.len() + 16..];
+        if checksum(body_bytes) != sum {
+            return Err(LoadError::Malformed);
+        }
+        let mut body = Reader::new(body_bytes, context);
+        let moved = body.u64()?;
+        let frozen_count = body.length()?;
+        let mut frozen_in = Reader::new(body.bytes()?, context);
+        let mut frozen = Vec::with_capacity(frozen_count);
+        for _ in 0..frozen_count {
+            let kind = kinds.get(usize::from(frozen_in.u16()?)).ok_or(Malformed)?;
+            let cost = frozen_in.u64()? as usize;
+            let mut value = Reader::new(frozen_in.bytes()?, context);
+            frozen.push(Shared { value: (kind.read)(&mut value)?, cost });
+            if !value.is_empty() {
+                return Err(LoadError::Malformed);
+            }
+        }
+        if !frozen_in.is_empty() {
+            return Err(LoadError::Malformed);
+        }
+        Ok(Self { moved, frozen, rest: bytes.len() - body.remaining() })
+    }
+}
+
+/// Rebuilds the objects of an image in the arena. `rest` is the part of the image after the frozen values. `frozen` holds, for each frozen
+/// value of the image in order, the word that a frozen field holds for it in this arena.
+fn build<'gc>(mc: &Mutation<'gc>, moved: u64, frozen: &[u64], rest: &[u8], descs: &[&'static Desc]) -> Result<Vec<Value<'gc>>, LoadError> {
     let heap = mc.heap;
     if heap.m.phase.get() != Phase::Idle {
         return Err(LoadError::Busy);
     }
-    let mut head = Reader::new(bytes, context);
-    for &byte in MAGIC {
-        if head.u8()? != byte {
-            return Err(LoadError::Malformed);
-        }
-    }
-    if head.u64()? != stamp {
-        return Err(LoadError::Stamp);
-    }
-    let sum = head.u64()?;
-    let body = &bytes[MAGIC.len() + 16..];
-    if checksum(body) != sum {
-        return Err(LoadError::Malformed);
-    }
-    let mut body = Reader::new(body, context);
-    let seed = body.u64()?;
-    let symbols = Symbols::with_seed(mc, seed)?;
-    if symbols.seed(mc) != seed {
-        return Err(LoadError::Symbols);
-    }
+    // Nothing after the frozen values reads the context.
+    let context: &dyn Any = &();
+    let mut body = Reader::new(rest, context);
+    // The arena hashes with its own seed, which is random unless the arena had symbols already. An image does not hold the seed of the
+    // arena that saved it. The loaded strings and symbols are made in this arena, so they are hashed with its seed. The loaded tables
+    // are given the seed below.
+    let symbols = Symbols::of_arena(mc)?;
+    let seed = symbols.seed(mc);
     // An identity table in the image was hashed by the object indices of the arena that saved it, at an evacuation count no higher than the saved count. Advance this arena's count past both counts, so every loaded identity table rehashes on first use.
-    let moved = body.u64()?;
     heap.m.evacuations.set(heap.m.evacuations.get().max(moved) + 1);
-
-    let frozen_count = body.length()?;
-    let mut frozen_in = Reader::new(body.bytes()?, context);
-    let mut frozen = Vec::with_capacity(frozen_count);
-    for _ in 0..frozen_count {
-        let kind = kinds.get(usize::from(frozen_in.u16()?)).ok_or(Malformed)?;
-        let cost = frozen_in.u64()? as usize;
-        let mut value = Reader::new(frozen_in.bytes()?, context);
-        frozen.push((kind.load)(mc, &mut value, cost)?);
-        if !value.is_empty() {
-            return Err(LoadError::Malformed);
-        }
-    }
 
     let count = body.length()?;
     let mut table = Reader::new(body.bytes()?, context);
     let strings = Strings::new(mc);
     let mut entries = Vec::with_capacity(count);
-    let mut loader = Loader { heap, indices: Vec::with_capacity(count), frozen };
+    let mut loader = Loader { heap, indices: Vec::with_capacity(count), frozen: frozen.to_vec() };
     #[inline(always)]
     fn index_of(value: Value<'_>) -> u32 {
         (value.to_bits() >> 32) as u32
@@ -591,6 +657,16 @@ pub fn load<'gc>(mc: &Mutation<'gc>, stamp: u64, bytes: &[u8], descs: &[&'static
             loader.object(loader.indices[place], desc, len, &mut words)?;
         }
     }
+    let (table_number, shape_number) = (crate::objects::Table::DESC.number, TableShape::DESC.number);
+    let mut rebuilt = HashMap::new();
+    for (place, entry) in entries.iter().enumerate() {
+        let &Entry::Plain(desc, _) = entry else { continue };
+        if desc.number == table_number {
+            crate::table::reseed_table(mc, Gc::new(loader.indices[place]), seed)?;
+        } else if desc.number == shape_number {
+            crate::table::reseed_shape(mc, Gc::new(loader.indices[place]), seed, &mut rebuilt)?;
+        }
+    }
     // The image's tree of table shapes becomes the arena's, if the arena has none yet. Tables that are built in this arena then get the same shapes as the tables of the image's code. The shape without a parent is the root of the tree.
     if symbols.shapes(mc).is_none() {
         for (place, entry) in entries.iter().enumerate() {
@@ -610,7 +686,7 @@ pub fn load<'gc>(mc: &Mutation<'gc>, stamp: u64, bytes: &[u8], descs: &[&'static
     for _ in 0..rooted.length()? {
         roots.push(Value::from_bits(loader.value(rooted.u64()?)?));
     }
-    if !(words.is_empty() && rooted.is_empty() && body.is_empty() && table.is_empty() && frozen_in.is_empty()) {
+    if !(words.is_empty() && rooted.is_empty() && body.is_empty() && table.is_empty()) {
         return Err(LoadError::Malformed);
     }
     Ok(roots)

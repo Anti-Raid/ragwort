@@ -751,7 +751,7 @@ impl<'s, 'gc> Run<'s, 'gc> {
                 } else {
                     frame.get(base)
                 };
-                let guard = guarding.then_some(handler);
+                let guard = if guarding { Some(handler) } else { None };
                 (handler_key(), prompts::handlers_with(mc, task, handler)?, guard)
             }
         };

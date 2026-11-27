@@ -57,7 +57,7 @@ impl Refs {
     pub(super) fn target(self, word: u64) -> Option<u32> {
         match self {
             Self::None => None,
-            Self::Values => (word & TAG == OBJECT).then_some((word >> 32) as u32),
+            Self::Values => if word & TAG == OBJECT { Some((word >> 32) as u32) } else { None },
             Self::Members | Self::Weaks => Some(word as u32).filter(|&target| target != 0),
         }
     }
@@ -128,7 +128,7 @@ macro_rules! words {
 
             #[inline]
             fn get<'gc, T: Object>(gc: Gc<'gc, T>, mc: &Mutation<'gc>, field: usize) -> $ty {
-                Self::load(mc.heap.words, gc.word(mc, field))
+                Self::load(mc.heap.words(), gc.word(mc, field))
             }
 
             #[inline]
@@ -214,7 +214,7 @@ impl<U: Object> Slot for Member<U> {
 
     #[inline]
     fn get<'gc, T: Object>(gc: Gc<'gc, T>, mc: &Mutation<'gc>, field: usize) -> Option<Gc<'gc, U>> {
-        super::target(mc.heap.words, gc.word(mc, field) as u32)
+        super::target(mc.heap.words(), gc.word(mc, field) as u32)
     }
 
     #[inline]
@@ -252,7 +252,7 @@ impl<U: Object> Slot for Weak<U> {
 
     #[inline]
     fn get<'gc, T: Object>(gc: Gc<'gc, T>, mc: &Mutation<'gc>, field: usize) -> Option<Gc<'gc, U>> {
-        super::target(mc.heap.words, gc.word(mc, field) as u32)
+        super::target(mc.heap.words(), gc.word(mc, field) as u32)
     }
 
     #[inline]
@@ -298,13 +298,13 @@ impl Slot for Tagged {
 
     #[inline]
     fn get<'gc, T: Object>(gc: Gc<'gc, T>, mc: &Mutation<'gc>, field: usize) -> Self::Out<'gc> {
-        Self::load(mc.heap.words, gc.word(mc, field))
+        Self::load(mc.heap.words(), gc.word(mc, field))
     }
 
     #[inline]
     fn set<'gc, T: Object>(gc: Gc<'gc, T>, mc: &Mutation<'gc>, field: usize, value: Self::In<'gc>) {
         let slot = super::field_slot(gc, field);
-        mc.heap.words[slot].set(Self::store(value));
+        mc.heap.words()[slot].set(Self::store(value));
         mc.heap.dirty(slot);
     }
 
@@ -408,7 +408,7 @@ impl Slot for Ephemeron {
 #[inline]
 fn set_frozen<'gc, T: Object>(gc: Gc<'gc, T>, mc: &Mutation<'gc>, field: usize, word: u64) {
     gc.set_word(mc, field, word);
-    if mc.heap.has_bit(gc.to_word() as usize, |page| &page.marks) {
+    if mc.heap.has_bit(gc.to_word() as usize, super::Bits::Marks) {
         mc.heap.m.frozen.mark(word);
     }
 }

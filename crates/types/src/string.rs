@@ -255,7 +255,7 @@ impl<'a, 'gc> Strings<'a, 'gc> {
     /// Returns `value` as a string, or `None` if it is not a string. The check reads only the tag and the type number in the value word.
     #[inline]
     pub fn string(&self, value: Value<'gc>) -> Option<Str<'gc>> {
-        (is_inline(value) || Text::of(value).is_some()).then_some(Str(value))
+        if is_inline(value) || Text::of(value).is_some() { Some(Str(value)) } else { None }
     }
 
     /// Returns a hash of the characters of `string`, seeded with the arena's seed. Two strings with the same characters have the same hash, however they are stored. The hash is never 0.
@@ -709,7 +709,7 @@ impl<'gc> Host for Strings<'_, 'gc> {
     fn known(&self, string: Str<'gc>) -> Option<Str<'gc>> {
         let mc = self.mc;
         match Text::of(string.0) {
-            Some(Text::Flat(flat)) => (flat.chars(mc) & INTERNED != 0).then_some(string),
+            Some(Text::Flat(flat)) => if flat.chars(mc) & INTERNED != 0 { Some(string) } else { None },
             // A rope is the interned string itself, or it is read as another string, which can be the interned string. The flat copy of an interned rope is not interned.
             Some(Text::Rope(rope)) => {
                 if rope.reads(mc) & INTERNED != 0 {
@@ -720,7 +720,7 @@ impl<'gc> Host for Strings<'_, 'gc> {
                 }
                 self.known(Str(rope.left(mc)))
             }
-            Some(Text::Extern(external)) => (external.hash(mc) & INTERNED != 0).then_some(string),
+            Some(Text::Extern(external)) => if external.hash(mc) & INTERNED != 0 { Some(string) } else { None },
             None => Some(string),
         }
     }

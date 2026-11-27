@@ -119,7 +119,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                     continue;
                 }
                 Task::Seq { before, repeat, after, tail, vector } => {
-                    let tail = tail.then(|| done.pop().expect("a tail"));
+                    let tail = if tail { Some(done.pop().expect("a tail")) } else { None };
                     let after = done.split_off(done.len() - after);
                     let repeat = if repeat { repeats.pop() } else { None };
                     let before = done.split_off(done.len() - before);

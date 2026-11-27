@@ -98,7 +98,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             return Ok(None);
         }
         let formals = self.formals(formals)?;
-        Ok(formals.has_keywords().then(|| formals.shape(self)))
+        Ok(if formals.has_keywords() { Some(formals.shape(self)) } else { None })
     }
 
     /// Expands a lambda with optional or keyword parameters and passes the result to `then`. `formals` already has `scope` added, and `scope` is added to `body` too.

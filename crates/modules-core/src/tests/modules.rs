@@ -1065,7 +1065,7 @@ mod shaped {
 
         fn get_at<'gc>(&self, _: &Mutation<'gc>, position: usize) -> Option<Result<Option<Value<'gc>>, Error>> {
             BY_POSITION.fetch_add(1, Ordering::Relaxed);
-            Some(Ok((position < FIELDS.len()).then(|| Value::fixnum(10 * self.0 + position as i64)).flatten()))
+            Some(Ok(if position < FIELDS.len() { Value::fixnum(10 * self.0 + position as i64) } else { None }))
         }
     }
 

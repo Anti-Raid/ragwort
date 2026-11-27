@@ -52,6 +52,8 @@ name = "ragwort"
 version = "0.1.0"
 dependencies = [
  "ragwort-compiler",
+ "ragwort-native",
+ "ragwort-types",
  "ragwort-vm",
 ]
 
@@ -168,6 +170,14 @@ dependencies = [
 [[package]]
 name = "ragwort-static-types"
 version = "0.1.0"
+dependencies = [
+ "ragwort-compiler",
+ "ragwort-native",
+ "ragwort-printer-scheme",
+ "ragwort-scheme",
+ "ragwort-types",
+ "ragwort-vm",
+]
 
 [[package]]
 name = "ragwort-string"

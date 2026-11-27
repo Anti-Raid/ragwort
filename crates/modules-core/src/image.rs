@@ -11,6 +11,16 @@
 //! let roots = arena.mutate(|mc| image::load(mc, &bytes, HOSTS.iter()))?;
 //! ```
 //!
+//! # Many arenas
+//!
+//! A program that makes many arenas with the same modules makes a [`Template`] of the image once, and loads the template into each arena.
+//! The arenas then share the instructions and the other read-only data of the modules, and each holds only its own objects.
+//!
+//! ```text
+//! let template = image::Template::new(&bytes, HOSTS.iter())?;
+//! let roots = arena.mutate(|mc| template.load(mc))?;
+//! ```
+//!
 //! # What an image is good for
 //!
 //! - A module in an image does not run again when the image is loaded. Its variables hold the values that they
@@ -72,7 +82,10 @@ pub fn save<'gc>(mc: &Mutation<'gc>, roots: &[Value<'gc>]) -> Result<Vec<u8>, Sa
 }
 
 /// Deserializes the image in `bytes` into the arena and returns the roots that the image was
-/// saved with. The arena must have no symbols yet. `hosts` are the host functions that the image's code can call.
+/// saved with. `hosts` are the host functions that the image's code can call.
+///
+/// The arena hashes with its own seed, which is random in a new arena. The image holds no seed, so two arenas that load one image do
+/// not share one.
 pub fn load<'gc>(mc: &Mutation<'gc>, bytes: &[u8], hosts: impl IntoIterator<Item = &'static HostDef>) -> Result<Vec<Value<'gc>>, ImageError> {
     let hosts = Hosts::new(hosts).map_err(ImageError::SameHost)?;
     image::load(mc, stamp(), bytes, &descs(), &kinds(), &hosts).map_err(|error| match hosts.missing() {
@@ -80,3 +93,33 @@ pub fn load<'gc>(mc: &Mutation<'gc>, bytes: &[u8], hosts: impl IntoIterator<Item
         None => ImageError::Load(error),
     })
 }
+
+/// An image that is ready to be loaded into many arenas of one thread. The arenas share the frozen values of the image, such as the
+/// instructions of its code. See [`ragwort_types::gc::image::Template`].
+pub struct Template(image::Template);
+
+impl Template {
+    /// Reads the image in `bytes`, which [`save`] wrote. `hosts` are the host functions that the image's code can call.
+    pub fn new(bytes: &[u8], hosts: impl IntoIterator<Item = &'static HostDef>) -> Result<Self, ImageError> {
+        let hosts = Hosts::new(hosts).map_err(ImageError::SameHost)?;
+        match image::Template::new(stamp(), bytes, &kinds(), &hosts) {
+            Ok(template) => Ok(Self(template)),
+            Err(error) => Err(match hosts.missing() {
+                Some(name) => ImageError::Host(name),
+                None => ImageError::Load(error),
+            }),
+        }
+    }
+
+    /// Rebuilds the image's objects in the arena and returns the roots that the image was saved with. The arena must be new: a load into
+    /// an arena that holds frozen values already fails. Each arena gets a hash seed of its own, as with [`load`].
+    pub fn load<'gc>(&self, mc: &Mutation<'gc>) -> Result<Vec<Value<'gc>>, ImageError> {
+        self.0.load(mc, &descs()).map_err(ImageError::Load)
+    }
+
+    /// Returns the number of frozen values that the arenas loading the template share.
+    pub fn frozen_values(&self) -> usize {
+        self.0.frozen_values()
+    }
+}
+

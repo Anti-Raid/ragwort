@@ -347,7 +347,7 @@ fn run(arena: &mut Arena, thunk: &ValueRoot, mut out: Option<&mut dyn FnMut(&str
     loop {
         let step = arena.step(|mc| match ran(mc, machine.run(mc)) {
             Ran::More => None,
-            Ran::Done(value) => Some(Ok((value != Value::VOID).then(|| shown(mc, value)))),
+            Ran::Done(value) => Some(Ok(if value != Value::VOID { Some(shown(mc, value)) } else { None })),
             Ran::Failed(message) => Some(Err(message)),
         });
         match step {

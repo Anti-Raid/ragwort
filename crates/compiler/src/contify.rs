@@ -274,7 +274,7 @@ impl<'id> Survey<'_, 'id, '_> {
                     if fits {
                         self.mine.last_mut().expect("in a let").push(Binding { members: vec![var], frame, at });
                     }
-                    todo.push(Task::Body(fun, fits.then_some(var)));
+                    todo.push(Task::Body(fun, if fits { Some(var) } else { None }));
                 }
                 _ => todo.push(Task::Fresh(init)),
             },
@@ -286,7 +286,7 @@ impl<'id> Survey<'_, 'id, '_> {
                 if fits.iter().all(|&fit| fit) && params <= MAX_PARAMS {
                     self.mine.last_mut().expect("in a let").push(Binding { members: group.iter().map(|&(var, _)| var).collect(), frame, at });
                 }
-                todo.extend(group.iter().zip(&fits).map(|(&(var, fun), &fits)| Task::Body(fun, fits.then_some(var))));
+                todo.extend(group.iter().zip(&fits).map(|(&(var, fun), &fits)| Task::Body(fun, if fits { Some(var) } else { None })));
             }
         }
     }

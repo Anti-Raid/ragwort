@@ -798,8 +798,27 @@ fn host_destructors_run_after_the_collector() {
 fn small_arenas_are_small() {
     let mut arena = Arena::new(1 << 20, 1);
     build(&mut arena, 100);
-    assert!(arena.meta.pages.len() <= 2 * (1 << 20) / (PAGE * 8) + 2);
+    assert!(arena.meta.page_count <= 2 * (1 << 20) / (PAGE * 8) + 2);
     assert_eq!(arena.meta.descs.chunks.iter().filter(|c| c.get().is_some()).count(), 0);
+}
+
+/// The record of a page is part of the region. It is all zero until the page is handed out, so the system has not committed it.
+#[test]
+fn page_records_are_written_as_pages_are_used() {
+    fn written(arena: &mut Arena) -> usize {
+        let heap = arena.heap();
+        (0..PAGES).filter(|&page| heap.page(page).0.iter().any(|word| word.get() != 0)).count()
+    }
+    let mut arena = Arena::new(64 << 20, 1);
+    assert_eq!(written(&mut arena), 0);
+    build(&mut arena, 100);
+    assert_eq!(written(&mut arena), 1);
+    // 100,000 nodes need about 150 pages. No record past the pages handed out is written.
+    build(&mut arena, 100_000);
+    arena.collect();
+    let used = arena.meta.used.get();
+    assert!(used > 100 && written(&mut arena) <= used, "{} records written for {used} pages", written(&mut arena));
+    assert_eq!(sum(&mut arena), (100_000 * 99_999 / 2 + 100 * 99 / 2, 100_100));
 }
 
 /// A minor collection scans only the dirty cards of an old vector, wherever the cards are in the vector.
@@ -868,3 +887,100 @@ fn characters_are_constants_apart_from_the_others() {
     }
     assert_ne!(Value::char('a'), Value::char('b'));
 }
+
+/// A collection keeps a nursery's worth of free pages. `trim` releases them too, and the arena works as before afterwards.
+#[test]
+fn trim_releases_the_free_pages_that_a_collection_keeps() {
+    if !ragwort_gc_region::Region::releases() {
+        return;
+    }
+    let mut arena = Arena::new(64 << 20, 1);
+    build(&mut arena, 1000);
+    // About 5 MB of garbage, in steps, so that minor collections run.
+    for _ in 0..200 {
+        arena
+            .step(|mc| {
+                for i in 0..1000 {
+                    Pair::new(mc, Value::fixnum(i).unwrap(), Value::NULL).unwrap();
+                }
+            })
+            .unwrap();
+    }
+    arena.collect();
+    let kept = arena.committed_bytes();
+    assert!(kept >= arena.nursery(), "a collection keeps a nursery's worth of free pages: {kept} bytes committed");
+    arena.trim();
+    // What is left holds the 1000 pairs of 24 bytes each. Pages are 16 KB.
+    assert!(arena.committed_bytes() <= 4 * PAGE * 8, "{} bytes committed after the trim", arena.committed_bytes());
+    assert!(arena.used() < kept / 4, "{} bytes charged after the trim", arena.used());
+    assert_eq!(sum(&mut arena), (1000 * 999 / 2, 1000));
+    // The arena allocates and collects as before.
+    build(&mut arena, 100_000);
+    arena.collect();
+    arena.trim();
+    assert_eq!(sum(&mut arena), (100_000 * 99_999 / 2 + 1000 * 999 / 2, 101_000));
+    // A trim during a major cycle does nothing.
+    arena.collect_slice(1);
+    let before = arena.committed_bytes();
+    arena.trim();
+    assert_eq!(arena.committed_bytes(), before);
+}
+
+/// The nursery is as large as the heap that the last collection left, within its bounds. So an arena that keeps little holds little,
+/// whatever its limit.
+#[test]
+fn the_nursery_follows_the_size_of_the_heap() {
+    let mut arena = Arena::new(64 << 20, 1);
+    assert_eq!(arena.nursery(), MIN_NURSERY);
+    build(&mut arena, 1000);
+    arena.collect();
+    assert_eq!(arena.nursery(), MIN_NURSERY);
+    // 50,000 pairs of 24 bytes are 1.2 MB.
+    build(&mut arena, 50_000);
+    arena.collect();
+    assert!((1 << 20..2 << 20).contains(&arena.nursery()), "a nursery of {} bytes", arena.nursery());
+    // A large heap has the largest nursery, as every arena had before.
+    build(&mut arena, 500_000);
+    arena.collect();
+    assert_eq!(arena.nursery(), 4 << 20);
+    // The heap shrinks, and the nursery with it.
+    arena.mutate(|mc| mc.set_root(0, Value::NULL));
+    arena.collect();
+    assert_eq!(arena.nursery(), MIN_NURSERY);
+    // A fixed size stays, and `None` lets the arena choose again.
+    arena.set_nursery(Some(100_000));
+    build(&mut arena, 50_000);
+    arena.collect();
+    assert_eq!(arena.nursery(), 7 * PAGE * 8);
+    arena.set_nursery(None);
+    assert!((1 << 20..2 << 20).contains(&arena.nursery()), "a nursery of {} bytes", arena.nursery());
+    // A small limit bounds the nursery below the usual least size.
+    assert_eq!(Arena::new(1 << 20, 1).nursery(), (1 << 20) / 8);
+}
+
+/// The words of the objects and the records of the pages are arrays of their own, though they are one mapping. A position past the
+/// objects is past the end of the object words, and reaches no record.
+#[test]
+fn a_position_past_the_objects_reaches_no_record() {
+    let mut arena = Arena::new(1 << 20, 2);
+    build(&mut arena, 100);
+    arena.collect();
+    arena.collect();
+    // The first record would be at this position if the two parts were one array.
+    let past = WORDS + SLACK;
+    let heap = arena.heap();
+    assert_eq!((heap.words().len(), heap.records().len()), (WORDS + SLACK, RECORDS));
+    assert!(heap.words().get(past).is_none() && heap.words().get(past..past + 4).is_none());
+    assert!(heap.bit_word(past, Bits::Marks).is_none() && !heap.has_bit(past, Bits::Starts));
+    let before: Vec<u64> = heap.records().iter().take(8 * PAGE_WORDS).map(Cell::get).collect();
+    // A made-up reference to such a position is a reference to no object. Collections, also ones that move objects, leave the records as they were.
+    arena.mutate(|mc| mc.set_root(1, Value::from_bits((past as u64 + 64) << 32 | OBJECT)));
+    arena.collect();
+    arena.collect_minor();
+    let after: Vec<u64> = arena.heap().records().iter().take(8 * PAGE_WORDS).map(Cell::get).collect();
+    assert!(before == after, "a record changed");
+    arena.set_evacuate_all(true);
+    arena.collect();
+    assert_eq!(sum(&mut arena), (100 * 99 / 2, 100));
+}
+

@@ -287,7 +287,7 @@ fn exact_sqrt<H: RealHost>(h: &H, value: H::Rational) -> Result<Option<H::Ration
     #[inline(always)]
     fn root<H: RealHost>(h: &H, integer: H::Int) -> Result<Option<H::Int>, H::Error> {
         let candidate = int::isqrt(h, integer)?;
-        Ok((int::compare(h, int::mul(h, candidate, candidate)?, integer) == Ordering::Equal).then_some(candidate))
+        Ok(if int::compare(h, int::mul(h, candidate, candidate)?, integer) == Ordering::Equal { Some(candidate) } else { None })
     }
     let Some(num) = root(h, rational::numerator(h, value))? else { return Ok(None) };
     let Some(den) = root(h, rational::denominator(h, value)?)? else { return Ok(None) };

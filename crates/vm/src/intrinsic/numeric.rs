@@ -236,7 +236,7 @@ impl Intrinsic {
 /// the quotient is exactly representable as a fixnum; otherwise returns `None`.
 fn fixnum_div<'gc>(dividend: Value<'gc>, divisor: Value<'gc>) -> Option<Value<'gc>> {
     let (dividend, divisor) = (dividend.as_fixnum()?, divisor.as_fixnum()?);
-    (divisor != 0 && dividend % divisor == 0).then(|| dividend / divisor).and_then(Value::fixnum)
+    if divisor != 0 && dividend % divisor == 0 { Value::fixnum(dividend / divisor) } else { None }
 }
 
 /// Folds the arithmetic operation `op` (`+`, `-`, `*` or `/`) over `first` and the elements of

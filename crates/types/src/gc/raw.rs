@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use super::{AnyHostRef, Fields, Gc, Item, Mutation, Object, Phase, Slots, Value, WORDS, field_slot, host_parts, items_start, mask};
+use super::{AnyHostRef, Bits, Fields, Gc, Item, Mutation, Object, Phase, Slots, Value, WORDS, field_slot, host_parts, items_start, mask};
 
 pub trait Raw<'gc>: Copy {
     /// Returns the word that a field declared in `Desc::members` holds for this object: the object's index.
@@ -58,7 +58,7 @@ impl<'gc, T: Object> Raw<'gc> for Gc<'gc, T> {
     #[inline]
     fn word(self, mc: &Mutation<'gc>, field: usize) -> u64 {
         assert!(field < T::DESC.fields as usize, "field {field} of {}", T::DESC.fields);
-        let words = mc.heap.words;
+        let words = mc.heap.words();
         match words.get(1 + field..).and_then(<[_]>::first_chunk::<WORDS>) {
             Some(shifted) => shifted[mask(self.index as usize)].get(),
             None => words[mask(self.index as usize) + 1 + field].get(),
@@ -67,7 +67,7 @@ impl<'gc, T: Object> Raw<'gc> for Gc<'gc, T> {
 
     #[inline]
     fn set_word(self, mc: &Mutation<'gc>, field: usize, word: u64) {
-        mc.heap.words[field_slot(self, field)].set(word);
+        mc.heap.words()[field_slot(self, field)].set(word);
     }
 
     #[inline]
@@ -78,21 +78,21 @@ impl<'gc, T: Object> Raw<'gc> for Gc<'gc, T> {
     #[inline]
     fn set_value(self, mc: &Mutation<'gc>, field: usize, value: Value<'gc>) {
         let slot = field_slot(self, field);
-        mc.heap.words[slot].set(value.word);
+        mc.heap.words()[slot].set(value.word);
         mc.heap.barrier(slot, self.index, value.word);
     }
 
     #[inline]
     fn member<U: Object>(self, mc: &Mutation<'gc>, field: usize) -> Option<Gc<'gc, U>> {
         let index = self.word(mc, field) as u32;
-        (index != 0).then(|| Gc::new(index))
+        if index != 0 { Some(Gc::new(index)) } else { None }
     }
 
     #[inline]
     fn set_member<U: Object>(self, mc: &Mutation<'gc>, field: usize, member: Option<Gc<'gc, U>>) {
         let slot = field_slot(self, field);
         let index = member.map_or(0, |member| member.index);
-        mc.heap.words[slot].set(u64::from(index));
+        mc.heap.words()[slot].set(u64::from(index));
         if index != 0 {
             mc.heap.barrier_ref(slot, self.index, index);
         }
@@ -106,7 +106,7 @@ impl<'gc, T: Object> Raw<'gc> for Gc<'gc, T> {
     #[inline]
     fn set_weak<U: Object>(self, mc: &Mutation<'gc>, field: usize, target: Option<Gc<'gc, U>>) {
         let slot = field_slot(self, field);
-        mc.heap.words[slot].set(u64::from(target.map_or(0, |target| target.index)));
+        mc.heap.words()[slot].set(u64::from(target.map_or(0, |target| target.index)));
         mc.heap.dirty(slot);
     }
 
@@ -117,8 +117,8 @@ impl<'gc, T: Object> Raw<'gc> for Gc<'gc, T> {
     }
 
     fn set_host(self, mc: &Mutation<'gc>, field: usize, host: AnyHostRef<'gc>) {
-        mc.heap.words[field_slot(self, field)].set(host.to_word());
-        if mc.heap.m.phase.get() == Phase::Marking && mc.heap.has_bit(self.index as usize, |page| &page.marks) {
+        mc.heap.words()[field_slot(self, field)].set(host.to_word());
+        if mc.heap.m.phase.get() == Phase::Marking && mc.heap.has_bit(self.index as usize, Bits::Marks) {
             mc.heap.mark_host(host.to_word());
         }
     }
@@ -128,7 +128,7 @@ impl<'gc, T: Object> Raw<'gc> for Gc<'gc, T> {
         const { assert!(N <= T::DESC.fields as usize, "more fields than the type declares") };
         let at = mask(self.index as usize) + 1;
         let heap = mc.heap;
-        let words = heap.words.get(at..)?.first_chunk()?;
+        let words = heap.words().get(at..)?.first_chunk()?;
         Some(Fields { words, at, owner: self.index, _brand: PhantomData })
     }
 
@@ -153,7 +153,7 @@ impl<'gc, T: Object> Raw<'gc> for Gc<'gc, T> {
     fn item_slots<S: Item>(self, mc: &Mutation<'gc>) -> Slots<'gc, S> {
         let at = items_start(self);
         let heap = mc.heap;
-        let words = heap.words.get(at..at + self.len(mc)).unwrap_or(&[]);
-        Slots { words, region: heap.words, at, owner: self.index, _marker: PhantomData }
+        let words = heap.words().get(at..at + self.len(mc)).unwrap_or(&[]);
+        Slots { words, region: heap.words(), at, owner: self.index, _marker: PhantomData }
     }
 }

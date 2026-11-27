@@ -353,7 +353,7 @@ impl<'a> Lexer<'a> {
         if first.is_alphanumeric() {
             self.at = self.name_end(self.at);
         }
-        let folded = (self.fold && self.at - from > first.len_utf8()).then(|| self.text[from..self.at].to_lowercase());
+        let folded = if self.fold && self.at - from > first.len_utf8() { Some(self.text[from..self.at].to_lowercase()) } else { None };
         let name = folded.as_deref().unwrap_or(&self.text[from..self.at]);
         let character = match name {
             _ if name.len() == first.len_utf8() => Some(first),

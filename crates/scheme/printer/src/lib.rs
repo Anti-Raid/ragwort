@@ -196,11 +196,11 @@ fn child<'gc>(mc: &Mutation<'gc>, value: Value<'gc>, i: usize) -> Option<Value<'
         return table.held(mc, i);
     }
     if let Some(syntax) = Syntax::of(value) {
-        return (i == 0).then(|| syntax.datum(mc));
+        return if i == 0 { Some(syntax.datum(mc)) } else { None };
     }
     if let Some(made) = value.downcast::<Struct>(mc) {
         let fields = made.items(mc);
-        return (i < fields.len()).then(|| fields.get(i));
+        return if i < fields.len() { Some(fields.get(i)) } else { None };
     }
     let condition = value.downcast::<Condition>(mc)?;
     [condition.message(mc), condition.irritants(mc)].get(i).copied()

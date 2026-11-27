@@ -254,8 +254,11 @@ const fn region() -> usize {
 
 /// The size of the region in words. It is twice `REGION`, so evacuation has fresh pages to copy into.
 const WORDS: usize = 2 * REGION / 8;
-/// The type of the region's word array. The array has `SLACK` extra words at its end.
+/// The type of the words that hold objects. The array has `SLACK` extra words at its end.
 type RegionWords = [Cell<u64>; WORDS + SLACK];
+/// The type of the whole region: the words that hold objects, and then the records of the pages. Code reaches the two parts through
+/// [`Heap::words`] and [`Heap::records`], which are arrays of their own. So an index that is wrong for one part cannot reach the other.
+type WholeRegion = [Cell<u64>; WORDS + SLACK + RECORDS];
 /// Page, line and card sizes in words.
 const PAGE: usize = 2048;
 const LINE: usize = 16;
@@ -265,6 +268,21 @@ const PAGES: usize = WORDS / PAGE;
 /// bounds check when `field` is a constant.
 const SLACK: usize = 128;
 const LINES: usize = PAGE / LINE;
+/// The number of words in the record of a page. See [`Page`].
+const PAGE_WORDS: usize = 2 * (PAGE / 64) + 6;
+/// The number of words that the records of all the pages take. They are part of the region, so the system commits the record of a page when
+/// it is first written, and an arena pays nothing for the records of the pages that it never uses.
+const RECORDS: usize = PAGES * PAGE_WORDS;
+
+/// One of the two bitmaps of a page. The value is where the bitmap starts in the page's record.
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum Bits {
+    /// A bit for each word of the page where an object starts.
+    Starts = 0,
+    /// A bit for each object of the page that is marked.
+    Marks = PAGE / 64,
+}
 /// The number of registers in a frame. A [`Frame`] or [`Window`] sees this many slots from its start. Every
 /// register limit in the VM and the compiler is derived from it. A register number is a byte and is taken modulo
 /// `WINDOW`, so no access needs a bounds check.
@@ -299,7 +317,7 @@ fn encode(double: f64) -> Option<u64> {
     let top = bits >> 60 & 0b111;
     if top == 0b011 || top == 0b100 {
         let word = bits.rotate_left(3) | FLONUM;
-        return (word.wrapping_sub(ZERO) > LAST_SPECIAL).then_some(word);
+        return if word.wrapping_sub(ZERO) > LAST_SPECIAL { Some(word) } else { None };
     }
     let index = SPECIALS.iter().position(|&special| special == bits)?;
     Some(ZERO + 4 * index as u64)
@@ -637,12 +655,12 @@ impl<'gc> Value<'gc> {
     #[inline]
     pub fn fixnum(number: i64) -> Option<Self> {
         let word = (number as u64) << 1;
-        ((word as i64) >> 1 == number).then_some(Self::from_bits(word))
+        if (word as i64) >> 1 == number { Some(Self::from_bits(word)) } else { None }
     }
 
     #[inline]
     pub fn as_fixnum(self) -> Option<i64> {
-        (self.word & 1 == 0).then_some(self.word as i64 >> 1)
+        if self.word & 1 == 0 { Some(self.word as i64 >> 1) } else { None }
     }
 
     pub const MAX_FIXNUM: i64 = i64::MAX >> 1;
@@ -715,7 +733,7 @@ impl<'gc> Value<'gc> {
     pub fn object<T: Object>(mc: &Mutation<'gc>, gc: Gc<'gc, T>) -> Self {
         let ty = match T::DESC.number {
             Some(ty) => u64::from(ty),
-            None => mc.heap.words[mask(gc.index as usize)].get() & TYPE_BITS,
+            None => mc.heap.words()[mask(gc.index as usize)].get() & TYPE_BITS,
         };
         Self::from_bits(u64::from(gc.index) << 32 | ty << 16 | OBJECT)
     }
@@ -728,20 +746,20 @@ impl<'gc> Value<'gc> {
     /// Returns the object if the value refers to a `T`. Compares the type number stored in the value with `tag`, without reading the object.
     #[inline]
     pub fn downcast_tag<T: Object>(self, tag: TypeTag<'gc, T>) -> Option<Gc<'gc, T>> {
-        (self.word & (TYPE_BITS << 16 | TAG) == u64::from(tag.ty) << 16 | OBJECT).then(|| Gc::new((self.word >> 32) as u32))
+        if self.word & (TYPE_BITS << 16 | TAG) == u64::from(tag.ty) << 16 | OBJECT { Some(Gc::new((self.word >> 32) as u32)) } else { None }
     }
 
     /// Returns the type number and index of the object that the value refers to, or `None` if it refers to no object. For `objects!` kinds.
     #[doc(hidden)]
     #[inline]
     pub fn object_parts(self) -> Option<(u16, u32)> {
-        (self.word & TAG == OBJECT).then_some(((self.word >> 16 & TYPE_BITS) as u16, (self.word >> 32) as u32))
+        if self.word & TAG == OBJECT { Some(((self.word >> 16 & TYPE_BITS) as u16, (self.word >> 32) as u32)) } else { None }
     }
 
     /// Returns the value as an [`Immediate`], or `None` if it refers to an object.
     #[inline]
     pub fn immediate(self) -> Option<Immediate> {
-        (self.word & TAG != OBJECT).then_some(Immediate(self.word))
+        if self.word & TAG != OBJECT { Some(Immediate(self.word)) } else { None }
     }
 }
 
@@ -833,7 +851,7 @@ impl<'gc, T: Object> Gc<'gc, T> {
     }
 
     pub fn len(self, mc: &Mutation<'gc>) -> usize {
-        if T::DESC.items == Items::None { 0 } else { (mc.heap.words[mask(self.index as usize)].get() >> 32) as usize }
+        if T::DESC.items == Items::None { 0 } else { (mc.heap.words()[mask(self.index as usize)].get() >> 32) as usize }
     }
 
     pub fn is_empty(self, mc: &Mutation<'gc>) -> bool {
@@ -1186,7 +1204,7 @@ impl<'gc> AnyHostRef<'gc> {
 
     /// Returns a typed reference if the value is alive and is a `T`.
     pub fn downcast<T: Any>(self, mc: &Mutation<'gc>) -> Option<HostRef<'gc, T>> {
-        self.is::<T>(mc).then_some(self.assume())
+        if self.is::<T>(mc) { Some(self.assume()) } else { None }
     }
 
     /// Returns a typed reference without checking the type. `HostRef::get` checks the type on every read.
@@ -1265,35 +1283,151 @@ impl<T: Default, const C: usize, const N: usize> Chunked<T, C, N> {
     }
 }
 
-#[derive(Default)]
-struct Page {
-    starts: [Cell<u64>; PAGE / 64],
-    marks: [Cell<u64>; PAGE / 64],
-    /// Bit mask of the lines that hold marked objects. It is built while marking.
-    lines: Cell<u128>,
-    /// Bit mask of the lines that the allocator cannot use. A sweep sets it to `lines`, and the allocator adds the lines of each hole it claims.
-    used: Cell<u128>,
-    cards: Cell<u32>,
-    evacuating: Cell<bool>,
-    /// Whether the page has been swept since the last major cycle finished marking.
-    swept: Cell<bool>,
-    /// The first page of a large object, if this page holds part of one. A large object has its own run of pages. Such a page is not
-    /// evacuated, and a dirty card finds the object's header without scanning back to it.
-    large: Cell<Option<u32>>,
-    /// Whether the page's memory has been released to the system. Only a free page is released.
-    released: Cell<bool>,
-    /// Whether the page held any object when it was last swept. `Meta::occupied` counts these pages.
-    counted: Cell<bool>,
+/// Which of the two line masks of a page. The value is where the mask starts in the page's record.
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum Lines {
+    /// The lines that hold marked objects. It is built while marking.
+    Marked = 2 * (PAGE / 64) + 1,
+    /// The lines that the allocator cannot use. A sweep sets it to the marked lines, and the allocator adds the lines of each hole it claims.
+    Used = 2 * (PAGE / 64) + 3,
 }
 
-/// Releases the free pages among `pages` to the system, in runs of adjacent pages. `pages` is in ascending order. The first free pages,
-/// one nursery's worth, are kept. Only a page that the system released completely is refunded. Every other page stays
+/// The record of one page: `PAGE_WORDS` words in the part of the region after the objects.
+///
+/// - Words 0 to 31 are a bitmap with a bit for each word of the page where an object starts.
+/// - Words 32 to 63 are a bitmap with a bit for each marked object.
+/// - Word 64 has a bit for each dirty card.
+/// - Words 65 and 66 are the mask of the lines that hold marked objects. Words 67 and 68 are the mask of the lines in use. See [`Lines`].
+/// - Word 69 holds the flags, and in its upper half the first page of a large object.
+///
+/// A record that was never written is all zero, which is the record of a page that holds nothing. Whether a page's memory has been released
+/// is not in its record. See `Meta::released`.
+#[derive(Clone, Copy)]
+struct Page<'a>(&'a [Cell<u64>; PAGE_WORDS]);
+
+/// The flags in the last word of a page's record.
+const EVACUATING: u64 = 1;
+/// Whether the page has been swept since the last major cycle finished marking.
+const SWEPT: u64 = 2;
+/// Whether the page held any object when it was last swept. `Meta::occupied` counts these pages.
+const COUNTED: u64 = 4;
+/// Whether the page holds part of a large object. The upper half of the word is then the object's first page.
+const LARGE: u64 = 8;
+
+impl<'a> Page<'a> {
+    #[inline]
+    fn bitmap(self, bits: Bits) -> &'a [Cell<u64>; PAGE / 64] {
+        self.0[bits as usize..].first_chunk().expect("a bitmap is PAGE / 64 words")
+    }
+
+    #[inline]
+    fn cards(self) -> &'a Cell<u64> {
+        &self.0[2 * (PAGE / 64)]
+    }
+
+    #[inline]
+    fn line_mask(self, lines: Lines) -> LineMask<'a> {
+        LineMask(self.0[lines as usize..].first_chunk().expect("a line mask is two words"))
+    }
+
+    #[inline]
+    fn lines(self) -> LineMask<'a> {
+        self.line_mask(Lines::Marked)
+    }
+
+    #[inline]
+    fn used(self) -> LineMask<'a> {
+        self.line_mask(Lines::Used)
+    }
+
+    #[inline]
+    fn flag(self, bit: u64) -> Flag<'a> {
+        Flag { word: &self.0[PAGE_WORDS - 1], bit }
+    }
+
+    fn evacuating(self) -> Flag<'a> {
+        self.flag(EVACUATING)
+    }
+
+    fn swept(self) -> Flag<'a> {
+        self.flag(SWEPT)
+    }
+
+    fn counted(self) -> Flag<'a> {
+        self.flag(COUNTED)
+    }
+
+    /// Returns the first page of a large object, if this page holds part of one. A large object has its own run of pages. Such a page is not
+    /// evacuated, and a dirty card finds the object's header without scanning back to it.
+    #[inline]
+    fn large(self) -> Option<u32> {
+        let word = self.0[PAGE_WORDS - 1].get();
+        if word & LARGE != 0 { Some((word >> 32) as u32) } else { None }
+    }
+
+    fn set_large(self, first: Option<u32>) {
+        let state = &self.0[PAGE_WORDS - 1];
+        let flags = state.get() & 0xFFFF_FFFF & !LARGE;
+        match first {
+            Some(first) => state.set(u64::from(first) << 32 | flags | LARGE),
+            None => state.set(flags),
+        }
+    }
+}
+
+/// A mask with a bit for each line of a page, in two words of the page's record.
+#[derive(Clone, Copy)]
+struct LineMask<'a>(&'a [Cell<u64>; 2]);
+
+impl LineMask<'_> {
+    #[inline]
+    fn get(self) -> u128 {
+        u128::from(self.0[0].get()) | u128::from(self.0[1].get()) << 64
+    }
+
+    #[inline]
+    fn set(self, lines: u128) {
+        self.0[0].set(lines as u64);
+        self.0[1].set((lines >> 64) as u64);
+    }
+}
+
+/// One flag of a page's record.
+#[derive(Clone, Copy)]
+struct Flag<'a> {
+    word: &'a Cell<u64>,
+    bit: u64,
+}
+
+impl Flag<'_> {
+    #[inline]
+    fn get(self) -> bool {
+        self.word.get() & self.bit != 0
+    }
+
+    #[inline]
+    fn set(self, on: bool) {
+        let word = self.word.get();
+        self.word.set(if on { word | self.bit } else { word & !self.bit });
+    }
+
+    /// Sets the flag and returns what it was.
+    fn replace(self, on: bool) -> bool {
+        let before = self.get();
+        self.set(on);
+        before
+    }
+}
+
+/// Releases the free pages among `pages` to the system, in runs of adjacent pages. `pages` is in ascending order. The first `warm` free pages
+/// are kept. Only a page that the system released completely is refunded. Every other page stays
 /// committed.
-fn give_back(memory: &mut Region, meta: &Meta, pages: impl Iterator<Item = usize>) {
-    let mut warm = meta.nursery / (PAGE * 8);
+fn give_back(memory: &mut Region, meta: &Meta, pages: impl Iterator<Item = usize>, mut warm: usize) {
     let mut run: Option<Range<usize>> = None;
     for index in pages.map(Some).chain([None]) {
-        let free = index.and_then(|index| meta.pages[..meta.used.get()].get(index)).is_some_and(|page| page.used.get() == 0 && !page.released.get());
+        let handed = index.filter(|&index| index < meta.used.get() && !meta.released.contains(index));
+        let free = handed.is_some_and(|index| view(memory, meta).page(index).used().get() == 0);
         let release = if free && warm > 0 {
             warm -= 1;
             false
@@ -1310,8 +1444,8 @@ fn give_back(memory: &mut Region, meta: &Meta, pages: impl Iterator<Item = usize
         if let Some(range) = run.take() {
             let words = memory.release(range.start * PAGE..range.end * PAGE);
             let gone = words.start.div_ceil(PAGE).max(range.start)..(words.end / PAGE).min(range.end);
-            for page in meta.pages.get(gone).unwrap_or_default() {
-                page.released.set(true);
+            for page in gone {
+                meta.released.insert(page);
                 meta.budget.refund(PAGE_COST);
                 meta.committed.set(meta.committed.get() - 1);
             }
@@ -1337,6 +1471,17 @@ impl PageSet {
         }
     }
 
+    fn remove(&self, page: usize) {
+        if let Some(word) = self.0.get(page / 64) {
+            word.set(word.get() & !(1 << (page % 64)));
+        }
+    }
+
+    #[inline]
+    fn contains(&self, page: usize) -> bool {
+        self.0.get(page / 64).is_some_and(|word| word.get() & 1 << (page % 64) != 0)
+    }
+
     fn insert_all(&self, pages: Range<usize>) {
         pages.for_each(|page| self.insert(page));
     }
@@ -1346,7 +1491,10 @@ impl PageSet {
         self.0.iter().enumerate().flat_map(move |(i, word)| {
             let mut bits = if take { word.replace(0) } else { word.get() };
             std::iter::from_fn(move || {
-                let bit = (bits != 0).then(|| bits.trailing_zeros() as usize)?;
+                if bits == 0 {
+                    return None;
+                }
+                let bit = bits.trailing_zeros() as usize;
                 bits &= bits - 1;
                 Some(i * 64 + bit)
             })
@@ -1383,7 +1531,10 @@ struct Work {
 
 /// The arena's state, apart from the words of the region.
 struct Meta {
-    pages: Box<[Page]>,
+    /// The number of pages that the arena can hand out: enough for twice its limit.
+    page_count: usize,
+    /// The pages whose memory has been released to the system. Only a free page is released.
+    released: PageSet,
     /// The number of pages handed out, counted from the start of the region. The pages among them that are not released are charged.
     used: Cell<usize>,
     budget: Budget,
@@ -1414,7 +1565,12 @@ struct Meta {
     sweep_cursor: Cell<usize>,
     /// Whether a major cycle has swept every page since free pages were last released.
     settle: Cell<bool>,
-    nursery: usize,
+    /// The size of the nursery in bytes. See [`Meta::size_nursery`].
+    nursery: Cell<usize>,
+    /// The largest size that the nursery takes by itself.
+    nursery_cap: usize,
+    /// Whether [`Arena::set_nursery`] has fixed the size of the nursery.
+    nursery_fixed: Cell<bool>,
     /// A major cycle starts once `paced_bytes` reaches this many bytes.
     threshold: Cell<usize>,
     phase: Cell<Phase>,
@@ -1468,7 +1624,7 @@ struct Meta {
 
 #[derive(Clone, Copy)]
 struct Heap<'a> {
-    words: &'a [Cell<u64>; WORDS + SLACK],
+    whole: &'a WholeRegion,
     m: &'a Meta,
 }
 
@@ -1480,12 +1636,27 @@ fn mask(index: usize) -> usize {
 }
 
 const MIN_THRESHOLD: usize = 64 << 10;
+/// The smallest size that the nursery takes by itself, in an arena whose limit allows this much.
+const MIN_NURSERY: usize = 256 << 10;
 
 impl Meta {
     /// Returns the heap size that pacing uses: the bytes of the occupied pages, plus the bytes charged for live host values and for old
     /// frozen values. Host values and old frozen values count because only a major collection frees them.
     fn paced_bytes(&self) -> usize {
         self.occupied.get() * PAGE * 8 + self.host_bytes.get() + self.frozen.live()
+    }
+
+    /// Sets the size of the nursery after a collection, unless [`Arena::set_nursery`] has fixed it. The nursery is as large as the heap that
+    /// the collection left, between `MIN_NURSERY` and an eighth of the limit, and at most 4 MiB.
+    ///
+    /// So the memory that an arena holds follows what the program keeps alive, and not the arena's limit. A program that keeps little
+    /// has a small nursery. A minor collection scans the dirty cards of the old objects, so a program that keeps much and changes it
+    /// often needs minor collections to be rare, and its larger heap gives it a larger nursery.
+    fn size_nursery(&self) {
+        if !self.nursery_fixed.get() {
+            let floor = MIN_NURSERY.min(self.nursery_cap);
+            self.nursery.set(self.paced_bytes().next_multiple_of(PAGE * 8).clamp(floor, self.nursery_cap));
+        }
     }
 
     /// Returns an estimate of the work, in bytes, for a major cycle that starts now. The estimate is a quarter more than the work of the last cycle.
@@ -1503,6 +1674,12 @@ impl Meta {
     fn room(&self) -> usize {
         let pages = (self.committed.get() - self.occupied.get().min(self.committed.get())) * PAGE_COST;
         self.budget.room_past(self.budget.used().saturating_sub(pages) + self.young.get())
+    }
+
+    /// Lowers the count of pages handed out, so that it ends at the last page still committed. The pages after it are handed out again as fresh pages.
+    fn drop_released_end(&self) {
+        let used = self.used.get();
+        self.used.set((1..used).rev().find(|&page| !self.released.contains(page)).map_or(1, |page| page + 1));
     }
 
     /// Returns whether a major cycle must start now to finish before the room runs out, when it is paced at up to `MAX_PACE`.
@@ -1532,7 +1709,7 @@ impl Meta {
         if self.phase.get() != Phase::Idle {
             return (MIN_SLICE - self.debt.get().min(MIN_SLICE)).div_ceil(self.pace.get().max(1));
         }
-        let nursery = self.nursery.saturating_sub(self.young_bytes());
+        let nursery = self.nursery.get().saturating_sub(self.young_bytes());
         let threshold = self.threshold.get().saturating_sub(self.paced_bytes());
         let room = self.room().saturating_sub(self.cycle_work() / MAX_PACE + MIN_SLICE);
         nursery.min(threshold).min(room)
@@ -1546,7 +1723,7 @@ fn shrink<T>(table: &mut Vec<T>) {
     }
 }
 /// The bytes charged for a committed page: its words and its `Page` record.
-const PAGE_COST: usize = PAGE * 8 + size_of::<Page>();
+const PAGE_COST: usize = (PAGE + PAGE_WORDS) * 8;
 /// Sweeping one page counts as this many bytes of slice work.
 const SWEEP_COST: usize = PAGE;
 const MIN_SLICE: usize = 64 << 10;
@@ -1555,14 +1732,20 @@ const MAX_PACE: usize = 16;
 /// The most dead host values, and the most dead frozen values, that are freed after one step.
 const FREE_BATCH: usize = 1024;
 
+/// Returns the collector's view of an arena's parts.
+fn view<'a>(memory: &'a mut Region, meta: &'a Meta) -> Heap<'a> {
+    let whole = memory.words().first_chunk().expect("the region is WORDS + SLACK + RECORDS long");
+    Heap { whole, m: meta }
+}
+
 pub struct Arena {
     memory: Region,
     meta: Meta,
 }
 
 impl Arena {
-    /// Creates an arena with a limit of `limit` bytes and `roots` value roots. The page table is allocated up
-    /// front for twice the limit and is not charged. The roots are charged. Objects in the region take at
+    /// Creates an arena with a limit of `limit` bytes and `roots` value roots. The page table covers twice the limit. The record of a page
+    /// is allocated when the page is first handed out. The roots are charged. Objects in the region take at
     /// most [`REGION`] bytes, whatever the limit is. Frozen and host values can use the rest of the limit.
     ///
     /// # Panics
@@ -1575,14 +1758,15 @@ impl Arena {
 
     /// Like [`Arena::new`], but returns `OutOfMemory` if the system cannot reserve the region's address space.
     pub fn try_new(limit: usize, roots: usize) -> Result<Self, OutOfMemory> {
-        let memory = Region::new(WORDS + SLACK).ok_or(OutOfMemory)?;
+        let memory = Region::new(WORDS + SLACK + RECORDS).ok_or(OutOfMemory)?;
         // Page 0 holds no object, so index 0 can mean no object. The page table covers twice the limit, so evacuation has room
         // to copy every object.
         let pages = (limit / (PAGE * 8)).clamp(1, PAGES / 2 - 1);
         let count = 2 * pages + 2;
         let id = NEXT_ARENA.fetch_add(1, Ordering::Relaxed);
         let meta = Meta {
-            pages: (0..count).map(|_| Page::default()).collect(),
+            page_count: count,
+            released: PageSet::new(count),
             used: Cell::new(1),
             budget: Budget::new(limit),
             cursor: Cell::new(0),
@@ -1599,7 +1783,9 @@ impl Arena {
             committed: Cell::new(0),
             sweep_cursor: Cell::new(0),
             settle: Cell::new(false),
-            nursery: (limit / 8).clamp(64 << 10, 4 << 20),
+            nursery: Cell::new(MIN_NURSERY.min((limit / 8).clamp(64 << 10, 4 << 20))),
+            nursery_cap: (limit / 8).clamp(64 << 10, 4 << 20),
+            nursery_fixed: Cell::new(false),
             threshold: Cell::new(MIN_THRESHOLD.min(pages * PAGE * 8 / 2)),
             phase: Cell::new(Phase::Idle),
             evacuating: Cell::new(false),
@@ -1640,8 +1826,7 @@ impl Arena {
     }
 
     fn heap(&mut self) -> Heap<'_> {
-        let words = self.memory.words().first_chunk().expect("the region is WORDS + SLACK long");
-        Heap { words, m: &self.meta }
+        view(&mut self.memory, &self.meta)
     }
 
     /// Runs at the end of every collection entry point. Releases free pages to the system, and drops dead host values, so that
@@ -1693,16 +1878,34 @@ impl Arena {
             return;
         }
         let emptied = std::mem::take(&mut *meta.emptied.borrow_mut());
+        // One nursery's worth of free pages is kept.
+        let warm = meta.nursery.get() / (PAGE * 8);
         if meta.settle.replace(false) {
-            give_back(memory, meta, 1..meta.used.get());
+            give_back(memory, meta, 1..meta.used.get(), warm);
         } else if !emptied.is_empty() {
-            give_back(memory, meta, emptied.into_iter().map(|page| page as usize));
+            give_back(memory, meta, emptied.into_iter().map(|page| page as usize), warm);
         } else {
             return;
         }
-        // The pages after the last committed page are handed out again as fresh pages.
-        let used = meta.used.get();
-        meta.used.set((1..used).rev().find(|&page| !meta.pages[page].released.get()).map_or(1, |page| page + 1));
+        meta.drop_released_end();
+    }
+
+    /// Returns the memory that the arena holds and does not need to the system. Call it when the program has nothing to do for a while, for
+    /// example between two events.
+    ///
+    /// A collection keeps some free pages, because a running program fills them again at once. This releases them too. It first collects the young
+    /// objects, so that their pages are free. The next allocations take fresh pages from the system, which costs a little time.
+    ///
+    /// While a major cycle is running, this does nothing. Call [`Arena::collect`] first to release everything that can be released.
+    pub fn trim(&mut self) {
+        if self.meta.phase.get() != Phase::Idle {
+            return;
+        }
+        self.heap().minor();
+        self.finish(usize::MAX);
+        let Self { memory, meta } = self;
+        give_back(memory, meta, 1..meta.used.get(), 0);
+        meta.drop_released_end();
     }
 
     pub fn mutate<R>(&mut self, body: impl for<'gc> FnOnce(&Mutation<'gc>) -> R) -> R {
@@ -1744,7 +1947,7 @@ impl Arena {
             return Ok(result);
         }
         let meta = &self.meta;
-        if meta.phase.get() == Phase::Idle && meta.young_bytes() >= meta.nursery {
+        if meta.phase.get() == Phase::Idle && meta.young_bytes() >= meta.nursery.get() {
             self.heap().minor();
         }
         let meta = &self.meta;
@@ -1810,8 +2013,8 @@ impl Arena {
     /// Returns the bytes of the pages handed out and not released. This is about the memory that the arena holds.
     pub fn committed_bytes(&self) -> usize {
         let meta = &self.meta;
-        let pages = &meta.pages[1..meta.used.get()];
-        (pages.len() - pages.iter().filter(|page| page.released.get()).count()) * PAGE * 8
+        let used = meta.used.get();
+        (used - 1 - (1..used).filter(|&page| meta.released.contains(page)).count()) * PAGE * 8
     }
 
     /// Returns the bytes of the pages that held an object when they were last swept.
@@ -1820,9 +2023,15 @@ impl Arena {
     }
 
     /// Returns the number of marked objects. After [`Arena::collect`], these are the live objects.
-    pub fn objects(&self) -> usize {
-        let pages = &self.meta.pages[..self.meta.used.get()];
-        pages.iter().flat_map(|page| page.starts.iter().zip(&page.marks)).map(|(start, mark)| (start.get() & mark.get()).count_ones() as usize).sum()
+    pub fn objects(&mut self) -> usize {
+        let heap = self.heap();
+        let mut count = 0;
+        for page in 0..heap.m.used.get() {
+            for (start, mark) in heap.bitmap(page, Bits::Starts).iter().zip(heap.bitmap(page, Bits::Marks)) {
+                count += (start.get() & mark.get()).count_ones() as usize;
+            }
+        }
+        count
     }
 
     pub fn hosts(&self) -> usize {
@@ -1858,6 +2067,27 @@ impl Arena {
 
     pub fn limit(&self) -> usize {
         self.meta.budget.limit()
+    }
+
+    /// Returns the size of the nursery in bytes. See [`Arena::set_nursery`].
+    pub fn nursery(&self) -> usize {
+        self.meta.nursery.get()
+    }
+
+    /// Fixes the size of the nursery at `bytes`, rounded up to whole pages. `None` lets the arena choose the size again, which is the default.
+    ///
+    /// A minor collection runs once the objects allocated since the last collection take as much as the nursery. A collection keeps as many
+    /// bytes of free pages for the next objects. So a smaller nursery keeps less memory and collects more often.
+    ///
+    /// By itself, an arena makes the nursery as large as the heap that the last collection left, between 256 KiB and an eighth of the
+    /// limit, and at most 4 MiB.
+    pub fn set_nursery(&mut self, bytes: Option<usize>) {
+        let meta = &self.meta;
+        meta.nursery_fixed.set(bytes.is_some());
+        match bytes {
+            Some(bytes) => meta.nursery.set(bytes.next_multiple_of(PAGE * 8).max(PAGE * 8)),
+            None => meta.size_nursery(),
+        }
     }
 
     /// Sets the reserve to `bytes`. The reserve is the last part of the limit. It lets a step finish once the rest is used.
@@ -2067,6 +2297,18 @@ fn cache_slot(type_id: TypeId) -> usize {
 }
 
 impl<'a> Heap<'a> {
+    /// Returns the words that hold objects.
+    #[inline(always)]
+    fn words(self) -> &'a RegionWords {
+        self.whole.first_chunk().expect("the region starts with the words of the objects")
+    }
+
+    /// Returns the words that hold the records of the pages. See [`Page`].
+    #[inline(always)]
+    fn records(self) -> &'a [Cell<u64>; RECORDS] {
+        self.whole.last_chunk().expect("the region ends with the records of the pages")
+    }
+
     #[inline]
     fn type_index(self, desc: &'static Desc) -> Option<u16> {
         // A type with a fixed number is registered at that number in `descs`. A type without one is looked up in the cache.
@@ -2124,7 +2366,7 @@ impl<'a> Heap<'a> {
         }
         let size = 1 + desc.fields as usize + len;
         let at = self.reserve(size)?;
-        let object = &self.words[at..at + size];
+        let object = &self.words()[at..at + size];
         object[0].set(u64::from(ty) | (len as u64) << 32);
         let (head, items) = object[1..].split_at(desc.fields as usize);
         for (slot, &word) in head.iter().zip(fields.iter().chain(std::iter::repeat(&0))) {
@@ -2148,7 +2390,7 @@ impl<'a> Heap<'a> {
         let ty = self.type_index(desc).ok_or_else(|| self.m.budget.fail())?;
         let size = 1 + desc.fields as usize + len;
         let at = self.reserve(size)?;
-        let object = &self.words[at..at + size];
+        let object = &self.words()[at..at + size];
         object[0].set(u64::from(ty) | (len as u64) << 32);
         let (head, items) = object[1..].split_at(desc.fields as usize);
         for (slot, &word) in head.iter().zip(fields.iter().chain(std::iter::repeat(&0))) {
@@ -2171,7 +2413,7 @@ impl<'a> Heap<'a> {
         let ty = self.type_index(desc).ok_or_else(|| self.m.budget.fail())?;
         let size = 1 + desc.fields as usize;
         let at = self.reserve(size)?;
-        let object = &self.words[at..at + size];
+        let object = &self.words()[at..at + size];
         object[0].set(u64::from(ty));
         for (slot, &word) in object[1..].iter().zip(fields.iter().chain(std::iter::repeat(&0))) {
             slot.set(word);
@@ -2199,7 +2441,7 @@ impl<'a> Heap<'a> {
         } else {
             self.reserve_slow(size)?
         };
-        self.set_bit(at, |page| &page.starts);
+        self.set_bit(at, Bits::Starts);
         Ok(at)
     }
 
@@ -2221,8 +2463,8 @@ impl<'a> Heap<'a> {
                 Some(first) => first,
                 None => self.fresh_pages(count)?,
             };
-            self.cover_lines(first * PAGE, size, |page| &page.used);
-            self.m.pages[first..first + count].iter().for_each(|page| page.large.set(Some(first as u32)));
+            self.cover_lines(first * PAGE, size, Lines::Used);
+            self.pages(first..first + count).for_each(|page| page.set_large(Some(first as u32)));
             return Ok(first * PAGE);
         }
         loop {
@@ -2230,7 +2472,7 @@ impl<'a> Heap<'a> {
                 Some(hole) => hole,
                 None => {
                     let page = self.fresh_pages(1)?;
-                    meta.pages[page].used.set(u128::MAX);
+                    self.page(page).used().set(u128::MAX);
                     meta.scan.set((page + 1) * LINES);
                     (page * PAGE, (page + 1) * PAGE)
                 }
@@ -2250,11 +2492,11 @@ impl<'a> Heap<'a> {
         while scan < self.m.used.get() * LINES {
             let (page, line) = (scan / LINES, scan % LINES);
             self.sweep_before_use(page);
-            let entry = &self.m.pages[page];
-            let used = entry.used.get();
+            let entry = self.page(page);
+            let used = entry.used().get();
             let free = !used & (u128::MAX << line);
             // Filling pages chosen for evacuation would undo the compaction.
-            if free == 0 || entry.evacuating.get() {
+            if free == 0 || entry.evacuating().get() {
                 scan = (page + 1) * LINES;
                 continue;
             }
@@ -2264,7 +2506,7 @@ impl<'a> Heap<'a> {
             // The last mask has bits `start..end` set, which marks the hole's lines as used. `end` is above `start`, so the shift by `LINES - end` is at most 127.
             let start = free.trailing_zeros() as usize;
             let end = (used & (u128::MAX << start)).trailing_zeros() as usize;
-            entry.used.set(used | (u128::MAX >> (LINES - end)) & (u128::MAX << start));
+            entry.used().set(used | (u128::MAX >> (LINES - end)) & (u128::MAX << start));
             self.m.scan.set(page * LINES + end);
             return Ok(Some((page * PAGE + start * LINE, page * PAGE + end * LINE)));
         }
@@ -2274,12 +2516,11 @@ impl<'a> Heap<'a> {
 
     /// Charges the budget again for the pages in `pages` that were released to the system, before they are reused.
     fn recommit(self, pages: Range<usize>) -> Result<(), OutOfMemory> {
-        let pages = &self.m.pages[pages];
-        let released = pages.iter().filter(|page| page.released.get()).count();
+        let released = pages.clone().filter(|&page| self.m.released.contains(page)).count();
         if released > 0 {
             self.m.budget.charge(released * PAGE_COST)?;
             self.m.committed.set(self.m.committed.get() + released);
-            pages.iter().for_each(|page| page.released.set(false));
+            pages.for_each(|page| self.m.released.remove(page));
         }
         Ok(())
     }
@@ -2290,8 +2531,8 @@ impl<'a> Heap<'a> {
         let mut run = 0;
         for index in 1..self.m.used.get() {
             self.sweep_before_use(index);
-            let page = &self.m.pages[index];
-            let free = page.used.get() == 0 && !(evacuation && page.evacuating.get());
+            let page = self.page(index);
+            let free = page.used().get() == 0 && !(evacuation && page.evacuating().get());
             run = if free { run + 1 } else { 0 };
             if run == count {
                 let first = index + 1 - count;
@@ -2305,7 +2546,7 @@ impl<'a> Heap<'a> {
 
     fn fresh_pages(self, count: usize) -> Result<usize, OutOfMemory> {
         let first = self.m.used.get();
-        if first + count > self.m.pages.len() {
+        if first + count > self.m.page_count {
             return Err(self.m.budget.fail());
         }
         self.m.budget.charge(count * PAGE_COST)?;
@@ -2313,9 +2554,9 @@ impl<'a> Heap<'a> {
         self.m.used.set(first + count);
         self.m.young_pages.insert_all(first..first + count);
         // A fresh page holds no object from before the cycle, so the lazy sweep has nothing to do on it.
-        for page in &self.m.pages[first..first + count] {
-            page.swept.set(true);
-            page.released.set(false);
+        for page in first..first + count {
+            self.page(page).swept().set(true);
+            self.m.released.remove(page);
         }
         Ok(first)
     }
@@ -2323,7 +2564,7 @@ impl<'a> Heap<'a> {
     /// Sweeps `page` if the lazy sweep has not reached it yet. The allocator calls this before it reads the page's lines, so it never sees stale lines.
     #[inline]
     fn sweep_before_use(self, page: usize) {
-        if self.m.phase.get() == Phase::Sweeping && !self.m.pages[page].swept.get() {
+        if self.m.phase.get() == Phase::Sweeping && !self.page(page).swept().get() {
             self.sweep_page(page);
         }
     }
@@ -2337,37 +2578,90 @@ impl<'a> Heap<'a> {
         self.m.young.set(0);
     }
 
+    /// Returns the record of page `index`, or `None` if the region has no such page.
     #[inline]
-    fn set_bit(self, index: usize, bits: impl FnOnce(&Page) -> &[Cell<u64>; PAGE / 64]) {
-        let word = &bits(&self.m.pages[index / PAGE])[index % PAGE / 64];
+    fn page_at(self, index: usize) -> Option<Page<'a>> {
+        if index >= PAGES {
+            return None;
+        }
+        Some(Page(self.records()[index * PAGE_WORDS..].first_chunk().expect("a record is PAGE_WORDS words")))
+    }
+
+    #[inline]
+    fn page(self, index: usize) -> Page<'a> {
+        self.page_at(index).expect("a page of the region")
+    }
+
+    /// Returns the records of the pages in `range`.
+    fn pages(self, range: Range<usize>) -> impl Iterator<Item = Page<'a>> + Clone {
+        range.map(move |index| self.page(index))
+    }
+
+    /// Returns one of the bitmaps of page `page`.
+    #[inline]
+    fn bitmap(self, page: usize, bits: Bits) -> &'a [Cell<u64>; PAGE / 64] {
+        self.page(page).bitmap(bits)
+    }
+
+    /// Returns the bitmap word that holds the bit of the word at `index`, or `None` if `index` is past the words that hold objects.
+    #[inline]
+    fn bit_word(self, index: usize, bits: Bits) -> Option<&'a Cell<u64>> {
+        if index >= WORDS {
+            return None;
+        }
+        Some(&self.records()[index / PAGE * PAGE_WORDS + bits as usize + index % PAGE / 64])
+    }
+
+    /// Returns the word that holds the dirty cards of page `page`, one bit for each card, or `None` if the region has no such page.
+    #[inline]
+    fn cards(self, page: usize) -> Option<&'a Cell<u64>> {
+        self.page_at(page).map(Page::cards)
+    }
+
+    #[inline]
+    fn set_bit(self, index: usize, bits: Bits) {
+        let word = self.bit_word(index, bits).expect("an index in the region");
         word.set(word.get() | 1 << (index % 64));
     }
 
-    fn has_bit(self, index: usize, bits: impl FnOnce(&Page) -> &[Cell<u64>; PAGE / 64]) -> bool {
-        self.m.pages.get(index / PAGE).is_some_and(|page| bits(page)[index % PAGE / 64].get() & 1 << (index % 64) != 0)
+    #[inline]
+    fn clear_bit(self, index: usize, bits: Bits) {
+        let word = self.bit_word(index, bits).expect("an index in the region");
+        word.set(word.get() & !(1 << (index % 64)));
+    }
+
+    #[inline]
+    fn has_bit(self, index: usize, bits: Bits) -> bool {
+        self.bit_word(index, bits).is_some_and(|word| word.get() & 1 << (index % 64) != 0)
     }
 
     /// Sets the bits of the lines that the `size` words at `start` cover. `lines` selects one of a page's line maps, `Page::lines` or `Page::used`.
-    fn cover_lines(self, start: usize, size: usize, lines: impl Fn(&Page) -> &Cell<u128>) {
+    fn cover_lines(self, start: usize, size: usize, lines: Lines) {
         let (mut at, end) = (start, start + size);
         while at < end {
-            let Some(page) = self.m.pages.get(at / PAGE) else { return };
+            let Some(page) = self.page_at(at / PAGE) else { return };
             let to = end.min((at / PAGE + 1) * PAGE);
             let (first, last) = (at % PAGE / LINE, (to - 1) % PAGE / LINE);
-            let lines = lines(page);
-            lines.set(lines.get() | (u128::MAX >> (127 - last)) & (u128::MAX << first));
+            let mask = page.line_mask(lines);
+            mask.set(mask.get() | (u128::MAX >> (127 - last)) & (u128::MAX << first));
             at = to;
+        }
+    }
+
+    fn clear_cards(self, page: usize) {
+        if let Some(cards) = self.cards(page) {
+            cards.set(0);
         }
     }
 
     #[inline]
     fn dirty(self, slot: usize) {
-        if let Some(page) = self.m.pages.get(slot / PAGE) {
-            let cards = page.cards.get();
+        if let Some(word) = self.cards(slot / PAGE) {
+            let cards = word.get();
             if cards == 0 {
                 self.m.dirty_pages.insert(slot / PAGE);
             }
-            page.cards.set(cards | 1 << (slot % PAGE / CARD));
+            word.set(cards | 1 << (slot % PAGE / CARD));
         }
     }
 
@@ -2381,16 +2675,16 @@ impl<'a> Heap<'a> {
 
     #[inline]
     fn ephemeron_at(self, slot: usize) -> Option<(Value<'a>, Value<'a>)> {
-        let key = Value::from_bits(self.words[slot].get());
-        (key != Value::BROKEN).then(|| (key, Value::from_bits(self.words[slot + 1].get())))
+        let key = Value::from_bits(self.words()[slot].get());
+        if key != Value::BROKEN { Some((key, Value::from_bits(self.words()[slot + 1].get()))) } else { None }
     }
 
     /// Stores an ephemeron's `key` and `value` at `slot`. Neither is shaded while marking, because the value is traced once the key is found live.
     /// Both cards are marked dirty, so a minor collection sees both words.
     #[inline]
     fn set_ephemeron_at(self, slot: usize, key: Value<'_>, value: Value<'_>) {
-        self.words[slot].set(key.word);
-        self.words[slot + 1].set(value.word);
+        self.words()[slot].set(key.word);
+        self.words()[slot + 1].set(value.word);
         self.dirty(slot);
         self.dirty(slot + 1);
     }
@@ -2406,10 +2700,10 @@ impl<'a> Heap<'a> {
     fn barrier_ref(self, slot: usize, owner: u32, target: u32) {
         // A minor collection traces only marked objects from their dirty cards. An unmarked owner is young,
         // and is traced anyway if it is reachable.
-        if self.has_bit(owner as usize, |page| &page.marks) {
+        if self.has_bit(owner as usize, Bits::Marks) {
             self.dirty(slot);
             if self.m.phase.get() == Phase::Marking {
-                shade(self.words, self.m, slot, owner, target);
+                shade(self.whole, self.m, slot, owner, target);
             }
         }
     }
@@ -2417,7 +2711,7 @@ impl<'a> Heap<'a> {
     /// Handles a store of `target` into `slot` of `owner` while marking. If `owner` is marked, marks `target`. If `target` is on a page being
     /// evacuated, also records the slot as a fixup.
     fn shade(self, slot: usize, owner: u32, target: u32) {
-        if self.has_bit(owner as usize, |page| &page.marks) {
+        if self.has_bit(owner as usize, Bits::Marks) {
             self.shade_marked(slot, owner, target);
         }
     }
@@ -2439,10 +2733,10 @@ impl<'a> Heap<'a> {
         }
         let (mut i, end) = (at, at + slots.len());
         while i < end {
-            let Some(page) = self.m.pages.get(i / PAGE) else { return };
+            let Some(cards) = self.cards(i / PAGE) else { return };
             let to = end.min((i / PAGE + 1) * PAGE);
             let (first, last) = (i % PAGE / CARD, (to - 1) % PAGE / CARD);
-            page.cards.set(page.cards.get() | ((u64::MAX >> (63 - last)) & (u64::MAX << first)) as u32);
+            cards.set(cards.get() | (u64::MAX >> (63 - last)) & (u64::MAX << first));
             self.m.dirty_pages.insert(i / PAGE);
             i = to;
         }
@@ -2456,7 +2750,7 @@ impl<'a> Heap<'a> {
     }
 
     fn in_evacuation(self, index: u32) -> bool {
-        self.m.pages.get(index as usize / PAGE).is_some_and(|page| page.evacuating.get())
+        self.page_at(index as usize / PAGE).is_some_and(|page| page.evacuating().get())
     }
 
     // Collection.
@@ -2477,6 +2771,7 @@ impl<'a> Heap<'a> {
         work.weak_runs.clear();
         work.ephemerons.clear();
         self.sweep_young();
+        self.m.size_nursery();
         self.m.minors.set(self.m.minors.get() + 1);
         *self.m.work.borrow_mut() = work;
     }
@@ -2489,27 +2784,27 @@ impl<'a> Heap<'a> {
         }
         // A page is a candidate for evacuation if at most a quarter of it is in use. Candidates are taken while half of the free room can hold their objects.
         // Pages of large objects are never evacuated.
-        let pages = &meta.pages[..meta.used.get()];
+        let pages = self.pages(0..meta.used.get());
         let all = meta.evacuate_all.get();
-        let occupied: usize = pages.iter().map(|page| page.used.get().count_ones() as usize * LINE).sum();
+        let occupied: usize = pages.clone().map(|page| page.used().get().count_ones() as usize * LINE).sum();
         let mut room = (meta.budget.limit() / 8).saturating_sub(occupied) / 2;
         let mut count = 0;
-        for page in pages {
-            page.marks.iter().for_each(|word| word.set(0));
-            page.lines.set(0);
-            page.cards.set(0);
-            let used = page.used.get().count_ones() as usize * LINE;
-            let candidate = page.large.get().is_none() && used > 0 && (all || (used <= PAGE / 4 && used <= room));
+        for (index, page) in pages.clone().enumerate() {
+            self.bitmap(index, Bits::Marks).iter().for_each(|word| word.set(0));
+            page.lines().set(0);
+            self.clear_cards(index);
+            let used = page.used().get().count_ones() as usize * LINE;
+            let candidate = page.large().is_none() && used > 0 && (all || (used <= PAGE / 4 && used <= room));
             if candidate {
                 room = room.saturating_sub(used);
                 count += 1;
             }
-            page.evacuating.set(candidate);
+            page.evacuating().set(candidate);
         }
         meta.dirty_pages.clear();
         let evacuating = count > 1 || all && count > 0;
         if !evacuating {
-            pages.iter().for_each(|page| page.evacuating.set(false));
+            pages.for_each(|page| page.evacuating().set(false));
         }
         meta.hosts.borrow_mut().iter_mut().for_each(|host| host.marked = false);
         meta.frozen.clear_marks();
@@ -2545,7 +2840,7 @@ impl<'a> Heap<'a> {
         if self.m.phase.get() == Phase::Sweeping {
             let mut cursor = self.m.sweep_cursor.get();
             while left > 0 && cursor < self.m.used.get() {
-                if !self.m.pages[cursor].swept.get() {
+                if !self.page(cursor).swept().get() {
                     self.sweep_page(cursor);
                     left = left.saturating_sub(SWEEP_COST);
                 }
@@ -2575,7 +2870,7 @@ impl<'a> Heap<'a> {
             let Some(index) = work.gray.pop() else { return Some(left) };
             left = left.saturating_sub(self.trace(index as usize, work) * 8);
         }
-        work.gray.is_empty().then_some(0)
+        if work.gray.is_empty() { Some(0) } else { None }
     }
 
     /// Ends marking in one atomic phase. Rescans the roots, because a write to a root applies no barrier. Then clears dead weak references,
@@ -2592,10 +2887,10 @@ impl<'a> Heap<'a> {
         }
         meta.frozen.sweep_all();
         self.sweep_hosts();
-        for page in &meta.pages[..meta.used.get()] {
-            page.cards.set(0);
-            page.evacuating.set(false);
-            page.swept.set(false);
+        for (index, page) in self.pages(0..meta.used.get()).enumerate() {
+            self.clear_cards(index);
+            page.evacuating().set(false);
+            page.swept().set(false);
         }
         meta.dirty_pages.clear();
         meta.young_pages.clear();
@@ -2644,14 +2939,15 @@ impl<'a> Heap<'a> {
         let meta = self.m;
         // A fresh page handed out during sweeping was never swept, so every page is counted again here.
         let mut occupied = 0;
-        for page in &meta.pages[..meta.used.get()] {
-            page.counted.set(page.used.get() != 0);
-            occupied += usize::from(page.counted.get());
+        for page in self.pages(0..meta.used.get()) {
+            page.counted().set(page.used().get() != 0);
+            occupied += usize::from(page.counted().get());
         }
         meta.occupied.set(occupied);
         let size = meta.paced_bytes();
         let limit = meta.budget.limit();
         meta.threshold.set((size * 2).max(MIN_THRESHOLD).min(size + limit.saturating_sub(size) / 2));
+        meta.size_nursery();
         meta.last_work.set(meta.cycle_work.get());
         meta.phase.set(Phase::Idle);
         meta.settle.set(true);
@@ -2689,12 +2985,12 @@ impl<'a> Heap<'a> {
     fn sweep_young(self) {
         let meta = self.m;
         for page in meta.dirty_pages.iter(true) {
-            meta.pages[page].cards.set(0);
+            self.clear_cards(page);
         }
         let (mut first, mut emptied) = (None, meta.emptied.borrow_mut());
         for page in meta.young_pages.iter(true) {
             self.sweep_page(page);
-            let used = meta.pages[page].used.get();
+            let used = self.page(page).used().get();
             if used != u128::MAX {
                 first = first.or(Some(page));
             }
@@ -2707,31 +3003,31 @@ impl<'a> Heap<'a> {
 
     /// Sweeps page `index`. Frees the objects that were not marked, and makes every line without a marked object available to the allocator.
     fn sweep_page(self, index: usize) {
-        let page = &self.m.pages[index];
-        for (start, mark) in page.starts.iter().zip(&page.marks) {
+        let page = self.page(index);
+        for (start, mark) in self.bitmap(index, Bits::Starts).iter().zip(self.bitmap(index, Bits::Marks)) {
             start.set(start.get() & mark.get());
         }
-        let lines = page.lines.get();
-        page.used.set(lines);
-        if page.counted.replace(lines != 0) != (lines != 0) {
+        let lines = page.lines().get();
+        page.used().set(lines);
+        if page.counted().replace(lines != 0) != (lines != 0) {
             let occupied = self.m.occupied.get();
             self.m.occupied.set(if lines != 0 { occupied + 1 } else { occupied - 1 });
         }
         // The last page of a large object can also hold small objects, which can outlive the large object. So `large` is cleared once the large object is dead.
-        if lines == 0 || page.large.get().is_some_and(|first| !self.has_bit(first as usize * PAGE, |page| &page.marks)) {
-            page.large.set(None);
+        if lines == 0 || page.large().is_some_and(|first| !self.has_bit(first as usize * PAGE, Bits::Marks)) {
+            page.set_large(None);
         }
-        page.swept.set(true);
+        page.swept().set(true);
     }
 
     /// Clears the weak fields and weak items whose targets were not marked, and breaks the ephemerons whose keys are dead.
     fn clear_weaks(self, work: &mut Work) {
         for &holder in &work.holders {
             let index = holder as usize;
-            let Some(desc) = self.words.get(index).and_then(|header| self.desc(header.get())) else { continue };
+            let Some(desc) = self.words().get(index).and_then(|header| self.desc(header.get())) else { continue };
             let mut bits = desc.weaks;
             while bits != 0 {
-                if let Some(slot) = self.words.get(index + 1 + bits.trailing_zeros() as usize) {
+                if let Some(slot) = self.words().get(index + 1 + bits.trailing_zeros() as usize) {
                     self.clear_dead(slot);
                 }
                 bits &= bits - 1;
@@ -2743,14 +3039,14 @@ impl<'a> Heap<'a> {
             }
         }
         for &(from, to) in &work.weak_runs {
-            for slot in self.words.get(from as usize..to as usize).unwrap_or(&[]) {
+            for slot in self.words().get(from as usize..to as usize).unwrap_or(&[]) {
                 self.clear_dead(slot);
             }
         }
         // A weak handle holds a value word. Its slot is emptied if the object was not marked.
         for slot in self.m.rooted.weak_slots().iter() {
             let word = slot.get();
-            if word & TAG == OBJECT && !self.has_bit((word >> 32) as usize, |page| &page.marks) {
+            if word & TAG == OBJECT && !self.has_bit((word >> 32) as usize, Bits::Marks) {
                 slot.set(0);
             }
         }
@@ -2769,29 +3065,29 @@ impl<'a> Heap<'a> {
     fn clear_dead(self, slot: &Cell<u64>) {
         let word = slot.get();
         let target = word as u32;
-        if target != 0 && !self.has_bit(target as usize, |page| &page.marks) {
+        if target != 0 && !self.has_bit(target as usize, Bits::Marks) {
             slot.set(word & !0xFFFF_FFFF);
         }
     }
 
     /// Returns the items of the object at `index`.
     fn items_of(self, index: usize) -> &'a [Cell<u64>] {
-        let Some(header) = self.words.get(index).map(Cell::get) else { return &[] };
+        let Some(header) = self.words().get(index).map(Cell::get) else { return &[] };
         let Some(desc) = self.desc(header) else { return &[] };
         let start = index + 1 + desc.fields as usize;
-        self.words.get(start..start + (header >> 32) as usize).unwrap_or(&[])
+        self.words().get(start..start + (header >> 32) as usize).unwrap_or(&[])
     }
 
     /// Calls `visit` with the key and value slots of each ephemeron in the object at `index`.
     fn each_ephemeron(self, index: usize, mut visit: impl FnMut(&'a Cell<u64>, &'a Cell<u64>)) {
-        let Some(header) = self.words.get(index).map(Cell::get) else { return };
+        let Some(header) = self.words().get(index).map(Cell::get) else { return };
         let Some(desc) = self.desc(header).filter(|desc| desc.has_ephemerons()) else { return };
         let fields = desc.fields as usize;
         let mut bits = desc.ephemerons;
         while bits != 0 {
             let field = bits.trailing_zeros() as usize;
             if field + 1 < fields
-                && let Some([key, value]) = self.words.get(index + 1 + field..index + 3 + field).and_then(|pair| pair.as_array())
+                && let Some([key, value]) = self.words().get(index + 1 + field..index + 3 + field).and_then(|pair| pair.as_array())
             {
                 visit(key, value);
             }
@@ -2799,7 +3095,7 @@ impl<'a> Heap<'a> {
         }
         if desc.items == Items::Ephemerons {
             let len = (header >> 32) as usize;
-            for [key, value] in self.words.get(index + 1 + fields..index + 1 + fields + len).unwrap_or(&[]).as_chunks().0 {
+            for [key, value] in self.words().get(index + 1 + fields..index + 1 + fields + len).unwrap_or(&[]).as_chunks().0 {
                 visit(key, value);
             }
         }
@@ -2807,7 +3103,7 @@ impl<'a> Heap<'a> {
 
     /// Returns whether the ephemeron key `word` is live. A key is live if it is a marked object or is not an object.
     fn key_live(self, word: u64) -> bool {
-        word & TAG != OBJECT || self.has_bit((word >> 32) as usize, |page| &page.marks)
+        word & TAG != OBJECT || self.has_bit((word >> 32) as usize, Bits::Marks)
     }
 
     /// Marks the value of each ephemeron whose key is live, and everything reachable from the value. Repeats until a pass
@@ -2845,14 +3141,14 @@ impl<'a> Heap<'a> {
     /// Returns whether this call marked the object.
     fn mark(self, index: u32, work: &mut Work) -> bool {
         let at = index as usize;
-        let Some(page) = self.m.pages.get(at / PAGE) else { return false };
-        let (marks, bit) = (&page.marks[at % PAGE / 64], 1 << (at % 64));
-        if marks.get() & bit != 0 || page.starts[at % PAGE / 64].get() & bit == 0 {
+        let Some(page) = self.page_at(at / PAGE) else { return false };
+        let (marks, bit) = (&page.bitmap(Bits::Marks)[at % PAGE / 64], 1 << (at % 64));
+        if marks.get() & bit != 0 || page.bitmap(Bits::Starts)[at % PAGE / 64].get() & bit == 0 {
             return false;
         }
-        let Some(desc) = self.desc(self.words[at].get()) else { return false };
+        let Some(desc) = self.desc(self.words()[at].get()) else { return false };
         marks.set(marks.get() | bit);
-        self.cover_lines(at, desc.size(self.words[at].get()), |page| &page.lines);
+        self.cover_lines(at, desc.size(self.words()[at].get()), Lines::Marked);
         if desc.traces {
             work.gray.push(index);
         }
@@ -2867,10 +3163,10 @@ impl<'a> Heap<'a> {
     /// Traces the fields of the object at `index`, and also its items if `items` is true. Returns the object's size in words.
     #[inline(always)]
     fn trace_parts(self, index: usize, work: &mut Work, items: bool) -> usize {
-        let Some(header) = self.words.get(index).map(Cell::get) else { return 1 };
+        let Some(header) = self.words().get(index).map(Cell::get) else { return 1 };
         let Some(desc) = self.desc(header) else { return 1 };
         let evacuating = self.m.evacuating.get();
-        let fields = self.words.get(index + 1..index + 1 + desc.fields as usize).unwrap_or(&[]);
+        let fields = self.words().get(index + 1..index + 1 + desc.fields as usize).unwrap_or(&[]);
         let mut bits = desc.values;
         while bits != 0 {
             let field = bits.trailing_zeros() as usize;
@@ -2936,7 +3232,7 @@ impl<'a> Heap<'a> {
             let traced = self.traced_items(index, header, desc);
             let start = desc.fields as usize;
             if items && desc.items == Items::Values {
-                for (j, slot) in self.words.get(index + 1 + start..index + 1 + start + traced).unwrap_or(&[]).iter().enumerate() {
+                for (j, slot) in self.words().get(index + 1 + start..index + 1 + start + traced).unwrap_or(&[]).iter().enumerate() {
                     let word = slot.get();
                     if word & TAG == OBJECT {
                         self.mark((word >> 32) as u32, work);
@@ -2944,7 +3240,7 @@ impl<'a> Heap<'a> {
                     }
                 }
             } else if items && desc.items == Items::Members {
-                for (j, slot) in self.words.get(index + 1 + start..index + 1 + start + traced).unwrap_or(&[]).iter().enumerate() {
+                for (j, slot) in self.words().get(index + 1 + start..index + 1 + start + traced).unwrap_or(&[]).iter().enumerate() {
                     let target = slot.get() as u32;
                     if target != 0 {
                         self.mark(target, work);
@@ -2970,7 +3266,7 @@ impl<'a> Heap<'a> {
     fn traced_items(self, index: usize, header: u64, desc: &'static Desc) -> usize {
         let len = (header >> 32) as usize;
         if desc.number == Segment::DESC.number {
-            self.words.get(index + 1).map_or(0, |word| (word.get() as u32 as usize).min(len))
+            self.words().get(index + 1).map_or(0, |word| (word.get() as u32 as usize).min(len))
         } else {
             len
         }
@@ -2981,11 +3277,11 @@ impl<'a> Heap<'a> {
     fn evacuate(self, work: &mut Work) {
         let used = self.m.used.get();
         for index in 0..used {
-            let page = &self.m.pages[index];
-            if !page.evacuating.get() {
+            let page = self.page(index);
+            if !page.evacuating().get() {
                 continue;
             }
-            for (word, (starts, marks)) in page.starts.iter().zip(&page.marks).enumerate() {
+            for (word, (starts, marks)) in self.bitmap(index, Bits::Starts).iter().zip(self.bitmap(index, Bits::Marks)).enumerate() {
                 let mut live = starts.get() & marks.get();
                 while live != 0 {
                     self.move_object(index * PAGE + word * 64 + live.trailing_zeros() as usize);
@@ -3012,8 +3308,8 @@ impl<'a> Heap<'a> {
         // A member or weak slot holds a bare index. Every other recorded slot holds a value.
         for &(owner, at) in &work.fixups {
             let object = self.resolve(owner) as usize;
-            let Some(desc) = self.words.get(object).and_then(|header| self.desc(header.get())) else { continue };
-            let Some(slot) = self.words.get(object + at as usize) else { continue };
+            let Some(desc) = self.words().get(object).and_then(|header| self.desc(header.get())) else { continue };
+            let Some(slot) = self.words().get(object + at as usize) else { continue };
             let field = at as usize - 1;
             let bit = if field < 64 { 1 << field } else { 0 };
             let index = if field >= desc.fields as usize {
@@ -3029,10 +3325,10 @@ impl<'a> Heap<'a> {
         }
         for &holder in &work.holders {
             let object = self.resolve(holder) as usize;
-            let Some(desc) = self.words.get(object).and_then(|header| self.desc(header.get())) else { continue };
+            let Some(desc) = self.words().get(object).and_then(|header| self.desc(header.get())) else { continue };
             let mut bits = desc.weaks;
             while bits != 0 {
-                if let Some(slot) = self.words.get(object + 1 + bits.trailing_zeros() as usize) {
+                if let Some(slot) = self.words().get(object + 1 + bits.trailing_zeros() as usize) {
                     self.fix_index(slot);
                 }
                 bits &= bits - 1;
@@ -3050,22 +3346,22 @@ impl<'a> Heap<'a> {
             });
         }
         // An object that found no room in the fresh pages stays where it is. So rebuild the line maps of the evacuated pages from the objects that stayed.
-        for page in &self.m.pages[..used] {
-            if page.evacuating.get() {
-                page.lines.set(0);
+        for page in self.pages(0..used) {
+            if page.evacuating().get() {
+                page.lines().set(0);
             }
         }
         for index in 0..used {
-            let page = &self.m.pages[index];
-            if !page.evacuating.get() {
+            let page = self.page(index);
+            if !page.evacuating().get() {
                 continue;
             }
-            for (word, (starts, marks)) in page.starts.iter().zip(&page.marks).enumerate() {
+            for (word, (starts, marks)) in self.bitmap(index, Bits::Starts).iter().zip(self.bitmap(index, Bits::Marks)).enumerate() {
                 let mut live = starts.get() & marks.get();
                 while live != 0 {
                     let object = index * PAGE + word * 64 + live.trailing_zeros() as usize;
-                    if let Some(desc) = self.desc(self.words[object].get()) {
-                        self.cover_lines(object, desc.size(self.words[object].get()), |page| &page.lines);
+                    if let Some(desc) = self.desc(self.words()[object].get()) {
+                        self.cover_lines(object, desc.size(self.words()[object].get()), Lines::Marked);
                     }
                     live &= live - 1;
                 }
@@ -3076,20 +3372,19 @@ impl<'a> Heap<'a> {
     /// Copies the marked object at `index` to a fresh page and leaves a forwarding header in its place. The copy is
     /// marked and the original is unmarked, so the sweep frees the original.
     fn move_object(self, index: usize) {
-        let header = self.words[index].get();
+        let header = self.words()[index].get();
         let Some(desc) = self.desc(header) else { return };
         let size = desc.size(header);
         let Some(new) = self.to_reserve(size) else { return };
-        let (Some(from), Some(to)) = (self.words.get(index..index + size), self.words.get(new..new + size)) else { return };
+        let (Some(from), Some(to)) = (self.words().get(index..index + size), self.words().get(new..new + size)) else { return };
         for (target, source) in to.iter().zip(from) {
             target.set(source.get());
         }
-        self.set_bit(new, |page| &page.starts);
-        self.set_bit(new, |page| &page.marks);
-        self.cover_lines(new, size, |page| &page.lines);
-        self.words[index].set((new as u64) << 32 | FORWARDED | header & TYPE_BITS);
-        let marks = &self.m.pages[index / PAGE].marks[index % PAGE / 64];
-        marks.set(marks.get() & !(1 << (index % 64)));
+        self.set_bit(new, Bits::Starts);
+        self.set_bit(new, Bits::Marks);
+        self.cover_lines(new, size, Lines::Marked);
+        self.words()[index].set((new as u64) << 32 | FORWARDED | header & TYPE_BITS);
+        self.clear_bit(index, Bits::Marks);
     }
 
     fn to_reserve(self, size: usize) -> Option<usize> {
@@ -3102,7 +3397,7 @@ impl<'a> Heap<'a> {
         let count = size.div_ceil(PAGE);
         let first = self.m.budget.optional(|| self.free_run(count, true)?.map_or_else(|| self.fresh_pages(count), Ok)).ok()?;
         // Mark every line as used, so the allocator leaves the pages alone. The sweep later sets the lines from the marked objects.
-        self.m.pages[first..first + count].iter().for_each(|page| page.used.set(u128::MAX));
+        self.pages(first..first + count).for_each(|page| page.used().set(u128::MAX));
         let start = first * PAGE;
         self.m.to_cursor.set(start + size);
         self.m.to_end.set(start + count * PAGE);
@@ -3112,8 +3407,8 @@ impl<'a> Heap<'a> {
     /// Returns the current index of the object that was at `index`: the forwarding target if the object moved, and `index` otherwise.
     fn resolve(self, index: u32) -> u32 {
         let at = index as usize;
-        match self.words.get(at).map(Cell::get) {
-            Some(header) if header & FORWARDED != 0 && self.has_bit(at, |page| &page.starts) => (header >> 32) as u32,
+        match self.words().get(at).map(Cell::get) {
+            Some(header) if header & FORWARDED != 0 && self.has_bit(at, Bits::Starts) => (header >> 32) as u32,
             _ => index,
         }
     }
@@ -3134,14 +3429,14 @@ impl<'a> Heap<'a> {
     fn scan_cards(self, work: &mut Work) {
         let mut last = usize::MAX;
         for page in self.m.dirty_pages.iter(false) {
-            let mut cards = self.m.pages[page].cards.get();
+            let mut cards = self.cards(page).map_or(0, Cell::get);
             while cards != 0 {
                 let card = cards.trailing_zeros() as usize;
                 cards &= cards - 1;
                 let (from, to) = (page * PAGE + card * CARD, page * PAGE + (card + 1) * CARD);
                 let mut next = self.start_at_or_before(from).or_else(|| self.next_start(from, to));
                 while let Some(object) = next.filter(|&object| object < to) {
-                    if self.has_bit(object, |page| &page.marks) {
+                    if self.has_bit(object, Bits::Marks) {
                         self.trace_card(object, from..to, object != last, work);
                         last = object;
                     }
@@ -3156,7 +3451,7 @@ impl<'a> Heap<'a> {
     /// the card are traced, so a store into a large vector does not rescan the whole vector. The rest of the
     /// object is traced once, for its first dirty card.
     fn trace_card(self, index: usize, card: Range<usize>, first: bool, work: &mut Work) {
-        let header = self.words[mask(index)].get();
+        let header = self.words()[mask(index)].get();
         let Some(desc) = self.desc(header) else { return };
         let Some(refs @ (Refs::Values | Refs::Members | Refs::Weaks)) = Refs::of(desc.items) else {
             if first {
@@ -3170,7 +3465,7 @@ impl<'a> Heap<'a> {
         let items = index + 1 + desc.fields as usize;
         let traced = self.traced_items(index, header, desc);
         let (from, to) = (card.start.max(items), card.end.min(items + traced));
-        let slots = self.words.get(from..to).unwrap_or(&[]);
+        let slots = self.words().get(from..to).unwrap_or(&[]);
         match refs {
             Refs::Values => slots.iter().for_each(|slot| self.visit(slot, work)),
             Refs::Members => slots.iter().filter(|slot| slot.get() as u32 != 0).for_each(|slot| _ = self.mark(slot.get() as u32, work)),
@@ -3182,15 +3477,18 @@ impl<'a> Heap<'a> {
     fn start_at_or_before(self, index: usize) -> Option<usize> {
         let (mut page, mut word) = (index / PAGE, index % PAGE / 64);
         let mut mask = u64::MAX >> (63 - index % 64);
+        let mut record = self.page_at(page)?;
         loop {
-            let starts = self.m.pages[page].starts[word].get() & mask;
+            let starts = record.bitmap(Bits::Starts)[word].get() & mask;
             if starts != 0 {
                 return Some(page * PAGE + word * 64 + 63 - starts.leading_zeros() as usize);
             }
             mask = u64::MAX;
             if word > 0 {
                 word -= 1;
-            } else if let Some(first) = self.m.pages[page].large.get().map(|first| first as usize).filter(|&first| first < page) {
+                continue;
+            }
+            if let Some(first) = record.large().map(|first| first as usize).filter(|&first| first < page) {
                 // No object starts between a large object's header and this page, so continue from the object's first page.
                 (page, word) = (first, 0);
             } else if page > 0 {
@@ -3198,6 +3496,7 @@ impl<'a> Heap<'a> {
             } else {
                 return None;
             }
+            record = self.page(page);
         }
     }
 
@@ -3205,7 +3504,7 @@ impl<'a> Heap<'a> {
         let mut i = from;
         while i < to {
             let (page, word) = (i / PAGE, i % PAGE / 64);
-            let starts = self.m.pages.get(page)?.starts[word].get() & (u64::MAX << (i % 64));
+            let starts = self.bit_word(i, Bits::Starts)?.get() & (u64::MAX << (i % 64));
             if starts != 0 {
                 return Some(page * PAGE + word * 64 + starts.trailing_zeros() as usize).filter(|&start| start < to);
             }
@@ -3219,6 +3518,6 @@ impl<'a> Heap<'a> {
 /// pass in registers: the caller would copy it to the stack on every store, slow path or not.
 #[cold]
 #[inline(never)]
-fn shade(words: &[Cell<u64>; WORDS + SLACK], meta: &Meta, slot: usize, owner: u32, target: u32) {
-    Heap { words, m: meta }.shade_marked(slot, owner, target);
+fn shade(whole: &WholeRegion, meta: &Meta, slot: usize, owner: u32, target: u32) {
+    Heap { whole, m: meta }.shade_marked(slot, owner, target);
 }

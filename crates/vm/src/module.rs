@@ -143,6 +143,13 @@ impl<'s, 'gc> HostArgs<'s, 'gc> {
         Some(self.frame.get(self.base + index))
     }
 
+    /// Returns the arguments after the first `count`. There are none if `count` is the number of arguments or more.
+    #[inline]
+    pub fn after(self, count: usize) -> Self {
+        let skipped = u8::try_from(count).map_or(self.len, |count| count.min(self.len));
+        HostArgs { frame: self.frame, base: self.base + skipped, len: self.len - skipped }
+    }
+
     #[inline]
     pub fn iter(self) -> impl ExactSizeIterator<Item = Value<'gc>> + use<'s, 'gc> {
         (0..self.len()).map(move |i| self.get(i).expect("an argument below the count"))

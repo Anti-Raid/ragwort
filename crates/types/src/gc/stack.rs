@@ -68,7 +68,7 @@ impl StackRecord {
     }
 
     fn set_ordinary(&self, heap: Heap<'_>, end: usize, attached: bool) {
-        if let Some(word) = heap.words.get(self.segment.get() as usize + 1) {
+        if let Some(word) = heap.words().get(self.segment.get() as usize + 1) {
             let flag = if attached { ATTACHED } else { 0 };
             word.set(flag | u64::from(end.try_into().unwrap_or(u32::MAX)));
         }
@@ -81,7 +81,7 @@ impl StackRecord {
         heap.mark(segment, work);
         if self.parked.get() {
             if dropped {
-                let end = heap.words.get(segment as usize + 1).map_or(0, |word| word.get() as u32 as usize);
+                let end = heap.words().get(segment as usize + 1).map_or(0, |word| word.get() as u32 as usize);
                 self.set_ordinary(heap, end, false);
             }
             return;
@@ -150,8 +150,8 @@ impl<'a> Heap<'a> {
     #[inline]
     fn segment_slots(self, segment: u32) -> &'a [Cell<u64>] {
         let at = segment as usize;
-        let len = self.words.get(at).map_or(0, |header| (header.get() >> 32) as usize);
-        self.words.get(at + 2..at + 2 + len).unwrap_or(&[])
+        let len = self.words().get(at).map_or(0, |header| (header.get() >> 32) as usize);
+        self.words().get(at + 2..at + 2 + len).unwrap_or(&[])
     }
 }
 

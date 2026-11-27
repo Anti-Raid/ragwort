@@ -416,11 +416,12 @@ impl<'a> Units<'a> {
     pub fn chars(self) -> impl Iterator<Item = char> + Clone + 'a {
         let mut at = 0;
         std::iter::from_fn(move || {
-            (at < self.len()).then(|| {
-                let (character, size) = self.char_at(at);
-                at += size;
-                character
-            })
+            if at >= self.len() {
+                return None;
+            }
+            let (character, size) = self.char_at(at);
+            at += size;
+            Some(character)
         })
     }
 

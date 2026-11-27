@@ -244,7 +244,7 @@ fn a_minor_collection_gives_back_what_a_burst_freed() {
     arena.collect_minor();
     assert_eq!(arena.collections(), (0, 1));
     if ragwort_gc_region::Region::releases() {
-        assert!(arena.committed_bytes() <= arena.meta.nursery + (1 << 20), "{} bytes committed", arena.committed_bytes());
+        assert!(arena.committed_bytes() <= arena.meta.nursery.get() + (1 << 20), "{} bytes committed", arena.committed_bytes());
     }
 }
 

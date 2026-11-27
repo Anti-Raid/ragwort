@@ -175,7 +175,7 @@ pub(crate) fn defined<'id>(tree: &L1<'id, '_>, root: Id<'id>, slot: u32) -> Opti
     };
     let Node::Intrinsic(Prim::Slot(SlotOp::Store, stored), value) = tree[set] else { return None };
     let Node::Lambda(fun) = tree[*tree[value].first()?] else { return None };
-    (stored == slot).then_some(fun)
+    if stored == slot { Some(fun) } else { None }
 }
 
 /// A deferred lowering task: an unlowered AST expression, a lexical scope boundary, or an

@@ -126,7 +126,7 @@ fn verify_obj<'gc>(
         let data = o.data(mc).map_or(&[][..], |d| d);
         assert!(data.iter().copied().eq((0..m.data as u64).map(|i| 5 * id as u64 + i)), "obj {id} data");
         let host = o.owned(mc).map(|h| *h.get(mc).unwrap());
-        assert_eq!(host, m.host.then_some(id as u64 * 3), "obj {id} host");
+        assert_eq!(host, if m.host { Some(id as u64 * 3) } else { None }, "obj {id} host");
         check_weak(o.cache(mc).map(|w| w.id(mc)), m.weak, live);
         cur = o.next(mc);
         want = m.next;

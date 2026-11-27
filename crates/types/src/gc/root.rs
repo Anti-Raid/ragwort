@@ -283,7 +283,10 @@ impl WeakHandle {
     pub fn upgrade(&self) -> Option<Handle> {
         let Some(table) = &self.table else { return Some(Handle { table: None, word: self.word }) };
         let word = table.weak.word(self.word as u32);
-        (word != 0).then(|| Handle { table: Some(table.clone()), word: u64::from(table.strong.take(word)) })
+        if word == 0 {
+            return None;
+        }
+        Some(Handle { table: Some(table.clone()), word: u64::from(table.strong.take(word)) })
     }
 
     /// Returns the value, or `None` if the object has been freed. Fails if the handle is of an object of another arena.
@@ -293,7 +296,7 @@ impl WeakHandle {
             return Err(ForeignRoot);
         }
         let word = table.weak.word(self.word as u32);
-        Ok((word != 0).then(|| Value::from_bits(word)))
+        if word == 0 { Ok(None) } else { Ok(Some(Value::from_bits(word))) }
     }
 }
 

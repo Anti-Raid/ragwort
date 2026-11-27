@@ -22,7 +22,7 @@ pub mod syntax_case;
 mod wind;
 
 pub use segments::CHUNK;
-pub use intrinsic::Intrinsic;
+pub use intrinsic::{Intrinsic, is_procedure};
 pub use machine::{MIN_SEGMENT, Machine, Outcome, SEGMENT};
 pub use module::{Deferred, HostArgs, HostContext, HostDef, HostFn, Purity, Reply};
 pub use op::{Capture, Context, Control, Fault, Fuel, Op};
