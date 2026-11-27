@@ -8,6 +8,7 @@
 //! - A module can provide a definition from any of its files.
 
 pub mod image;
+pub mod libraries;
 
 #[cfg(test)]
 #[path = "tests/modules.rs"]

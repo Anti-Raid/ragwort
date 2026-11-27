@@ -432,9 +432,15 @@ impl<'gc> Shape<'gc> {
     /// The new shape shares the arrays of this shape if their next entry is unused, or holds `key` already: a shape made here earlier and collected since put it there. Otherwise another shape made from this one took that entry for another key, and the new shape gets a copy of the arrays.
     fn extended(self, mc: &Mutation<'gc>, key: Value<'gc>, hash_of_key: u64) -> Result<Self, Error> {
         let count = self.len(mc);
+        let (index, pairs) = self.arrays_with(mc, key, hash_of_key)?;
+        Ok(Self(objects::TableShape::new(mc, index, pairs, self.0.seed(mc), count as u64 + 1, Some(self.0), key, None, None, 0)?))
+    }
+
+    /// Returns the index and the key array for the shape with the keys of this shape and then `key`. They are the arrays of this shape
+    /// with `key` added, if this shape can share them, and new arrays otherwise. See [`Shape::extended`].
+    fn arrays_with(self, mc: &Mutation<'gc>, key: Value<'gc>, hash_of_key: u64) -> Result<Arrays<'gc>, Error> {
+        let count = self.len(mc);
         let seed = self.0.seed(mc);
-        let mut index = self.0.index(mc);
-        let mut pairs = self.0.pairs(mc);
         let next = self.parts(mc).filter(|parts| count < parts.room()).map(|parts| parts.entries.get(2 * count));
         let shared = match (self.parts(mc), next) {
             (Some(parts), Some(held)) if held == Value::BROKEN => {
@@ -445,27 +451,29 @@ impl<'gc> Shape<'gc> {
             (Some(_), Some(held)) => stands_for(mc, held, key)?,
             _ => false,
         };
-        if !shared {
-            let fresh = arrays(mc, count + 1)?;
-            if let Some(parts) = self.parts(mc) {
-                for position in 0..count {
-                    let held = parts.entries.get(2 * position);
-                    fresh.parts.entries.set(mc, 2 * position, held);
-                    fresh.parts.link(mc, hash(mc, seed, held)?.hash, position);
-                }
-            }
-            fresh.parts.entries.set(mc, 2 * count, key);
-            fresh.parts.link(mc, hash_of_key, count);
-            index = Some(fresh.index);
-            pairs = Some(fresh.entries);
+        if shared {
+            return Ok((self.0.index(mc), self.0.pairs(mc)));
         }
-        Ok(Self(objects::TableShape::new(mc, index, pairs, seed, count as u64 + 1, Some(self.0), key, None, None, 0)?))
+        let fresh = arrays(mc, count + 1)?;
+        if let Some(parts) = self.parts(mc) {
+            for position in 0..count {
+                let held = parts.entries.get(2 * position);
+                fresh.parts.entries.set(mc, 2 * position, held);
+                fresh.parts.link(mc, hash(mc, seed, held)?.hash, position);
+            }
+        }
+        fresh.parts.entries.set(mc, 2 * count, key);
+        fresh.parts.link(mc, hash_of_key, count);
+        Ok((Some(fresh.index), Some(fresh.entries)))
     }
 
     fn parts(self, mc: &Mutation<'gc>) -> Option<Parts<'gc>> {
         Some(Parts { index: self.0.index(mc)?.items(mc), entries: self.0.pairs(mc)?.items(mc) })
     }
 }
+
+/// The index and the key array of a shape.
+type Arrays<'gc> = (Option<Gc<'gc, objects::TableIndex>>, Option<Gc<'gc, objects::TableEntries>>);
 
 /// A table. Its entries are stored in the arena or owned by the host. See the [module docs](self).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2199,9 +2207,12 @@ pub(crate) fn reseed_table<'gc>(mc: &Mutation<'gc>, table: Gc<'gc, objects::Tabl
 /// Gives a table shape that was loaded from an image the hash seed `seed`, as [`reseed_table`] does for a table. A shape shares its index
 /// with other shapes. `rebuilt` maps each index that has been rebuilt to its replacement, so every shape that shared an index shares the
 /// new one.
-pub(crate) fn reseed_shape<'gc>(mc: &Mutation<'gc>, shape: Gc<'gc, objects::TableShape>, seed: u64, rebuilt: &mut HashMap<u64, Gc<'gc, objects::TableIndex>>) -> Result<(), Error> {
+///
+/// `borrowed` is whether the shape's arrays belong to an image that was loaded earlier. Those arrays have the arena's seed already, and
+/// [`reshare_shape`] deals with them.
+pub(crate) fn reseed_shape<'gc>(mc: &Mutation<'gc>, shape: Gc<'gc, objects::TableShape>, seed: u64, borrowed: bool, rebuilt: &mut HashMap<u64, Gc<'gc, objects::TableIndex>>) -> Result<(), Error> {
     shape.set_seed(mc, seed);
-    if let (Some(index), Some(pairs)) = (shape.index(mc), shape.pairs(mc)) {
+    if let (Some(index), Some(pairs), false) = (shape.index(mc), shape.pairs(mc), borrowed) {
         let old = Value::object(mc, index).to_bits();
         let fresh = match rebuilt.get(&old) {
             Some(&fresh) => fresh,
@@ -2230,6 +2241,44 @@ pub(crate) fn reseed_shape<'gc>(mc: &Mutation<'gc>, shape: Gc<'gc, objects::Tabl
             }
         }
         shape.set_links(mc, Some(fresh));
+    }
+    Ok(())
+}
+
+/// Gives a loaded table shape its arrays again, if they belong to an image that was loaded earlier. Such a shape shared the arrays of its
+/// parent when it was made, and its key was added to them. That image was saved before, so its arrays do not hold the key in this arena.
+/// The key is added here as it was when the shape was made: to the parent's arrays if they have room for it, and to new arrays otherwise.
+/// Call this for the shapes with fewer keys first, so that the parent of a shape has its arrays.
+pub(crate) fn reshare_shape<'gc>(mc: &Mutation<'gc>, shape: Gc<'gc, objects::TableShape>) -> Result<(), Error> {
+    let Some(parent) = shape.parent(mc).map(Shape) else { return Ok(()) };
+    let key = shape.key(mc);
+    let (index, pairs) = parent.arrays_with(mc, key, hash(mc, parent.0.seed(mc), key)?.hash)?;
+    shape.set_index(mc, index);
+    shape.set_pairs(mc, pairs);
+    Ok(())
+}
+
+/// Returns the number of keys of a loaded table shape, for the order in which [`reshare_shape`] is called.
+pub(crate) fn shape_keys<'gc>(mc: &Mutation<'gc>, shape: Gc<'gc, objects::TableShape>) -> u64 {
+    shape.count(mc)
+}
+
+/// Returns the key array of a table shape as a value, or `None` if the shape has none.
+pub(crate) fn shape_array<'gc>(mc: &Mutation<'gc>, shape: Gc<'gc, objects::TableShape>) -> Option<Value<'gc>> {
+    shape.pairs(mc).map(|pairs| Value::object(mc, pairs))
+}
+
+/// Makes a table shape that was loaded from an image known to its parent, if the parent does not list it. The parent of a loaded shape
+/// can be a shape of an image that was loaded earlier. That shape was not saved again with its new child. Call this once the loaded
+/// shapes have their seed.
+pub(crate) fn rejoin_shape<'gc>(mc: &Mutation<'gc>, shape: Gc<'gc, objects::TableShape>) -> Result<(), Error> {
+    let shape = Shape(shape);
+    let Some(parent) = shape.parent(mc) else { return Ok(()) };
+    let key = shape.0.key(mc);
+    let hashed = hash(mc, parent.0.seed(mc), key)?;
+    // If the arena made a shape with this key from the parent in the meantime, that shape stays the parent's child.
+    if parent.found(mc, key, hashed.hash)?.is_none() {
+        parent.adopt(mc, shape, hashed.hash)?;
     }
     Ok(())
 }

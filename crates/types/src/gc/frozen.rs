@@ -8,9 +8,9 @@
 //! # Shared values
 //!
 //! An arena that loads an [image template](crate::gc::image::Template) holds the template's frozen values without copies of them: its table
-//! refers to the template's list of values, which every such arena shares. The lowest ids are the values of that list, in order, and the
-//! arena's own values come after them. A shared value is not freed while the arena lives, even when no object holds it any more. It takes none
-//! of the arena's memory, so nothing is lost.
+//! refers to the template's list of values, which every such arena shares. An arena can hold many such lists, one for each template that it
+//! loaded. The id of a shared value has the `SHARED` bit set, and holds the number of the list and the value's position in it. A shared
+//! value is not freed while the arena lives, even when no object holds it any more. It takes none of the arena's memory, so nothing is lost.
 //!
 //! A frozen value is live while a live object holds it. Tracing finds these values. A minor collection
 //! frees the values created since the last collection that no surviving object holds. A major collection
@@ -96,6 +96,16 @@ impl<T> FrozenRef<'_, T> {
     }
 }
 
+/// The bit of an id that says that the value is a shared one. The bits below it hold the number of the value's list, and the lowest
+/// `POSITION_BITS` bits the position of the value in the list.
+const SHARED: usize = 1 << 31;
+const POSITION_BITS: u32 = 20;
+/// The lists of shared values are kept in groups of this many, and there are this many groups. A group is allocated when its first list is added.
+const GROUP: usize = 32;
+
+/// One group of lists of shared values.
+type Group = [OnceCell<Rc<[Shared]>>; GROUP];
+
 /// A frozen value that arenas share, with the bytes that each of them is charged for it.
 pub(crate) struct Shared {
     pub(crate) value: Box<dyn Any>,
@@ -104,10 +114,12 @@ pub(crate) struct Shared {
 
 /// The table of frozen values. It is made of chunks that are allocated as they are needed, so a slot never moves.
 pub(crate) struct FrozenTable {
-    /// The values that the arena shares with others, if it loaded a template. Their ids are their positions in the list. The id of one of the
-    /// arena's own values is the number of shared values plus the number of its slot.
-    shared: OnceCell<Rc<[Shared]>>,
-    /// The bytes charged for the shared values.
+    /// The lists of values that the arena shares with others: one for each template that it loaded, in groups of `GROUP`.
+    shared: [OnceCell<Box<Group>>; GROUP],
+    /// The number of lists in `shared`.
+    lists: Cell<usize>,
+    /// The number of the shared values, and the bytes charged for them.
+    shared_count: Cell<usize>,
     shared_cost: Cell<usize>,
     chunks: Box<[OnceCell<Box<[Slot]>>]>,
     /// One past the highest id handed out.
@@ -132,10 +144,13 @@ pub(crate) struct FrozenTable {
 impl FrozenTable {
     /// Creates a table with room for as many values as `limit` bytes can pay for.
     pub(crate) fn new(limit: usize) -> Self {
-        let room = (limit / FROZEN_COST).clamp(LARGEST, u32::MAX as usize - 1);
+        // The id of one of the arena's own values is the number of its slot, which must not reach the `SHARED` bit.
+        let room = (limit / FROZEN_COST).clamp(LARGEST, SHARED - 1);
         let (last, _) = place(room - 1);
         Self {
-            shared: OnceCell::new(),
+            shared: [const { OnceCell::new() }; GROUP],
+            lists: Cell::new(0),
+            shared_count: Cell::new(0),
             shared_cost: Cell::new(0),
             chunks: (0..=last).map(|_| OnceCell::new()).collect(),
             room,
@@ -149,19 +164,14 @@ impl FrozenTable {
         }
     }
 
-    /// Returns the values that the arena shares with others.
+    /// Returns the shared value with the id `id`, or `None` if the id is of one of the arena's own values or of no value.
     #[inline]
-    fn shared(&self) -> &[Shared] {
-        match self.shared.get() {
-            Some(shared) => shared,
-            None => &[],
+    fn shared(&self, id: usize) -> Option<&Shared> {
+        if id & SHARED == 0 {
+            return None;
         }
-    }
-
-    /// Returns the slot of the arena's own value with the id `id`, or `None` if the id is of a shared value or of no value.
-    #[inline]
-    fn slot(&self, id: usize) -> Option<&Slot> {
-        self.own(id.checked_sub(self.shared().len())?)
+        let (list, position) = ((id & !SHARED) >> POSITION_BITS, id & ((1 << POSITION_BITS) - 1));
+        self.shared.get(list / GROUP)?.get()?[list % GROUP].get()?.get(position)
     }
 
     /// Returns the arena's own slot with the number `number`, or `None` if its chunk has not been allocated.
@@ -175,37 +185,43 @@ impl FrozenTable {
     #[inline]
     pub(crate) fn get<T: Any>(&self, word: u64) -> Option<&T> {
         let id = (word as u32).checked_sub(1)? as usize;
-        match self.shared().get(id) {
-            Some(shared) => shared.value.downcast_ref(),
-            None => self.slot(id)?.value.get()?.downcast_ref(),
+        if id & SHARED != 0 {
+            return self.shared(id)?.value.downcast_ref();
         }
+        self.own(id)?.value.get()?.downcast_ref()
     }
 
     /// Returns the value that the frozen field word `word` refers to, whatever its type, and the bytes charged for it.
     pub(crate) fn any(&self, word: u64) -> Option<(&dyn Any, usize)> {
         let id = (word as u32).checked_sub(1)? as usize;
-        if let Some(shared) = self.shared().get(id) {
+        if id & SHARED != 0 {
+            let shared = self.shared(id)?;
             return Some((&*shared.value, shared.cost));
         }
-        let slot = self.slot(id)?;
+        let slot = self.own(id)?;
         Some((&**slot.value.get()?, slot.cost.get()))
     }
 
-    /// Makes `shared` the values that the arena shares with others, and charges the arena for them. Returns the number of values. The table
-    /// must hold no value yet, because the shared values take the lowest ids. Returns `None` if it holds one.
-    pub(crate) fn share(&self, budget: &Budget, shared: &Rc<[Shared]>) -> Result<Option<usize>, OutOfMemory> {
-        if self.next.get() != 0 || self.shared.get().is_some() {
+    /// Adds `shared` to the lists of values that the arena shares with others, and charges the arena for the values. Returns the id of
+    /// the first value. The ids of the others follow it in order. Returns `None` if the arena holds as many lists as it can, or if the list
+    /// is too long.
+    pub(crate) fn share(&self, budget: &Budget, shared: &Rc<[Shared]>) -> Result<Option<u32>, OutOfMemory> {
+        let list = self.lists.get();
+        if list >= GROUP * GROUP || shared.len() > 1 << POSITION_BITS {
             return Ok(None);
         }
         let cost = shared.iter().fold(0usize, |total, value| total.saturating_add(value.cost));
         budget.count_allocation()?;
         budget.ensure(cost)?;
-        if self.shared.set(shared.clone()).is_err() {
-            unreachable!("the table has no shared values yet");
+        let group = self.shared[list / GROUP].get_or_init(|| Box::new([const { OnceCell::new() }; GROUP]));
+        if group[list % GROUP].set(shared.clone()).is_err() {
+            unreachable!("the next list of shared values is not set yet");
         }
         budget.force(cost);
-        self.shared_cost.set(cost);
-        Ok(Some(shared.len()))
+        self.lists.set(list + 1);
+        self.shared_count.set(self.shared_count.get() + shared.len());
+        self.shared_cost.set(self.shared_cost.get() + cost);
+        Ok(Some((SHARED | list << POSITION_BITS) as u32))
     }
 
     pub(crate) fn alloc<T: Any>(&self, budget: &Budget, marked: bool, value: T, owned: usize) -> Result<u32, OutOfMemory> {
@@ -242,13 +258,15 @@ impl FrozenTable {
         budget.force(cost);
         self.young.borrow_mut().push(slot as u32);
         self.young_bytes.set(self.young_bytes.get() + cost);
-        Ok((slot + self.shared().len()) as u32)
+        Ok(slot as u32)
     }
 
     /// Marks the value that the frozen field word `word` refers to. A shared value needs no mark.
     pub(crate) fn mark(&self, word: u64) {
         let Some(id) = (word as u32).checked_sub(1) else { return };
-        if let Some(slot) = self.slot(id as usize) {
+        if id as usize & SHARED == 0
+            && let Some(slot) = self.own(id as usize)
+        {
             slot.marked.set(true);
         }
     }
@@ -336,7 +354,7 @@ impl FrozenTable {
 
     /// Returns the number of values that the arena holds: its own values not yet freed, and the shared values.
     pub(crate) fn count(&self) -> usize {
-        self.next.get() - self.free.borrow().len() + self.shared().len()
+        self.next.get() - self.free.borrow().len() + self.shared_count.get()
     }
 
     /// Returns the bytes that the table and its lists take, beyond the charges of the values themselves.

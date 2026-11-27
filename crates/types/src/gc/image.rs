@@ -13,6 +13,17 @@
 //! let roots = other.mutate(|mc| image::load(mc, STAMP, &bytes, &descs, &kinds, &hosts))?;
 //! ```
 //!
+//! # Images that build on other images
+//!
+//! [`save_linked`] saves an image that refers to objects of images saved before it, and does not hold copies of them. A library is saved
+//! this way, on top of the image of the code that it uses. An arena then loads the library's image only if it needs the library, after
+//! the images that the library refers to.
+//!
+//! - While saving, [`Known`] says which objects belong to earlier images. Each such object is saved as the number of its image and its
+//!   position in that image.
+//! - While loading, each earlier image is represented by its [`Exports`]: the objects at the positions that later images refer to.
+//!   [`Template::load_linked`] takes them, and returns the exports of the image that it loads.
+//!
 //! # What's saved
 //!
 //! - An object is saved as its type number, its item count, and its words. A word
@@ -50,7 +61,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::frozen::Shared;
-use super::{Desc, Gc, Heap, Items, Mutation, OBJECT, Object, OutOfMemory, Phase, Role, TAG, TYPE_BITS, Value, mask};
+use super::{Desc, Gc, Heap, Items, Mutation, OBJECT, Object, OutOfMemory, Role, TAG, TYPE_BITS, Value, mask};
 use crate::objects::{Interned, Sym, TableShape, TableShapeFields};
 use crate::string::{Strings, chars};
 use crate::symbol::{Keyword, Symbol, Symbols};
@@ -65,6 +76,8 @@ const KEYWORD: u8 = 2;
 const SYMBOLS: u8 = 3;
 /// A flat string, or a rope that is an interned string. It is saved as its text, and loaded as a string of the arena with that text: the interned string, if the text is short enough to be interned when it is made.
 const STRING: u8 = 4;
+/// An object of an image that was saved earlier. It is saved as the number of that image and the object's position in it.
+const IMPORT: u8 = 5;
 
 /// A kind of frozen value that can be saved.
 #[derive(Clone, Copy)]
@@ -146,10 +159,10 @@ pub enum LoadError {
     Malformed,
     /// Another build wrote the image: its stamp differs.
     Stamp,
-    /// A major collection cycle is in progress.
-    Busy,
-    /// The arena already holds frozen values, so it cannot share those of a [`Template`].
-    Used,
+    /// The arena holds as many [`Template`]s as it can, or the template has too many frozen values.
+    TooMany,
+    /// The image refers to an object of an image that the arena has not loaded, or that the given [`Exports`] do not hold.
+    Unlinked,
     OutOfMemory,
 }
 
@@ -190,6 +203,9 @@ struct Saver<'k, 'gc> {
     /// Maps the word of each frozen value reached to its position in the image, counted from one.
     frozen: HashMap<u64, u32>,
     frozen_out: Writer,
+    known: &'k Known,
+    /// The objects of earlier images that were reached, as image and position.
+    imports: Vec<(u32, u32)>,
 }
 
 impl<'gc> Saver<'_, 'gc> {
@@ -303,6 +319,11 @@ impl<'gc> Saver<'_, 'gc> {
                 table.u8(STRING);
                 let text: String = chars(&Strings::new(self.mc), string).collect();
                 table.bytes(text.as_bytes());
+            } else if let Some(&(image, place)) = self.known.objects.get(&index) {
+                table.u8(IMPORT);
+                table.u32(image);
+                table.u32(place);
+                self.imports.push((image, place));
             } else {
                 let desc = self.heap.desc(header).filter(|desc| desc.number.is_some()).ok_or(SaveError::Unnumbered)?;
                 table.u8(PLAIN);
@@ -321,8 +342,47 @@ impl<'gc> Saver<'_, 'gc> {
 ///
 /// A weak reference or an ephemeron is saved as if it were a strong reference. Collect first, so that the image leaves out dead objects.
 pub fn save<'gc>(mc: &Mutation<'gc>, stamp: u64, roots: &[Value<'gc>], kinds: &[Kind]) -> Result<Vec<u8>, SaveError> {
+    Ok(save_linked(mc, stamp, roots, kinds, &Known::default())?.bytes)
+}
+
+/// Which objects of the arena belong to images that were saved earlier. [`save_linked`] saves a reference to such an object, and not the
+/// object.
+///
+/// It holds the places of the objects in the arena, so it is valid only in the step that made it. A collection can move the objects.
+#[derive(Default)]
+pub struct Known {
+    /// Maps the index of an object to the number of its image and its position in that image, counted from one.
+    objects: HashMap<u32, (u32, u32)>,
+}
+
+impl Known {
+    /// Records the objects of the image with the number `image`. `objects` are the objects of that image in the order of
+    /// [`Saved::objects`]. An object that an image before it holds already stays with that image.
+    pub fn add<'gc>(&mut self, image: u32, objects: impl Iterator<Item = Value<'gc>>) {
+        for (position, object) in objects.enumerate() {
+            if object.to_bits() & TAG == OBJECT {
+                self.objects.entry((object.to_bits() >> 32) as u32).or_insert((image, position as u32 + 1));
+            }
+        }
+    }
+}
+
+/// What [`save_linked`] returns.
+pub struct Saved<'gc> {
+    pub bytes: Vec<u8>,
+    /// The objects of the image, in the order of their positions. Give them to [`Known::add`] before a later image is saved. Keep them
+    /// in the arena until then, for example in a vector, because a collection can move them.
+    pub objects: Vec<Value<'gc>>,
+    /// The objects of earlier images that the image refers to, each as the number of its image and its position in that image. An
+    /// arena that loads this image needs them as [`Exports`] of those images.
+    pub imports: Vec<(u32, u32)>,
+}
+
+/// Works like [`save`], for an image that builds on images saved earlier. An object that `known` lists is saved as a reference to it.
+/// A symbol, a keyword or a string is saved as its name or text all the same, and is loaded as the arena's own.
+pub fn save_linked<'gc>(mc: &Mutation<'gc>, stamp: u64, roots: &[Value<'gc>], kinds: &[Kind], known: &Known) -> Result<Saved<'gc>, SaveError> {
     let heap = mc.heap;
-    let mut saver = Saver { mc, heap, kinds, places: HashMap::new(), order: Vec::new(), frozen: HashMap::new(), frozen_out: Writer::new() };
+    let mut saver = Saver { mc, heap, kinds, places: HashMap::new(), order: Vec::new(), frozen: HashMap::new(), frozen_out: Writer::new(), known, imports: Vec::new() };
     let mut rooted = Writer::new();
     rooted.length(roots.len());
     for root in roots {
@@ -346,7 +406,12 @@ pub fn save<'gc>(mc: &Mutation<'gc>, stamp: u64, roots: &[Value<'gc>], kinds: &[
     out.u64(checksum(&body));
     let mut bytes = out.finish();
     bytes.extend(body);
-    Ok(bytes)
+    let mut objects = Vec::with_capacity(saver.order.len());
+    for &index in &saver.order {
+        let ty = heap.words()[mask(index as usize)].get() & TYPE_BITS;
+        objects.push(Value::from_bits(u64::from(index) << 32 | ty << 16 | OBJECT));
+    }
+    Ok(Saved { bytes, objects, imports: saver.imports })
 }
 
 fn checksum(bytes: &[u8]) -> u64 {
@@ -478,6 +543,24 @@ enum Entry {
     Keyword(u32),
     Symbols,
     String,
+    /// An object of an image that the arena loaded earlier.
+    Import,
+}
+
+/// The objects of one loaded image that later images refer to. `places` are their positions in the image, in ascending order, and
+/// `objects` holds the object at each of those positions, in the same order.
+#[derive(Clone, Copy)]
+pub struct Exports<'a, 'gc> {
+    pub places: &'a [u32],
+    pub objects: crate::vector::ImmutableVector<'gc>,
+}
+
+/// What [`Template::load_linked`] returns.
+pub struct Loaded<'gc> {
+    /// The roots that the image was saved with.
+    pub roots: Vec<Value<'gc>>,
+    /// The objects at the positions that were asked for, in the same order.
+    pub exported: Vec<Value<'gc>>,
 }
 
 /// Rebuilds the objects serialized in `bytes`, which [`save`] wrote, and returns the roots that `save` was given.
@@ -497,7 +580,7 @@ pub fn load<'gc>(mc: &Mutation<'gc>, stamp: u64, bytes: &[u8], descs: &[&'static
     for value in head.frozen {
         words.push(u64::from(frozen.alloc_boxed(&mc.heap.m.budget, false, value.value, value.cost)?) + 1);
     }
-    build(mc, head.moved, &words, &bytes[head.rest..], descs)
+    Ok(build(mc, head.moved, &words, &bytes[head.rest..], descs, &[], &[])?.roots)
 }
 
 /// An image that is ready to be loaded into many arenas of one thread.
@@ -521,12 +604,22 @@ impl Template {
 
     /// Rebuilds the image's objects in the arena and returns the roots that the image was saved with. See [`load`].
     ///
-    /// The arena must be new: it must hold no frozen value yet. Otherwise the load fails with [`LoadError::Used`].
+    /// An arena can load many templates. The load fails with [`LoadError::TooMany`] past the most that an arena can hold.
     pub fn load<'gc>(&self, mc: &Mutation<'gc>, descs: &[&'static Desc]) -> Result<Vec<Value<'gc>>, LoadError> {
-        let count = mc.heap.m.frozen.share(&mc.heap.m.budget, &self.frozen)?.ok_or(LoadError::Used)?;
-        // A shared value's id is its position in the template, and a frozen field holds the id plus one.
-        let words: Vec<u64> = (1..=count as u64).collect();
-        build(mc, self.moved, &words, &self.rest, descs)
+        Ok(self.load_linked(mc, descs, &[], &[])?.roots)
+    }
+
+    /// Works like [`Template::load`], for an image that [`save_linked`] wrote.
+    ///
+    /// - `links` holds the exports of the images that the arena loaded earlier, at the number of each image. An image that the arena
+    ///   has not loaded is `None`. The load fails with [`LoadError::Unlinked`] if this image refers to an object that `links` lacks.
+    /// - `wanted` are the positions of this image that later images refer to, in ascending order. The objects there are returned, to
+    ///   be kept as this image's [`Exports`].
+    pub fn load_linked<'gc>(&self, mc: &Mutation<'gc>, descs: &[&'static Desc], links: &[Option<Exports<'_, 'gc>>], wanted: &[u32]) -> Result<Loaded<'gc>, LoadError> {
+        let first = mc.heap.m.frozen.share(&mc.heap.m.budget, &self.frozen)?.ok_or(LoadError::TooMany)?;
+        // The ids of the template's values follow each other from `first`, and a frozen field holds the id plus one.
+        let words: Vec<u64> = (0..self.frozen.len() as u64).map(|position| u64::from(first) + position + 1).collect();
+        build(mc, self.moved, &words, &self.rest, descs, links, wanted)
     }
 
     /// Returns the number of frozen values that the arenas loading the template share.
@@ -585,11 +678,11 @@ impl Head {
 
 /// Rebuilds the objects of an image in the arena. `rest` is the part of the image after the frozen values. `frozen` holds, for each frozen
 /// value of the image in order, the word that a frozen field holds for it in this arena.
-fn build<'gc>(mc: &Mutation<'gc>, moved: u64, frozen: &[u64], rest: &[u8], descs: &[&'static Desc]) -> Result<Vec<Value<'gc>>, LoadError> {
+///
+/// A load can run while a collection cycle is in progress. The loader allocates the objects as a program does, and fills them in before
+/// the step ends. An object that is allocated while the collector marks is traced later, with the words that it then has.
+fn build<'gc>(mc: &Mutation<'gc>, moved: u64, frozen: &[u64], rest: &[u8], descs: &[&'static Desc], links: &[Option<Exports<'_, 'gc>>], wanted: &[u32]) -> Result<Loaded<'gc>, LoadError> {
     let heap = mc.heap;
-    if heap.m.phase.get() != Phase::Idle {
-        return Err(LoadError::Busy);
-    }
     // Nothing after the frozen values reads the context.
     let context: &dyn Any = &();
     let mut body = Reader::new(rest, context);
@@ -637,6 +730,13 @@ fn build<'gc>(mc: &Mutation<'gc>, moved: u64, frozen: &[u64], rest: &[u8], descs
             // The keyword is created in the next loop, once its symbol exists.
             KEYWORD => (Entry::Keyword(table.u32()?), 0),
             SYMBOLS => (Entry::Symbols, index_of(symbols.value(mc))),
+            IMPORT => {
+                let (image, place) = (table.u32()? as usize, table.u32()?);
+                let exports = links.get(image).copied().flatten().ok_or(LoadError::Unlinked)?;
+                let found = exports.places.binary_search(&place).map_err(|_| LoadError::Unlinked)?;
+                let object = exports.objects.get(mc, found).filter(|object| object.to_bits() & TAG == OBJECT).ok_or(LoadError::Unlinked)?;
+                (Entry::Import, index_of(object))
+            }
             _ => return Err(LoadError::Malformed),
         };
         entries.push(entry);
@@ -658,14 +758,37 @@ fn build<'gc>(mc: &Mutation<'gc>, moved: u64, frozen: &[u64], rest: &[u8], descs
         }
     }
     let (table_number, shape_number) = (crate::objects::Table::DESC.number, TableShape::DESC.number);
+    // The arena indices of the objects that belong to images loaded earlier.
+    let mut imported = std::collections::HashSet::new();
+    for (place, entry) in entries.iter().enumerate() {
+        if matches!(entry, Entry::Import) {
+            imported.insert(loader.indices[place]);
+        }
+    }
     let mut rebuilt = HashMap::new();
+    // The loaded shapes whose arrays belong to an earlier image, each with its number of keys.
+    let mut borrowed: Vec<(u64, Gc<'gc, TableShape>)> = Vec::new();
+    let mut shapes: Vec<Gc<'gc, TableShape>> = Vec::new();
     for (place, entry) in entries.iter().enumerate() {
         let &Entry::Plain(desc, _) = entry else { continue };
         if desc.number == table_number {
             crate::table::reseed_table(mc, Gc::new(loader.indices[place]), seed)?;
         } else if desc.number == shape_number {
-            crate::table::reseed_shape(mc, Gc::new(loader.indices[place]), seed, &mut rebuilt)?;
+            let shape: Gc<'gc, TableShape> = Gc::new(loader.indices[place]);
+            let borrows = crate::table::shape_array(mc, shape).is_some_and(|array| imported.contains(&index_of(array)));
+            crate::table::reseed_shape(mc, shape, seed, borrows, &mut rebuilt)?;
+            if borrows {
+                borrowed.push((crate::table::shape_keys(mc, shape), shape));
+            }
+            shapes.push(shape);
         }
+    }
+    borrowed.sort_by_key(|&(keys, _)| keys);
+    for (_, shape) in borrowed {
+        crate::table::reshare_shape(mc, shape)?;
+    }
+    for shape in shapes {
+        crate::table::rejoin_shape(mc, shape)?;
     }
     // The image's tree of table shapes becomes the arena's, if the arena has none yet. Tables that are built in this arena then get the same shapes as the tables of the image's code. The shape without a parent is the root of the tree.
     if symbols.shapes(mc).is_none() {
@@ -689,5 +812,9 @@ fn build<'gc>(mc: &Mutation<'gc>, moved: u64, frozen: &[u64], rest: &[u8], descs
     if !(words.is_empty() && rooted.is_empty() && body.is_empty() && table.is_empty()) {
         return Err(LoadError::Malformed);
     }
-    Ok(roots)
+    let mut exported = Vec::with_capacity(wanted.len());
+    for &place in wanted {
+        exported.push(Value::from_bits(loader.value(u64::from(place) << 32 | OBJECT)?));
+    }
+    Ok(Loaded { roots, exported })
 }

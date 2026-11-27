@@ -1,6 +1,6 @@
 use super::*;
 use crate::gc::table::{Strong, Table, TableHead};
-use crate::gc::{Arena, HostRef, objects};
+use crate::gc::{Arena, HostRef, Phase, objects};
 use crate::num::{Nums, int};
 use crate::pair::{Pair, Pairs};
 use crate::string::{self, Str};
@@ -326,9 +326,15 @@ fn arenas_that_load_a_template_share_its_frozen_values() {
         let roots = load(mc, STAMP, &again, &descs(), &kinds(), &()).unwrap();
         let items: Vec<Value> = Pairs::new(mc).elements(roots[0]).collect();
         assert_eq!(Syntax::of(items[7]).unwrap().span(mc).source().unwrap().line_starts(mc), &[0, 4, 8]);
-        // An arena that holds frozen values already cannot share a template's.
-        assert_eq!(template.load(mc, &descs()).err(), Some(LoadError::Used));
+        // An arena that holds frozen values of its own shares a template's as well, and can load a template more than once.
+        for holders in [4, 5] {
+            let roots = template.load(mc, &descs()).unwrap();
+            let items: Vec<Value> = Pairs::new(mc).elements(roots[0]).collect();
+            assert_eq!(Syntax::of(items[7]).unwrap().span(mc).source().unwrap().line_starts(mc), &[0, 4, 8]);
+            assert_eq!(Rc::strong_count(&template.frozen), holders);
+        }
     });
+    drop(plain);
     drop((first, second));
     assert_eq!(Rc::strong_count(&template.frozen), 1);
     // An image of another build makes no template.
@@ -430,5 +436,140 @@ fn read_keyed<'gc>(mc: &Mutation<'gc>, again: bool) {
         // The shape that this arena makes for the same keys is the loaded one: the loaded shapes find their children.
         assert_eq!(tables.shape(&[first, second, field]).unwrap(), shaped.shape(mc).unwrap(), "shape {number}");
     }
+}
+
+/// Returns the positions of image `image` that the given imports refer to, in ascending order and without repeats.
+fn wanted(image: u32, imports: &[&[(u32, u32)]]) -> Vec<u32> {
+    let mut places: Vec<u32> = imports.iter().flat_map(|list| list.iter()).filter(|&&(from, _)| from == image).map(|&(_, place)| place).collect();
+    places.sort_unstable();
+    places.dedup();
+    places
+}
+
+/// Three images that build on each other: a base, a library that uses objects of the base, and a second library that uses objects of
+/// both. An arena loads the base, and each library only when it wants it. A library's references are the arena's objects of the
+/// earlier images, not copies.
+#[test]
+fn an_image_refers_to_objects_of_earlier_images() {
+    // The saving arena. Root 0 holds what has been made so far, so that collections between the saves keep and move it.
+    let mut saving = Arena::new(1 << 22, 4);
+    let base = saving.mutate(|mc| {
+        let (symbols, strings, tables, pairs, vectors) = (Symbols::of_arena(mc).unwrap(), Strings::new(mc), crate::table::Tables::new(mc), Pairs::new(mc), Vectors::new(mc));
+        let shared = pairs.cons(fix(1), fix(2)).unwrap().value(mc);
+        let registry = tables.make().unwrap();
+        registry.set(mc, string::from_str(&strings, "a key of the base table").unwrap().value(), fix(10)).unwrap();
+        let shape = tables.shape(&[symbols.intern_str(&strings, "first").unwrap().value(mc)]).unwrap();
+        let session = SyntaxSession::named(mc, "base.rg", "one\ntwo").unwrap();
+        let syntax = Syntax::new(mc, fix(2), SyntaxSpan::new(mc, session.source(mc).unwrap(), 0, 3).unwrap(), None).unwrap().value(mc);
+        let root = vectors.from_slice(&[shared, registry.value(mc), shape.value(mc), syntax]).unwrap().value(mc);
+        mc.set_root(0, root);
+        let saved = save_linked(mc, STAMP, &[root], &kinds(), &Known::default()).unwrap();
+        assert!(saved.imports.is_empty());
+        mc.set_root(1, vectors.from_slice(&saved.objects).unwrap().value(mc));
+        saved.bytes
+    });
+    saving.set_evacuate_all(true);
+    saving.collect();
+    // The first library: a vector with objects of the base and objects of its own.
+    let (first, first_imports) = saving.mutate(|mc| {
+        let (symbols, strings, tables, pairs, vectors) = (Symbols::of_arena(mc).unwrap(), Strings::new(mc), crate::table::Tables::new(mc), Pairs::new(mc), Vectors::new(mc));
+        let held = vectors.vector(mc.root(0)).unwrap();
+        let (shared, registry, shape) = (held.get(mc, 0).unwrap(), held.get(mc, 1).unwrap(), crate::table::Shape::of(held.get(mc, 2).unwrap()).unwrap());
+        let own = pairs.cons(shared, fix(3)).unwrap().value(mc);
+        let child = shape.child(mc, symbols.intern_str(&strings, "second").unwrap().value(mc)).unwrap();
+        let shaped = tables.shaped(child, [Some(fix(7)), Some(fix(8))].into_iter()).unwrap().value(mc);
+        let session = SyntaxSession::named(mc, "first.rg", "three\nfour\nfive").unwrap();
+        let syntax = Syntax::new(mc, fix(3), SyntaxSpan::new(mc, session.source(mc).unwrap(), 0, 5).unwrap(), None).unwrap().value(mc);
+        let root = vectors.from_slice(&[shared, registry, own, shaped, syntax, string::from_str(&strings, "a string of the first library").unwrap().value()]).unwrap().value(mc);
+        mc.set_root(2, root);
+        let mut known = Known::default();
+        let objects = vectors.vector(mc.root(1)).unwrap();
+        known.add(0, (0..objects.len(mc)).map(|at| objects.get(mc, at).unwrap()));
+        let saved = save_linked(mc, STAMP, &[root], &kinds(), &known).unwrap();
+        mc.set_root(3, vectors.from_slice(&saved.objects).unwrap().value(mc));
+        (saved.bytes, saved.imports)
+    });
+    assert!(!first_imports.is_empty() && first_imports.iter().all(|&(image, _)| image == 0), "{first_imports:?}");
+    saving.collect();
+    // The second library uses the base and the first library.
+    let (second, second_imports) = saving.mutate(|mc| {
+        let (pairs, vectors) = (Pairs::new(mc), Vectors::new(mc));
+        let (held, library) = (vectors.vector(mc.root(0)).unwrap(), vectors.vector(mc.root(2)).unwrap());
+        let root = vectors.from_slice(&[held.get(mc, 0).unwrap(), library.get(mc, 2).unwrap(), pairs.cons(fix(5), library.get(mc, 3).unwrap()).unwrap().value(mc)]).unwrap().value(mc);
+        let mut known = Known::default();
+        for (image, slot) in [(0, 1), (1, 3)] {
+            let objects = vectors.vector(mc.root(slot)).unwrap();
+            known.add(image, (0..objects.len(mc)).map(|at| objects.get(mc, at).unwrap()));
+        }
+        let saved = save_linked(mc, STAMP, &[root], &kinds(), &known).unwrap();
+        (saved.bytes, saved.imports)
+    });
+    assert!(second_imports.iter().any(|&(image, _)| image == 0) && second_imports.iter().any(|&(image, _)| image == 1), "{second_imports:?}");
+    assert!(first.len() < base.len() + 400 && second.len() < 400, "the libraries hold no copies: {} {} {}", base.len(), first.len(), second.len());
+    let templates = [Template::new(STAMP, &base, &kinds(), &()).unwrap(), Template::new(STAMP, &first, &kinds(), &()).unwrap(), Template::new(STAMP, &second, &kinds(), &()).unwrap()];
+    let exports = [wanted(0, &[&first_imports, &second_imports]), wanted(1, &[&second_imports]), Vec::new()];
+
+    // The loading arena. Roots 0 to 2 hold the roots of the images, and roots 3 to 5 their exported objects.
+    let mut arena = Arena::new(1 << 22, 6);
+    arena.mutate(|mc| {
+        let loaded = templates[0].load_linked(mc, &descs(), &[], &exports[0]).unwrap();
+        mc.set_root(0, loaded.roots[0]);
+        mc.set_root(3, Vectors::new(mc).immutable_from_slice(&loaded.exported).unwrap().value(mc));
+        // A library does not load before the images that it refers to.
+        assert_eq!(templates[1].load_linked(mc, &descs(), &[], &[]).err(), Some(LoadError::Unlinked));
+        assert_eq!(templates[2].load_linked(mc, &descs(), &[None, None], &[]).err(), Some(LoadError::Unlinked));
+    });
+    // The arena works and collects before it wants the first library, which it then loads while a collection cycle is running.
+    arena.mutate(|mc| {
+        let base = Vectors::new(mc).vector(mc.root(0)).unwrap();
+        let registry = crate::table::Tables::new(mc).table(base.get(mc, 1).unwrap()).unwrap();
+        registry.set(mc, string::from_str(&Strings::new(mc), "added before the library").unwrap().value(), fix(11)).unwrap();
+    });
+    arena.set_evacuate_all(true);
+    arena.collect();
+    let objects = arena.objects();
+    arena.collect_slice(1);
+    assert_eq!(arena.phase(), Phase::Marking);
+    for image in 1..3 {
+        arena.mutate(|mc| {
+            let vectors = Vectors::new(mc);
+            let mut links = Vec::new();
+            for (earlier, places) in exports.iter().enumerate().take(image) {
+                links.push(Some(Exports { places, objects: crate::vector::ImmutableVector::of(mc.root(3 + earlier)).unwrap() }));
+            }
+            let loaded = templates[image].load_linked(mc, &descs(), &links, &exports[image]).unwrap();
+            mc.set_root(image, loaded.roots[0]);
+            mc.set_root(3 + image, vectors.immutable_from_slice(&loaded.exported).unwrap().value(mc));
+        });
+        arena.collect();
+    }
+    // The libraries added their own few objects, and no copy of the base.
+    assert!(arena.objects() > objects && arena.objects() < objects + 40, "{} objects, {objects} before", arena.objects());
+    arena.mutate(|mc| {
+        let (symbols, strings, tables, vectors) = (Symbols::of_arena(mc).unwrap(), Strings::new(mc), crate::table::Tables::new(mc), Vectors::new(mc));
+        let (base, first, second) = (vectors.vector(mc.root(0)).unwrap(), vectors.vector(mc.root(1)).unwrap(), vectors.vector(mc.root(2)).unwrap());
+        // The pair and the table of the base are the same objects in every image.
+        let shared = base.get(mc, 0).unwrap();
+        assert!(first.get(mc, 0) == Some(shared) && second.get(mc, 0) == Some(shared));
+        assert_eq!(first.get(mc, 1), base.get(mc, 1));
+        let registry = tables.table(first.get(mc, 1).unwrap()).unwrap();
+        assert_eq!(registry.get(mc, string::from_str(&strings, "added before the library").unwrap().value()).unwrap(), Some(fix(11)));
+        assert_eq!(registry.get(mc, string::from_str(&strings, "a key of the base table").unwrap().value()).unwrap(), Some(fix(10)));
+        // The first library's own pair holds the base's pair, and the second library refers to that pair of the first.
+        let own = Pair::of(first.get(mc, 2).unwrap()).unwrap();
+        assert_eq!((own.head(mc), own.tail(mc)), (shared, fix(3)));
+        assert_eq!(second.get(mc, 1), first.get(mc, 2));
+        assert_eq!(Pair::of(second.get(mc, 2).unwrap()).unwrap().tail(mc), first.get(mc, 3).unwrap());
+        // The library's table has a shape that was made from a shape of the base. The base's shape knows it now.
+        let shaped = tables.table(first.get(mc, 3).unwrap()).unwrap();
+        let (one, two) = (symbols.intern_str(&strings, "first").unwrap().value(mc), symbols.intern_str(&strings, "second").unwrap().value(mc));
+        assert_eq!((shaped.get(mc, one).unwrap(), shaped.get(mc, two).unwrap()), (Some(fix(7)), Some(fix(8))));
+        assert_eq!(tables.shape(&[one, two]).unwrap(), shaped.shape(mc).unwrap());
+        assert_eq!(crate::table::Shape::of(base.get(mc, 2).unwrap()).unwrap(), shaped.shape(mc).unwrap().parent(mc).unwrap());
+        // Each image's frozen values are read.
+        assert_eq!(Syntax::of(base.get(mc, 3).unwrap()).unwrap().span(mc).source().unwrap().line_starts(mc), &[0, 4]);
+        assert_eq!(Syntax::of(first.get(mc, 4).unwrap()).unwrap().span(mc).source().unwrap().line_starts(mc), &[0, 6, 11]);
+        assert_eq!(text(mc, first.get(mc, 5).unwrap()), "a string of the first library");
+    });
 }
 

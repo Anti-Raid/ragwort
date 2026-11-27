@@ -31,7 +31,7 @@
 //! - An image must be one that the program itself wrote, because an image is trusted. See [`ragwort_types::gc::image`].
 
 use ragwort_compiler::module::INTERFACE;
-use ragwort_types::gc::image::{self, Kind, LoadError, SaveError};
+use ragwort_types::gc::image::{self, Exports, Kind, Known, LoadError, Loaded, SaveError, Saved};
 use ragwort_types::gc::{Desc, Mutation, Value};
 use ragwort_types::wire::{mix, shape_of};
 use ragwort_vm::HostDef;
@@ -81,6 +81,11 @@ pub fn save<'gc>(mc: &Mutation<'gc>, roots: &[Value<'gc>]) -> Result<Vec<u8>, Sa
     image::save(mc, stamp(), roots, &kinds())
 }
 
+/// Works like [`save`], for an image that builds on images saved earlier. See [`image::save_linked`].
+pub fn save_linked<'gc>(mc: &Mutation<'gc>, roots: &[Value<'gc>], known: &Known) -> Result<Saved<'gc>, SaveError> {
+    image::save_linked(mc, stamp(), roots, &kinds(), known)
+}
+
 /// Deserializes the image in `bytes` into the arena and returns the roots that the image was
 /// saved with. `hosts` are the host functions that the image's code can call.
 ///
@@ -115,6 +120,11 @@ impl Template {
     /// an arena that holds frozen values already fails. Each arena gets a hash seed of its own, as with [`load`].
     pub fn load<'gc>(&self, mc: &Mutation<'gc>) -> Result<Vec<Value<'gc>>, ImageError> {
         self.0.load(mc, &descs()).map_err(ImageError::Load)
+    }
+
+    /// Works like [`Template::load`], for an image that [`save_linked`] wrote. See [`image::Template::load_linked`].
+    pub fn load_linked<'gc>(&self, mc: &Mutation<'gc>, links: &[Option<Exports<'_, 'gc>>], wanted: &[u32]) -> Result<Loaded<'gc>, ImageError> {
+        self.0.load_linked(mc, &descs(), links, wanted).map_err(ImageError::Load)
     }
 
     /// Returns the number of frozen values that the arenas loading the template share.
