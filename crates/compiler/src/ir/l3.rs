@@ -85,6 +85,8 @@ pub(crate) struct Function<'id> {
     pub(crate) id: u32,
     /// Number of trailing entries in `params` that a call may omit.
     pub(crate) optional: u32,
+    /// The argument counts that the function refuses although `optional` allows them, as in `Shape::refused` of the VM. A function made from a `case-lambda` has them.
+    pub(crate) refused: u16,
     pub(crate) params: Span<'id, Var>,
     /// Receives the arguments past `params` as a list, if any.
     pub(crate) rest: Option<Var>,

@@ -1637,7 +1637,7 @@ fn keyword_mistakes_name_the_keyword() {
     }
     assert_eq!(caught("((lambda (#:a a) a) #:b 1)"), "(keyword (#:b))");
     assert_eq!(caught("(let ([f (lambda (#:a a) a)]) (f))"), "(keyword (#:a))");
-    assert_eq!(caught("(define (f #:a a) a) (f #:a 1 2)"), "(arity ())");
+    assert_eq!(caught("(define (f #:a a) a) (f #:a 1 2)"), "(arity (#<procedure f> 1))");
     assert_eq!(caught("(car #:a 1)"), "(keyword (#:a))");
     assert_eq!(caught("(keyword-apply list '(#:b #:a) '(1 2) '())"), "(keyword (#:a))");
     assert_eq!(error("(define (f #:k k) k) (set! f 1)"), (Immutable, "f"));
@@ -1685,9 +1685,9 @@ fn calls_through_a_value_reach_keyword_procedures_and_apply() {
     assert_eq!(caught(defs, "(apply (pick 0) 7 '(8))"), "(7 8 #f)");
     // Deep enough to continue on further stack segments.
     assert_eq!(caught(defs, "((pick 3) 100000)"), "100000");
-    // A call the procedure cannot take names the keyword procedure.
-    for wrong in ["((pick 0))", "(car ((pick 0) 1 2 3))", "(apply (pick 0) '())", "((pick 2) (pick 0) '(1 2 3))"] {
-        assert_eq!(caught(defs, wrong), "(arity (#<procedure greet>))", "{wrong}");
+    // A call the procedure cannot take names the keyword procedure and the number of arguments.
+    for (wrong, given) in [("((pick 0))", 0), ("(car ((pick 0) 1 2 3))", 3), ("(apply (pick 0) '())", 0), ("((pick 2) (pick 0) '(1 2 3))", 3)] {
+        assert_eq!(caught(defs, wrong), format!("(arity (#<procedure greet> {given}))"), "{wrong}");
     }
     assert_eq!(caught(defs, "((pick 1))"), "(keyword (#:key))");
     assert_eq!(caught(defs, "((pick 2) (pick 1) '())"), "(keyword (#:key))");
@@ -1852,8 +1852,8 @@ fn keyword_calls_through_a_value_match_while_they_run() {
     assert_eq!(caught(defs, "((pick 2) 1 2)"), "(keyword (#:y))");
     assert_eq!(caught(defs, "((pick 2) 1 2 #:y 3 #:z 4)"), "(keyword (#:z))");
     assert_eq!(caught(defs, "((pick 0) 1 #:x 2)"), "(keyword (#:x))");
-    assert_eq!(caught(defs, "((pick 1) #:x 2)"), "(arity ())");
-    assert_eq!(caught(defs, "((pick 1) 1 2 #:x 2)"), "(arity ())");
+    assert_eq!(caught(defs, "((pick 1) #:x 2)"), "(arity (#<procedure one> 0))");
+    assert_eq!(caught(defs, "((pick 1) 1 2 #:x 2)"), "(arity (#<procedure one> 2))");
     assert_eq!(caught(defs, "(5 1 #:x 2)"), "(keyword (#:x))");
 }
 
@@ -2905,6 +2905,12 @@ mod macros;
 
 #[path = "modules.rs"]
 mod modules;
+
+#[path = "case_lambda.rs"]
+mod case_lambda;
+
+#[path = "arity.rs"]
+mod arity;
 
 #[test]
 fn faults_name_the_operation_and_what_it_was_given() {

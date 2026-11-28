@@ -6,7 +6,7 @@ use ragwort_types::pair::{Pair, Pairs};
 use crate::passed::{Passed, Taken};
 use crate::frame::{self, ARGS, CLOSURE, Link};
 use crate::objects::{Bytecode, BytecodeFields, Closure, ClosureFields, Condition, ConditionFields, Continuation, KeywordProcedure, Native, NativeFields, Task, TaskFields};
-use crate::run::{self, Exit, HostThen, MAX_ARGS, Regs, bind};
+use crate::run::{self, Exit, HostThen, MAX_ARGS, Refused, Regs, bind};
 use crate::segments::{CHUNK, Resume, Segments};
 use crate::wind::Kind;
 use crate::module::Deferred;
@@ -326,11 +326,13 @@ pub(crate) struct Outer<'a, 'gc> {
     pub(crate) regs: &'a mut Regs<'gc>,
     /// The root task created by the machine.
     pub(crate) root: Gc<'gc, Task>,
+    /// The call that argument binding refused while the current exit was handled, if any. The arity fault that follows reports it.
+    refused: Option<Refused<'gc>>,
 }
 
 impl<'a, 'gc> Outer<'a, 'gc> {
     fn new(mc: &'a Mutation<'gc>, stack: &'a mut Stack, root: Gc<'gc, Task>, task: Gc<'gc, Task>, regs: &'a mut Regs<'gc>, size: usize) -> Self {
-        Outer { segments: Segments { mc, stack, task, size }, regs, root }
+        Outer { segments: Segments { mc, stack, task, size }, regs, root, refused: None }
     }
 
     pub(crate) fn mc(&self) -> &'a Mutation<'gc> {
@@ -345,11 +347,17 @@ impl<'a, 'gc> Outer<'a, 'gc> {
     /// `Condition` objects, including faults that occur while invoking exception handlers.
     fn exit(&mut self, exit: Exit<'gc>, deferred: &mut Option<Deferred>) -> Step<'gc> {
         let mut blame = Blame::Nothing;
+        self.refused = None;
         let mut step = match exit {
             Exit::Paused => return Ok(Some(Outcome::Paused)),
             Exit::Fault(fault) => {
                 blame = Blame::Instruction;
                 Err(fault)
+            }
+            Exit::Refused(refused) => {
+                self.refused = Some(refused);
+                blame = Blame::Instruction;
+                Err(Fault::Arity)
             }
             Exit::Overflow { callee, argc, rest } => self.overflow(callee, argc, rest).map(|()| None),
             Exit::Underflow => self.resume(),
@@ -375,8 +383,16 @@ impl<'a, 'gc> Outer<'a, 'gc> {
     }
 
     /// Identifies the operation that raised `fault` and the values it was given, according to `blame`.
-    fn origin(&self, fault: Fault, blame: Blame<'gc>) -> Result<Origin<'gc>, Fault> {
+    ///
+    /// `refused` is the call that argument binding refused, if any. An arity fault then came from that call, whatever started the call: a call instruction, an `apply`, or a request that calls a procedure. The irritants are the procedure and the number of arguments.
+    fn origin(&self, fault: Fault, blame: Blame<'gc>, refused: Option<Refused<'gc>>) -> Result<Origin<'gc>, Fault> {
         let mc = self.mc();
+        if let Some(refused) = refused.filter(|_| fault == Fault::Arity) {
+            let given = i64::try_from(refused.given).ok().and_then(Value::fixnum).unwrap_or(Value::VOID);
+            let pairs = Pairs::new(mc);
+            let irritants = pairs.cons(refused.callee, pairs.cons(given, Value::NULL)?.value(mc))?.value(mc);
+            return Ok(Origin { operation: None, irritants });
+        }
         match blame {
             Blame::Instruction => {
                 let (Some(code), Ok(frame)) = (self.regs.code, self.segments.frame(self.regs.fp)) else { return Ok(Origin { operation: None, irritants: Value::NULL }) };
@@ -403,7 +419,8 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         } else {
             None
         };
-        let origin = self.origin(fault, blame)?;
+        let refused = self.refused.take();
+        let origin = self.origin(fault, blame, refused)?;
         let failure = Failure { fault, operation: origin.operation };
         let raised = Value::object(mc, Condition::new(mc, mc.frozen(failure)?, Value::VOID, origin.irritants, Value::FALSE)?);
         // A request can park its task and then fail. The condition is raised on top of the task's frames, so they are saved first.
@@ -762,7 +779,12 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         let closure = frame.get(CLOSURE).downcast::<Closure>(mc).ok_or(Fault::NotProcedure)?;
         // The outer loop independently checks whether a GC step is due, so fuel tracking is omitted here.
         let mut fuel = Fuel { run: 0, rest: 0 };
-        bind(mc, frame, closure.code(mc).ok_or(Fault::Malformed)?.arity(mc), argc, rest, &mut fuel)?;
+        if let Err(fault) = bind(mc, frame, closure.code(mc).ok_or(Fault::Malformed)?.arity(mc), argc, rest, &mut fuel) {
+            if fault == Fault::Arity {
+                self.refused = Some(Refused::new(mc, frame.get(CLOSURE), argc, rest));
+            }
+            return Err(fault);
+        }
         frame::set_link(mc, frame, link)?;
         (self.regs.fp, self.regs.pc) = (fp, 0);
         Ok(())

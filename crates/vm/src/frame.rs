@@ -78,6 +78,10 @@ use ragwort_types::gc::{Frame, Gc, Mutation, Slots, Value, WINDOW};
 use crate::Fault;
 use crate::objects::{BytecodeFields, Closure, ClosureFields};
 
+#[cfg(test)]
+#[path = "tests/frame.rs"]
+mod tests;
+
 /// Register slot 0 of an execution frame, which holds the closure procedure being called (providing the bytecode, constant table, and captured upvalues).
 pub const CLOSURE: u8 = 0;
 /// Register index 1, where the first positional argument is placed in an execution frame.
@@ -97,6 +101,10 @@ pub struct Shape {
     pub required: u64,
     pub optional: u64,
     pub rest: bool,
+    /// The argument counts between `required` and `required + optional` that the procedure refuses. Bit `i - 1` is set if it refuses
+    /// `required + i` arguments. A procedure made from a `case-lambda` has such gaps: one with clauses for one and for three arguments refuses two.
+    /// The mask holds [`Shape::GAPS`] bits, so `i` is at most that.
+    pub refused: u16,
 }
 
 /// Describes the expected number of arguments for a procedure, intrinsic, request, or host function.
@@ -110,6 +118,9 @@ pub enum ExpectedArity {
     AtLeast(u32),
     /// An even number of arguments (e.g. key/value pairs).
     Even,
+    /// One of several counts, as a procedure made from a `case-lambda` takes. Bit `n` of `counts` is set if exactly `n` arguments are
+    /// accepted. With `at_least`, every count from that number on is accepted too.
+    OneOf { counts: u32, at_least: Option<u32> },
 }
 
 impl ExpectedArity {
@@ -121,6 +132,7 @@ impl ExpectedArity {
             ExpectedArity::Range { min, max } => count >= min as usize && count <= max as usize,
             ExpectedArity::AtLeast(min) => count >= min as usize,
             ExpectedArity::Even => count.is_multiple_of(2),
+            ExpectedArity::OneOf { counts, at_least } => (count < 32 && counts >> count & 1 == 1) || at_least.is_some_and(|least| count >= least as usize),
         }
     }
 }
@@ -128,6 +140,25 @@ impl ExpectedArity {
 impl From<Shape> for ExpectedArity {
     fn from(shape: Shape) -> Self {
         let min = u32::try_from(shape.required).unwrap_or(u32::MAX);
+        if shape.refused != 0 && shape.required + shape.optional < 32 {
+            let mut counts = 0u32;
+            for count in shape.required..=shape.required + shape.optional {
+                if !shape.refuses(count) {
+                    counts |= 1 << count;
+                }
+            }
+            // With a rest parameter, every count above the largest listed one is accepted. The listed counts just below join that run.
+            let mut at_least = if shape.rest {
+                Some((shape.required + shape.optional + 1) as u32)
+            } else {
+                None
+            };
+            while let Some(least) = at_least.filter(|&least| least > 0 && counts >> (least - 1) & 1 == 1) {
+                counts &= !(1 << (least - 1));
+                at_least = Some(least - 1);
+            }
+            return ExpectedArity::OneOf { counts, at_least };
+        }
         if shape.rest {
             ExpectedArity::AtLeast(min)
         } else if shape.optional == 0 {
@@ -146,22 +177,36 @@ impl fmt::Display for ExpectedArity {
             ExpectedArity::Range { min, max } => write!(formatter, "expected {min} to {max}"),
             ExpectedArity::AtLeast(min) => write!(formatter, "expected at least {min}"),
             ExpectedArity::Even => formatter.write_str("expected an even number"),
+            ExpectedArity::OneOf { counts, at_least } => {
+                let mut listed: Vec<String> = (0..32).filter(|count| counts >> count & 1 == 1).map(|count| count.to_string()).collect();
+                listed.extend(at_least.map(|least| format!("at least {least}")));
+                let last = listed.pop().unwrap_or_default();
+                if listed.is_empty() {
+                    write!(formatter, "expected {last}")
+                } else {
+                    write!(formatter, "expected {} or {last}", listed.join(", "))
+                }
+            }
         }
     }
 }
 
-/// Bit flag (bit 48) marking an encoded arity integer that contains optional parameters, with parameter counts stored in the lower bits.
+/// Bit flag (bit 48) marking an encoded arity integer that contains optional parameters, with parameter counts stored in the lower bits. The counts
+/// that the procedure refuses are in the bits from [`REFUSED`] up.
 const OPTIONAL: i64 = 1 << 48;
+/// The position of the lowest bit of [`Shape::refused`] in an encoded arity.
+const REFUSED: u32 = 33;
 
 impl Shape {
     /// Encodes this parameter shape as an `i64` arity representation stored in [`crate::objects::Bytecode`]. Without optional parameters, it follows Chez Scheme encoding: `n >= 0` for exactly `n` arguments, and `-(n + 1)` for at least `n` arguments with a rest list. With optional parameters, required and optional counts (16 bits each) and the rest flag are tagged with the high `OPTIONAL` bit, ensuring calls take the general arity-checking path. Returns `None` if counts exceed 16 bits.
     pub fn encode(self) -> Option<i64> {
         let required = i64::try_from(self.required).ok()?;
         Some(match (self.optional, self.rest) {
+            _ if u32::from(self.refused) >> Self::GAPS != 0 || (self.optional == 0 && self.refused != 0) => return None,
             (0, false) => required,
             (0, true) => -required - 1,
             (optional, rest) if self.required <= 0xFFFF && optional <= 0xFFFF => {
-                OPTIONAL | required | (optional as i64) << 16 | i64::from(rest) << 32
+                OPTIONAL | required | (optional as i64) << 16 | i64::from(rest) << 32 | i64::from(self.refused) << REFUSED
             }
             _ => return None,
         })
@@ -169,12 +214,23 @@ impl Shape {
 
     pub fn of(arity: i64) -> Self {
         if arity < 0 {
-            return Self { required: (-(arity + 1)) as u64, optional: 0, rest: true };
+            return Self { required: (-(arity + 1)) as u64, optional: 0, rest: true, refused: 0 };
         }
         if arity & OPTIONAL == 0 {
-            return Self { required: arity as u64, optional: 0, rest: false };
+            return Self { required: arity as u64, optional: 0, rest: false, refused: 0 };
         }
-        Self { required: (arity & 0xFFFF) as u64, optional: (arity >> 16 & 0xFFFF) as u64, rest: arity >> 32 & 1 == 1 }
+        let refused = (arity >> REFUSED) as u16 & ((1 << Self::GAPS) - 1);
+        Self { required: (arity & 0xFFFF) as u64, optional: (arity >> 16 & 0xFFFF) as u64, rest: arity >> 32 & 1 == 1, refused }
+    }
+
+    /// The number of bits of [`Shape::refused`] that an encoded arity holds.
+    pub const GAPS: u32 = 15;
+
+    /// Returns whether the procedure refuses `count` arguments, although `count` is between `required` and `required + optional`.
+    #[inline]
+    pub fn refuses(self, count: u64) -> bool {
+        let extra = count.wrapping_sub(self.required);
+        extra >= 1 && extra <= u64::from(Self::GAPS) && extra <= self.optional && self.refused >> (extra - 1) & 1 == 1
     }
 
     /// Returns the total number of parameter slots bound by this shape, counting the rest list parameter as a single slot if present.
@@ -184,7 +240,7 @@ impl Shape {
 
     /// Returns `true` if this parameter shape accepts `count` positional arguments.
     pub fn takes(self, count: u64) -> bool {
-        count >= self.required && (self.rest || count <= self.required + self.optional)
+        count >= self.required && (self.rest || count <= self.required + self.optional) && !self.refuses(count)
     }
 }
 

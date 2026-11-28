@@ -26,7 +26,7 @@ fn join<'id>(t: &mut L4<'id, 'static>, params: &[u32], scope: Id<'id>) -> Id<'id
 /// Builds a zero-argument closure with `captures` and `body`.
 fn closure<'id>(t: &mut L4<'id, 'static>, captures: &[UpvalSource], body: Id<'id>) -> Fun<'id> {
     let (params, captures) = (t.list([]), t.list(captures.iter().copied()));
-    t.closure(Closure { id: 0, optional: 0, params, rest: None, captures, body })
+    t.closure(Closure { id: 0, optional: 0, refused: 0, params, rest: None, captures, body })
 }
 
 #[test]

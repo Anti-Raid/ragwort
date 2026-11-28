@@ -249,7 +249,7 @@ b0:
 
 fn function<'a, 'gc>(arena: &'a Trees, values: u32, blocks: Vec<BlockData<'a, 'gc>>) -> Function<'a, 'gc> {
     let blocks = blocks.into_iter().collect_in(arena);
-    Function { id: None, this: Val(0), params: arena.vec(), optional: 0, rest: None, upvalues: 0, blocks, values }
+    Function { id: None, this: Val(0), params: arena.vec(), optional: 0, refused: 0, rest: None, upvalues: 0, blocks, values }
 }
 
 fn block<'a, 'gc>(arena: &'a Trees, params: &[u32], insts: Vec<Inst<'a, 'gc>>, end: End<'a>) -> BlockData<'a, 'gc> {
@@ -327,7 +327,7 @@ fn deep<'id, 'gc>(t: &mut L4<'id, 'gc>) -> Id<'id> {
     let mut lambdas = quote(t, Value::fixnum(0).unwrap());
     for id in 0..LAMBDAS {
         let (params, captures) = (t.list([]), t.list([]));
-        let fun = t.closure(Closure { id, optional: 0, params, rest: None, captures, body: lambdas });
+        let fun = t.closure(Closure { id, optional: 0, refused: 0, params, rest: None, captures, body: lambdas });
         lambdas = t.add(Node::Lambda(fun));
     }
     let test = quote(t, Value::FALSE);

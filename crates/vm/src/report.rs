@@ -49,7 +49,8 @@ pub fn procedure_expected_arity<'gc>(mc: &Mutation<'gc>, procedure: Value<'gc>) 
         if let Some(plain) = keyword.plain(mc).downcast::<Closure>(mc) {
             return plain.code(mc).map(|code| ExpectedArity::from(Shape::of(code.arity(mc))));
         }
-        return keyword.core(mc).downcast::<Closure>(mc).and_then(|c| c.code(mc)).map(|code| ExpectedArity::from(Shape::of(code.arity(mc))));
+        // The core closure also takes one argument for each keyword, so the positional parameters are read from the signature.
+        return crate::keyword::signature(mc, procedure).map(|(_, shape)| ExpectedArity::from(shape));
     }
     if let Some(kind) = procedure.downcast::<StructType>(mc) {
         return Some(ExpectedArity::Exactly(StructTypeFields::fields(kind, mc)));
@@ -113,10 +114,6 @@ fn list<'gc>(mc: &Mutation<'gc>, values: impl DoubleEndedIterator<Item = Value<'
     Ok(list)
 }
 
-fn count<'gc>(number: u8) -> Value<'gc> {
-    Value::fixnum(i64::from(number)).unwrap_or(Value::VOID)
-}
-
 /// Identifies the origin of `fault` from the instruction that raised it: the instruction before `pc` in `code`, executing in `frame`.
 ///
 /// Returns an origin with no name and no irritants when the instruction does not explain the fault.
@@ -135,14 +132,8 @@ pub(crate) fn origin<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, code: Gc<'g
         Op::TableSetHinted { table, value, hint, .. } => (Some(Operation::Intrinsic(Intrinsic::TableSet)), list(mc, [frame.get(table), hint_key(mc, code, hint), frame.get(value)].into_iter())?),
         Op::AddImm { a: operand, imm, .. } => (Some(Operation::Intrinsic(Intrinsic::Add)), list(mc, [frame.get(operand), Value::fixnum(i64::from(imm)).unwrap_or(Value::VOID)].into_iter())?),
         Op::StructField { a: instance, .. } | Op::StructRef { a: instance, .. } => (None, list(mc, [frame.get(instance)].into_iter())?),
-        Op::Call { base, args } if fault == Fault::Arity => (None, list(mc, [frame.get(base), count(args)].into_iter())?),
-        // A failed tail call has already moved the callee into the frame's closure register.
-        Op::TailCall { args, .. } if fault == Fault::Arity => (None, list(mc, [frame.get(CLOSURE), count(args)].into_iter())?),
         // `received` is the number of values the accumulator held. A load takes exactly one value, so the irritant is that number.
         Op::LoadAcc { .. } if fault == Fault::ValueCount => (None, list(mc, [received].into_iter())?),
-        // A receiving call passes the values in the accumulator, so `received` is its number of arguments. A failed tail call has already moved the callee, as above.
-        Op::CallReceived { base } if fault == Fault::Arity => (None, list(mc, [frame.get(base), received].into_iter())?),
-        Op::TailCallReceived { .. } if fault == Fault::Arity => (None, list(mc, [frame.get(CLOSURE), received].into_iter())?),
         Op::LoadSlotChecked { slot, .. } | Op::StoreSlotChecked { slot, .. } if fault == Fault::Unbound => {
             let names = code.module(mc).and_then(|module| AnyVector::of(module.names(mc)));
             let Some(name) = names.and_then(|names| names.get(mc, slot as usize)) else { return Ok(unknown) };
@@ -155,6 +146,12 @@ pub(crate) fn origin<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, code: Gc<'g
         }
         _ => return Ok(unknown),
     };
+    // A procedure that checks the number of its arguments itself refuses the call that it is running. The irritants are those of a refused call: the procedure
+    // and the number of arguments.
+    if fault == Fault::Arity && operation == Some(Operation::Intrinsic(Intrinsic::RefuseArity)) {
+        let given = Pair::of(irritants).map_or(Value::VOID, |cell| cell.head(mc));
+        return Ok(Origin { operation, irritants: list(mc, [frame.get(CLOSURE), given].into_iter())? });
+    }
     Ok(Origin { operation, irritants })
 }
 
@@ -459,6 +456,13 @@ pub fn decode<'gc>(mc: &Mutation<'gc>, raised: Value<'gc>) -> Raised<'gc> {
         Fault::Immutable => Raised::Immutable { operation, operands },
         Fault::Num(error) => Raised::Number { error, operation, operands },
         Fault::Str(error) => Raised::String { error, operation, operands },
+        // Such a procedure takes numbers of arguments that its arity does not describe, so the report says none.
+        Fault::Arity if operation == Some(Operation::Intrinsic(Intrinsic::RefuseArity)) => Raised::Arity {
+            operation: None,
+            procedure: first,
+            expected: None,
+            given: Pair::of(operands).and_then(|cell| Pair::of(cell.tail(mc))).and_then(|cell| cell.head(mc).as_fixnum()).and_then(|given| usize::try_from(given).ok()).unwrap_or(0),
+        },
         Fault::Arity if operation.is_some() => Raised::Arity {
             operation,
             procedure: None,
@@ -490,6 +494,10 @@ pub fn decode<'gc>(mc: &Mutation<'gc>, raised: Value<'gc>) -> Raised<'gc> {
 /// Returns the name of the operation that raised `condition` as a symbol, or `#f` when the VM identified none.
 pub(crate) fn who<'gc>(mc: &Mutation<'gc>, condition: Gc<'gc, Condition>) -> Result<Value<'gc>, Fault> {
     let Some(operation) = condition.failure(mc).and_then(|failure| failure.operation) else { return Ok(Value::FALSE) };
+    // The operation that refuses a call for its procedure is not one that a program names.
+    if operation == Operation::Intrinsic(Intrinsic::RefuseArity) {
+        return Ok(Value::FALSE);
+    }
     Ok(ragwort_types::symbol::Symbols::of_arena(mc)?.intern_str(&Strings::new(mc), operation.name())?.value(mc))
 }
 

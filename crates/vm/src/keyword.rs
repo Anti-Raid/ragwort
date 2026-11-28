@@ -39,8 +39,27 @@ pub fn signature<'gc>(mc: &Mutation<'gc>, callee: Value<'gc>) -> Option<(Vec<(Ke
 pub(crate) fn positional<'gc>(mc: &Mutation<'gc>, callee: Gc<'gc, KeywordProcedure>, args: Passed<'gc>) -> Result<Then<'gc>, Fault> {
     match callee.plain(mc) {
         Value::FALSE => apply(mc, Value::object(mc, callee), Value::NULL, Value::NULL, args),
-        plain => Ok(Then::Call(plain, args)),
+        plain => match untaken(mc, plain, 0, args) {
+            Some(given) => refuse(mc, callee, given),
+            None => Ok(Then::Call(plain, args)),
+        },
     }
+}
+
+/// Returns the number of values in `args` if closure `procedure` does not take that number of arguments after `leading` others. Returns `None` if it takes them, and for arguments that cannot be counted, which the call itself then reports.
+fn untaken<'gc>(mc: &Mutation<'gc>, procedure: Value<'gc>, leading: u64, args: Passed<'gc>) -> Option<u64> {
+    let shape = Shape::of(procedure.downcast::<Closure>(mc)?.code(mc)?.arity(mc));
+    args.len(mc).filter(|&given| !shape.takes(leading + given))
+}
+
+/// Raises the arity error of a call that passes `given` positional arguments to keyword procedure `callee`.
+///
+/// The error names the keyword procedure and counts the positional arguments only. The closure that would run for the call has another name or none, and the core closure also takes the keyword values as arguments.
+fn refuse<'gc>(mc: &Mutation<'gc>, callee: Gc<'gc, KeywordProcedure>, given: u64) -> Result<Then<'gc>, Fault> {
+    let pairs = Pairs::new(mc);
+    let given = i64::try_from(given).ok().and_then(Value::fixnum).unwrap_or(Value::VOID);
+    let irritants = pairs.cons(Value::object(mc, callee), pairs.cons(given, Value::NULL)?.value(mc))?.value(mc);
+    Ok(Then::Raise(condition(mc, Fault::Arity, Value::VOID, irritants)?, false))
 }
 
 /// Implements `(keyword-apply f kws vals arg ...)`: invokes `callee` with keyword arguments `kws` (which must be sorted and distinct) and corresponding values `vals`, followed by positional arguments `args`. Raises a keyword fault if an unexpected keyword is supplied or if a required keyword is missing.
@@ -77,6 +96,9 @@ pub(crate) fn apply<'gc>(mc: &Mutation<'gc>, callee: Value<'gc>, kws: Value<'gc>
             None if required.contains(&accepted.value(mc)) => return raise(mc, "missing required keyword", accepted.value(mc)),
             None => values.push(Value::UNSUPPLIED),
         }
+    }
+    if let Some(given) = untaken(mc, callee.core(mc), values.len() as u64, args) {
+        return refuse(mc, callee, given);
     }
     let list = pairs.list_with_tail(values, args.to_list(mc)?)?;
     Ok(Then::Call(callee.core(mc), Passed::list(list)))

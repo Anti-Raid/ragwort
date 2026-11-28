@@ -1776,7 +1776,7 @@ impl<'gc> ModuleBuilder<'gc> {
             Form::Expr(core) => (core, None),
             Form::Define(slot, value) => {
                 // For a keyword procedure, the lambda is lowered to the core procedure, and the core has its own slot.
-                let procedure = matches!(value, Core::Lambda(_) | Core::OptionalLambda(_));
+                let procedure = matches!(value, Core::Lambda(_) | Core::OptionalLambda(_) | Core::CaseLambda(_));
                 let defined = self.cores.get(&slot).map_or(slot, |&(core, _)| core);
                 let defining = if procedure {
                     Some(defined)

@@ -86,6 +86,8 @@ impl<'id, 'gc> Bodies<'id, 'gc> for JoinCode<'id> {
 pub(crate) struct Closure<'id> {
     pub(crate) id: u32,
     pub(crate) optional: u32,
+    /// The argument counts that the function refuses although `optional` allows them, as in `Shape::refused` of the VM. A function made from a `case-lambda` has them.
+    pub(crate) refused: u16,
     pub(crate) params: Span<'id, Var>,
     pub(crate) rest: Option<Var>,
     pub(crate) captures: Span<'id, UpvalSource>,

@@ -60,6 +60,8 @@ pub(crate) struct Function<'a, 'gc> {
     /// The formal parameter values. The caller may omit up to the last `optional` parameters.
     pub(crate) params: Vec<'a, Val>,
     pub(crate) optional: u32,
+    /// The argument counts that the function refuses although `optional` allows them, as in `Shape::refused` of the VM. A function made from a `case-lambda` has them.
+    pub(crate) refused: u16,
     /// The rest parameter holding any surplus arguments as a Scheme list, or `None` if absent.
     pub(crate) rest: Option<Val>,
     /// The number of upvalues captured by closures of this function.
@@ -208,14 +210,14 @@ impl End<'_> {
 /// Each function is lowered independently by its own [`Builder`]. Closures are lowered in a stack-oriented,
 /// bottom-up order, with nested closure functions emitted ahead of the functions enclosing them.
 pub(crate) fn lower<'a, 'id, 'gc>(arena: &'a Arena, tree: &L4<'id, 'gc>, root: Id<'id>) -> Result<Program<'a, 'gc>, CompileError> {
-    let top = Formals { params: &[], optional: 0, rest: None };
+    let top = Formals { params: &[], optional: 0, refused: 0, rest: None };
     let mut stack = vec![Builder::new(arena, tree, None, top, 0, root)];
     let mut functions = std::vec::Vec::new();
     loop {
         let builder = stack.last_mut().expect("lowering until the code is done");
         if let Some((fun, upvalues)) = builder.run()? {
             let clos = tree[fun];
-            let formals = Formals { params: &tree[clos.params], optional: clos.optional, rest: clos.rest };
+            let formals = Formals { params: &tree[clos.params], optional: clos.optional, refused: clos.refused, rest: clos.rest };
             stack.push(Builder::new(arena, tree, Some(clos.id), formals, upvalues, clos.body));
             continue;
         }
@@ -240,6 +242,7 @@ pub(crate) fn check(program: &Program<'_, '_>) {
 struct Formals<'a> {
     params: &'a [Var],
     optional: u32,
+    refused: u16,
     rest: Option<Var>,
 }
 
@@ -283,6 +286,7 @@ struct Builder<'a, 't, 'id, 'gc> {
     id: Option<u32>,
     params: Vec<'a, Val>,
     optional: u32,
+    refused: u16,
     rest: Option<Val>,
     upvalues: u32,
     blocks: std::vec::Vec<Building<'a, 'gc>>,
@@ -445,6 +449,7 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
             id,
             params: arena.vec(),
             optional: formals.optional,
+            refused: formals.refused,
             rest: None,
             upvalues,
             blocks: vec![Building { params: arena.vec(), insts: arena.vec(), sites: std::vec::Vec::new(), end: None, end_site: 0 }],
@@ -475,8 +480,8 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
             end: block.end.expect("every block made ends"),
             end_site: block.end_site,
         });
-        let (id, this, params, optional, rest, upvalues) = (self.id, self.this, self.params, self.optional, self.rest, self.upvalues);
-        Function { id, this, params, optional, rest, upvalues, blocks: blocks.collect_in(self.arena), values: self.next }
+        let (id, this, params, optional, refused, rest, upvalues) = (self.id, self.this, self.params, self.optional, self.refused, self.rest, self.upvalues);
+        Function { id, this, params, optional, refused, rest, upvalues, blocks: blocks.collect_in(self.arena), values: self.next }
     }
 
     /// Drives lowering until the function is complete, or until compilation pauses because the code

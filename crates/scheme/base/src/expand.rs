@@ -31,6 +31,7 @@ pub enum Form {
     Quote,
     If,
     Lambda,
+    CaseLambda,
     Define,
     Set,
     Begin,
@@ -96,12 +97,13 @@ pub enum Keyword {
     Aux(Aux),
 }
 
-const KEYWORDS: [(&str, Keyword); 45] = [
+const KEYWORDS: [(&str, Keyword); 46] = [
     ("struct-copy", Keyword::Macro(Macro::StructCopy)),
     ("struct", Keyword::Form(Form::Struct)),
     ("quote", Keyword::Form(Form::Quote)),
     ("if", Keyword::Form(Form::If)),
     ("lambda", Keyword::Form(Form::Lambda)),
+    ("case-lambda", Keyword::Form(Form::CaseLambda)),
     ("define", Keyword::Form(Form::Define)),
     ("set!", Keyword::Form(Form::Set)),
     ("begin", Keyword::Form(Form::Begin)),
@@ -542,6 +544,10 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 Ok(Step::Done(Core::If(Box::new(test), Box::new(then), Box::new(other))))
             }),
             (Form::Lambda, &[formals, ref body @ ..]) => self.lambda(stx, formals, body.to_vec()),
+            (Form::CaseLambda, clauses) => {
+                let lambda = self.introduce("lambda", stx)?;
+                self.case_lambda(stx, clauses.to_vec(), lambda)
+            }
             (Form::Define | Form::Require | Form::Provide | Form::Struct, _) => Err(self.error(ExpandErrorKind::Definition, stx)),
             (Form::Set, &[id, value]) if self.is_id(id) => self.set(id, value),
             (Form::Begin, &[_, ..]) => self.sequence(items[1..].to_vec()),

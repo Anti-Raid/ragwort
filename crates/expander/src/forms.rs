@@ -8,7 +8,8 @@
 //! core form only if a macro from native ragwort introduced it.
 
 use ragwort_compiler::steps::Step;
-use ragwort_compiler::{Arg, Core, Formal, Lambda, OptionalLambda, Prim, Var, keyword};
+use ragwort_compiler::{Arg, CaseLambda, Core, Formal, Lambda, OptionalLambda, Prim, Var, keyword};
+use ragwort_types::gc::Value;
 use ragwort_types::symbol::Keyword;
 use ragwort_vm::HostDef;
 
@@ -36,6 +37,7 @@ pub enum CoreForm {
     Break,
     Continue,
     Begin,
+    CaseLambda,
     Define,
     DefineSyntax,
     Struct,
@@ -54,7 +56,7 @@ pub enum CoreForm {
 
 impl CoreForm {
     /// The names of the core forms. `quote` and `syntax` are the forms that the reader's `'` and `#'` stand for.
-    pub const NAMED: [(&'static str, CoreForm); 33] = [
+    pub const NAMED: [(&'static str, CoreForm); 34] = [
         ("%struct", CoreForm::Struct),
         ("%quote", CoreForm::Quote),
         ("%if", CoreForm::If),
@@ -74,6 +76,7 @@ impl CoreForm {
         ("%break", CoreForm::Break),
         ("%continue", CoreForm::Continue),
         ("%begin", CoreForm::Begin),
+        ("%case-lambda", CoreForm::CaseLambda),
         ("%define-syntax", CoreForm::DefineSyntax),
         ("%syntax-case", CoreForm::SyntaxCase),
         ("%syntax", CoreForm::Syntax),
@@ -155,10 +158,45 @@ pub trait Forms<'a, 'gc: 'a>: Host<'a, 'gc> {
             (CoreForm::Begin, &[_, ..]) => sequence(self, items[1..].to_vec(), Wrap::None),
             (CoreForm::SyntaxCase, &[input, literals, ref clauses @ ..]) => self.syntax_case(input, literals, clauses.to_vec()),
             (CoreForm::Syntax, &[template]) => Ok(Step::Done(self.syntax(template)?)),
+            (CoreForm::CaseLambda, clauses) => {
+                let lambda = self.core_id("%lambda", stx)?;
+                self.case_lambda(stx, clauses.to_vec(), lambda)
+            }
             (CoreForm::SyntaxRules, &[literals, ref rules @ ..]) => Ok(Step::Tail(Call::Expr(syntax_rules(self, stx, literals, rules)?))),
             (CoreForm::Unsupported, _) => Err(self.error(ExpandErrorKind::Unsupported, stx)),
             _ => Err(self.error(ExpandErrorKind::BadSyntax, stx)),
         }
+    }
+
+    /// Returns the first step of expanding the `case-lambda` form `stx`, whose clauses are `clauses`. A clause is `(formals body ...)`. It is expanded
+    /// as the language's lambda with those formals and that body: `lambda` is the identifier of the language's lambda form.
+    ///
+    /// The result is a [`Core::CaseLambda`]. A clause whose formals have a default or a keyword is an error.
+    fn case_lambda(&mut self, stx: Stx, clauses: Vec<Stx>, lambda: Stx) -> Result<Ex<'a, 'gc, Self>, ExpandError> {
+        if clauses.is_empty() {
+            return Err(self.error(ExpandErrorKind::BadSyntax, stx));
+        }
+        let mut lambdas = Vec::with_capacity(clauses.len());
+        for &clause in &clauses {
+            let parts = self.proper(clause)?;
+            if parts.len() < 2 {
+                return Err(self.error(ExpandErrorKind::BadSyntax, clause));
+            }
+            let span = self.tree.span(clause);
+            lambdas.push(self.tree.list(&[&[lambda], parts.as_slice()].concat(), None, span)?);
+        }
+        Self::exprs(lambdas, move |this, mut expanded| {
+            let mut plain = Vec::with_capacity(expanded.len());
+            for (index, clause) in expanded.iter_mut().enumerate() {
+                // A core form cannot be taken apart by value, so the lambda is swapped out of it.
+                let empty = Lambda { id: 0, optional: 0, params: Vec::new(), rest: None, body: Box::new(Core::Quote(Value::VOID)), name: None, at: None };
+                match clause {
+                    Core::Lambda(found) if found.optional == 0 => plain.push(std::mem::replace(found, empty)),
+                    _ => return Err(this.error(ExpandErrorKind::BadSyntax, clauses[index])),
+                }
+            }
+            Ok(Step::Done(Core::CaseLambda(CaseLambda { id: this.lambda_id(), clauses: plain, name: None, at: this.position(stx) })))
+        })
     }
 }
 

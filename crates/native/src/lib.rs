@@ -13,6 +13,7 @@
 //! (%require spec ...)
 //! (%provide spec ...)
 //! (%lambda (name ... . rest) body ...)   (%lambda rest body ...)
+//! (%case-lambda ((name ... . rest) body ...) ...)
 //! (%app f arg ...)
 //! (%intrinsic name arg ...)
 //! (%apply-intrinsic name arg ... list)
@@ -50,6 +51,9 @@
 //! - A macro's output can define further macros. A macro whose name the output introduces is known only to that output, like a variable that it defines.
 //! - `(%provide name)` exports a macro as it exports a variable. A module of any language can require the macro, because the macro's output is made of core forms. The parts of a use are then expressions of the using module's language.
 //! - The output of a macro is checked like code of the module that uses the macro. A `%call-host` in it must name a host function of that module, and an `%intrinsic` in it can name an internal intrinsic only if that module can.
+//!
+//! `%case-lambda` makes a procedure with several clauses. A call runs the first clause that takes the number of arguments of the call, and a
+//! number that no clause takes is an arity error. A clause is written like a `%lambda` without its name, and its parameters have no defaults or keywords.
 //!
 //! The last argument of `%apply-intrinsic` is a list of further arguments:
 //! `(%apply-intrinsic + 1 2 '(3 4))` computes the same as `(%intrinsic + 1 2 3 4)`.

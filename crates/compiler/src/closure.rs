@@ -177,7 +177,7 @@ impl<'s, 'id, 'gc> Convert<'_, 's, 'id, 'gc> {
                     .collect();
                 let closure = from[fun];
                 let (captures, params) = (self.tree.list(captures), self.tree.list(from[closure.params].iter().copied()));
-                let fun = self.tree.closure(l4::Closure { id: closure.id, optional: closure.optional, params, rest: closure.rest, captures, body });
+                let fun = self.tree.closure(l4::Closure { id: closure.id, optional: closure.optional, refused: closure.refused, params, rest: closure.rest, captures, body });
                 self.funs.push(fun);
             }
             Task::Val(var) => {

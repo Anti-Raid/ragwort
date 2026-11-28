@@ -106,3 +106,18 @@ fn bad_macros_are_reported() {
     // A macro's name is not a variable.
     assert_eq!(error("(%define-syntax m (%syntax-rules () ((_) 'a))) (%set! m 'b)"), (BadShape, "m"));
 }
+
+#[test]
+fn case_lambda_picks_a_clause_by_the_number_of_arguments() {
+    let pick = "(%define pick (%case-lambda (() 'none) ((a) a) ((a b . more) (%intrinsic cons b more))))
+                (%intrinsic cons (%app pick) (%intrinsic cons (%app pick 'one) (%intrinsic cons (%app pick 'one 'two 'three) '())))";
+    assert_eq!(eval(pick), "(none one (two three))");
+    // A macro can make one, and a clause is a `%lambda` without defaults or keywords.
+    let made = "(%define-syntax two-way (%syntax-rules () ((_ one two) (%case-lambda ((a) one) ((a b) two)))))
+                (%let ((f (two-way 'single 'double))) (%intrinsic cons (%app f 1) (%app f 1 2)))";
+    assert_eq!(eval(made), "(single . double)");
+    assert_eq!(fault("(%define f (%case-lambda ((a) a) ((a b c) c))) (%app f 1 2)"), Fault::Arity);
+    assert_eq!(error("(%case-lambda)"), (BadShape, "(%case-lambda)"));
+    assert_eq!(error("(%case-lambda ((a (b 1)) a))"), (BadShape, "((a (b 1)) a)"));
+    assert_eq!(error("(%case-lambda ((a)))"), (BadShape, "((a))"));
+}

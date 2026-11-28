@@ -73,6 +73,8 @@ pub(crate) enum Exit<'gc> {
     /// segment.
     Overflow { callee: usize, argc: u8, rest: Value<'gc> },
     Underflow,
+    /// A call of a closure that does not take the number of arguments it was given.
+    Refused(Refused<'gc>),
     /// An invocation of a non-closure procedure located in register `base`, passing `argc` following
     /// registers and elements of `rest` as arguments.
     Call { base: u8, argc: u8, rest: Value<'gc>, tail: bool },
@@ -94,6 +96,59 @@ pub(crate) enum HostThen<'gc> {
 
 impl From<Fault> for Exit<'_> {
     fn from(fault: Fault) -> Self {
+        Exit::Fault(fault)
+    }
+}
+
+/// A call that argument binding refused with [`Fault::Arity`]: the procedure, and the number of arguments it was given.
+///
+/// The binder builds this record itself, because the call cannot be read back from the frame afterwards. The arguments of an `apply` come from a list, and binding overwrites the register that held the list.
+#[derive(Clone, Copy)]
+pub(crate) struct Refused<'gc> {
+    pub(crate) callee: Value<'gc>,
+    pub(crate) given: u64,
+}
+
+impl<'gc> Refused<'gc> {
+    /// Describes a call of `callee` with `argc` arguments in registers, followed by the elements of `rest`.
+    pub(crate) fn new(mc: &Mutation<'gc>, callee: Value<'gc>, argc: u8, rest: Value<'gc>) -> Self {
+        let listed = match Pairs::new(mc).list_len(rest) {
+            Some(listed) => listed,
+            // An improper list is refused for the pairs it has, so they are counted one by one.
+            None => {
+                let (mut listed, mut at) = (0, rest);
+                while let Some(pair) = Pair::of(at) {
+                    listed += 1;
+                    at = pair.tail(mc);
+                }
+                listed
+            }
+        };
+        Refused { callee, given: u64::from(argc) + listed }
+    }
+}
+
+/// Returns whether `closure` takes `argc` arguments followed by the elements of `rest`. Returns `false` if `rest` is not a list.
+///
+/// Most calls pass exactly the parameters of the closure in registers, which one comparison finds out.
+#[inline(always)]
+fn takes<'gc>(mc: &Mutation<'gc>, closure: Gc<'gc, Closure>, argc: u8, rest: Value<'gc>) -> bool {
+    let exact = rest == Value::NULL && closure.code(mc).is_some_and(|code| code.arity(mc) == i64::from(argc));
+    exact || takes_slow(mc, closure, argc, rest)
+}
+
+#[inline(never)]
+fn takes_slow<'gc>(mc: &Mutation<'gc>, closure: Gc<'gc, Closure>, argc: u8, rest: Value<'gc>) -> bool {
+    let given = Pairs::new(mc).list_len(rest).map(|listed| listed + u64::from(argc));
+    closure.code(mc).zip(given).is_some_and(|(code, given)| Shape::of(code.arity(mc)).takes(given))
+}
+
+/// Returns the exit for a call that argument binding failed with `fault`. `frame` is the frame of the callee, and `call` is the call as it was made.
+#[inline(never)]
+fn bind_failed<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, call: Call<'gc>, fault: Fault) -> Exit<'gc> {
+    if fault == Fault::Arity {
+        Exit::Refused(Refused::new(mc, frame.get(CLOSURE), call.argc, call.rest))
+    } else {
         Exit::Fault(fault)
     }
 }
@@ -284,9 +339,7 @@ impl<'s, 'gc> Run<'s, 'gc> {
         let Some(keyed) = frame.get(base).downcast::<KeywordProcedure>(mc) else { return Err(exit) };
         let plain = keyed.plain(mc);
         let Some(closure) = plain.downcast::<Closure>(mc) else { return Err(exit) };
-        let given = Pairs::new(mc).list_len(rest).map(|listed| listed + u64::from(argc));
-        let takes = closure.code(mc).zip(given).is_some_and(|(code, given)| Shape::of(code.arity(mc)).takes(given));
-        if !takes {
+        if !takes(mc, closure, argc, rest) {
             return Err(exit);
         }
         frame.set(base, plain);
@@ -304,7 +357,7 @@ impl<'s, 'gc> Run<'s, 'gc> {
             // Because a tail call overwrites the current frame with the callee, write the return link
             // immediately so fault unwinding finds a valid linkage.
             frame.set(frame::link_slot(arity), link);
-            return Err(fault.into());
+            return Err(bind_failed(mc, frame, call, fault));
         }
         self.switch(closure, code)?;
         frame.set(self.link, link);
@@ -667,13 +720,14 @@ impl<'s, 'gc> Run<'s, 'gc> {
     /// - A required keyword is missing.
     /// - The keywords are out of order.
     /// - The procedure accepts more than [`KEYWORDS`] keywords.
+    /// - The procedure does not take the number of positional arguments.
     /// - The laid-out call does not fit in the frame window.
     #[inline(never)]
     fn keyword_call(&mut self, base: u8, args: u8) -> Option<Call<'gc>> {
         let (mc, frame) = (self.cx.mc, self.cx.frame);
         let callee = frame.get(base).downcast::<KeywordProcedure>(mc)?;
         let core = callee.core(mc);
-        core.downcast::<Closure>(mc)?;
+        let closure = core.downcast::<Closure>(mc)?;
         let pairs = Pairs::new(mc);
         let (mut given, mut values) = (frame.get(base + 1), frame.get(base + 2));
         let mut passed = [Value::UNSUPPLIED; KEYWORDS];
@@ -699,6 +753,9 @@ impl<'s, 'gc> Run<'s, 'gc> {
         // The positional arguments are in the registers after the three operands, and the last register holds the list of the rest.
         let positional = usize::from(args) - 4;
         let rest = frame.get(base + args - 1);
+        if !takes(mc, closure, (count + positional) as u8, rest) {
+            return None;
+        }
         // The core is placed in the register just below its first argument. Up to two keyword values fit in the registers of the `keyword-apply` operands. Each further keyword value shifts the positional arguments up by one register.
         let shift = count.saturating_sub(2);
         let core_at = usize::from(base) + 2 + shift - count;
@@ -840,6 +897,8 @@ fn bind_slow<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, mut arg
         return bind_spread(mc, frame, shape, argc, rest);
     }
     let (required, fixed) = counts(shape)?;
+    // Whether the arguments have run out, so the remaining parameters are unsupplied. A procedure without gaps has nothing to check then.
+    let mut out = shape.refused == 0;
     while argc < fixed {
         let item = match Pair::of(rest) {
             Some(pair) => {
@@ -848,7 +907,12 @@ fn bind_slow<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, arity: i64, mut arg
             }
             None if rest != Value::NULL => return Err(Fault::WrongType),
             None if argc < required => return Err(Fault::Arity),
-            None => Value::UNSUPPLIED,
+            // When the arguments run out, `argc` is their number. A procedure made from a `case-lambda` refuses some numbers.
+            None if !out && shape.refuses(u64::from(argc)) => return Err(Fault::Arity),
+            None => {
+                out = true;
+                Value::UNSUPPLIED
+            }
         };
         frame.set(ARGS + argc, item);
         argc += 1;

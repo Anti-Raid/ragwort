@@ -413,3 +413,17 @@ fn the_list_of_what_each_library_provides_matches_the_libraries() {
         assert_eq!(library_of("no-such-procedure"), None);
     });
 }
+
+#[test]
+fn a_case_lambda_is_a_procedure_like_any_other_across_modules() {
+    let mut arena = arena();
+    let library = "(define area (case-lambda [(side) (* side side)] [(width height) (* width height)]))
+                   (define-syntax describe (syntax-rules () ((_ x ...) (case-lambda [() 'none] [(extra) (list extra x ...)]))))
+                   (provide area describe)";
+    assert_eq!(module_in(&mut arena, "shapes", &[(Scheme, library)]), Ok(Ok("#<void>".into())));
+    // Another module calls it, passes it on, and gets one from a macro. A native module calls it too.
+    let user = "(require shapes) (define d (describe 1 2)) (list (area 3) (area 2 5) (map area '(1 2)) (d) (d 0))";
+    assert_eq!(module_in(&mut arena, "user", &[(Scheme, user)]), Ok(Ok("(9 10 (1 4) none (0 1 2))".into())));
+    assert_eq!(module_in(&mut arena, "native-user", &[(Native, "(%require shapes) (%app area 4 5)")]), Ok(Ok("20".into())));
+    assert_eq!(module_in(&mut arena, "wrong", &[(Scheme, "(require shapes) (area 1 2 3)")]), Ok(Err(Fault::Arity)));
+}

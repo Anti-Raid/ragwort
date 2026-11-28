@@ -701,6 +701,10 @@ named! {
         /// `(make-syntax-error message form subform ...)`: constructs a macro syntax error condition
         /// with explanatory `message`, identifying malformed `form` and relevant `subform` context.
         MakeSyntaxError = ("make-syntax-error", any(TRUTHY)),
+        /// `(refuse-arity count)`: raises the arity error of the procedure that runs it, for a call with `count` arguments. The compiler
+        /// puts it in a procedure that checks the number of its arguments itself: one made from a `case-lambda` with a clause too wide
+        /// for a frame's parameter registers.
+        RefuseArity = ("refuse-arity", takes(1, INTERNAL)),
         /// `(procedure? x)`: returns `#t` if `x` is callable (a closure, continuation, or keyword
         /// procedure), and `#f` otherwise.
         IsProcedure = ("procedure?", takes(1, FOLD | DISCARD | PREDICATE)),
@@ -1580,6 +1584,7 @@ impl Intrinsic {
                 }
                 value
             }
+            Intrinsic::RefuseArity => return Err(Fault::Arity),
             Intrinsic::MakeError
             | Intrinsic::MakeSyntaxError
             | Intrinsic::ErrorObjectMessage

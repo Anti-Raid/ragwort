@@ -33,6 +33,7 @@ use ragwort_types::string::{self, Strings};
 use ragwort_types::symbol::{Keyword, Symbols};
 use ragwort_types::syntax::SyntaxSpan;
 use ragwort_types::vector::AnyVector;
+use ragwort_vm::frame::MAX_PARAMS;
 use ragwort_vm::{Intrinsic, Request};
 
 use crate::hash::{HashMap, HashSet};
@@ -41,7 +42,7 @@ use crate::ir::l1::{Fun, Function, Id, L1, Node};
 use crate::keyword::{self, CallShape};
 use crate::module::{Binding, Import, Inline, Target, Unit};
 use crate::structs::Call;
-use crate::{CompileError, Core, GlobalError, OptionalLambda, Place, Position, Prim, SlotOp, Var};
+use crate::{CaseLambda, CompileError, Core, GlobalError, Lambda, OptionalLambda, Place, Position, Prim, SlotOp, Var};
 
 /// Lowers the input `core` AST into the IR `tree`, returning the lowered root node ID and a
 /// fresh `Supply` configured for subsequent variable and lambda identifier allocations.
@@ -101,6 +102,14 @@ pub(crate) fn lower<'id, 'gc>(
             }
             Task::Optional(lambda) => {
                 let id = pass.optional(lambda, &mut vals)?;
+                vals.push(id);
+            }
+            Task::Clause(clause, wide) => {
+                let id = pass.clause(clause, wide, &mut vals);
+                vals.push(id);
+            }
+            Task::Case(case) => {
+                let id = pass.case(case, &mut vals)?;
                 vals.push(id);
             }
             Task::Struct(call, args) => {
@@ -198,6 +207,10 @@ enum Task<'c, 'gc> {
     Bind(Var),
     /// Builds an optional lambda. Runs after its defaults and body are lowered.
     Optional(&'c OptionalLambda<'gc>),
+    /// Builds the lambda of one clause of a `case-lambda`. Runs after the clause's body is lowered. The flag says whether the `case-lambda` is wide. See [`Lower::wide`].
+    Clause(&'c Lambda<'gc>, bool),
+    /// Builds the procedure of a `case-lambda`. Runs after every clause is built.
+    Case(&'c CaseLambda<'gc>),
     /// Builds a call with keyword arguments, or any call of a known keyword procedure. Runs after the arguments are lowered. The callee is lowered too, unless the call goes directly to a core procedure.
     ///
     /// The list has one entry per argument, in written order: the argument's keyword, or `None` for a positional argument.
@@ -462,6 +475,39 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
                 then.push(Task::Keyword(labels, direct));
                 return Ok(None);
             }
+            Core::CaseLambda(case) => {
+                if !self.lambdas.insert(case.id) {
+                    return Err(CompileError::SameLambda(case.id));
+                }
+                self.max_lambda = self.max_lambda.max(case.id.saturating_add(1));
+                if case.clauses.is_empty() {
+                    return Err(CompileError::Formals(case.id));
+                }
+                let framed = !self.loops.is_empty();
+                let wide = is_wide(case);
+                for clause in &case.clauses {
+                    if !self.lambdas.insert(clause.id) {
+                        return Err(CompileError::SameLambda(clause.id));
+                    }
+                    // A clause has no optional parameters: the clauses say which numbers of arguments the procedure takes.
+                    if clause.optional != 0 {
+                        return Err(CompileError::Formals(clause.id));
+                    }
+                    self.max_lambda = self.max_lambda.max(clause.id.saturating_add(1));
+                    for &var in clause.params.iter().chain(&clause.rest) {
+                        self.reserve_var(var)?;
+                        then.push(Task::Bind(var));
+                    }
+                    if framed {
+                        then.extend([Task::Frame(true), Task::Expr(&clause.body), Task::Frame(false)]);
+                    } else {
+                        then.push(Task::Expr(&clause.body));
+                    }
+                    then.push(Task::Clause(clause, wide));
+                }
+                then.push(Task::Case(case));
+                return Ok(None);
+            }
             Core::Lambda(lambda) => {
                 if !self.lambdas.insert(lambda.id) {
                     return Err(CompileError::SameLambda(lambda.id));
@@ -555,6 +601,7 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
                 let unnamed = match &**value {
                     Core::Lambda(lambda) if lambda.name.is_none() => Some(lambda.id),
                     Core::OptionalLambda(lambda) if lambda.name.is_none() => Some(lambda.id),
+                    Core::CaseLambda(case) if case.name.is_none() => Some(case.id),
                     _ => None,
                 };
                 if let Some(id) = unnamed
@@ -582,7 +629,7 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
                 }
                 let params = self.tree.list(lambda.params.iter().copied());
                 self.names.describe(lambda.id, lambda.name, lambda.at);
-                Node::Lambda(self.tree.function(Function { id: lambda.id, params, optional: lambda.optional, rest: lambda.rest, body }))
+                Node::Lambda(self.tree.function(Function { id: lambda.id, params, optional: lambda.optional, refused: 0, rest: lambda.rest, body }))
             }
             Core::Intrinsic(prim, args, _) => Node::Intrinsic(*prim, self.tree.list(last(vals, args.len()))),
             Core::ApplyIntrinsic(prim, args, _) => Node::ApplyIntrinsic(*prim, self.tree.list(last(vals, args.len()))),
@@ -598,7 +645,7 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
                 Node::Intrinsic(Prim::Slot(op, slot), self.tree.list(value))
             }
             Core::Quote(_) | Core::Ref(_) | Core::Import(_) | Core::Global(..) => unreachable!("leaves are lowered as they're reached"),
-            Core::OptionalLambda(_) | Core::KeywordApp(..) => unreachable!("optional lambdas and keyword calls have tasks of their own"),
+            Core::OptionalLambda(_) | Core::KeywordApp(..) | Core::CaseLambda(_) => unreachable!("optional lambdas, case lambdas and keyword calls have tasks of their own"),
             Core::Loop(..) | Core::Break(_) | Core::Continue(_) => unreachable!("loops and jumps have tasks of their own"),
         })
     }
@@ -608,6 +655,7 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
         let unnamed = match init {
             Core::Lambda(lambda) if lambda.name.is_none() => Some(lambda.id),
             Core::OptionalLambda(lambda) if lambda.name.is_none() => Some(lambda.id),
+            Core::CaseLambda(case) if case.name.is_none() => Some(case.id),
             _ => None,
         };
         if let Some(lambda) = unnamed
@@ -712,7 +760,7 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
     /// Returns a lambda with the parameters `params` and the lowered `body`. It is the code of a loop or of a join.
     fn procedure_of(&mut self, params: crate::ir::l1::Span<'id, Var>, body: Id<'id>) -> Id<'id> {
         let id = self.fresh_lambda();
-        let fun = self.tree.function(Function { id, params, optional: 0, rest: None, body });
+        let fun = self.tree.function(Function { id, params, optional: 0, refused: 0, rest: None, body });
         self.tree.add(Node::Lambda(fun))
     }
 
@@ -897,7 +945,7 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
             };
             let optional = u32::try_from(shape.optional).map_err(|_| CompileError::OutOfMemory)?;
             let (id, params) = (self.fresh_lambda(), self.tree.list(params));
-            let fun = self.tree.function(Function { id, params, optional, rest, body });
+            let fun = self.tree.function(Function { id, params, optional, refused: 0, rest, body });
             self.tree.add(Node::Lambda(fun))
         };
         let pairs = Pairs::new(mc);
@@ -907,6 +955,170 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
         let parts = [plain, self.read(core), self.tree.add(all), self.tree.add(required)];
         let parts = self.tree.list(parts);
         Ok(self.tree.add(Node::Intrinsic(Prim::Intrinsic(Intrinsic::MakeKeywordProcedure), parts)))
+    }
+
+    /// Builds the lambda of `clause`, a clause of a `case-lambda`, from its lowered body.
+    ///
+    /// Usually the lambda takes the clause's rest parameter as an ordinary last parameter: the procedure of the `case-lambda` builds the list and passes
+    /// it. See [`Lower::case`]. For a wide `case-lambda`, the lambda is the clause as written, and the procedure applies it to the list of all arguments. See [`Lower::wide`].
+    fn clause(&mut self, clause: &Lambda<'gc>, wide: bool, vals: &mut Vec<Id<'id>>) -> Id<'id> {
+        let body = vals.pop().expect("a clause's body is lowered");
+        for var in clause.params.iter().chain(&clause.rest) {
+            self.scope.remove(var);
+        }
+        self.names.describe(clause.id, clause.name, clause.at);
+        let fun = if wide {
+            let params = self.tree.list(clause.params.iter().copied());
+            self.tree.function(Function { id: clause.id, params, optional: 0, refused: 0, rest: clause.rest, body })
+        } else {
+            let params = self.tree.list(clause.params.iter().chain(&clause.rest).copied());
+            self.tree.function(Function { id: clause.id, params, optional: 0, refused: 0, rest: None, body })
+        };
+        self.tree.add(Node::Lambda(fun))
+    }
+
+    /// Builds the procedure of the wide `case-lambda` `case` from the lambdas of its clauses. A `case-lambda` is wide if its widest clause does not fit the
+    /// parameter registers of a frame, so [`Lower::case`] cannot give the procedure a parameter for each of them.
+    ///
+    /// The procedure takes all its arguments as one list. It counts them, and applies the first clause that takes that number to the list. If no clause
+    /// does, it raises the arity error itself, since the VM accepts any number for it.
+    ///
+    /// For `(case-lambda [(a) x] [(a b ... q) y] [(a b . more) z])`, where the second clause has 17 parameters, the result is:
+    ///
+    /// ```text
+    /// (lambda args
+    ///   (let ([c1 (lambda (a) x)] [c2 (lambda (a b ... q) y)] [c3 (lambda (a b . more) z)])
+    ///     (let ([count (length args)])
+    ///       (if (eq? count 1)
+    ///           (apply c1 args)
+    ///           (if (eq? count 17)
+    ///               (apply c2 args)
+    ///               (if (< count 2) (refuse-arity count) (apply c3 args)))))))
+    /// ```
+    fn wide(&mut self, case: &CaseLambda<'gc>, lambdas: Vec<Id<'id>>) -> Result<Id<'id>, CompileError> {
+        let (args, count) = (self.fresh_var(), self.fresh_var());
+        let clauses: Vec<Var> = case.clauses.iter().map(|_| self.fresh_var()).collect();
+        let operands = [self.tree.add(Node::Ref(count))];
+        let operands = self.tree.list(operands);
+        let mut dispatch = self.tree.add(Node::Intrinsic(Prim::Intrinsic(Intrinsic::RefuseArity), operands));
+        for (clause, &var) in case.clauses.iter().zip(&clauses).rev() {
+            let fixed = Value::fixnum(i64::try_from(clause.params.len()).map_err(|_| CompileError::OutOfMemory)?).ok_or(CompileError::OutOfMemory)?;
+            let operands = [self.tree.add(Node::Ref(count)), self.tree.add(Node::Quote(fixed))];
+            let operands = self.tree.list(operands);
+            let passed = [self.tree.add(Node::Ref(var)), self.tree.add(Node::Ref(args))];
+            let passed = self.tree.list(passed);
+            let call = self.tree.add(Node::Intrinsic(Prim::Request(Request::Apply), passed));
+            dispatch = if clause.rest.is_some() {
+                // A clause with a rest parameter takes its own number of parameters or more.
+                let fewer = self.tree.add(Node::Intrinsic(Prim::Intrinsic(Intrinsic::Lt), operands));
+                self.tree.add(Node::If(fewer, dispatch, call))
+            } else {
+                let same = self.tree.add(Node::Intrinsic(Prim::Intrinsic(Intrinsic::Eq), operands));
+                self.tree.add(Node::If(same, call, dispatch))
+            };
+        }
+        let operands = [self.tree.add(Node::Ref(args))];
+        let operands = self.tree.list(operands);
+        let length = self.tree.add(Node::Intrinsic(Prim::Intrinsic(Intrinsic::Length), operands));
+        let binds = self.tree.list([(count, length)]);
+        let counted = self.tree.add(Node::Let(binds, dispatch));
+        let binds = self.tree.list(clauses.iter().copied().zip(lambdas));
+        let body = self.tree.add(Node::Let(binds, counted));
+        let params = self.tree.list(std::iter::empty());
+        self.names.describe(case.id, case.name, case.at);
+        let fun = self.tree.function(Function { id: case.id, params, optional: 0, refused: 0, rest: Some(args), body });
+        Ok(self.tree.add(Node::Lambda(fun)))
+    }
+
+    /// Builds the procedure of the `case-lambda` `case` from the lambdas of its clauses.
+    ///
+    /// The procedure is one lambda. It has a parameter for each parameter of the widest clause. The ones past the narrowest clause are optional, and
+    /// it has a rest parameter if any clause has one. So the VM binds the arguments as for any procedure, and it refuses the numbers of arguments
+    /// that no clause takes. See `Shape::refused` in the VM.
+    ///
+    /// The body binds each clause's lambda to a variable. It then finds the number of arguments from the parameters that are unsupplied, and calls the
+    /// first clause that takes that number. Each call is a tail call of a local lambda, which a later pass turns into a jump in the same frame.
+    ///
+    /// For `(case-lambda [(a) x] [(a b c) y] [(a . more) z])` the result is:
+    ///
+    /// ```text
+    /// (lambda (p1 [p2] [p3] . rest)
+    ///   (let ([c1 (lambda (a) x)] [c2 (lambda (a b c) y)] [c3 (lambda (a more) z)])
+    ///     (if (eq? p2 #<unsupplied>)
+    ///         (c1 p1)
+    ///         (if (eq? p3 #<unsupplied>)
+    ///             (c3 p1 (cons p2 '()))
+    ///             (if (null? rest) (c2 p1 p2 p3) (c3 p1 (cons p2 (cons p3 rest))))))))
+    /// ```
+    fn case(&mut self, case: &CaseLambda<'gc>, vals: &mut Vec<Id<'id>>) -> Result<Id<'id>, CompileError> {
+        let lambdas = vals.split_off(vals.len() - case.clauses.len());
+        if is_wide(case) {
+            return self.wide(case, lambdas);
+        }
+        let fixed: Vec<usize> = case.clauses.iter().map(|clause| clause.params.len()).collect();
+        let (least, most) = (fixed.iter().copied().min().unwrap_or(0), fixed.iter().copied().max().unwrap_or(0));
+        let any_rest = case.clauses.iter().any(|clause| clause.rest.is_some());
+        let params: Vec<Var> = (0..most).map(|_| self.fresh_var()).collect();
+        let rest = if any_rest {
+            Some(self.fresh_var())
+        } else {
+            None
+        };
+        let clauses: Vec<Var> = case.clauses.iter().map(|_| self.fresh_var()).collect();
+        let mut refused = 0u16;
+        // The call for exactly `most` arguments, then the tests for the smaller numbers around it, from the largest down.
+        let mut dispatch = self.arm(case, &clauses, &params, most, None);
+        if let Some(rest) = rest {
+            let more = self.arm(case, &clauses, &params, most + 1, Some(rest));
+            let operands = [self.tree.add(Node::Ref(rest))];
+            let operands = self.tree.list(operands);
+            let none = self.tree.add(Node::Intrinsic(Prim::Intrinsic(Intrinsic::IsNull), operands));
+            dispatch = self.tree.add(Node::If(none, dispatch, more));
+        }
+        for count in (least..most).rev() {
+            if count > least && chosen(case, count).is_none() {
+                refused |= 1 << (count - least - 1);
+            }
+            let operands = [self.tree.add(Node::Ref(params[count])), self.tree.add(Node::Quote(Value::UNSUPPLIED))];
+            let operands = self.tree.list(operands);
+            let missing = self.tree.add(Node::Intrinsic(Prim::Intrinsic(Intrinsic::Eq), operands));
+            let arm = self.arm(case, &clauses, &params, count, None);
+            dispatch = self.tree.add(Node::If(missing, arm, dispatch));
+        }
+        let binds = self.tree.list(clauses.iter().copied().zip(lambdas));
+        let body = self.tree.add(Node::Let(binds, dispatch));
+        let optional = u32::try_from(most - least).map_err(|_| CompileError::TooManyOptional(case.id))?;
+        let params = self.tree.list(params);
+        self.names.describe(case.id, case.name, case.at);
+        let fun = self.tree.function(Function { id: case.id, params, optional, refused, rest, body });
+        Ok(self.tree.add(Node::Lambda(fun)))
+    }
+
+    /// Builds the call of the clause of `case` that takes `count` arguments. `clauses` are the variables that hold the clauses' lambdas, and `params` are the
+    /// parameters of the procedure. With `more`, the call is for any number above the widest clause, and `more` holds the arguments past `params`.
+    ///
+    /// A clause with a rest parameter gets the arguments past its own parameters as a list. If no clause takes `count` arguments, the VM refuses the
+    /// call before this code runs, and the result is a constant.
+    fn arm(&mut self, case: &CaseLambda<'gc>, clauses: &[Var], params: &[Var], count: usize, more: Option<Var>) -> Id<'id> {
+        let Some(index) = chosen(case, count) else { return self.tree.add(Node::Quote(Value::VOID)) };
+        let clause = &case.clauses[index];
+        let given = count.min(params.len());
+        let mut args: Vec<Id<'id>> = params[..clause.params.len()].iter().map(|&param| self.tree.add(Node::Ref(param))).collect();
+        if clause.rest.is_some() {
+            let mut list = match more {
+                Some(more) => self.tree.add(Node::Ref(more)),
+                None => self.tree.add(Node::Quote(Value::NULL)),
+            };
+            for &param in params[clause.params.len()..given].iter().rev() {
+                let operands = [self.tree.add(Node::Ref(param)), list];
+                let operands = self.tree.list(operands);
+                list = self.tree.add(Node::Intrinsic(Prim::Intrinsic(Intrinsic::Cons), operands));
+            }
+            args.push(list);
+        }
+        let callee = self.tree.add(Node::Ref(clauses[index]));
+        let args = self.tree.list(args);
+        self.tree.add(Node::App(callee, args))
     }
 
     /// Builds the plain lambda for the optional lambda `lambda` from its lowered defaults and body.
@@ -953,7 +1165,7 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
         let optional = u32::try_from(shape.optional).map_err(|_| CompileError::TooManyOptional(lambda.id))?;
         let params = self.tree.list(params);
         self.names.describe(lambda.id, lambda.name, lambda.at);
-        let fun = self.tree.function(Function { id: lambda.id, params, optional, rest: lambda.rest, body });
+        let fun = self.tree.function(Function { id: lambda.id, params, optional, refused: 0, rest: lambda.rest, body });
         let plain = self.tree.add(Node::Lambda(fun));
         // Without keywords, the lambda is the whole procedure. With keywords, the lambda is the core. If the lambda is in `keyword_cores`, only the core is returned: the `letrec` or the module definition that binds the procedure builds the keyword procedure around it.
         if shape.keywords.is_empty() || self.keyword_cores.contains(&lambda.id) {
@@ -1064,6 +1276,16 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
                     }
                     todo.push(&lambda.body);
                 }
+                Core::CaseLambda(case) => {
+                    lambdas = lambdas.max(case.id.saturating_add(1));
+                    for clause in &case.clauses {
+                        lambdas = lambdas.max(clause.id.saturating_add(1));
+                        for var in clause.params.iter().chain(&clause.rest) {
+                            vars = vars.max(var.0.saturating_add(1));
+                        }
+                        todo.push(&clause.body);
+                    }
+                }
                 Core::OptionalLambda(lambda) => {
                     lambdas = lambdas.max(lambda.id.saturating_add(1));
                     for formal in &lambda.params {
@@ -1166,6 +1388,19 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
         }
         Ok(())
     }
+}
+
+/// Returns whether `case` is wide: its widest clause, with a rest parameter if any clause has one, needs more parameter registers than a frame has.
+/// The compiler then builds its procedure in another way. See `Lower::wide`.
+fn is_wide(case: &CaseLambda<'_>) -> bool {
+    let most = case.clauses.iter().map(|clause| clause.params.len()).max().unwrap_or(0);
+    let any_rest = case.clauses.iter().any(|clause| clause.rest.is_some());
+    most + usize::from(any_rest) > usize::from(MAX_PARAMS)
+}
+
+/// Returns the index of the first clause of `case` that takes `count` arguments.
+fn chosen(case: &CaseLambda<'_>, count: usize) -> Option<usize> {
+    case.clauses.iter().position(|clause| clause.params.len() == count || (clause.rest.is_some() && clause.params.len() <= count))
 }
 
 /// Returns the keyword and optionality of each parameter of `lambda`, in the order written.

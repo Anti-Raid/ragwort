@@ -37,7 +37,7 @@ pub(crate) fn lower<'s, 'id, 'gc>(tree: &mut l3::L3<'id, 'gc>, from: &L2<'s, 'gc
     fn function<'s, 'id, 'gc>(tree: &mut l3::L3<'id, 'gc>, from: &L2<'s, 'gc>, fun: l2::Fun<'s>, body: Id<'id>) -> Fun<'id> {
         let original = from[fun];
         let params = tree.list(from[original.params].iter().copied());
-        tree.function(l3::Function { id: original.id, optional: original.optional, params, rest: original.rest, body })
+        tree.function(l3::Function { id: original.id, optional: original.optional, refused: original.refused, params, rest: original.rest, body })
     }
     fn pop<'id>(vals: &mut std::vec::Vec<Id<'id>>) -> Id<'id> {
         vals.pop().expect("a lowered child")

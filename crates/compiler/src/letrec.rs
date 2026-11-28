@@ -97,7 +97,7 @@ pub(crate) fn fix_letrec<'s, 'id, 'gc>(mc: &Mutation<'gc>, from: &L1<'s, 'gc>, r
                         let params = &from[function.params];
                         usages.last_mut().expect("the root's usage is never closed").absorb(inner.bind(params.iter().copied().chain(function.rest)));
                         let params = cx.tree.list(params.iter().copied());
-                        Node::Lambda(cx.tree.function(l2::Function { id: function.id, optional: function.optional, params, rest: function.rest, body }))
+                        Node::Lambda(cx.tree.function(l2::Function { id: function.id, optional: function.optional, refused: function.refused, params, rest: function.rest, body }))
                     }
                     l1::Node::Let(binds, _) | l1::Node::Letrec(binds, _) => {
                         let body = last(&mut vals, 1)[0];

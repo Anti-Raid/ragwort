@@ -1,11 +1,15 @@
 //! Ragwort's base language: Scheme in the style of R7RS and Racket. This crate expands it to the
 //! compiler's core forms and compiles it.
 //!
-//! The expander handles `quote`, `if`, `lambda`, `define`, `set!`, `begin`, `let`, `letrec` and
+//! The expander handles `quote`, `if`, `lambda`, `case-lambda`, `define`, `set!`, `begin`, `let`, `letrec` and
 //! `letrec*` directly. Named `let`, `let*`, `and`, `or`, `when`, `unless`, `cond`, `case`, `do`,
 //! `quasiquote`, `guard`, `match`, `struct-copy`, `with-continuation-mark`, `syntax-rules` and
 //! `with-syntax` are built-in macros written in Rust. They expand hygienically with sets of scopes,
 //! in the same way as the macros that a program defines.
+//!
+//! `case-lambda` makes a procedure with several clauses, as in R7RS: `(case-lambda [(a) ...] [(a b . more) ...])`. A call runs the first
+//! clause that takes its number of arguments. A clause takes plain parameters and a rest parameter, and no default or keyword. A call
+//! that no clause takes is an arity error that lists the numbers the procedure takes.
 //!
 //! `struct` defines a struct type, as Racket's `struct` does: `(struct point (x y))` defines the
 //! constructor `point`, the predicate `point?` and the accessors `point-x` and `point-y`. A

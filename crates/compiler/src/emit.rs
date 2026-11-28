@@ -162,7 +162,7 @@ impl<'a, 'gc> Module<'a, 'gc> {
 
     fn attempt(&mut self, function: &Function<'_, 'gc>, captures: &[Capture], near: bool) -> Result<Option<Gc<'gc, Bytecode>>, CompileError> {
         let (count, optional) = (function.params.len() as u64, u64::from(function.optional));
-        let shape = Shape { required: count - optional, optional, rest: function.rest.is_some() };
+        let shape = Shape { required: count - optional, optional, rest: function.rest.is_some(), refused: function.refused };
         // Optional parameters must reside in frame registers; reject parameter shapes exceeding `MAX_PARAMS`.
         if optional > 0 && shape.slots() > u64::from(MAX_PARAMS) {
             return Err(CompileError::TooManyRegisters);

@@ -15,7 +15,7 @@ fn error<'id>(t: &L3<'id, 'static>, root: Id<'id>) -> String {
 /// Builds a function with `params` and `body`.
 fn function<'id>(t: &mut L3<'id, 'static>, params: &[u32], body: Id<'id>) -> Fun<'id> {
     let params = t.list(params.iter().map(|&v| Var(v)));
-    t.function(Function { id: 0, optional: 0, params, rest: None, body })
+    t.function(Function { id: 0, optional: 0, refused: 0, params, rest: None, body })
 }
 
 #[test]

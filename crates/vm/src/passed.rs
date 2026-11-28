@@ -73,6 +73,11 @@ impl<'gc> Passed<'gc> {
         self.slots.map_or(0, Slots::len)
     }
 
+    /// Returns the number of values, or `None` if `rest` is not a list.
+    pub(crate) fn len(self, mc: &Mutation<'gc>) -> Option<u64> {
+        Pairs::new(mc).list_len(self.rest).map(|listed| listed + self.count() as u64)
+    }
+
     /// Returns the value at position `index`. Fails with [`Fault::Arity`] if there are not that many.
     pub(crate) fn get(self, mc: &Mutation<'gc>, index: usize) -> Result<Value<'gc>, Fault> {
         if let Some(slots) = self.slots.filter(|slots| index < slots.len()) {

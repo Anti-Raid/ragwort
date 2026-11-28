@@ -535,7 +535,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
     fn function(&mut self, fun: Fun<'s>, body: Id<'d>) -> Fun<'d> {
         let func = self.src[fun];
         let params = self.out.list(self.src[func.params].iter().copied());
-        self.out.function(Function { id: func.id, optional: func.optional, params, rest: func.rest, body })
+        self.out.function(Function { id: func.id, optional: func.optional, refused: func.refused, params, rest: func.rest, body })
     }
 
     fn restore(&mut self, var: Var, prev: Option<Subst<'gc>>) {
@@ -1580,7 +1580,7 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         let params = self.src.list(params);
         let id = self.supply.fresh_lambda();
         self.names.copy(func.id, id);
-        self.src.function(Function { id, params, optional: func.optional, rest, body })
+        self.src.function(Function { id, params, optional: func.optional, refused: func.refused, rest, body })
     }
 
     /// Recursively copies expression `expr` into the source AST table while substituting variables according to `map`.
@@ -1650,6 +1650,11 @@ fn small<'x>(tree: &L2<'x, '_>, assigned: &HashSet<Var>, expr: Id<'x>, size: &mu
 fn takes<'x>(tree: &L2<'x, '_>, fun: Fun<'x>, argc: usize) -> bool {
     let func = tree[fun];
     let (most, least) = (tree[func.params].len(), tree[func.params].len() - func.optional as usize);
+    // A function made from a `case-lambda` refuses some counts between `least` and `most`. A call with such a count is left to the VM, which raises the error.
+    let extra = argc.wrapping_sub(least);
+    if (1..=16).contains(&extra) && extra <= func.optional as usize && func.refused >> (extra - 1) & 1 == 1 {
+        return false;
+    }
     match func.rest {
         None => (least..=most).contains(&argc),
         Some(_) => argc >= least && argc.saturating_sub(most) <= MAX_REST_INLINE,

@@ -193,6 +193,25 @@ pub struct Lambda<'gc> {
     pub at: Option<Position<'gc>>,
 }
 
+/// A `case-lambda` expression in the [`Core`] AST: a procedure with several clauses. A call runs the first clause that takes the number of arguments
+/// of the call. A call with a number that no clause takes is an arity error.
+///
+/// A clause is a lambda without optional parameters. The compiler makes one procedure of all the clauses. The procedure takes as many arguments as the
+/// widest clause, and the code at its start goes to the clause for the number that it got.
+///
+/// A clause can have any number of parameters. If the widest clause does not fit the parameter registers of a frame, the procedure takes its
+/// arguments as a list instead, counts them, and applies the clause. That is slower, and its arity error does not say which numbers it takes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaseLambda<'gc> {
+    /// A unique identifier, as [`Lambda::id`]. Each clause has an identifier of its own too.
+    pub id: u32,
+    pub clauses: Vec<Lambda<'gc>>,
+    /// The symbol the procedure is bound to, as [`Lambda::name`].
+    pub name: Option<Value<'gc>>,
+    /// The position where the form starts, as [`Lambda::at`].
+    pub at: Option<Position<'gc>>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Core<'gc> {
     Quote(Value<'gc>),
@@ -208,6 +227,8 @@ pub enum Core<'gc> {
     /// Calls a procedure with arguments. The last field is the source position of the call, which error reports use. It is `None` for a call that a front end or the compiler generated.
     App(Box<Core<'gc>>, Vec<Core<'gc>>, Option<Position<'gc>>),
     Lambda(Lambda<'gc>),
+    /// A procedure with several clauses. See [`CaseLambda`].
+    CaseLambda(CaseLambda<'gc>),
     /// Applies a built-in operation to arguments. The last field is the source position, as for `App`.
     Intrinsic(Prim, Vec<Core<'gc>>, Option<Position<'gc>>),
     /// Invokes an intrinsic whose final argument is a list that is spread into remaining arguments, analogous to `apply`. The last field is the source position, as for `App`.
@@ -277,6 +298,7 @@ impl Core<'_> {
             }
             Core::SetGlobal(_, value, _) => take(value, out),
             Core::Lambda(lambda) => take(&mut lambda.body, out),
+            Core::CaseLambda(case) => case.clauses.iter_mut().for_each(|clause| take(&mut clause.body, out)),
             Core::OptionalLambda(lambda) => {
                 lambda.params.iter_mut().filter_map(|formal| formal.default.as_mut()).for_each(|default| take(default, out));
                 take(&mut lambda.body, out);
