@@ -39,7 +39,8 @@ use ragwort_types::symbol::{Keyword, Symbol};
 use ragwort_types::syntax::{Abbreviation, Syntax, SyntaxKind};
 use ragwort_types::table::Table;
 use ragwort_types::vector::{EveryVector, ExternVector, Vector};
-use ragwort_vm::report::{Failure, Raised, Report};
+use ragwort_vm::Fault;
+use ragwort_vm::report::{Failure, Raised, Report, decode, procedure_name};
 use ragwort_vm::objects::{Closure, Condition, ConditionFields, Continuation, KeywordProcedure, Tag, Task};
 use ragwort_vm::objects::{Struct, StructFields, StructType, StructTypeFields};
 
@@ -437,6 +438,29 @@ impl<'gc> Printer<'_, 'gc> {
             return Ok(());
         };
         let (message, irritants) = (condition.message(mc), condition.irritants(mc));
+        if self.mode == Mode::Display
+            && fault == Fault::Arity
+            && message == Value::VOID
+            && let Raised::Arity { operation, procedure, expected, given } = decode(mc, Value::object(mc, condition))
+        {
+            if let Some(operation) = operation {
+                self.out.push_str(operation.name());
+                self.out.push_str(": ");
+            } else if let Some(name) = procedure.and_then(|proc| procedure_name(mc, proc)) {
+                self.symbol(name, false)?;
+                self.out.push_str(": ");
+            }
+            self.out.push_str(fault.message());
+            match expected {
+                Some(expected) => {
+                    let _ = write!(self.out, " ({expected}, got {given})");
+                }
+                None => {
+                    let _ = write!(self.out, " (got {given})");
+                }
+            }
+            return Ok(());
+        }
         if self.mode == Mode::Display {
             // The irritants are written even when the condition is displayed, so that a string irritant keeps its quotes.
             work.extend([Work::Mode(Mode::Display), Work::Tail(irritants), Work::Mode(Mode::Write)]);

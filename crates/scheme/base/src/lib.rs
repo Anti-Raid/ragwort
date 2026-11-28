@@ -34,9 +34,24 @@
 //! language. A name that is not a local variable, a definition or an import is an error. `(require spec ...)` and `(provide spec ...)` are allowed only at the top level. They take the same
 //! specs as `%require` and `%provide` in native ragwort.
 //!
-//! Procedures such as `car` and `+` are exports of the [`PRELUDE`] module, which is written in
-//! native ragwort. Every Scheme module requires the prelude implicitly, and the prelude must have run before a Scheme module is expanded. A module can define a name that
-//! the prelude also exports. The module's definition then shadows the prelude's. A module cannot assign a prelude export.
+//! # Libraries
+//!
+//! A Scheme module starts with the forms above and with no procedure. Procedures such as `car` and `+` are exports of libraries, which
+//! a module requires. [`LIBRARIES`] lists them. Each is a file of the crate's `prelude` folder, written in native ragwort. The build script finds
+//! the files, so a new file there is a new library:
+//!
+//! - `scheme/core`: `eq?`, `eqv?`, `equal?`, `not`, booleans, `void`, `values`, `apply`, symbols, keywords, boxes, and what a program can ask about procedures and structs
+//! - `scheme/number`: arithmetic, comparison, bitwise operations, `number->string` and `string->number`
+//! - `scheme/list`: pairs and lists
+//! - `scheme/string`: strings, characters and string cursors
+//! - `scheme/vector`, `scheme/bytevector`, `scheme/table`
+//! - `scheme/error`: `raise`, `error`, `with-exception-handler` and the parts of an error object
+//! - `scheme/cont`: `call/cc`, prompts and continuation marks
+//! - `scheme/dynamic-wind`, `scheme/coro` (coroutines), `scheme/syntax` (syntax objects)
+//! - `scheme`: all of the above. See [`SCHEME`].
+//!
+//! The forms need no library. `guard` and `with-continuation-mark`, for example, work in a module that requires nothing. An embedder can make a module
+//! require libraries implicitly. A module can define a name that an implicitly required library also exports. The module's definition then shadows it.
 
 mod derived;
 mod expand;
@@ -62,8 +77,14 @@ pub(crate) use ragwort_expander::{scope, tree};
 
 pub use crate::expand::{Expander, Top};
 
-/// The source text of the prelude module, written in native ragwort.
-pub const PRELUDE: &str = include_str!("prelude.rg");
+// `LIBRARIES`, `SCHEME` and `PROVIDED`, which the build script writes from the files of the `prelude` folder.
+include!(concat!(env!("OUT_DIR"), "/prelude.rs"));
+
+/// Returns the name of the library that provides the procedure `name`, such as `scheme/list` for `car`. A report of an unbound name can
+/// then say which library to require.
+pub fn library_of(name: &str) -> Option<&'static str> {
+    PROVIDED.binary_search_by(|&(provided, _)| provided.cmp(name)).ok().map(|index| PROVIDED[index].1)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -96,23 +117,19 @@ impl From<CompileError> for Error {
     }
 }
 
-/// The name of the [`PRELUDE`] module.
-pub const PRELUDE_NAME: &str = "ragwort/prelude";
-
 /// Builds the module named `name` from the Scheme source in `files`, and expands and compiles each
 /// of its forms. The files form one body. Names are interned in `symbols`. The module implicitly
-/// requires `prelude`, which must have run, then each module of `implicit` in order. An export of a later
+/// requires each module of `implicit` in order, which must have run. An export of a later
 /// module shadows the same name from an earlier one. `resolver` finds the modules that `require` forms name.
 pub fn load<'gc>(
     mc: &Mutation<'gc>,
     symbols: Symbols<'gc>,
-    prelude: Gc<'gc, Module>,
     name: &str,
     files: &[&SyntaxSession],
     implicit: &[Gc<'gc, Module>],
     resolver: &mut dyn Resolver<'gc>,
 ) -> Result<Loaded<'gc>, Error> {
-    let mut expander = Expander::new(mc, symbols, prelude, name, &[], implicit)?;
+    let mut expander = Expander::new(mc, symbols, name, &[], implicit)?;
     let mut tops = Vec::new();
     let mut declared = Vec::new();
     for session in files {

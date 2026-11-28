@@ -100,7 +100,7 @@ pub enum ExpandErrorKind {
     /// A `%call-host` names something that is not one of the host functions given to the module.
     UnknownHost,
     /// An `%intrinsic` or `%call-host` has a number of arguments that the intrinsic or host function does not accept.
-    Arity,
+    Arity { expected: ragwort_vm::ExpectedArity, got: u32 },
     /// A `%break` or `%continue` names a loop that is not around it.
     Label,
     /// The code uses a macro of another language. The macro's output is not made of core forms, so only its own language can expand it.
@@ -143,29 +143,32 @@ impl From<ragwort_types::Error> for ExpandError {
 
 impl fmt::Display for ExpandErrorKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let ExpandErrorKind::Arity { expected, got } = *self {
+            return write!(formatter, "wrong number of arguments ({expected}, got {got})");
+        }
         formatter.write_str(match self {
             ExpandErrorKind::BadSyntax => "bad syntax",
-            ExpandErrorKind::Duplicate => "an identifier bound twice",
-            ExpandErrorKind::Definition => "a definition where an expression goes",
-            ExpandErrorKind::NoExpression => "a body with no expression",
-            ExpandErrorKind::Immutable => "an assignment of an import",
-            ExpandErrorKind::Unbound => "a name nothing defines",
-            ExpandErrorKind::Conflict => "a name both defined and required",
-            ExpandErrorKind::Resolve => "a module that can't be found",
-            ExpandErrorKind::NotProvided => "a name the module doesn't provide",
-            ExpandErrorKind::NotDefined => "a provide of a name that isn't defined",
-            ExpandErrorKind::NoConstructor => "a struct whose constructor its module doesn't provide",
-            ExpandErrorKind::Ambiguous => "an identifier with more than one binding",
-            ExpandErrorKind::Unsupported => "syntax that isn't supported yet",
-            ExpandErrorKind::Transformer => "a macro's transformer that failed",
-            ExpandErrorKind::Phase => "a macro's transformer that refers to a variable that doesn't exist yet",
-            ExpandErrorKind::NotAForm => "a list that doesn't start with a form's name",
-            ExpandErrorKind::UnknownIntrinsic => "an intrinsic the code can't name",
-            ExpandErrorKind::UnknownHost => "a host function the module wasn't given",
-            ExpandErrorKind::Arity => "an intrinsic or host call with the wrong number of arguments",
-            ExpandErrorKind::Label => "a break or continue of a loop that isn't around it",
-            ExpandErrorKind::Language => "a macro of another language",
-            ExpandErrorKind::Arena(ragwort_types::Error::OutOfMemory) => "running out of memory",
+            ExpandErrorKind::Duplicate => "duplicate identifier",
+            ExpandErrorKind::Definition => "definition not allowed in expression context",
+            ExpandErrorKind::NoExpression => "body must end with an expression",
+            ExpandErrorKind::Immutable => "cannot assign to imported binding",
+            ExpandErrorKind::Unbound => "undefined identifier",
+            ExpandErrorKind::Conflict => "identifier both defined and required",
+            ExpandErrorKind::Resolve => "module not found",
+            ExpandErrorKind::NotProvided => "identifier not provided by module",
+            ExpandErrorKind::NotDefined => "cannot provide undefined identifier",
+            ExpandErrorKind::NoConstructor => "struct constructor not provided by module",
+            ExpandErrorKind::Ambiguous => "ambiguous identifier binding",
+            ExpandErrorKind::Unsupported => "unsupported syntax",
+            ExpandErrorKind::Transformer => "macro transformer failed",
+            ExpandErrorKind::Phase => "macro transformer references runtime variable",
+            ExpandErrorKind::NotAForm => "list does not start with a form name",
+            ExpandErrorKind::UnknownIntrinsic => "unknown intrinsic",
+            ExpandErrorKind::UnknownHost => "unknown host function",
+            ExpandErrorKind::Arity { .. } => unreachable!(),
+            ExpandErrorKind::Label => "break or continue outside enclosing loop",
+            ExpandErrorKind::Language => "macro from incompatible language",
+            ExpandErrorKind::Arena(ragwort_types::Error::OutOfMemory) => "out of memory",
             ExpandErrorKind::Arena(other) => ragwort_vm::Fault::from(*other).message(),
         })
     }
@@ -173,7 +176,11 @@ impl fmt::Display for ExpandErrorKind {
 
 impl fmt::Display for ExpandError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{} at bytes {}..{}", self.kind, self.start, self.end)
+        if self.start == 0 && self.end == 0 && matches!(self.kind, ExpandErrorKind::Arena(_)) {
+            write!(formatter, "{}", self.kind)
+        } else {
+            write!(formatter, "{} at bytes {}..{}", self.kind, self.start, self.end)
+        }
     }
 }
 

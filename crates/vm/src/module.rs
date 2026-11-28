@@ -8,6 +8,7 @@ use std::fmt;
 use ragwort_types::gc::{Frame, Gc, Mutation, OutOfMemory, Value};
 use ragwort_types::vector::Vectors;
 
+use crate::frame::{ExpectedArity, Shape};
 use crate::objects::{Module, ModuleFields};
 use crate::{Fault, Fuel};
 
@@ -53,6 +54,12 @@ impl HostDef {
     #[inline]
     pub fn takes(&self, count: usize) -> bool {
         takes(self.arity, count)
+    }
+
+    /// Returns the expected argument arity of this host function.
+    #[inline]
+    pub fn expected_arity(&self) -> ExpectedArity {
+        ExpectedArity::from(Shape::of(self.arity))
     }
 }
 

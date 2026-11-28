@@ -116,20 +116,24 @@ named! {
 }
 
 impl Request {
+    /// Returns the expected argument arity of this request.
+    pub fn expected_arity(self) -> crate::ExpectedArity {
+        use crate::ExpectedArity::*;
+        match self {
+            Request::Apply | Request::Receive => AtLeast(2),
+            Request::WithMark | Request::CallWithPrompt => AtLeast(3),
+            Request::Capture | Request::WithHandler | Request::Guard | Request::GuardQuiet | Request::ResumeError | Request::Reset => Exactly(2),
+            Request::CallCc | Request::Raise | Request::RaiseContinuable | Request::Close => Exactly(1),
+            Request::Abort | Request::Resume | Request::TryResume | Request::Compose | Request::Collect => AtLeast(1),
+            Request::Yield => AtLeast(0),
+            Request::KeywordApply => AtLeast(4),
+        }
+    }
+
     /// Returns whether the request accepts `args` arguments; bytecode supplying any other argument count
     /// is malformed.
     pub fn takes(self, args: usize) -> bool {
-        let (least, most) = match self {
-            Request::Apply | Request::Receive => (2, None),
-            Request::WithMark | Request::CallWithPrompt => (3, None),
-            Request::Capture | Request::WithHandler | Request::Guard | Request::GuardQuiet => (2, Some(2)),
-            Request::CallCc | Request::Raise | Request::RaiseContinuable | Request::Close => (1, Some(1)),
-            Request::ResumeError | Request::Reset => (2, Some(2)),
-            Request::Abort | Request::Resume | Request::TryResume | Request::Compose | Request::Collect => (1, None),
-            Request::Yield => (0, None),
-            Request::KeywordApply => (4, None),
-        };
-        args >= least && most.is_none_or(|most| args <= most)
+        self.expected_arity().takes(args)
     }
 
     /// Returns the number of leading operands the request reads itself. The operands after them are passed on to a procedure or returned.

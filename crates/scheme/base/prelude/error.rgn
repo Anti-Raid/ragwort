@@ -1,0 +1,21 @@
+; scheme/error: raising and handling errors, and the parts of an error object. Most procedures wrap an intrinsic of the VM. A helper procedure is bound with
+; %letrec around the procedure that uses it, so it is created once and the library does not export it.
+
+(%provide (all-var-defined-out))
+
+(%define with-exception-handler (%lambda (handler thunk) (%intrinsic with-exception-handler handler thunk)))
+(%define raise (%lambda (obj) (%intrinsic raise obj)))
+(%define raise-continuable (%lambda (obj) (%intrinsic raise-continuable obj)))
+(%define error (%lambda (message . irritants) (%intrinsic raise (%apply-intrinsic make-error message irritants))))
+(%define error-object? (%lambda (x) (%intrinsic error-object? x)))
+(%define error-object-message (%lambda (c) (%intrinsic error-object-message c)))
+(%define error-object-irritants (%lambda (c) (%intrinsic error-object-irritants c)))
+(%define error-object-kind (%lambda (c) (%intrinsic error-object-kind c)))
+(%define error-object-traceback (%lambda (c) (%intrinsic error-object-traceback c)))
+(%define error-object-who (%lambda (c) (%intrinsic error-object-who c)))
+
+; The `guard` form expands to a call of `%guard`. `%guard` calls `thunk`. If `thunk` raises, `%guard` calls
+; `handler` with the raised value, in place of `thunk`. `%guard/no-traceback` does the same, except that a
+; condition it catches records no traceback when it is raised.
+(%define %guard (%lambda (thunk handler) (%intrinsic guard thunk handler)))
+(%define %guard/no-traceback (%lambda (thunk handler) (%intrinsic guard/no-traceback thunk handler)))

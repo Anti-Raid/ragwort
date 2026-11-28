@@ -21,7 +21,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use ragwort_compiler::module::Resolver;
-use ragwort_modules_core::{File, Language, Source, load, prelude};
+use ragwort_modules_core::{File, Language, Source, load, scheme};
 use ragwort_types::Error;
 use ragwort_types::gc::{Arena, Gc, Mutation, Value};
 use ragwort_types::pair::{Pair, Pairs};
@@ -205,10 +205,10 @@ fn run<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) {
 fn loaded(arena: &mut Arena, name: &str, language: Language, text: &str) -> Machine {
     arena.mutate(|mc| {
         let symbols = Symbols::of(mc.root(0)).expect("the symbol table");
-        let prelude = mc.root(1).downcast::<Module>(mc).expect("the prelude");
+        let all = mc.root(1).downcast::<Module>(mc).expect("the `scheme` module");
         let session = SyntaxSession::new(mc, text).expect("session");
         let files = [File { language, session: &session }];
-        let loaded = load(mc, symbols, prelude, &Source { name, hosts: &HOSTS, files: &files, implicit: &[], internals: false }, &mut Registry).expect("load");
+        let loaded = load(mc, symbols, &Source { name, hosts: &HOSTS, files: &files, implicit: &[all], internals: false }, &mut Registry).expect("load");
         let (last, first) = loaded.thunks.split_last().expect("a form");
         for &thunk in first {
             run(mc, thunk);
@@ -220,17 +220,17 @@ fn loaded(arena: &mut Arena, name: &str, language: Language, text: &str) -> Mach
     })
 }
 
-/// Makes an arena that holds the prelude and the `events` module, whose procedures call the host functions.
+/// Makes an arena that holds Scheme's libraries and the `events` module, whose procedures call the host functions. Root 1 holds the `scheme` module, which every module here requires implicitly.
 fn arena() -> Arena {
     let mut arena = Arena::new(256 << 20, 5);
     arena.mutate(|mc| {
         let symbols = Symbols::with_seed(mc, 1).expect("the symbol table");
         mc.set_root(0, symbols.value(mc));
-        let loaded = prelude(mc, symbols).expect("the prelude");
-        for thunk in loaded.thunks {
+        let built = scheme(mc, symbols).expect("the libraries of Scheme");
+        for &thunk in &built.thunks {
             run(mc, thunk);
         }
-        mc.set_root(1, Value::object(mc, loaded.module));
+        mc.set_root(1, Value::object(mc, built.all()));
         mc.set_root(2, Value::NULL);
     });
     let mut machine = loaded(&mut arena, "events", Language::Native, BINDINGS);

@@ -855,6 +855,73 @@ impl Intrinsic {
         TRAITS[self as usize].arity
     }
 
+    /// Returns the expected argument arity for this intrinsic, including range and minimum bounds
+    /// for variadic intrinsics.
+    pub fn expected_arity(self) -> Option<crate::ExpectedArity> {
+        use crate::ExpectedArity::*;
+        if let Some(arity) = self.arity() {
+            return Some(Exactly(u32::from(arity)));
+        }
+        match self {
+            Intrinsic::MakePromptTag | Intrinsic::MakeTable => Some(Range { min: 0, max: 1 }),
+            Intrinsic::MakeVector
+            | Intrinsic::MakeBytevector
+            | Intrinsic::MakeString
+            | Intrinsic::StringJoin
+            | Intrinsic::NumberToString
+            | Intrinsic::StringToNumber
+            | Intrinsic::Log
+            | Intrinsic::Atan => Some(Range { min: 1, max: 2 }),
+            Intrinsic::BytevectorCopy
+            | Intrinsic::StringToList
+            | Intrinsic::StringToVector
+            | Intrinsic::VectorToString
+            | Intrinsic::StringToUtf8
+            | Intrinsic::Utf8ToString => Some(Range { min: 1, max: 3 }),
+            Intrinsic::Substring
+            | Intrinsic::StringFind
+            | Intrinsic::StringFindLast
+            | Intrinsic::StringFindCursor
+            | Intrinsic::StringFindLastCursor => Some(Range { min: 2, max: 3 }),
+            Intrinsic::Sub
+            | Intrinsic::Div
+            | Intrinsic::NumEq
+            | Intrinsic::Lt
+            | Intrinsic::Gt
+            | Intrinsic::Le
+            | Intrinsic::Ge
+            | Intrinsic::Max
+            | Intrinsic::Min
+            | Intrinsic::CharEq
+            | Intrinsic::CharLt
+            | Intrinsic::CharGt
+            | Intrinsic::CharLe
+            | Intrinsic::CharGe
+            | Intrinsic::CharCiEq
+            | Intrinsic::CharCiLt
+            | Intrinsic::CharCiGt
+            | Intrinsic::CharCiLe
+            | Intrinsic::CharCiGe
+            | Intrinsic::StringEq
+            | Intrinsic::StringLt
+            | Intrinsic::StringGt
+            | Intrinsic::StringLe
+            | Intrinsic::StringGe
+            | Intrinsic::StringCiEq
+            | Intrinsic::StringCiLt
+            | Intrinsic::StringCiGt
+            | Intrinsic::StringCiLe
+            | Intrinsic::StringCiGe
+            | Intrinsic::MakeError
+            | Intrinsic::MakeStruct
+            | Intrinsic::MakeShapedTable
+            | Intrinsic::SyntaxBuild => Some(AtLeast(1)),
+            Intrinsic::MakeSyntaxError => Some(AtLeast(2)),
+            Intrinsic::MakeTableOf => Some(Even),
+            _ => None,
+        }
+    }
+
     /// Returns whether the intrinsic's trait mask includes all bits specified in `flags`.
     const fn has(self, flags: u16) -> bool {
         TRAITS[self as usize].is & flags == flags

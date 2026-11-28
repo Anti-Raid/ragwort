@@ -1,0 +1,65 @@
+; scheme/vector: vectors. Most procedures wrap an intrinsic of the VM. A helper procedure is bound with
+; %letrec around the procedure that uses it, so it is created once and the library does not export it.
+
+(%provide (all-var-defined-out))
+
+(%define vector? (%lambda (x) (%intrinsic vector? x)))
+(%define make-vector (%lambda (k . fill) (%apply-intrinsic make-vector k fill)))
+(%define vector (%lambda xs (%apply-intrinsic vector xs)))
+(%define vector-length (%lambda (v) (%intrinsic vector-length v)))
+(%define vector-ref (%lambda (v k) (%intrinsic vector-ref v k)))
+(%define vector-set! (%lambda (v k x) (%intrinsic vector-set! v k x)))
+(%define vector->list (%lambda (v) (%intrinsic vector->list v)))
+(%define list->vector (%lambda (xs) (%intrinsic list->vector xs)))
+
+; `vector-for-each` and `vector-map` call `f` with the elements at each index in turn, from the first. With
+; several vectors, `f` takes one element of each, up to the length of the shortest. They read each
+; vector's length once, so they work the same on a vector the host holds.
+(%define vector-for-each
+  (%letrec ((each1 (%lambda (f v at end)
+                     (%if (%intrinsic = at end)
+                          (%intrinsic void)
+                          (%let ((_ (%app f (%intrinsic vector-ref v at))))
+                            (%app each1 f v (%intrinsic + at 1) end)))))
+            (shortest (%lambda (vs len)
+                        (%if (%intrinsic null? vs)
+                             len
+                             (%app shortest (%intrinsic cdr vs) (%intrinsic min len (%intrinsic vector-length (%intrinsic car vs)))))))
+            (refs (%lambda (vs at)
+                    (%if (%intrinsic null? vs)
+                         '()
+                         (%intrinsic cons (%intrinsic vector-ref (%intrinsic car vs) at) (%app refs (%intrinsic cdr vs) at)))))
+            (eachn (%lambda (f vs at end)
+                     (%if (%intrinsic = at end)
+                          (%intrinsic void)
+                          (%let ((_ (%intrinsic apply f (%app refs vs at))))
+                            (%app eachn f vs (%intrinsic + at 1) end))))))
+    (%lambda (f v . more)
+      (%if (%intrinsic null? more)
+           (%app each1 f v 0 (%intrinsic vector-length v))
+           (%app eachn f (%intrinsic cons v more) 0 (%app shortest more (%intrinsic vector-length v)))))))
+(%define vector-map
+  (%letrec ((map1 (%lambda (f v out at end)
+                    (%if (%intrinsic = at end)
+                         out
+                         (%let ((_ (%intrinsic vector-set! out at (%app f (%intrinsic vector-ref v at)))))
+                           (%app map1 f v out (%intrinsic + at 1) end)))))
+            (shortest (%lambda (vs len)
+                        (%if (%intrinsic null? vs)
+                             len
+                             (%app shortest (%intrinsic cdr vs) (%intrinsic min len (%intrinsic vector-length (%intrinsic car vs)))))))
+            (refs (%lambda (vs at)
+                    (%if (%intrinsic null? vs)
+                         '()
+                         (%intrinsic cons (%intrinsic vector-ref (%intrinsic car vs) at) (%app refs (%intrinsic cdr vs) at)))))
+            (mapn (%lambda (f vs out at end)
+                    (%if (%intrinsic = at end)
+                         out
+                         (%let ((_ (%intrinsic vector-set! out at (%intrinsic apply f (%app refs vs at)))))
+                           (%app mapn f vs out (%intrinsic + at 1) end))))))
+    (%lambda (f v . more)
+      (%if (%intrinsic null? more)
+           (%let ((end (%intrinsic vector-length v)))
+             (%app map1 f v (%intrinsic make-vector end) 0 end))
+           (%let ((end (%app shortest more (%intrinsic vector-length v))))
+             (%app mapn f (%intrinsic cons v more) (%intrinsic make-vector end) 0 end))))))

@@ -141,11 +141,11 @@ pub struct LexError {
 impl fmt::Display for LexError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let what = match self.kind {
-            ErrorKind::Unclosed => "a string or comment that's never closed",
-            ErrorKind::Unsupported => "syntax that isn't supported yet",
-            ErrorKind::BadChar => "an unknown character name",
-            ErrorKind::BadEscape => "an unknown escape",
-            ErrorKind::BadLabel => "a datum label too big to be one",
+            ErrorKind::Unclosed => "unclosed string or comment",
+            ErrorKind::Unsupported => "unsupported syntax",
+            ErrorKind::BadChar => "unknown character name",
+            ErrorKind::BadEscape => "unknown escape sequence",
+            ErrorKind::BadLabel => "datum label out of range",
         };
         write!(formatter, "{what} at bytes {}..{}", self.start, self.end)
     }

@@ -380,6 +380,20 @@ impl<'gc> Imports<'gc> {
         Self(self.0.into_iter().map(|(name, import)| (format!("{prefix}{name}"), import)).collect())
     }
 
+    /// Keeps the imports whose names are in `names` if `listed` is true, and the others if it is false. It does not check that every name is an import.
+    fn keep<L>(self, names: &[(String, L)], listed: bool) -> Self {
+        Self(self.0.into_iter().filter(|(name, _)| names.iter().any(|(wanted, _)| wanted == name) == listed).collect())
+    }
+
+    /// Renames the imports according to `renames`, each an old name, a new name and a location. It does not check that every old name is an import.
+    fn renamed<L>(self, renames: &[(String, String, L)]) -> Self {
+        let renamed = self.0.into_iter().map(|(name, import)| match renames.iter().find(|(old, _, _)| *old == name) {
+            Some((_, new, _)) => (new.clone(), import),
+            None => (name, import),
+        });
+        Self(renamed.collect())
+    }
+
     /// Renames imported bindings according to `renames`, returning an error identifying the first missing original name if any cannot be found.
     pub fn rename(self, renames: &[(String, String)]) -> Result<Self, String> {
         let olds: Vec<String> = renames.iter().map(|(old, _)| old.clone()).collect();
@@ -400,15 +414,26 @@ impl<'gc> Imports<'gc> {
 }
 
 /// An import specification parsed by a language front end, annotated with source locations `L`.
-/// Applies nested import filters sequentially from innermost to outermost (e.g. `(prefix-in p: (only-in m a))` applies `only-in` prior to `prefix-in`).
+///
+/// A spec is a module's name, a filter around a spec, or a group of specs. It is held as the steps that compute its imports, innermost
+/// first. `(prefix-in p: [a (only-in b x)])` is the steps: module `a`, module `b`, only `x`, group of 2, prefix `p:`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RequireSpec<L> {
-    pub module: String,
-    pub at: L,
-    pub filters: Vec<Filter<L>>,
+    pub steps: Vec<RequireStep<L>>,
 }
 
-/// Filtering or renaming operations applied to an imported module's export set.
+/// One step of a [`RequireSpec`]. The steps work on a stack of import sets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequireStep<L> {
+    /// Pushes the exports of the module with this name.
+    Module(String, L),
+    /// Replaces the newest sets, as many as the number says, by one set that holds them all.
+    Group(usize),
+    /// Applies the filter to the newest set.
+    Filter(Filter<L>),
+}
+
+/// Filtering or renaming operations applied to a set of imports.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Filter<L> {
     Only(Vec<(String, L)>),
@@ -428,33 +453,57 @@ pub enum SpecError<L> {
 }
 
 impl<L: Copy> RequireSpec<L> {
-    /// Resolves and filters the module imports for a requiring module named `from` using `resolver`.
-    pub fn imports<'gc>(&self, mc: &Mutation<'gc>, resolver: &mut dyn Resolver<'gc>, from: Value<'gc>) -> Result<Imports<'gc>, SpecError<L>> {
-        fn at<L: Copy>(names: &[(String, L)], missing: String) -> Option<SpecError<L>> {
-            names.iter().find(|(name, _)| *name == missing).map(|&(_, at)| SpecError::NotProvided(at))
+    /// Returns the spec of the module `name` with `filters` around it, innermost first.
+    pub fn module(name: String, at: L, filters: Vec<Filter<L>>) -> Self {
+        let mut steps = vec![RequireStep::Module(name, at)];
+        steps.extend(filters.into_iter().map(RequireStep::Filter));
+        Self { steps }
+    }
+
+    /// Resolves the modules of the spec with `resolver`, for a requiring module named `from`, and applies the filters. Returns the imports of each
+    /// module with the module's name as the spec wrote it. A filter around a group applies to the imports of every module of the group, and
+    /// the names that it mentions can come from any of them.
+    pub fn imports<'gc>(&self, mc: &Mutation<'gc>, resolver: &mut dyn Resolver<'gc>, from: Value<'gc>) -> Result<Vec<(String, Imports<'gc>)>, SpecError<L>> {
+        /// Returns the error for the first of `names` that none of `parts` has.
+        fn missing<'gc, L: Copy>(parts: &[(String, Imports<'gc>)], names: &[(String, L)]) -> Option<SpecError<L>> {
+            names.iter().find(|(name, _)| !parts.iter().any(|(_, imports)| imports.0.iter().any(|(imported, _)| imported == name))).map(|&(_, at)| SpecError::NotProvided(at))
         }
-        let module = resolver.resolve(mc, &self.module, from).ok_or(SpecError::Resolve(self.at))?;
-        let mut imports = Imports::all(mc, module).ok_or(SpecError::Resolve(self.at))?;
-        for filter in &self.filters {
-            imports = match filter {
-                Filter::Only(names) | Filter::Except(names) => {
-                    let just: Vec<String> = names.iter().map(|(name, _)| name.clone()).collect();
-                    let kept = if matches!(filter, Filter::Only(..)) {
-                        imports.only(&just)
-                    } else {
-                        imports.except(&just)
+        let mut stack: Vec<Vec<(String, Imports<'gc>)>> = Vec::new();
+        for step in &self.steps {
+            match step {
+                RequireStep::Module(name, at) => {
+                    let module = resolver.resolve(mc, name, from).ok_or(SpecError::Resolve(*at))?;
+                    stack.push(vec![(name.clone(), Imports::all(mc, module).ok_or(SpecError::Resolve(*at))?)]);
+                }
+                RequireStep::Group(count) => {
+                    let members = stack.split_off(stack.len() - count);
+                    stack.push(members.into_iter().flatten().collect());
+                }
+                RequireStep::Filter(filter) => {
+                    let parts = stack.pop().expect("a filter is around a spec");
+                    let wanted: Vec<(String, L)> = match filter {
+                        Filter::Only(names) | Filter::Except(names) => names.clone(),
+                        Filter::Prefix(_) => Vec::new(),
+                        Filter::Rename(renames) => renames.iter().map(|(old, _, at)| (old.clone(), *at)).collect(),
                     };
-                    kept.map_err(|missing| at(names, missing).expect("a missing name is one of the spec's"))?
+                    if let Some(error) = missing(&parts, &wanted) {
+                        return Err(error);
+                    }
+                    let mut filtered = Vec::with_capacity(parts.len());
+                    for (module, imports) in parts {
+                        let imports = match filter {
+                            Filter::Only(names) => imports.keep(names, true),
+                            Filter::Except(names) => imports.keep(names, false),
+                            Filter::Prefix(prefix) => imports.prefix(prefix),
+                            Filter::Rename(renames) => imports.renamed(renames),
+                        };
+                        filtered.push((module, imports));
+                    }
+                    stack.push(filtered);
                 }
-                Filter::Prefix(prefix) => imports.prefix(prefix),
-                Filter::Rename(renames) => {
-                    let pairs: Vec<(String, String)> = renames.iter().map(|(old, new, _)| (old.clone(), new.clone())).collect();
-                    let olds: Vec<(String, L)> = renames.iter().map(|(old, _, at)| (old.clone(), *at)).collect();
-                    imports.rename(&pairs).map_err(|missing| at(&olds, missing).expect("a missing name is one of the spec's"))?
-                }
-            };
+            }
         }
-        Ok(imports)
+        Ok(stack.pop().expect("a spec has a module"))
     }
 }
 
@@ -1421,11 +1470,11 @@ impl<'gc> ModuleBuilder<'gc> {
     /// Call it after every require is declared, and before the module starts. A name that the module already exports as the same binding is skipped.
     pub fn provide_all_from(&mut self, mc: &Mutation<'gc>, symbols: Symbols<'gc>, from: &str) -> Result<(), ModuleError> {
         let strings = Strings::new(mc);
-        let mut names: Vec<Required<'gc>> = match self.required.iter().find(|(module, _)| **module == *from) {
-            Some((_, names)) => names.clone(),
-            None => Vec::new(),
-        };
-        if names.is_empty() {
+        let explicit = self.required.iter().find(|(module, _)| **module == *from).map(|(_, names)| names.clone());
+        // A require can bind no name, when a filter keeps none of the module's exports. The module is still required.
+        let implicit = explicit.is_none();
+        let mut names: Vec<Required<'gc>> = explicit.unwrap_or_default();
+        if implicit {
             // An implicit require binds a name only where the module has no binding of its own for it.
             let named = self.implicit_modules.iter().copied().find(|module| Symbol::of(module.name(mc)).is_some_and(|name| chars(&strings, name.name(mc)).eq(from.chars())));
             let Some(module) = named else { return Err(ModuleError::NotDefined) };
@@ -1651,12 +1700,14 @@ impl<'gc> ModuleBuilder<'gc> {
             Item::Expr(_) => {}
             Item::Require(requires) => {
                 for require in requires {
-                    let imports = require.spec.imports(mc, resolver, self.name).map_err(|error| match error {
+                    let parts = require.spec.imports(mc, resolver, self.name).map_err(|error| match error {
                         SpecError::Resolve(span) => (ModuleError::Resolve, span),
                         SpecError::NotProvided(span) => (ModuleError::NotProvided, span),
                     })?;
                     let symbols = Symbols::of_arena(mc).map_err(|error| (error.into(), require.span))?;
-                    self.require(mc, symbols, &require.spec.module, imports).map_err(|error| (error, require.span))?;
+                    for (module, imports) in parts {
+                        self.require(mc, symbols, &module, imports).map_err(|error| (error, require.span))?;
+                    }
                 }
             }
             // Exports are applied later, because a later form may define the provided name.

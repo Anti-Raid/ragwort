@@ -1,5 +1,5 @@
 //! Combines ragwort's languages. This crate builds modules whose files can be written in different
-//! languages, and it builds the prelude, which Scheme is built on.
+//! languages, and it builds the libraries that hold Scheme's procedures.
 //!
 //! The embedder states the language of each file. The files of a module make up one body:
 //!
@@ -17,9 +17,11 @@ mod tests;
 
 use ragwort_compiler::CompileError;
 use ragwort_compiler::module::{Item, Loaded, NoModules, Resolver};
+use ragwort_types::gc::Value;
 use ragwort_native::{LowerError, Lowerer};
 use ragwort_reader_scheme::{ReadError, Reader};
-use ragwort_scheme::{ExpandError, Expander, PRELUDE, PRELUDE_NAME, Top};
+pub use ragwort_scheme::library_of;
+use ragwort_scheme::{ExpandError, Expander, Top};
 use ragwort_types::gc::{Gc, Mutation, OutOfMemory};
 use ragwort_types::symbol::Symbols;
 use ragwort_types::syntax::SyntaxSession;
@@ -34,6 +36,18 @@ pub enum Error {
     /// An error in the code of a native file.
     Lower(LowerError),
     Compile(CompileError),
+}
+
+impl Error {
+    /// Returns the byte range of the name, if the error is a name that nothing defines. If the name is a procedure of Scheme,
+    /// [`library_of`] gives the library that the module would have to require.
+    pub fn unbound(&self) -> Option<(u32, u32)> {
+        match self {
+            Error::Expand(error) if error.kind == ragwort_scheme::ExpandErrorKind::Unbound => Some((error.start, error.end)),
+            Error::Lower(error) if error.kind == ragwort_native::LowerErrorKind::Unbound => Some((error.start, error.end)),
+            _ => None,
+        }
+    }
 }
 
 impl From<ReadError> for Error {
@@ -80,10 +94,46 @@ impl From<ragwort_native::Error> for Error {
     }
 }
 
-/// Builds the module of the [`PRELUDE`]. Its forms must run before any Scheme code is loaded.
-pub fn prelude<'gc>(mc: &Mutation<'gc>, symbols: Symbols<'gc>) -> Result<Loaded<'gc>, Error> {
-    let session = SyntaxSession::named(mc, "prelude", PRELUDE).map_err(|error| LowerError::from(ragwort_types::Error::from(error)))?;
-    Ok(ragwort_native::load(mc, symbols, PRELUDE_NAME, &[], &[&session], &mut NoModules)?)
+/// The modules of Scheme's libraries, built in one arena. See [`scheme`].
+pub struct Scheme<'gc> {
+    /// The name and the module of each library of [`ragwort_scheme::LIBRARIES`], then of the `scheme` module, which passes them all on.
+    pub modules: Vec<(&'static str, Gc<'gc, Module>)>,
+    /// The thunks of the libraries' forms. They must run, in order, before code that requires a library is loaded.
+    pub thunks: Vec<Value<'gc>>,
+}
+
+impl<'gc> Scheme<'gc> {
+    /// Returns the `scheme` module. A module that requires it, or that is given it as an implicit module, has every procedure of the language.
+    pub fn all(&self) -> Gc<'gc, Module> {
+        self.modules.last().expect("the `scheme` module").1
+    }
+}
+
+/// Finds a module of Scheme's libraries by its name, for the `scheme` module that requires them.
+struct Built<'m, 'gc>(&'m [(&'static str, Gc<'gc, Module>)]);
+
+impl<'gc> Resolver<'gc> for Built<'_, 'gc> {
+    fn resolve(&mut self, _: &Mutation<'gc>, name: &str, _: Value<'gc>) -> Option<Gc<'gc, Module>> {
+        self.0.iter().find(|(built, _)| *built == name).map(|&(_, module)| module)
+    }
+}
+
+/// Builds the modules of Scheme's libraries, and the `scheme` module that passes them all on. A program that does not use a set of
+/// [`libraries`] builds them this way.
+pub fn scheme<'gc>(mc: &Mutation<'gc>, symbols: Symbols<'gc>) -> Result<Scheme<'gc>, Error> {
+    let mut built = Scheme { modules: Vec::with_capacity(ragwort_scheme::LIBRARIES.len() + 1), thunks: Vec::new() };
+    for (name, source) in ragwort_scheme::LIBRARIES {
+        let session = SyntaxSession::named(mc, name, source).map_err(|error| LowerError::from(ragwort_types::Error::from(error)))?;
+        let loaded = ragwort_native::load(mc, symbols, name, &[], &[&session], &mut NoModules)?;
+        built.modules.push((name, loaded.module));
+        built.thunks.extend(loaded.thunks);
+    }
+    let (name, source) = ragwort_scheme::SCHEME;
+    let session = SyntaxSession::named(mc, name, source).map_err(|error| LowerError::from(ragwort_types::Error::from(error)))?;
+    let loaded = ragwort_native::load(mc, symbols, name, &[], &[&session], &mut Built(&built.modules))?;
+    built.modules.push((name, loaded.module));
+    built.thunks.extend(loaded.thunks);
+    Ok(built)
 }
 
 /// The language a file of a module is written in.
@@ -105,7 +155,7 @@ pub struct File<'s> {
 /// - `name`: the module's name.
 /// - `hosts`: the host functions that its native files can call.
 /// - `files`: its files, in order.
-/// - `implicit`: the modules that it requires implicitly, after the prelude. The exports of each
+/// - `implicit`: the modules that it requires implicitly. They must have run. Without any, the module starts with no procedure. The exports of each
 ///   module shadow the exports of the modules before it. The module's own definitions and
 ///   requires shadow all of them.
 /// - `internals`: whether its native files can name
@@ -134,40 +184,37 @@ pub struct Located {
 }
 
 /// Builds the module that `source` describes and compiles each of its forms. Names are interned in `symbols`.
-/// The module implicitly requires `prelude`, which must already have run. `resolver` finds the modules
+/// `resolver` finds the modules
 /// that the code requires explicitly.
 pub fn load<'gc>(
     mc: &Mutation<'gc>,
     symbols: Symbols<'gc>,
-    prelude: Gc<'gc, Module>,
     source: &Source<'_, 'gc>,
     resolver: &mut dyn Resolver<'gc>,
 ) -> Result<Loaded<'gc>, Error> {
-    load_located(mc, symbols, prelude, source, resolver).map_err(|failed| failed.error)
+    load_located(mc, symbols, source, resolver).map_err(|failed| failed.error)
 }
 
 /// Works like [`load`], but the error also says which file it is in.
 pub fn load_located<'gc>(
     mc: &Mutation<'gc>,
     symbols: Symbols<'gc>,
-    prelude: Gc<'gc, Module>,
     source: &Source<'_, 'gc>,
     resolver: &mut dyn Resolver<'gc>,
 ) -> Result<Loaded<'gc>, Located> {
     let mut file = None;
-    load_from(mc, symbols, prelude, source, resolver, &mut file).map_err(|error| Located { error, file })
+    load_from(mc, symbols, source, resolver, &mut file).map_err(|error| Located { error, file })
 }
 
 /// Implements [`load`]. While it works on the code of one file, `at` holds that file's index. Otherwise `at` is `None`.
 fn load_from<'gc>(
     mc: &Mutation<'gc>,
     symbols: Symbols<'gc>,
-    prelude: Gc<'gc, Module>,
     source: &Source<'_, 'gc>,
     resolver: &mut dyn Resolver<'gc>,
     at: &mut Option<usize>,
 ) -> Result<Loaded<'gc>, Error> {
-    let mut expander = Expander::new(mc, symbols, prelude, source.name, source.hosts, source.implicit)?;
+    let mut expander = Expander::new(mc, symbols, source.name, source.hosts, source.implicit)?;
     let mut lowerer = None;
     let mut forms = Vec::new();
     let mut tops = Vec::new();

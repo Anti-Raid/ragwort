@@ -20,9 +20,9 @@ impl<'gc> Resolver<'gc> for Registry {
 fn module_in(arena: &mut Arena, name: &str, text: &str) -> Result<Result<String, Fault>, Error> {
     arena.mutate(|mc| {
         let symbols = Symbols::of(mc.root(0)).unwrap();
-        let prelude = mc.root(2).downcast::<Module>(mc).unwrap();
+        let libraries: Vec<Gc<Module>> = Pairs::new(mc).elements(mc.root(2)).map(|module| module.downcast::<Module>(mc).unwrap()).collect();
         let session = SyntaxSession::new(mc, text).unwrap();
-        let loaded = load(mc, symbols, prelude, name, &[&session], &[], &mut Registry)?;
+        let loaded = load(mc, symbols, name, &[&session], &libraries, &mut Registry)?;
         Ok(run_and_register(mc, name, loaded))
     })
 }
@@ -89,7 +89,10 @@ fn modules_mistakes_point_at_themselves() {
     assert_eq!(error(&mut arena, "(require nowhere)"), (Resolve, "nowhere".into()));
     assert_eq!(error(&mut arena, "(require (only-in lib nope))"), (NotProvided, "nope".into()));
     assert_eq!(error(&mut arena, "(require (rename-in lib (nope x)))"), (NotProvided, "(nope x)".into()));
-    assert_eq!(error(&mut arena, "(require (sideways lib))"), (BadSyntax, "(sideways lib)".into()));
+    // A list that is no filter is a group of specs, so a misspelt filter is read as a module's name.
+    assert_eq!(error(&mut arena, "(require (sideways lib))"), (Resolve, "sideways".into()));
+    assert_eq!(error(&mut arena, "(require (only-in))"), (BadSyntax, "(only-in)".into()));
+    assert_eq!(error(&mut arena, "(require ())"), (BadSyntax, "()".into()));
     assert_eq!(error(&mut arena, "(require lib) (define twice 1)"), (Conflict, "twice".into()));
     assert_eq!(error(&mut arena, "(require lib) (set! total 1)"), (Immutable, "total".into()));
     assert_eq!(error(&mut arena, "(require (only-in lib twice)) bump!"), (Unbound, "bump!".into()));

@@ -10,9 +10,16 @@ fn scratch(name: &str) -> PathBuf {
     folder
 }
 
+/// Writes the file `name` in `folder`. A module that is not a REPL input starts with no procedure. So a Scheme file gets a last line that
+/// requires all of Scheme, which leaves the lines and columns of `text` as they are.
 fn file(folder: &Path, name: &str, text: &str) -> PathBuf {
     let path = folder.join(name);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let text = if name.ends_with(".rg") {
+        format!("{text}\n(require scheme)")
+    } else {
+        text.to_string()
+    };
     std::fs::write(&path, text).unwrap();
     path
 }
@@ -54,14 +61,14 @@ fn the_repl_keeps_what_each_input_defines() {
     // An input that fails does not change the inputs before it.
     assert_eq!(eval(&mut program, "(car 5)"), Err(vec!["error: car: wrong type of argument: 5\n  at <input>:1".to_string()]));
     assert_eq!(eval(&mut program, "1 (car 5) 2"), Err(vec!["error: car: wrong type of argument: 5\n  at <input>:1".to_string()]));
-    assert_eq!(eval(&mut program, "\n (nope)"), Err(vec!["<input>:2:3: a name nothing defines".to_string()]));
+    assert_eq!(eval(&mut program, "\n (nope)"), Err(vec!["<input>:2:3: undefined identifier".to_string()]));
     // An input that fails keeps the definitions that ran before the error, and none of the definitions after it. Neither a reference nor a call reaches a procedure whose definition never ran.
     assert_eq!(eval(&mut program, "(define (kept) 10) (car 7) (define (lost) 20)").map_err(|e| e.len()), Err(1));
     assert_eq!(eval(&mut program, "(kept)"), values(&["10"]));
-    assert_eq!(eval(&mut program, "lost"), Err(vec!["<input>:1:1: a name nothing defines".to_string()]));
-    assert_eq!(eval(&mut program, "(lost)"), Err(vec!["<input>:1:2: a name nothing defines".to_string()]));
+    assert_eq!(eval(&mut program, "lost"), Err(vec!["<input>:1:1: undefined identifier".to_string()]));
+    assert_eq!(eval(&mut program, "(lost)"), Err(vec!["<input>:1:2: undefined identifier".to_string()]));
     assert_eq!(eval(&mut program, "(define (lost) 21) (lost)"), values(&["21"]));
-    assert_eq!(eval(&mut program, "(set! x 2)"), Err(vec!["<input>:1:7: an assignment of an import".to_string()]));
+    assert_eq!(eval(&mut program, "(set! x 2)"), Err(vec!["<input>:1:7: cannot assign to imported binding".to_string()]));
     assert_eq!(eval(&mut program, "(f x)"), values(&["14"]));
 }
 
@@ -78,7 +85,7 @@ fn code_requires_the_modules_the_command_line_names() {
     let root = scratch("requires");
     let mut program = Program::new(HEAP, library(&root)).unwrap();
     assert_eq!(eval(&mut program, "(require lib/foo lib/text) (list (greet (make-user \"ann\" 3)) (twice 21))"), values(&["(\"ann!\" 42)"]));
-    assert_eq!(eval(&mut program, "(require lib/text) (user \"ann\" 3)"), Err(vec!["<input>:1:21: a struct whose constructor its module doesn't provide".to_string()]));
+    assert_eq!(eval(&mut program, "(require lib/text) (user \"ann\" 3)"), Err(vec!["<input>:1:21: struct constructor not provided by module".to_string()]));
     // A module that an input requires by name stays visible to the inputs after it. A later definition
     // shadows the module's binding of the same name.
     assert_eq!(eval(&mut program, "(twice 4)"), values(&["8"]));
@@ -86,7 +93,7 @@ fn code_requires_the_modules_the_command_line_names() {
     assert_eq!(eval(&mut program, "(list (twice 4) (shout \"a\"))"), values(&["(mine \"a!\")"]));
     let mut filtered = Program::new(HEAP, library(&root)).unwrap();
     assert_eq!(eval(&mut filtered, "(require (only-in lib/text twice)) (twice 4)"), values(&["8"]));
-    assert_eq!(eval(&mut filtered, "(twice 4)"), Err(vec!["<input>:1:2: a name nothing defines".to_string()]));
+    assert_eq!(eval(&mut filtered, "(twice 4)"), Err(vec!["<input>:1:2: undefined identifier".to_string()]));
     let main = file(&root, "main.rg", "(require lib/foo lib/text)\n(define made (make-user \"bo\" 1))\n(greet made)\n(twice 2)");
     assert_eq!(Program::new(HEAP, library(&root)).unwrap().run_file(&main, true), Ok(()));
     let failing = file(&root, "failing.rg", "(require lib/text)\n(twice 'two)");
@@ -114,33 +121,33 @@ fn what_is_wrong_says_where() {
     }
     let root = scratch("wrong");
     let unbound = file(&root, "unbound.rg", "(define (f) 1)\n\n(f 1 2\n   (g))\n");
-    assert_eq!(run(Vec::new(), &unbound), [at(&unbound, "4:5: a name nothing defines")]);
+    assert_eq!(run(Vec::new(), &unbound), [at(&unbound, "4:5: undefined identifier")]);
     let unclosed = file(&root, "unclosed.rgn", "(%define x 1)\n(%define y");
-    assert_eq!(run(Vec::new(), &unclosed), [at(&unclosed, "2:1: a list, string or comment that's never closed")]);
+    assert_eq!(run(Vec::new(), &unclosed), [at(&unclosed, "2:1: unclosed list, string, or comment")]);
     let native = file(&root, "native.rgn", "(%define x 1)\n  (x)");
-    assert_eq!(run(Vec::new(), &native), [at(&native, "2:3: a list that doesn't start with a form's name")]);
+    assert_eq!(run(Vec::new(), &native), [at(&native, "2:3: list does not start with a form name")]);
     let missing = file(&root, "missing.rg", "(require nope)");
-    assert_eq!(run(Vec::new(), &missing), [at(&missing, "1:10: a module that can't be found")]);
+    assert_eq!(run(Vec::new(), &missing), [at(&missing, "1:10: module not found")]);
     assert!(run(Vec::new(), &root.join("absent.rg"))[0].starts_with(&at(&root.join("absent.rg"), " ")));
 
     // An error in a required module is reported first, followed by the location of the `require`.
     let broken = file(&root, "broken/one.rg", "(provide f)\n(define (f) 1)");
     let second = file(&root, "broken/two.rg", "(define (g)\n  (h))");
     let user = file(&root, "user.rg", "(require broken)\n(f)");
-    assert_eq!(run(vec![dir("broken", broken.parent().unwrap())], &user), [at(&second, "2:4: a name nothing defines"), at(&user, "1:10: a module that can't be found")]);
+    assert_eq!(run(vec![dir("broken", broken.parent().unwrap())], &user), [at(&second, "2:4: undefined identifier"), at(&user, "1:10: module not found")]);
     let raising = file(&root, "raising/one.rg", "(car 1)");
     let raises = file(&root, "raises.rg", "(require raising)");
-    assert_eq!(run(vec![dir("raising", raising.parent().unwrap())], &raises), [format!("module raising: error: car: wrong type of argument: 1\n  at {}:1", raising.display()), at(&raises, "1:10: a module that can't be found")]);
+    assert_eq!(run(vec![dir("raising", raising.parent().unwrap())], &raises), [format!("module raising: error: car: wrong type of argument: 1\n  at {}:1", raising.display()), at(&raises, "1:10: module not found")]);
     let empty = scratch("wrong-empty");
     let needs = file(&root, "needs.rg", "(require empty)");
-    assert_eq!(run(vec![dir("empty", &empty)], &needs), [format!("{}: no .rg or .rgn files", empty.display()), at(&needs, "1:10: a module that can't be found")]);
+    assert_eq!(run(vec![dir("empty", &empty)], &needs), [format!("{}: no .rg or .rgn files", empty.display()), at(&needs, "1:10: module not found")]);
 
     // Modules that require each other can't be loaded.
     let a = file(&root, "a/a.rg", "(require b)");
     let b = file(&root, "b/b.rg", "(require a)");
     let dirs = vec![dir("a", a.parent().unwrap()), dir("b", b.parent().unwrap())];
     let cycle = file(&root, "cycle.rg", "(require a)");
-    assert_eq!(run(dirs, &cycle), ["module a: it requires itself, through a, b".to_string(), at(&b, "1:10: a module that can't be found"), at(&a, "1:10: a module that can't be found"), at(&cycle, "1:10: a module that can't be found")]);
+    assert_eq!(run(dirs, &cycle), ["module a: circular dependency via a, b".to_string(), at(&b, "1:10: module not found"), at(&a, "1:10: module not found"), at(&cycle, "1:10: module not found")]);
 }
 
 #[test]
@@ -163,7 +170,7 @@ fn compiling_lists_the_bytecode_of_each_module() {
     let wrong = file(&root, "wrong.rg", "(define (f) (g))");
     let mut program = Program::new(HEAP, library(&root)).unwrap();
     program.list();
-    assert_eq!(program.run_file(&wrong, false), Err(vec![format!("{}:1:14: a name nothing defines", wrong.display())]));
+    assert_eq!(program.run_file(&wrong, false), Err(vec![format!("{}:1:14: undefined identifier", wrong.display())]));
     assert_eq!(program.take_listing(), "");
 }
 
@@ -191,11 +198,11 @@ fn an_image_starts_a_program_from_the_modules_it_holds() {
     assert_eq!(eval(&mut last, "(require extra) (thrice 5)"), values(&["15"]));
 
     let clash = Program::from_image(HEAP, vec![dir("lib/text", &root)], &bytes).err();
-    assert_eq!(clash, Some(vec!["the module `lib/text` is in the image already".to_string()]));
-    assert_eq!(Program::from_image(HEAP, Vec::new(), b"not an image").err(), Some(vec!["not a ragwort image, or one that's damaged".to_string()]));
+    assert_eq!(clash, Some(vec!["module `lib/text` is already present in the image".to_string()]));
+    assert_eq!(Program::from_image(HEAP, Vec::new(), b"not an image").err(), Some(vec!["invalid or corrupted ragwort image".to_string()]));
     let mut other = bytes.clone();
     other[8] ^= 1;
-    assert_eq!(Program::from_image(HEAP, Vec::new(), &other).err(), Some(vec!["the image was made by another build of ragwort".to_string()]));
+    assert_eq!(Program::from_image(HEAP, Vec::new(), &other).err(), Some(vec!["image was created by a different build of ragwort".to_string()]));
 }
 
 #[test]
@@ -250,4 +257,50 @@ fn native_code_and_keyword_calls_report_their_lines() {
     let at = keyword.display();
     let report = format!("error: vector-ref: value out of range: #(1) 9\n  in pick ({at}:2)\n  in use ({at}:5)\n  at {at}:6");
     assert_eq!(Program::new(HEAP, Vec::new()).unwrap().run_file(&keyword, true), Err(vec![report]));
+}
+
+#[test]
+fn a_module_starts_with_no_procedure() {
+    let root = scratch("bare");
+    // A file that is not a REPL input requires what it uses. The forms of the language need no library.
+    let forms = root.join("forms.rg");
+    std::fs::write(&forms, "(define (pick x) (match x [(list a b) a] [_ 'other]))\n(guard (e (#t 'caught)) (pick '(1 2)))").unwrap();
+    assert_eq!(Program::new(HEAP, Vec::new()).unwrap().run_file(&forms, true), Ok(()));
+    // The report of a procedure that the module does not have names the library to require.
+    let bare = root.join("bare.rg");
+    std::fs::write(&bare, "(define (inc n)\n  (+ n 1))").unwrap();
+    let report = format!("{}:2:4: undefined identifier: `+` is in `scheme/number`, which is not required", bare.display());
+    assert_eq!(Program::new(HEAP, Vec::new()).unwrap().run_file(&bare, true), Err(vec![report]));
+    std::fs::write(&bare, "(require scheme/number)\n(define (inc n)\n  (+ n 1))\n(inc (car '(1)))").unwrap();
+    let report = format!("{}:4:7: undefined identifier: `car` is in `scheme/list`, which is not required", bare.display());
+    assert_eq!(Program::new(HEAP, Vec::new()).unwrap().run_file(&bare, true), Err(vec![report]));
+    std::fs::write(&bare, "(require scheme/number scheme/list)\n(define (inc n)\n  (+ n 1))\n(inc (car '(1)))").unwrap();
+    assert_eq!(Program::new(HEAP, Vec::new()).unwrap().run_file(&bare, true), Ok(()));
+    // The report does not name a library that the module requires, also when a filter leaves the name out.
+    for required in ["(require (prefix-in l: scheme/list))", "(require (only-in scheme/list cdr))", "(require [scheme/number (except-in scheme/list car)])", "(require (except-in scheme car))"] {
+        std::fs::write(&bare, format!("{required}\n(car '(1))")).unwrap();
+        let report = format!("{}:2:2: undefined identifier", bare.display());
+        assert_eq!(Program::new(HEAP, Vec::new()).unwrap().run_file(&bare, true), Err(vec![report]), "{required}");
+    }
+    // A REPL input has all of Scheme, and can still require one library by name.
+    let mut program = Program::new(HEAP, Vec::new()).unwrap();
+    assert_eq!(eval(&mut program, "(map (lambda (n) (* n n)) '(1 2 3))"), values(&["(1 4 9)"]));
+    assert_eq!(eval(&mut program, "(require (prefix-in n: scheme/number)) (n:+ 1 2)"), values(&["3"]));
+    // A folder cannot be the module of a name that a library of Scheme has.
+    let clash = Program::new(HEAP, vec![dir("scheme/list", &root)]).err();
+    assert_eq!(clash, Some(vec!["module `scheme/list` is already a library of Scheme".to_string()]));
+}
+
+#[test]
+fn a_group_that_an_input_requires_stays_visible() {
+    let root = scratch("groups");
+    let mut program = Program::new(HEAP, library(&root)).unwrap();
+    // The modules of a group are required by name alone, so the inputs after it see them, as with `(require lib/foo lib/text)`.
+    assert_eq!(eval(&mut program, "(require [lib/foo [lib/text]]) (twice 21)"), values(&["42"]));
+    assert_eq!(eval(&mut program, "(list (twice 4) (greet (make-user \"ann\" 3)))"), values(&["(8 \"ann!\")"]));
+    // A module inside a filter is required for that input only, in a group too.
+    let mut filtered = Program::new(HEAP, library(&root)).unwrap();
+    assert_eq!(eval(&mut filtered, "(require [lib/foo (only-in lib/text twice)]) (twice 4)"), values(&["8"]));
+    assert_eq!(eval(&mut filtered, "(twice 4)"), Err(vec!["<input>:1:2: undefined identifier".to_string()]));
+    assert_eq!(eval(&mut filtered, "(require (only-in lib/text make-user)) (greet (make-user \"bo\" 1))"), values(&["\"bo!\""]));
 }

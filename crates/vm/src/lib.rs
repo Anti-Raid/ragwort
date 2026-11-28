@@ -21,6 +21,7 @@ mod syntax;
 pub mod syntax_case;
 mod wind;
 
+pub use frame::ExpectedArity;
 pub use segments::CHUNK;
 pub use intrinsic::{Intrinsic, is_procedure};
 pub use machine::{MIN_SEGMENT, Machine, Outcome, SEGMENT};

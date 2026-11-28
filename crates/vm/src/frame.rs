@@ -71,6 +71,8 @@
 //! For example, `(+ 1 (f))` loads the result of `(f)` and fails if `f` returned two values, while
 //! `(call-with-values f list)` and a tail call `(f)` take whatever `f` returned.
 
+use std::fmt;
+
 use ragwort_types::gc::{Frame, Gc, Mutation, Slots, Value, WINDOW};
 
 use crate::Fault;
@@ -95,6 +97,57 @@ pub struct Shape {
     pub required: u64,
     pub optional: u64,
     pub rest: bool,
+}
+
+/// Describes the expected number of arguments for a procedure, intrinsic, request, or host function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpectedArity {
+    /// Exactly `n` arguments.
+    Exactly(u32),
+    /// Between `min` and `max` arguments (inclusive).
+    Range { min: u32, max: u32 },
+    /// At least `min` arguments.
+    AtLeast(u32),
+    /// An even number of arguments (e.g. key/value pairs).
+    Even,
+}
+
+impl ExpectedArity {
+    /// Returns whether `count` satisfies this expected arity.
+    #[inline]
+    pub fn takes(self, count: usize) -> bool {
+        match self {
+            ExpectedArity::Exactly(n) => count == n as usize,
+            ExpectedArity::Range { min, max } => count >= min as usize && count <= max as usize,
+            ExpectedArity::AtLeast(min) => count >= min as usize,
+            ExpectedArity::Even => count.is_multiple_of(2),
+        }
+    }
+}
+
+impl From<Shape> for ExpectedArity {
+    fn from(shape: Shape) -> Self {
+        let min = u32::try_from(shape.required).unwrap_or(u32::MAX);
+        if shape.rest {
+            ExpectedArity::AtLeast(min)
+        } else if shape.optional == 0 {
+            ExpectedArity::Exactly(min)
+        } else {
+            let max = u32::try_from(shape.required.saturating_add(shape.optional)).unwrap_or(u32::MAX);
+            ExpectedArity::Range { min, max }
+        }
+    }
+}
+
+impl fmt::Display for ExpectedArity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            ExpectedArity::Exactly(n) => write!(formatter, "expected {n}"),
+            ExpectedArity::Range { min, max } => write!(formatter, "expected {min} to {max}"),
+            ExpectedArity::AtLeast(min) => write!(formatter, "expected at least {min}"),
+            ExpectedArity::Even => formatter.write_str("expected an even number"),
+        }
+    }
 }
 
 /// Bit flag (bit 48) marking an encoded arity integer that contains optional parameters, with parameter counts stored in the lower bits.

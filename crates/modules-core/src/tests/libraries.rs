@@ -11,13 +11,14 @@ fn twice<'s, 'gc>(_: &mut HostContext<'s, 'gc>, args: HostArgs<'s, 'gc>) -> Resu
 
 static HOSTS: [HostDef; 1] = [host!("twice", 1, Purity::Pure, twice)];
 
-/// A library with state: each arena counts the counters that it made.
+/// A library with state: each arena counts the counters that it made. It requires the two libraries of Scheme that its code uses.
 static COUNTER: Library = Library {
     name: "lib/counter",
-    base: Some(&PRELUDE),
+    implicit: &[],
     files: &[LibraryFile::scheme(
         "counter.rg",
-        "(provide make-counter counters-made)
+        "(require scheme/number scheme/table)
+         (provide make-counter counters-made)
          (define made (make-table))
          (table-set! made 'count 0)
          (define (make-counter start)
@@ -26,19 +27,19 @@ static COUNTER: Library = Library {
          (define (counters-made) (table-ref made 'count 0))",
     )],
     hosts: &[],
-    requires: &[],
+    requires: &[scheme::library("scheme/number"), scheme::library("scheme/table")],
     internals: false,
 };
 
 /// A library in two languages that requires another library and calls a host function.
 static TEXT: Library = Library {
     name: "lib/text",
-    base: Some(&PRELUDE),
+    implicit: &[],
     files: &[
         LibraryFile::native("text.rgn", "(%define twice (%lambda (n) (%call-host twice n)))"),
         LibraryFile::scheme(
             "text.rg",
-            "(require lib/counter)
+            "(require lib/counter scheme/string)
              (provide shout doubled-counter label)
              (define label (string-append \"made by lib/text, \" \"in a string that is an object\"))
              (define (shout text) (string-append text \"!\"))
@@ -46,17 +47,17 @@ static TEXT: Library = Library {
         ),
     ],
     hosts: &HOSTS,
-    requires: &[&COUNTER],
+    requires: &[&COUNTER, scheme::library("scheme/string")],
     internals: false,
 };
 
 /// A library with a large value, which an arena should hold only if it requires the library.
 static LARGE: Library = Library {
     name: "lib/large",
-    base: Some(&PRELUDE),
-    files: &[LibraryFile::scheme("large.rg", "(provide large) (define large (make-vector 5000 0))")],
+    implicit: &[],
+    files: &[LibraryFile::scheme("large.rg", "(require scheme/vector) (provide large) (define large (make-vector 5000 0))")],
     hosts: &[],
-    requires: &[],
+    requires: &[scheme::library("scheme/vector")],
     internals: false,
 };
 
@@ -78,18 +79,16 @@ fn finish<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Value<'gc> {
     }
 }
 
-/// Compiles `text` as a module in the arena and runs it. The code can require the libraries in `allowed`, or all of them for `None`.
+/// Compiles `text` as a module in the arena and runs it. The module starts with no procedure. The code can require the libraries in `allowed`, or all of them for `None`.
 /// Returns the written form of the last form's value.
 fn program(arena: &mut Arena, libraries: &Libraries, allowed: Option<&[&str]>, text: &str) -> Result<String, Error> {
     arena.mutate(|mc| {
         let shelf = Shelf::of(mc, mc.root(0)).unwrap();
         let session = SyntaxSession::new(mc, text).unwrap();
         let files = [File { language: Language::Scheme, session: &session }];
-        // Scheme code is compiled against the prelude, which the arena loads here if it does not hold it yet.
-        let prelude = libraries.require(mc, shelf, PRELUDE.name).unwrap().unwrap();
         let mut resolver = libraries.resolver(shelf, allowed);
         let source = Source { name: "main", hosts: &[], files: &files, implicit: &[], internals: false };
-        let loaded = load(mc, shelf.symbols(mc), prelude, &source, &mut resolver)?;
+        let loaded = load(mc, shelf.symbols(mc), &source, &mut resolver)?;
         assert!(resolver.failed().is_none());
         let mut last = Value::VOID;
         for thunk in loaded.thunks {
@@ -108,41 +107,51 @@ fn loaded(arena: &mut Arena) -> usize {
 #[test]
 fn an_arena_loads_a_library_when_its_code_requires_it() {
     let libraries = Libraries::build(&[&TEXT, &LARGE], 64 << 20).unwrap();
-    // A library is built after its base and the libraries that it requires, which join the set by themselves.
-    assert_eq!(libraries.names().collect::<Vec<_>>(), [PRELUDE.name, "lib/counter", "lib/text", "lib/large"]);
+    // A library is built after the libraries that it requires, which join the set by themselves. That includes the libraries of Scheme that are used.
+    assert_eq!(libraries.names().collect::<Vec<_>>(), ["scheme/number", "scheme/table", "lib/counter", "scheme/string", "lib/text", "scheme/vector", "lib/large"]);
 
     let mut first = started(&libraries);
-    // A new arena holds no library, not even the prelude.
+    // A new arena holds no library. A program that uses only the forms of the language loads none.
     assert_eq!(loaded(&mut first), 0);
-    assert_eq!(program(&mut first, &libraries, None, "(+ 1 2)").unwrap(), "3");
+    assert_eq!(program(&mut first, &libraries, None, "(let ((x 'a)) (if x 'yes 'no))").unwrap(), "yes");
+    assert_eq!(loaded(&mut first), 0);
+    // A procedure is in a library. Without the library, the name is unbound.
+    assert!(program(&mut first, &libraries, None, "(+ 1 2)").is_err());
+    assert_eq!(program(&mut first, &libraries, None, "(require scheme/number) (+ 1 2)").unwrap(), "3");
     assert_eq!(loaded(&mut first), 1);
     first.collect();
     let bare = first.objects();
-    // The program requires one library. The arena loads it, and the library that it requires.
-    let text = "(require lib/text) (define next (doubled-counter 10)) (list (next) (next) (shout label))";
-    assert_eq!(program(&mut first, &libraries, None, text).unwrap(), "(22 24 \"made by lib/text, in a string that is an object!\")");
-    assert_eq!(loaded(&mut first), 3);
+    // The program requires one library. The arena loads it, and the libraries that it requires.
+    let text = "(require lib/text) (define next (doubled-counter 10)) (vector (next) (next) (shout label))";
+    assert!(program(&mut first, &libraries, None, text).is_err());
+    let text = "(require lib/text scheme/vector) (define next (doubled-counter 10)) (vector (next) (next) (shout label))";
+    assert_eq!(program(&mut first, &libraries, None, text).unwrap(), "#(22 24 \"made by lib/text, in a string that is an object!\")");
+    assert_eq!(loaded(&mut first), 6);
     // The library's code keeps working after a collection that moves its objects, and a second requirement finds the loaded library.
     first.set_evacuate_all(true);
     first.collect();
-    let again = "(require lib/text) (require lib/counter) (list (shout \"again\") (counters-made))";
-    assert_eq!(program(&mut first, &libraries, None, again).unwrap(), "(\"again!\" 1)");
-    assert_eq!(loaded(&mut first), 3);
+    let again = "(require lib/text) (require lib/counter scheme/vector) (vector (shout \"again\") (counters-made))";
+    assert_eq!(program(&mut first, &libraries, None, again).unwrap(), "#(\"again!\" 1)");
+    assert_eq!(loaded(&mut first), 6);
 
     // A second arena has its own state of the library, and loads only what it requires.
     let mut second = started(&libraries);
-    let counting = "(require lib/counter) (define a (make-counter 0)) (define b (make-counter 5)) (list (a) (b) (counters-made))";
-    assert_eq!(program(&mut second, &libraries, None, counting).unwrap(), "(1 6 2)");
-    assert_eq!(loaded(&mut second), 2);
+    let counting = "(require lib/counter scheme/vector) (define a (make-counter 0)) (define b (make-counter 5)) (vector (a) (b) (counters-made))";
+    assert_eq!(program(&mut second, &libraries, None, counting).unwrap(), "#(1 6 2)");
+    assert_eq!(loaded(&mut second), 4);
     assert_eq!(program(&mut first, &libraries, None, "(require lib/counter) (counters-made)").unwrap(), "1");
 
-    // Neither arena holds the large library. A third arena that requires it holds its vector of 5000 slots.
+    // Neither arena holds the large library. A third arena that requires it holds its vector of 5000 slots, which a fourth arena with
+    // only the vector procedures does not.
     first.collect();
     second.collect();
     let mut third = started(&libraries);
-    assert_eq!(program(&mut third, &libraries, None, "(require lib/large) (vector-length large)").unwrap(), "5000");
+    assert_eq!(program(&mut third, &libraries, None, "(require lib/large scheme/vector) (vector-length large)").unwrap(), "5000");
     third.collect();
-    assert!(first.occupied_bytes() + 40_000 <= third.occupied_bytes(), "{} and {} bytes", first.occupied_bytes(), third.occupied_bytes());
+    let mut fourth = started(&libraries);
+    assert_eq!(program(&mut fourth, &libraries, None, "(require scheme/vector) (vector-length (vector 'a))").unwrap(), "1");
+    fourth.collect();
+    assert!(fourth.occupied_bytes() + 40_000 <= third.occupied_bytes(), "{} and {} bytes", fourth.occupied_bytes(), third.occupied_bytes());
     assert!(first.objects() > bare && second.objects() < first.objects());
 }
 
@@ -152,8 +161,8 @@ fn code_requires_only_the_libraries_that_it_is_allowed() {
     let libraries = Libraries::build(&[&TEXT, &LARGE], 64 << 20).unwrap();
     let mut arena = started(&libraries);
     assert!(program(&mut arena, &libraries, Some(&["lib/counter"]), "(require lib/text) (shout \"no\")").is_err());
-    // Only the prelude was loaded, for the compile.
-    assert_eq!(loaded(&mut arena), 1);
+    // Nothing was loaded.
+    assert_eq!(loaded(&mut arena), 0);
     assert_eq!(program(&mut arena, &libraries, Some(&["lib/counter"]), "(require lib/counter) (counters-made)").unwrap(), "0");
     // A name that no library has is not found either.
     assert!(program(&mut arena, &libraries, None, "(require lib/missing) 1").is_err());
@@ -164,13 +173,14 @@ fn code_requires_only_the_libraries_that_it_is_allowed() {
     assert_eq!(program(&mut other, &small, None, "(require lib/counter) (counters-made)").unwrap(), "0");
 }
 
-static FIRST_OF_TWO: Library = Library { name: "lib/first", base: Some(&PRELUDE), files: &[], hosts: &[], requires: &[&SECOND_OF_TWO], internals: false };
-static SECOND_OF_TWO: Library = Library { name: "lib/second", base: Some(&PRELUDE), files: &[], hosts: &[], requires: &[&FIRST_OF_TWO], internals: false };
-static FAILING: Library = Library { name: "lib/failing", base: Some(&PRELUDE), files: &[LibraryFile::scheme("failing.rg", "(car 5)")], hosts: &[], requires: &[], internals: false };
-static UNBOUND: Library = Library { name: "lib/unbound", base: Some(&PRELUDE), files: &[LibraryFile::scheme("unbound.rg", "(define x 1)\n(no-such-procedure x)")], hosts: &[], requires: &[], internals: false };
-static OTHER_COUNTER: Library = Library { name: "lib/counter", base: Some(&PRELUDE), files: &[LibraryFile::scheme("other.rg", "(provide one) (define one 1)")], hosts: &[], requires: &[], internals: false };
-/// A library without a base must be native code.
-static BASELESS: Library = Library { name: "lib/baseless", base: None, files: &[LibraryFile::scheme("baseless.rg", "(define x 1)")], hosts: &[], requires: &[], internals: false };
+static FIRST_OF_TWO: Library = Library { name: "lib/first", implicit: &[&SCHEME], files: &[], hosts: &[], requires: &[&SECOND_OF_TWO], internals: false };
+static SECOND_OF_TWO: Library = Library { name: "lib/second", implicit: &[&SCHEME], files: &[], hosts: &[], requires: &[&FIRST_OF_TWO], internals: false };
+static FAILING: Library = Library { name: "lib/failing", implicit: &[&SCHEME], files: &[LibraryFile::scheme("failing.rg", "(car 5)")], hosts: &[], requires: &[], internals: false };
+static FAILING_LATER: Library = Library { name: "lib/later", implicit: &[&SCHEME], files: &[LibraryFile::scheme("later.rg", "(define (fail) (car 5))")], hosts: &[], requires: &[], internals: false };
+static UNBOUND: Library = Library { name: "lib/unbound", implicit: &[&SCHEME], files: &[LibraryFile::scheme("unbound.rg", "(define x 1)\n(no-such-procedure x)")], hosts: &[], requires: &[], internals: false };
+static OTHER_COUNTER: Library = Library { name: "lib/counter", implicit: &[&SCHEME], files: &[LibraryFile::scheme("other.rg", "(provide one) (define one 1)")], hosts: &[], requires: &[], internals: false };
+/// A Scheme library that uses only the forms of the language needs no other library.
+static BARE: Library = Library { name: "lib/bare", implicit: &[], files: &[LibraryFile::scheme("bare.rg", "(provide x) (define x 'bare)")], hosts: &[], requires: &[], internals: false };
 
 #[test]
 fn a_set_that_cannot_be_built_says_which_library_is_wrong() {
@@ -178,37 +188,38 @@ fn a_set_that_cannot_be_built_says_which_library_is_wrong() {
     assert!(matches!(Libraries::build(&[&COUNTER, &FAILING], 64 << 20), Err(BuildError::Raised { library: "lib/failing", fault: Some(Fault::WrongType) })));
     assert!(matches!(Libraries::build(&[&UNBOUND], 64 << 20), Err(BuildError::Load { library: "lib/unbound", error: Located { file: Some(0), .. } })));
     assert!(matches!(Libraries::build(&[&COUNTER, &OTHER_COUNTER], 64 << 20), Err(BuildError::SameName("lib/counter"))));
-    assert!(matches!(Libraries::build(&[&BASELESS], 64 << 20), Err(BuildError::Base("lib/baseless"))));
-    // The same library twice is one library. The prelude joins as the base.
-    assert_eq!(Libraries::build(&[&COUNTER, &TEXT, &COUNTER], 64 << 20).unwrap().names().count(), 3);
+    assert_eq!(Libraries::build(&[&BARE], 64 << 20).unwrap().names().collect::<Vec<_>>(), ["lib/bare"]);
+    // The same library twice is one library. The libraries that it requires join by themselves.
+    assert_eq!(Libraries::build(&[&COUNTER, &TEXT, &COUNTER], 64 << 20).unwrap().names().collect::<Vec<_>>(), ["scheme/number", "scheme/table", "lib/counter", "scheme/string", "lib/text"]);
+    // A library that uses all of Scheme without requiring it brings the `scheme` library and the twelve that it passes on.
+    assert_eq!(Libraries::build(&[&FAILING_LATER], 64 << 20).unwrap().names().count(), 14);
 }
 
-/// The base library of another language: a few procedures in native code, with nothing beneath it.
+/// A library of another language: a few procedures in native code, which requires nothing.
 static OTHER_BASE: Library = Library {
     name: "other/base",
-    base: None,
+    implicit: &[],
     files: &[LibraryFile::native("base.rgn", "(%provide add twice) (%define add (%lambda (a b) (%intrinsic + a b))) (%define twice (%lambda (n) (%call-host twice n)))")],
     hosts: &HOSTS,
     requires: &[],
     internals: false,
 };
 
-/// A library of that language. This test has no front end for another language, so the library is native code that requires its base.
+/// A second library of that language. This test has no front end for another language, so the library is native code that requires the first.
 static OTHER_LIBRARY: Library = Library {
     name: "other/math",
-    base: None,
+    implicit: &[],
     files: &[LibraryFile::native("math.rgn", "(%require other/base) (%provide add-twice) (%define add-twice (%lambda (a b) (%app twice (%app add a b))))")],
     hosts: &[],
     requires: &[&OTHER_BASE],
     internals: false,
 };
 
-/// A set holds the libraries of several languages, each on its own base. An arena that runs code of one language does not hold the
-/// base of another.
+/// A set holds the libraries of several languages. An arena that runs code of one language does not hold the libraries of another.
 #[test]
-fn each_language_has_its_own_base_library() {
+fn each_language_has_its_own_libraries() {
     let libraries = Libraries::build(&[&OTHER_LIBRARY, &TEXT], 64 << 20).unwrap();
-    assert_eq!(libraries.names().collect::<Vec<_>>(), ["other/base", "other/math", PRELUDE.name, "lib/counter", "lib/text"]);
+    assert_eq!(libraries.names().collect::<Vec<_>>(), ["other/base", "other/math", "scheme/number", "scheme/table", "lib/counter", "scheme/string", "lib/text"]);
     let mut arena = started(&libraries);
     arena.collect();
     let bare = arena.occupied_bytes();
@@ -230,17 +241,17 @@ fn each_language_has_its_own_base_library() {
     assert_eq!(result, Some(14));
     assert_eq!(loaded(&mut arena), 2);
     arena.collect();
-    // The prelude is a hundred kilobytes of objects. This arena holds a page or two more than an empty one.
+    // The libraries of Scheme are tens of kilobytes of objects. This arena holds a page or two more than an empty one.
     assert!(arena.occupied_bytes() <= bare + 2 * 16384, "{} bytes, {bare} when empty", arena.occupied_bytes());
-    // The same arena can run Scheme code later, and loads the prelude then.
+    // The same arena can run Scheme code later, and loads the libraries of Scheme that the code needs then.
     assert_eq!(program(&mut arena, &libraries, None, "(require lib/text) (shout \"both\")").unwrap(), "\"both!\"");
-    assert_eq!(loaded(&mut arena), 5);
+    assert_eq!(loaded(&mut arena), 7);
 }
 
 /// A native library that exports macros. Its macros use a procedure that it does not export.
 static LOOPS: Library = Library {
     name: "lib/loops",
-    base: None,
+    implicit: &[],
     files: &[LibraryFile::native(
         "loops.rgn",
         "(%define-syntax while
@@ -262,7 +273,7 @@ static LOOPS: Library = Library {
 /// A Scheme library that exports a macro. The macro uses a macro of another library and a procedure of its own.
 static REPEAT: Library = Library {
     name: "lib/repeat",
-    base: Some(&PRELUDE),
+    implicit: &[&SCHEME],
     files: &[LibraryFile::scheme(
         "repeat.rg",
         "(require lib/loops)
@@ -282,7 +293,7 @@ static REPEAT: Library = Library {
 fn a_librarys_macros_work_from_its_image() {
     let libraries = Libraries::build(&[&REPEAT], 64 << 20).unwrap();
     let mut arena = started(&libraries);
-    let text = "(require lib/repeat lib/loops)
+    let text = "(require lib/repeat lib/loops scheme)
                 (define (step n) 'mine)
                 (define total 0)
                 (repeat 4 times (set! total (+ total 10)))

@@ -3,7 +3,7 @@
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 
-use ragwort_compiler::module::{self, Filter, Item, ModuleBuilder, ModuleError, Provide, Require, RequireSpec, Resolver, Unusable};
+use ragwort_compiler::module::{self, Filter, Item, ModuleBuilder, ModuleError, Provide, Require, RequireSpec, RequireStep, Resolver, Unusable};
 use ragwort_compiler::steps::Step;
 use ragwort_compiler::structs::{self, Declaration};
 use ragwort_compiler::{CompileError, Core, GlobalError, Place};
@@ -48,7 +48,7 @@ pub enum LowerErrorKind {
     /// A `%call-host` named something that is not one of the host functions given to the code.
     UnknownHost,
     /// An `%intrinsic` or `%call-host` had a number of arguments that the intrinsic or host function does not accept.
-    Arity,
+    Arity { expected: ragwort_vm::ExpectedArity, got: u32 },
     /// A `%break` or `%continue` named a loop that is not around it.
     Label,
     /// The code used syntax that native ragwort does not have, such as a quasiquote outside a quoted datum.
@@ -119,36 +119,43 @@ impl LowerError {
 
 impl fmt::Display for LowerErrorKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let LowerErrorKind::Arity { expected, got } = *self {
+            return write!(formatter, "wrong number of arguments ({expected}, got {got})");
+        }
         formatter.write_str(match self {
-            LowerErrorKind::NotAForm => "a list that doesn't start with a form's name",
-            LowerErrorKind::BadShape => "a form with the wrong parts",
-            LowerErrorKind::Duplicate => "a name bound twice",
-            LowerErrorKind::Unbound => "a name nothing defines",
-            LowerErrorKind::Conflict => "a name both defined and required",
-            LowerErrorKind::Immutable => "an assignment of a name that can't change",
-            LowerErrorKind::Definition => "a definition that isn't at the top level",
-            LowerErrorKind::Resolve => "a module that can't be found",
-            LowerErrorKind::NotProvided => "a name the module doesn't provide",
-            LowerErrorKind::NotDefined => "a provide of a name that isn't defined",
-            LowerErrorKind::Uninitialized => "an export of a module that hasn't defined it yet",
-            LowerErrorKind::NoConstructor => "a struct whose constructor its module doesn't provide",
-            LowerErrorKind::UnknownIntrinsic => "an intrinsic the code can't name",
-            LowerErrorKind::UnknownHost => "a host function the module wasn't given",
-            LowerErrorKind::Arity => "an intrinsic or host call with the wrong number of arguments",
-            LowerErrorKind::Label => "a break or continue of a loop that isn't around it",
-            LowerErrorKind::Unsupported => "syntax native ragwort doesn't have",
-            LowerErrorKind::Ambiguous => "an identifier with more than one binding",
-            LowerErrorKind::Transformer => "a macro's transformer that failed",
-            LowerErrorKind::Language => "a macro of another language",
-            LowerErrorKind::Phase => "a macro's transformer that refers to a variable that doesn't exist yet",
-            LowerErrorKind::Arena(_) => "running out of memory",
+            LowerErrorKind::NotAForm => "list does not start with a form name",
+            LowerErrorKind::BadShape => "malformed form",
+            LowerErrorKind::Duplicate => "duplicate identifier",
+            LowerErrorKind::Unbound => "undefined identifier",
+            LowerErrorKind::Conflict => "identifier both defined and required",
+            LowerErrorKind::Immutable => "cannot assign to immutable binding",
+            LowerErrorKind::Definition => "definition only allowed at top level",
+            LowerErrorKind::Resolve => "module not found",
+            LowerErrorKind::NotProvided => "identifier not provided by module",
+            LowerErrorKind::NotDefined => "cannot provide undefined identifier",
+            LowerErrorKind::Uninitialized => "imported binding not yet initialized",
+            LowerErrorKind::NoConstructor => "struct constructor not provided by module",
+            LowerErrorKind::UnknownIntrinsic => "unknown intrinsic",
+            LowerErrorKind::UnknownHost => "unknown host function",
+            LowerErrorKind::Arity { .. } => unreachable!(),
+            LowerErrorKind::Label => "break or continue outside enclosing loop",
+            LowerErrorKind::Unsupported => "unsupported syntax in native ragwort",
+            LowerErrorKind::Ambiguous => "ambiguous identifier binding",
+            LowerErrorKind::Transformer => "macro transformer failed",
+            LowerErrorKind::Language => "macro from incompatible language",
+            LowerErrorKind::Phase => "macro transformer references runtime variable",
+            LowerErrorKind::Arena(_) => "out of memory",
         })
     }
 }
 
 impl fmt::Display for LowerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{} at bytes {}..{}", self.kind, self.start, self.end)
+        if self.start == 0 && self.end == 0 && matches!(self.kind, LowerErrorKind::Arena(_)) {
+            write!(formatter, "{}", self.kind)
+        } else {
+            write!(formatter, "{} at bytes {}..{}", self.kind, self.start, self.end)
+        }
     }
 }
 
@@ -180,7 +187,7 @@ impl From<ExpandError> for LowerError {
             ExpandErrorKind::NotAForm => LowerErrorKind::NotAForm,
             ExpandErrorKind::UnknownIntrinsic => LowerErrorKind::UnknownIntrinsic,
             ExpandErrorKind::UnknownHost => LowerErrorKind::UnknownHost,
-            ExpandErrorKind::Arity => LowerErrorKind::Arity,
+            ExpandErrorKind::Arity { expected, got } => LowerErrorKind::Arity { expected, got },
             ExpandErrorKind::Label => LowerErrorKind::Label,
             ExpandErrorKind::Language => LowerErrorKind::Language,
             ExpandErrorKind::Arena(error) => LowerErrorKind::Arena(error),
@@ -516,39 +523,36 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         (self.engine.tree.symbol(id).expect("an identifier").value(self.engine.mc), self.engine.tree.span(id))
     }
 
-    /// Parses the require spec `spec`. The spec is written with its filters outermost first, around the module's name.
-    /// The returned filters are in the order in which they apply, innermost first.
-    fn spec(&mut self, mut spec: Stx) -> Result<RequireSpec<SyntaxSpan<'gc>>, ExpandError> {
-        let mut filters = Vec::new();
-        loop {
-            if let Some(module) = self.text(spec) {
-                filters.reverse();
-                return Ok(RequireSpec { module, at: self.engine.tree.span(spec), filters });
-            }
-            let items = self.proper(spec)?;
-            let Some((&head, args)) = items.split_first() else { return Err(self.error(ExpandErrorKind::BadSyntax, spec)) };
-            let word = if self.is_id(head) {
-                self.text(head)
-            } else {
-                None
-            };
-            let (filter, inner) = match (word.as_deref(), args) {
-                (Some("only-in"), &[inner, ref names @ ..]) => (Filter::Only(self.identifiers(names)?), inner),
-                (Some("except-in"), &[inner, ref names @ ..]) => (Filter::Except(self.identifiers(names)?), inner),
-                (Some("prefix-in"), &[prefix, inner]) => (Filter::Prefix(self.identifier(prefix)?), inner),
-                (Some("rename-in"), &[inner, ref renames @ ..]) => {
-                    let mut pairs = Vec::with_capacity(renames.len());
-                    for &rename in renames {
-                        let (old, new) = self.pair_of_names(rename)?;
-                        pairs.push((old, new, self.engine.tree.span(rename)));
+    /// Parses the require spec `spec`. See [`Engine::require_spec`]. The result reports an error at a span of the source.
+    fn spec(&mut self, spec: Stx) -> Result<RequireSpec<SyntaxSpan<'gc>>, ExpandError> {
+        let parsed = self.require_spec(spec)?;
+        let mut steps = Vec::with_capacity(parsed.steps.len());
+        for step in parsed.steps {
+            steps.push(match step {
+                RequireStep::Module(name, at) => RequireStep::Module(name, self.engine.tree.span(at)),
+                RequireStep::Group(count) => RequireStep::Group(count),
+                RequireStep::Filter(Filter::Prefix(prefix)) => RequireStep::Filter(Filter::Prefix(prefix)),
+                RequireStep::Filter(Filter::Only(names)) => RequireStep::Filter(Filter::Only(self.spans(names))),
+                RequireStep::Filter(Filter::Except(names)) => RequireStep::Filter(Filter::Except(self.spans(names))),
+                RequireStep::Filter(Filter::Rename(renames)) => {
+                    let mut spanned = Vec::with_capacity(renames.len());
+                    for (old, new, at) in renames {
+                        spanned.push((old, new, self.engine.tree.span(at)));
                     }
-                    (Filter::Rename(pairs), inner)
+                    RequireStep::Filter(Filter::Rename(spanned))
                 }
-                _ => return Err(self.error(ExpandErrorKind::BadSyntax, spec)),
-            };
-            filters.push(filter);
-            spec = inner;
+            });
         }
+        Ok(RequireSpec { steps })
+    }
+
+    /// Returns `names` with the span of each identifier in place of the identifier.
+    fn spans(&self, names: Vec<(String, Stx)>) -> Vec<(String, SyntaxSpan<'gc>)> {
+        let mut spanned = Vec::with_capacity(names.len());
+        for (name, at) in names {
+            spanned.push((name, self.engine.tree.span(at)));
+        }
+        spanned
     }
 
     /// Parses the provide spec `spec` and appends the exports that it names to `out`.
@@ -599,23 +603,6 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             _ => return Err(self.error(ExpandErrorKind::BadSyntax, spec)),
         }
         Ok(())
-    }
-
-    /// Returns the two names in `stx`, which has the form `(old new)`.
-    fn pair_of_names(&mut self, stx: Stx) -> Result<(String, String), ExpandError> {
-        match *self.proper(stx)?.as_slice() {
-            [old, new] => Ok((self.identifier(old)?, self.identifier(new)?)),
-            _ => Err(self.error(ExpandErrorKind::BadSyntax, stx)),
-        }
-    }
-
-    /// Returns the name and the span of each of the identifiers `ids`.
-    fn identifiers(&mut self, ids: &[Stx]) -> Result<Vec<(String, SyntaxSpan<'gc>)>, ExpandError> {
-        let mut named = Vec::with_capacity(ids.len());
-        for &id in ids {
-            named.push((self.identifier(id)?, self.engine.tree.span(id)));
-        }
-        Ok(named)
     }
 
     /// Returns the name of the identifier `stx`. Fails with `BadSyntax` if `stx` is not an identifier.

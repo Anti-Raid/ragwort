@@ -22,12 +22,16 @@ fn arena_of(bytes: usize) -> Arena {
         mc.set_root(0, symbols.value(mc));
         mc.set_root(1, Value::NULL);
         mc.set_root(3, Value::NULL);
-        let session = SyntaxSession::named(mc, "prelude", PRELUDE).unwrap();
-        let loaded = ragwort_native::load(mc, symbols, PRELUDE_NAME, &[], &[&session], &mut NoModules).unwrap();
-        for thunk in loaded.thunks {
-            run(mc, thunk).unwrap();
+        let mut libraries = Value::NULL;
+        for (name, source) in LIBRARIES {
+            let session = SyntaxSession::named(mc, name, source).unwrap();
+            let loaded = ragwort_native::load(mc, symbols, name, &[], &[&session], &mut NoModules).unwrap();
+            for thunk in loaded.thunks {
+                run(mc, thunk).unwrap();
+            }
+            libraries = Pairs::new(mc).cons(Value::object(mc, loaded.module), libraries).unwrap().value(mc);
         }
-        mc.set_root(2, Value::object(mc, loaded.module));
+        mc.set_root(2, libraries);
     });
     arena
 }
@@ -36,12 +40,12 @@ fn arena_of(bytes: usize) -> Arena {
 /// of a REPL does. It exports all its definitions to the modules loaded after it.
 fn load_text<'gc>(mc: &Mutation<'gc>, text: &str) -> Result<Vec<Value<'gc>>, Error> {
     let symbols = Symbols::of(mc.root(0)).unwrap();
-    let prelude = mc.root(2).downcast::<Module>(mc).unwrap();
     let session = SyntaxSession::new(mc, text).unwrap();
     let all = SyntaxSession::new(mc, "(provide (all-defined-out))").unwrap();
-    let mut earlier: Vec<Gc<Module>> = Pairs::new(mc).elements(mc.root(1)).map(|m| m.downcast::<Module>(mc).unwrap()).collect();
+    // The module requires every library of the language, then the modules loaded before it.
+    let mut earlier: Vec<Gc<Module>> = Pairs::new(mc).elements(mc.root(1)).chain(Pairs::new(mc).elements(mc.root(2))).map(|m| m.downcast::<Module>(mc).unwrap()).collect();
     earlier.reverse();
-    let loaded = load(mc, symbols, prelude, "main", &[&session, &all], &earlier, &mut NoModules)?;
+    let loaded = load(mc, symbols, "main", &[&session, &all], &earlier, &mut NoModules)?;
     let modules = Pairs::new(mc).cons(Value::object(mc, loaded.module), mc.root(1)).unwrap();
     mc.set_root(1, modules.value(mc));
     Ok(loaded.thunks)
@@ -843,13 +847,14 @@ fn structs_equal_only_to_themselves() {
 fn struct_parts_are_the_forms_alone() {
     let account = "(struct account (id [balance #:mutable] owner))";
     // A macro cannot name `struct-ref`, the field read that `match` and `struct-copy` expand to. That holds even for an identifier with the scopes
-    // of syntax that a built-in macro introduced. Such an identifier does reach the prelude's `car`.
+    // of syntax that a built-in macro introduced. Such an identifier refers to a form such as `quote`, and to no procedure.
     fn borrowed(account: &str, name: &str, args: &str) -> String {
         format!("{account} (define a (account 1 2 \"al\"))
                  (define-syntax borrow (lambda (stx) (syntax-case stx () [(_ t) (with-syntax ([f (datum->syntax #'t '{name})]) #'(f {args}))])))
                  (cond [1 => borrow])")
     }
-    assert_eq!(eval(&borrowed(account, "car", "'(1 2)")), "1");
+    assert_eq!(eval(&borrowed(account, "quote", "(1 2)")), "(1 2)");
+    assert_eq!(error(&borrowed(account, "car", "'(1 2)")).0, ExpandErrorKind::Unbound);
     assert_eq!(error(&borrowed(account, "struct-ref", "a struct:account 0")).0, ExpandErrorKind::Unbound);
     // Only the procedures that a `struct` form defines can create a struct, or read or set a field of one.
     for name in ["make-struct-type", "make-struct", "struct-ref", "struct-field", "struct-set!"] {
@@ -2911,12 +2916,12 @@ fn faults_name_the_operation_and_what_it_was_given() {
         })
     }
     assert_eq!(displayed("(car 5)"), "car: wrong type of argument: 5");
-    assert_eq!(displayed("(string-length \"abc\" 1)"), "wrong number of arguments: #<procedure string-length> 2");
+    assert_eq!(displayed("(string-length \"abc\" 1)"), "string-length: wrong number of arguments (expected 1, got 2)");
     assert_eq!(displayed("(vector-ref (vector 1 2) 9)"), "vector-ref: value out of range: #(1 2) 9");
     assert_eq!(displayed("(+ \"two\" 1)"), "+: wrong type of argument: \"two\" 1");
     assert_eq!(displayed("(if (< 1 'x) 1 2)"), "<: wrong type of argument: 1 x");
     assert_eq!(displayed("(5 1 2)"), "not a procedure: 5");
-    assert_eq!(displayed("((lambda (x) x) 1 2)"), "wrong number of arguments: #<procedure> 2");
+    assert_eq!(displayed("((lambda (x) x) 1 2)"), "wrong number of arguments (expected 1, got 2)");
     assert_eq!(displayed("(error \"bad thing\" \"a\" 'b)"), "bad thing: \"a\" b");
     assert_eq!(displayed("(error \"alone\")"), "alone");
     assert_eq!(uncaught("(error \"bad thing\" \"a\" 'b)"), "#<error \"bad thing\" \"a\" b>");
@@ -3036,17 +3041,33 @@ fn a_host_matches_on_what_was_raised() {
     });
     reported("(/ 1 0)", |_, report| assert!(matches!(report.error, Raised::Number { error: NumError::DivideByZero, operation: Some(_), .. })));
     reported("(define (f a) a) (+ 1 (f 1 2))", |mc, report| {
-        let Raised::Arity { operation: None, procedure: Some(procedure), given: 2 } = report.error else { panic!("{:?}", report.error) };
+        let Raised::Arity { operation: None, procedure: Some(procedure), expected: Some(ragwort_vm::ExpectedArity::Exactly(1)), given: 2 } = report.error else { panic!("{:?}", report.error) };
         assert_eq!(procedure_name(mc, procedure).map(|name| show(mc, name.value(mc))), Some("f".to_string()));
+        assert_eq!(ragwort_printer_scheme::render(mc, &report, usize::MAX), "error: f: wrong number of arguments (expected 1, got 2)");
     });
-    reported("(car)", |_, report| assert!(matches!(report.error, Raised::Arity { procedure: Some(_), given: 0, .. })));
+    reported("(car)", |mc, report| {
+        assert!(matches!(report.error, Raised::Arity { procedure: Some(_), expected: Some(ragwort_vm::ExpectedArity::Exactly(1)), given: 0, .. }), "{:?}", report.error);
+        assert_eq!(ragwort_printer_scheme::render(mc, &report, usize::MAX), "error: car: wrong number of arguments (expected 1, got 0)");
+    });
+    reported("(define (g a [b 1]) (+ a b)) (g 1 2 3)", |mc, report| {
+        assert_eq!(ragwort_printer_scheme::render(mc, &report, usize::MAX), "error: g: wrong number of arguments (expected 1 to 2, got 3)");
+    });
+    reported("(define (h a . rest) a) (h)", |mc, report| {
+        assert_eq!(ragwort_printer_scheme::render(mc, &report, usize::MAX), "error: h: wrong number of arguments (expected at least 1, got 0)");
+    });
+    reported("((lambda (x y) x) 1)", |mc, report| {
+        assert_eq!(ragwort_printer_scheme::render(mc, &report, usize::MAX), "error: wrong number of arguments (expected 2, got 1)");
+    });
+    reported("(-)", |mc, report| {
+        assert_eq!(ragwort_printer_scheme::render(mc, &report, usize::MAX), "error: -: wrong number of arguments (expected at least 1, got 0)");
+    });
     // A receiving call reports how many values it passed to its consumer.
     reported("(define three (car (list (lambda () (values 1 2 3))))) (define (f a b) a) (+ 1 (call-with-values three f))", |mc, report| {
-        let Raised::Arity { operation: None, procedure: Some(procedure), given: 3 } = report.error else { panic!("{:?}", report.error) };
+        let Raised::Arity { operation: None, procedure: Some(procedure), expected: Some(ragwort_vm::ExpectedArity::Exactly(2)), given: 3 } = report.error else { panic!("{:?}", report.error) };
         assert_eq!(procedure_name(mc, procedure).map(|name| show(mc, name.value(mc))), Some("f".to_string()));
     });
     reported("(define one (car (list (lambda () 1)))) (define (f a b) a) (call-with-values one f)", |_, report| {
-        assert!(matches!(report.error, Raised::Arity { procedure: Some(_), given: 1, .. }), "{:?}", report.error);
+        assert!(matches!(report.error, Raised::Arity { procedure: Some(_), expected: Some(ragwort_vm::ExpectedArity::Exactly(2)), given: 1, .. }), "{:?}", report.error);
     });
     reported("(define two (car (list (lambda () (values 1 2))))) (+ 1 (two))", |mc, report| {
         assert_eq!(report.error, Raised::ValueCount { received: Some(2) });

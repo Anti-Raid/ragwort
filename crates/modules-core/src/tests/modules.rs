@@ -10,19 +10,25 @@ use crate::Language::{Native, Scheme};
 #[path = "macros.rs"]
 mod macros;
 
-/// Creates an arena for a test. Root 0 holds the symbol table. Root 1 holds the prelude's module, which has already run. Root 2 holds the
-/// modules that other modules can require, as a list of `(name . module)` pairs.
+/// Creates an arena for a test. Root 0 holds the symbol table. Root 1 holds the `scheme` module, which every test module requires implicitly. Root 2 holds the
+/// modules that other modules can require, as a list of `(name . module)` pairs. It starts with Scheme's libraries, which have already run.
 fn arena() -> Arena {
     let mut arena = Arena::new(1 << 24, 3);
     arena.mutate(|mc| {
         let symbols = Symbols::with_seed(mc, 1).unwrap();
         mc.set_root(0, symbols.value(mc));
-        let loaded = prelude(mc, symbols).unwrap();
-        for thunk in loaded.thunks {
+        let built = scheme(mc, symbols).unwrap();
+        for &thunk in &built.thunks {
             run(mc, thunk).unwrap();
         }
-        mc.set_root(1, Value::object(mc, loaded.module));
-        mc.set_root(2, Value::NULL);
+        mc.set_root(1, Value::object(mc, built.all()));
+        let mut modules = Value::NULL;
+        for &(name, module) in &built.modules {
+            let name = symbols.intern_str(&Strings::new(mc), name).unwrap().value(mc);
+            let entry = Pairs::new(mc).cons(name, Value::object(mc, module)).unwrap().value(mc);
+            modules = Pairs::new(mc).cons(entry, modules).unwrap().value(mc);
+        }
+        mc.set_root(2, modules);
     });
     arena
 }
@@ -69,7 +75,7 @@ fn module_from(arena: &mut Arena, name: &str, hosts: &'static [HostDef], interna
         let prelude = mc.root(1).downcast::<Module>(mc).unwrap();
         let sessions: Vec<SyntaxSession> = files.iter().map(|(_, text)| SyntaxSession::new(mc, text).unwrap()).collect();
         let files: Vec<File> = files.iter().zip(&sessions).map(|(&(language, _), session)| File { language, session }).collect();
-        let loaded = load(mc, symbols, prelude, &Source { name, hosts, files: &files, implicit: &[], internals }, &mut Registry)?;
+        let loaded = load(mc, symbols, &Source { name, hosts, files: &files, implicit: &[prelude], internals }, &mut Registry)?;
         let mut last = Value::VOID;
         for thunk in loaded.thunks {
             match run(mc, thunk) {
@@ -142,7 +148,7 @@ fn keyword_procedures_are_called_across_languages() {
         let (symbols, prelude) = (Symbols::of(mc.root(0)).unwrap(), mc.root(1).downcast::<Module>(mc).unwrap());
         let sessions = [SyntaxSession::new(mc, scheme).unwrap(), SyntaxSession::new(mc, native).unwrap()];
         let files = [File { language: Scheme, session: &sessions[0] }, File { language: Native, session: &sessions[1] }];
-        let loaded = load(mc, symbols, prelude, &Source { name: "main", hosts: &[], files: &files, implicit: &[], internals: false }, &mut Registry).unwrap();
+        let loaded = load(mc, symbols, &Source { name: "main", hosts: &[], files: &files, implicit: &[prelude], internals: false }, &mut Registry).unwrap();
         for thunk in loaded.thunks {
             run(mc, thunk).unwrap();
         }
@@ -161,7 +167,7 @@ fn closure_ops(arena: &mut Arena, name: &str, text: &str) -> String {
         let (symbols, prelude) = (Symbols::of(mc.root(0)).unwrap(), mc.root(1).downcast::<Module>(mc).unwrap());
         let session = SyntaxSession::new(mc, text).unwrap();
         let files = [File { language: Scheme, session: &session }];
-        let loaded = load(mc, symbols, prelude, &Source { name, hosts: &[], files: &files, implicit: &[], internals: false }, &mut Registry).unwrap();
+        let loaded = load(mc, symbols, &Source { name, hosts: &[], files: &files, implicit: &[prelude], internals: false }, &mut Registry).unwrap();
         for thunk in loaded.thunks {
             run(mc, thunk).unwrap();
         }

@@ -1,0 +1,44 @@
+; scheme/core: equality, booleans, symbols, keywords, boxes, multiple values, and what a program can ask about procedures and structs. Most procedures wrap an intrinsic of the VM. A helper procedure is bound with
+; %letrec around the procedure that uses it, so it is created once and the library does not export it.
+
+(%provide (all-var-defined-out))
+
+(%define eq? (%lambda (a b) (%intrinsic eq? a b)))
+(%define eqv? (%lambda (a b) (%intrinsic eqv? a b)))
+(%define equal? (%lambda (a b) (%intrinsic equal? a b)))
+(%define not (%lambda (x) (%intrinsic not x)))
+(%define boolean? (%lambda (x) (%intrinsic boolean? x)))
+
+; The three false values are #f, #nil and #none. #nil stands where there is no value at all. #none
+; is a value that says "none".
+(%define nil? (%lambda (x) (%intrinsic nil? x)))
+(%define none? (%lambda (x) (%intrinsic none? x)))
+(%define procedure? (%lambda (x) (%intrinsic procedure? x)))
+(%define void (%lambda args (%intrinsic void)))
+(%define box (%lambda (x) (%intrinsic box x)))
+(%define box? (%lambda (x) (%intrinsic box? x)))
+(%define unbox (%lambda (b) (%intrinsic unbox b)))
+(%define set-box! (%lambda (b x) (%intrinsic set-box! b x)))
+(%define apply (%lambda (f . args) (%apply-intrinsic apply f args)))
+(%define keyword-apply (%lambda (f kws vals . args) (%apply-intrinsic keyword-apply f kws vals args)))
+(%define procedure-keywords
+  (%lambda (f)
+    (%let ((both (%intrinsic procedure-keywords f)))
+      (%intrinsic values (%intrinsic car both) (%intrinsic cdr both)))))
+(%define values (%lambda xs (%apply-intrinsic values xs)))
+(%define call-with-values
+  (%lambda (producer consumer)
+    (%intrinsic receive consumer producer)))
+(%define keyword? (%lambda (x) (%intrinsic keyword? x)))
+(%define keyword->string (%lambda (k) (%intrinsic keyword->string k)))
+(%define string->keyword (%lambda (s) (%intrinsic string->keyword s)))
+(%define symbol? (%lambda (x) (%intrinsic symbol? x)))
+(%define symbol->string (%lambda (s) (%intrinsic symbol->string s)))
+(%define string->symbol (%lambda (s) (%intrinsic string->symbol s)))
+(%define struct? (%lambda (v) (%intrinsic struct? v)))
+(%define struct-type? (%lambda (v) (%intrinsic struct-type? v)))
+(%define struct-derived-from? (%lambda (v type) (%intrinsic struct-derived-from? v type)))
+(%define struct-type (%lambda (s) (%intrinsic struct-type s)))
+(%define struct->list (%lambda (s) (%intrinsic struct->list s)))
+(%define struct-fields (%lambda (type) (%intrinsic struct-fields type)))
+(%define struct-field-mutable? (%lambda (type k) (%intrinsic struct-field-mutable? type k)))

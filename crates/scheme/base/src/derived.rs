@@ -44,6 +44,30 @@ enum Part {
     Spliced(Stx),
 }
 
+/// The procedures that the built-in macros call, each with the intrinsic or the request that does its work with the same arguments.
+const PRIMITIVES: [(&str, &str); 20] = [
+    ("equal?", "equal?"),
+    ("eqv?", "eqv?"),
+    ("cons", "cons"),
+    ("car", "car"),
+    ("cdr", "cdr"),
+    ("pair?", "pair?"),
+    ("null?", "null?"),
+    ("list?", "list?"),
+    ("append", "append"),
+    ("reverse", "reverse"),
+    ("memv", "memv"),
+    ("vector?", "vector?"),
+    ("vector-ref", "vector-ref"),
+    ("vector-length", "vector-length"),
+    ("struct-derived-from?", "struct-derived-from?"),
+    ("void", "void"),
+    ("raise-continuable", "raise-continuable"),
+    ("call-with-mark", "with-mark"),
+    ("%guard", "guard"),
+    ("%guard/no-traceback", "guard/no-traceback"),
+];
+
 impl<'a, 'gc> Expander<'a, 'gc> {
     pub(crate) fn derived(&mut self, kind: Macro, stx: Stx) -> Result<Stx, ExpandError> {
         let items = self.proper(stx)?;
@@ -138,10 +162,43 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         }
     }
 
-    /// Builds `(name part ...)` with the span of `at`. `name` becomes an introduced identifier. The parts are the slices of `parts`, concatenated in order.
+    /// Builds a use of `name` with the span of `at`. The parts are the slices of `parts`, concatenated in order.
+    ///
+    /// - If `name` is a form or a macro, the result is `(name part ...)`, and `name` becomes an introduced identifier.
+    /// - If `name` is one of the procedures that the built-in macros call, the result is the core form that does the procedure's work. So the
+    ///   macros work in a module that requires no library. See [`PRIMITIVES`].
     pub(crate) fn build(&mut self, at: Stx, name: &str, parts: &[&[Stx]]) -> Result<Stx, ExpandError> {
-        let head = self.introduce(name, at)?;
-        self.list(&[&[head], parts.concat().as_slice()].concat(), at)
+        let parts = parts.concat();
+        match name {
+            "list" => {
+                let mut built = self.value(Value::NULL, at)?;
+                for &part in parts.iter().rev() {
+                    built = self.intrinsic(at, "cons", &[part, built])?;
+                }
+                Ok(built)
+            }
+            "error" => {
+                let made = self.intrinsic(at, "make-error", &parts)?;
+                self.intrinsic(at, "raise", &[made])
+            }
+            "call-with-values" => match *parts.as_slice() {
+                [producer, consumer] => self.intrinsic(at, "receive", &[consumer, producer]),
+                _ => Err(self.error(ExpandErrorKind::BadSyntax, at)),
+            },
+            _ => match PRIMITIVES.iter().find(|(procedure, _)| *procedure == name) {
+                Some(&(_, primitive)) => self.intrinsic(at, primitive, &parts),
+                None => {
+                    let head = self.introduce(name, at)?;
+                    self.list(&[&[head], parts.as_slice()].concat(), at)
+                }
+            },
+        }
+    }
+
+    /// Builds `(%intrinsic name arg ...)` with the span of `at`.
+    fn intrinsic(&mut self, at: Stx, name: &str, args: &[Stx]) -> Result<Stx, ExpandError> {
+        let (form, name) = (self.core_id("%intrinsic", at)?, self.core_id(name, at)?);
+        self.list(&[&[form, name], args].concat(), at)
     }
 
     pub(crate) fn list(&mut self, items: &[Stx], at: Stx) -> Result<Stx, ExpandError> {
@@ -323,11 +380,11 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         self.build(stx, "lambda", &[&[formals, case]])
     }
 
-    /// Expands `guard` to `(%guard (lambda () body ...) (lambda (var) (cond clause ... (else (raise-continuable
-    /// var)))))`. The `else` clause is added only if the clauses have none. The prelude's `%guard` calls the
+    /// Expands `guard` to `(%intrinsic guard (lambda () body ...) (lambda (var) (cond clause ... (else (raise-continuable
+    /// var)))))`. The `else` clause is added only if the clauses have none. The `guard` request calls the
     /// handler after it has left the body, so the clauses run in the context of the `guard` form.
     ///
-    /// `(guard (var #:no-traceback clause ...) body ...)` expands to `%guard/no-traceback` instead, so a condition this guard catches records no call trace when it is raised.
+    /// `(guard (var #:no-traceback clause ...) body ...)` expands to the `guard/no-traceback` request instead, so a condition this guard catches records no call trace when it is raised.
     fn guard(&mut self, stx: Stx, spec: Stx, body: &[Stx]) -> Result<Stx, ExpandError> {
         let parts = self.proper(spec)?;
         let Some((&var, clauses)) = parts.split_first().filter(|(var, _)| self.is_id(**var)) else {

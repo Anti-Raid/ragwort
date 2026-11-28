@@ -317,7 +317,7 @@ pub enum CompileError {
     /// A [`Core::KeywordApp`] passes two arguments by the same keyword.
     SameKeyword,
     /// An intrinsic was invoked with an unsupported number of arguments.
-    Arity(Prim),
+    Arity { prim: Prim, expected: ragwort_vm::ExpectedArity, got: usize },
     /// The number of constants in the compilation unit exceeded the 2^32 indexable limit.
     TooManyConstants,
     /// Attempted to call a host function not registered in the target module's host table.
@@ -363,27 +363,27 @@ impl From<ragwort_types::Error> for CompileError {
 impl fmt::Display for CompileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Import(module::Unusable::Uninitialized) => write!(formatter, "an import whose module hasn't defined it yet"),
-            Self::Import(module::Unusable::MatchOnly) => write!(formatter, "a struct whose constructor its module doesn't provide"),
-            Self::Global { kind: GlobalError::Unbound, .. } => write!(formatter, "a name nothing defines"),
-            Self::Global { kind: GlobalError::Immutable, .. } => write!(formatter, "an assignment of a name that can't change"),
+            Self::Import(module::Unusable::Uninitialized) => write!(formatter, "imported binding not yet initialized"),
+            Self::Import(module::Unusable::MatchOnly) => write!(formatter, "struct constructor not provided by module"),
+            Self::Global { kind: GlobalError::Unbound, .. } => write!(formatter, "undefined identifier"),
+            Self::Global { kind: GlobalError::Immutable, .. } => write!(formatter, "cannot assign to immutable binding"),
             Self::Global { kind: GlobalError::Import(unusable), .. } => Self::Import(*unusable).fmt(formatter),
             Self::Unbound(var) => write!(formatter, "unbound variable {}", var.0),
             Self::Rebound(var) => write!(formatter, "variable {} bound more than once", var.0),
             Self::SameLambda(id) => write!(formatter, "lambda {id} appears more than once"),
             Self::TooManyOptional(id) => write!(formatter, "lambda {id} has more optional parameters than parameters"),
             Self::Formals(id) => write!(formatter, "lambda {id} repeats a keyword, or has a required parameter after an optional one"),
-            Self::SameKeyword => write!(formatter, "a call passes the same keyword twice"),
-            Self::Jump(label) => write!(formatter, "a break or continue of loop {} outside the loop, or where a value is needed", label.0),
-            Self::Arity(Prim::Intrinsic(intrinsic)) => write!(formatter, "wrong number of arguments to {}", intrinsic.name()),
-            Self::Arity(Prim::Request(request)) => write!(formatter, "wrong number of arguments to {}", request.name()),
-            Self::Arity(Prim::Host(host)) => write!(formatter, "wrong number of arguments to host function {}", host.name),
-            Self::Arity(Prim::Slot(_, slot)) => write!(formatter, "wrong number of arguments to an access of module variable {slot}"),
-            Self::TooManyConstants => write!(formatter, "more than 2^32 constants"),
-            Self::UnknownHost(host) => write!(formatter, "host function {} isn't one of the module's", host.name),
-            Self::UnknownSlot(slot) => write!(formatter, "variable {slot} isn't one of the module's"),
-            Self::TooManyRegisters => write!(formatter, "more than 2^32 locals"),
-            Self::TooManyArguments => write!(formatter, "a host call with more arguments than fit a frame"),
+            Self::SameKeyword => write!(formatter, "duplicate keyword argument in call"),
+            Self::Jump(label) => write!(formatter, "break or continue for loop {} outside loop or in value position", label.0),
+            Self::Arity { prim: Prim::Intrinsic(intrinsic), expected, got } => write!(formatter, "wrong number of arguments to {} ({expected}, got {got})", intrinsic.name()),
+            Self::Arity { prim: Prim::Request(request), expected, got } => write!(formatter, "wrong number of arguments to {} ({expected}, got {got})", request.name()),
+            Self::Arity { prim: Prim::Host(host), expected, got } => write!(formatter, "wrong number of arguments to host function {} ({expected}, got {got})", host.name),
+            Self::Arity { prim: Prim::Slot(_, slot), expected, got } => write!(formatter, "wrong number of arguments to module variable {slot} ({expected}, got {got})"),
+            Self::TooManyConstants => write!(formatter, "too many constants (exceeds 2^32)"),
+            Self::UnknownHost(host) => write!(formatter, "host function {} is not defined in this module", host.name),
+            Self::UnknownSlot(slot) => write!(formatter, "module variable {slot} does not exist"),
+            Self::TooManyRegisters => write!(formatter, "too many local variables (exceeds 2^32)"),
+            Self::TooManyArguments => write!(formatter, "too many arguments for host call frame"),
             Self::OutOfMemory => write!(formatter, "out of memory"),
         }
     }

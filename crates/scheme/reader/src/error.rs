@@ -91,31 +91,35 @@ impl ReadError {
 impl fmt::Display for ErrorKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            ErrorKind::UnexpectedClose => "a closing bracket with no list open",
-            ErrorKind::Mismatched { .. } => "a list closed with the wrong bracket",
-            ErrorKind::Unclosed => "a list, string or comment that's never closed",
-            ErrorKind::EmptyQuote => "a quote or datum comment with nothing after it",
-            ErrorKind::BadDot => "a misplaced dot",
-            ErrorKind::Unsupported => "syntax the reader doesn't support yet",
-            ErrorKind::BadNumber => "a malformed number",
-            ErrorKind::BadChar => "an unknown character name",
-            ErrorKind::BadEscape => "an unknown escape",
-            ErrorKind::BadByte => "a bytevector item that isn't a byte",
-            ErrorKind::UnknownLabel => "a datum label used before it's defined",
-            ErrorKind::BadLabel => "a datum label too big to be one",
-            ErrorKind::CyclicLabel => "a datum label used inside the datum it labels",
-            ErrorKind::DuplicateLabel => "a datum label defined twice",
-            ErrorKind::InvalidUtf8 => "text that isn't UTF-8",
-            ErrorKind::ForeignSession => "a session from another arena",
-            ErrorKind::Arena(Error::OutOfMemory) => "running out of memory",
-            ErrorKind::Arena(_) => "a value the arena couldn't make",
+            ErrorKind::UnexpectedClose => "unexpected closing delimiter",
+            ErrorKind::Mismatched { .. } => "mismatched closing delimiter",
+            ErrorKind::Unclosed => "unclosed list, string, or comment",
+            ErrorKind::EmptyQuote => "missing datum after quote or datum comment",
+            ErrorKind::BadDot => "misplaced dot",
+            ErrorKind::Unsupported => "unsupported reader syntax",
+            ErrorKind::BadNumber => "malformed number",
+            ErrorKind::BadChar => "unknown character name",
+            ErrorKind::BadEscape => "unknown escape sequence",
+            ErrorKind::BadByte => "bytevector element out of range (expected 0..255)",
+            ErrorKind::UnknownLabel => "undefined datum label",
+            ErrorKind::BadLabel => "datum label out of range",
+            ErrorKind::CyclicLabel => "cyclic datum label reference",
+            ErrorKind::DuplicateLabel => "duplicate datum label",
+            ErrorKind::InvalidUtf8 => "invalid UTF-8",
+            ErrorKind::ForeignSession => "syntax session belongs to another arena",
+            ErrorKind::Arena(Error::OutOfMemory) => "out of memory",
+            ErrorKind::Arena(_) => "failed to allocate value in arena",
         })
     }
 }
 
 impl fmt::Display for ReadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{} at bytes {}..{}", self.kind, self.start, self.end)
+        if self.start == 0 && self.end == 0 && matches!(self.kind, ErrorKind::Arena(_) | ErrorKind::ForeignSession) {
+            write!(formatter, "{}", self.kind)
+        } else {
+            write!(formatter, "{} at bytes {}..{}", self.kind, self.start, self.end)
+        }
     }
 }
 

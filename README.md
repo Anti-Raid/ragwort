@@ -14,6 +14,8 @@ A (fairly) simple GC'd scheme-like language for defining Discord bots etc. in An
 
 A ``.rg`` file is Scheme and a ``.rgn`` file is native ragwort. ``(require repl)`` gives ``display``, ``write`` and ``newline``.
 
+A Scheme file starts with the forms of the language (``define``, ``lambda``, ``if``, ``match``, ``guard``, ...) and with no procedure. It requires the libraries that it uses: ``(require scheme/number)`` for arithmetic, ``scheme/list``, ``scheme/string``, ``scheme/vector``, ``scheme/bytevector``, ``scheme/table``, ``scheme/error``, ``scheme/cont`` (continuations and marks), ``scheme/dynamic-wind``, ``scheme/coro`` (coroutines), ``scheme/syntax``, and ``scheme/core`` (``equal?``, ``not``, ``values``, symbols, ...). ``(require scheme)`` gives them all, and ``(require [scheme/number scheme/list])`` requires a group. An input of the REPL has all of them already.
+
 ## Memory Safety
 
 ragwort's heap is a 64MB region of 64-bit words (or another power of two if built with ``RAGWORT_REGION_MB`` set, such as ``RAGWORT_REGION_MB=128``), and every reference into it is an index, so the GC and everything built on it are safe Rust. The only unsafe code is in ``crates/gc-region``, which maps the region and gives free pages back to the system. A bug in the GC or a corrupted object gives wrong results or a panic, never memory corruption in the host.

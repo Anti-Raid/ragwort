@@ -481,21 +481,28 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
                 }
             }
             Core::Intrinsic(prim, args, _) => {
-                let takes = match *prim {
-                    Prim::Intrinsic(intrinsic) => intrinsic.arity().is_none_or(|arity| usize::from(arity) == args.len()),
-                    Prim::Request(request) => request.takes(args.len()),
-                    Prim::Host(host) => host.takes(args.len()),
-                    Prim::Slot(op, _) => op.arity() == args.len(),
+                let expected = match *prim {
+                    Prim::Intrinsic(intrinsic) => intrinsic.arity().map(|arity| ragwort_vm::ExpectedArity::Exactly(u32::from(arity))),
+                    Prim::Request(request) => Some(request.expected_arity()),
+                    Prim::Host(host) => Some(host.expected_arity()),
+                    Prim::Slot(op, _) => Some(ragwort_vm::ExpectedArity::Exactly(op.arity() as u32)),
                 };
-                if !takes {
-                    return Err(CompileError::Arity(*prim));
+                if let Some(expected) = expected
+                    && !expected.takes(args.len())
+                {
+                    return Err(CompileError::Arity { prim: *prim, expected, got: args.len() });
                 }
                 all(args, then);
             }
             Core::ApplyIntrinsic(prim, args, _) => {
                 // Host functions and slot primitives cannot be invoked via dynamic apply intrinsics; arguments must fit a VM call frame.
                 if args.is_empty() || matches!(prim, Prim::Host(_) | Prim::Slot(..)) {
-                    return Err(CompileError::Arity(*prim));
+                    let expected = match *prim {
+                        Prim::Host(host) => host.expected_arity(),
+                        Prim::Slot(op, _) => ragwort_vm::ExpectedArity::Exactly(op.arity() as u32),
+                        _ => ragwort_vm::ExpectedArity::AtLeast(1),
+                    };
+                    return Err(CompileError::Arity { prim: *prim, expected, got: args.len() });
                 }
                 all(args, then);
             }

@@ -1,0 +1,18 @@
+; scheme/dynamic-wind: `dynamic-wind`. Most procedures wrap an intrinsic of the VM. A helper procedure is bound with
+; %letrec around the procedure that uses it, so it is created once and the library does not export it.
+
+(%provide (all-var-defined-out))
+
+; dynamic-wind follows Chez Scheme. It calls `before`, adds a winder to the task's winders while `thunk`
+; runs, and then calls `after`. When control jumps out of or into the extent of `thunk`, the VM runs the
+; winder's `after` or `before`. call/cc and exceptions are implemented by the VM, and a VM fault is
+; raised as an error object.
+(%define dynamic-wind
+  (%lambda (before thunk after)
+    (%let* ((_ (%app before))
+            (outside (%intrinsic winders))
+            (_ (%intrinsic set-winders! (%intrinsic cons (%intrinsic make-winder before after) outside)))
+            (results (%intrinsic collect thunk))
+            (_ (%intrinsic set-winders! outside)))
+      (%app after)
+      (%apply-intrinsic values results))))

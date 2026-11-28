@@ -1,0 +1,38 @@
+; scheme/cont: continuations, prompts and continuation marks. Most procedures wrap an intrinsic of the VM. A helper procedure is bound with
+; %letrec around the procedure that uses it, so it is created once and the library does not export it.
+
+(%provide (all-var-defined-out))
+
+(%define continuation? (%lambda (x) (%intrinsic continuation? x)))
+(%define default-continuation-prompt-tag (%lambda () (%intrinsic default-continuation-prompt-tag)))
+(%define make-continuation-prompt-tag (%lambda args (%apply-intrinsic make-continuation-prompt-tag args)))
+
+; Takes `f` and an optional prompt tag. With more arguments than that, the procedure applies itself
+; to no arguments. That call raises an arity error that names this procedure.
+(%define call-with-composable-continuation
+  (%lambda (f . more)
+    (%if (%intrinsic null? more)
+         (%intrinsic capture (%intrinsic default-continuation-prompt-tag) f)
+         (%if (%intrinsic null? (%intrinsic cdr more))
+              (%intrinsic capture (%intrinsic car more) f)
+              (%intrinsic apply call-with-composable-continuation '())))))
+(%define call-with-continuation-prompt
+  (%letrec ((handler (%lambda (thunk)
+                       (%intrinsic call-with-prompt (%intrinsic default-continuation-prompt-tag) handler thunk))))
+    (%lambda (proc . more)
+      (%if (%intrinsic null? more)
+           (%intrinsic call-with-prompt (%intrinsic default-continuation-prompt-tag) handler proc)
+           (%let ((tag (%intrinsic car more)) (rest (%intrinsic cdr more)))
+             (%if (%intrinsic null? rest)
+                  (%intrinsic call-with-prompt tag handler proc)
+                  (%let ((h (%intrinsic car rest)) (args (%intrinsic cdr rest)))
+                    (%apply-intrinsic call-with-prompt tag h proc args))))))))
+
+; Continuation marks, as in Racket. `call-with-mark` calls `thunk` with a mark that pairs `key` with `value`.
+; A `call-with-mark` in tail position replaces the mark for `key` of its frame. `mark-value` returns the
+; value of the nearest mark for `key`, or `default` if there is none.
+(%define call-with-mark (%lambda (key value thunk) (%intrinsic with-mark key value thunk)))
+(%define mark-value (%lambda (key default) (%intrinsic mark-value key default)))
+(%define abort-current-continuation (%lambda (tag . args) (%apply-intrinsic abort tag args)))
+(%define call/cc (%lambda (f) (%intrinsic call/cc f)))
+(%define call-with-current-continuation (%lambda (f) (%intrinsic call/cc f)))

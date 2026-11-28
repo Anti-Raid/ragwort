@@ -10,8 +10,8 @@ use ragwort_types::symbol::Symbol;
 use ragwort_types::syntax::SyntaxSource;
 use ragwort_types::vector::{AnyVector, Vectors};
 
-use crate::frame::{self, CLOSURE, Link};
-use crate::objects::{Bytecode, BytecodeFields, HINT_KEY, HINT_SLOTS, HintsFields, Sites, SitesFields, Closure, ClosureFields, Condition, ConditionFields, FramesFields, KeywordProcedure, KeywordProcedureFields, ModuleFields, Prompt, PromptFields, Task, TaskFields};
+use crate::frame::{self, CLOSURE, ExpectedArity, Link, Shape};
+use crate::objects::{Bytecode, BytecodeFields, HINT_KEY, HINT_SLOTS, HintsFields, Sites, SitesFields, Closure, ClosureFields, Condition, ConditionFields, FramesFields, KeywordProcedure, KeywordProcedureFields, ModuleFields, Prompt, PromptFields, StructType, StructTypeFields, Task, TaskFields};
 use crate::segments::records;
 use crate::{Fault, HostDef, Intrinsic, Op, coroutine};
 
@@ -30,6 +30,31 @@ impl Operation {
             Operation::Host(host) => host.name,
         }
     }
+
+    /// Returns the expected argument arity of this operation, if it has a fixed or bounded arity.
+    pub fn expected_arity(self) -> Option<ExpectedArity> {
+        match self {
+            Operation::Intrinsic(intrinsic) => intrinsic.expected_arity(),
+            Operation::Host(host) => Some(host.expected_arity()),
+        }
+    }
+}
+
+/// Returns the expected positional arity of `procedure`, when it is a closure, keyword procedure, or struct type constructor.
+pub fn procedure_expected_arity<'gc>(mc: &Mutation<'gc>, procedure: Value<'gc>) -> Option<ExpectedArity> {
+    if let Some(closure) = procedure.downcast::<Closure>(mc) {
+        return closure.code(mc).map(|code| ExpectedArity::from(Shape::of(code.arity(mc))));
+    }
+    if let Some(keyword) = procedure.downcast::<KeywordProcedure>(mc) {
+        if let Some(plain) = keyword.plain(mc).downcast::<Closure>(mc) {
+            return plain.code(mc).map(|code| ExpectedArity::from(Shape::of(code.arity(mc))));
+        }
+        return keyword.core(mc).downcast::<Closure>(mc).and_then(|c| c.code(mc)).map(|code| ExpectedArity::from(Shape::of(code.arity(mc))));
+    }
+    if let Some(kind) = procedure.downcast::<StructType>(mc) {
+        return Some(ExpectedArity::Exactly(StructTypeFields::fields(kind, mc)));
+    }
+    None
 }
 
 /// The payload of a [`Condition`]: the kind of fault, and the operation that raised it when the VM could identify one.
@@ -387,7 +412,7 @@ pub enum Raised<'gc> {
     /// A string operation failed. `error` gives the reason.
     String { error: StrError, operation: Option<Operation>, operands: Value<'gc> },
     /// A procedure or operation was called with a number of arguments it does not accept. `procedure` is the procedure that was called, when the call was to a procedure and not to a built-in operation.
-    Arity { operation: Option<Operation>, procedure: Option<Value<'gc>>, given: usize },
+    Arity { operation: Option<Operation>, procedure: Option<Value<'gc>>, expected: Option<ExpectedArity>, given: usize },
     /// A place that takes exactly one value received `received` values.
     ValueCount { received: Option<usize> },
     /// A call's target was not a procedure.
@@ -418,11 +443,12 @@ pub struct Report<'gc> {
 impl<'gc> Report<'gc> {
     /// Describes `raised`, a value that a program raised, such as the value in [`Outcome::Raised`](crate::Outcome::Raised).
     pub fn of(mc: &Mutation<'gc>, raised: Value<'gc>) -> Self {
-        Report { value: raised, error: decoded(mc, raised), trace: trace(mc, raised) }
+        Report { value: raised, error: decode(mc, raised), trace: trace(mc, raised) }
     }
 }
 
-fn decoded<'gc>(mc: &Mutation<'gc>, raised: Value<'gc>) -> Raised<'gc> {
+/// Decodes a raised value into a structured [`Raised`] variant without building a call trace.
+pub fn decode<'gc>(mc: &Mutation<'gc>, raised: Value<'gc>) -> Raised<'gc> {
     let Some(condition) = raised.downcast::<Condition>(mc) else { return Raised::Value(raised) };
     let Some(&Failure { fault, operation }) = condition.failure(mc) else { return Raised::Value(raised) };
     let (message, operands) = (condition.message(mc), condition.irritants(mc));
@@ -433,11 +459,21 @@ fn decoded<'gc>(mc: &Mutation<'gc>, raised: Value<'gc>) -> Raised<'gc> {
         Fault::Immutable => Raised::Immutable { operation, operands },
         Fault::Num(error) => Raised::Number { error, operation, operands },
         Fault::Str(error) => Raised::String { error, operation, operands },
-        Fault::Arity if operation.is_some() => Raised::Arity { operation, procedure: None, given: Pair::of(operands).and_then(|cell| cell.list_len(mc)).unwrap_or(0) as usize },
+        Fault::Arity if operation.is_some() => Raised::Arity {
+            operation,
+            procedure: None,
+            expected: operation.and_then(Operation::expected_arity),
+            given: Pair::of(operands).and_then(|cell| cell.list_len(mc)).unwrap_or(0) as usize,
+        },
         Fault::Arity => {
             // A call's arity fault lists the procedure and the number of arguments it was given.
             let given = Pair::of(operands).and_then(|cell| Pair::of(cell.tail(mc))).and_then(|cell| cell.head(mc).as_fixnum());
-            Raised::Arity { operation, procedure: first, given: given.and_then(|given| usize::try_from(given).ok()).unwrap_or(0) }
+            Raised::Arity {
+                operation,
+                procedure: first,
+                expected: first.and_then(|proc| procedure_expected_arity(mc, proc)),
+                given: given.and_then(|given| usize::try_from(given).ok()).unwrap_or(0),
+            }
         }
         // For the `values` operation, the irritants are the values it was given. For a load, the only irritant is the number of values.
         Fault::ValueCount if operation.is_some() => Raised::ValueCount { received: Pairs::new(mc).list_len(operands).and_then(|received| usize::try_from(received).ok()) },

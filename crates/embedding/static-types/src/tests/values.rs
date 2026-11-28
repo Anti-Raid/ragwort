@@ -1,5 +1,5 @@
 use ragwort_compiler::module::NoModules;
-use ragwort_scheme::{PRELUDE, PRELUDE_NAME};
+use ragwort_scheme::LIBRARIES;
 use ragwort_types::external::{ExternalKind, ExternalRefs};
 use ragwort_types::gc::{self, Arena, Mutation};
 use ragwort_types::string::Strings;
@@ -10,18 +10,22 @@ use ragwort_vm::{MIN_SEGMENT, Machine, Outcome};
 
 use crate::{Error, Number, Pair, Table, Value};
 
-/// Creates an arena whose root 0 holds the symbol table and whose root 1 holds the prelude's module, which has run.
+/// Creates an arena whose root 0 holds the symbol table and whose root 1 holds a list of the modules of Scheme's libraries, which have run.
 fn arena() -> Arena {
     let mut arena = Arena::new(1 << 24, 2);
     arena.mutate(|mc| {
         let symbols = Symbols::with_seed(mc, 1).unwrap();
         mc.set_root(0, symbols.value(mc));
-        let session = SyntaxSession::named(mc, "prelude", PRELUDE).unwrap();
-        let loaded = ragwort_native::load(mc, symbols, PRELUDE_NAME, &[], &[&session], &mut NoModules).unwrap();
-        for thunk in loaded.thunks {
-            run(mc, thunk);
+        let mut libraries = gc::Value::NULL;
+        for (name, source) in LIBRARIES {
+            let session = SyntaxSession::named(mc, name, source).unwrap();
+            let loaded = ragwort_native::load(mc, symbols, name, &[], &[&session], &mut NoModules).unwrap();
+            for thunk in loaded.thunks {
+                run(mc, thunk);
+            }
+            libraries = ragwort_types::pair::Pairs::new(mc).cons(gc::Value::object(mc, loaded.module), libraries).unwrap().value(mc);
         }
-        mc.set_root(1, gc::Value::object(mc, loaded.module));
+        mc.set_root(1, libraries);
     });
     arena
 }
@@ -40,9 +44,9 @@ fn run<'gc>(mc: &Mutation<'gc>, thunk: gc::Value<'gc>) -> gc::Value<'gc> {
 /// Runs the forms of `text` and returns the value of the last one.
 fn eval<'gc>(mc: &Mutation<'gc>, text: &str) -> gc::Value<'gc> {
     let symbols = Symbols::of(mc.root(0)).unwrap();
-    let prelude = mc.root(1).downcast::<Module>(mc).unwrap();
+    let libraries: Vec<_> = ragwort_types::pair::Pairs::new(mc).elements(mc.root(1)).map(|module| module.downcast::<Module>(mc).unwrap()).collect();
     let session = SyntaxSession::new(mc, text).unwrap();
-    let loaded = ragwort_scheme::load(mc, symbols, prelude, "main", &[&session], &[], &mut NoModules).unwrap();
+    let loaded = ragwort_scheme::load(mc, symbols, "main", &[&session], &libraries, &mut NoModules).unwrap();
     let mut last = gc::Value::VOID;
     for thunk in loaded.thunks {
         last = run(mc, thunk);

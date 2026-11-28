@@ -546,7 +546,7 @@ fn bad_forms_dont_compile() {
     // (let ((_ (let ((x 1)) x))) x): x is out of scope.
     assert_eq!(error(|_| seq(1, let_(vec![(0, q(1))], var(0)), var(0))), CompileError::Unbound(Var(0)));
     assert_eq!(error(|_| let_(vec![(0, q(1))], let_(vec![(0, q(2))], var(0)))), CompileError::Rebound(Var(0)));
-    assert_eq!(error(|_| prim(Car, vec![])), CompileError::Arity(Prim::Intrinsic(Car)));
+    assert_eq!(error(|_| prim(Car, vec![])), CompileError::Arity { prim: Prim::Intrinsic(Car), expected: ragwort_vm::ExpectedArity::Exactly(1), got: 0 });
     // ((lambda () 1) (lambda () 2)), both numbered 7.
     fn numbered<'gc>(body: Core<'gc>) -> Core<'gc> {
         Core::Lambda(Lambda { id: 7, params: Vec::new(), optional: 0, rest: None, body: Box::new(body), name: None, at: None })
@@ -554,7 +554,7 @@ fn bad_forms_dont_compile() {
     assert_eq!(error(|_| app(numbered(q(1)), vec![numbered(q(2))])), CompileError::SameLambda(7));
     // Reject a lambda with one parameter but an optional-parameter count of two.
     assert_eq!(error(|_| Core::Lambda(Lambda { id: 7, params: vec![Var(0)], optional: 2, rest: None, body: Box::new(q(1)), name: None, at: None })), CompileError::TooManyOptional(7));
-    assert_eq!(error(|_| Core::Intrinsic(Prim::Request(Request::Capture), vec![q(1)], None)), CompileError::Arity(Prim::Request(Request::Capture)));
+    assert_eq!(error(|_| Core::Intrinsic(Prim::Request(Request::Capture), vec![q(1)], None)), CompileError::Arity { prim: Prim::Request(Request::Capture), expected: ragwort_vm::ExpectedArity::Exactly(2), got: 1 });
 }
 
 
@@ -1514,7 +1514,7 @@ fn a_description_builds_a_whole_module() {
         }
         let lib = exporting_with(mc, &[], &[], vec![("plus", lambda(&[0, 1], None, add(var(0), var(1))), false), ("minus", lambda(&[0], None, var(0)), false)]);
         fn require<'gc>(span: SyntaxSpan<'gc>, filters: Vec<Filter<SyntaxSpan<'gc>>>) -> Item<'gc> {
-            Item::Require(vec![Require { spec: RequireSpec { module: "lib".into(), at: span, filters }, span }])
+            Item::Require(vec![Require { spec: RequireSpec::module("lib".into(), span, filters), span }])
         }
         fn point<'gc>(mc: &Mutation<'gc>, symbols: Symbols<'gc>, span: SyntaxSpan<'gc>, parent: Option<&str>) -> structs::Form<'gc> {
             structs::Form {
@@ -1874,7 +1874,7 @@ fn intrinsics_on_the_task_get_register_forms_and_unused_ones_go() {
         let constant = ops(mc, lambda(&[], None, prim(MarkValue, vec![q(1), q(2)])));
         assert!(constant.iter().any(|op| matches!(op, Op::TailCallIntrinsic { intrinsic: MarkValue, .. })), "{constant:?}");
     });
-    assert_eq!(error(|_| prim(MarkValue, vec![q(1)])), CompileError::Arity(Prim::Intrinsic(MarkValue)));
+    assert_eq!(error(|_| prim(MarkValue, vec![q(1)])), CompileError::Arity { prim: Prim::Intrinsic(MarkValue), expected: ragwort_vm::ExpectedArity::Exactly(2), got: 1 });
 }
 
 fn add_host<'s, 'gc>(_: &mut ragwort_vm::HostContext<'s, 'gc>, args: ragwort_vm::HostArgs<'s, 'gc>) -> Result<ragwort_vm::Reply<'gc>, Fault> {
@@ -1939,8 +1939,8 @@ fn module_variables_are_slots() {
     assert_eq!(number(|_| seq(9, define(0, lambda(&[0], None, add(var(0), q(1)))), app(checked(0), vec![q(41)]))), Ok(42));
     assert_eq!(error(|_| slot(3)), CompileError::UnknownSlot(3));
     assert_eq!(error(|_| define(3, q(1))), CompileError::UnknownSlot(3));
-    assert_eq!(error(|_| Core::Intrinsic(Prim::Slot(SlotOp::Store, 0), vec![], None)), CompileError::Arity(Prim::Slot(SlotOp::Store, 0)));
-    assert_eq!(error(|_| Core::ApplyIntrinsic(Prim::Slot(SlotOp::Load, 0), vec![q(1)], None)), CompileError::Arity(Prim::Slot(SlotOp::Load, 0)));
+    assert_eq!(error(|_| Core::Intrinsic(Prim::Slot(SlotOp::Store, 0), vec![], None)), CompileError::Arity { prim: Prim::Slot(SlotOp::Store, 0), expected: ragwort_vm::ExpectedArity::Exactly(1), got: 0 });
+    assert_eq!(error(|_| Core::ApplyIntrinsic(Prim::Slot(SlotOp::Load, 0), vec![q(1)], None)), CompileError::Arity { prim: Prim::Slot(SlotOp::Load, 0), expected: ragwort_vm::ExpectedArity::Exactly(0), got: 1 });
     let mut arena = Arena::new(1 << 22, 0);
     arena.mutate(|mc| {
         assert_eq!(compile(mc, None, &slot(0)), Err(CompileError::UnknownSlot(0)));
@@ -1983,8 +1983,8 @@ fn host_functions_are_called_in_the_loop() {
     // Host functions are called only through direct primitives, so their arguments must fit in a frame
     // and cannot be spread.
     assert_eq!(error(|_| host(ADD_HOST, (1..=60).map(q).collect())), CompileError::TooManyArguments);
-    assert_eq!(error(|_| host(CALL_WITH, vec![q(1)])), CompileError::Arity(Prim::Host(CALL_WITH)));
-    assert_eq!(error(|_| Core::ApplyIntrinsic(Prim::Host(ADD_HOST), vec![q(1)], None)), CompileError::Arity(Prim::Host(ADD_HOST)));
+    assert_eq!(error(|_| host(CALL_WITH, vec![q(1)])), CompileError::Arity { prim: Prim::Host(CALL_WITH), expected: CALL_WITH.expected_arity(), got: 1 });
+    assert_eq!(error(|_| Core::ApplyIntrinsic(Prim::Host(ADD_HOST), vec![q(1)], None)), CompileError::Arity { prim: Prim::Host(ADD_HOST), expected: ADD_HOST.expected_arity(), got: 1 });
     assert_eq!(error(|_| host(&ELSEWHERE, vec![])), CompileError::UnknownHost(&ELSEWHERE));
     let mut arena = Arena::new(1 << 22, 0);
     arena.mutate(|mc| assert_eq!(compile(mc, None, &host(ADD_HOST, vec![])), Err(CompileError::UnknownHost(ADD_HOST))));

@@ -6,7 +6,7 @@
 
 use std::ops::{Deref, DerefMut};
 
-use ragwort_compiler::module::{self, Filter, ModuleBuilder, RequireSpec, Resolver, SpecError};
+use ragwort_compiler::module::{self, ModuleBuilder, Resolver, SpecError};
 use ragwort_compiler::steps::Step;
 use ragwort_compiler::structs::Declared;
 use ragwort_compiler::{Core, Lambda, Place, Position, Prim, Var};
@@ -235,24 +235,22 @@ impl<'a, 'gc> Host<'a, 'gc> for Expander<'a, 'gc> {
 
 impl<'a, 'gc> Expander<'a, 'gc> {
     /// Creates an expander for the Scheme files of the module named `name`. `hosts` are the host functions that the module's native files
-    /// call. The module implicitly requires `prelude`, then each module of `implicit` in order. An export of a later
-    /// module shadows the same name from an earlier one. `prelude` must have run. Its exports are also the base
-    /// bindings.
+    /// call. The module implicitly requires each module of `implicit` in order, which must have run. An export of a later
+    /// module shadows the same name from an earlier one. Without implicit modules, the module starts with Scheme's forms and no procedure.
     pub fn new(
         mc: &'a Mutation<'gc>,
         symbols: Symbols<'gc>,
-        prelude: Gc<'gc, Module>,
         name: &str,
         hosts: &'static [HostDef],
         implicit: &[Gc<'gc, Module>],
     ) -> Result<Self, ExpandError> {
         let strings = Strings::new(mc);
         let mut builder = ModuleBuilder::new(symbols.intern_str(&strings, name)?.value(mc), hosts);
-        for &module in std::iter::once(&prelude).chain(implicit) {
+        for &module in implicit {
             builder.require_implicitly(mc, symbols, module).map_err(|_| OutOfMemory)?;
         }
         let (ellipsis, underscore) = (Keyword::Aux(Aux::Ellipsis), Keyword::Aux(Aux::Underscore));
-        let mut engine = Engine::new(mc, symbols, builder, &KEYWORDS, Some(ellipsis), Some(underscore), Some(prelude), false, LANGUAGE)?;
+        let mut engine = Engine::new(mc, symbols, builder, &KEYWORDS, Some(ellipsis), Some(underscore), None, false, LANGUAGE)?;
         engine.bind_internal("struct-ref", Keyword::Form(Form::StructRef))?;
         Ok(Self { engine, provides: Vec::new(), form: 0, defining: None })
     }
@@ -289,12 +287,14 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 }
                 Head::Require(form) => {
                     for spec in self.proper(form)?.into_iter().skip(1) {
-                        let parsed = self.spec(spec)?;
-                        let imports = parsed.imports(self.engine.mc, resolver, self.engine.module.name()).map_err(|error| match error {
+                        let parsed = self.require_spec(spec)?;
+                        let parts = parsed.imports(self.engine.mc, resolver, self.engine.module.name()).map_err(|error| match error {
                             SpecError::Resolve(at) => self.error(ExpandErrorKind::Resolve, at),
                             SpecError::NotProvided(at) => self.error(ExpandErrorKind::NotProvided, at),
                         })?;
-                        self.engine.module.require(self.engine.mc, self.engine.symbols, &parsed.module, imports).map_err(|error| self.module_error(error, spec))?;
+                        for (module, imports) in parts {
+                            self.engine.module.require(self.engine.mc, self.engine.symbols, &module, imports).map_err(|error| self.module_error(error, spec))?;
+                        }
                     }
                 }
                 Head::Provide(form) => self.provides.push(form),
@@ -359,64 +359,12 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         Ok(())
     }
 
-    /// Parses the require spec `spec`. Filters are written outermost first, around the module name.
-    /// The returned filters are in the order they apply, innermost first.
-    fn spec(&mut self, mut spec: Stx) -> Result<RequireSpec<Stx>, ExpandError> {
-        let mut filters = Vec::new();
-        loop {
-            if let Some(module) = self.text(spec) {
-                filters.reverse();
-                return Ok(RequireSpec { module, at: spec, filters });
-            }
-            let items = self.proper(spec)?;
-            let Some((&head, args)) = items.split_first() else { return Err(self.error(ExpandErrorKind::BadSyntax, spec)) };
-            let word = if self.is_id(head) {
-                self.text(head)
-            } else {
-                None
-            };
-            let (filter, inner) = match (word.as_deref(), args) {
-                (Some("only-in"), &[inner, ref ids @ ..]) => (Filter::Only(self.identifiers(ids)?), inner),
-                (Some("except-in"), &[inner, ref ids @ ..]) => (Filter::Except(self.identifiers(ids)?), inner),
-                (Some("prefix-in"), &[prefix, inner]) => (Filter::Prefix(self.identifier(prefix)?), inner),
-                (Some("rename-in"), &[inner, ref renames @ ..]) => {
-                    let mut pairs = Vec::with_capacity(renames.len());
-                    for &rename in renames {
-                        let (old, new) = self.pair_of_names(rename)?;
-                        pairs.push((self.text(old).expect("an identifier"), new, rename));
-                    }
-                    (Filter::Rename(pairs), inner)
-                }
-                _ => return Err(self.error(ExpandErrorKind::BadSyntax, spec)),
-            };
-            filters.push(filter);
-            spec = inner;
-        }
-    }
-
     /// Parses `stx` as `(old new)`, a list of two identifiers. Returns the identifier `old` and the name of `new`.
     fn pair_of_names(&mut self, stx: Stx) -> Result<(Stx, String), ExpandError> {
         match *self.proper(stx)?.as_slice() {
             [old, new] if self.is_id(old) && self.is_id(new) => Ok((old, self.text(new).expect("an identifier"))),
             _ => Err(self.error(ExpandErrorKind::BadSyntax, stx)),
         }
-    }
-
-    /// Returns the name of each of the identifiers `ids`, with the identifier.
-    fn identifiers(&mut self, ids: &[Stx]) -> Result<Vec<(String, Stx)>, ExpandError> {
-        let mut named = Vec::with_capacity(ids.len());
-        for &id in ids {
-            named.push((self.identifier(id)?, id));
-        }
-        Ok(named)
-    }
-
-    /// Returns the name of the identifier `stx`, or a `BadSyntax` error if `stx` is not an identifier.
-    fn identifier(&mut self, stx: Stx) -> Result<String, ExpandError> {
-        if !self.is_id(stx) {
-            return Err(self.error(ExpandErrorKind::BadSyntax, stx));
-        }
-        Ok(self.text(stx).expect("an identifier"))
     }
 
     /// Expands `top`, the module's top-level form with index `form`. The module must have been started.

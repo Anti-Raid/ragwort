@@ -5,32 +5,32 @@
 //! and pays nothing for a library that it never needs.
 //!
 //! ```text
-//! static QUEUE: Library = Library { name: "std/queue", base: Some(&PRELUDE), files: &[LibraryFile::scheme("queue.rg", QUEUE_SOURCE)], hosts: &[], requires: &[], internals: false };
+//! static QUEUE: Library = Library { name: "std/queue", implicit: &[&SCHEME], files: &[LibraryFile::scheme("queue.rg", QUEUE_SOURCE)], hosts: &[], requires: &[], internals: false };
 //!
 //! // Once, when the program starts:
 //! let libraries = Libraries::build(&[&QUEUE], 64 << 20)?;
 //! // In each new arena:
 //! let shelf = arena.mutate(|mc| libraries.start(mc))?;
-//! // To compile Scheme code in the arena: its base library, and a resolver that loads what the code requires.
-//! let prelude = libraries.require(mc, shelf, PRELUDE.name)?;
+//! // To compile code in the arena: a resolver that loads what the code requires.
 //! let mut resolver = libraries.resolver(shelf, None);
 //! ```
 //!
-//! # Base libraries
+//! # The libraries of Scheme
 //!
-//! The code of a language is compiled against that language's base library, which it uses without requiring it. For Scheme this is the
-//! prelude, [`PRELUDE`]. A base library is a library like any other in the set: it is built once, shared, and loaded into an arena
-//! when the arena first needs it. So an arena that runs no Scheme code does not hold the prelude.
+//! A Scheme module starts with the forms of the language and with no procedure. The procedures are in the libraries of
+//! [`scheme::LIBRARIES`], such as `scheme/number` and `scheme/list`, and [`SCHEME`] passes them all on. They are libraries like any
+//! other in the set: each is built once, shared, and loaded into an arena when the arena's code first requires it. So an arena holds
+//! only the parts of the language that its code uses.
 //!
-//! A library names its base in [`Library::base`]. A base library has none. It is written in native ragwort, which needs nothing
-//! beneath it.
+//! A library's own code can use libraries without requiring them: it names them in [`Library::implicit`]. The `QUEUE` above is written
+//! against all of Scheme in this way. An embedder gives a program the same convenience with [`Source::implicit`](crate::Source::implicit).
 //!
 //! # What the arenas share
 //!
 //! The set holds one image of each library. The arenas share the frozen values of the images, such as the instructions of the code.
 //! Each arena has its own copy of the objects of the images that it loaded, and its own hash seed. See [`image::Template`].
 //!
-//! A library's image refers to the objects of its base and of the libraries that it uses. It does not hold copies of them. So an arena
+//! A library's image refers to the objects of the libraries that it uses. It does not hold copies of them. So an arena
 //! that loads a library loads those first.
 //!
 //! # What a library can do
@@ -86,29 +86,113 @@ impl LibraryFile {
 /// A module of the program's own that arenas share. See the [module docs](self).
 ///
 /// - `name`: the name that code requires it by, such as `std/queue`.
-/// - `base`: the base library of the language that it is written in, which its code is compiled against. `None` for a base library
-///   itself. Its files are then all native.
+/// - `implicit`: the libraries that its code uses without requiring them, in order. An export of a later one shadows the same name from an earlier
+///   one. They are built before it, and are part of every set that it is part of.
 /// - `files`: its files, in order. They make up one body.
 /// - `hosts`: the host functions that its native files can call.
 /// - `requires`: the libraries that its code requires. They are built before it, and are part of every set that it is part of.
 /// - `internals`: whether its native files can name internal intrinsics. See [`Source::internals`].
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Library {
     pub name: &'static str,
-    pub base: Option<&'static Library>,
+    pub implicit: &'static [&'static Library],
     pub files: &'static [LibraryFile],
     pub hosts: &'static [HostDef],
     pub requires: &'static [&'static Library],
     pub internals: bool,
 }
 
-/// The base library of Scheme: the prelude. Scheme code is compiled against it.
-pub static PRELUDE: Library = Library {
-    name: ragwort_scheme::PRELUDE_NAME,
-    base: None,
-    files: &[LibraryFile::native("prelude", ragwort_scheme::PRELUDE)],
+/// The libraries that hold Scheme's procedures: one for each entry of [`ragwort_scheme::LIBRARIES`], which lists the files of the prelude folder. No
+/// library requires another. A library that is written in Scheme names the ones that its code requires:
+///
+/// ```text
+/// static QUEUE: Library = Library { name: "std/queue", requires: &[scheme::library("scheme/list"), scheme::library("scheme/number")], ... };
+/// ```
+pub mod scheme {
+    use super::{Library, LibraryFile};
+
+    /// The number of libraries.
+    const COUNT: usize = ragwort_scheme::LIBRARIES.len();
+
+    /// The source file of each library.
+    static FILES: [[LibraryFile; 1]; COUNT] = files();
+
+    const fn files() -> [[LibraryFile; 1]; COUNT] {
+        let mut files = [[LibraryFile::native("", "")]; COUNT];
+        let mut index = 0;
+        while index < COUNT {
+            let (name, source) = ragwort_scheme::LIBRARIES[index];
+            files[index] = [LibraryFile::native(name, source)];
+            index += 1;
+        }
+        files
+    }
+
+    const fn libraries() -> [Library; COUNT] {
+        let mut libraries = [Library { name: "", implicit: &[], files: &[], hosts: &[], requires: &[], internals: false }; COUNT];
+        let mut index = 0;
+        while index < COUNT {
+            libraries[index].name = ragwort_scheme::LIBRARIES[index].0;
+            libraries[index].files = &FILES[index];
+            index += 1;
+        }
+        libraries
+    }
+
+    const fn references() -> [&'static Library; COUNT] {
+        let mut references = [&LIBRARIES[0]; COUNT];
+        let mut index = 0;
+        while index < COUNT {
+            references[index] = &LIBRARIES[index];
+            index += 1;
+        }
+        references
+    }
+
+    /// The libraries, in the order of [`ragwort_scheme::LIBRARIES`].
+    pub static LIBRARIES: [Library; COUNT] = libraries();
+
+    /// A reference to each library of [`LIBRARIES`], as a library's `requires` holds them.
+    pub static ALL: [&Library; COUNT] = references();
+
+    /// Returns the library named `name`, such as `scheme/number`. It is for a `static` that describes a library. A name that no library has
+    /// stops the build.
+    pub const fn library(name: &str) -> &'static Library {
+        let mut index = 0;
+        while index < COUNT {
+            if same(ragwort_scheme::LIBRARIES[index].0, name) {
+                return &LIBRARIES[index];
+            }
+            index += 1;
+        }
+        panic!("no library of Scheme has this name")
+    }
+
+    /// Returns whether two names are equal. A constant function cannot compare strings with `==`.
+    const fn same(first: &str, second: &str) -> bool {
+        let (first, second) = (first.as_bytes(), second.as_bytes());
+        if first.len() != second.len() {
+            return false;
+        }
+        let mut index = 0;
+        while index < first.len() {
+            if first[index] != second[index] {
+                return false;
+            }
+            index += 1;
+        }
+        true
+    }
+}
+
+/// The library `scheme`, which passes on every library of [`scheme::LIBRARIES`]. Code that requires it has every procedure of the language. An arena
+/// that loads it loads them all.
+pub static SCHEME: Library = Library {
+    name: ragwort_scheme::SCHEME.0,
+    implicit: &[],
+    files: &[LibraryFile::native(ragwort_scheme::SCHEME.0, ragwort_scheme::SCHEME.1)],
     hosts: &[],
-    requires: &[],
+    requires: &scheme::ALL,
     internals: false,
 };
 
@@ -116,8 +200,6 @@ pub static PRELUDE: Library = Library {
 #[derive(Debug)]
 pub enum BuildError {
     OutOfMemory,
-    /// The library has no base, and one of its files is not native.
-    Base(&'static str),
     /// Two libraries of the set have this name.
     SameName(&'static str),
     /// The library requires itself, directly or through other libraries.
@@ -171,7 +253,7 @@ const ROOTS: usize = 4;
 
 impl Libraries {
     /// Builds the libraries in `libraries`, their bases and the libraries that they require, in an arena with a limit of `limit`
-    /// bytes that is dropped afterwards. Each library is built and run once, after its base and the libraries that it requires.
+    /// bytes that is dropped afterwards. Each library is built and run once, after the libraries that it uses.
     pub fn build(libraries: &[&'static Library], limit: usize) -> Result<Self, BuildError> {
         let order = ordered(libraries)?;
         let hosts: Vec<&'static HostDef> = order.iter().flat_map(|library| library.hosts.iter()).collect();
@@ -198,7 +280,7 @@ impl Libraries {
             let image = Linked { template: Template::new(&saved[position], hosts.iter().copied()).map_err(BuildError::Image)?, exports };
             // The libraries that this one refers to, and those that they need. An earlier library's needs are complete already.
             let mut needs: Vec<usize> = imports[position].iter().map(|&(image, _)| image as usize).collect();
-            for required in library.requires.iter().chain(library.base.iter()) {
+            for required in library.requires.iter().chain(library.implicit.iter()) {
                 needs.extend(order.iter().position(|other| other.name == required.name));
             }
             let mut index = 0;
@@ -302,7 +384,7 @@ impl<'gc> Shelf<'gc> {
         Symbols::of(self.0.items(mc).get(Self::SYMBOLS)).expect("a shelf holds the symbol table")
     }
 
-    /// Returns the number of libraries that the arena has loaded, base libraries included.
+    /// Returns the number of libraries that the arena has loaded.
     pub fn loaded(self, mc: &Mutation<'gc>) -> usize {
         let items = self.0.items(mc);
         (Self::IMAGES..items.len()).step_by(2).filter(|&slot| items.get(slot + 1).downcast::<Module>(mc).is_some()).count()
@@ -340,7 +422,7 @@ impl<'gc> Resolver<'gc> for Requires<'_, 'gc> {
     }
 }
 
-/// Returns `libraries`, their bases and the libraries that they require, each after its base and the libraries that it requires.
+/// Returns `libraries` and the libraries that they use, each after the libraries that it uses.
 fn ordered(libraries: &[&'static Library]) -> Result<Vec<&'static Library>, BuildError> {
     /// A library that is being placed, and the number of its requirements that have been dealt with.
     struct Visit {
@@ -360,8 +442,7 @@ fn ordered(libraries: &[&'static Library]) -> Result<Vec<&'static Library>, Buil
                 path.pop();
                 continue;
             }
-            // A library's base comes before the libraries that it requires.
-            let wanted = library.base.iter().chain(library.requires.iter()).nth(visit.next).copied();
+            let wanted = library.implicit.iter().chain(library.requires.iter()).nth(visit.next).copied();
             match wanted {
                 Some(required) => {
                     visit.next += 1;
@@ -371,9 +452,6 @@ fn ordered(libraries: &[&'static Library]) -> Result<Vec<&'static Library>, Buil
                     path.push(Visit { library: required, next: 0 });
                 }
                 None => {
-                    if library.base.is_none() && library.files.iter().any(|file| file.language != Language::Native) {
-                        return Err(BuildError::Base(library.name));
-                    }
                     order.push(library);
                     path.pop();
                 }
@@ -398,20 +476,13 @@ fn compile<'gc>(mc: &Mutation<'gc>, library: &'static Library, built: &[&'static
         sessions.push(SyntaxSession::named(mc, file.path, file.text)?);
     }
     let mut resolver = Earlier { built, required: library.requires };
-    let loaded = match library.base {
-        // A base library is native code with nothing beneath it.
-        None => {
-            let files: Vec<&SyntaxSession> = sessions.iter().collect();
-            let loaded = ragwort_native::load(mc, symbols, library.name, library.hosts, &files, &mut resolver);
-            loaded.map_err(|error| BuildError::Load { library: library.name, error: Located { error: error.into(), file: None } })?
-        }
-        Some(base) => {
-            let base = module_of(mc, built, base.name).expect("a library's base is built before it");
-            let files: Vec<File> = library.files.iter().zip(&sessions).map(|(file, session)| File { language: file.language, session }).collect();
-            let source = Source { name: library.name, hosts: library.hosts, files: &files, implicit: &[], internals: library.internals };
-            load_located(mc, symbols, base, &source, &mut resolver).map_err(|error| BuildError::Load { library: library.name, error })?
-        }
-    };
+    let mut implicit = Vec::with_capacity(library.implicit.len());
+    for used in library.implicit {
+        implicit.push(module_of(mc, built, used.name).expect("a library is built after the libraries that it uses"));
+    }
+    let files: Vec<File> = library.files.iter().zip(&sessions).map(|(file, session)| File { language: file.language, session }).collect();
+    let source = Source { name: library.name, hosts: library.hosts, files: &files, implicit: &implicit, internals: library.internals };
+    let loaded = load_located(mc, symbols, &source, &mut resolver).map_err(|error| BuildError::Load { library: library.name, error })?;
     let pairs = ragwort_types::pair::Pairs::new(mc);
     mc.set_root(MODULES, pairs.cons(Value::object(mc, loaded.module), mc.root(MODULES))?.value(mc));
     mc.set_root(THUNKS, Vectors::new(mc).from_slice(&loaded.thunks)?.value(mc));

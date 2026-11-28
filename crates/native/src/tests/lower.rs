@@ -209,7 +209,10 @@ fn modules_require_what_others_provide() {
     assert_eq!(error(&mut arena, "(%require (only-in lib nope))"), (NotProvided, "nope".into()));
     assert_eq!(error(&mut arena, "(%require (rename-in lib (nope x)))"), (NotProvided, "(nope x)".into()));
     assert_eq!(error(&mut arena, "(%require nowhere)"), (Resolve, "nowhere".into()));
-    assert_eq!(error(&mut arena, "(%require (sideways lib))"), (BadShape, "(sideways lib)".into()));
+    // A list that is no filter is a group of specs, so a misspelt filter is read as a module's name.
+    assert_eq!(error(&mut arena, "(%require (sideways lib))"), (Resolve, "sideways".into()));
+    assert_eq!(error(&mut arena, "(%require (only-in))"), (BadShape, "(only-in)".into()));
+    assert_eq!(error(&mut arena, "(%require ())"), (BadShape, "()".into()));
     assert_eq!(error(&mut arena, "(%provide nope)"), (NotDefined, "nope".into()));
     assert_eq!(error(&mut arena, "(%define a 1) (%provide a (rename-out (a a)))"), (Duplicate, "(a a)".into()));
     assert_eq!(error(&mut arena, "(%provide (all-defined-out x))"), (BadShape, "(all-defined-out x)".into()));
@@ -479,8 +482,8 @@ fn bad_forms_point_at_themselves() {
     assert_eq!(error("(%lambda ('a) a)"), (BadShape, "'a"));
     assert_eq!(error("(%set! (a) 'b)"), (BadShape, "(a)"));
     assert_eq!(error("(%intrinsic frob 'a)"), (UnknownIntrinsic, "frob"));
-    assert_eq!(error("(%intrinsic car)"), (Arity, "(%intrinsic car)"));
-    assert_eq!(error("(%intrinsic capture 'a)"), (Arity, "(%intrinsic capture 'a)"));
+    assert_eq!(error("(%intrinsic car)"), (Arity { expected: ragwort_vm::ExpectedArity::Exactly(1), got: 0 }, "(%intrinsic car)"));
+    assert_eq!(error("(%intrinsic capture 'a)"), (Arity { expected: ragwort_vm::ExpectedArity::Exactly(2), got: 1 }, "(%intrinsic capture 'a)"));
     fn deep(depth: usize) -> String {
         format!("{}'a{}", "(%intrinsic car ".repeat(depth), ")".repeat(depth))
     }
@@ -674,7 +677,7 @@ fn native_code_calls_the_host_and_wraps_it_for_other_code() {
     assert_eq!(eval(wrapped), "6");
     assert_eq!(fault("(%call-host add 1 'x)"), Fault::WrongType);
     assert_eq!(error("(%call-host nope 1)"), (UnknownHost, "nope"));
-    assert_eq!(error("(%call-host add 1)"), (Arity, "(%call-host add 1)"));
+    assert_eq!(error("(%call-host add 1)"), (Arity { expected: ragwort_vm::ExpectedArity::Exactly(2), got: 1 }, "(%call-host add 1)"));
     assert_eq!(error("(%call-host)"), (BadShape, "(%call-host)"));
     assert_eq!(error("(%call-host (add) 1)"), (BadShape, "(add)"));
 }

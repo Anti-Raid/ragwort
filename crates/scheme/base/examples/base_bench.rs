@@ -5,7 +5,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use ragwort_compiler::module::NoModules;
-use ragwort_scheme::{PRELUDE, PRELUDE_NAME, load};
+use ragwort_scheme::{LIBRARIES, load};
 use ragwort_types::gc::{Arena, Mutation, Value};
 use ragwort_types::symbol::Symbols;
 use ragwort_types::syntax::SyntaxSession;
@@ -85,18 +85,22 @@ fn run<'gc>(mc: &Mutation<'gc>, thunk: Value<'gc>) -> Value<'gc> {
     }
 }
 
-/// Creates an arena with the symbol table in root 0 and the prelude's module in root 1. The prelude has run.
+/// Creates an arena with the symbol table in root 0 and a list of the modules of Scheme's libraries in root 1. The libraries have run.
 fn arena() -> Arena {
     let mut arena = Arena::new(1 << 28, 2);
     arena.mutate(|mc| {
         let symbols = Symbols::with_seed(mc, 1).expect("table");
         mc.set_root(0, symbols.value(mc));
-        let session = SyntaxSession::named(mc, "prelude", PRELUDE).expect("session");
-        let loaded = ragwort_native::load(mc, symbols, PRELUDE_NAME, &[], &[&session], &mut NoModules).expect("prelude");
-        mc.set_root(1, Value::object(mc, loaded.module));
-        for thunk in loaded.thunks {
-            run(mc, thunk);
+        let mut libraries = Value::NULL;
+        for (name, source) in LIBRARIES {
+            let session = SyntaxSession::named(mc, name, source).expect("session");
+            let loaded = ragwort_native::load(mc, symbols, name, &[], &[&session], &mut NoModules).expect("a library");
+            for thunk in loaded.thunks {
+                run(mc, thunk);
+            }
+            libraries = ragwort_types::pair::Pairs::new(mc).cons(Value::object(mc, loaded.module), libraries).expect("a pair").value(mc);
         }
+        mc.set_root(1, libraries);
     });
     arena
 }
@@ -107,13 +111,13 @@ fn prepared(text: &str, native: bool) -> (Arena, Duration, Machine) {
     arena.collect();
     let (loaded, machine) = arena.mutate(|mc| {
         let symbols = Symbols::of(mc.root(0)).expect("table");
-        let prelude = mc.root(1).downcast::<Module>(mc).expect("the prelude");
+        let libraries: Vec<_> = ragwort_types::pair::Pairs::new(mc).elements(mc.root(1)).map(|module| module.downcast::<Module>(mc).expect("a library")).collect();
         let session = SyntaxSession::new(mc, text).expect("session");
         let start = Instant::now();
         let loaded = if native {
             ragwort_native::load(mc, symbols, "main", &[], &[&session], &mut NoModules).expect("load")
         } else {
-            load(mc, symbols, prelude, "main", &[&session], &[], &mut NoModules).expect("load")
+            load(mc, symbols, "main", &[&session], &libraries, &mut NoModules).expect("load")
         };
         let mut thunks = loaded.thunks;
         let loaded = start.elapsed();

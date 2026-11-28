@@ -461,14 +461,16 @@ fn intrinsic<'a, 'gc: 'a, H: Host<'a, 'gc>>(this: &mut H, stx: Stx, name: Stx, a
     if spread {
         return H::exprs(args, move |this, args| Ok(Step::Done(Core::ApplyIntrinsic(prim, args, this.position(stx)))));
     }
-    let takes = match prim {
-        Prim::Intrinsic(intrinsic) => intrinsic.arity().is_none_or(|arity| usize::from(arity) == args.len()),
-        Prim::Request(request) => request.takes(args.len()),
-        Prim::Host(host) => host.takes(args.len()),
-        Prim::Slot(op, _) => op.arity() == args.len(),
+    let expected = match prim {
+        Prim::Intrinsic(intrinsic) => intrinsic.arity().map(|arity| ragwort_vm::ExpectedArity::Exactly(u32::from(arity))),
+        Prim::Request(request) => Some(request.expected_arity()),
+        Prim::Host(host) => Some(host.expected_arity()),
+        Prim::Slot(op, _) => Some(ragwort_vm::ExpectedArity::Exactly(op.arity() as u32)),
     };
-    if !takes {
-        return Err(this.error(ExpandErrorKind::Arity, stx));
+    if let Some(expected) = expected
+        && !expected.takes(args.len())
+    {
+        return Err(this.error(ExpandErrorKind::Arity { expected, got: args.len() as u32 }, stx));
     }
     H::exprs(args, move |this, args| Ok(Step::Done(Core::Intrinsic(prim, args, this.position(stx)))))
 }
@@ -481,8 +483,9 @@ fn call_host<'a, 'gc: 'a, H: Host<'a, 'gc>>(this: &mut H, stx: Stx, name: Stx, a
     let text = this.text(name).expect("an identifier");
     let hosts: &'static [HostDef] = this.module.hosts();
     let Some(def) = hosts.iter().find(|def| def.name == text) else { return Err(this.error(ExpandErrorKind::UnknownHost, name)) };
-    if !def.takes(args.len()) {
-        return Err(this.error(ExpandErrorKind::Arity, stx));
+    let expected = def.expected_arity();
+    if !expected.takes(args.len()) {
+        return Err(this.error(ExpandErrorKind::Arity { expected, got: args.len() as u32 }, stx));
     }
     H::exprs(args, move |this, args| Ok(Step::Done(Core::Intrinsic(Prim::Host(def), args, this.position(stx)))))
 }

@@ -1,0 +1,22 @@
+; scheme/syntax: syntax objects, for macro transformers and for any other code. Most procedures wrap an intrinsic of the VM. A helper procedure is bound with
+; %letrec around the procedure that uses it, so it is created once and the library does not export it.
+
+(%provide (all-var-defined-out))
+
+; Syntax objects, for macro transformers and for any other code. Each identifier that the expander
+; creates carries a value that identifies its binding. So these procedures do not need the expander.
+(%define syntax? (%lambda (x) (%intrinsic syntax? x)))
+(%define identifier? (%lambda (x) (%intrinsic identifier? x)))
+(%define syntax-e (%lambda (stx) (%intrinsic syntax-e stx)))
+(%define syntax->datum (%lambda (stx) (%intrinsic syntax->datum stx)))
+(%define datum->syntax (%lambda (context datum) (%intrinsic datum->syntax context datum)))
+(%define bound-identifier=? (%lambda (a b) (%intrinsic bound-identifier=? a b)))
+(%define syntax->list
+  (%lambda (stx)
+    (%let ((e (%if (%intrinsic syntax? stx) (%intrinsic syntax-e stx) stx)))
+      (%if (%intrinsic list? e) e #f))))
+(%define free-identifier=? (%lambda (a b) (%intrinsic free-identifier=? a b)))
+(%define generate-temporaries (%lambda (xs) (%intrinsic generate-temporaries xs (%quote t))))
+(%define syntax-violation
+  (%lambda (who message form . subform)
+    (%intrinsic raise (%apply-intrinsic make-syntax-error message form subform))))

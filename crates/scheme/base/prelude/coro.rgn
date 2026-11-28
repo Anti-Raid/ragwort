@@ -1,0 +1,20 @@
+; scheme/coro: coroutines. Most procedures wrap an intrinsic of the VM. A helper procedure is bound with
+; %letrec around the procedure that uses it, so it is created once and the library does not export it.
+
+(%provide (all-var-defined-out))
+
+(%define make-coroutine (%lambda (f) (%intrinsic make-coroutine f)))
+(%define coroutine? (%lambda (x) (%intrinsic coroutine? x)))
+(%define co/resume (%lambda (co . args) (%apply-intrinsic co/resume co args)))
+(%define co/try-resume (%lambda (co . args) (%apply-intrinsic co/try-resume co args)))
+(%define co/yield (%lambda args (%apply-intrinsic co/yield args)))
+(%define co/running (%lambda () (%intrinsic co/running)))
+
+; Returns the status of `co` as a symbol. `coroutine-state` gives the state as an index into the vector:
+; 0 is pending, 1 is running, 2 is dead, 3 is failed (reported as `error`), and 4 is closing. A closing
+; coroutine is running its `after` thunks for `co/close` or `co/reset`. It is reported as `running`.
+(%define co/status
+  (%lambda (co) (%intrinsic vector-ref #(pending running dead error running) (%intrinsic coroutine-state co))))
+(%define co/resume-error (%lambda (co obj) (%intrinsic co/resume-error co obj)))
+(%define co/close (%lambda (co) (%intrinsic co/close co)))
+(%define co/reset (%lambda (co thunk) (%intrinsic co/reset co thunk)))

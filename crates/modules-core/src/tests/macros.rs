@@ -305,10 +305,111 @@ fn a_module_passes_on_everything_from_a_module() {
     let last = "(require all numbers) (list (eq? double n:double) (triple limit) (unless #f 'ran))";
     assert_eq!(module_in(&mut arena, "last", &[(Scheme, last)]), Ok(Ok("(#t 9 ran)".into())));
     // A module can pass on the module that it requires implicitly. Its own `car` shadows the prelude's, so it does not pass on a `car`.
-    assert_eq!(module_in(&mut arena, "base", &[(Scheme, "(define (car x) 'mine) (provide (all-from-out ragwort/prelude))")]), Ok(Ok("#<void>".into())));
+    assert_eq!(module_in(&mut arena, "base", &[(Scheme, "(define (car x) 'mine) (provide (all-from-out scheme))")]), Ok(Ok("#<void>".into())));
     assert_eq!(module_in(&mut arena, "base-user", &[(Scheme, "(require (prefix-in b: (only-in base cadr))) (b:cadr '(a b))")]), Ok(Ok("b".into())));
     let shadowed = module_in(&mut arena, "shadowed", &[(Scheme, "(require (only-in base car))")]);
     assert!(matches!(shadowed, Err(Error::Expand(e)) if e.kind == ExpandErrorKind::NotProvided), "{shadowed:?}");
     let missing = module_in(&mut arena, "missing", &[(Scheme, "(provide (all-from-out loops))")]);
     assert!(matches!(missing, Err(Error::Expand(e)) if e.kind == ExpandErrorKind::NotDefined), "{missing:?}");
+}
+
+#[test]
+fn a_require_takes_a_group_of_specs() {
+    let mut arena = arena();
+    assert_eq!(module_in(&mut arena, "loops", &[(Native, LOOPS)]), Ok(Ok("#<void>".into())));
+    assert_eq!(module_in(&mut arena, "numbers", &[(Scheme, "(define (double n) (* 2 n)) (define limit 3) (provide double limit)")]), Ok(Ok("#<void>".into())));
+    // A group requires every spec in it.
+    assert_eq!(module_in(&mut arena, "plain", &[(Scheme, "(require [loops numbers]) (list (double limit) (unless #f 'ran))")]), Ok(Ok("(6 ran)".into())));
+    // A filter around a group applies to all of it, and the names that it mentions come from any member. A member can be a filter or a group itself.
+    let filtered = "(require (prefix-in k: [loops [(only-in numbers double)]]))
+                    (require (only-in [numbers loops] limit unless))
+                    (list (k:double limit) (k:unless #f 'ran) (unless #f 'too))";
+    assert_eq!(module_in(&mut arena, "filtered", &[(Scheme, filtered)]), Ok(Ok("(6 ran too)".into())));
+    let native = "(%require (rename-in [loops numbers] (double twice) (unless if-not)))
+                  (%intrinsic cons (%app twice limit) (if-not #f 'ran))";
+    assert_eq!(module_in(&mut arena, "native-user", &[(Native, native)]), Ok(Ok("(6 . ran)".into())));
+    // A name that no member provides is an error at the name. A module that a group passes on is found by the name that the group wrote.
+    let missing = module_in(&mut arena, "missing", &[(Scheme, "(require (only-in [numbers loops] limit nope))")]);
+    assert!(matches!(missing, Err(Error::Expand(e)) if e.kind == ExpandErrorKind::NotProvided), "{missing:?}");
+    assert_eq!(module_in(&mut arena, "passes", &[(Scheme, "(require [loops numbers]) (provide (all-from-out numbers))")]), Ok(Ok("#<void>".into())));
+    // A filter around a group can keep nothing of a member. The member is still required, so the module can pass on all of it, which is nothing.
+    let emptied = "(require (only-in [loops numbers] double)) (provide (all-from-out loops numbers))";
+    assert_eq!(module_in(&mut arena, "emptied", &[(Scheme, emptied)]), Ok(Ok("#<void>".into())));
+    assert_eq!(module_in(&mut arena, "emptied-user", &[(Scheme, "(require (prefix-in e: emptied)) (e:double 4)")]), Ok(Ok("8".into())));
+    let gone = module_in(&mut arena, "gone-user", &[(Scheme, "(require (only-in emptied while))")]);
+    assert!(matches!(gone, Err(Error::Expand(e)) if e.kind == ExpandErrorKind::NotProvided), "{gone:?}");
+    assert_eq!(module_in(&mut arena, "last", &[(Scheme, "(require (prefix-in p: passes)) (p:double p:limit)")]), Ok(Ok("6".into())));
+    // The libraries of Scheme are required the same way.
+    let bare = "(require [scheme/number scheme/list]) (car (list (+ 1 2)))";
+    assert_eq!(module_in(&mut arena, "numbers-and-lists", &[(Scheme, bare)]), Ok(Ok("3".into())));
+}
+
+/// Loads `text` as a Scheme module that requires nothing implicitly, and returns the written form of its last form's value.
+fn bare(arena: &mut Arena, name: &str, text: &str) -> Result<Result<String, Fault>, Error> {
+    arena.mutate(|mc| {
+        let symbols = Symbols::of(mc.root(0)).unwrap();
+        let session = SyntaxSession::new(mc, text).unwrap();
+        let files = [File { language: Scheme, session: &session }];
+        let loaded = load(mc, symbols, &Source { name, hosts: &[], files: &files, implicit: &[], internals: false }, &mut Registry)?;
+        let mut last = Value::VOID;
+        for thunk in loaded.thunks {
+            match run(mc, thunk) {
+                Ok(value) => last = value,
+                Err(fault) => return Ok(Err(fault)),
+            }
+        }
+        Ok(Ok(ragwort_printer_scheme::to_string(mc, last, ragwort_printer_scheme::Mode::Write, usize::MAX).unwrap()))
+    })
+}
+
+#[test]
+fn a_scheme_module_starts_with_the_forms_and_no_procedure() {
+    let mut arena = arena();
+    // Every form works in a module that requires nothing, the ones that expand to calls of procedures included.
+    let forms = "(struct point (x y))
+                 (define-syntax swap! (syntax-rules () ((_ a b) (let ((tmp a)) (set! a b) (set! b tmp)))))
+                 (define (kind v)
+                   (match v
+                     [(list a b) `(two ,a ,@(case b [(1 2) '(small)] [else '(big)]))]
+                     [(point x _) (cond [x => (lambda (found) found)] [else 'none])]
+                     [(vector a _) a]
+                     [_ 'other]))
+                 (define moved (struct-copy point (point 1 2) [x 5]))
+                 (define caught (guard (e (#t 'caught)) (match 5 [(list) 'empty])))
+                 (define marked (with-continuation-mark 'key 'value (let-values ([(a) (let ((x 1) (y 2)) (swap! x y) (when (if x #t #f) (quote-syntax here)) (unless #f 'done))]) a)))
+                 (do ((i 0 (if i i i)) (acc '() acc)) (#t `(,(kind '(1 2)) ,(kind moved) ,(kind #(v w)) ,(kind 5) ,caught)))";
+    assert_eq!(bare(&mut arena, "forms", forms), Ok(Ok("((two 1 small) 5 v other caught)".into())));
+    // A procedure is in a library. The module has it once it requires the library, and has nothing else of the language.
+    let unbound = bare(&mut arena, "unbound", "(car '(1))");
+    assert!(matches!(unbound, Err(Error::Expand(e)) if e.kind == ExpandErrorKind::Unbound), "{unbound:?}");
+    assert_eq!(bare(&mut arena, "lists", "(require scheme/list) (car '(1))"), Ok(Ok("1".into())));
+    let other = bare(&mut arena, "other", "(require scheme/list) (+ (car '(1)) 1)");
+    assert!(matches!(other, Err(Error::Expand(e)) if e.kind == ExpandErrorKind::Unbound), "{other:?}");
+    assert_eq!(bare(&mut arena, "all", "(require scheme) (+ (car '(1)) (string-length \"ab\"))"), Ok(Ok("3".into())));
+    // A procedure that a form calls is the language's own, whatever the module defines under that name.
+    let shadowed = "(define (equal? a b) #f) (define (car x) 'mine) (define (list . xs) 'mine) (match '(1 2) [(list 1 b) b])";
+    assert_eq!(bare(&mut arena, "shadowed", shadowed), Ok(Ok("2".into())));
+}
+
+#[test]
+fn the_list_of_what_each_library_provides_matches_the_libraries() {
+    let mut arena = arena();
+    arena.mutate(|mc| {
+        let mut total = 0;
+        for (library, _) in ragwort_scheme::LIBRARIES {
+            let module = Registry.resolve(mc, library, Value::FALSE).unwrap();
+            let mut exported: Vec<String> = ragwort_compiler::module::Imports::all(mc, module).unwrap().0.into_iter().map(|(name, _)| name).collect();
+            exported.sort();
+            let mut listed: Vec<String> = ragwort_scheme::PROVIDED.iter().filter(|&&(_, provider)| provider == library).map(|&(name, _)| name.to_string()).collect();
+            listed.sort();
+            assert_eq!(exported, listed, "{library}");
+            assert!(exported.iter().all(|name| library_of(name) == Some(library)), "{library}");
+            total += exported.len();
+        }
+        // No two libraries provide the same name, and `scheme` passes on every one.
+        let all = Registry.resolve(mc, ragwort_scheme::SCHEME.0, Value::FALSE).unwrap();
+        assert_eq!(ragwort_compiler::module::Imports::all(mc, all).unwrap().0.len(), total);
+        assert_eq!(total, ragwort_scheme::PROVIDED.len());
+        assert_eq!(library_of("no-such-procedure"), None);
+    });
 }

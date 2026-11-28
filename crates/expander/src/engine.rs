@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use ragwort_compiler::module::{self, Import, Imports, ModuleBuilder, ModuleError, Unusable};
+use ragwort_compiler::module::{self, Filter, Import, Imports, ModuleBuilder, ModuleError, RequireSpec, RequireStep, Unusable};
 use ragwort_compiler::{Position, Prim, Var};
 use ragwort_types::gc::{Gc, Mutation, OutOfMemory, Value};
 use ragwort_types::string::{Strings, chars};
@@ -293,6 +293,75 @@ impl<'a, 'gc, K: Copy + PartialEq + fmt::Debug> Engine<'a, 'gc, K> {
         let span = node.span(self.mc);
         let stx = self.tree.read(node).map_err(|error| ExpandError { kind: error.into(), start: span.start(), end: span.end() })?;
         Ok(self.tree.with(stx, TOP, Op::Add)?)
+    }
+
+    /// Parses the require spec `spec`: a module's name, a filter around a spec, or a group of specs. A filter is `(only-in spec name ...)`,
+    /// `(except-in spec name ...)`, `(prefix-in prefix spec)` or `(rename-in spec (old new) ...)`. Any other list is a group, such as `[a b c]`.
+    pub fn require_spec(&mut self, spec: Stx) -> Result<RequireSpec<Stx>, ExpandError> {
+        enum Task {
+            Parse(Stx),
+            Emit(RequireStep<Stx>),
+        }
+        let mut todo = vec![Task::Parse(spec)];
+        let mut steps = Vec::new();
+        while let Some(task) = todo.pop() {
+            let spec = match task {
+                Task::Parse(spec) => spec,
+                Task::Emit(step) => {
+                    steps.push(step);
+                    continue;
+                }
+            };
+            if let Some(module) = self.text(spec) {
+                steps.push(RequireStep::Module(module, spec));
+                continue;
+            }
+            let items = self.proper(spec)?;
+            let Some((&head, args)) = items.split_first() else { return Err(self.error(ExpandErrorKind::BadSyntax, spec)) };
+            let word = if self.is_id(head) {
+                self.text(head)
+            } else {
+                None
+            };
+            let (filter, inner) = match (word.as_deref(), args) {
+                (Some("only-in"), &[inner, ref ids @ ..]) => (Filter::Only(self.identifiers(ids)?), inner),
+                (Some("except-in"), &[inner, ref ids @ ..]) => (Filter::Except(self.identifiers(ids)?), inner),
+                (Some("prefix-in"), &[prefix, inner]) if self.is_id(prefix) => (Filter::Prefix(self.text(prefix).expect("an identifier")), inner),
+                (Some("rename-in"), &[inner, ref renames @ ..]) => {
+                    let mut pairs = Vec::with_capacity(renames.len());
+                    for &rename in renames {
+                        match *self.proper(rename)?.as_slice() {
+                            [old, new] if self.is_id(old) && self.is_id(new) => pairs.push((self.text(old).expect("an identifier"), self.text(new).expect("an identifier"), rename)),
+                            _ => return Err(self.error(ExpandErrorKind::BadSyntax, rename)),
+                        }
+                    }
+                    (Filter::Rename(pairs), inner)
+                }
+                (Some("only-in" | "except-in" | "prefix-in" | "rename-in"), _) => return Err(self.error(ExpandErrorKind::BadSyntax, spec)),
+                // A list that is no filter is a group. Its members are parsed in order, then joined.
+                _ => {
+                    self.tree.scopes.charge(items.len() * size_of::<Task>())?;
+                    todo.push(Task::Emit(RequireStep::Group(items.len())));
+                    todo.extend(items.into_iter().rev().map(Task::Parse));
+                    continue;
+                }
+            };
+            todo.push(Task::Emit(RequireStep::Filter(filter)));
+            todo.push(Task::Parse(inner));
+        }
+        Ok(RequireSpec { steps })
+    }
+
+    /// Returns the name of each of the identifiers `ids`, with the identifier. Fails with `BadSyntax` at the first of `ids` that is not an identifier.
+    fn identifiers(&mut self, ids: &[Stx]) -> Result<Vec<(String, Stx)>, ExpandError> {
+        let mut named = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if !self.is_id(id) {
+                return Err(self.error(ExpandErrorKind::BadSyntax, id));
+            }
+            named.push((self.text(id).expect("an identifier"), id));
+        }
+        Ok(named)
     }
 
     /// Returns the text of `stx` if it is an identifier or a string literal.

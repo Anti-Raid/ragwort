@@ -1,4 +1,4 @@
-//! Native ragwort is the language that the prelude is written in. The Scheme reader reads it, and
+//! Native ragwort is the language that the libraries of Scheme are written in. The Scheme reader reads it, and
 //! this crate lowers it to the compiler's core forms. Its forms are the core forms of the shared expander. See [`ragwort_expander::forms`]. The name of each form starts with `%`:
 //!
 //! ```text
@@ -93,6 +93,7 @@
 //! - `(except-in spec name ...)`
 //! - `(prefix-in prefix spec)`
 //! - `(rename-in spec (old new) ...)`
+//! - `[spec ...]`: a group, which requires every spec in it. A filter around a group applies to them all, as in `(prefix-in s: [scheme/number scheme/list])`. `(require [a b])` is the same as `(require a b)`.
 //!
 //! A provide spec is one of:
 //!

@@ -6,7 +6,7 @@
 //! against newly built modules.
 //!
 //! ```text
-//! let bytes = arena.mutate(|mc| image::save(mc, &[symbols, prelude, library]))?;
+//! let bytes = arena.mutate(|mc| image::save(mc, &[symbols, scheme, library]))?;
 //! // In another arena, or another run of the program:
 //! let roots = arena.mutate(|mc| image::load(mc, &bytes, HOSTS.iter()))?;
 //! ```
