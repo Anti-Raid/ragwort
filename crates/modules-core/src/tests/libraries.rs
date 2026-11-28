@@ -236,3 +236,59 @@ fn each_language_has_its_own_base_library() {
     assert_eq!(program(&mut arena, &libraries, None, "(require lib/text) (shout \"both\")").unwrap(), "\"both!\"");
     assert_eq!(loaded(&mut arena), 5);
 }
+
+/// A native library that exports macros. Its macros use a procedure that it does not export.
+static LOOPS: Library = Library {
+    name: "lib/loops",
+    base: None,
+    files: &[LibraryFile::native(
+        "loops.rgn",
+        "(%define-syntax while
+           (%syntax-rules ()
+             ((_ test body ...) (%loop again (%if test (%begin body ...) (%break again))))))
+         (%define-syntax tally
+           (%syntax-rules ()
+             ((_ body) (%begin (%app note) body (%app notes)))))
+         (%define count 0)
+         (%define note (%lambda () (%set! count (%intrinsic + count 1))))
+         (%define notes (%lambda () count))
+         (%provide while tally)",
+    )],
+    hosts: &[],
+    requires: &[],
+    internals: false,
+};
+
+/// A Scheme library that exports a macro. The macro uses a macro of another library and a procedure of its own.
+static REPEAT: Library = Library {
+    name: "lib/repeat",
+    base: Some(&PRELUDE),
+    files: &[LibraryFile::scheme(
+        "repeat.rg",
+        "(require lib/loops)
+         (provide repeat)
+         (define (step n) (+ n 1))
+         (define-syntax repeat
+           (syntax-rules (times)
+             ((_ count times body ...) (let ((n 0)) (while (< n count) body ... (set! n (step n)))))))",
+    )],
+    hosts: &[],
+    requires: &[&LOOPS],
+    internals: false,
+};
+
+/// A library's macros are saved in its image. An arena that loads the library can use them, and their output refers to the library's own bindings.
+#[test]
+fn a_librarys_macros_work_from_its_image() {
+    let libraries = Libraries::build(&[&REPEAT], 64 << 20).unwrap();
+    let mut arena = started(&libraries);
+    let text = "(require lib/repeat lib/loops)
+                (define (step n) 'mine)
+                (define total 0)
+                (repeat 4 times (set! total (+ total 10)))
+                (list total (tally 'done) (tally 'again))";
+    assert_eq!(program(&mut arena, &libraries, None, text).unwrap(), "(40 1 2)");
+    // Each arena has its own state of the library that the macro's output uses.
+    let mut other = started(&libraries);
+    assert_eq!(program(&mut other, &libraries, None, "(require lib/loops) (tally 'first)").unwrap(), "1");
+}

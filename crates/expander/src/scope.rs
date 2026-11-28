@@ -6,34 +6,37 @@ use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 
 use ragwort_types::gc::{Charge, Mutation, OutOfMemory};
 
-pub(crate) type Scope = u32;
+pub type Scope = u32;
 
 /// The scope that every form read from source has.
-pub(crate) const TOP: Scope = 0;
+pub const TOP: Scope = 0;
 /// The scope of the identifiers that built-in macros introduce. No identifier read from source has it.
-pub(crate) const BASE: Scope = 1;
+pub const BASE: Scope = 1;
 /// The scope of the forms that only the expander generates. No syntax that a program receives
 /// has this scope, so a program cannot name such a form.
-pub(crate) const INTERNAL: Scope = 2;
+pub const INTERNAL: Scope = 2;
+/// The scope of the identifiers that the expander creates to name a core form. Such an identifier refers to the core form whatever the
+/// language of the module is.
+pub const CORE: Scope = 3;
 
 /// An interned set of scopes, stored in sorted order.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct Set(u32);
+pub struct Set(u32);
 
 /// An interned sequence of scope operations, reduced to at most one operation per scope.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct Ops(u32);
+pub struct Ops(u32);
 
 impl Ops {
-    pub(crate) const NONE: Self = Self(0);
+    pub const NONE: Self = Self(0);
 }
 
 impl Set {
-    pub(crate) const EMPTY: Self = Self(0);
+    pub const EMPTY: Self = Self(0);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum Op {
+pub enum Op {
     Add,
     Remove,
     Flip,
@@ -55,13 +58,13 @@ impl Op {
 
 /// The hash map of the expander's tables. The keys are numbers: scopes, ids of interned sets,
 /// and the raw bits of symbols.
-pub(crate) type Map<K, V> = HashMap<K, V, Seeded>;
+pub type Map<K, V> = HashMap<K, V, Seeded>;
 
 /// A hasher builder that uses a folded multiply. The multiply mixes every bit of a word into the whole word. It is far
 /// cheaper than the standard library's default hasher on the long scope sets of deeply nested code. Each table gets
 /// a random seed, so the program being expanded cannot choose keys that collide.
 #[derive(Clone, Copy)]
-pub(crate) struct Seeded(u64);
+pub struct Seeded(u64);
 
 impl Default for Seeded {
     fn default() -> Self {
@@ -77,7 +80,7 @@ impl BuildHasher for Seeded {
     }
 }
 
-pub(crate) struct Folded(u64);
+pub struct Folded(u64);
 
 impl Hasher for Folded {
     fn write(&mut self, bytes: &[u8]) {
@@ -161,7 +164,7 @@ impl<T: Eq + Hash + Clone> Interned<T> {
     }
 }
 
-pub(crate) struct Scopes<'gc> {
+pub struct Scopes<'gc> {
     charge: Charge<'gc>,
     sets: Interned<Scope>,
     ops: Interned<(Scope, Op)>,
@@ -174,47 +177,47 @@ pub(crate) struct Scopes<'gc> {
 }
 
 impl<'gc> Scopes<'gc> {
-    pub(crate) fn new(mc: &Mutation<'gc>) -> Self {
-        Self { charge: mc.charge(), sets: Interned::new(), ops: Interned::new(), applied: Map::default(), composed: Map::default(), next: INTERNAL + 1, scratch_set: Vec::new(), scratch_ops: Vec::new() }
+    pub fn new(mc: &Mutation<'gc>) -> Self {
+        Self { charge: mc.charge(), sets: Interned::new(), ops: Interned::new(), applied: Map::default(), composed: Map::default(), next: CORE + 1, scratch_set: Vec::new(), scratch_ops: Vec::new() }
     }
 
-    pub(crate) fn charge(&mut self, bytes: usize) -> Result<(), OutOfMemory> {
+    pub fn charge(&mut self, bytes: usize) -> Result<(), OutOfMemory> {
         self.charge.grow(bytes)
     }
 
-    pub(crate) fn fresh(&mut self) -> Result<Scope, OutOfMemory> {
+    pub fn fresh(&mut self) -> Result<Scope, OutOfMemory> {
         let scope = self.next;
         self.next = self.next.checked_add(1).ok_or(OutOfMemory)?;
         Ok(scope)
     }
 
-    pub(crate) fn set(&mut self, mut scopes: Vec<Scope>) -> Result<Set, OutOfMemory> {
+    pub fn set(&mut self, mut scopes: Vec<Scope>) -> Result<Set, OutOfMemory> {
         scopes.sort_unstable();
         scopes.dedup();
         self.sets.intern(&mut self.charge, &scopes).map(Set)
     }
 
-    pub(crate) fn scopes(&self, set: Set) -> &[Scope] {
+    pub fn scopes(&self, set: Set) -> &[Scope] {
         self.sets.get(set.0)
     }
 
-    pub(crate) fn contains(&self, set: Set, scope: Scope) -> bool {
+    pub fn contains(&self, set: Set, scope: Scope) -> bool {
         self.scopes(set).binary_search(&scope).is_ok()
     }
 
     /// Returns whether every scope of `part` is in `whole`.
-    pub(crate) fn subset(&self, part: Set, whole: Set) -> bool {
+    pub fn subset(&self, part: Set, whole: Set) -> bool {
         let (part, whole) = (self.scopes(part), self.scopes(whole));
         let mut whole = whole.iter();
         part.len() <= whole.len() && part.iter().all(|scope| whole.by_ref().any(|other| other == scope))
     }
 
-    pub(crate) fn op(&mut self, scope: Scope, op: Op) -> Result<Ops, OutOfMemory> {
+    pub fn op(&mut self, scope: Scope, op: Op) -> Result<Ops, OutOfMemory> {
         self.ops.intern(&mut self.charge, &[(scope, op)]).map(Ops)
     }
 
     /// Returns the operations equivalent to `first` followed by `then`.
-    pub(crate) fn compose(&mut self, first: Ops, then: Ops) -> Result<Ops, OutOfMemory> {
+    pub fn compose(&mut self, first: Ops, then: Ops) -> Result<Ops, OutOfMemory> {
         if first == Ops::NONE || then == Ops::NONE {
             return Ok(if then == Ops::NONE { first } else { then });
         }
@@ -249,7 +252,7 @@ impl<'gc> Scopes<'gc> {
     }
 
     /// Returns `set` with `ops` applied.
-    pub(crate) fn apply(&mut self, set: Set, ops: Ops) -> Result<Set, OutOfMemory> {
+    pub fn apply(&mut self, set: Set, ops: Ops) -> Result<Set, OutOfMemory> {
         if ops == Ops::NONE {
             return Ok(set);
         }

@@ -10,6 +10,9 @@ use ragwort_types::pair::Pairs;
 use super::*;
 use crate::LowerErrorKind::*;
 
+#[path = "macros.rs"]
+mod macros;
+
 /// Creates an arena for a test. Root 0 holds the symbol table. Root 1 holds the modules that have
 /// run, as a list of `(name . module)` pairs, so code loaded later can require them.
 fn arena() -> Arena {

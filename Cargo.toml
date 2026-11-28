@@ -4,6 +4,7 @@ members = [
     "crates/cli",
     "crates/compiler",
     "crates/derive",
+    "crates/expander",
     "crates/gc-region",
     "crates/native",
     "crates/num",

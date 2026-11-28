@@ -1,0 +1,18 @@
+[package]
+name = "ragwort-expander"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ragwort-types = { path = "../types", default-features = false }
+ragwort-vm = { path = "../vm", default-features = false }
+ragwort-compiler = { path = "../compiler", default-features = false }
+
+[features]
+default = ["mmap", "arena"]
+mmap = ["ragwort-types/mmap", "ragwort-vm/mmap", "ragwort-compiler/mmap"]
+# Keeps each compile's trees in an arena; see ragwort-compiler.
+arena = ["ragwort-compiler/arena"]
+
+[lints]
+workspace = true

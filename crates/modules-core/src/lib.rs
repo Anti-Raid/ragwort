@@ -4,7 +4,8 @@
 //! The embedder states the language of each file. The files of a module make up one body:
 //!
 //! - Code in one file can refer by name to the top-level definitions of the other files.
-//! - The exception is a definition that a Scheme macro introduces hygienically. Other files cannot refer to it.
+//! - The exception is a definition that a macro introduces hygienically. Other files cannot refer to it.
+//! - A macro is known only to the module's files of its own language. Another module can require it: a module of any language can require a macro of native ragwort.
 //! - A module can provide a definition from any of its files.
 
 pub mod image;
@@ -183,11 +184,10 @@ fn load_from<'gc>(
                 Language::Native => {
                     let lowerer = match &mut lowerer {
                         Some(lowerer) => lowerer,
-                        None => lowerer.insert(Lowerer::new(mc, symbols, source.hosts, source.internals).map_err(LowerError::from)?),
+                        None => lowerer.insert(Lowerer::new(mc, symbols, source.internals)?),
                     };
-                    let item = lowerer.item(expander.builder().locals(), node)?;
-                    expander.builder().declare(mc, resolver, first, &item).map_err(|(error, span)| LowerError::declared(error, span))?;
-                    forms.push((file_index, Form::Native(item)));
+                    let items = lowerer.declare(expander.builder(), resolver, node, first)?;
+                    forms.extend(items.into_iter().map(|item| (file_index, Form::Native(item))));
                 }
             }
         }
@@ -209,6 +209,10 @@ fn load_from<'gc>(
         }
     }
     *at = None;
+    let sealed = lowerer.as_mut().map(|lowerer| lowerer.seal(expander.builder()));
     let module = expander.finish()?;
+    if let Some(sealed) = sealed {
+        sealed.patch(mc, module);
+    }
     Ok(Loaded { module, thunks })
 }

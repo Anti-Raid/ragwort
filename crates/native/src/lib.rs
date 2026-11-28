@@ -1,5 +1,5 @@
 //! Native ragwort is the language that the prelude is written in. The Scheme reader reads it, and
-//! this crate lowers it to the compiler's core forms. It has no macros, only the core forms. The name of each form starts with `%`:
+//! this crate lowers it to the compiler's core forms. Its forms are the core forms of the shared expander. See [`ragwort_expander::forms`]. The name of each form starts with `%`:
 //!
 //! ```text
 //! (%quote datum)  'datum
@@ -19,7 +19,36 @@
 //! (%call-host name arg ...)
 //! (%loop name body ...)
 //! (%break name)   (%continue name)
+//! (%begin form ...)
+//! (%define-syntax name transformer)
+//! (%syntax-rules (literal ...) (pattern template) ...)
+//! (%syntax-case input (literal ...) clause ...)
+//! (%syntax template)  #'template
 //! ```
+//!
+//! `'datum` is short for `(quote datum)`, which is the same form as `(%quote datum)`. `#'template` is short for `(syntax template)`, which is the same form as `(%syntax template)`.
+//!
+//! # Macros
+//!
+//! `%define-syntax` defines a macro. It is allowed only at the top level. The transformer is a procedure that takes the syntax
+//! object of a macro use and returns the syntax to lower in its place. `%syntax-rules` creates such a procedure from patterns and
+//! templates, as Scheme's `syntax-rules` does. A transformer can also be a `%lambda` that takes the use apart with `%syntax-case`
+//! and builds its result with `%syntax`.
+//!
+//! ```text
+//! (%define-syntax while
+//!   (%syntax-rules ()
+//!     ((_ test body ...) (%loop again (%if test (%begin body ...) (%break again))))))
+//! ```
+//!
+//! Macros are hygienic. A variable or a loop name that a macro's output binds is apart from the names of the macro's use. A name in a macro's
+//! output that the output does not bind refers to the binding of the macro's own module.
+//!
+//! - A transformer runs while the module is being lowered. It can call what the module requires. It cannot refer to the module's own variables.
+//! - `%begin` at the top level stands for the forms inside it, so a macro can define several things. In an expression, `%begin` evaluates its expressions in order.
+//! - A `%define` whose name comes from the macro's use defines a variable of the module. A `%define` whose name the macro itself introduces defines a variable that only that use of the macro refers to.
+//! - `(%provide name)` exports a macro as it exports a variable. A module of any language can require the macro, because the macro's output is made of core forms. The parts of a use are then expressions of the using module's language.
+//! - The output of a macro is checked like code of the module that uses the macro. A `%call-host` in it must name a host function of that module, and an `%intrinsic` in it can name an internal intrinsic only if that module can.
 //!
 //! The last argument of `%apply-intrinsic` is a list of further arguments:
 //! `(%apply-intrinsic + 1 2 '(3 4))` computes the same as `(%intrinsic + 1 2 3 4)`.
@@ -50,7 +79,7 @@
 //! with `internals` set, which is meant for code that the embedder wrote itself.
 //!
 //! Code is loaded as a module. The top-level forms of all the module's files make up one body.
-//! `%define`, `%struct`, `%require` and `%provide` are allowed only at the top level.
+//! `%define`, `%define-syntax`, `%struct`, `%require` and `%provide` are allowed only at the top level.
 //!
 //! - `%define` defines a module variable. Code anywhere in the module can refer to the variable.
 //! - `%require` imports bindings from other modules. Code anywhere in the module can refer to them too.
@@ -89,10 +118,10 @@ mod lower;
 #[path = "tests/lower.rs"]
 mod tests;
 
-pub use lower::{LowerError, LowerErrorKind, Lowerer};
+pub use lower::{LowerError, LowerErrorKind, Lowerer, NoKeyword};
 
 use ragwort_compiler::CompileError;
-use ragwort_compiler::module::{BuildError, Description, Loaded, Locals, Resolver};
+use ragwort_compiler::module::{BuildError, Item, Loaded, ModuleBuilder, Resolver};
 use ragwort_reader_scheme::{ReadError, Reader};
 use ragwort_types::gc::Mutation;
 use ragwort_types::string::Strings;
@@ -149,13 +178,28 @@ pub fn load<'gc>(
     resolver: &mut dyn Resolver<'gc>,
 ) -> Result<Loaded<'gc>, Error> {
     let name = symbols.intern_str(&Strings::new(mc), name).map_err(LowerError::from)?;
-    let mut lowerer = Lowerer::new(mc, symbols, hosts, false).map_err(LowerError::from)?;
-    let mut locals = Locals::default();
-    let mut items = Vec::new();
+    let mut builder = ModuleBuilder::new(name.value(mc), hosts);
+    let mut lowerer = Lowerer::new(mc, symbols, false)?;
+    let mut items: Vec<Item<'gc>> = Vec::new();
     for session in files {
         for node in Reader::new(mc, symbols, session)? {
-            items.push(lowerer.item(&mut locals, node?)?);
+            let first = index(items.len())?;
+            items.extend(lowerer.declare(&mut builder, resolver, node?, first)?);
         }
     }
-    Ok(Description { name: name.value(mc), hosts, locals, items }.build(mc, resolver)?)
+    builder.provide_items(mc).map_err(BuildError::from)?;
+    builder.start(mc).map_err(CompileError::from)?;
+    let mut thunks = Vec::with_capacity(items.len());
+    for (position, item) in items.into_iter().enumerate() {
+        thunks.extend(builder.compile_item(mc, index(position)?, item)?);
+    }
+    let sealed = lowerer.seal(&mut builder);
+    let module = builder.finish(mc).map_err(CompileError::from)?;
+    sealed.patch(mc, module);
+    Ok(Loaded { module, thunks })
+}
+
+/// Returns `position`, the position of a top-level form in its module, as the form's index.
+fn index(position: usize) -> Result<u32, CompileError> {
+    u32::try_from(position).map_err(|_| CompileError::OutOfMemory)
 }

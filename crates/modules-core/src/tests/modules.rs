@@ -7,6 +7,9 @@ use ragwort_vm::{Fault, MIN_SEGMENT, Machine, Outcome};
 use super::*;
 use crate::Language::{Native, Scheme};
 
+#[path = "macros.rs"]
+mod macros;
+
 /// Creates an arena for a test. Root 0 holds the symbol table. Root 1 holds the prelude's module, which has already run. Root 2 holds the
 /// modules that other modules can require, as a list of `(name . module)` pairs.
 fn arena() -> Arena {

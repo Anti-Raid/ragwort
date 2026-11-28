@@ -12,6 +12,7 @@ use ragwort_types::syntax::{Syntax, SyntaxContext, SyntaxKind, SyntaxMeta, Synta
 use ragwort_types::vector::{AnyVector, Vectors};
 
 use crate::Fault;
+use crate::objects::Module;
 use crate::equal::PER_FUEL;
 use crate::op::Fuel;
 
@@ -234,21 +235,36 @@ pub(crate) fn same_identifier<'gc>(mc: &Mutation<'gc>, left: Value<'gc>, right: 
 
 /// Returns `true` if identifiers `left` and `right` refer to the same lexical or module binding (implements `free-identifier=?`).
 ///
-/// Compares expander-assigned binding values: matching local binding objects, keyword symbols,
-/// module-import `(module_name . export_name)` pairs, or falling back to symbolic datum equality for unbound identifiers.
+/// Compares the binding values that the expander gave the identifiers:
+///
+/// - A local binding has an object of its own, and a keyword has its symbol. Two such values are the same binding if they are the same value.
+/// - A module-level name has a vector of two items: the module that the name is bound in, and the name. Two such vectors are the same
+///   binding if their items are the same. The first item is not a module if the name has no binding, or if its module is still being
+///   expanded. Two names with such an item are the same binding if the names are the same.
+///
+/// Two identifiers without a binding value are compared by their symbols.
 pub(crate) fn same_binding<'gc>(mc: &Mutation<'gc>, left: Value<'gc>, right: Value<'gc>) -> Result<bool, Fault> {
     if !is_identifier(mc, left) || !is_identifier(mc, right) {
         return Err(Fault::WrongType);
     }
     let (left, right) = (Syntax::of(left).ok_or(Fault::WrongType)?, Syntax::of(right).ok_or(Fault::WrongType)?);
     Ok(match (left.binding(mc), right.binding(mc)) {
-        (Some(left_binding), Some(right_binding)) => match (Pair::of(left_binding), Pair::of(right_binding)) {
-            (Some(left_pair), Some(right_pair)) => left_pair.head(mc) == right_pair.head(mc) && left_pair.tail(mc) == right_pair.tail(mc),
+        (Some(left_binding), Some(right_binding)) => match (named(mc, left_binding), named(mc, right_binding)) {
+            (Some((left_module, left_name)), Some((right_module, right_name))) => {
+                let unresolved = left_module.downcast::<Module>(mc).is_none() && right_module.downcast::<Module>(mc).is_none();
+                left_name == right_name && (left_module == right_module || unresolved)
+            }
             _ => left_binding == right_binding,
         },
         (None, None) => left.datum(mc) == right.datum(mc),
         _ => false,
     })
+}
+
+/// Returns the two items of `binding` if it is the binding value of a module-level name.
+fn named<'gc>(mc: &Mutation<'gc>, binding: Value<'gc>) -> Option<(Value<'gc>, Value<'gc>)> {
+    let vector = AnyVector::of(binding).filter(|vector| vector.len(mc) == 2)?;
+    Some((vector.get(mc, 0)?, vector.get(mc, 1)?))
 }
 
 /// Generates a Scheme list of fresh temporary identifiers corresponding to each element of `list` (implements `generate-temporaries`).

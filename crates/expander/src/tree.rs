@@ -11,11 +11,11 @@ use ragwort_types::symbol::{Keyword, Symbol};
 use ragwort_types::syntax::{Syntax, SyntaxKind, SyntaxSpan};
 use ragwort_types::vector::Vectors;
 
-use crate::scope::{Op, Ops, Scope, Scopes, Set};
+use crate::scope::{Map, Op, Ops, Scope, Scopes, Set};
 
 /// A piece of syntax: the index of a node, and the scope operations pending on the node and its children.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Stx {
+pub struct Stx {
     node: u32,
     ops: Ops,
 }
@@ -37,25 +37,27 @@ struct Node<'gc> {
 }
 
 /// The shape of a node, with its children as [`Stx`] values. `List` holds the items and the tail of an improper list.
-pub(crate) enum View<'gc> {
+pub enum View<'gc> {
     Id,
     Datum(Value<'gc>),
     List(Vec<Stx>, Option<Stx>),
     Vector(Vec<Stx>),
 }
 
-pub(crate) struct Tree<'a, 'gc> {
+pub struct Tree<'a, 'gc> {
     mc: &'a Mutation<'gc>,
     nodes: ScratchVec<'gc, Node<'gc>>,
     kids: ScratchVec<'gc, Stx>,
-    pub(crate) scopes: Scopes<'gc>,
+    pub scopes: Scopes<'gc>,
     /// The symbol that each reader abbreviation stands for, indexed by the abbreviation's number.
     abbreviations: Vec<Symbol<'gc>>,
+    /// The binding value of each identifier that came from the expansion of another module, keyed by the identifier's node. See [`Tree::origin`].
+    origins: Map<u32, Value<'gc>>,
 }
 
 impl<'a, 'gc> Tree<'a, 'gc> {
-    pub(crate) fn new(mc: &'a Mutation<'gc>, abbreviations: Vec<Symbol<'gc>>) -> Self {
-        Self { mc, nodes: ScratchVec::new(mc), kids: ScratchVec::new(mc), scopes: Scopes::new(mc), abbreviations }
+    pub fn new(mc: &'a Mutation<'gc>, abbreviations: Vec<Symbol<'gc>>) -> Self {
+        Self { mc, nodes: ScratchVec::new(mc), kids: ScratchVec::new(mc), scopes: Scopes::new(mc), abbreviations, origins: Map::default() }
     }
 
     fn node(&self, stx: Stx) -> Node<'gc> {
@@ -77,40 +79,53 @@ impl<'a, 'gc> Tree<'a, 'gc> {
         Ok((u32::try_from(first).map_err(|_| OutOfMemory)?, len as u32))
     }
 
-    pub(crate) fn id(&mut self, symbol: Symbol<'gc>, scopes: Set, span: SyntaxSpan<'gc>) -> Result<Stx, OutOfMemory> {
+    pub fn id(&mut self, symbol: Symbol<'gc>, scopes: Set, span: SyntaxSpan<'gc>) -> Result<Stx, OutOfMemory> {
         self.make(Shape::Id(symbol), scopes, span)
     }
 
-    pub(crate) fn datum(&mut self, value: Value<'gc>, span: SyntaxSpan<'gc>) -> Result<Stx, OutOfMemory> {
+    /// Records `binding` as the origin of the identifier `id`.
+    pub fn set_origin(&mut self, id: Stx, binding: Value<'gc>) -> Result<(), OutOfMemory> {
+        self.scopes.charge(size_of::<(u32, Value<'gc>)>())?;
+        self.origins.insert(id.node, binding);
+        Ok(())
+    }
+
+    /// Returns the origin of the identifier `id`, if it has one. The origin is the binding value that the identifier's syntax object carried
+    /// when a macro of another module introduced it. It says what the identifier refers to in that module.
+    pub fn origin(&self, id: Stx) -> Option<Value<'gc>> {
+        self.origins.get(&id.node).copied()
+    }
+
+    pub fn datum(&mut self, value: Value<'gc>, span: SyntaxSpan<'gc>) -> Result<Stx, OutOfMemory> {
         self.make(Shape::Datum(value), Set::EMPTY, span)
     }
 
-    pub(crate) fn list(&mut self, items: &[Stx], tail: Option<Stx>, span: SyntaxSpan<'gc>) -> Result<Stx, OutOfMemory> {
+    pub fn list(&mut self, items: &[Stx], tail: Option<Stx>, span: SyntaxSpan<'gc>) -> Result<Stx, OutOfMemory> {
         let (first, len) = self.parts(items.iter().copied().chain(tail))?;
         self.make(Shape::List { first, len, dotted: tail.is_some() }, Set::EMPTY, span)
     }
 
-    pub(crate) fn vector(&mut self, items: &[Stx], span: SyntaxSpan<'gc>) -> Result<Stx, OutOfMemory> {
+    pub fn vector(&mut self, items: &[Stx], span: SyntaxSpan<'gc>) -> Result<Stx, OutOfMemory> {
         let (first, len) = self.parts(items.iter().copied())?;
         self.make(Shape::Vector { first, len }, Set::EMPTY, span)
     }
 
-    pub(crate) fn span(&self, stx: Stx) -> SyntaxSpan<'gc> {
+    pub fn span(&self, stx: Stx) -> SyntaxSpan<'gc> {
         self.node(stx).span
     }
 
     /// Returns `stx` with the operation `op` on `scope` pending. `Op::Flip` removes `scope` if the syntax has it, and adds it otherwise.
-    pub(crate) fn with(&mut self, stx: Stx, scope: Scope, op: Op) -> Result<Stx, OutOfMemory> {
+    pub fn with(&mut self, stx: Stx, scope: Scope, op: Op) -> Result<Stx, OutOfMemory> {
         let op = self.scopes.op(scope, op)?;
         Ok(Stx { node: stx.node, ops: self.scopes.compose(stx.ops, op)? })
     }
 
     /// Returns the scope set of `stx`, with its pending operations applied.
-    pub(crate) fn scopes_of(&mut self, stx: Stx) -> Result<Set, OutOfMemory> {
+    pub fn scopes_of(&mut self, stx: Stx) -> Result<Set, OutOfMemory> {
         self.scopes.apply(self.node(stx).scopes, stx.ops)
     }
 
-    pub(crate) fn symbol(&self, stx: Stx) -> Option<Symbol<'gc>> {
+    pub fn symbol(&self, stx: Stx) -> Option<Symbol<'gc>> {
         match self.node(stx).shape {
             Shape::Id(symbol) => Some(symbol),
             _ => None,
@@ -118,14 +133,14 @@ impl<'a, 'gc> Tree<'a, 'gc> {
     }
 
     /// Returns the keyword if `stx` is a keyword datum, such as `#:name`.
-    pub(crate) fn keyword(&self, stx: Stx) -> Option<Keyword<'gc>> {
+    pub fn keyword(&self, stx: Stx) -> Option<Keyword<'gc>> {
         match self.node(stx).shape {
             Shape::Datum(value) => Keyword::of(value),
             _ => None,
         }
     }
 
-    pub(crate) fn view(&mut self, stx: Stx) -> Result<View<'gc>, OutOfMemory> {
+    pub fn view(&mut self, stx: Stx) -> Result<View<'gc>, OutOfMemory> {
         Ok(match self.node(stx).shape {
             Shape::Id(_) => View::Id,
             Shape::Datum(value) => View::Datum(value),
@@ -149,7 +164,7 @@ impl<'a, 'gc> Tree<'a, 'gc> {
 
     /// Converts `root`, a syntax object from the reader, into nodes with empty scope sets. The
     /// traversal uses an explicit stack, and creates the children of a node before the node.
-    pub(crate) fn read(&mut self, root: Syntax<'gc>) -> Result<Stx, OutOfMemory> {
+    pub fn read(&mut self, root: Syntax<'gc>) -> Result<Stx, OutOfMemory> {
         enum Task<'gc> {
             Visit(Syntax<'gc>),
             /// Creates the list or vector of a reader node from the last `count` nodes created. If the list is dotted, the last of them is its tail.
@@ -210,7 +225,7 @@ impl<'a, 'gc> Tree<'a, 'gc> {
 
     /// Returns the datum of `root`, without scopes and spans. The traversal uses an explicit
     /// stack, and builds each list or vector from the data of its items.
-    pub(crate) fn strip(&mut self, root: Stx) -> Result<Value<'gc>, OutOfMemory> {
+    pub fn strip(&mut self, root: Stx) -> Result<Value<'gc>, OutOfMemory> {
         enum Task {
             Visit(Stx),
             /// Builds a list from the last `len` data produced. If the list is dotted, the last datum is its tail.

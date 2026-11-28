@@ -251,7 +251,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         }
         let parsed: Vec<_> = parsed.iter().map(|(steps, body)| (steps.as_slice(), body)).collect();
         let code = steps::run(self, Code::Tries(parsed, none), Self::code)?;
-        let message = string::from_str(&Strings::new(self.ex.mc), "match: no matching clause for")?.value();
+        let message = string::from_str(&Strings::new(self.ex.engine.mc), "match: no matching clause for")?.value();
         let message = self.ex.value(message, stx)?;
         let error = self.ex.build(stx, "error", &[&[message, target.stx]])?;
         let code = self.let_thunk(stx, none, error, code)?;
@@ -391,7 +391,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
         let Some((&pattern, rest)) = parts.split_first() else { return Err(self.ex.error(ExpandErrorKind::BadSyntax, clause)) };
         let steps = self.match_pattern(target, pattern)?;
         let when_ = self.ex.symbol("when")?;
-        let when = rest.first().is_some_and(|&first| self.ex.tree.keyword(first).is_some_and(|keyword| keyword.symbol(self.ex.mc) == when_));
+        let when = rest.first().is_some_and(|&first| self.ex.engine.tree.keyword(first).is_some_and(|keyword| keyword.symbol(self.ex.engine.mc) == when_));
         let escape = match rest.first() {
             Some(&first) => self.escape(first)?,
             None => None,
@@ -422,7 +422,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
 
     /// Returns `id` if `stx` is `(=> id)`.
     fn escape(&mut self, stx: Stx) -> Result<Option<Stx>, ExpandError> {
-        let View::List(items, None) = self.ex.tree.view(stx)? else { return Ok(None) };
+        let View::List(items, None) = self.ex.engine.tree.view(stx)? else { return Ok(None) };
         Ok(match *items {
             [arrow, id] if self.ex.is_aux(arrow, Aux::Arrow)? && self.ex.is_id(id) => Some(id),
             _ => None,
@@ -466,7 +466,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
 
     /// Adds the steps that match `pattern` against `target` to the step list being built.
     fn pattern(&mut self, (target, pattern): (Temp, Stx)) -> Result<Pat<'e, 'a, 'gc>, ExpandError> {
-        let (items, tail) = match self.ex.tree.view(pattern)? {
+        let (items, tail) = match self.ex.engine.tree.view(pattern)? {
             View::Id if self.ex.is_aux(pattern, Aux::Underscore)? => return Ok(Next::Done(())),
             View::Id if self.ex.is_aux(pattern, Aux::Ellipsis)? => return Err(self.ex.error(ExpandErrorKind::BadSyntax, pattern)),
             View::Id => {
@@ -492,8 +492,8 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
             }
             View::List(items, tail) => (items, tail),
         };
-        let name = match self.ex.tree.symbol(items[0]) {
-            Some(symbol) if tail.is_none() => string::chars(&Strings::new(self.ex.mc), symbol.name(self.ex.mc)).collect::<String>(),
+        let name = match self.ex.engine.tree.symbol(items[0]) {
+            Some(symbol) if tail.is_none() => string::chars(&Strings::new(self.ex.engine.mc), symbol.name(self.ex.engine.mc)).collect::<String>(),
             _ => return Err(self.ex.error(ExpandErrorKind::BadSyntax, pattern)),
         };
         let args = &items[1..];
@@ -625,7 +625,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
     /// Returns a `Duplicate` error if the pattern so far already binds the variable `id`. A variable that is bound to a list of
     /// matches cannot also be an equality test against an earlier binding.
     fn not_bound(&mut self, id: Stx) -> Result<(), ExpandError> {
-        let key = (self.ex.tree.symbol(id).expect("an identifier"), self.ex.tree.scopes_of(id)?);
+        let key = (self.ex.engine.tree.symbol(id).expect("an identifier"), self.ex.engine.tree.scopes_of(id)?);
         if self.m.seen.iter().any(|seen| seen.key() == key) {
             return Err(self.ex.error(ExpandErrorKind::Duplicate, id));
         }
@@ -705,7 +705,7 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
     /// Compiles the variable pattern `id`. It matches any value and binds `id` to it. If the pattern already binds `id`, it instead matches a value that is
     /// `equal?` to that binding.
     fn variable(&mut self, target: Temp, id: Stx) -> Result<(), ExpandError> {
-        let seen = Seen { id, symbol: self.ex.tree.symbol(id).expect("an identifier"), set: self.ex.tree.scopes_of(id)?, value: target.stx };
+        let seen = Seen { id, symbol: self.ex.engine.tree.symbol(id).expect("an identifier"), set: self.ex.engine.tree.scopes_of(id)?, value: target.stx };
         match self.m.seen.iter().find(|other| other.key() == seen.key()) {
             Some(first) => {
                 let test = self.ex.build(id, "equal?", &[&[first.value, target.stx]])?;

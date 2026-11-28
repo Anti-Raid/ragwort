@@ -3,6 +3,8 @@
 //! syntax object created from the tree is mapped back to its node. So when a transformer returns a part of
 //! its input unchanged, converting that part back takes one lookup.
 
+use std::fmt;
+
 use ragwort_types::gc::{OutOfMemory, Value};
 use ragwort_types::pair::{Pair, Pairs};
 use ragwort_types::symbol::Symbol;
@@ -10,17 +12,16 @@ use ragwort_types::syntax::{Syntax, SyntaxContext, SyntaxKind, SyntaxMeta, Synta
 use ragwort_types::vector::{AnyVector, Vectors};
 
 use ragwort_compiler::module;
-use ragwort_vm::objects::ModuleFields;
 
-use crate::expand::{Binding, Expander, Stamp};
-use crate::scope::{Scope, Set};
+use crate::engine::{Binding, Engine, Stamp, internal_name};
+use crate::scope::{Scope, Set, TOP};
 use crate::tree::{Stx, View};
 use crate::{ExpandError, ExpandErrorKind};
 
-impl<'gc> Expander<'_, 'gc> {
+impl<'a, 'gc, K: Copy + PartialEq + fmt::Debug> Engine<'a, 'gc, K> {
     /// Converts `root` to a syntax object. The traversal uses an explicit stack, and builds each
     /// list or vector from the syntax objects of its items.
-    pub(crate) fn wrap(&mut self, root: Stx) -> Result<Value<'gc>, ExpandError> {
+    pub fn wrap(&mut self, root: Stx) -> Result<Value<'gc>, ExpandError> {
         enum Task {
             Visit(Stx),
             /// Builds the list or vector of a node from the last `count` syntax objects created. The
@@ -70,7 +71,7 @@ impl<'gc> Expander<'_, 'gc> {
     }
 
     /// Returns the metadata for syntax of `kind` with the scope set `set`. It is created once for each such pair and cached.
-    pub(crate) fn meta(&mut self, set: Set, kind: SyntaxKind) -> Result<SyntaxMeta<'gc>, ExpandError> {
+    pub fn meta(&mut self, set: Set, kind: SyntaxKind) -> Result<SyntaxMeta<'gc>, ExpandError> {
         let tag = match kind {
             SyntaxKind::Identifier => 0,
             SyntaxKind::List => 1,
@@ -99,27 +100,38 @@ impl<'gc> Expander<'_, 'gc> {
     /// Returns the binding value for the syntax object of the identifier `id`, or `None` if `id` is ambiguous.
     /// `free-identifier=?` in `ragwort_vm` compares these values.
     ///
-    /// - A keyword's value is the identifier's symbol.
-    /// - A [`Stamp::Named`] binding has a pair `(module . name)`. Two such pairs are the same binding if their parts are equal.
+    /// - The value of a keyword or a core form is the identifier's symbol.
+    /// - A [`Stamp::Named`] binding has a mutable vector of two items: the module that binds the name, and the name. For a name of the module being
+    ///   expanded, the first item is the module's name until [`Sealed::patch`](crate::Sealed::patch) replaces it with the module.
     /// - A [`Stamp::Own`] binding has a fresh `SyntaxScope` object. The object is not used as a scope. It only serves as a unique value that is compared by identity.
-    fn binding_value(&mut self, id: Stx) -> Result<Option<Value<'gc>>, ExpandError> {
+    ///
+    /// An identifier that a macro of another module introduced keeps the binding value that it came with.
+    pub fn binding_value(&mut self, id: Stx) -> Result<Option<Value<'gc>>, ExpandError> {
         let mc = self.mc;
         let symbol = self.tree.symbol(id).expect("an identifier");
         let set = self.tree.scopes_of(id)?;
-        let Ok(binding) = self.resolve_name(symbol, set) else { return Ok(None) };
+        let origin = self.origin(id, set);
+        let Ok(binding) = self.resolve_name(symbol, set, origin) else { return Ok(None) };
+        if let Some(origin) = origin
+            && !matches!(binding, Binding::Local(_) | Binding::Macro(_) | Binding::Pattern { .. } | Binding::Slot(_))
+        {
+            return Ok(Some(origin));
+        }
         let (stamp, name) = match binding {
-            Binding::Keyword(_) => return Ok(Some(symbol.value(mc))),
+            Binding::Keyword(_) | Binding::Core(_) => return Ok(Some(symbol.value(mc))),
             Binding::Local(var) => (Stamp::Own(0, var.0), None),
-            Binding::Macro(macro_index) => (Stamp::Own(1, macro_index), None),
+            Binding::Macro(macro_index) => match self.macro_names[macro_index as usize] {
+                Some((module, name)) => (Stamp::Named(module.to_bits(), name.to_bits()), Some((module, name))),
+                None => (Stamp::Own(1, macro_index), None),
+            },
             Binding::Pattern { var, .. } => (Stamp::Own(2, var.0), None),
-            Binding::Slot(slot) if !matches!(self.builder.binding(symbol.value(mc)), Some(module::Binding::Slot(bound)) if bound == slot) => (Stamp::Own(3, slot), None),
+            Binding::Slot(slot) if !matches!(self.module.binding(symbol.value(mc)), Some(module::Binding::Slot(bound)) if bound == slot) => (Stamp::Own(3, slot), None),
             Binding::Slot(_) | Binding::Free => {
-                let module = self.builder.name();
+                let module = self.module.name();
                 (Stamp::Named(module.to_bits(), symbol.value(mc).to_bits()), Some((module, symbol.value(mc))))
             }
             Binding::Import(import) => {
-                let (module, names) = (import.module.name(mc), import.module.names(mc));
-                let name = AnyVector::of(names).and_then(|names| names.get(mc, import.export.slot as usize)).unwrap_or(Value::FALSE);
+                let (module, name) = (Value::object(mc, import.module), internal_name(mc, import));
                 (Stamp::Named(module.to_bits(), name.to_bits()), Some((module, name)))
             }
         };
@@ -127,7 +139,7 @@ impl<'gc> Expander<'_, 'gc> {
             return Ok(Some(value));
         }
         let value = match name {
-            Some((module, name)) => Pairs::new(mc).cons(module, name)?.value(mc),
+            Some((module, name)) => Vectors::new(mc).from_slice(&[module, name])?.value(mc),
             None => SyntaxScope::new(mc)?.value(),
         };
         self.tree.scopes.charge(size_of::<(Stamp, Value)>())?;
@@ -136,7 +148,7 @@ impl<'gc> Expander<'_, 'gc> {
     }
 
     /// Returns the `SyntaxScope` object that represents `scope` in syntax objects. It is created on first use.
-    fn scope_object(&mut self, scope: Scope) -> Result<SyntaxScope<'gc>, OutOfMemory> {
+    pub fn scope_object(&mut self, scope: Scope) -> Result<SyntaxScope<'gc>, OutOfMemory> {
         if let Some(&object) = self.scope_objects.get(&scope) {
             return Ok(object);
         }
@@ -149,7 +161,7 @@ impl<'gc> Expander<'_, 'gc> {
 
     /// Returns the scope set of `context`. A scope object that this load has not seen gets a fresh
     /// scope number. Such an object comes from another load or was created at run time.
-    pub(crate) fn set_of(&mut self, context: Option<SyntaxContext<'gc>>) -> Result<Set, OutOfMemory> {
+    pub fn set_of(&mut self, context: Option<SyntaxContext<'gc>>) -> Result<Set, OutOfMemory> {
         let Some(context) = context else { return Ok(Set::EMPTY) };
         let mut scopes = Vec::with_capacity(context.scopes(self.mc).len());
         for object in context.scopes(self.mc) {
@@ -172,7 +184,7 @@ impl<'gc> Expander<'_, 'gc> {
     /// object is treated as syntax with the span of `at`, the macro use. A bare symbol is an error. The traversal uses an explicit stack, and creates the items of a list or
     /// vector before it. The stack is charged to the arena's budget as it grows. Otherwise cyclic data
     /// would grow the stack without limit.
-    pub(crate) fn unwrap(&mut self, value: Value<'gc>, at: Stx) -> Result<Stx, ExpandError> {
+    pub fn unwrap(&mut self, value: Value<'gc>, at: Stx) -> Result<Stx, ExpandError> {
         enum Task<'gc> {
             Visit(Value<'gc>),
             /// Builds a list or vector from the last `count` nodes created. The node of a list's tail, if the list has one, is on the stack above them.
@@ -195,6 +207,7 @@ impl<'gc> Expander<'_, 'gc> {
                 continue;
             }
             self.tree.scopes.charge(size_of::<Task<'gc>>())?;
+            let origin = Syntax::of(value).and_then(|syntax| syntax.binding(mc));
             let (datum, span, kind, context) = match Syntax::of(value) {
                 Some(syntax) => (syntax.datum(mc), syntax.span(mc), syntax.kind(mc).ok_or_else(|| self.error(ExpandErrorKind::BadSyntax, at))?, syntax.context(mc)),
                 None if value == Value::NULL || Pair::of(value).is_some() => (value, self.tree.span(at), SyntaxKind::List, None),
@@ -206,7 +219,14 @@ impl<'gc> Expander<'_, 'gc> {
                 SyntaxKind::Identifier => {
                     let symbol = Symbol::of(datum).ok_or_else(|| self.error(ExpandErrorKind::BadSyntax, at))?;
                     let set = self.set_of(context)?;
-                    done.push(self.tree.id(symbol, set, span)?);
+                    let id = self.tree.id(symbol, set, span)?;
+                    // An identifier without the `TOP` scope was not read from this module's source. Its binding value says what it refers to.
+                    if let Some(origin) = origin
+                        && !self.tree.scopes.contains(set, TOP)
+                    {
+                        self.tree.set_origin(id, origin)?;
+                    }
+                    done.push(id);
                 }
                 SyntaxKind::List => {
                     let (mut items, mut rest) = (Vec::new(), datum);

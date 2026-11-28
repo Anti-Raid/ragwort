@@ -145,13 +145,13 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     }
 
     pub(crate) fn list(&mut self, items: &[Stx], at: Stx) -> Result<Stx, ExpandError> {
-        let span = self.tree.span(at);
-        Ok(self.tree.list(items, None, span)?)
+        let span = self.engine.tree.span(at);
+        Ok(self.engine.tree.list(items, None, span)?)
     }
 
     pub(crate) fn value(&mut self, value: Value<'gc>, at: Stx) -> Result<Stx, ExpandError> {
-        let span = self.tree.span(at);
-        Ok(self.tree.datum(value, span)?)
+        let span = self.engine.tree.span(at);
+        Ok(self.engine.tree.datum(value, span)?)
     }
 
     pub(crate) fn quoted(&mut self, datum: Stx, at: Stx) -> Result<Stx, ExpandError> {
@@ -177,7 +177,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     /// the list of each variable with its temporary. `prefix` is part of each temporary's name. It keeps the temporaries of one clause distinct from
     /// those of another clause.
     fn temporaries(&mut self, formals: Stx, prefix: usize) -> Result<(Stx, Vec<(Stx, Stx)>), ExpandError> {
-        let (vars, tail) = match self.tree.view(formals)? {
+        let (vars, tail) = match self.engine.tree.view(formals)? {
             View::Id => (Vec::new(), Some(formals)),
             View::List(vars, tail) => (vars, tail),
             _ => return Err(self.error(ExpandErrorKind::BadSyntax, formals)),
@@ -190,11 +190,11 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             pairs.push((var, self.introduce(&format!("t{prefix}-{position}"), var)?));
         }
         let temps: Vec<Stx> = pairs.iter().map(|&(_, temp)| temp).collect();
-        let span = self.tree.span(formals);
+        let span = self.engine.tree.span(formals);
         let shaped = match (tail, temps.split_last()) {
             (Some(_), Some((&last, []))) if vars.is_empty() => last,
-            (Some(_), Some((&last, before))) => self.tree.list(before, Some(last), span)?,
-            _ => self.tree.list(&temps, None, span)?,
+            (Some(_), Some((&last, before))) => self.engine.tree.list(before, Some(last), span)?,
+            _ => self.engine.tree.list(&temps, None, span)?,
         };
         Ok((shaped, pairs))
     }
@@ -308,13 +308,13 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let mut clauses = Vec::with_capacity(rules.len());
         for &rule in rules {
             let &[pattern, template] = self.proper(rule)?.as_slice() else { return Err(self.error(ExpandErrorKind::BadSyntax, rule)) };
-            let View::List(items, tail) = self.tree.view(pattern)? else { return Err(self.error(ExpandErrorKind::BadSyntax, pattern)) };
+            let View::List(items, tail) = self.engine.tree.view(pattern)? else { return Err(self.error(ExpandErrorKind::BadSyntax, pattern)) };
             if items.is_empty() {
                 return Err(self.error(ExpandErrorKind::BadSyntax, pattern));
             }
             let any = self.introduce("_", pattern)?;
-            let span = self.tree.span(pattern);
-            let pattern = self.tree.list(&[&[any], &items[1..]].concat(), tail, span)?;
+            let span = self.engine.tree.span(pattern);
+            let pattern = self.engine.tree.list(&[&[any], &items[1..]].concat(), tail, span)?;
             let template = self.build(rule, "syntax", &[&[template]])?;
             clauses.push(self.list(&[pattern, template], rule)?);
         }
@@ -427,7 +427,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     /// Returns an expression that builds `template` at quasiquote nesting `depth`. Returns `None` if `template` has
     /// nothing unquoted, in which case it can be quoted as it is.
     fn quasi(&mut self, (template, depth): (Stx, usize)) -> Result<Quasi<'a, 'gc>, ExpandError> {
-        match self.tree.view(template)? {
+        match self.engine.tree.view(template)? {
             View::List(items, tail) => {
                 if tail.is_none()
                     && let Some((tag, operand)) = self.tag(&items)?
@@ -464,7 +464,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     /// Builds the remaining items of a quasiquoted list, then its tail.
     fn quasi_items(&mut self, mut list: Built) -> Result<Quasi<'a, 'gc>, ExpandError> {
         while let Some(&item) = list.items.get(list.built.len()) {
-            let spliced = match self.tree.view(item)? {
+            let spliced = match self.engine.tree.view(item)? {
                 View::List(parts, None) if list.depth == 0 => match self.tag(&parts)? {
                     Some((Tag::UnquoteSplicing, operand)) => Some(operand),
                     _ => None,
@@ -517,7 +517,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     /// supported.
     fn quasi_vector(&mut self, template: Stx, depth: usize, items: Vec<Stx>, i: usize) -> Result<Quasi<'a, 'gc>, ExpandError> {
         let Some(&item) = items.get(i) else { return Ok(Step::Done(None)) };
-        let spliced = match self.tree.view(item)? {
+        let spliced = match self.engine.tree.view(item)? {
             View::List(parts, None) => self.tag(&parts)?.is_some_and(|(tag, _)| tag == Tag::UnquoteSplicing),
             _ => false,
         };

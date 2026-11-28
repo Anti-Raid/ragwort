@@ -6,6 +6,7 @@
 //! [`Core::KeywordApp`], which the compiler lowers to keyword procedures and direct core calls.
 
 use ragwort_compiler::keyword::{self, CallShape};
+use ragwort_expander::Expand;
 use ragwort_compiler::steps::Step;
 use ragwort_compiler::{Arg, Core, Formal, OptionalLambda, Position};
 use ragwort_types::symbol::Keyword;
@@ -38,14 +39,14 @@ impl<'gc> Formals<'gc> {
     }
 
     fn shape(&self, ex: &Expander<'_, 'gc>) -> CallShape<'gc> {
-        CallShape::of(ex.mc, &self.params(), self.rest.is_some())
+        CallShape::of(ex.engine.mc, &self.params(), self.rest.is_some())
     }
 }
 
 impl<'a, 'gc> Expander<'a, 'gc> {
     /// Returns whether `formals` are plain: a single identifier, or a list of identifiers that can have an identifier as its tail.
     pub(crate) fn plain_formals(&mut self, formals: Stx) -> Result<bool, ExpandError> {
-        Ok(match self.tree.view(formals)? {
+        Ok(match self.engine.tree.view(formals)? {
             View::Id => true,
             View::List(ids, rest) => ids.iter().chain(&rest).all(|&id| self.is_id(id)),
             _ => false,
@@ -54,16 +55,16 @@ impl<'a, 'gc> Expander<'a, 'gc> {
 
     /// Parses `formals` that have optional or keyword parameters.
     pub(crate) fn formals(&mut self, formals: Stx) -> Result<Formals<'gc>, ExpandError> {
-        let View::List(items, rest) = self.tree.view(formals)? else { return Err(self.error(ExpandErrorKind::BadSyntax, formals)) };
+        let View::List(items, rest) = self.engine.tree.view(formals)? else { return Err(self.error(ExpandErrorKind::BadSyntax, formals)) };
         let mut params: Vec<Param<'gc>> = Vec::new();
         let mut items = items.into_iter();
         while let Some(item) = items.next() {
-            let keyword = self.tree.keyword(item);
+            let keyword = self.engine.tree.keyword(item);
             let at = match keyword {
                 Some(_) => items.next().ok_or_else(|| self.error(ExpandErrorKind::BadSyntax, item))?,
                 None => item,
             };
-            let (id, default) = match self.tree.view(at)? {
+            let (id, default) = match self.engine.tree.view(at)? {
                 View::Id => (at, None),
                 View::List(parts, None) if matches!(*parts, [id, _] if self.is_id(id)) => (parts[0], Some(parts[1])),
                 _ => return Err(self.error(ExpandErrorKind::BadSyntax, at)),
@@ -89,7 +90,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
 
     /// Returns the call shape of the keyword procedure if `value` is a `lambda` form with keyword parameters.
     pub(crate) fn keyword_lambda(&mut self, value: Stx) -> Result<Option<CallShape<'gc>>, ExpandError> {
-        let View::List(items, None) = self.tree.view(value)? else { return Ok(None) };
+        let View::List(items, None) = self.engine.tree.view(value)? else { return Ok(None) };
         let [head, formals, _, ..] = items[..] else { return Ok(None) };
         if !self.is_id(head) || !matches!(self.resolve(head)?, Binding::Keyword(crate::expand::Keyword::Form(crate::expand::Form::Lambda))) {
             return Ok(None);
@@ -136,7 +137,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let rest = lambda.rest.map(|id| self.local(id)).transpose()?;
         let body = self.scoped(&lambda.body, lambda.scope)?;
         Self::body_then(lambda.stx, body, move |this, body| {
-            let at = Position::of(this.mc, this.tree.span(lambda.stx));
+            let at = Position::of(this.engine.mc, this.engine.tree.span(lambda.stx));
             let id = this.lambda_id();
             then(this, OptionalLambda { id, params: lambda.params, rest, body: Box::new(body), name: None, at })
         })
@@ -150,7 +151,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
 
     /// Returns whether any of the call arguments `args` is a keyword.
     pub(crate) fn has_keyword_args(&self, args: &[Stx]) -> bool {
-        args.iter().any(|&arg| self.tree.keyword(arg).is_some())
+        args.iter().any(|&arg| self.engine.tree.keyword(arg).is_some())
     }
 
     /// Expands the call `stx` of `head` with arguments `args`, some of which have keywords, into a [`Core::KeywordApp`].
@@ -158,7 +159,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let (mut keywords, mut values) = (Vec::with_capacity(args.len()), Vec::with_capacity(args.len()));
         let mut items = args.iter().copied();
         while let Some(arg) = items.next() {
-            let Some(keyword) = self.tree.keyword(arg) else {
+            let Some(keyword) = self.engine.tree.keyword(arg) else {
                 keywords.push(None);
                 values.push(arg);
                 continue;

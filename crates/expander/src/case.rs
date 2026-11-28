@@ -5,94 +5,27 @@
 //! also becomes a constant, and the generated code builds syntax from it and the variables' matches. A template without pattern variables becomes
 //! its own syntax object.
 
-use std::rc::Rc;
+use std::fmt;
 
-use ragwort_compiler::steps::Step;
-use ragwort_compiler::{Core, Lambda, Place, Prim, Var};
+use ragwort_compiler::{Core, Place, Prim, Var};
 use ragwort_types::gc::Value;
 use ragwort_types::syntax::{Syntax, SyntaxKind};
+use ragwort_vm::Intrinsic;
 use ragwort_vm::syntax_case::{self, Pattern, PatternShape, Repeat, Template, TemplateShape};
-use ragwort_vm::{Intrinsic, Request};
 
-use crate::expand::{Aux, Binding, Call, Ex, Expander};
-use crate::scope::Op;
+use crate::engine::{Binding, Engine};
 use crate::tree::{Stx, View};
 use crate::{ExpandError, ExpandErrorKind};
 
-fn index(items: &[Value<'_>]) -> u32 {
+pub(crate) fn index(items: &[Value<'_>]) -> u32 {
     u32::try_from(items.len()).expect("fewer than 2^32 parts")
 }
 
-impl<'a, 'gc> Expander<'a, 'gc> {
-    /// Expands `(syntax-case input (literal ...) clause ...)`. A clause is `(pattern output)` or `(pattern
-    /// fender output)`. The clauses are tried in order. The pattern variables of a clause are bound in its fender and its output.
-    pub(crate) fn syntax_case(&mut self, input: Stx, literals: Stx, clauses: Vec<Stx>) -> Result<Ex<'a, 'gc>, ExpandError> {
-        let literals = self.proper(literals)?;
-        if let Some(&bad) = literals.iter().find(|&&id| !self.is_id(id)) {
-            return Err(self.error(ExpandErrorKind::BadSyntax, bad));
-        }
-        let var = self.fresh();
-        let (literals, clauses): (Rc<[Stx]>, Rc<[Stx]>) = (literals.into(), clauses.into());
-        Self::expr(input, move |_, value| {
-            Ok(Step::then(Call::Run(Box::new(move |this: &mut Self| this.clauses(var, literals, clauses, 0))), move |_: &mut Self, clauses| Ok(Step::Done(Core::Let(vec![(var, value)], Box::new(clauses))))))
-        })
-    }
-
-    /// Expands the clauses from index `at` on. Each clause is tried if the clauses before it do not match. If no clause matches, the code raises a syntax error with the input.
-    fn clauses(&mut self, input: Var, literals: Rc<[Stx]>, clauses: Rc<[Stx]>, at: usize) -> Result<Ex<'a, 'gc>, ExpandError> {
-        let Some(&clause) = clauses.get(at) else {
-            let error = Core::Intrinsic(Prim::Intrinsic(Intrinsic::MakeSyntaxError), vec![Core::Quote(Value::VOID), local(input)], None);
-            return Ok(Step::Done(Core::Intrinsic(Prim::Request(Request::Raise), vec![error], None)));
-        };
-        let (pattern, fender, output) = match *self.proper(clause)?.as_slice() {
-            [pattern, output] => (pattern, None, output),
-            [pattern, fender, output] => (pattern, Some(fender), output),
-            _ => return Err(self.error(ExpandErrorKind::BadSyntax, clause)),
-        };
-        let (mut vars, mut items) = (Vec::new(), Vec::new());
-        let mut shape = self.pattern(pattern, &literals, &mut vars, &mut items)?;
-        shape.vars = u32::try_from(vars.len()).expect("fewer than 2^32 variables");
-        let pattern = Core::Quote(syntax_case::pattern(self.mc, shape, &items)?);
-        let asked = Core::Intrinsic(Prim::Intrinsic(Intrinsic::SyntaxMatch), vec![pattern, local(input)], None);
-        let scope = self.tree.scopes.fresh()?;
-        let ids = vars.iter().map(|&(id, _)| self.tree.with(id, scope, Op::Add)).collect::<Result<Vec<_>, _>>()?;
-        self.distinct(&ids)?;
-        let matched = self.fresh();
-        let mut binds = Vec::with_capacity(ids.len());
-        for (slot, (&id, &(_, depth))) in ids.iter().zip(&vars).enumerate() {
-            let var = self.fresh();
-            self.bind(id, Binding::Pattern { var, depth })?;
-            let at = Core::Quote(Value::fixnum(slot as i64).expect("a fixnum"));
-            binds.push((var, Core::Intrinsic(Prim::Intrinsic(Intrinsic::VectorRef), vec![local(matched), at], None)));
-        }
-        let output = self.tree.with(output, scope, Op::Add)?;
-        let fender = fender.map(|fender| self.tree.with(fender, scope, Op::Add)).transpose()?;
-        Ok(Step::then(Call::Run(Box::new(move |this: &mut Self| this.clauses(input, literals, clauses, at + 1))), move |_, next| {
-            Self::expr(output, move |this, output| {
-                let Some(fender) = fender else {
-                    let body = Core::Let(binds, Box::new(output));
-                    return Ok(Step::Done(Core::Let(vec![(matched, asked)], Box::new(Core::If(Box::new(local(matched)), Box::new(body), Box::new(next))))));
-                };
-                // The remaining clauses are tried if the fender fails or the pattern does not match. So their code goes into a thunk that both cases call.
-                let retry = this.fresh();
-                let thunk = Core::Lambda(Lambda { id: this.lambda_id(), params: Vec::new(), optional: 0, rest: None, body: Box::new(next), name: None, at: None });
-                Self::expr(fender, move |_, fender| {
-                    fn again<'gc>(retry: Var) -> Core<'gc> {
-                        Core::App(Box::new(local(retry)), Vec::new(), None)
-                    }
-                    let body = Core::If(Box::new(fender), Box::new(output), Box::new(again(retry)));
-                    let body = Core::Let(binds, Box::new(body));
-                    let tried = Core::If(Box::new(local(matched)), Box::new(body), Box::new(again(retry)));
-                    Ok(Step::Done(Core::Let(vec![(retry, thunk)], Box::new(Core::Let(vec![(matched, asked)], Box::new(tried))))))
-                })
-            })
-        }))
-    }
-
+impl<'a, 'gc, K: Copy + PartialEq + fmt::Debug> Engine<'a, 'gc, K> {
     /// Compiles the pattern `root`. Adds each pattern variable to `vars`, with the number of ellipses that it is
     /// under. Adds the literals and data that the pattern refers to to `parts`. The traversal uses an explicit stack, and compiles the items of a list or vector before it.
     /// A repeated item is recorded with the range of the slots of its variables.
-    fn pattern(&mut self, root: Stx, literals: &[Stx], vars: &mut Vec<(Stx, u32)>, parts: &mut Vec<Value<'gc>>) -> Result<PatternShape, ExpandError> {
+    pub fn pattern(&mut self, root: Stx, literals: &[Stx], vars: &mut Vec<(Stx, u32)>, parts: &mut Vec<Value<'gc>>) -> Result<PatternShape, ExpandError> {
         enum Task {
             Visit(Stx, u32),
             /// Marks the start of an item that an ellipsis repeats. The slots of the item's variables start at the current number of variables.
@@ -129,11 +62,11 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 }
             };
             let (items, tail, vector) = match self.tree.view(pattern)? {
-                View::Id if self.is_aux(pattern, Aux::Underscore)? => {
+                View::Id if self.is_underscore(pattern)? => {
                     done.push(shape.add(Pattern::Any));
                     continue;
                 }
-                View::Id if self.is_aux(pattern, Aux::Ellipsis)? => return Err(self.error(ExpandErrorKind::BadSyntax, pattern)),
+                View::Id if self.is_ellipsis(pattern)? => return Err(self.error(ExpandErrorKind::BadSyntax, pattern)),
                 View::Id if self.is_literal(pattern, literals)? => {
                     let at = index(parts);
                     parts.push(self.wrap(pattern)?);
@@ -158,7 +91,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             // an ellipsis, all items count as before.
             let mut dots = Vec::new();
             for (i, &item) in items.iter().enumerate() {
-                if self.is_aux(item, Aux::Ellipsis)? {
+                if self.is_ellipsis(item)? {
                     dots.push(i);
                 }
             }
@@ -184,7 +117,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     }
 
     /// Returns whether `id` is one of `literals`, that is, has the same name and the same scopes as one of them.
-    fn is_literal(&mut self, id: Stx, literals: &[Stx]) -> Result<bool, ExpandError> {
+    pub fn is_literal(&mut self, id: Stx, literals: &[Stx]) -> Result<bool, ExpandError> {
         let (symbol, set) = (self.tree.symbol(id), self.tree.scopes_of(id)?);
         for &literal in literals {
             if self.tree.symbol(literal) == symbol && self.tree.scopes_of(literal)? == set {
@@ -195,7 +128,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     }
 
     /// Expands `(syntax template)` to code that builds the syntax of `template`, with each pattern variable replaced by its match.
-    pub(crate) fn syntax(&mut self, template: Stx) -> Result<Core<'gc>, ExpandError> {
+    pub fn syntax(&mut self, template: Stx) -> Result<Core<'gc>, ExpandError> {
         let (mut used, mut parts) = (Vec::new(), Vec::new());
         let mut shape = self.template(template, &mut used, &mut parts)?;
         Ok(match *shape.nodes.last().expect("a template's root") {
@@ -214,7 +147,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     /// `used`, once. Adds the constant syntax objects of the template to `parts`. The items of a list or
     /// vector are compiled before it. In an escaped template, `(... template)`, `...` is an ordinary
     /// identifier.
-    fn template(&mut self, root: Stx, used: &mut Vec<(Var, u32)>, parts: &mut Vec<Value<'gc>>) -> Result<TemplateShape, ExpandError> {
+    pub fn template(&mut self, root: Stx, used: &mut Vec<(Var, u32)>, parts: &mut Vec<Value<'gc>>) -> Result<TemplateShape, ExpandError> {
         /// A compiled part of a template: its node, the slots of the variables in it in order of first
         /// occurrence, whether it is a constant, and whether it contains an escape.
         struct Made {
@@ -282,7 +215,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 }
             };
             let (items, tail, vector) = match self.tree.view(template)? {
-                View::Id if !escaped && self.is_aux(template, Aux::Ellipsis)? => return Err(self.error(ExpandErrorKind::BadSyntax, template)),
+                View::Id if !escaped && self.is_ellipsis(template)? => return Err(self.error(ExpandErrorKind::BadSyntax, template)),
                 View::Id => {
                     if let Binding::Pattern { var, depth } = self.resolve(template)? {
                         if nesting < depth {
@@ -304,7 +237,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                     if let [dots, inner] = items[..]
                         && !escaped
                         && tail.is_none()
-                        && self.is_aux(dots, Aux::Ellipsis)?
+                        && self.is_ellipsis(dots)?
                     {
                         todo.extend([Task::Escaped, Task::Visit(inner, nesting, true)]);
                         continue;
@@ -326,7 +259,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             while i < items.len() {
                 let item = items[i];
                 let mut count = 0;
-                while !escaped && i + 1 < items.len() && self.is_aux(items[i + 1], Aux::Ellipsis)? {
+                while !escaped && i + 1 < items.len() && self.is_ellipsis(items[i + 1])? {
                     count += 1;
                     i += 1;
                 }
@@ -342,6 +275,6 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     }
 }
 
-fn local<'gc>(var: Var) -> Core<'gc> {
+pub(crate) fn local<'gc>(var: Var) -> Core<'gc> {
     Core::Ref(Place::Local(var))
 }

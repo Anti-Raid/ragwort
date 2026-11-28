@@ -148,15 +148,15 @@ pub(crate) struct Info<'gc> {
 impl<'a, 'gc> Expander<'a, 'gc> {
     /// Returns the name of `stx` if it is a keyword. The name does not include the `#:` prefix.
     pub(crate) fn keyword_name(&self, stx: Stx) -> Option<String> {
-        let keyword = self.tree.keyword(stx)?;
-        Some(chars(&self.strings, keyword.symbol(self.mc).name(self.mc)).collect())
+        let keyword = self.engine.tree.keyword(stx)?;
+        Some(chars(&self.engine.strings, keyword.symbol(self.engine.mc).name(self.engine.mc)).collect())
     }
 
     /// Creates an identifier named `name` with the scopes and the span of `from`. A form that binds
     /// `from` uses it for a derived name that the form also binds, such as `point?` for `point`.
     fn named_after(&mut self, from: Stx, name: &str) -> Result<Stx, ExpandError> {
-        let (symbol, scopes) = (self.symbol(name)?, self.tree.scopes_of(from)?);
-        Ok(self.tree.id(symbol, scopes, self.tree.span(from))?)
+        let (symbol, scopes) = (self.symbol(name)?, self.engine.tree.scopes_of(from)?);
+        Ok(self.engine.tree.id(symbol, scopes, self.engine.tree.span(from))?)
     }
 
     /// Parses `form`, a `struct` form.
@@ -171,7 +171,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             parent = Some(next);
             next = rest.next().ok_or_else(|| self.error(bad, form))?;
         }
-        let specs = match self.tree.view(next)? {
+        let specs = match self.engine.tree.view(next)? {
             View::List(specs, None) => specs,
             View::Datum(Value::NULL) => Vec::new(),
             _ => return Err(self.error(bad, next)),
@@ -221,8 +221,8 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             Info { kind, fields: def.fields.to_vec(), sealed: def.sealed, match_only: def.match_only }
         }
         Ok(match self.resolve(id)? {
-            Binding::Slot(slot) => self.builder.struct_def(slot).map(|(def, kind)| info(def, kind)),
-            Binding::Import(import) => import.struct_def(self.mc).map(|(def, kind)| info(def, kind)),
+            Binding::Slot(slot) => self.engine.module.struct_def(slot).map(|(def, kind)| info(def, kind)),
+            Binding::Import(import) => import.struct_def(self.engine.mc).map(|(def, kind)| info(def, kind)),
             _ => None,
         })
     }
@@ -231,7 +231,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
     fn struct_item(&self, form: &Form, whole: Stx) -> structs::Form<'gc> {
         structs::Form {
             name: self.symbol_and_span(form.name),
-            span: self.tree.span(whole),
+            span: self.engine.tree.span(whole),
             parent: form.parent.map(|parent| self.symbol_and_span(parent)),
             fields: form.fields.iter().map(|field| Declaration { name: self.symbol_and_span(field.id).0, mutable: field.mutable }).collect(),
             flags: form.flags,
@@ -241,7 +241,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
 
     /// Returns the symbol of the identifier `id` and its span.
     fn symbol_and_span(&self, id: Stx) -> (Value<'gc>, SyntaxSpan<'gc>) {
-        (self.tree.symbol(id).expect("an identifier").value(self.mc), self.tree.span(id))
+        (self.engine.tree.symbol(id).expect("an identifier").value(self.engine.mc), self.engine.tree.span(id))
     }
 
     /// Declares the bindings of `form`, a `struct` form that is the module's top-level form `index`.
@@ -259,7 +259,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 None => return Err(self.error(ExpandErrorKind::BadSyntax, id)),
             },
         };
-        let planned = self.struct_item(&parts, form).plan(self.mc, parent).map_err(|error| match (error, parts.parent) {
+        let planned = self.struct_item(&parts, form).plan(self.engine.mc, parent).map_err(|error| match (error, parts.parent) {
             (ModuleError::Supertype, Some(id)) => self.error(ExpandErrorKind::BadSyntax, id),
             _ => self.module_error(error, form),
         })?;
@@ -272,13 +272,13 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             };
             slots.push(self.define_top(id, index)?);
         }
-        Ok(planned.declare(&mut self.builder, slots))
+        Ok(planned.declare(&mut self.engine.module, slots))
     }
 
     /// Returns the code of a declared `struct` form. The code defines each of the form's variables.
     pub(crate) fn lower_struct(&mut self, declared: Declared) -> Core<'gc> {
-        let (_, kind) = self.builder.struct_def(declared.constructor()).expect("a declared struct");
-        declared.define(kind, self.builder.locals())
+        let (_, kind) = self.engine.module.struct_def(declared.constructor()).expect("a declared struct");
+        declared.define(kind, self.engine.module.locals())
     }
 
     /// Returns an expression for the struct type of `info`, with the span of `at`.

@@ -95,6 +95,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ragwort-expander"
+version = "0.1.0"
+dependencies = [
+ "ragwort-compiler",
+ "ragwort-types",
+ "ragwort-vm",
+]
+
+[[package]]
 name = "ragwort-gc-region"
 version = "0.1.0"
 dependencies = [
@@ -120,6 +129,7 @@ name = "ragwort-native"
 version = "0.1.0"
 dependencies = [
  "ragwort-compiler",
+ "ragwort-expander",
  "ragwort-printer-scheme",
  "ragwort-reader-scheme",
  "ragwort-types",
@@ -160,6 +170,7 @@ name = "ragwort-scheme"
 version = "0.1.0"
 dependencies = [
  "ragwort-compiler",
+ "ragwort-expander",
  "ragwort-native",
  "ragwort-printer-scheme",
  "ragwort-reader-scheme",
