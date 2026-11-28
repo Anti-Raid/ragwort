@@ -1,5 +1,9 @@
 //! Sets the `RAGWORT_BUILD` environment variable for the crate. It is a stamp that identifies this build of ragwort: a
-//! hash of the source of every ragwort crate, the crate version and the build target.
+//! hash of the source of every ragwort crate, the crate version and the target's pointer width.
+//!
+//! The stamp does not name the target. An image is written in a fixed format, with every number in little-endian order at a fixed width, so
+//! builds of one source for two targets read each other's images. A program built for one machine can include an image that a build script made on another.
+//! The pointer width is in the stamp because no 32-bit build has been tried.
 //!
 //! An image is valid only for the build that made it. A change to the source can alter what
 //! an image means without altering the shape of the saved data. Examples are an intrinsic that changes its
@@ -54,7 +58,7 @@ fn main() {
     sources(&root, &mut files);
     files.sort();
     let mut sum = 0xCBF2_9CE4_8422_2325u64;
-    for name in ["CARGO_PKG_VERSION", "TARGET"] {
+    for name in ["CARGO_PKG_VERSION", "CARGO_CFG_TARGET_POINTER_WIDTH"] {
         hash(&mut sum, std::env::var(name).unwrap_or_default().as_bytes());
     }
     for file in &files {

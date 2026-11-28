@@ -62,7 +62,8 @@ fn kinds() -> Vec<Kind> {
 }
 
 /// A stamp that identifies this build of ragwort. The build script computes it as a hash of the
-/// source of every ragwort crate, the crate version and the build target.
+/// source of every ragwort crate, the crate version and the target's pointer width. It does not name the target, so builds of one source for
+/// two targets with the same pointer width read each other's images.
 pub const BUILD: &str = env!("RAGWORT_BUILD");
 
 /// Returns the stamp that identifies the images of this build. It combines [`BUILD`] with the shape of every

@@ -70,6 +70,7 @@ version = "0.1.0"
 dependencies = [
  "ragwort-compiler",
  "ragwort-modules-core",
+ "ragwort-prebuilt-scheme",
  "ragwort-printer-scheme",
  "ragwort-reader-scheme",
  "ragwort-types",
@@ -145,6 +146,17 @@ name = "ragwort-parser-scheme"
 version = "0.1.0"
 dependencies = [
  "ragwort-num",
+]
+
+[[package]]
+name = "ragwort-prebuilt-scheme"
+version = "0.1.0"
+dependencies = [
+ "ragwort-compiler",
+ "ragwort-modules-core",
+ "ragwort-printer-scheme",
+ "ragwort-types",
+ "ragwort-vm",
 ]
 
 [[package]]

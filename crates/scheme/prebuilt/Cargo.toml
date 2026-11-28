@@ -1,0 +1,27 @@
+[package]
+name = "ragwort-prebuilt-scheme"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ragwort-types = { path = "../../types", default-features = false }
+ragwort-vm = { path = "../../vm", default-features = false }
+ragwort-modules-core = { path = "../../modules-core", default-features = false }
+
+# The build script builds the libraries of Scheme into an image. See `build.rs`.
+[build-dependencies]
+ragwort-types = { path = "../../types", default-features = false }
+ragwort-vm = { path = "../../vm", default-features = false }
+ragwort-modules-core = { path = "../../modules-core", default-features = false }
+
+[dev-dependencies]
+ragwort-compiler = { path = "../../compiler", default-features = false }
+ragwort-printer-scheme = { path = "../printer", default-features = false }
+
+[features]
+default = ["mmap", "arena"]
+mmap = ["ragwort-types/mmap", "ragwort-vm/mmap", "ragwort-modules-core/mmap"]
+arena = ["ragwort-modules-core/arena"]
+
+[lints]
+workspace = true

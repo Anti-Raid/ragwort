@@ -98,7 +98,8 @@ impl From<ragwort_native::Error> for Error {
 pub struct Scheme<'gc> {
     /// The name and the module of each library of [`ragwort_scheme::LIBRARIES`], then of the `scheme` module, which passes them all on.
     pub modules: Vec<(&'static str, Gc<'gc, Module>)>,
-    /// The thunks of the libraries' forms. They must run, in order, before code that requires a library is loaded.
+    /// The thunks of the libraries' forms. They must run, in order, before code that requires a library is loaded. There are none when the
+    /// modules came from an image, because they ran before the image was saved.
     pub thunks: Vec<Value<'gc>>,
 }
 

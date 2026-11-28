@@ -114,6 +114,8 @@ pub struct Program {
     /// each module that an earlier input required by name. `required` holds the names of those modules.
     inputs: Vec<Root<Module>>,
     required: Vec<String>,
+    /// The machine that runs each thunk of the program, once the first thunk has made it. See [`run`].
+    machine: Option<Machine>,
 }
 
 /// Returns the text of `node` if `node` is an identifier or a string literal, and `None` otherwise.
@@ -365,11 +367,20 @@ impl<'gc> Resolver<'gc> for Finder<'_> {
     }
 }
 
-/// Creates the symbol table and builds the libraries of Scheme, in the first step of a new arena. Adds each library to `modules.loaded` under its
+/// Makes the symbol table and the libraries of Scheme, in the first step of a new arena. Adds each library to `modules.loaded` under its
 /// name, so code can require it. Returns the `scheme` module, which passes them all on, with the thunks of the libraries.
+///
+/// The libraries come from the image of [`ragwort_prebuilt_scheme`], and have run already. The image was made on the machine that built the program. If that machine and
+/// this program differ in pointer width, the image has another stamp. Then the libraries are compiled from their source, and their thunks must run.
 fn start<'gc>(mc: &Mutation<'gc>, modules: &mut Modules) -> Result<(ValueRoot, Built), String> {
-    let symbols = Symbols::with_seed(mc, RandomState::new().build_hasher().finish()).map_err(|_| OUT_OF_MEMORY.to_string())?;
-    let libraries = scheme(mc, symbols).map_err(|error| format!("the libraries of Scheme: {error:?}"))?;
+    let (symbols, libraries) = match ragwort_prebuilt_scheme::load(mc) {
+        Ok(loaded) => loaded,
+        Err(ImageError::Load(LoadError::Stamp)) => {
+            let symbols = Symbols::with_seed(mc, RandomState::new().build_hasher().finish()).map_err(|_| OUT_OF_MEMORY.to_string())?;
+            (symbols, scheme(mc, symbols).map_err(|error| format!("the libraries of Scheme: {error:?}"))?)
+        }
+        Err(error) => return Err(format!("the libraries of Scheme: {error:?}")),
+    };
     for &(name, module) in &libraries.modules {
         if modules.dirs.iter().any(|dir| dir.name == name) {
             return Err(format!("module `{name}` is already a library of Scheme"));
@@ -411,13 +422,23 @@ fn restore<'gc>(mc: &Mutation<'gc>, bytes: &[u8], modules: &mut Modules) -> Resu
 
 /// Calls `thunk` and runs it to completion, one arena step at a time, so the collector keeps up. The written form of its
 /// value is passed to `out`, unless the value is void.
-fn run(arena: &mut Arena, thunk: &ValueRoot, mut out: Option<&mut dyn FnMut(&str)>) -> Result<(), String> {
-    let mut machine = arena.mutate(|mc| {
+///
+/// `machine` is the machine that ran the thunk before this one, if it finished. It runs this thunk too, and is left there for the next. A machine has
+/// a stack of its own, and a collection may not come between two thunks. A machine for each thunk would add up to megabytes while the libraries start.
+fn run(arena: &mut Arena, machine: &mut Option<Machine>, thunk: &ValueRoot, mut out: Option<&mut dyn FnMut(&str)>) -> Result<(), String> {
+    let earlier = machine.take();
+    let mut running = arena.mutate(|mc| {
         let thunk = thunk.get(mc).map_err(|_| "value belongs to another arena".to_string())?;
+        // A machine that did not finish cannot be restarted. It is dropped, and a new one takes its place.
+        if let Some(mut earlier) = earlier
+            && earlier.restart(mc, thunk, &[]).is_ok()
+        {
+            return Ok(earlier);
+        }
         Machine::new(mc, MIN_SEGMENT, thunk, &[]).map_err(fault)
     })?;
     loop {
-        let step = arena.step(|mc| match ran(mc, machine.run(mc)) {
+        let step = arena.step(|mc| match ran(mc, running.run(mc)) {
             Ran::More => None,
             Ran::Done(value) => {
                 let text = if value != Value::VOID {
@@ -437,6 +458,7 @@ fn run(arena: &mut Arena, thunk: &ValueRoot, mut out: Option<&mut dyn FnMut(&str
                 if let (Some(out), Some(text)) = (&mut out, text) {
                     out(&text);
                 }
+                *machine = Some(running);
                 return Ok(());
             }
         }
@@ -449,10 +471,11 @@ impl Program {
         let mut arena = Arena::new(heap, 0);
         let mut modules = Modules { dirs, loaded: Vec::new(), wanted: None, errors: Vec::new(), listing: None };
         let (symbols, built) = arena.mutate(|mc| start(mc, &mut modules)).map_err(|message| vec![message])?;
+        let mut machine = None;
         for thunk in &built.thunks {
-            run(&mut arena, thunk, None).map_err(|message| vec![format!("the libraries of Scheme: {message}")])?;
+            run(&mut arena, &mut machine, thunk, None).map_err(|message| vec![format!("the libraries of Scheme: {message}")])?;
         }
-        let mut program = Self { arena, symbols, scheme_module: built.module, modules, inputs: Vec::new(), required: Vec::new() };
+        let mut program = Self { arena, symbols, scheme_module: built.module, modules, inputs: Vec::new(), required: Vec::new(), machine };
         let files = [SourceFile { path: "repl.rgn".into(), text: hosts::SOURCE.to_string(), language: Language::Native }];
         let Some(built) = program.build(hosts::NAME, &hosts::HOSTS, &files, false) else { return Err(program.take_errors()) };
         program.inputs.push(built.module.clone());
@@ -509,7 +532,7 @@ impl Program {
     /// Runs the built module `name` and records it as loaded, so that later code can require it.
     fn finish(&mut self, name: &str, built: Built) -> Result<(), String> {
         for thunk in &built.thunks {
-            run(&mut self.arena, thunk, None).map_err(|message| format!("module {name}: {message}"))?;
+            run(&mut self.arena, &mut self.machine, thunk, None).map_err(|message| format!("module {name}: {message}"))?;
         }
         self.modules.loaded.push((name.to_string(), built.module));
         Ok(())
@@ -568,7 +591,7 @@ impl Program {
         let (symbols, scheme_module) = arena.mutate(|mc| restore(mc, bytes, &mut modules)).map_err(|message| vec![message])?;
         let repl = modules.loaded.iter().find(|(name, _)| name == hosts::NAME).map(|(_, module)| module.clone());
         let Some(repl) = repl else { return Err(vec![format!("an image without the `{}` module", hosts::NAME)]) };
-        Ok(Self { arena, symbols, scheme_module, modules, inputs: vec![repl], required: Vec::new() })
+        Ok(Self { arena, symbols, scheme_module, modules, inputs: vec![repl], required: Vec::new(), machine: None })
     }
 
     /// Saves the symbol table, the `scheme` module and every loaded module as an image that
@@ -621,7 +644,7 @@ impl Program {
         let Some(built) = self.build(&name, &[], &[file], false) else { return Err(self.take_errors()) };
         if running {
             for thunk in &built.thunks {
-                run(&mut self.arena, thunk, None).map_err(|message| vec![message])?;
+                run(&mut self.arena, &mut self.machine, thunk, None).map_err(|message| vec![message])?;
             }
         }
         Ok(())
@@ -652,7 +675,7 @@ impl Program {
         let name = format!("input-{}", self.inputs.len());
         let files = [file(text), file("(provide (all-defined-out))")];
         let Some(built) = self.build(&name, &[], &files, true) else { return Err(self.take_errors()) };
-        let Self { arena, symbols, modules, inputs, required, .. } = self;
+        let Self { arena, symbols, modules, inputs, required, machine, .. } = self;
         let names = arena.mutate(|mc| symbols.get(mc).ok().and_then(Symbols::of).map_or(Vec::new(), |symbols| required_by(mc, symbols, text)));
         for name in names {
             let found = modules.loaded.iter().find(|(loaded, _)| *loaded == name);
@@ -663,7 +686,7 @@ impl Program {
         }
         inputs.push(built.module);
         for thunk in &built.thunks {
-            run(arena, thunk, Some(&mut *out)).map_err(|message| vec![message])?;
+            run(arena, machine, thunk, Some(&mut *out)).map_err(|message| vec![message])?;
         }
         Ok(())
     }

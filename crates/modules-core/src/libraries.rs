@@ -512,11 +512,18 @@ impl<'gc> Resolver<'gc> for Earlier<'_> {
 }
 
 /// Runs the thunks in the `THUNKS` root in order, one step of the arena at a time, and then collects. `library` names what is running.
+///
+/// One machine runs them all. A machine has a stack of its own, and a collection may not come between two thunks, so a machine for each thunk would add up.
 fn run(arena: &mut Arena, thunks: usize, library: &'static str) -> Result<(), BuildError> {
+    let mut earlier: Option<Machine> = None;
     for index in 0..thunks {
+        let reused = earlier.take();
         let mut machine = arena.mutate(|mc| {
             let thunk = Vector::of(mc.root(THUNKS)).expect("the thunks").items(mc).get(index);
-            Machine::new(mc, SEGMENT, thunk, &[])
+            match reused {
+                Some(mut machine) => machine.restart(mc, thunk, &[]).map(|()| machine),
+                None => Machine::new(mc, SEGMENT, thunk, &[]),
+            }
         });
         loop {
             let Ok(running) = &mut machine else { return Err(BuildError::Raised { library, fault: machine.err() }) };
@@ -534,7 +541,9 @@ fn run(arena: &mut Arena, thunks: usize, library: &'static str) -> Result<(), Bu
                 Err(OutOfMemory) => return Err(BuildError::OutOfMemory),
             }
         }
+        earlier = machine.ok();
     }
+    drop(earlier);
     arena.mutate(|mc| mc.set_root(THUNKS, Value::NULL));
     arena.collect();
     Ok(())
