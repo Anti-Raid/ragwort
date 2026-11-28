@@ -90,14 +90,22 @@ impl ExternalTable for Positional {
     }
 
     fn get_at<'gc>(&self, _: &Mutation<'gc>, position: usize) -> Option<Result<Option<Value<'gc>>, Error>> {
-        let field = if self.reversed { FIELDS.len().checked_sub(position + 1) } else { Some(position) };
+        let field = if self.reversed {
+            FIELDS.len().checked_sub(position + 1)
+        } else {
+            Some(position)
+        };
         Some(Ok(field.filter(|&field| field < FIELDS.len()).and_then(|field| Value::fixnum(field as i64 + 1))))
     }
 }
 
 /// Returns the shape of a [`Message`], or the shape with the same fields in the opposite order if `reversed`. Each is made on the first call and kept in a root.
 fn shape<'gc>(mc: &Mutation<'gc>, reversed: bool) -> Result<Shape<'gc>, Fault> {
-    let root = if reversed { 4 } else { 3 };
+    let root = if reversed {
+        4
+    } else {
+        3
+    };
     if let Some(shape) = Shape::of(mc.root(root)) {
         return Ok(shape);
     }

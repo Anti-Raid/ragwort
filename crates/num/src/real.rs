@@ -105,7 +105,12 @@ fn compare_exact<H: RealHost>(h: &H, fraction: H::Rational, float: f64) -> Resul
         return Ok(None);
     }
     if float.is_infinite() {
-        return Ok(Some(if float > 0.0 { Ordering::Less } else { Ordering::Greater }));
+        let order = if float > 0.0 {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
+        return Ok(Some(order));
     }
     // An integer of magnitude up to 2^53 is exact as an `f64`.
     if let RationalView::Integer(n) = h.rational_view(fraction)
@@ -132,7 +137,14 @@ pub fn eqv<H: RealHost>(h: &H, x: H::Real, y: H::Real) -> bool {
 pub fn hash<H: RealHost, S: Hasher>(h: &H, x: H::Real, state: &mut S) {
     match h.real_view(x) {
         RealView::Exact(fraction) => rational::hash(h, fraction, state),
-        RealView::Flonum(float) => state.write_u64(if float.is_nan() { f64::NAN.to_bits() } else { float.to_bits() }),
+        RealView::Flonum(float) => {
+            let bits = if float.is_nan() {
+                f64::NAN.to_bits()
+            } else {
+                float.to_bits()
+            };
+            state.write_u64(bits)
+        }
     }
 }
 
@@ -200,7 +212,11 @@ fn extreme<H: RealHost>(h: &H, x: H::Real, y: H::Real, want: Ordering) -> Res<H>
         Some(order) if order == want => y,
         Some(_) => x,
     };
-    if is_exact(h, x) && is_exact(h, y) { Ok(pick) } else { inexact(h, pick) }
+    if is_exact(h, x) && is_exact(h, y) {
+        Ok(pick)
+    } else {
+        inexact(h, pick)
+    }
 }
 
 /// Rounds `x` in the direction that `mode` selects: `floor`, `ceiling`, `truncate` or `round`, which rounds ties to even.
@@ -287,7 +303,12 @@ fn integer_op<H: RealHost>(
         return Ok(h.of_rational(h.of_int(n)));
     }
     let float = int::to_f64(h, n);
-    h.flonum(if float == 0.0 && negative_zero(view_f64(h, vx)?, view_f64(h, vy)?) { -0.0 } else { float })
+    let signed = if float == 0.0 && negative_zero(view_f64(h, vx)?, view_f64(h, vy)?) {
+        -0.0
+    } else {
+        float
+    };
+    h.flonum(signed)
 }
 
 /// Returns `x` written in `radix`, in a form that a reader reads back as the same number. `radix` must be 10 or a power of two.
@@ -298,7 +319,14 @@ pub fn to_string<H: RealHost>(h: &H, x: H::Real, radix: u32) -> Result<String, H
     match h.real_view(x) {
         RealView::Exact(fraction) => rational::to_string(h, fraction, radix),
         RealView::Flonum(float) if float.is_nan() => Ok("+nan.0".into()),
-        RealView::Flonum(float) if float.is_infinite() => Ok(if float > 0.0 { "+inf.0" } else { "-inf.0" }.into()),
+        RealView::Flonum(float) if float.is_infinite() => {
+            let text = if float > 0.0 {
+                "+inf.0"
+            } else {
+                "-inf.0"
+            };
+            Ok(text.into())
+        }
         RealView::Flonum(float) if radix == 10 => Ok(format!("{float:?}")),
         RealView::Flonum(float) => flonum_in_radix(h, float, radix),
     }
@@ -306,11 +334,19 @@ pub fn to_string<H: RealHost>(h: &H, x: H::Real, radix: u32) -> Result<String, H
 
 /// Returns the exact digits of `float` in `radix`. `float` must be finite, and `radix` must be a power of two.
 fn flonum_in_radix<H: RealHost>(h: &H, float: f64, radix: u32) -> Result<String, H::Error> {
-    let sign = if float.is_sign_negative() { "-" } else { "" };
+    let sign = if float.is_sign_negative() {
+        "-"
+    } else {
+        ""
+    };
     let bits = float.abs().to_bits();
     let (exponent, fraction) = ((bits >> 52) as i64, bits & ((1 << 52) - 1));
     // `|float|` is `mantissa · 2^scale`.
-    let (mantissa, scale) = if exponent == 0 { (fraction, -1074) } else { (fraction | 1 << 52, exponent - 1075) };
+    let (mantissa, scale) = if exponent == 0 {
+        (fraction, -1074)
+    } else {
+        (fraction | 1 << 52, exponent - 1075)
+    };
     if mantissa == 0 {
         return Ok(format!("{sign}0.0"));
     }
@@ -326,5 +362,10 @@ fn flonum_in_radix<H: RealHost>(h: &H, float: f64, radix: u32) -> Result<String,
     let digits = format!("{}{digits}", "0".repeat((places as usize + 1).saturating_sub(digits.len())));
     let (whole, fraction) = digits.split_at(digits.len() - places as usize);
     let fraction = fraction.trim_end_matches('0');
-    Ok(format!("{sign}{whole}.{}", if fraction.is_empty() { "0" } else { fraction }))
+    let shown = if fraction.is_empty() {
+        "0"
+    } else {
+        fraction
+    };
+    Ok(format!("{sign}{whole}.{}", shown))
 }

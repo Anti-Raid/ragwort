@@ -65,22 +65,38 @@ impl<'a, 'gc> Nums<'a, 'gc> {
 
     #[inline]
     pub fn integer(&self, value: Value<'gc>) -> Option<Integer<'gc>> {
-        if value.is_fixnum() || matches!(Numbers::of(value), Some(Numbers::Big(_))) { Some(Integer(value)) } else { None }
+        if value.is_fixnum() || matches!(Numbers::of(value), Some(Numbers::Big(_))) {
+            Some(Integer(value))
+        } else {
+            None
+        }
     }
 
     #[inline]
     pub fn rational(&self, value: Value<'gc>) -> Option<Rational<'gc>> {
-        if value.is_fixnum() || matches!(Numbers::of(value), Some(Numbers::Big(_) | Numbers::Ratio(_))) { Some(Rational(value)) } else { None }
+        if value.is_fixnum() || matches!(Numbers::of(value), Some(Numbers::Big(_) | Numbers::Ratio(_))) {
+            Some(Rational(value))
+        } else {
+            None
+        }
     }
 
     #[inline]
     pub fn real(&self, value: Value<'gc>) -> Option<Real<'gc>> {
-        if value.is_flonum() || self.rational(value).is_some() { Some(Real(value)) } else { None }
+        if value.is_flonum() || self.rational(value).is_some() {
+            Some(Real(value))
+        } else {
+            None
+        }
     }
 
     #[inline]
     pub fn number(&self, value: Value<'gc>) -> Option<Number<'gc>> {
-        if value.is_flonum() || value.is_fixnum() || Numbers::of(value).is_some() { Some(Number(value)) } else { None }
+        if value.is_flonum() || value.is_fixnum() || Numbers::of(value).is_some() {
+            Some(Number(value))
+        } else {
+            None
+        }
     }
 }
 

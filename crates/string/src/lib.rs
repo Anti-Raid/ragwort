@@ -157,7 +157,11 @@ pub(crate) fn info<H: Host>(h: &H, string: H::Str) -> Info {
 /// Returns the byte offset of character `index` in the flat string `units`, which holds `chars` characters. `index` is at most `chars`.
 #[inline]
 pub(crate) fn offset(units: Units<'_>, chars: usize, index: usize) -> usize {
-    if chars == units.len() { index } else { units.offset_of(index) }
+    if chars == units.len() {
+        index
+    } else {
+        units.offset_of(index)
+    }
 }
 
 /// Returns the byte offset of character `index` of `string`. `index` is at most the number of characters.
@@ -188,7 +192,11 @@ fn leaf<H: Host>(h: &H, mut string: H::Str, mut at: usize) -> (Units<'_>, usize)
             StrView::Rope { flat: Some(flat), .. } => string = flat,
             StrView::Rope { left, right, .. } => {
                 let left_bytes = info(h, left).bytes;
-                (string, at) = if at < left_bytes { (left, at) } else { (right, at - left_bytes) };
+                (string, at) = if at < left_bytes {
+                    (left, at)
+                } else {
+                    (right, at - left_bytes)
+                };
             }
         }
     }
@@ -250,7 +258,14 @@ pub fn char_index<H: Host>(h: &H, mut string: H::Str, mut at: usize) -> Result<u
     let mut before = 0;
     loop {
         match h.view(string) {
-            StrView::Flat { units, chars } => return Ok(before + if chars == units.len() { at } else { units.slice(0..at).count_chars() }),
+            StrView::Flat { units, chars } => {
+                let counted = if chars == units.len() {
+                    at
+                } else {
+                    units.slice(0..at).count_chars()
+                };
+                return Ok(before + counted);
+            }
             StrView::Rope { info, .. } if info.chars == info.bytes => return Ok(before + at),
             StrView::Rope { flat: Some(flat), .. } => string = flat,
             StrView::Rope { left, right, .. } => {
@@ -378,7 +393,11 @@ fn rope_char_at<H: Host>(h: &H, mut string: H::Str, mut i: usize) -> Result<char
                     return Err(StrError::OutOfRange.into());
                 }
                 let left_chars = len(h, left);
-                (string, i) = if i < left_chars { (left, i) } else { (right, i - left_chars) };
+                (string, i) = if i < left_chars {
+                    (left, i)
+                } else {
+                    (right, i - left_chars)
+                };
             }
         }
     }

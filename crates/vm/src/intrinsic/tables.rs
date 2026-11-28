@@ -32,7 +32,11 @@ impl Intrinsic {
                 fuel.spend(count as u64 / equal::PER_FUEL)?;
                 // A table whose first key is a symbol is likely a record, so it starts with a shape, which it keeps while its keys are symbols. Any other table gets room for its entries as a map.
                 let tables = Tables::new(mc);
-                let table = if count > 0 && Symbol::of(operands.get(0)).is_some() { tables.make()? } else { tables.with_room(count / 2)? };
+                let table = if count > 0 && Symbol::of(operands.get(0)).is_some() {
+                    tables.make()?
+                } else {
+                    tables.with_room(count / 2)?
+                };
                 for position in (0..count).step_by(2) {
                     let key = operands.get(position);
                     charge(mc, table, key, fuel)?;
@@ -80,7 +84,11 @@ impl Intrinsic {
                 fuel.spend(table.len(mc) as u64 / equal::PER_FUEL)?;
                 let entries = table.entries(mc)?;
                 // The host of an external table can list fewer entries than the table's length, so the listed entries are counted.
-                let count = if table.is_external() { entries.count() } else { table.len(mc) };
+                let count = if table.is_external() {
+                    entries.count()
+                } else {
+                    table.len(mc)
+                };
                 let vector = Vectors::new(mc).make(2 * count, Value::VOID)?;
                 let items = vector.items(mc);
                 for (position, (key, value)) in entries.take(count).enumerate() {

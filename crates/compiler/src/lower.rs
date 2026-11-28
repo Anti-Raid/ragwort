@@ -175,7 +175,11 @@ pub(crate) fn defined<'id>(tree: &L1<'id, '_>, root: Id<'id>, slot: u32) -> Opti
     };
     let Node::Intrinsic(Prim::Slot(SlotOp::Store, stored), value) = tree[set] else { return None };
     let Node::Lambda(fun) = tree[*tree[value].first()?] else { return None };
-    if stored == slot { Some(fun) } else { None }
+    if stored == slot {
+        Some(fun)
+    } else {
+        None
+    }
 }
 
 /// A deferred lowering task: an unlowered AST expression, a lexical scope boundary, or an
@@ -303,7 +307,11 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
                 return Ok(Some(Node::Ref(*var)));
             }
             Core::Ref(Place::Slot { slot, checked }) => {
-                let op = if *checked { SlotOp::LoadChecked } else { SlotOp::Load };
+                let op = if *checked {
+                    SlotOp::LoadChecked
+                } else {
+                    SlotOp::Load
+                };
                 return Ok(Some(Node::Intrinsic(Prim::Slot(op, *slot), self.tree.list([]))));
             }
             // A loop is a statement of its own body, and ends with `#<void>` as its value.
@@ -528,7 +536,11 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
                     }
                 }
                 let binds = self.tree.list(made);
-                if matches!(core, Core::Let(..)) { Node::Let(binds, body) } else { Node::Letrec(binds, body) }
+                if matches!(core, Core::Let(..)) {
+                    Node::Let(binds, body)
+                } else {
+                    Node::Letrec(binds, body)
+                }
             }
             Core::Set(Place::Local(var), _) => Node::Set(*var, last(vals, 1)[0]),
             Core::Set(Place::Slot { slot, checked }, value) => {
@@ -543,7 +555,11 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
                 {
                     self.names.name(id, name);
                 }
-                let op = if *checked { SlotOp::StoreChecked } else { SlotOp::Store };
+                let op = if *checked {
+                    SlotOp::StoreChecked
+                } else {
+                    SlotOp::Store
+                };
                 let value = last(vals, 1);
                 Node::Intrinsic(Prim::Slot(op, *slot), self.tree.list(value))
             }
@@ -566,7 +582,11 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
             Core::SetGlobal(name, ..) => {
                 let (Some(unit), Some(Binding::Slot(slot))) = (self.unit, self.unit.and_then(|unit| unit.binding(*name))) else { unreachable!("an assigned name is a variable of the module") };
                 let Place::Slot { slot, checked } = unit.place(slot) else { unreachable!("a module variable has a slot") };
-                let op = if checked { SlotOp::StoreChecked } else { SlotOp::Store };
+                let op = if checked {
+                    SlotOp::StoreChecked
+                } else {
+                    SlotOp::Store
+                };
                 let value = last(vals, 1);
                 Node::Intrinsic(Prim::Slot(op, slot), self.tree.list(value))
             }
@@ -785,7 +805,11 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
         match place {
             Place::Local(var) => Node::Ref(var),
             Place::Slot { slot, checked } => {
-                let op = if checked { SlotOp::LoadChecked } else { SlotOp::Load };
+                let op = if checked {
+                    SlotOp::LoadChecked
+                } else {
+                    SlotOp::Load
+                };
                 Node::Intrinsic(Prim::Slot(op, slot), self.tree.list([]))
             }
         }
@@ -839,7 +863,11 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
             self.tree.add(Node::Quote(Value::FALSE))
         } else {
             let params: Vec<Var> = (0..shape.required + shape.optional).map(|_| self.fresh_var()).collect();
-            let rest = if shape.rest { Some(self.fresh_var()) } else { None };
+            let rest = if shape.rest {
+                Some(self.fresh_var())
+            } else {
+                None
+            };
             let callee = self.read(core);
             let mut passed = Vec::with_capacity(shape.keywords.len() + params.len() + 2);
             for _ in &shape.keywords {
@@ -891,7 +919,12 @@ impl<'id, 'gc> Lower<'_, 'id, 'gc> {
         // A parameter with a default is received in a fresh variable. Any other parameter is received in its own variable.
         let mut raws = Vec::with_capacity(lambda.params.len());
         for formal in &lambda.params {
-            raws.push(if formal.default.is_some() { self.fresh_var() } else { formal.var });
+            let raw = if formal.default.is_some() {
+                self.fresh_var()
+            } else {
+                formal.var
+            };
+            raws.push(raw);
         }
         let mut next = defaults;
         for (formal, &raw) in lambda.params.iter().zip(&raws).rev() {

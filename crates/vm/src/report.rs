@@ -175,7 +175,11 @@ fn calls<'gc>(mc: &Mutation<'gc>, chain: Value<'gc>, entries: &mut Entries<'gc>)
 /// Appends the calls in the parked frames of `task` to `entries`, innermost first: the frame that switched away, then its callers down to the bottom frame of the task's stack. Returns `false` once `entries` is full.
 fn parked<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, entries: &mut Entries<'gc>) -> bool {
     fn code<'gc>(mc: &Mutation<'gc>, slots: Slots<'gc>, at: usize) -> Option<Gc<'gc, Bytecode>> {
-        if at < slots.len() { slots.get(at).downcast::<Closure>(mc).and_then(|closure| closure.code(mc)) } else { None }
+        if at < slots.len() {
+            slots.get(at).downcast::<Closure>(mc).and_then(|closure| closure.code(mc))
+        } else {
+            None
+        }
     }
     let (true, Some(segment)) = (coroutine::is_parked(mc, task), task.segment(mc)) else { return true };
     let slots = segment.slots(mc);
@@ -222,7 +226,11 @@ pub(crate) fn capture<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, first: Optio
         tasks += 1;
     }
     // The slot after the last entry already holds `#f`, which marks a truncated trace when it is included.
-    let len = if complete { entries.len } else { entries.len + 1 };
+    let len = if complete {
+        entries.len
+    } else {
+        entries.len + 1
+    };
     Ok(Vectors::new(mc).immutable_from_slice(&entries.values[..len])?.value(mc))
 }
 
@@ -262,7 +270,11 @@ struct Entry<'gc> {
 /// Each entry reports the position of the call or operation that was in progress in it. A function compiled without positions reports where it is defined.
 fn located<'gc>(mc: &Mutation<'gc>, code: Gc<'gc, Bytecode>, pc: usize, entries: &mut Vec<Entry<'gc>>) {
     fn item<'gc>(items: Slots<'gc>, index: u32) -> Value<'gc> {
-        if (index as usize) < items.len() { items.get(index as usize) } else { Value::FALSE }
+        if (index as usize) < items.len() {
+            items.get(index as usize)
+        } else {
+            Value::FALSE
+        }
     }
     let (mut source, mut offset) = (code.source(mc), code.start(mc));
     let sites = code.sites(mc).downcast::<Sites>(mc);
@@ -345,7 +357,11 @@ pub(crate) fn traceback<'gc>(mc: &Mutation<'gc>, condition: Gc<'gc, Condition>) 
             Some(file) => string::from_str(&strings, &file)?.value(),
             None => Value::FALSE,
         };
-        let line = if line == 0 { Value::FALSE } else { Value::fixnum(i64::from(line)).unwrap_or(Value::FALSE) };
+        let line = if line == 0 {
+            Value::FALSE
+        } else {
+            Value::fixnum(i64::from(line)).unwrap_or(Value::FALSE)
+        };
         entries.push(list(mc, [name, file, line].into_iter())?);
     }
     let mut all = Value::NULL;
@@ -446,5 +462,9 @@ fn hint_key<'gc>(mc: &Mutation<'gc>, code: Gc<'gc, Bytecode>, hint: u16) -> Valu
     let Some(hints) = code.hints(mc) else { return Value::VOID };
     let hints = HintsFields::items(hints, mc);
     let slot = HINT_SLOTS * usize::from(hint) + HINT_KEY;
-    if slot < hints.len() { hints.get(slot) } else { Value::VOID }
+    if slot < hints.len() {
+        hints.get(slot)
+    } else {
+        Value::VOID
+    }
 }

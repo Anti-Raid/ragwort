@@ -81,7 +81,14 @@ fn rounding_parts_and_exactness() {
 fn random_integer(h: &TestHost, rng: &mut Rng) -> TestReal {
     match rng.below(5) {
         0 => TestReal::Exact(TestRational::Int(h.random(rng, 2))),
-        1 => TestReal::Flonum((rng.below(41) as f64 - 20.0).copysign(if rng.bool() { 1.0 } else { -1.0 })),
+        1 => {
+            let sign = if rng.bool() {
+                1.0
+            } else {
+                -1.0
+            };
+            TestReal::Flonum((rng.below(41) as f64 - 20.0).copysign(sign))
+        }
         2 => TestReal::Flonum([1e300, -2f64.powi(63), 2f64.powi(53) + 2.0, 4503599627370497.0][rng.below(4) as usize]),
         3 => TestReal::Flonum(h.random_flonum(rng)),
         _ => h.random_real(rng, 2),

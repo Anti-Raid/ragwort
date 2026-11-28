@@ -160,7 +160,11 @@ fn to_small(negative: bool, digits: Digits<'_>) -> Option<i64> {
     debug_assert_eq!(digits.normalize().len(), digits.len());
     match digits.len() {
         0 => Some(0),
-        1 if negative => if digits.at(0) <= 1 << 63 { Some((digits.at(0) as i64).wrapping_neg()) } else { None },
+        1 if negative => if digits.at(0) <= 1 << 63 {
+            Some((digits.at(0) as i64).wrapping_neg())
+        } else {
+            None
+        },
         1 => i64::try_from(digits.at(0)).ok(),
         _ => None,
     }
@@ -209,7 +213,11 @@ pub fn from_i128<H: Host>(h: &H, n: i128) -> Res<H> {
 pub fn to_u64<H: Host>(h: &H, x: H::Int) -> Option<u64> {
     match h.view(x) {
         IntView::Small(n) => u64::try_from(n).ok(),
-        IntView::Big { negative, digits } => if !negative && digits.len() == 1 { Some(digits.at(0)) } else { None },
+        IntView::Big { negative, digits } => if !negative && digits.len() == 1 {
+            Some(digits.at(0))
+        } else {
+            None
+        },
     }
 }
 
@@ -238,7 +246,11 @@ pub fn to_f64<H: Host>(h: &H, x: H::Int) -> f64 {
         IntView::Small(n) => n as f64,
         IntView::Big { negative, digits } => {
             let value = bigint::to_f64(digits);
-            if negative { -value } else { value }
+            if negative {
+                -value
+            } else {
+                value
+            }
         }
     }
 }
@@ -405,8 +417,16 @@ pub fn divide<H: Host>(
                 quotient -= 1;
                 remainder += b;
             }
-            let quotient = if want_q { Some(from_i128(h, quotient)?) } else { None };
-            let remainder = if want_r { Some(from_i128(h, remainder)?) } else { None };
+            let quotient = if want_q {
+                Some(from_i128(h, quotient)?)
+            } else {
+                None
+            };
+            let remainder = if want_r {
+                Some(from_i128(h, remainder)?)
+            } else {
+                None
+            };
             return Ok((quotient, remainder));
         }
         (xv, yv) => (Signed::new(xv, &mut bx), Signed::new(yv, &mut by)),
@@ -424,7 +444,17 @@ pub fn divide<H: Host>(
         } else {
             (from_i64(h, -1)?, make(h, ys.negative, yd.len(), |z| bigint::subtract(z, yd, xd))?)
         };
-        return Ok((if want_q { Some(quotient) } else { None }, if want_r { Some(remainder) } else { None }));
+        let kept_quotient = if want_q {
+            Some(quotient)
+        } else {
+            None
+        };
+        let kept_remainder = if want_r {
+            Some(remainder)
+        } else {
+            None
+        };
+        return Ok((kept_quotient, kept_remainder));
     }
 
     if yd.len() == 1 {
@@ -456,7 +486,11 @@ pub fn divide<H: Host>(
     let mut buf = vec![0; len];
     let (quotient_digits, rest) = buf.split_at_mut(q_len);
     let (remainder_digits, scratch) = rest.split_at_mut(r_len);
-    let q_out = if want_q { Some(RWDigits::new(&mut quotient_digits[..q_len - 1])) } else { None };
+    let q_out = if want_q {
+        Some(RWDigits::new(&mut quotient_digits[..q_len - 1]))
+    } else {
+        None
+    };
     bigint::divide(q_out, Some(RWDigits::new(remainder_digits)), xd, yd, RWDigits::new(scratch));
     let adjust = adjust && !Digits::of_mut(remainder_digits).is_zero();
     let quotient = if want_q {
@@ -521,7 +555,11 @@ pub fn gcd<H: Host>(h: &H, x: H::Int, y: H::Int) -> Res<H> {
         (IntView::Small(a), IntView::Small(b)) => return from_u64(h, gcd_u64(a.unsigned_abs(), b.unsigned_abs())),
         (xv, yv) => (Signed::new(xv, &mut bx).digits, Signed::new(yv, &mut by).digits),
     };
-    let (x, y) = if bigint::compare(x, y) == Ordering::Less { (y, x) } else { (x, y) };
+    let (x, y) = if bigint::compare(x, y) == Ordering::Less {
+        (y, x)
+    } else {
+        (x, y)
+    };
     if y.is_zero() {
         return from_digits(h, false, x);
     }
@@ -590,7 +628,11 @@ fn bitwise<H: Host>(h: &H, x: H::Int, y: H::Int, op: Bitwise) -> Res<H> {
         (xv, yv) => (Signed::new(xv, &mut bx), Signed::new(yv, &mut by)),
     };
     // The digit functions take the positive operand first.
-    let (x, y) = if x.negative && !y.negative { (y, x) } else { (x, y) };
+    let (x, y) = if x.negative && !y.negative {
+        (y, x)
+    } else {
+        (x, y)
+    };
     let (xd, yd) = (x.digits, y.digits);
     h.charge(xd.len().max(yd.len()) as u64)?;
     type Op = fn(RWDigits<'_>, Digits<'_>, Digits<'_>);
@@ -639,7 +681,12 @@ pub fn arithmetic_shift<H: Host>(h: &H, x: H::Int, shift: i64) -> Res<H> {
     }
     let shift = usize::try_from(shift.unsigned_abs()).unwrap_or(usize::MAX);
     if shift / DIGIT_BITS >= xd.len() {
-        return from_i64(h, if x.negative { -1 } else { 0 });
+        let fill = if x.negative {
+            -1
+        } else {
+            0
+        };
+        return from_i64(h, fill);
     }
     h.charge(xd.len() as u64)?;
     let round = x.negative && bigint::shifts_out_ones(xd, shift);
@@ -654,7 +701,14 @@ pub fn arithmetic_shift<H: Host>(h: &H, x: H::Int, shift: i64) -> Res<H> {
 /// Returns the number of bits needed to represent `x` in two's complement, not counting the sign bit.
 pub fn integer_length<H: Host>(h: &H, x: H::Int) -> u64 {
     match h.view(x) {
-        IntView::Small(n) => (64 - if n < 0 { !n } else { n }.leading_zeros()) as u64,
+        IntView::Small(n) => {
+            let magnitude = if n < 0 {
+                !n
+            } else {
+                n
+            };
+            (64 - magnitude.leading_zeros()) as u64
+        }
         IntView::Big { negative, digits } => {
             let bits = digits.bit_len() as u64;
             // `-m` needs as many bits as `m - 1`. That is one fewer than `m` needs when `m` is a power of two, and the same number otherwise.
@@ -671,12 +725,23 @@ pub fn bit_count<H: Host>(h: &H, x: H::Int) -> Result<u64, H::Error> {
         digits.iter().map(|digit| u64::from(digit.count_ones())).sum::<u64>()
     }
     Ok(match h.view(x) {
-        IntView::Small(n) => u64::from(if n < 0 { !n } else { n }.count_ones()),
+        IntView::Small(n) => {
+            let magnitude = if n < 0 {
+                !n
+            } else {
+                n
+            };
+            u64::from(magnitude.count_ones())
+        }
         IntView::Big { negative, digits } => {
             h.charge(digits.len() as u64)?;
             // `-m` is `!(m - 1)`, so its zero bits are the one bits of `m - 1`. `m - 1` is `m` with its lowest one bit cleared
             // and the zero bits below it set.
-            if negative { ones(digits) - 1 + trailing_zeros(digits) } else { ones(digits) }
+            if negative {
+                ones(digits) - 1 + trailing_zeros(digits)
+            } else {
+                ones(digits)
+            }
         }
     })
 }

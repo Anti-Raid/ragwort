@@ -105,7 +105,11 @@
 //!     fn get<'gc>(&self, _: &Mutation<'gc>, key: Key<'_>) -> Result<Option<Value<'gc>>, Error> {
 //!         Ok(match key {
 //!             Key::Symbol("id") => Value::fixnum(self.id),
-//!             Key::Symbol("pinned") => Some(if self.pinned { Value::TRUE } else { Value::FALSE }),
+//!             Key::Symbol("pinned") => Some(if self.pinned {
+//!                 Value::TRUE
+//!             } else {
+//!                 Value::FALSE
+//!             }),
 //!             _ => None,
 //!         })
 //!     }
@@ -278,7 +282,11 @@ impl<'gc> Shape<'gc> {
     /// Returns the key at `position`, or `None` if `position` is not below the number of keys.
     pub fn key(self, mc: &Mutation<'gc>, position: usize) -> Option<Value<'gc>> {
         let pairs = self.0.pairs(mc)?.items(mc);
-        if position < self.len(mc) { Some(pairs.get(2 * position)) } else { None }
+        if position < self.len(mc) {
+            Some(pairs.get(2 * position))
+        } else {
+            None
+        }
     }
 
     /// Returns the position of `key`, or `None` if the shape does not have the key. This is the entry number of `key` in every table made from the shape.
@@ -402,7 +410,11 @@ impl<'gc> Shape<'gc> {
         let room = (living + 1).checked_mul(2).ok_or_else(|| mc.out_of_memory())?.max(CHILDREN);
         let grown = objects::ShapeChildren::new(mc, room, None)?;
         // The index is at most half full, so every probe ends at a slot that was never used.
-        let links = if room > CHILD_SCAN { Some(objects::TableIndex::new(mc, room.checked_mul(2).and_then(usize::checked_next_power_of_two).ok_or_else(|| mc.out_of_memory())?, 0)?) } else { None };
+        let links = if room > CHILD_SCAN {
+            Some(objects::TableIndex::new(mc, room.checked_mul(2).and_then(usize::checked_next_power_of_two).ok_or_else(|| mc.out_of_memory())?, 0)?)
+        } else {
+            None
+        };
         let slots = grown.items(mc);
         let seed = self.0.seed(mc);
         let mut kept = 0;
@@ -738,7 +750,12 @@ impl<'gc> Table<'gc> {
             return tables.shaped(shape, (0..shape.len(mc)).map(|position| self.held(mc, 2 * position + 1).filter(|&value| value != Value::BROKEN)));
         }
         let fielded = shape.is_some();
-        let copy = tables.inside(if fielded { 0 } else { self.len(mc) })?;
+        let capacity = if fielded {
+            0
+        } else {
+            self.len(mc)
+        };
+        let copy = tables.inside(capacity)?;
         if fielded {
             copy.0.set_shape(mc, Some(tables.root()?.0));
         }
@@ -780,7 +797,11 @@ impl<'gc> Table<'gc> {
             Kept::Record(table) => table.held(mc, index),
             Kept::Outside(table) => {
                 let walk = table.walk(mc).ok()?;
-                if index < walk.len() { Some(walk.get(index)) } else { None }
+                if index < walk.len() {
+                    Some(walk.get(index))
+                } else {
+                    None
+                }
             }
         }
     }
@@ -814,7 +835,11 @@ impl<'gc> Inside<'gc> {
             return None;
         }
         let value = values.get(position);
-        if value == Value::BROKEN { None } else { Some(value) }
+        if value == Value::BROKEN {
+            None
+        } else {
+            Some(value)
+        }
     }
 
     /// Finds `key` in a table in shape mode, whose shape is `shape`.
@@ -850,13 +875,21 @@ impl<'gc> Inside<'gc> {
     fn get_at_own(self, mc: &Mutation<'gc>, key: Value<'gc>, position: usize) -> Option<Value<'gc>> {
         let entries = self.0.pairs(mc)?.items(mc);
         let place = position.checked_mul(2)?;
-        if place < entries.len() && entries.get(place) == key { Some(entries.get(place + 1)) } else { None }
+        if place < entries.len() && entries.get(place) == key {
+            Some(entries.get(place + 1))
+        } else {
+            None
+        }
     }
 
     /// Does the work of [`Inside::get_at`] for a table in shape mode, whose shape is `shape`: the key at `position` of the shape is compared with `key`.
     #[inline(never)]
     fn get_at_shaped(self, mc: &Mutation<'gc>, shape: Shape<'gc>, key: Value<'gc>, position: usize) -> Option<Value<'gc>> {
-        if shape.key(mc, position) == Some(key) { self.value_at(mc, position) } else { None }
+        if shape.key(mc, position) == Some(key) {
+            self.value_at(mc, position)
+        } else {
+            None
+        }
     }
 
     /// Works like [`Inside::get_at`]. If the table is in shape mode and its shape is the object `shape`, the key at `position` is `key`, and no key is read.
@@ -1002,7 +1035,12 @@ impl<'gc> Inside<'gc> {
         // The key is hashed once, for the search of the shape and for the search of the shapes made from it.
         let hashed = hash(mc, shape.0.seed(mc), key)?;
         if let Some(position) = shape.position_hashed(mc, key, hashed.hash)? {
-            return Ok(if self.replace(mc, position, value) { Some(Place { shape: Some(shape), position }) } else { None });
+            let place = if self.replace(mc, position, value) {
+                Some(Place { shape: Some(shape), position })
+            } else {
+                None
+            };
+            return Ok(place);
         }
         if !field && Symbol::of(key).is_none() {
             return Ok(None);
@@ -1114,7 +1152,11 @@ impl<'gc> Inside<'gc> {
             return Shape(shape).key(mc, index / 2);
         }
         let entries = self.0.pairs(mc)?.items(mc);
-        if index < 2 * self.0.used(mc) as usize { Some(entries.get(index)) } else { None }
+        if index < 2 * self.0.used(mc) as usize {
+            Some(entries.get(index))
+        } else {
+            None
+        }
     }
 
     #[inline]
@@ -1131,7 +1173,11 @@ impl<'gc> Inside<'gc> {
     /// Returns the arrays. Rebuilds the index first if objects have moved since it was built.
     #[inline]
     fn settled(self, mc: &Mutation<'gc>) -> Result<Option<Parts<'gc>>, Error> {
-        if self.is_stale(mc) { self.reindex(mc) } else { Ok(self.parts(mc)) }
+        if self.is_stale(mc) {
+            self.reindex(mc)
+        } else {
+            Ok(self.parts(mc))
+        }
     }
 
     /// Rebuilds the index from the current entries, in a new array of the same size.
@@ -1237,7 +1283,11 @@ impl<'gc> Record<'gc> {
             return None;
         }
         let value = values.get(position);
-        if value == Value::BROKEN { None } else { Some(value) }
+        if value == Value::BROKEN {
+            None
+        } else {
+            Some(value)
+        }
     }
 
     /// Returns the shape that gives the positions of the record's entries, if they have one. For a record that has grown, this is the shape of the table that took its entries.
@@ -1467,7 +1517,11 @@ impl<'gc> Record<'gc> {
     fn slot(self, mc: &Mutation<'gc>, position: usize) -> Option<Value<'gc>> {
         self.0.shape(mc)?;
         let values = self.0.items(mc);
-        if position < values.len() { Some(values.get(position)) } else { None }
+        if position < values.len() {
+            Some(values.get(position))
+        } else {
+            None
+        }
     }
 
     /// Stores `value` at `position`, whether or not the record has the key at that position yet. The record must not have grown. Unlike [`Record::set`], this does not treat a key that the record lacks as a new last entry. It is for a cache, where the order of the entries does not matter.
@@ -2089,7 +2143,11 @@ impl<'gc> Outside<'gc> {
             };
             with_values = host.list(mc, &mut listed)?;
         }
-        let slots = if with_values { listed.len() } else { 2 * listed.len() };
+        let slots = if with_values {
+            listed.len()
+        } else {
+            2 * listed.len()
+        };
         let walk = objects::TableEntries::new(mc, slots, Value::BROKEN)?;
         let items = walk.items(mc);
         let mut place = 0;

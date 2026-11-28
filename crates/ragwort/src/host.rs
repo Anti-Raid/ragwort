@@ -99,7 +99,11 @@ impl Arity {
             Arity::Exactly(fixed) => (fixed, 0),
             Arity::AtLeast(fixed) => (fixed, 1),
         };
-        if fixed <= MAX_FIXED { Some(2 * fixed + rest) } else { None }
+        if fixed <= MAX_FIXED {
+            Some(2 * fixed + rest)
+        } else {
+            None
+        }
     }
 }
 
@@ -131,7 +135,11 @@ impl<'gc> Captures<'gc> {
 
     pub fn get(self, mc: &Mutation<'gc>, index: usize) -> Option<Value<'gc>> {
         let items = self.0.items(mc);
-        if index < items.len() { Some(items.get(index)) } else { None }
+        if index < items.len() {
+            Some(items.get(index))
+        } else {
+            None
+        }
     }
 
     /// Replaces the value at `index`. Returns `false` if there is no such value.
@@ -187,7 +195,11 @@ impl<'gc> Hosting<'gc> {
             return None;
         }
         let hosts = items.get(ARITIES).downcast::<Module>(mc)?.hosts(mc)?;
-        if hosts.len() == 1 && *hosts[0] == HOSTS[0] { Some(Self(slots)) } else { None }
+        if hosts.len() == 1 && *hosts[0] == HOSTS[0] {
+            Some(Self(slots))
+        } else {
+            None
+        }
     }
 
     pub fn value(self, mc: &Mutation<'gc>) -> Value<'gc> {

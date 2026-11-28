@@ -47,6 +47,7 @@
 //! - A transformer runs while the module is being lowered. It can call what the module requires. It cannot refer to the module's own variables.
 //! - `%begin` at the top level stands for the forms inside it, so a macro can define several things. In an expression, `%begin` evaluates its expressions in order.
 //! - A `%define` whose name comes from the macro's use defines a variable of the module. A `%define` whose name the macro itself introduces defines a variable that only that use of the macro refers to.
+//! - A macro's output can define further macros. A macro whose name the output introduces is known only to that output, like a variable that it defines.
 //! - `(%provide name)` exports a macro as it exports a variable. A module of any language can require the macro, because the macro's output is made of core forms. The parts of a use are then expressions of the using module's language.
 //! - The output of a macro is checked like code of the module that uses the macro. A `%call-host` in it must name a host function of that module, and an `%intrinsic` in it can name an internal intrinsic only if that module can.
 //!
@@ -95,9 +96,11 @@
 //!
 //! A provide spec is one of:
 //!
-//! - a name
+//! - a name: a variable or a macro that the module defines, or a binding that it requires. The module passes on a binding that it requires, and a module that gets it this way has the same binding as one that requires the defining module.
 //! - `(rename-out (name external) ...)`
-//! - `(all-defined-out)`
+//! - `(all-defined-out)`, which exports every variable and every macro that the module defines
+//! - `(all-var-defined-out)`, which exports every variable that the module defines and none of its macros. A module keeps a macro in memory only if another module can reach it, so this form keeps helper macros out of the arenas that load the module.
+//! - `(all-from-out module ...)`, which passes on every binding that the module requires from each of the named modules, under the name that the module itself uses for it
 //! - `(struct-out name)`, which exports every binding that the struct form for `name` defines
 //! - `(struct-out name #:omit-constructor)`, which exports the same bindings without the form's
 //!   constructors. An importing module then cannot use the struct's name as a value. See Scheme's

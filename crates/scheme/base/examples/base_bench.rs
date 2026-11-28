@@ -49,7 +49,11 @@ fn macro_source(forms: usize, macros: &str) -> String {
                 (define-syntax my-cond (lambda (stx) (syntax-case stx (else)
                   ((_ (else e ...)) #'(begin e ...))
                   ((_ (c e ...) clause ...) #'(if c (begin e ...) (my-cond clause ...))))))\n";
-    let my = if macros.is_empty() { "" } else { "my-" };
+    let my = if macros.is_empty() {
+        ""
+    } else {
+        "my-"
+    };
     let forms: String = (0..forms)
         .map(|i| {
             format!(
@@ -152,7 +156,11 @@ fn time_yields(text: &str, answers: bool) -> Duration {
             done = arena
                 .step(|mc| {
                     loop {
-                        let outcome = if waiting && answers { machine.resume(mc, &[Value::TRUE]) } else { machine.run(mc) };
+                        let outcome = if waiting && answers {
+                            machine.resume(mc, &[Value::TRUE])
+                        } else {
+                            machine.run(mc)
+                        };
                         match outcome.expect("run") {
                             Outcome::Yielded(yielded) => {
                                 black_box(yielded);

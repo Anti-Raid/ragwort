@@ -78,7 +78,11 @@ fn number<H: ComplexHost>(nums: &H, text: &str, radix: u32, exact: Option<bool>)
         Some(b'-') => (true, &text[1..]),
         _ => (false, text),
     };
-    let sign = if negative { -1.0 } else { 1.0 };
+    let sign = if negative {
+        -1.0
+    } else {
+        1.0
+    };
     if body.len() < text.len() && radix == 10 {
         match body.to_ascii_lowercase().as_str() {
             "inf.0" => return Ok(Some(nums.flonum(sign * f64::INFINITY)?)),
@@ -98,7 +102,11 @@ fn number<H: ComplexHost>(nums: &H, text: &str, radix: u32, exact: Option<bool>)
     if let Some(integer) = int::parse(nums, body.as_bytes(), radix, negative)? {
         return Ok(Some(nums.of_rational(nums.of_int(integer))));
     }
-    if radix == 10 { decimal(nums, negative, body, exact) } else { Ok(None) }
+    if radix == 10 {
+        decimal(nums, negative, body, exact)
+    } else {
+        Ok(None)
+    }
 }
 
 /// Parses a decimal of the form `digits [. digits] [e [sign] digits]`. There must be a digit before or after the point.
@@ -130,9 +138,18 @@ fn decimal<H: ComplexHost>(nums: &H, negative: bool, body: &str, exact: Option<b
         }
         let significand = int::parse(nums, format!("{whole}{fraction}").as_bytes(), 10, negative)?.expect("checked digits");
         let power = int::parse(nums, format!("1{}", "0".repeat(scale.unsigned_abs() as usize)).as_bytes(), 10, false)?.expect("digits");
-        let x = if scale >= 0 { nums.of_int(int::mul(nums, significand, power)?) } else { rational::from_parts(nums, significand, power)? };
+        let x = if scale >= 0 {
+            nums.of_int(int::mul(nums, significand, power)?)
+        } else {
+            rational::from_parts(nums, significand, power)?
+        };
         return Ok(Some(nums.of_rational(x)));
     }
     let Ok(value) = body.parse::<f64>() else { return Ok(None) };
-    Ok(Some(nums.flonum(if negative { -value } else { value })?))
+    let signed = if negative {
+        -value
+    } else {
+        value
+    };
+    Ok(Some(nums.flonum(signed)?))
 }

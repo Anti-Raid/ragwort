@@ -548,7 +548,11 @@ fn interned_strings_outlive_their_neighbors() {
     const COUNT: usize = 6000;
     fn text(number: usize, round: usize) -> String {
         // One string in eight is longer than the buffer that short strings are built in.
-        let filler = if number.is_multiple_of(8) { "long ".repeat(120) } else { String::new() };
+        let filler = if number.is_multiple_of(8) {
+            "long ".repeat(120)
+        } else {
+            String::new()
+        };
         format!("string {number} of round {round}, {filler}é")
     }
     let mut arena = arena(64 << 20);
@@ -601,7 +605,11 @@ fn a_flat_string_hashes_as_its_text() {
         let mut seen = std::collections::HashSet::new();
         for widest in ['w', 'é', 'Ā', '😀'] {
             for count in 8..=70 {
-                let text: String = (0..count).map(|index| if index == count / 2 { widest } else { char::from(b'a' + (index % 26) as u8) }).collect();
+                let text: String = (0..count).map(|index| if index == count / 2 {
+                    widest
+                } else {
+                    char::from(b'a' + (index % 26) as u8)
+                }).collect();
                 let made = string(&h, &text);
                 assert_eq!(h.hash(made), Ok(narrowed(hash_str(&text, seed))), "{count} characters with {widest}");
                 assert!(seen.insert(h.hash(made).unwrap()), "{count} characters with {widest}");

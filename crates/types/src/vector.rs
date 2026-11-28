@@ -117,7 +117,11 @@ impl<'gc> ImmutableVector<'gc> {
     #[inline]
     pub fn get(self, mc: &Mutation<'gc>, index: usize) -> Option<Value<'gc>> {
         let items = self.0.items(mc);
-        if index < items.len() { Some(items.get(index)) } else { None }
+        if index < items.len() {
+            Some(items.get(index))
+        } else {
+            None
+        }
     }
 }
 
@@ -156,7 +160,11 @@ impl<'gc> AnyVector<'gc> {
     #[inline]
     pub fn get(self, mc: &Mutation<'gc>, index: usize) -> Option<Value<'gc>> {
         let items = self.items(mc);
-        if index < items.len() { Some(items.get(index)) } else { None }
+        if index < items.len() {
+            Some(items.get(index))
+        } else {
+            None
+        }
     }
 
     pub fn is_mutable(self) -> bool {
@@ -328,8 +336,16 @@ impl<'gc> ExternVector<'gc> {
     /// element. Reading all of them costs little more than one vector of the full length.
     fn remembered(self, mc: &Mutation<'gc>, index: usize) -> Option<Value<'gc>> {
         let memo = self.0.memo(mc)?.items(mc);
-        let known = if self.len(mc) <= CHUNK { memo.get(index) } else { Vector::of(memo.get(index / CHUNK))?.items(mc).get(index % CHUNK) };
-        if known != Value::BROKEN { Some(known) } else { None }
+        let known = if self.len(mc) <= CHUNK {
+            memo.get(index)
+        } else {
+            Vector::of(memo.get(index / CHUNK))?.items(mc).get(index % CHUNK)
+        };
+        if known != Value::BROKEN {
+            Some(known)
+        } else {
+            None
+        }
     }
 
     /// Caches `value` as the element at `index`. `index` must be less than the length. See [`ExternVector::remembered`].
@@ -339,7 +355,12 @@ impl<'gc> ExternVector<'gc> {
             Some(memo) => memo,
             None => {
                 // Both layouts start filled with `Value::BROKEN`. In the vector of chunks, each slot holds a chunk's value, and `Value::BROKEN` marks a chunk that is not allocated yet.
-                let memo = objects::Vector::new(mc, if len <= CHUNK { len } else { len.div_ceil(CHUNK) }, Value::BROKEN)?;
+                let slots = if len <= CHUNK {
+                    len
+                } else {
+                    len.div_ceil(CHUNK)
+                };
+                let memo = objects::Vector::new(mc, slots, Value::BROKEN)?;
                 self.0.set_memo(mc, Some(memo));
                 memo
             }

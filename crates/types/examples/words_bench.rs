@@ -152,7 +152,11 @@ fn main() {
     });
 
     for tagged in [false, true] {
-        let name = if tagged { "value list sum (tag) 1M x 20" } else { "value list sum 1M x 20" };
+        let name = if tagged {
+            "value list sum (tag) 1M x 20"
+        } else {
+            "value list sum 1M x 20"
+        };
         time(name, 7, || {
             let mut arena = Arena::new(REGION, 1);
             arena.mutate(|mc| {
@@ -168,7 +172,11 @@ fn main() {
                 for _ in 0..20 {
                     let (mut sum, mut cur) = (fixnum(0), mc.root(0));
                     loop {
-                        let pair = if tagged { cur.downcast_tag(tag) } else { cur.downcast::<Pair>(mc) };
+                        let pair = if tagged {
+                            cur.downcast_tag(tag)
+                        } else {
+                            cur.downcast::<Pair>(mc)
+                        };
                         let Some(pair) = pair else { break };
                         sum = sum.fixnum_add(pair.car(mc)).expect("sum");
                         cur = pair.cdr(mc);
@@ -289,7 +297,11 @@ fn main() {
                 let f = black_box(&stack).frame(mc, fp).expect("frame");
                 f.set(0, acc);
                 acc = f.get(1);
-                fp = if fp + 16 > 4096 - WINDOW { 0 } else { fp + 16 };
+                fp = if fp + 16 > 4096 - WINDOW {
+                    0
+                } else {
+                    fp + 16
+                };
             }
             black_box(acc);
         });

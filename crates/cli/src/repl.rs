@@ -14,7 +14,12 @@ pub fn run(program: &mut Program) -> ExitCode {
     let mut pending = String::new();
     loop {
         if prompts {
-            put(if pending.is_empty() { "> " } else { "  " });
+            let prompt = if pending.is_empty() {
+                "> "
+            } else {
+                "  "
+            };
+            put(prompt);
             flush();
         }
         let mut line = String::new();

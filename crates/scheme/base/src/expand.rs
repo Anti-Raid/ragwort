@@ -289,11 +289,12 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 }
                 Head::Require(form) => {
                     for spec in self.proper(form)?.into_iter().skip(1) {
-                        let imports = self.spec(spec)?.imports(self.engine.mc, resolver, self.engine.module.name()).map_err(|error| match error {
+                        let parsed = self.spec(spec)?;
+                        let imports = parsed.imports(self.engine.mc, resolver, self.engine.module.name()).map_err(|error| match error {
                             SpecError::Resolve(at) => self.error(ExpandErrorKind::Resolve, at),
                             SpecError::NotProvided(at) => self.error(ExpandErrorKind::NotProvided, at),
                         })?;
-                        self.engine.module.require(self.engine.mc, self.engine.symbols, imports).map_err(|error| self.module_error(error, spec))?;
+                        self.engine.module.require(self.engine.mc, self.engine.symbols, &parsed.module, imports).map_err(|error| self.module_error(error, spec))?;
                     }
                 }
                 Head::Provide(form) => self.provides.push(form),
@@ -321,9 +322,20 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 }
                 let items = self.proper(spec)?;
                 let Some((&head, args)) = items.split_first() else { return Err(self.error(ExpandErrorKind::BadSyntax, spec)) };
-                let word = if self.is_id(head) { self.text(head) } else { None };
+                let word = if self.is_id(head) {
+                    self.text(head)
+                } else {
+                    None
+                };
                 match (word.as_deref(), args) {
                     (Some("all-defined-out"), []) => self.engine.module.provide_all(self.engine.mc).map_err(|error| self.module_error(error, spec))?,
+                    (Some("all-var-defined-out"), []) => self.engine.module.provide_all_variables(self.engine.mc).map_err(|error| self.module_error(error, spec))?,
+                    (Some("all-from-out"), modules) => {
+                        for &module in modules {
+                            let Some(name) = self.text(module) else { return Err(self.error(ExpandErrorKind::BadSyntax, module)) };
+                            self.engine.module.provide_all_from(self.engine.mc, self.engine.symbols, &name).map_err(|error| self.module_error(error, module))?;
+                        }
+                    }
                     (Some("struct-out"), &[name, ref options @ ..]) if self.is_id(name) => {
                         let constructors = match options {
                             [] => true,
@@ -358,7 +370,11 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             }
             let items = self.proper(spec)?;
             let Some((&head, args)) = items.split_first() else { return Err(self.error(ExpandErrorKind::BadSyntax, spec)) };
-            let word = if self.is_id(head) { self.text(head) } else { None };
+            let word = if self.is_id(head) {
+                self.text(head)
+            } else {
+                None
+            };
             let (filter, inner) = match (word.as_deref(), args) {
                 (Some("only-in"), &[inner, ref ids @ ..]) => (Filter::Only(self.identifiers(ids)?), inner),
                 (Some("except-in"), &[inner, ref ids @ ..]) => (Filter::Except(self.identifiers(ids)?), inner),
@@ -411,7 +427,11 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                 let lambda = matches!(self.engine.tree.view(value)?, View::List(items, None) if items.first().is_some_and(|&head| {
                     self.is_id(head) && matches!(self.resolve(head), Ok(Binding::Keyword(Keyword::Form(Form::Lambda))))
                 }));
-                self.defining = if lambda { Some(slot) } else { None };
+                self.defining = if lambda {
+                    Some(slot)
+                } else {
+                    None
+                };
                 let value = self.expand_now(value);
                 self.defining = None;
                 Ok(module::Form::Define(slot, value?))
@@ -583,7 +603,7 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             (Form::LetSyntax | Form::LetrecSyntax, &[binds, ref body @ ..]) => self.let_syntax(stx, binds, body.to_vec(), form == Form::LetrecSyntax),
             (Form::SyntaxCase, &[input, literals, ref clauses @ ..]) => self.syntax_case(input, literals, clauses.to_vec()),
             (Form::Syntax, &[template]) => Ok(Step::Done(self.syntax(template)?)),
-            (Form::QuoteSyntax, &[datum]) => Ok(Step::Done(Core::Quote(self.wrap(datum)?))),
+            (Form::QuoteSyntax, &[datum]) => Ok(Step::Done(Core::Quote(self.quote(datum)?))),
             (Form::Unsupported, _) => Err(self.error(ExpandErrorKind::Unsupported, stx)),
             (Form::StructRef, &[instance, kind, index]) => Self::exprs(vec![instance, kind, index], move |this, parts| Ok(Step::Done(Core::Intrinsic(Prim::Intrinsic(Intrinsic::StructRef), parts, this.position(stx))))),
             _ => Err(self.error(ExpandErrorKind::BadSyntax, stx)),
@@ -639,7 +659,14 @@ impl<'a, 'gc> Expander<'a, 'gc> {
                     this.sequence_from(before, binds, last)
                 })
             }
-            None => Self::expr(last, move |_, last| Ok(Step::Done(if binds.is_empty() { last } else { Core::Let(binds, Box::new(last)) }))),
+            None => Self::expr(last, move |_, last| {
+                let body = if binds.is_empty() {
+                    last
+                } else {
+                    Core::Let(binds, Box::new(last))
+                };
+                Ok(Step::Done(body))
+            }),
         }
     }
 
@@ -697,7 +724,12 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         Self::body_then(stx, body, move |_, body| {
             let binds = vars.into_iter().zip(inits).collect();
             let body = Box::new(body);
-            Ok(Step::Done(if recursive { Core::Letrec(binds, body) } else { Core::Let(binds, body) }))
+            let bound = if recursive {
+                Core::Letrec(binds, body)
+            } else {
+                Core::Let(binds, body)
+            };
+            Ok(Step::Done(bound))
         })
     }
 
@@ -737,7 +769,11 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         self.distinct(&scan.names)?;
         let Some(Item::Expr(last)) = scan.items.pop() else { return Err(self.error(ExpandErrorKind::NoExpression, scan.stx)) };
         if scan.defined.is_empty() {
-            let mut stxs: Vec<Stx> = scan.items.into_iter().filter_map(|item| if let Item::Expr(expr) = item { Some(expr) } else { None }).collect();
+            let mut stxs: Vec<Stx> = scan.items.into_iter().filter_map(|item| if let Item::Expr(expr) = item {
+                Some(expr)
+            } else {
+                None
+            }).collect();
             stxs.push(last);
             return self.sequence(stxs);
         }

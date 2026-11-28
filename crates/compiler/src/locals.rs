@@ -106,7 +106,11 @@ fn fields_for<'id, 'gc>(tree: &mut L2<'id, 'gc>, var: Var, made: &Made<'id, 'gc>
     let Bind::Val(_, init) = binds[at] else { unreachable!("found as one") };
     let Node::Intrinsic(_, args) = tree[init] else { unreachable!("a struct is made by an intrinsic") };
     let values = tree[args][1..].to_vec();
-    let set: HashSet<usize> = made.uses.iter().filter_map(|&(_, field)| if let Use::Write(position, _) = field { Some(position) } else { None }).collect();
+    let set: HashSet<usize> = made.uses.iter().filter_map(|&(_, field)| if let Use::Write(position, _) = field {
+        Some(position)
+    } else {
+        None
+    }).collect();
     let (mut bound, mut fields) = (Vec::new(), Vec::with_capacity(values.len()));
     for (position, &value) in values.iter().enumerate() {
         let copyable = match tree[value] {

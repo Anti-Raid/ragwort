@@ -245,7 +245,11 @@ struct Formals<'a> {
 
 /// Collects all local variables mutated (via `set!`) within the frame rooted at `root` into `sets`.
 fn sets_in<'id>(tree: &L4<'id, '_>, root: Id<'id>, sets: &mut HashSet<Var>) {
-    sets.extend(tree.frame(root).filter_map(|id| if let Node::Set(var, _) = tree[id] { Some(var) } else { None }));
+    sets.extend(tree.frame(root).filter_map(|id| if let Node::Set(var, _) = tree[id] {
+        Some(var)
+    } else {
+        None
+    }));
 }
 
 struct Building<'a, 'gc> {
@@ -538,7 +542,12 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
                 Task::Callee { args, tail, site } => {
                     let Some(callee) = self.ret else { continue };
                     self.site = site;
-                    self.args(args, None, if tail { Use::TailCall(callee) } else { Use::Call(callee) });
+                    let usage = if tail {
+                        Use::TailCall(callee)
+                    } else {
+                        Use::Call(callee)
+                    };
+                    self.args(args, None, usage);
                 }
                 Task::Args { args, order, at, mut vals, then, site } => {
                     if at > 0 {
@@ -688,7 +697,11 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
     /// Initiates lowering for arguments in `args`, following permutation `order` if provided, to feed into `then`.
     fn args(&mut self, args: Span<'id, Id<'id>>, order: Option<Vec<'a, usize>>, then: Use) {
         let count = self.tree[args].len();
-        let vals = if order.is_some() { self.arena.vec_of(self.this, count) } else { Vec::with_capacity_in(count, self.arena) };
+        let vals = if order.is_some() {
+            self.arena.vec_of(self.this, count)
+        } else {
+            Vec::with_capacity_in(count, self.arena)
+        };
         self.todo.push(Task::Args { args, order, at: 0, vals, then, site: self.site });
     }
 
@@ -730,7 +743,11 @@ impl<'a, 't, 'id, 'gc> Builder<'a, 't, 'id, 'gc> {
         };
         let mut params = self.arena.vec();
         let (mut from_a, mut from_b) = (self.arena.vec(), self.arena.vec());
-        let result = if value_a == value_b { value_a } else { self.fresh() };
+        let result = if value_a == value_b {
+            value_a
+        } else {
+            self.fresh()
+        };
         if value_a != value_b {
             params.push(result);
             from_a.push(value_a);
@@ -954,8 +971,16 @@ impl Defs {
     /// reaching this point using the immediate dominator tree `idom`.
     fn check(&self, idom: &[usize], value: Val, block: usize, at: usize) -> Result<(), String> {
         let def = self.at.get(&value).ok_or_else(|| format!("{value}, used in b{block}, isn't defined"))?;
-        let ok = if def.block == block { def.after < at } else { dominates(idom, def.block, block) };
-        if ok { Ok(()) } else { Err(format!("{value}, used in b{block}, isn't defined on every way there")) }
+        let ok = if def.block == block {
+            def.after < at
+        } else {
+            dominates(idom, def.block, block)
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(format!("{value}, used in b{block}, isn't defined on every way there"))
+        }
     }
 }
 
@@ -1036,7 +1061,11 @@ pub(crate) fn verify_function(checked: &Function<'_, '_>, before: &[Function<'_,
     for (block_index, block) in checked.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             // Closures within a mutually recursive group may capture each other's allocated instances.
-            let at = if let Inst::Closures { .. } = inst { i + 2 } else { i + 1 };
+            let at = if let Inst::Closures { .. } = inst {
+                i + 2
+            } else {
+                i + 1
+            };
             for value in inst.uses() {
                 defs.check(&idom, value, block_index, at)?;
             }
@@ -1163,7 +1192,12 @@ pub(crate) struct Vals<'a>(pub(crate) &'a [Val]);
 impl fmt::Display for Vals<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (i, value) in self.0.iter().enumerate() {
-            write!(formatter, "{}{value}", if i == 0 { "" } else { " " })?;
+            let separator = if i == 0 {
+                ""
+            } else {
+                " "
+            };
+            write!(formatter, "{}{value}", separator)?;
         }
         Ok(())
     }
@@ -1213,11 +1247,19 @@ impl fmt::Display for PrimName {
 }
 
 pub(crate) fn spread(spread: bool) -> &'static str {
-    if spread { "apply " } else { "" }
+    if spread {
+        "apply "
+    } else {
+        ""
+    }
 }
 
 pub(crate) fn args(args: &[Val]) -> String {
-    if args.is_empty() { String::new() } else { format!(" {}", Vals(args)) }
+    if args.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", Vals(args))
+    }
 }
 
 /// Formats the program for display by printing the top-level function followed by each nested closure

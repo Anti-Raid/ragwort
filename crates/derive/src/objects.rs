@@ -60,7 +60,11 @@ impl Slot {
     }
 
     fn width(&self) -> usize {
-        if self.class == Class::Ephemeron { 2 } else { 1 }
+        if self.class == Class::Ephemeron {
+            2
+        } else {
+            1
+        }
     }
 }
 
@@ -304,7 +308,11 @@ fn expand_object(object: &Object, kind: &Ident, number: &Literal) -> syn::Result
 
     // A constructor without items only calls `alloc_fixed`. It is small enough to inline
     // everywhere, and the inlining must be forced: otherwise LLVM stops inlining it into large functions.
-    let inline = if items.is_none() { quote!(#[inline(always)]) } else { quote!(#[inline]) };
+    let inline = if items.is_none() {
+        quote!(#[inline(always)])
+    } else {
+        quote!(#[inline])
+    };
     let (params, alloc, items_sig, items_impl) = match items {
         None => (quote!(), quote!(mc.alloc::<#name, #words>(__words)), quote!(), quote!()),
         Some(Slot { class: Class::Ephemeron, .. }) => (

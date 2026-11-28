@@ -397,7 +397,12 @@ mod events {
         }
 
         fn get<'gc>(&self, mc: &Mutation<'gc>, key: Key<'_>) -> Result<Option<Value<'gc>>, Error> {
-            Ok(if self.has(key) { Some(from_str(&Strings::new(mc), "cy")?.value()) } else { None })
+            let found = if self.has(key) {
+                Some(from_str(&Strings::new(mc), "cy")?.value())
+            } else {
+                None
+            };
+            Ok(found)
         }
 
         fn keys(&self) -> impl Iterator<Item = Key<'_>> {
@@ -1068,7 +1073,12 @@ mod shaped {
 
         fn get_at<'gc>(&self, _: &Mutation<'gc>, position: usize) -> Option<Result<Option<Value<'gc>>, Error>> {
             BY_POSITION.fetch_add(1, Ordering::Relaxed);
-            Some(Ok(if position < FIELDS.len() { Value::fixnum(10 * self.0 + position as i64) } else { None }))
+            let field = if position < FIELDS.len() {
+                Value::fixnum(10 * self.0 + position as i64)
+            } else {
+                None
+            };
+            Some(Ok(field))
         }
     }
 

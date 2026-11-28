@@ -44,7 +44,11 @@ fn member_items_keep_their_targets_and_follow_moves() {
         }
         mc.set_root(0, Value::object(mc, array));
     });
-    let expected: Vec<_> = (0..1000).map(|i| if i % 3 != 0 { Some(i as i64) } else { None }).collect();
+    let expected: Vec<_> = (0..1000).map(|i| if i % 3 != 0 {
+        Some(i as i64)
+    } else {
+        None
+    }).collect();
     arena.collect();
     assert_eq!(arena.mutate(|mc| numbers(mc, nodes(mc, 0).items(mc))), expected);
     arena.set_evacuate_all(true);
@@ -102,7 +106,11 @@ fn weak_items_clear_once_their_targets_die() {
         mc.set_root(0, Value::object(mc, weak));
         mc.set_root(1, Value::object(mc, strong));
     });
-    let expected: Vec<_> = (0..1000).map(|i| if i % 2 == 0 { Some(i as i64) } else { None }).collect();
+    let expected: Vec<_> = (0..1000).map(|i| if i % 2 == 0 {
+        Some(i as i64)
+    } else {
+        None
+    }).collect();
     arena.collect();
     arena.mutate(churn);
     assert_eq!(arena.mutate(|mc| numbers(mc, weaks(mc, 0).items(mc))), expected);
@@ -148,7 +156,12 @@ fn weak_items_on_dirty_cards_clear_in_minor_collections() {
         churn(mc);
         let items = weaks(mc, 0).items(mc);
         for (k, &i) in stores.iter().enumerate() {
-            assert_eq!(items.get(i).map(|n| n.n(mc)), if k % 2 == 0 { Some(i as i64) } else { None }, "item {i}");
+            let expected = if k % 2 == 0 {
+                Some(i as i64)
+            } else {
+                None
+            };
+            assert_eq!(items.get(i).map(|n| n.n(mc)), expected, "item {i}");
         }
         assert_eq!(items.get(1).map(|n| n.n(mc)), Some(-1));
     });
@@ -231,7 +244,11 @@ fn bulk_member_copies_while_marking_keep_their_targets() {
     for round in 0..64 {
         arena
             .step(|mc| {
-                let (to, from) = if round % 2 == 0 { (0, 1) } else { (1, 0) };
+                let (to, from) = if round % 2 == 0 {
+                    (0, 1)
+                } else {
+                    (1, 0)
+                };
                 for chunk in 0..N / 256 {
                     let range = chunk * 256..(chunk + 1) * 256;
                     nodes(mc, to).items(mc).slice(range.clone()).unwrap().copy_from(mc, nodes(mc, from).items(mc).slice(range.clone()).unwrap());

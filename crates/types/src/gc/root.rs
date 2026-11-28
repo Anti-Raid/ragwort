@@ -296,7 +296,11 @@ impl WeakHandle {
             return Err(ForeignRoot);
         }
         let word = table.weak.word(self.word as u32);
-        if word == 0 { Ok(None) } else { Ok(Some(Value::from_bits(word))) }
+        if word == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(Value::from_bits(word)))
+        }
     }
 }
 

@@ -108,7 +108,11 @@ handles! {
     Struct: Gc<'gc, objects::Struct>, "struct", (mc, value) { value.downcast::<objects::Struct>(mc) }
 
     /// A handle of a procedure: a closure, a continuation or a keyword procedure.
-    Procedure: gc::Value<'gc>, "procedure", (mc, value) { if ragwort_vm::is_procedure(mc, value) { Some(value) } else { None } }
+    Procedure: gc::Value<'gc>, "procedure", (mc, value) { if ragwort_vm::is_procedure(mc, value) {
+        Some(value)
+    } else {
+        None
+    } }
 
     /// A handle of a coroutine.
     Coroutine: Gc<'gc, objects::Task>, "coroutine", (mc, value) { value.downcast::<objects::Task>(mc) }

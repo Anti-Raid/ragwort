@@ -5,7 +5,7 @@
 //!
 //! - Code in one file can refer by name to the top-level definitions of the other files.
 //! - The exception is a definition that a macro introduces hygienically. Other files cannot refer to it.
-//! - A macro is known only to the module's files of its own language. Another module can require it: a module of any language can require a macro of native ragwort.
+//! - A macro of native ragwort is known to the module's files of every language, once the form that defines it is declared. A Scheme macro is known only to the module's Scheme files.
 //! - A module can provide a definition from any of its files.
 
 pub mod image;

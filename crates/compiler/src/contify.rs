@@ -83,7 +83,11 @@ pub(crate) fn contify<'id>(tree: &mut L3<'id, '_>, root: Id<'id>) {
                 Bind::Fix(group) => !plan.joins.contains(&tree[group][0].0),
             })
             .collect();
-        let node = if kept.is_empty() { tree[body] } else { Node::Let(tree.list(kept), body) };
+        let node = if kept.is_empty() {
+            tree[body]
+        } else {
+            Node::Let(tree.list(kept), body)
+        };
         tree.set(at, node);
     }
 }
@@ -274,7 +278,12 @@ impl<'id> Survey<'_, 'id, '_> {
                     if fits {
                         self.mine.last_mut().expect("in a let").push(Binding { members: vec![var], frame, at });
                     }
-                    todo.push(Task::Body(fun, if fits { Some(var) } else { None }));
+                    let fitting = if fits {
+                        Some(var)
+                    } else {
+                        None
+                    };
+                    todo.push(Task::Body(fun, fitting));
                 }
                 _ => todo.push(Task::Fresh(init)),
             },
@@ -286,7 +295,14 @@ impl<'id> Survey<'_, 'id, '_> {
                 if fits.iter().all(|&fit| fit) && params <= MAX_PARAMS {
                     self.mine.last_mut().expect("in a let").push(Binding { members: group.iter().map(|&(var, _)| var).collect(), frame, at });
                 }
-                todo.extend(group.iter().zip(&fits).map(|(&(var, fun), &fits)| Task::Body(fun, if fits { Some(var) } else { None })));
+                todo.extend(group.iter().zip(&fits).map(|(&(var, fun), &fits)| {
+                    let fitting = if fits {
+                        Some(var)
+                    } else {
+                        None
+                    };
+                    Task::Body(fun, fitting)
+                }));
             }
         }
     }

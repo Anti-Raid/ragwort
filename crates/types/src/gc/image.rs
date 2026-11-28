@@ -227,7 +227,11 @@ impl<'gc> Saver<'_, 'gc> {
     }
 
     fn member(&mut self, word: u64) -> u32 {
-        if word == 0 { 0 } else { self.place(word as u32) }
+        if word == 0 {
+            0
+        } else {
+            self.place(word as u32)
+        }
     }
 
     fn frozen(&mut self, word: u64, holder: u16) -> Result<u32, SaveError> {
@@ -273,7 +277,11 @@ impl<'gc> Saver<'_, 'gc> {
             }
         }
         let items = at + 1 + desc.fields as usize;
-        let len = if desc.items == Items::None { 0 } else { (header >> 32) as usize };
+        let len = if desc.items == Items::None {
+            0
+        } else {
+            (header >> 32) as usize
+        };
         for item in items..items + len {
             let word = words[mask(item)].get();
             match desc.items {
@@ -328,7 +336,12 @@ impl<'gc> Saver<'_, 'gc> {
                 let desc = self.heap.desc(header).filter(|desc| desc.number.is_some()).ok_or(SaveError::Unnumbered)?;
                 table.u8(PLAIN);
                 table.u16(ty as u16);
-                table.u32(if desc.items == Items::None { 0 } else { (header >> 32) as u32 });
+                let count = if desc.items == Items::None {
+                    0
+                } else {
+                    (header >> 32) as u32
+                };
+                table.u32(count);
                 self.object(at, header, desc, words)?;
             }
         }
@@ -492,7 +505,11 @@ impl Loader<'_> {
                 }
                 Some(Role::Frozen) => {
                     let place = input.u32()? as usize;
-                    let word = if place == 0 { 0 } else { *self.frozen.get(place - 1).ok_or(Malformed)? };
+                    let word = if place == 0 {
+                        0
+                    } else {
+                        *self.frozen.get(place - 1).ok_or(Malformed)?
+                    };
                     heap.words()[mask(slot)].set(word);
                 }
             }

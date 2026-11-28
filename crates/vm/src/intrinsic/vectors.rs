@@ -105,7 +105,11 @@ impl Intrinsic {
                 let (big, (size, signed)) = (big_endian(operands.get(2))?, int_kind(operands.get(3))?);
                 let number = bytes.get_uint(mc, index(operands.get(1))?, size).ok_or(Fault::OutOfRange)?;
                 let unused = 64 - size as u32 * 8;
-                let number = if big { number.swap_bytes() >> unused } else { number };
+                let number = if big {
+                    number.swap_bytes() >> unused
+                } else {
+                    number
+                };
                 let nums = Nums::new(mc);
                 if signed {
                     let number = ((number << unused) as i64) >> unused;
@@ -133,7 +137,11 @@ impl Intrinsic {
                 };
                 let number = number.ok_or(Fault::OutOfRange)?;
                 let AnyBytevector::Mutable(bytes) = bytes else { return Err(Fault::Immutable) };
-                let number = if big { (number << unused).swap_bytes() } else { number };
+                let number = if big {
+                    (number << unused).swap_bytes()
+                } else {
+                    number
+                };
                 if !bytes.set_uint(mc, index(operands.get(1))?, size, number) {
                     return Err(Fault::OutOfRange);
                 }
@@ -147,7 +155,11 @@ impl Intrinsic {
 /// Parses a bytevector endianness indicator value into a boolean (`true` for big-endian `#t`,
 /// `false` for little-endian `#f`).
 fn big_endian(value: Value<'_>) -> Result<bool, Fault> {
-    if value == Value::TRUE || value == Value::FALSE { Ok(value == Value::TRUE) } else { Err(Fault::WrongType) }
+    if value == Value::TRUE || value == Value::FALSE {
+        Ok(value == Value::TRUE)
+    } else {
+        Err(Fault::WrongType)
+    }
 }
 
 /// Parses a bytevector integer size and signedness descriptor, returning the byte width (1 to

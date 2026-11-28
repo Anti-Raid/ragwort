@@ -384,10 +384,20 @@ fn optional_parameters_are_unsupplied_when_left_out() {
     // in two ways: directly, where cp0 sees the lambda, and through `apply`, where the VM binds the parameters.
     fn f<'gc>(rest: bool) -> Core<'gc> {
         let missing = eq(var(1), Core::Quote(Value::UNSUPPLIED));
-        optional_lambda(&[0, 1], 1, if rest { Some(2) } else { None }, when(missing, add(var(0), q(100)), add(var(0), var(1))))
+        let rest_var = if rest {
+            Some(2)
+        } else {
+            None
+        };
+        optional_lambda(&[0, 1], 1, rest_var, when(missing, add(var(0), q(100)), add(var(0), var(1))))
     }
     for rest in [false, true] {
-        for (args, expect) in [(vec![1], Ok(101)), (vec![1, 2], Ok(3)), (vec![], Err(Fault::Arity)), (vec![1, 2, 3], if rest { Ok(3) } else { Err(Fault::Arity) })] {
+        let with_three = if rest {
+            Ok(3)
+        } else {
+            Err(Fault::Arity)
+        };
+        for (args, expect) in [(vec![1], Ok(101)), (vec![1, 2], Ok(3)), (vec![], Err(Fault::Arity)), (vec![1, 2, 3], with_three)] {
             let direct = number(|_| app(f(rest), args.iter().map(|&n| q(n)).collect()));
             let applied = number(|_| {
                 let args = std::iter::once(f(rest)).chain(args.iter().map(|&n| q(n))).chain([Core::Quote(Value::NULL)]).collect();
@@ -684,7 +694,12 @@ fn requests_take_any_number_of_arguments() {
                 let mut args = vec![var(0)];
                 args.extend(nums(300));
                 let abort = request(Request::Abort, args);
-                let thunk = lambda(&[], None, if tail { abort } else { add(q(1), abort) });
+                let body = if tail {
+                    abort
+                } else {
+                    add(q(1), abort)
+                };
+                let thunk = lambda(&[], None, body);
                 let_(vec![(0, prim(MakePromptTag, vec![]))], request(Request::CallWithPrompt, vec![var(0), lambda(&[], Some(1), var(1)), thunk]))
             },
             |mc, result| assert_eq!(items(mc, result.unwrap()), (0..300).collect::<Vec<_>>()),
@@ -1477,7 +1492,11 @@ struct OnlyLib<'gc>(Gc<'gc, ragwort_vm::objects::Module>);
 
 impl<'gc> crate::module::Resolver<'gc> for OnlyLib<'gc> {
     fn resolve(&mut self, _: &Mutation<'gc>, name: &str, _: Value<'gc>) -> Option<Gc<'gc, ragwort_vm::objects::Module>> {
-        if name == "lib" { Some(self.0) } else { None }
+        if name == "lib" {
+            Some(self.0)
+        } else {
+            None
+        }
     }
 }
 
@@ -1606,7 +1625,12 @@ fn modules_export_what_code_that_requires_them_needs() {
         assert_eq!(run_to_end(mc, compile(mc, None, &applied).unwrap()), Ok(fix(7)));
         // Compare inlined execution with the original call's behavior.
         for (name, want) in [("sum", fix(7)), ("sum-not", Value::FALSE), ("car-cons", fix(3)), ("first", fix(8))] {
-            let call = call(imported(mc, lib, name), vec![q(3), q(4)].into_iter().take(if name == "first" { 1 } else { 2 }).collect());
+            let count = if name == "first" {
+                1
+            } else {
+                2
+            };
+            let call = call(imported(mc, lib, name), vec![q(3), q(4)].into_iter().take(count).collect());
             assert_eq!(run_to_end(mc, compile(mc, None, &call).unwrap()), Ok(want), "{name}");
         }
         // A reference to an immutable export is its value. A reference to a mutable export is a `module-ref` read.
@@ -1703,7 +1727,9 @@ fn module_builders_check_names_and_where_variables_are_defined() {
         assert_eq!(builder.define(c, 2), Ok(1));
         assert_eq!(builder.provide("a", a), Ok(()));
         assert_eq!(builder.provide("a", c), Err(ModuleError::Duplicate));
-        assert_eq!(builder.provide("b", b), Err(ModuleError::NotDefined));
+        // An import can be provided: the module passes it on.
+        assert_eq!(builder.provide("b", b), Ok(()));
+        assert_eq!(builder.provide("d", symbol(mc, "d")), Err(ModuleError::NotDefined));
         // References after an earlier defining form, or within the defining lambda itself, omit
         // initialization checks.
         assert_eq!(builder.place(0, 1, None), Place::Slot { slot: 0, checked: false });

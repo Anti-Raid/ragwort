@@ -131,7 +131,11 @@ pub fn make_type<'gc>(
 ) -> Result<Gc<'gc, StructType>, Fault> {
     Symbol::of(name).ok_or(Fault::WrongType)?;
     let mut flags = flags.as_fixnum().and_then(|bits| u32::try_from(bits).ok()).and_then(TypeFlags::from_bits).ok_or(Fault::WrongType)?;
-    let parent = if parent == Value::FALSE { None } else { Some(type_of(mc, parent)?) };
+    let parent = if parent == Value::FALSE {
+        None
+    } else {
+        Some(type_of(mc, parent)?)
+    };
     let above = parent.map_or(TypeFlags::empty(), |parent| type_flags(mc, parent));
     if above.contains(TypeFlags::SEALED) {
         return Err(Fault::WrongType);
@@ -206,5 +210,9 @@ pub fn derives<'gc>(mc: &Mutation<'gc>, kind: Gc<'gc, StructType>, from: Gc<'gc,
 #[inline]
 pub fn of<'gc>(mc: &Mutation<'gc>, value: Value<'gc>, kind: Gc<'gc, StructType>) -> Option<Gc<'gc, Struct>> {
     let made = value.downcast::<Struct>(mc)?;
-    if derives(mc, made.kind(mc)?, kind) { Some(made) } else { None }
+    if derives(mc, made.kind(mc)?, kind) {
+        Some(made)
+    } else {
+        None
+    }
 }

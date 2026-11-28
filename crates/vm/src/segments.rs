@@ -69,7 +69,11 @@ impl<'gc> Segments<'_, 'gc> {
         let (start, old) = (self.stack.base(), self.stack.segment(mc));
         let caller = self.frame(fp)?;
         let link = frame::link_of(mc, caller)?;
-        let marks = if fp > start { self.marks_under(fp, link)? } else { Value::NULL };
+        let marks = if fp > start {
+            self.marks_under(fp, link)?
+        } else {
+            Value::NULL
+        };
         let mut moved = [Value::VOID; WINDOW];
         for (i, slot) in moved[..len].iter_mut().enumerate() {
             *slot = caller.get(i as u8);
@@ -142,7 +146,11 @@ impl<'gc> Segments<'_, 'gc> {
             }
             let link = frame::link_at(mc, slots, split)?;
             let under = below(start, split, link.base)?;
-            let caller_marks = if link.marks { slots.get(Kept::under(split, start)?.marks) } else { marks };
+            let caller_marks = if link.marks {
+                slots.get(Kept::under(split, start)?.marks)
+            } else {
+                marks
+            };
             if end - under > CHUNK {
                 let (link, one_shot) = (link.value().ok_or(Fault::Malformed)?, record.one_shot(mc));
                 // The frames below the split stay behind in a record. A few frames get a segment of their own size. Sharing the record's segment would keep all of it alive for them, and a program that captures a continuation at every level of a deep recursion would then hold a chunk of stack for each level.
@@ -280,7 +288,11 @@ pub(crate) fn marked<'gc>(mc: &Mutation<'gc>, attachments: Value<'gc>, under: Va
     }
     let mut marks = under;
     for mark in own.into_iter().rev() {
-        let value = if mark.head(mc) == key { value } else { mark.tail(mc) };
+        let value = if mark.head(mc) == key {
+            value
+        } else {
+            mark.tail(mc)
+        };
         marks = pairs.cons(pairs.cons(mark.head(mc), value)?.value(mc), marks)?.value(mc);
     }
     Ok(marks)

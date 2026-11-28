@@ -53,7 +53,11 @@ impl Intrinsic {
             Intrinsic::MakeString if !(1..=2).contains(&operands.count()) => return Err(Fault::Arity),
             Intrinsic::MakeString => {
                 let len = index(operands.get(0))?;
-                let fill = if operands.count() == 2 { char_of(operands.get(1))? } else { ' ' };
+                let fill = if operands.count() == 2 {
+                    char_of(operands.get(1))?
+                } else {
+                    ' '
+                };
                 fuel.spend(len as u64 / equal::PER_FUEL)?;
                 string::repeat(&strings, fill, len)?.value()
             }
@@ -132,9 +136,19 @@ impl Intrinsic {
                 let (string, part) = (string_of(&strings, operands.get(0))?, string_of(&strings, operands.get(1))?);
                 spend(fuel, &strings, string)?;
                 let found = if self == Intrinsic::StringFind {
-                    string::find(&strings, string, part, if operands.count() == 3 { index(operands.get(2))? } else { 0 })?
+                    let from = if operands.count() == 3 {
+                        index(operands.get(2))?
+                    } else {
+                        0
+                    };
+                    string::find(&strings, string, part, from)?
                 } else {
-                    string::rfind(&strings, string, part, if operands.count() == 3 { index(operands.get(2))? } else { string::len(&strings, string) })?
+                    let from = if operands.count() == 3 {
+                        index(operands.get(2))?
+                    } else {
+                        string::len(&strings, string)
+                    };
+                    string::rfind(&strings, string, part, from)?
                 };
                 return Ok(found.map_or(Value::FALSE, |position| fixnum(position as i64)));
             }
@@ -144,9 +158,19 @@ impl Intrinsic {
                 spend(fuel, &strings, string)?;
                 let forward = matches!(self, Intrinsic::StringFind | Intrinsic::StringFindCursor);
                 let found = if forward {
-                    string::find_bytes(&strings, string, part, if operands.count() == 3 { offset(&strings, string, operands.get(2))? } else { 0 })?
+                    let from = if operands.count() == 3 {
+                        offset(&strings, string, operands.get(2))?
+                    } else {
+                        0
+                    };
+                    string::find_bytes(&strings, string, part, from)?
                 } else {
-                    string::rfind_bytes(&strings, string, part, if operands.count() == 3 { offset(&strings, string, operands.get(2))? } else { string::byte_len(&strings, string) })?
+                    let from = if operands.count() == 3 {
+                        offset(&strings, string, operands.get(2))?
+                    } else {
+                        string::byte_len(&strings, string)
+                    };
+                    string::rfind_bytes(&strings, string, part, from)?
                 };
                 let Some(found) = found else { return Ok(Value::FALSE) };
                 if matches!(self, Intrinsic::StringFindCursor | Intrinsic::StringFindLastCursor) {
@@ -211,13 +235,21 @@ impl Intrinsic {
             }
             Intrinsic::StringSplit => {
                 let string = string_of(&strings, operands.get(0))?;
-                let sep = if operands.get(1).is_false() { None } else { Some(string_of(&strings, operands.get(1))?) };
+                let sep = if operands.get(1).is_false() {
+                    None
+                } else {
+                    Some(string_of(&strings, operands.get(1))?)
+                };
                 spend(fuel, &strings, string)?;
                 string_split(mc, string, sep, operands.get(2).is_true(), operands.get(3).is_true())?
             }
             Intrinsic::StringTrim => {
                 let string = string_of(&strings, operands.get(0))?;
-                let sep = if operands.get(1).is_false() { None } else { Some(string_of(&strings, operands.get(1))?) };
+                let sep = if operands.get(1).is_false() {
+                    None
+                } else {
+                    Some(string_of(&strings, operands.get(1))?)
+                };
                 spend(fuel, &strings, string)?;
                 let (left, right, repeat) = (operands.get(2).is_true(), operands.get(3).is_true(), operands.get(4).is_true());
                 trimmed(&strings, string, sep, left, right, repeat)?.value()
@@ -347,7 +379,12 @@ fn trimmed<'gc>(strings: &Strings<'_, 'gc>, string: Str<'gc>, sep: Option<Str<'g
             break;
         }
     }
-    Ok(if (start, end) == (0, len) { string } else { string::substring(strings, string, start, end)? })
+    let trimmed = if (start, end) == (0, len) {
+        string
+    } else {
+        string::substring(strings, string, start, end)?
+    };
+    Ok(trimmed)
 }
 
 /// Implements Racket-compatible `(string-split string [sep] #:trim? trim #:repeat? repeat)`, splitting
@@ -375,10 +412,19 @@ fn string_split<'gc>(mc: &Mutation<'gc>, string: Str<'gc>, sep: Option<Str<'gc>>
                 space = character.is_whitespace();
             }
             let len = string::len(&strings, string);
-            pieces.push(string::substring(&strings, string, if space { len } else { start }, len)?.value())?;
+            let piece_start = if space {
+                len
+            } else {
+                start
+            };
+            pieces.push(string::substring(&strings, string, piece_start, len)?.value())?;
         }
         Some(sep) => {
-            let string = if trim { trimmed(&strings, string, Some(sep), true, true, repeat)? } else { string };
+            let string = if trim {
+                trimmed(&strings, string, Some(sep), true, true, repeat)?
+            } else {
+                string
+            };
             if trim && string::len(&strings, string) == 0 {
                 return Ok(Value::NULL);
             }

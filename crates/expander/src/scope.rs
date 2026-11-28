@@ -219,7 +219,12 @@ impl<'gc> Scopes<'gc> {
     /// Returns the operations equivalent to `first` followed by `then`.
     pub fn compose(&mut self, first: Ops, then: Ops) -> Result<Ops, OutOfMemory> {
         if first == Ops::NONE || then == Ops::NONE {
-            return Ok(if then == Ops::NONE { first } else { then });
+            let composed = if then == Ops::NONE {
+                first
+            } else {
+                then
+            };
+            return Ok(composed);
         }
         if let Some(&ops) = self.composed.get(&(first, then)) {
             return Ok(ops);

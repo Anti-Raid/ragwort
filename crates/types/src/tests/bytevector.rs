@@ -38,7 +38,12 @@ fn integers_of_up_to_8_bytes_read_and_write_at_any_offset() {
                     want[..size].copy_from_slice(&model[at..at + size]);
                 }
                 let got = AnyBytevector::Mutable(v).get_uint(mc, at, size);
-                assert_eq!(got, if fits { Some(u64::from_le_bytes(want)) } else { None }, "{size} at {at}");
+                let expected = if fits {
+                    Some(u64::from_le_bytes(want))
+                } else {
+                    None
+                };
+                assert_eq!(got, expected, "{size} at {at}");
                 let mut wrote = model.clone();
                 let value = 0x0123_4567_89ab_cdef_u64.rotate_left(at as u32);
                 if fits {

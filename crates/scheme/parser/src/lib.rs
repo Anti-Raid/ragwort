@@ -301,7 +301,12 @@ impl<'a> Lexer<'a> {
         let define = self.text.as_bytes()[self.at + digits] == b'=';
         self.at += digits + 1;
         let number = number.map_err(|_| self.error(ErrorKind::BadLabel, start, self.at))?;
-        Ok(if define { Token::Label(number) } else { Token::LabelRef(number) })
+        let token = if define {
+            Token::Label(number)
+        } else {
+            Token::LabelRef(number)
+        };
+        Ok(token)
     }
 
     /// Lexes a boolean, `#nil`, `#none`, a directive or a prefixed number that begins with the `#` at `start`. Returns `None` for a directive.
@@ -315,7 +320,7 @@ impl<'a> Lexer<'a> {
             self.fold = token.len() == "#!fold-case".len();
             return Ok(None);
         }
-        Ok(Some(if is(token, &["#t", "#true"]) {
+        let token = if is(token, &["#t", "#true"]) {
             Token::Boolean(true)
         } else if is(token, &["#f", "#false"]) {
             Token::Boolean(false)
@@ -327,7 +332,8 @@ impl<'a> Lexer<'a> {
             Token::Number(token)
         } else {
             return Err(self.error(ErrorKind::Unsupported, start, self.at));
-        }))
+        };
+        Ok(Some(token))
     }
 
     /// Lexes the `#:` keyword at `start`. The keyword's name is read as an identifier is, or it is quoted between `|`s.
@@ -342,7 +348,12 @@ impl<'a> Lexer<'a> {
             return Err(self.error(ErrorKind::Unsupported, start, self.at));
         }
         let name = &self.text[from..self.at];
-        Ok(Token::Keyword(if self.fold { Cow::Owned(name.to_lowercase()) } else { Cow::Borrowed(name) }))
+        let folded = if self.fold {
+            Cow::Owned(name.to_lowercase())
+        } else {
+            Cow::Borrowed(name)
+        };
+        Ok(Token::Keyword(folded))
     }
 
     /// Lexes the `#\` character at `start`. The text after `#\` is a single character or a character name.
@@ -353,7 +364,11 @@ impl<'a> Lexer<'a> {
         if first.is_alphanumeric() {
             self.at = self.name_end(self.at);
         }
-        let folded = if self.fold && self.at - from > first.len_utf8() { Some(self.text[from..self.at].to_lowercase()) } else { None };
+        let folded = if self.fold && self.at - from > first.len_utf8() {
+            Some(self.text[from..self.at].to_lowercase())
+        } else {
+            None
+        };
         let name = folded.as_deref().unwrap_or(&self.text[from..self.at]);
         let character = match name {
             _ if name.len() == first.len_utf8() => Some(first),
@@ -439,8 +454,16 @@ impl<'a> Lexer<'a> {
         if starts_numeric(token) {
             return Token::Number(token);
         }
-        let name = if self.fold { Cow::Owned(token.to_lowercase()) } else { Cow::Borrowed(token) };
-        if might_be_number(token) { Token::NumberOr { text: token, name } } else { Token::Identifier(name) }
+        let name = if self.fold {
+            Cow::Owned(token.to_lowercase())
+        } else {
+            Cow::Borrowed(token)
+        };
+        if might_be_number(token) {
+            Token::NumberOr { text: token, name }
+        } else {
+            Token::Identifier(name)
+        }
     }
 }
 

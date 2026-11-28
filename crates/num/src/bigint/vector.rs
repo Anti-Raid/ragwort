@@ -11,7 +11,11 @@ pub fn compare(x: Digits<'_>, y: Digits<'_>) -> Ordering {
 
 /// Computes `z = x + y`. `z` needs one more digit than the longer of `x` and `y`.
 pub fn add(mut z: RWDigits<'_>, x: Digits<'_>, y: Digits<'_>) {
-    let (x, y) = if x.len() >= y.len() { (x, y) } else { (y, x) };
+    let (x, y) = if x.len() >= y.len() {
+        (x, y)
+    } else {
+        (y, x)
+    };
     let mut carry = 0;
     for i in 0..x.len() {
         carry = z.put(i, digit_add(x.at(i), y.get(i), carry));
@@ -130,7 +134,12 @@ pub fn right_shift(mut z: RWDigits<'_>, x: Digits<'_>, shift: usize) {
     let n = x.len().saturating_sub(digits);
     for i in 0..n {
         let lo = x.at(digits + i);
-        z.set(i, if bits == 0 { lo } else { lo >> bits | x.get(digits + i + 1) << (DIGIT_BITS - bits) });
+        let digit = if bits == 0 {
+            lo
+        } else {
+            lo >> bits | x.get(digits + i + 1) << (DIGIT_BITS - bits)
+        };
+        z.set(i, digit);
     }
     z.offset(n).clear();
 }

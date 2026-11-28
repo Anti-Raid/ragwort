@@ -16,7 +16,11 @@ fn addition_subtraction_and_comparison() {
         oracle.case("add", &[hex(x), hex(y)], hex(Digits::of_mut(&mut z)));
         let order = compare(x, y);
         oracle.case("cmp", &[hex(x), hex(y)], (order as i8).to_string());
-        let (big, small) = if order == Ordering::Less { (y, x) } else { (x, y) };
+        let (big, small) = if order == Ordering::Less {
+            (y, x)
+        } else {
+            (x, y)
+        };
         let mut z = vec![7; big.len() + 2];
         subtract(RWDigits::new(&mut z), big, small);
         oracle.case("sub", &[hex(big), hex(small)], hex(Digits::of_mut(&mut z)));

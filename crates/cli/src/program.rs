@@ -347,7 +347,14 @@ fn run(arena: &mut Arena, thunk: &ValueRoot, mut out: Option<&mut dyn FnMut(&str
     loop {
         let step = arena.step(|mc| match ran(mc, machine.run(mc)) {
             Ran::More => None,
-            Ran::Done(value) => Some(Ok(if value != Value::VOID { Some(shown(mc, value)) } else { None })),
+            Ran::Done(value) => {
+                let text = if value != Value::VOID {
+                    Some(shown(mc, value))
+                } else {
+                    None
+                };
+                Some(Ok(text))
+            }
             Ran::Failed(message) => Some(Err(message)),
         });
         match step {
@@ -389,7 +396,11 @@ impl Program {
     /// that is not loaded. If `input` is true, the module is a REPL input and implicitly requires the modules in `inputs`.
     fn attempt(&mut self, name: &str, hosts: &'static [HostDef], files: &[SourceFile], input: bool) -> Result<Built, Missed> {
         let Self { arena, symbols, prelude, modules, inputs, .. } = self;
-        let implicit: &[Root<Module>] = if input { inputs } else { &[] };
+        let implicit: &[Root<Module>] = if input {
+            inputs
+        } else {
+            &[]
+        };
         let built = arena.mutate(|mc| {
             let symbols = symbols.get(mc).ok().and_then(Symbols::of);
             let (Some(symbols), Ok(prelude)) = (symbols, prelude.get(mc)) else { return Ok(None) };

@@ -46,6 +46,7 @@ impl<'a, 'gc, K: Copy + PartialEq + fmt::Debug> Engine<'a, 'gc, K> {
         let macro_index = u32::try_from(self.macros.len()).map_err(|_| self.error(ExpandErrorKind::Transformer, at))?;
         self.macros.push(transformer);
         self.macro_names.push(None);
+        self.macro_refs.push(Vec::new());
         Ok(macro_index)
     }
 

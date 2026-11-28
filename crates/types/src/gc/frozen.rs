@@ -54,12 +54,20 @@ fn place(number: usize) -> (usize, usize) {
 
 /// Returns the number of slots in chunk `chunk`.
 fn size(chunk: usize) -> usize {
-    if chunk < DOUBLING { FIRST << chunk } else { LARGEST }
+    if chunk < DOUBLING {
+        FIRST << chunk
+    } else {
+        LARGEST
+    }
 }
 
 /// Returns the number of the first slot of chunk `chunk`.
 fn first(chunk: usize) -> usize {
-    if chunk < DOUBLING { (FIRST << chunk) - FIRST } else { SMALL + (chunk - DOUBLING) * LARGEST }
+    if chunk < DOUBLING {
+        (FIRST << chunk) - FIRST
+    } else {
+        SMALL + (chunk - DOUBLING) * LARGEST
+    }
 }
 /// The bytes charged for a frozen value beyond its own size. They cover its slot and the allocation's header.
 pub(crate) const FROZEN_COST: usize = size_of::<Slot>() + 16;

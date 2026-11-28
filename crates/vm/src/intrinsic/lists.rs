@@ -42,7 +42,11 @@ pub(super) fn find<'gc>(mc: &Mutation<'gc>, kind: Intrinsic, target: Value<'gc>,
     while xs != Value::NULL {
         let pair = Pair::of(xs).ok_or(Fault::WrongType)?;
         let item = pair.head(mc);
-        let candidate = if assoc { Pair::of(item).ok_or(Fault::WrongType)?.head(mc) } else { item };
+        let candidate = if assoc {
+            Pair::of(item).ok_or(Fault::WrongType)?.head(mc)
+        } else {
+            item
+        };
         let prev = steps / equal::PER_FUEL;
         let matched = match kind {
             Intrinsic::Memq | Intrinsic::Assq => {
@@ -68,7 +72,12 @@ pub(super) fn find<'gc>(mc: &Mutation<'gc>, kind: Intrinsic, target: Value<'gc>,
         };
         fuel.spend(steps / equal::PER_FUEL - prev)?;
         if matched {
-            return Ok(if assoc { item } else { xs });
+            let found = if assoc {
+                item
+            } else {
+                xs
+            };
+            return Ok(found);
         }
         xs = pair.tail(mc);
     }
@@ -111,18 +120,32 @@ pub(super) fn append<'gc>(mc: &Mutation<'gc>, args: impl ExactSizeIterator<Item 
 /// if `xs` is too short or if `need_pair` is true and the resulting tail is not a pair.
 pub(super) fn list_tail<'gc>(mc: &Mutation<'gc>, mut xs: Value<'gc>, count: usize, need_pair: bool, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
     if let Some(len) = Pairs::new(mc).list_len(xs) {
-        let max = if need_pair { len } else { len.saturating_add(1) };
+        let max = if need_pair {
+            len
+        } else {
+            len.saturating_add(1)
+        };
         if count as u64 >= max {
             return Err(Fault::OutOfRange);
         }
     }
     fuel.spend(count as u64 / equal::PER_FUEL)?;
     for _ in 0..count {
-        let pair = Pair::of(xs).ok_or(if xs == Value::NULL { Fault::OutOfRange } else { Fault::WrongType })?;
+        let fault = if xs == Value::NULL {
+            Fault::OutOfRange
+        } else {
+            Fault::WrongType
+        };
+        let pair = Pair::of(xs).ok_or(fault)?;
         xs = pair.tail(mc);
     }
     if need_pair && Pair::of(xs).is_none() {
-        return Err(if xs == Value::NULL { Fault::OutOfRange } else { Fault::WrongType });
+        let fault = if xs == Value::NULL {
+            Fault::OutOfRange
+        } else {
+            Fault::WrongType
+        };
+        return Err(fault);
     }
     Ok(xs)
 }

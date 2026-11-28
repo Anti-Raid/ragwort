@@ -1123,11 +1123,19 @@ impl Intrinsic {
             Intrinsic::Mul => arith(mc, fuel, self, fixnum(1), operands.from(0))?,
             Intrinsic::Sub | Intrinsic::Div if operands.count() == 0 => return Err(Fault::Arity),
             Intrinsic::Sub => {
-                let (first, rest) = if operands.count() == 1 { (fixnum(0), 0) } else { (operands.get(0), 1) };
+                let (first, rest) = if operands.count() == 1 {
+                    (fixnum(0), 0)
+                } else {
+                    (operands.get(0), 1)
+                };
                 arith(mc, fuel, self, first, operands.from(rest))?
             }
             Intrinsic::Div => {
-                let (first, rest) = if operands.count() == 1 { (fixnum(1), 0) } else { (operands.get(0), 1) };
+                let (first, rest) = if operands.count() == 1 {
+                    (fixnum(1), 0)
+                } else {
+                    (operands.get(0), 1)
+                };
                 arith(mc, fuel, self, first, operands.from(rest))?
             }
             Intrinsic::NumEq | Intrinsic::Lt | Intrinsic::Gt | Intrinsic::Le | Intrinsic::Ge if operands.count() == 0 => return Err(Fault::Arity),
@@ -1213,12 +1221,28 @@ impl Intrinsic {
                 let part = if cursors {
                     // With a cursor at either end, both ends are taken as byte offsets. No characters are counted for a cursor.
                     let start = text::offset(&strings, string, operands.get(1))?;
-                    let end = if operands.count() > 2 { text::offset(&strings, string, operands.get(2))? } else { string::byte_len(&strings, string) };
+                    let end = if operands.count() > 2 {
+                        text::offset(&strings, string, operands.get(2))?
+                    } else {
+                        string::byte_len(&strings, string)
+                    };
                     string::substring_bytes(&strings, string, start, end)?
                 } else {
-                    let start = if operands.count() > 1 { index(operands.get(1))? } else { 0 };
-                    let end = if operands.count() > 2 { index(operands.get(2))? } else { string::len(&strings, string) };
-                    if (start, end) == (0, string::len(&strings, string)) { string } else { string::substring(&strings, string, start, end)? }
+                    let start = if operands.count() > 1 {
+                        index(operands.get(1))?
+                    } else {
+                        0
+                    };
+                    let end = if operands.count() > 2 {
+                        index(operands.get(2))?
+                    } else {
+                        string::len(&strings, string)
+                    };
+                    if (start, end) == (0, string::len(&strings, string)) {
+                        string
+                    } else {
+                        string::substring(&strings, string, start, end)?
+                    }
                 };
                 if self == Intrinsic::Substring {
                     made(mc, fuel, part.value())
@@ -1247,7 +1271,14 @@ impl Intrinsic {
                 boolean(compare_strings(mc, self, operands.from(0), fuel)?)
             }
             Intrinsic::StringJoin if !(1..=2).contains(&operands.count()) => return Err(Fault::Arity),
-            Intrinsic::StringJoin => string_join(mc, operands.get(0), if operands.count() == 2 { Some(operands.get(1)) } else { None }, fuel)?,
+            Intrinsic::StringJoin => {
+                let separator = if operands.count() == 2 {
+                    Some(operands.get(1))
+                } else {
+                    None
+                };
+                string_join(mc, operands.get(0), separator, fuel)?
+            }
             Intrinsic::IsChar => boolean(operands.get(0).as_char().is_some()),
             Intrinsic::CharToInteger => fixnum(i64::from(u32::from(operands.get(0).as_char().ok_or(Fault::WrongType)?))),
             Intrinsic::IntegerToChar => {
@@ -1264,7 +1295,11 @@ impl Intrinsic {
             Intrinsic::NumberToString => {
                 let nums = Nums::new(mc);
                 let number = nums.number(operands.get(0)).ok_or(Fault::WrongType)?;
-                let radix = if operands.count() == 2 { operands.get(1).as_fixnum().ok_or(Fault::WrongType)? } else { 10 };
+                let radix = if operands.count() == 2 {
+                    operands.get(1).as_fixnum().ok_or(Fault::WrongType)?
+                } else {
+                    10
+                };
                 let radix = [2, 8, 10, 16].into_iter().find(|&allowed| allowed == radix).ok_or(Fault::OutOfRange)? as u32;
                 if let Some(integer) = operands.get(0).as_fixnum() {
                     return Ok(made(mc, fuel, fixnum_to_string(mc, integer, radix)?));
@@ -1502,7 +1537,11 @@ impl Intrinsic {
 }
 
 fn boolean<'gc>(flag: bool) -> Value<'gc> {
-    if flag { Value::TRUE } else { Value::FALSE }
+    if flag {
+        Value::TRUE
+    } else {
+        Value::FALSE
+    }
 }
 
 fn fixnum<'gc>(integer: i64) -> Value<'gc> {
@@ -1521,8 +1560,16 @@ pub fn is_procedure<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> bool {
 /// arguments for a sequence of length `len`, defaulting to `0` and `len` respectively and
 /// ensuring `0 <= start <= end <= len`.
 fn range<'gc>(len: usize, operands: impl Operands<'gc>) -> Result<(usize, usize), Fault> {
-    let start = if operands.count() > 1 { index(operands.get(1))? } else { 0 };
-    let end = if operands.count() > 2 { index(operands.get(2))? } else { len };
+    let start = if operands.count() > 1 {
+        index(operands.get(1))?
+    } else {
+        0
+    };
+    let end = if operands.count() > 2 {
+        index(operands.get(2))?
+    } else {
+        len
+    };
     if start > end || end > len {
         return Err(Fault::OutOfRange);
     }
@@ -1533,7 +1580,11 @@ fn range<'gc>(len: usize, operands: impl Operands<'gc>) -> Result<(usize, usize)
 /// [`Fault::OutOfRange`] if `value` is an exact integer too large to be a fixnum,
 /// and [`Fault::WrongType`] otherwise.
 fn not_fixnum<'gc>(mc: &Mutation<'gc>, value: Value<'gc>) -> Fault {
-    if Nums::new(mc).integer(value).is_some() { Fault::OutOfRange } else { Fault::WrongType }
+    if Nums::new(mc).integer(value).is_some() {
+        Fault::OutOfRange
+    } else {
+        Fault::WrongType
+    }
 }
 
 /// Validates that `value` is a non-negative fixnum, returning `usize` on success, or

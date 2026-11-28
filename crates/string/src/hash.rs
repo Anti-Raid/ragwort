@@ -106,7 +106,11 @@ impl State {
             self.byte(packed.byte(i));
             i += 1;
         }
-        let packed = if i == 0 { packed } else { packed.slice(i..packed.len()) };
+        let packed = if i == 0 {
+            packed
+        } else {
+            packed.slice(i..packed.len())
+        };
         let bytes = packed.len();
         let (whole, rest) = (bytes / 8, bytes % 8);
         let mut word_index = 0;

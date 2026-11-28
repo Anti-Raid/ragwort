@@ -59,7 +59,11 @@ impl<B: Copy> Table<B> {
         // list: the identifier's scopes, or the scopes that the name has bindings under.
         let bound_in = self.bound_in.get(&name_key).map_or(&[][..], Vec::as_slice);
         let own = scopes.scopes(set);
-        let (bound_in, own) = if bound_in.len() < own.len() { (bound_in, &[][..]) } else { (&[][..], own) };
+        let (bound_in, own) = if bound_in.len() < own.len() {
+            (bound_in, &[][..])
+        } else {
+            (&[][..], own)
+        };
         let mut best: Option<(Set, B)> = None;
         for &(bound, binding) in self.candidates(scopes, name_key, set, bound_in, own) {
             if best.is_none_or(|(best_set, _)| scopes.subset(best_set, bound)) {

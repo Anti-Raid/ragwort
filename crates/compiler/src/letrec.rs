@@ -104,7 +104,11 @@ pub(crate) fn fix_letrec<'s, 'id, 'gc>(mc: &Mutation<'gc>, from: &L1<'s, 'gc>, r
                         let body_usage = usages.pop().expect("opened");
                         let fixed = inits.split_off(inits.len() - from[binds].len());
                         let binds: Vec<(Var, Id<'id>, Usage)> = from[binds].iter().zip(fixed).map(|(&(var, _), (init, init_usage))| (var, init, init_usage)).collect();
-                        let (expr, combined) = if matches!(from[id], l1::Node::Letrec(..)) { cx.fix_block(binds, body, body_usage) } else { cx.simplify_let_with(binds, body, body_usage) };
+                        let (expr, combined) = if matches!(from[id], l1::Node::Letrec(..)) {
+                            cx.fix_block(binds, body, body_usage)
+                        } else {
+                            cx.simplify_let_with(binds, body, body_usage)
+                        };
                         usages.last_mut().expect("the root's usage is never closed").absorb(combined);
                         vals.push(expr);
                         continue;
@@ -238,7 +242,11 @@ pub(crate) fn prune<'id, 'gc>(mc: &Mutation<'gc>, tree: &mut l2::L2<'id, 'gc>, r
                 usages.last_mut().expect("the root's usage is never closed").absorb(inner);
                 let mut binds = kept.pop().expect("in a let");
                 binds.reverse();
-                let node = if binds.is_empty() { tree[body] } else { l2::Node::Let(tree.list(binds), body) };
+                let node = if binds.is_empty() {
+                    tree[body]
+                } else {
+                    l2::Node::Let(tree.list(binds), body)
+                };
                 tree.set(at, node);
             }
             Task::Expr(id) => match tree[id] {

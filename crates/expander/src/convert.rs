@@ -13,7 +13,7 @@ use ragwort_types::vector::{AnyVector, Vectors};
 
 use ragwort_compiler::module;
 
-use crate::engine::{Binding, Engine, Stamp, internal_name};
+use crate::engine::{Binding, Engine, Found, Stamp, internal_name};
 use crate::scope::{Scope, Set, TOP};
 use crate::tree::{Stx, View};
 use crate::{ExpandError, ExpandErrorKind};
@@ -48,9 +48,17 @@ impl<'a, 'gc, K: Copy + PartialEq + fmt::Debug> Engine<'a, 'gc, K> {
                     }
                 },
                 Task::Make(stx, count, tail, kind) => {
-                    let tail = if tail { done.pop().expect("a tail") } else { Value::NULL };
+                    let tail = if tail {
+                        done.pop().expect("a tail")
+                    } else {
+                        Value::NULL
+                    };
                     let items = done.split_off(done.len() - count);
-                    let datum = if kind == SyntaxKind::Vector { Vectors::new(mc).immutable_from_slice(&items)?.value(mc) } else { Pairs::new(mc).list_with_tail(items, tail)? };
+                    let datum = if kind == SyntaxKind::Vector {
+                        Vectors::new(mc).immutable_from_slice(&items)?.value(mc)
+                    } else {
+                        Pairs::new(mc).list_with_tail(items, tail)?
+                    };
                     (stx, datum, kind)
                 }
             };
@@ -61,13 +69,26 @@ impl<'a, 'gc, K: Copy + PartialEq + fmt::Debug> Engine<'a, 'gc, K> {
                     Some(self.meta(set, kind)?)
                 }
             };
-            let binding = if kind == SyntaxKind::Identifier { self.binding_value(stx)? } else { None };
+            let binding = if kind == SyntaxKind::Identifier {
+                self.binding_value(stx)?
+            } else {
+                None
+            };
             let value = Syntax::bound(mc, datum, self.tree.span(stx), meta, binding)?.value(mc);
             self.tree.scopes.charge(size_of::<(u64, Stx)>())?;
             self.unwrapped.insert(value.to_bits(), stx);
             done.push(value);
         }
         Ok(done.pop().expect("the root's wrapped"))
+    }
+
+    /// Converts `root` to a syntax object that becomes part of the code, such as a template. Records the bindings of the module that `root` refers
+    /// to, so the module can keep them for another module that gets the syntax.
+    pub fn quote(&mut self, root: Stx) -> Result<Value<'gc>, ExpandError> {
+        self.quoting = true;
+        let wrapped = self.wrap(root);
+        self.quoting = false;
+        wrapped
     }
 
     /// Returns the metadata for syntax of `kind` with the scope set `set`. It is created once for each such pair and cached.
@@ -111,10 +132,23 @@ impl<'a, 'gc, K: Copy + PartialEq + fmt::Debug> Engine<'a, 'gc, K> {
         let symbol = self.tree.symbol(id).expect("an identifier");
         let set = self.tree.scopes_of(id)?;
         let origin = self.origin(id, set);
-        let Ok(binding) = self.resolve_name(symbol, set, origin) else { return Ok(None) };
+        // A macro of another file of the module has the binding value of a name that the module binds.
+        let binding = match self.find(symbol, set, origin) {
+            Ok(Found::Bound(binding)) => binding,
+            Ok(Found::ModuleMacro(_)) => Binding::Free,
+            Err(_) => return Ok(None),
+        };
         if let Some(origin) = origin
             && !matches!(binding, Binding::Local(_) | Binding::Macro(_) | Binding::Pattern { .. } | Binding::Slot(_))
         {
+            // The origin can be a binding of this module, from a file in another language.
+            if self.quoting
+                && let Some(named) = AnyVector::of(origin).filter(|vector| vector.len(mc) == 2)
+                && named.get(mc, 0) == Some(self.module.name())
+                && let Some(key) = named.get(mc, 1)
+            {
+                self.quoted.push(key);
+            }
             return Ok(Some(origin));
         }
         let (stamp, name) = match binding {
@@ -125,7 +159,10 @@ impl<'a, 'gc, K: Copy + PartialEq + fmt::Debug> Engine<'a, 'gc, K> {
                 None => (Stamp::Own(1, macro_index), None),
             },
             Binding::Pattern { var, .. } => (Stamp::Own(2, var.0), None),
-            Binding::Slot(slot) if !matches!(self.module.binding(symbol.value(mc)), Some(module::Binding::Slot(bound)) if bound == slot) => (Stamp::Own(3, slot), None),
+            Binding::Slot(slot) if !matches!(self.module.binding(symbol.value(mc)), Some(module::Binding::Slot(bound)) if bound == slot) => {
+                let (module, slot) = (self.module.name(), Value::fixnum(i64::from(slot)).expect("slots are fixnums"));
+                (Stamp::Named(module.to_bits(), slot.to_bits()), Some((module, slot)))
+            }
             Binding::Slot(_) | Binding::Free => {
                 let module = self.module.name();
                 (Stamp::Named(module.to_bits(), symbol.value(mc).to_bits()), Some((module, symbol.value(mc))))
@@ -135,6 +172,12 @@ impl<'a, 'gc, K: Copy + PartialEq + fmt::Debug> Engine<'a, 'gc, K> {
                 (Stamp::Named(module.to_bits(), name.to_bits()), Some((module, name)))
             }
         };
+        if self.quoting
+            && let Some((module, key)) = name
+            && module == self.module.name()
+        {
+            self.quoted.push(key);
+        }
         if let Some(&value) = self.binding_values.get(&stamp) {
             return Ok(Some(value));
         }
@@ -196,9 +239,18 @@ impl<'a, 'gc, K: Copy + PartialEq + fmt::Debug> Engine<'a, 'gc, K> {
             let value = match task {
                 Task::Visit(value) => value,
                 Task::Make(span, count, tail, vector) => {
-                    let tail = if tail { done.pop() } else { None };
+                    let tail = if tail {
+                        done.pop()
+                    } else {
+                        None
+                    };
                     let items = done.split_off(done.len() - count);
-                    done.push(if vector { self.tree.vector(&items, span)? } else { self.tree.list(&items, tail, span)? });
+                    let made = if vector {
+                        self.tree.vector(&items, span)?
+                    } else {
+                        self.tree.list(&items, tail, span)?
+                    };
+                    done.push(made);
                     continue;
                 }
             };

@@ -105,13 +105,21 @@ impl<'gc> Walk<'gc> {
 
     fn charge(&mut self, amount: u64) -> Result<(), Fault> {
         self.count = self.count.saturating_add(amount);
-        if self.count > self.most { Err(Fault::OutOfFuel) } else { Ok(()) }
+        if self.count > self.most {
+            Err(Fault::OutOfFuel)
+        } else {
+            Ok(())
+        }
     }
 
     /// Constructs a Scheme list (or improper list if `tail` is true) from the top `count` values on the stack,
     /// optionally wrapping the result in a syntax object with metadata `meta`.
     fn list(&mut self, mc: &Mutation<'gc>, count: usize, tail: bool, meta: Option<(SyntaxSpan<'gc>, SyntaxMeta<'gc>)>) -> Result<(), Fault> {
-        let tail = if tail { self.done.pop().expect("a tail") } else { Value::NULL };
+        let tail = if tail {
+            self.done.pop().expect("a tail")
+        } else {
+            Value::NULL
+        };
         let items = self.done.split_off(self.done.len() - count);
         let list = Pairs::new(mc).list_with_tail(items, tail)?;
         self.made(mc, list, meta)
@@ -280,7 +288,11 @@ pub(crate) fn temporaries<'gc>(mc: &Mutation<'gc>, list: Value<'gc>, name: Value
         if let Some(pair) = Pair::of(at) {
             let item = pair.head(mc);
             let syntax = Syntax::of(item);
-            let named = if is_identifier(mc, item) { syntax.map_or(name, |source| source.datum(mc)) } else { name };
+            let named = if is_identifier(mc, item) {
+                syntax.map_or(name, |source| source.datum(mc))
+            } else {
+                name
+            };
             let context = SyntaxContext::new(mc, &[SyntaxScope::new(mc)?])?;
             let meta = SyntaxMeta::new(mc, SyntaxKind::Identifier, Some(context), None)?;
             let span = syntax.map(|source| source.span(mc)).unwrap_or_default();

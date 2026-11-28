@@ -100,8 +100,13 @@ fn by_hand_mul<'gc>(mc: &Mutation<'gc>, x: Value<'gc>, y: Value<'gc>) -> Value<'
     bigint::multiply(RWDigits::of_cells(z.items(mc).words()), xd, yd);
     let kept = digits(mc, z).normalize().len();
     let low = z.items(mc).words()[0].get();
+    let signed = if negative {
+        (low as i64).wrapping_neg()
+    } else {
+        low as i64
+    };
     if kept <= 1
-        && let Some(small) = Value::fixnum(if negative { (low as i64).wrapping_neg() } else { low as i64 })
+        && let Some(small) = Value::fixnum(signed)
     {
         return small;
     }

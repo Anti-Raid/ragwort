@@ -510,7 +510,11 @@ fn captures<'id>(tree: &l3::L3<'id, '_>, expr: Id<'id>, tail: bool) -> bool {
             Node::If(test, then, other) => todo.extend([(test, false), (then, tail), (other, tail)]),
             Node::Seq(first, second) => todo.extend([(first, false), (second, tail)]),
             Node::Let(binds, body) => {
-                todo.extend(tree[binds].iter().filter_map(|bind| if let l3::Bind::Val(_, init) = *bind { Some((init, false)) } else { None }));
+                todo.extend(tree[binds].iter().filter_map(|bind| if let l3::Bind::Val(_, init) = *bind {
+                    Some((init, false))
+                } else {
+                    None
+                }));
                 todo.push((body, tail));
             }
             Node::App(function, operands) => {

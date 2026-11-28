@@ -119,7 +119,11 @@ fn bytes_that_are_not_an_image_do_not_load() {
     for at in (0..bytes.len()).step_by(7) {
         let mut changed = bytes.clone();
         changed[at] ^= 0x40;
-        let expected = if (8..16).contains(&at) { LoadError::Stamp } else { LoadError::Malformed };
+        let expected = if (8..16).contains(&at) {
+            LoadError::Stamp
+        } else {
+            LoadError::Malformed
+        };
         assert_eq!(loaded(&changed, STAMP), Err(expected), "changed at {at}");
     }
     // An arena that is too small reports `OutOfMemory`.
@@ -414,7 +418,12 @@ fn read_keyed<'gc>(mc: &Mutation<'gc>, again: bool) {
     let (symbols, strings, tables, pairs) = (Symbols::of_arena(mc).unwrap(), Strings::new(mc), crate::table::Tables::new(mc), Pairs::new(mc));
     let items: Vec<Value> = pairs.elements(mc.root(0)).collect();
     let plain = tables.table(items[0]).unwrap();
-    assert_eq!(plain.len(mc), if again { 403 } else { 402 });
+    let expected = if again {
+        403
+    } else {
+        402
+    };
+    assert_eq!(plain.len(mc), expected);
     for number in 0..200 {
         let text = string::from_str(&strings, &format!("a key with the number {number}")).unwrap().value();
         assert_eq!((plain.get(mc, text).unwrap(), plain.get(mc, fix(number)).unwrap()), (Some(fix(number)), Some(fix(-number))));

@@ -48,7 +48,12 @@ fn strings_match_a_model() {
         let mut rng = Rng(seed);
         let mut pool: Vec<(TestStr, Vec<char>)> = Vec::new();
         for _ in 0..600 {
-            let (s, want) = match rng.below(if pool.is_empty() { 1 } else { 6 }) {
+            let choices = if pool.is_empty() {
+                1
+            } else {
+                6
+            };
+            let (s, want) = match rng.below(choices) {
                 0 => {
                     let text = rng.text();
                     let s = match rng.below(3) {
@@ -166,7 +171,11 @@ fn piece_at_a_time_stays_shallow() {
             for _ in 0..20_000 {
                 let text: Vec<char> = (0..piece).map(|_| rng.char(Width::One)).collect();
                 let p = make(&h, &text);
-                s = if prepend { concat(&h, p, s) } else { concat(&h, s, p) }.unwrap();
+                s = if prepend {
+                    concat(&h, p, s)
+                } else {
+                    concat(&h, s, p)
+                }.unwrap();
                 pieces.push(text);
             }
             if prepend {
@@ -304,7 +313,11 @@ fn near_misses_compare_by_their_characters() {
             let text: Vec<char> = (0..len).map(|_| rng.char(widest)).collect();
             for at in [0, len / 2, len - 1] {
                 let mut other = text.clone();
-                other[at] = if other[at] == 'a' { 'b' } else { 'a' };
+                other[at] = if other[at] == 'a' {
+                    'b'
+                } else {
+                    'a'
+                };
                 for x in shapes(&h, &text) {
                     for y in shapes(&h, &other) {
                         assert_eq!(equal(&h, x, y), Ok(text == other));
@@ -325,7 +338,11 @@ fn short_strings_hash_alike_in_every_shape() {
     let mut rng = Rng(9);
     for widest in [Width::One, Width::Two, Width::Four] {
         for n in 0..=36 {
-            let text: Vec<char> = (0..n).map(|i| if i == n / 2 { rng.char(widest) } else { rng.char(Width::One) }).collect();
+            let text: Vec<char> = (0..n).map(|i| if i == n / 2 {
+                rng.char(widest)
+            } else {
+                rng.char(Width::One)
+            }).collect();
             let string: String = text.iter().collect();
             let flat = make(&h, &text);
             let want = hash_of(&h, flat);
@@ -374,7 +391,11 @@ fn hashes_follow_the_characters() {
         let mut seen = std::collections::HashSet::from([want]);
         for i in [0, 1, 7, 8, 9, 15, 16, 1499, 1500, 2999] {
             let mut other = text.clone();
-            other[i] = if other[i] == 'a' { 'b' } else { 'a' };
+            other[i] = if other[i] == 'a' {
+                'b'
+            } else {
+                'a'
+            };
             assert!(seen.insert(hash_of(&h, make(&h, &other))), "changing {i}");
         }
         assert!(seen.insert(hash(&h, flat, SEED + 1).unwrap()));

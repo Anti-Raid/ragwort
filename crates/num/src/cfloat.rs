@@ -71,7 +71,11 @@ pub(crate) fn sqrt(z: C) -> C {
         };
     }
     if z.re.is_infinite() {
-        return if z.re > 0.0 { c(z.re, 0.0f64.copysign(z.im)) } else { c(0.0, f64::INFINITY.copysign(z.im)) };
+        return if z.re > 0.0 {
+            c(z.re, 0.0f64.copysign(z.im))
+        } else {
+            c(0.0, f64::INFINITY.copysign(z.im))
+        };
     }
     if z.re == 0.0 && z.im == 0.0 {
         return c(0.0, z.im);
@@ -91,7 +95,11 @@ pub(crate) fn sqrt(z: C) -> C {
         2.0 * (ax + ax.hypot(ay / 8.0)).sqrt()
     };
     let quotient = ay / (2.0 * root);
-    if z.re >= 0.0 { c(root, quotient.copysign(z.im)) } else { c(quotient, root.copysign(z.im)) }
+    if z.re >= 0.0 {
+        c(root, quotient.copysign(z.im))
+    } else {
+        c(quotient, root.copysign(z.im))
+    }
 }
 
 /// Returns `factor · e^x`. The result overflows only when the product itself overflows. A zero `factor` is returned unchanged, even when `e^x` overflows.
@@ -111,7 +119,11 @@ pub(crate) fn exp(z: C) -> C {
         return c(z.re.exp(), z.im);
     }
     if z.re.is_infinite() && !z.im.is_finite() {
-        return if z.re > 0.0 { c(z.re, f64::NAN) } else { c(0.0, 0.0) };
+        return if z.re > 0.0 {
+            c(z.re, f64::NAN)
+        } else {
+            c(0.0, 0.0)
+        };
     }
     let (sin, cos) = z.im.sin_cos();
     c(times_exp(cos, z.re), times_exp(sin, z.re))
@@ -165,16 +177,29 @@ pub(crate) fn tan(z: C) -> C {
 /// Returns `factor · sinh(x)` if `odd`, or `factor · cosh(x)` otherwise. This is for `|x|` so large that `sinh` and `cosh` alone would overflow. Both are then `±e^|x| / 2`.
 fn times_half_exp(factor: f64, x: f64, odd: bool) -> f64 {
     let result = times_exp(factor / 2.0, x.abs());
-    if odd && x < 0.0 { -result } else { result }
+    if odd && x < 0.0 {
+        -result
+    } else {
+        result
+    }
 }
 
 fn sinh(z: C) -> C {
     let (x, y) = (z.re, z.im);
     if !x.is_finite() || !y.is_finite() {
         return if x.is_infinite() && y.is_finite() {
-            if y == 0.0 { z } else { c(x * y.cos(), f64::INFINITY * y.sin()) }
+            if y == 0.0 {
+                z
+            } else {
+                c(x * y.cos(), f64::INFINITY * y.sin())
+            }
         } else if x.is_infinite() || x == 0.0 || x.is_nan() && y == 0.0 {
-            c(x, if x.is_nan() { y } else { f64::NAN })
+            let imaginary = if x.is_nan() {
+                y
+            } else {
+                f64::NAN
+            };
+            c(x, imaginary)
         } else {
             c(f64::NAN, f64::NAN)
         };
@@ -191,11 +216,20 @@ fn cosh(z: C) -> C {
     let (x, y) = (z.re, z.im);
     if !x.is_finite() || !y.is_finite() {
         return if x.is_infinite() && y.is_finite() {
-            if y == 0.0 { c(f64::INFINITY, y * x.signum()) } else { c(f64::INFINITY * y.cos(), x * y.sin()) }
+            if y == 0.0 {
+                c(f64::INFINITY, y * x.signum())
+            } else {
+                c(f64::INFINITY * y.cos(), x * y.sin())
+            }
         } else if x.is_infinite() {
             c(f64::INFINITY, f64::NAN)
         } else if x == 0.0 || x.is_nan() && y == 0.0 {
-            c(f64::NAN, if x.is_nan() { 0.0 } else { x })
+            let imaginary = if x.is_nan() {
+                0.0
+            } else {
+                x
+            };
+            c(f64::NAN, imaginary)
         } else {
             c(f64::NAN, f64::NAN)
         };
@@ -213,9 +247,19 @@ fn tanh(z: C) -> C {
     let (x, y) = (z.re, z.im);
     if !x.is_finite() || !y.is_finite() {
         return if x.is_infinite() {
-            c(1.0f64.copysign(x), 0.0f64.copysign(if y.is_finite() { y.sin() * y.cos() } else { y }))
+            let angle = if y.is_finite() {
+                y.sin() * y.cos()
+            } else {
+                y
+            };
+            c(1.0f64.copysign(x), 0.0f64.copysign(angle))
         } else if x == 0.0 || x.is_nan() && y == 0.0 {
-            c(x, if x.is_nan() { y } else { f64::NAN })
+            let imaginary = if x.is_nan() {
+                y
+            } else {
+                f64::NAN
+            };
+            c(x, imaginary)
         } else {
             c(f64::NAN, f64::NAN)
         };
@@ -249,7 +293,11 @@ pub(crate) fn acos(z: C) -> C {
     if z.re.abs() > LARGE || z.im.abs() > LARGE {
         let re = z.im.abs().atan2(z.re);
         let log_magnitude = (z.re / 2.0).hypot(z.im / 2.0).ln() + LN_2 * 2.0;
-        let im = if z.re < 0.0 { -log_magnitude.copysign(z.im) } else { log_magnitude.copysign(-z.im) };
+        let im = if z.re < 0.0 {
+            -log_magnitude.copysign(z.im)
+        } else {
+            log_magnitude.copysign(-z.im)
+        };
         return c(re, im);
     }
     let s1 = sqrt(c(1.0 - z.re, -z.im));
@@ -276,7 +324,11 @@ fn asinh(z: C) -> C {
     }
     if z.re.abs() > LARGE || z.im.abs() > LARGE {
         let log_magnitude = (z.re / 2.0).hypot(z.im / 2.0).ln() + LN_2 * 2.0;
-        let re = if z.im >= 0.0 { log_magnitude.copysign(z.re) } else { -log_magnitude.copysign(-z.re) };
+        let re = if z.im >= 0.0 {
+            log_magnitude.copysign(z.re)
+        } else {
+            -log_magnitude.copysign(-z.re)
+        };
         return c(re, z.im.atan2(z.re.abs()));
     }
     let s1 = sqrt(c(1.0 + z.im, -z.re));
@@ -303,7 +355,11 @@ fn atanh(z: C) -> C {
     let ay = z.im.abs();
     if z.re > SQRT_LARGE || ay > SQRT_LARGE {
         let half_magnitude = (z.re / 2.0).hypot(z.im / 2.0);
-        let re = if half_magnitude.is_infinite() { 0.0f64.copysign(z.re) } else { z.re / 4.0 / half_magnitude / half_magnitude };
+        let re = if half_magnitude.is_infinite() {
+            0.0f64.copysign(z.re)
+        } else {
+            z.re / 4.0 / half_magnitude / half_magnitude
+        };
         return c(re, -FRAC_PI_2.copysign(-z.im));
     }
     if z.re == 1.0 && ay < SQRT_MIN {

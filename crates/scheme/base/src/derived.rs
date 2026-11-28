@@ -334,7 +334,11 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             return Err(self.error(ExpandErrorKind::BadSyntax, spec));
         };
         let quiet = clauses.first().is_some_and(|&option| self.keyword_name(option).as_deref() == Some("no-traceback"));
-        let mut clauses = if quiet { clauses[1..].to_vec() } else { clauses.to_vec() };
+        let mut clauses = if quiet {
+            clauses[1..].to_vec()
+        } else {
+            clauses.to_vec()
+        };
         let has_else = match clauses.last() {
             Some(&last) => match self.proper(last)?.first() {
                 Some(&head) => self.is_aux(head, Aux::Else)?,
@@ -352,7 +356,12 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let cond = self.build(stx, "cond", &[&clauses])?;
         let formals = self.list(&[var], stx)?;
         let handler = self.build(stx, "lambda", &[&[formals, cond]])?;
-        self.build(stx, if quiet { "%guard/no-traceback" } else { "%guard" }, &[&[thunk, handler]])
+        let guard = if quiet {
+            "%guard/no-traceback"
+        } else {
+            "%guard"
+        };
+        self.build(stx, guard, &[&[thunk, handler]])
     }
 
     /// Expands `case` to `(let ((t key)) (cond ((memv t '(datum ...)) body ...) ...))`. A clause body `=> f` becomes `(f t)`.

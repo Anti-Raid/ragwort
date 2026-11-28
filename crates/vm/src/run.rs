@@ -366,13 +366,21 @@ impl<'s, 'gc> Run<'s, 'gc> {
             Reply::Value(Value::VALUES) => Err(Fault::WrongType.into()),
             Reply::Value(value) => {
                 self.cx.acc = value;
-                if tail { self.ret() } else { Ok(()) }
+                if tail {
+                    self.ret()
+                } else {
+                    Ok(())
+                }
             }
             Reply::Call(procedure, args) => {
                 let call = Call { base, argc: 0, rest: args };
                 fits(call)?;
                 self.cx.frame.set(base, procedure);
-                if tail { self.tail_call(call) } else { self.call(call, false) }
+                if tail {
+                    self.tail_call(call)
+                } else {
+                    self.call(call, false)
+                }
             }
             Reply::Raise(raised) => Err(Exit::Host { base, tail, then: HostThen::Raise(raised) }),
             Reply::Defer(data) => {
@@ -420,13 +428,21 @@ impl<'s, 'gc> Run<'s, 'gc> {
             Request::Close | Request::Reset if !spread => match self.ended(base, args, request) {
                 Some(value) => {
                     self.cx.acc = value;
-                    return if tail { self.ret() } else { Ok(()) };
+                    return if tail {
+                        self.ret()
+                    } else {
+                        Ok(())
+                    };
                 }
                 None => return Err(Exit::Request { base, args, request, spread, tail }),
             },
             _ => return Err(Exit::Request { base, args, request, spread, tail }),
         };
-        if tail { self.tail_call(call) } else { self.call(call, false) }
+        if tail {
+            self.tail_call(call)
+        } else {
+            self.call(call, false)
+        }
     }
 
     /// Returns the hint slots of the running code and the index of the first slot of hint `hint`. Fails with [`Fault::Malformed`] if the code has no such hint. See [`crate::objects::Hints`].
@@ -574,7 +590,11 @@ impl<'s, 'gc> Run<'s, 'gc> {
             return None;
         }
         if request == Request::Close {
-            return if args == 1 { Some(Value::VOID) } else { None };
+            return if args == 1 {
+                Some(Value::VOID)
+            } else {
+                None
+            };
         }
         let thunk = frame.get(base + 1);
         if args != 2 || !crate::intrinsic::is_procedure(mc, thunk) {
@@ -598,7 +618,11 @@ impl<'s, 'gc> Run<'s, 'gc> {
             self.cx.frame.set(base + ARGS, acc);
             call
         };
-        if tail { self.tail_call(call) } else { self.call(call, false) }
+        if tail {
+            self.tail_call(call)
+        } else {
+            self.call(call, false)
+        }
     }
 
     /// Sets the mark of a `with-mark` or `with-exception-handler` in tail position on the current frame. Returns the call that replaces the request.
@@ -751,7 +775,11 @@ impl<'s, 'gc> Run<'s, 'gc> {
                 } else {
                     frame.get(base)
                 };
-                let guard = if guarding { Some(handler) } else { None };
+                let guard = if guarding {
+                    Some(handler)
+                } else {
+                    None
+                };
                 (handler_key(), prompts::handlers_with(mc, task, handler)?, guard)
             }
         };
@@ -869,7 +897,12 @@ fn bind_spread<'gc>(mc: &Mutation<'gc>, frame: Frame<'_, 'gc>, shape: Shape, mut
     let (variadic, slots) = (shape.rest, shape.slots());
     let keep = MAX_PARAMS - 1;
     while argc < keep {
-        let pair = Pair::of(rest).ok_or(if rest == Value::NULL { Fault::Arity } else { Fault::WrongType })?;
+        let fault = if rest == Value::NULL {
+            Fault::Arity
+        } else {
+            Fault::WrongType
+        };
+        let pair = Pair::of(rest).ok_or(fault)?;
         frame.set(ARGS + argc, pair.head(mc));
         (rest, argc) = (pair.tail(mc), argc + 1);
     }

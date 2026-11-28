@@ -52,9 +52,17 @@ impl<'a, 'gc, K: Copy + PartialEq + fmt::Debug> Engine<'a, 'gc, K> {
                     continue;
                 }
                 Task::Seq { before, repeat, after, tail, vector } => {
-                    let tail = if tail { Some(done.pop().expect("a tail")) } else { None };
+                    let tail = if tail {
+                        Some(done.pop().expect("a tail"))
+                    } else {
+                        None
+                    };
                     let after = done.split_off(done.len() - after);
-                    let repeat = if repeat { repeats.pop() } else { None };
+                    let repeat = if repeat {
+                        repeats.pop()
+                    } else {
+                        None
+                    };
                     let before = done.split_off(done.len() - before);
                     let (before, after) = (shape.list(before), shape.list(after));
                     done.push(shape.add(Pattern::Seq { before, repeat, after, tail, vector }));
@@ -184,7 +192,11 @@ impl<'a, 'gc, K: Copy + PartialEq + fmt::Debug> Engine<'a, 'gc, K> {
                     continue;
                 }
                 Task::Seq { t: template, ellipses, tail, vector, start: (parts_at, nodes, items, slots) } => {
-                    let tail = if tail { done.pop() } else { None };
+                    let tail = if tail {
+                        done.pop()
+                    } else {
+                        None
+                    };
                     let built = done.split_off(done.len() - ellipses.len());
                     let inner = built.iter().chain(&tail).any(|made| made.escapes);
                     // A list of constants becomes one constant: the syntax object of the list itself. That is not possible if the list contains an escape,
@@ -192,7 +204,7 @@ impl<'a, 'gc, K: Copy + PartialEq + fmt::Debug> Engine<'a, 'gc, K> {
                     if built.iter().chain(&tail).all(|made| made.constant) && !inner {
                         parts.truncate(parts_at);
                         shape.truncate(nodes, items, slots);
-                        parts.push(self.wrap(template)?);
+                        parts.push(self.quote(template)?);
                         done.push(Made { node: shape.add(Template::Const(index(&parts[..parts_at]))), slots: Vec::new(), constant: true, escapes: false });
                         continue;
                     }
@@ -204,7 +216,11 @@ impl<'a, 'gc, K: Copy + PartialEq + fmt::Debug> Engine<'a, 'gc, K> {
                     }
                     let tail = tail.map(|made| made.node);
                     let items = shape.items(built.into_iter().zip(ellipses).map(|(made, ellipses)| (made.node, ellipses, made.slots)));
-                    let kind = if vector { SyntaxKind::Vector } else { SyntaxKind::List };
+                    let kind = if vector {
+                        SyntaxKind::Vector
+                    } else {
+                        SyntaxKind::List
+                    };
                     let set = self.tree.scopes_of(template)?;
                     let meta = self.meta(set, kind)?;
                     let like = index(parts);
@@ -248,7 +264,7 @@ impl<'a, 'gc, K: Copy + PartialEq + fmt::Debug> Engine<'a, 'gc, K> {
             };
             let Some(vector) = vector else {
                 let at = index(parts);
-                parts.push(self.wrap(template)?);
+                parts.push(self.quote(template)?);
                 done.push(Made { node: shape.add(Template::Const(at)), slots: Vec::new(), constant: true, escapes: false });
                 continue;
             };

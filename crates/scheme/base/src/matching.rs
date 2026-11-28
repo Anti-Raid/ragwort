@@ -474,7 +474,11 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
                 return Ok(Next::Done(()));
             }
             View::Datum(value) => {
-                let same = if value.immediate().is_some() { "eqv?" } else { "equal?" };
+                let same = if value.immediate().is_some() {
+                    "eqv?"
+                } else {
+                    "equal?"
+                };
                 let quoted = self.ex.quoted(pattern, pattern)?;
                 let test = self.ex.build(pattern, same, &[&[target.stx, quoted]])?;
                 self.push(Step::Test(test));
@@ -569,7 +573,11 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
                 dots = Some(i);
             }
         }
-        let single = pats.len() - if dots.is_some() { 2 } else { 0 };
+        let single = pats.len() - if dots.is_some() {
+            2
+        } else {
+            0
+        };
         let spare = match fields.checked_sub(single) {
             Some(spare) if spare == 0 || dots.is_some() => spare,
             _ => return Err(self.ex.error(bad, pattern)),
@@ -581,7 +589,11 @@ impl<'e, 'a, 'gc> Matching<'e, 'a, 'gc> {
                 continue;
             }
             let repeats = dots == Some(i + 1);
-            let count = if repeats { spare } else { 1 };
+            let count = if repeats {
+                spare
+            } else {
+                1
+            };
             out.push(FieldPat { pat, first, count, repeats });
             first += count;
         }

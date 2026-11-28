@@ -96,7 +96,11 @@ impl std::error::Error for PrintError {}
 ///   at bot.rg:12
 /// ```
 pub fn render<'gc>(mc: &Mutation<'gc>, report: &Report<'gc>, limit: usize) -> String {
-    let (label, mode) = if matches!(report.error, Raised::Value(_)) { ("uncaught", Mode::Write) } else { ("error", Mode::Display) };
+    let (label, mode) = if matches!(report.error, Raised::Value(_)) {
+        ("uncaught", Mode::Write)
+    } else {
+        ("error", Mode::Display)
+    };
     let mut text = format!("{label}: {}", to_string(mc, report.value, mode, limit).unwrap_or_else(|_| "...".to_string()));
     for context in &report.trace.contexts {
         let place = context.file.as_ref().map(|file| format!("{file}:{}", context.line));
@@ -196,11 +200,19 @@ fn child<'gc>(mc: &Mutation<'gc>, value: Value<'gc>, i: usize) -> Option<Value<'
         return table.held(mc, i);
     }
     if let Some(syntax) = Syntax::of(value) {
-        return if i == 0 { Some(syntax.datum(mc)) } else { None };
+        return if i == 0 {
+            Some(syntax.datum(mc))
+        } else {
+            None
+        };
     }
     if let Some(made) = value.downcast::<Struct>(mc) {
         let fields = made.items(mc);
-        return if i < fields.len() { Some(fields.get(i)) } else { None };
+        return if i < fields.len() {
+            Some(fields.get(i))
+        } else {
+            None
+        };
     }
     let condition = value.downcast::<Condition>(mc)?;
     [condition.message(mc), condition.irritants(mc)].get(i).copied()
@@ -335,7 +347,12 @@ impl<'gc> Printer<'_, 'gc> {
                         at += 1;
                     }
                     if let (Some(key), Some(value)) = (table.held(self.mc, 2 * at), table.held(self.mc, 2 * at + 1)) {
-                        self.out.push_str(if written { " (" } else { "(" });
+                        let open = if written {
+                            " ("
+                        } else {
+                            "("
+                        };
+                        self.out.push_str(open);
                         work.extend([Work::Entries(table, at + 1, true), Work::Text(")"), Work::Value(value), Work::Text(" . "), Work::Value(key)]);
                     }
                 }
@@ -469,7 +486,11 @@ impl<'gc> Printer<'_, 'gc> {
             let name = string::to_string(&self.strings, keyword.symbol(self.mc).name(self.mc));
             self.out.push_str("#:");
             let bars = name.is_empty() || name.bytes().any(ends_name) || name.chars().any(|character| character.is_control() || character.is_whitespace());
-            if write && bars { self.write_text(name.chars(), '|') } else { self.out.push_str(&name) }
+            if write && bars {
+                self.write_text(name.chars(), '|')
+            } else {
+                self.out.push_str(&name)
+            }
         } else if let Some(character) = value.as_char() {
             if write {
                 self.write_char(character);

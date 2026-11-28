@@ -133,7 +133,11 @@ impl<'gc> Outer<'_, 'gc> {
                 }
             }
             Kind::Receive => {
-                let received = if self.regs.acc == Value::VALUES { Passed::list(self.regs.values) } else { self.pass(&[self.regs.acc])? };
+                let received = if self.regs.acc == Value::VALUES {
+                    Passed::list(self.regs.values)
+                } else {
+                    self.pass(&[self.regs.acc])?
+                };
                 Then::Call(first, received)
             }
             Kind::Collect => Then::Return(self.regs.list(mc)?),
@@ -213,7 +217,12 @@ impl<'gc> Outer<'_, 'gc> {
     pub(crate) fn guard(&mut self, handler: Value<'gc>, tried: bool, traced: bool) -> Result<(), Fault> {
         let (mc, task) = (self.mc(), self.task());
         let guard = Value::object(mc, Guard::new(mc, handler, task.winders(mc), traced)?);
-        self.push(Kind::Guarded, guard, if tried { Value::TRUE } else { Value::FALSE })?;
+        let flag = if tried {
+            Value::TRUE
+        } else {
+            Value::FALSE
+        };
+        self.push(Kind::Guarded, guard, flag)?;
         let pairs = Pairs::new(mc);
         let mark = pairs.cons(handler_key(), prompts::handlers_with(mc, task, guard)?)?.value(mc);
         task.set_attachments(mc, pairs.cons(mark, task.attachments(mc))?.value(mc));

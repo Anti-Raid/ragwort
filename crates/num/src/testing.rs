@@ -9,7 +9,11 @@ use std::process::{Command, Stdio};
 use crate::bigint::{Digit, Digits, RWDigits};
 use crate::int::*;
 
-pub const ROUNDS: usize = if cfg!(miri) { 30 } else { 4000 };
+pub const ROUNDS: usize = if cfg!(miri) {
+    30
+} else {
+    4000
+};
 
 /// A SplitMix64 random number generator.
 pub struct Rng(pub u64);
@@ -76,7 +80,11 @@ pub fn hex(x: Digits<'_>) -> String {
 }
 
 pub fn signed(x: Digits<'_>, negative: bool) -> String {
-    if negative && !x.is_zero() { format!("-{}", hex(x)) } else { hex(x) }
+    if negative && !x.is_zero() {
+        format!("-{}", hex(x))
+    } else {
+        hex(x)
+    }
 }
 
 #[derive(Default)]
@@ -150,7 +158,11 @@ pub struct TestHost {
     used: Cell<usize>,
 }
 
-pub const CAPACITY: usize = if cfg!(miri) { 1 << 12 } else { 1 << 16 };
+pub const CAPACITY: usize = if cfg!(miri) {
+    1 << 12
+} else {
+    1 << 16
+};
 
 impl TestHost {
     pub fn new(bits: u32) -> Self {
@@ -176,7 +188,11 @@ impl Host for TestHost {
 
     fn small(&self, n: i64) -> Option<TestInt> {
         let fits = self.bits >= 64 || (-(1i64 << (self.bits - 1))..1i64 << (self.bits - 1)).contains(&n);
-        if fits { Some(TestInt::Small(n)) } else { None }
+        if fits {
+            Some(TestInt::Small(n))
+        } else {
+            None
+        }
     }
 
     fn big(&self, negative: bool, len: usize, init: impl FnOnce(RWDigits<'_>) -> usize) -> Result<TestInt, TestError> {
@@ -196,7 +212,11 @@ impl Host for TestHost {
 pub const WIDTHS: [u32; 4] = [64, 63, 9, 2];
 
 pub fn hex_i64(n: i64) -> String {
-    let sign = if n < 0 { "-" } else { "" };
+    let sign = if n < 0 {
+        "-"
+    } else {
+        ""
+    };
     format!("{sign}{:x}", n.unsigned_abs())
 }
 
@@ -210,7 +230,16 @@ impl TestHost {
             let all = self.bigs[at].get().expect("made by this host");
             assert!(all.len() <= 2 * digits.len(), "{} digits kept of {}", digits.len(), all.len());
             assert!(all[digits.len()..].iter().all(|digit| digit.get() == 0), "digits left past those kept");
-            let value = if digits.len() == 1 { Some(if negative { (digits[0].get() as i64).wrapping_neg() } else { digits[0].get() as i64 }) } else { None };
+            let value = if digits.len() == 1 {
+                let small = if negative {
+                    (digits[0].get() as i64).wrapping_neg()
+                } else {
+                    digits[0].get() as i64
+                };
+                Some(small)
+            } else {
+                None
+            };
             let small = value.filter(|&number| (number < 0) == negative && number != 0).and_then(|number| self.small(number));
             assert!(small.is_none(), "{x:?} should be small");
         }
@@ -224,7 +253,12 @@ impl TestHost {
             0 => {
                 let n = edges[rng.below(edges.len() as u64) as usize];
                 let n = n.wrapping_add(rng.below(3) as i64 - 1);
-                from_i64(self, if self.bits < 64 && rng.bool() { n >> (64 - self.bits) } else { n }).unwrap()
+                let narrowed = if self.bits < 64 && rng.bool() {
+                    n >> (64 - self.bits)
+                } else {
+                    n
+                };
+                from_i64(self, narrowed).unwrap()
             }
             1 => from_i64(self, rng.u64() as i64 >> rng.below(64)).unwrap(),
             _ => from_digits(self, rng.bool(), Digits::new(&rng.digits(max_len))).unwrap(),
@@ -372,7 +406,14 @@ impl TestHost {
             TestReal::Exact(fraction) => self.show_rational(fraction),
             // A NaN's sign and payload depend on the CPU (x86 makes 0/0 negative), and ragwort
             // treats every NaN as the same number.
-            TestReal::Flonum(float) => format!("fl{:x}", if float.is_nan() { f64::NAN } else { float }.to_bits()),
+            TestReal::Flonum(float) => {
+                let canonical = if float.is_nan() {
+                    f64::NAN
+                } else {
+                    float
+                };
+                format!("fl{:x}", canonical.to_bits())
+            }
         }
     }
 
@@ -388,8 +429,16 @@ impl TestHost {
             0 => FLONUM_EDGES[rng.below(FLONUM_EDGES.len() as u64) as usize],
             1 => f64::from_bits(rng.u64()),
             // Small integers and half-integers. These often equal exact numbers and each other.
-            2 => (rng.below(41) as f64 - 20.0) / if rng.bool() { 1.0 } else { 2.0 },
-            _ => (rng.u64() as i64 >> rng.below(64)) as f64 * if rng.bool() { 1.0 } else { 1e-3 },
+            2 => (rng.below(41) as f64 - 20.0) / if rng.bool() {
+                1.0
+            } else {
+                2.0
+            },
+            _ => (rng.u64() as i64 >> rng.below(64)) as f64 * if rng.bool() {
+                1.0
+            } else {
+                1e-3
+            },
         }
     }
 

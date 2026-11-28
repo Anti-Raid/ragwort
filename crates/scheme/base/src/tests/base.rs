@@ -946,7 +946,11 @@ fn structs_are_matched_and_copied() {
                  (struct-copy p (note (p 1 2)) [b (note 'b)] [a (note 'a)]) (reverse log)";
     assert_eq!(eval(order), "(#(struct:p 1 2) b a)");
     for wrong in ["(struct-copy point (point3 1 2 3) [x 1] [y 2])", "(struct-copy point3 (point 1 2) [z 1])", "(struct-copy point 5 [x 1] [y 2])", "(struct-copy point 5)"] {
-        let expected = if wrong.contains("(point3 1 2 3)") { Ok(Ok("#(struct:point 1 2)".to_string())) } else { Ok(Err(Fault::WrongType)) };
+        let expected = if wrong.contains("(point3 1 2 3)") {
+            Ok(Ok("#(struct:point 1 2)".to_string()))
+        } else {
+            Ok(Err(Fault::WrongType))
+        };
         assert_eq!(eval_in(&mut arena(), &format!("{shapes} {wrong}")), expected, "{wrong}");
     }
     assert_eq!(error(&format!("{shapes} (struct-copy point (point 1 2) [z 1])")), (ExpandErrorKind::BadSyntax, "z"));
@@ -1492,7 +1496,14 @@ fn a_coroutine_two_machines_resume_in_turn_is_copied_where_it_waits() {
             arena.collect();
         }
         let machine = &mut machines[i % 2];
-        seen.push(arena.mutate(|mc| show_outcome(mc, if i < 2 { machine.run(mc) } else { machine.resume(mc, &[]) })));
+        seen.push(arena.mutate(|mc| {
+            let outcome = if i < 2 {
+                machine.run(mc)
+            } else {
+                machine.resume(mc, &[])
+            };
+            show_outcome(mc, outcome)
+        }));
     }
     assert_eq!(seen, (0..8).map(|i| format!("yielded ({i})")).collect::<Vec<_>>());
 }
@@ -1896,7 +1907,11 @@ fn calls_the_vm_builds_work_at_any_stack_depth() {
 fn run_to_outcome(arena: &mut Arena, machine: &mut Machine, mut resume: bool) -> String {
     loop {
         let outcome = arena.step(|mc| {
-            let outcome = if std::mem::take(&mut resume) { machine.resume(mc, &[]) } else { machine.run(mc) };
+            let outcome = if std::mem::take(&mut resume) {
+                machine.resume(mc, &[])
+            } else {
+                machine.run(mc)
+            };
             match outcome.unwrap() {
                 Outcome::Paused => None,
                 outcome => Some(show_outcome(mc, Ok(outcome))),
@@ -2156,7 +2171,11 @@ fn switches_in_every_position_come_back_to_their_frames() {
     let mut hosted = Vec::new();
     let done = loop {
         let outcome = arena.step(|mc| {
-            let outcome = if let Some(value) = told.take() { machine.resume(mc, &[Value::fixnum(value).unwrap()]) } else { machine.run(mc) };
+            let outcome = if let Some(value) = told.take() {
+                machine.resume(mc, &[Value::fixnum(value).unwrap()])
+            } else {
+                machine.run(mc)
+            };
             match outcome.unwrap() {
                 Outcome::Paused => None,
                 outcome => Some((matches!(outcome, Outcome::Yielded(_)), show_outcome(mc, Ok(outcome)))),

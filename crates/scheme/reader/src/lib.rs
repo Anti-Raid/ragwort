@@ -202,7 +202,14 @@ impl<'a, 'gc> Reader<'a, 'gc> {
                     self.dot(start)?;
                     continue;
                 }
-                Token::Boolean(boolean) => self.node(if boolean { Value::TRUE } else { Value::FALSE }, self.literal, start)?,
+                Token::Boolean(boolean) => {
+                    let value = if boolean {
+                        Value::TRUE
+                    } else {
+                        Value::FALSE
+                    };
+                    self.node(value, self.literal, start)?
+                }
                 Token::Nil => self.node(Value::NIL, self.literal, start)?,
                 Token::NoneValue => self.node(Value::NONE, self.literal, start)?,
                 Token::Char(character) => self.node(Value::char(character), self.literal, start)?,

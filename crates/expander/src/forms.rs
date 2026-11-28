@@ -145,7 +145,12 @@ pub trait Forms<'a, 'gc: 'a>: Host<'a, 'gc> {
                     return Err(self.error(ExpandErrorKind::BadSyntax, name));
                 }
                 let Some(label) = self.label(name)? else { return Err(self.error(ExpandErrorKind::Label, name)) };
-                Ok(Step::Done(if form == CoreForm::Break { Core::Break(label) } else { Core::Continue(label) }))
+                let jump = if form == CoreForm::Break {
+                    Core::Break(label)
+                } else {
+                    Core::Continue(label)
+                };
+                Ok(Step::Done(jump))
             }
             (CoreForm::Begin, &[_, ..]) => sequence(self, items[1..].to_vec(), Wrap::None),
             (CoreForm::SyntaxCase, &[input, literals, ref clauses @ ..]) => self.syntax_case(input, literals, clauses.to_vec()),
@@ -199,7 +204,11 @@ fn sequence<'a, 'gc: 'a, H: Host<'a, 'gc>>(_: &mut H, stxs: Vec<Stx>, wrap: Wrap
                 core
             }
             Wrap::Lambda { stx, mut vars, params } => {
-                let rest = if vars.len() > params { vars.pop() } else { None };
+                let rest = if vars.len() > params {
+                    vars.pop()
+                } else {
+                    None
+                };
                 let id = this.lambda_id();
                 Core::Lambda(Lambda { id, params: vars, optional: 0, rest, body: Box::new(body), name: None, at: this.position(stx) })
             }
@@ -328,7 +337,11 @@ fn formals<'a, 'gc: 'a, H: Host<'a, 'gc>>(this: &mut H, formals: Stx) -> Result<
     let mut items = items.into_iter();
     while let Some(item) = items.next() {
         let keyword = this.tree.keyword(item);
-        let at = if keyword.is_some() { items.next().ok_or_else(|| this.error(ExpandErrorKind::BadSyntax, item))? } else { item };
+        let at = if keyword.is_some() {
+            items.next().ok_or_else(|| this.error(ExpandErrorKind::BadSyntax, item))?
+        } else {
+            item
+        };
         let (name, default) = match this.tree.view(at)? {
             View::Id => (at, None),
             View::List(parts, None) => match *parts.as_slice() {

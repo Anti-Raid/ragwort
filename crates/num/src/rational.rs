@@ -40,12 +40,20 @@ fn is_zero<H: Host>(h: &H, x: H::Int) -> bool {
 
 /// Returns `x / divisor`. `divisor` must divide `x` exactly.
 fn exact_div<H: Host>(h: &H, x: H::Int, divisor: H::Int) -> IntRes<H> {
-    if is_one(h, divisor) { Ok(x) } else { int::quotient(h, x, divisor) }
+    if is_one(h, divisor) {
+        Ok(x)
+    } else {
+        int::quotient(h, x, divisor)
+    }
 }
 
 /// Returns the rational `num / den`. `den` must be positive, and `num` and `den` must share no factor.
 fn reduced<H: RationalHost>(h: &H, num: H::Int, den: H::Int) -> Res<H> {
-    if is_one(h, den) || is_zero(h, num) { Ok(h.of_int(num)) } else { h.ratio(num, den) }
+    if is_one(h, den) || is_zero(h, num) {
+        Ok(h.of_int(num))
+    } else {
+        h.ratio(num, den)
+    }
 }
 
 /// Returns `num / den` in lowest terms, or [`NumError::DivideByZero`] if `den` is zero.
@@ -132,7 +140,11 @@ pub fn neg<H: RationalHost>(h: &H, x: H::Rational) -> Res<H> {
 }
 
 pub fn abs<H: RationalHost>(h: &H, x: H::Rational) -> Res<H> {
-    if sign(h, x) == Ordering::Less { neg(h, x) } else { Ok(x) }
+    if sign(h, x) == Ordering::Less {
+        neg(h, x)
+    } else {
+        Ok(x)
+    }
 }
 
 pub fn add<H: RationalHost>(h: &H, x: H::Rational, y: H::Rational) -> Res<H> {
@@ -229,7 +241,11 @@ pub fn round<H: RationalHost>(h: &H, x: H::Rational, mode: Round) -> IntRes<H> {
                 Ordering::Greater => true,
                 Ordering::Equal => !int::is_even(h, quotient),
             };
-            if up { int::add(h, quotient, int::from_i64(h, 1)?) } else { Ok(quotient) }
+            if up {
+                int::add(h, quotient, int::from_i64(h, 1)?)
+            } else {
+                Ok(quotient)
+            }
         }
     }
 }
@@ -259,7 +275,12 @@ pub fn to_f64<H: RationalHost>(h: &H, x: H::Rational) -> Result<f64, H::Error> {
     let negative = int::sign(h, num) == Ordering::Less;
     let num = int::abs(h, num)?;
     let value = ratio_to_f64(h, num, den)?;
-    Ok(if negative { -value } else { value })
+    let signed = if negative {
+        -value
+    } else {
+        value
+    };
+    Ok(signed)
 }
 
 /// Returns the `f64` nearest to `num / den`, with ties to even. `num` and `den` must be positive.
@@ -287,7 +308,11 @@ fn ratio_to_f64<H: Host>(h: &H, num: H::Int, den: H::Int) -> Result<f64, H::Erro
         return Ok(f64::INFINITY);
     }
     // Below the normal range, fewer bits are left for the significand.
-    let precision = if exponent >= -1022 { 53 } else { exponent + 1075 };
+    let precision = if exponent >= -1022 {
+        53
+    } else {
+        exponent + 1075
+    };
     let drop = len - precision;
     if drop > len {
         return Ok(0.0);
@@ -326,7 +351,12 @@ pub fn from_f64<H: RationalHost>(h: &H, value: f64) -> Res<H> {
     let tz = (significand.trailing_zeros() as i64).min(-shift);
     significand >>= tz;
     shift += tz;
-    let num = int::from_i64(h, if value < 0.0 { -(significand as i64) } else { significand as i64 })?;
+    let signed = if value < 0.0 {
+        -(significand as i64)
+    } else {
+        significand as i64
+    };
+    let num = int::from_i64(h, signed)?;
     let den = int::arithmetic_shift(h, int::from_i64(h, 1)?, -shift)?;
     h.ratio(num, den)
 }

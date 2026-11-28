@@ -303,7 +303,11 @@ impl<'a, 'gc> Expander<'a, 'gc> {
         let mut binds = Vec::with_capacity(updates.len());
         for (i, &update) in updates.iter().enumerate() {
             let &[field, value] = self.proper(update)?.as_slice() else { return Err(self.error(bad, update)) };
-            let named = if self.is_id(field) { self.text(field) } else { None };
+            let named = if self.is_id(field) {
+                self.text(field)
+            } else {
+                None
+            };
             // If several types in the supertype chain have a field of this name, the name refers to the field of the most derived type.
             let Some(index) = named.and_then(|named| info.fields.iter().rposition(|candidate| *candidate.name == *named)) else { return Err(self.error(bad, field)) };
             if given[index].is_some() {

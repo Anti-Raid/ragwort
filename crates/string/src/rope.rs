@@ -107,7 +107,12 @@ pub(crate) fn sub<H: Host>(h: &H, string: H::Str, start: usize, end: usize, char
         StrView::Flat { units, .. } if start == 0 && end == units.len() => return Ok(string),
         StrView::Flat { units, chars: all } => {
             // In an ASCII string every byte is a character.
-            let known = chars.or(if all == units.len() { Some(end - start) } else { None });
+            let ascii = if all == units.len() {
+                Some(end - start)
+            } else {
+                None
+            };
+            let known = chars.or(ascii);
             // A host that keeps long strings outside its heap can let the part share the bytes.
             if let Some(shared) = h.slice(string, start, end, known)? {
                 return Ok(shared);
@@ -119,7 +124,12 @@ pub(crate) fn sub<H: Host>(h: &H, string: H::Str, start: usize, end: usize, char
         StrView::Rope { left, right, info, .. } => (info, left, right),
     };
     if fits(end - start) {
-        return copy_range(h, string, start, end, chars.or(if whole.chars == whole.bytes { Some(end - start) } else { None }));
+        let ascii = if whole.chars == whole.bytes {
+            Some(end - start)
+        } else {
+            None
+        };
+        return copy_range(h, string, start, end, chars.or(ascii));
     }
     let left_bytes = info(h, left).bytes;
     if end <= left_bytes {

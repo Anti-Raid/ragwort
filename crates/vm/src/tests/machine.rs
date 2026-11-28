@@ -47,7 +47,11 @@ const TAG: i64 = i64::MIN;
 
 fn table<'gc>(mc: &Mutation<'gc>, constants: &[i64]) -> Vec<Value<'gc>> {
     let tag = Value::object(mc, Tag::new(mc, Value::VOID).unwrap());
-    constants.iter().map(|&n| if n == TAG { tag } else { fix(n) }).collect()
+    constants.iter().map(|&n| if n == TAG {
+        tag
+    } else {
+        fix(n)
+    }).collect()
 }
 
 fn closure<'gc>(mc: &Mutation<'gc>, code: Gc<'gc, Bytecode>) -> Value<'gc> {
@@ -116,7 +120,11 @@ fn run<'gc>(mc: &Mutation<'gc>, code: Gc<'gc, Bytecode>, args: &[Value<'gc>]) ->
         Outcome::Raised(raised) => return Err(fault(mc, raised)),
         Outcome::Paused | Outcome::Yielded(_) | Outcome::Deferred(_) => unreachable!(),
     };
-    Ok(values.iter().map(|&v| if Pair::of(v).is_some() { items(mc, v).iter().fold(0, |a, &n| a * 10 + n) } else { v.as_fixnum().unwrap() }).collect())
+    Ok(values.iter().map(|&v| if Pair::of(v).is_some() {
+        items(mc, v).iter().fold(0, |a, &n| a * 10 + n)
+    } else {
+        v.as_fixnum().unwrap()
+    }).collect())
 }
 
 /// Steps the machine to completion across arena collection boundaries, allowing incremental GC between execution steps. Returns the final values as fixnums and the total number of execution steps required.
@@ -1291,7 +1299,11 @@ fn external_references_are_equal_as_their_kind_says() {
         externals.make(&HANDLE, number, 0, Value::NULL).unwrap().value(mc)
     }
     fn truth<'gc>(flag: bool) -> Value<'gc> {
-        if flag { Value::TRUE } else { Value::FALSE }
+        if flag {
+            Value::TRUE
+        } else {
+            Value::FALSE
+        }
     }
     Arena::new(1 << 24, 0).mutate(|mc| {
         let externals = ExternalRefs::new(mc);

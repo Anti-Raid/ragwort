@@ -44,7 +44,11 @@ fn names(distinct: usize, rng: &mut Rng) -> Vec<String> {
     while out.len() < distinct {
         let parts = 1 + rng.next() as usize % 3;
         let name = (0..parts).map(|_| PARTS[rng.next() as usize % PARTS.len()]).collect::<Vec<_>>().join("-");
-        let name = if rng.next().is_multiple_of(4) { format!("{name}{}", rng.next() % 100) } else { name };
+        let name = if rng.next().is_multiple_of(4) {
+            format!("{name}{}", rng.next() % 100)
+        } else {
+            name
+        };
         if !out.contains(&name) {
             out.push(name);
         }
@@ -58,7 +62,11 @@ fn source(names: &[String], count: usize, rng: &mut Rng) -> String {
     let tokens: Vec<&str> = (0..count)
         .map(|_| {
             let r = rng.next() as usize;
-            if r.is_multiple_of(2) { names[r / 2 % KEYWORDS.len()].as_str() } else { names[r / 2 % names.len()].as_str() }
+            if r.is_multiple_of(2) {
+                names[r / 2 % KEYWORDS.len()].as_str()
+            } else {
+                names[r / 2 % names.len()].as_str()
+            }
         })
         .collect();
     tokens.join(" ")

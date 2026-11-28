@@ -60,7 +60,12 @@ fn maps_find_what_they_hold() {
                 assert_eq!(insert(mc, t, n, -n, bits), Some(n * 10));
             }
             for n in (0..2000).step_by(2) {
-                assert_eq!(remove(mc, t, n, bits), Some(if n % 3 == 0 { -n } else { n * 10 }));
+                let stored = if n % 3 == 0 {
+                    -n
+                } else {
+                    n * 10
+                };
+                assert_eq!(remove(mc, t, n, bits), Some(stored));
             }
             assert_eq!(remove(mc, t, 0, bits), None);
             assert_eq!(t.count(mc), 1000);
@@ -72,7 +77,16 @@ fn maps_find_what_they_hold() {
         arena.mutate(|mc| {
             let t = table::<Strong>(mc, 0);
             for n in 0..2000 {
-                let want = if n % 2 == 1 { Some(if n % 3 == 0 { -n } else { n * 10 }) } else { None };
+                let want = if n % 2 == 1 {
+                    let stored = if n % 3 == 0 {
+                        -n
+                    } else {
+                        n * 10
+                    };
+                    Some(stored)
+                } else {
+                    None
+                };
                 assert_eq!(get(mc, t, n, bits), want, "{bits:#x}: {n}");
             }
             let keys: HashSet<_> = t.entries(mc).map(|(k, _)| k.as_fixnum().unwrap()).collect();
@@ -135,7 +149,11 @@ fn identity_tables_rehash_after_objects_move() {
             let t = table::<Strong>(mc, 0);
             let keys = crate::gc::GcVec::<slot::Value>::of(mc.root(1).downcast(mc).unwrap());
             for (n, key) in keys.iter(mc).enumerate() {
-                let want = if round < 2 || n % 2 == 1 { Some(fix(n as i64)) } else { None };
+                let want = if round < 2 || n % 2 == 1 {
+                    Some(fix(n as i64))
+                } else {
+                    None
+                };
                 assert_eq!(t.get_eq(mc, key).unwrap(), want, "round {round}: key {n}");
             }
             assert_eq!(t.get_eq(mc, fix(7)).unwrap(), Some(fix(-7)));

@@ -238,7 +238,12 @@ impl<'gc> Form<'gc> {
         })?;
         let mut members = Vec::with_capacity(named.len() + self.constructors.len());
         for (text, member) in named {
-            members.push((if member == Member::Make { Named::Own } else { Named::Derived(text) }, member));
+            let named = if member == Member::Make {
+                Named::Own
+            } else {
+                Named::Derived(text)
+            };
+            members.push((named, member));
             // Extra constructors come right after the main constructor.
             if member == Member::Make {
                 members.extend((0..self.constructors.len()).map(|i| (Named::Constructor(i), Member::Make)));

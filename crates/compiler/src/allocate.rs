@@ -84,7 +84,11 @@ pub(crate) fn allocate<'t>(arena: &'t Arena, function: &Function<'_, '_>, link: 
     let colours = colour(arena, function, &live, &pinned);
 
     let own = LIMIT.saturating_sub(link + 1);
-    let (spill, first) = if colours.count > u32::from(own) { (Some(link + 1), link + 2) } else { (None, link + 1) };
+    let (spill, first) = if colours.count > u32::from(own) {
+        (Some(link + 1), link + 2)
+    } else {
+        (None, link + 1)
+    };
     let own = u32::from(LIMIT.saturating_sub(first));
     let locs = fixed
         .iter()
@@ -145,7 +149,11 @@ fn has_reg(regs: &Regs, register: u8) -> bool {
 
 fn set_reg(regs: &mut Regs, register: u8, to: bool) {
     let (word, bit) = (&mut regs[usize::from(register) / 64], 1 << (register % 64));
-    *word = if to { *word | bit } else { *word & !bit };
+    *word = if to {
+        *word | bit
+    } else {
+        *word & !bit
+    };
 }
 
 fn highest(regs: &Regs) -> Option<u8> {

@@ -207,7 +207,11 @@ impl<'gc> Matcher<'_, 'gc> {
 
     fn charge(&mut self, amount: u64) -> Result<(), Fault> {
         self.count = self.count.saturating_add(amount);
-        if self.count > self.most { Err(Fault::OutOfFuel) } else { Ok(()) }
+        if self.count > self.most {
+            Err(Fault::OutOfFuel)
+        } else {
+            Ok(())
+        }
     }
 
     fn slot(&mut self, slot: u32) -> Result<&mut Value<'gc>, Fault> {
@@ -253,7 +257,11 @@ impl<'gc> Matcher<'_, 'gc> {
                     same
                 }
                 Pattern::Seq { before, repeat, after, tail, vector } => {
-                    let items = if *vector { vector_items(mc, value) } else { list_items(mc, value) };
+                    let items = if *vector {
+                        vector_items(mc, value)
+                    } else {
+                        list_items(mc, value)
+                    };
                     let Some((items, rests)) = items else { return Ok(false) };
                     self.charge(items.len() as u64)?;
                     let (before, after) = (shape.of(before), shape.of(after));
@@ -280,7 +288,12 @@ impl<'gc> Matcher<'_, 'gc> {
                             todo.extend(after.iter().zip(&items[len - after_len..]).map(|(&node, &item)| Match::Node(node, item)));
                         }
                         if let Some(tail) = tail {
-                            todo.push(Match::Node(*tail, rests[if repeat.is_some() { len } else { before_len }]));
+                            let rest_index = if repeat.is_some() {
+                                len
+                            } else {
+                                before_len
+                            };
+                            todo.push(Match::Node(*tail, rests[rest_index]));
                         }
                         todo[at..].reverse();
                     }
@@ -417,9 +430,17 @@ impl<'gc> Builder<'_, 'gc> {
                 Build::Seq(node, start) => {
                     let Template::Seq { tail, vector, like, .. } = shape.nodes[node as usize] else { unreachable!("a sequence's node") };
                     let like = Syntax::of(self.item(like)?).ok_or(Fault::Malformed)?;
-                    let tail = if tail.is_some() && !vector { made.pop().expect("a tail") } else { Value::NULL };
+                    let tail = if tail.is_some() && !vector {
+                        made.pop().expect("a tail")
+                    } else {
+                        Value::NULL
+                    };
                     let out = made.split_off(start);
-                    let datum = if vector { Vectors::new(mc).immutable_from_slice(&out)?.value(mc) } else { Pairs::new(mc).list_with_tail(out, tail)? };
+                    let datum = if vector {
+                        Vectors::new(mc).immutable_from_slice(&out)?.value(mc)
+                    } else {
+                        Pairs::new(mc).list_with_tail(out, tail)?
+                    };
                     made.push(Syntax::new(mc, datum, like.span(mc), like.metadata(mc))?.value(mc));
                 }
             }

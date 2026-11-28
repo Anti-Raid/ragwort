@@ -287,7 +287,11 @@ impl<'gc> Shelf<'gc> {
     pub fn of(mc: &Mutation<'gc>, value: Value<'gc>) -> Option<Self> {
         let slots = Vector::of(value)?;
         let items = slots.items(mc);
-        if items.len() >= Self::IMAGES && Symbols::of(items.get(Self::SYMBOLS)).is_some() { Some(Self(slots)) } else { None }
+        if items.len() >= Self::IMAGES && Symbols::of(items.get(Self::SYMBOLS)).is_some() {
+            Some(Self(slots))
+        } else {
+            None
+        }
     }
 
     pub fn value(self, mc: &Mutation<'gc>) -> Value<'gc> {

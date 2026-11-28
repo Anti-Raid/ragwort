@@ -13,7 +13,11 @@ fn every_slot_number_has_one_place() {
     for number in 0..SMALL + 5 * LARGEST {
         assert_eq!(place(number), expected, "slot {number}");
         assert_eq!(first(expected.0) + expected.1, number);
-        expected = if expected.1 + 1 == size(expected.0) { (expected.0 + 1, 0) } else { (expected.0, expected.1 + 1) };
+        expected = if expected.1 + 1 == size(expected.0) {
+            (expected.0 + 1, 0)
+        } else {
+            (expected.0, expected.1 + 1)
+        };
     }
     assert_eq!((size(0), size(DOUBLING - 1), size(DOUBLING), size(DOUBLING + 9)), (FIRST, LARGEST / 2, LARGEST, LARGEST));
 }

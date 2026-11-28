@@ -54,7 +54,11 @@ impl Intrinsic {
                 }));
             }
             Intrinsic::IsPositive | Intrinsic::IsNegative => {
-                let want = if self == Intrinsic::IsPositive { Ordering::Greater } else { Ordering::Less };
+                let want = if self == Intrinsic::IsPositive {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                };
                 return Ok(boolean(real::sign(&nums, real(&nums, operands.get(0))?) == Some(want)));
             }
             Intrinsic::IsOdd | Intrinsic::IsEven => {
@@ -71,7 +75,11 @@ impl Intrinsic {
                 for i in 1..operands.count() {
                     let next = real(&nums, operands.get(i))?;
                     acc = match (acc.value().as_fixnum(), next.value().as_fixnum()) {
-                        (Some(left), Some(right)) => if (right > left) == max { next } else { acc },
+                        (Some(left), Some(right)) => if (right > left) == max {
+                            next
+                        } else {
+                            acc
+                        },
                         _ if max => real::max(&nums, acc, next)?,
                         _ => real::min(&nums, acc, next)?,
                     };
@@ -87,16 +95,30 @@ impl Intrinsic {
             },
             Intrinsic::Gcd | Intrinsic::Lcm => {
                 let gcd = self == Intrinsic::Gcd;
-                let (mut acc, mut exact) = (int::from_i64(&nums, if gcd { 0 } else { 1 })?, true);
+                let identity = if gcd {
+                    0
+                } else {
+                    1
+                };
+                let (mut acc, mut exact) = (int::from_i64(&nums, identity)?, true);
                 for i in 0..operands.count() {
                     let (integer, is_exact) = integral(mc, &nums, operands.get(i))?;
                     exact &= is_exact;
                     let words = int::integer_length(&nums, acc).max(int::integer_length(&nums, integer)) / 64;
                     fuel.spend(words.saturating_mul(words) / equal::PER_FUEL)?;
-                    acc = if gcd { int::gcd(&nums, acc, integer)? } else { int::lcm(&nums, acc, integer)? };
+                    acc = if gcd {
+                        int::gcd(&nums, acc, integer)?
+                    } else {
+                        int::lcm(&nums, acc, integer)?
+                    };
                 }
                 let acc = nums.of_rational(nums.of_int(acc));
-                nums.of_real(if exact { acc } else { real::inexact(&nums, acc)? })
+                let result = if exact {
+                    acc
+                } else {
+                    real::inexact(&nums, acc)?
+                };
+                nums.of_real(result)
             }
             Intrinsic::Numerator => nums.of_real(real::numerator(&nums, real(&nums, operands.get(0))?)?),
             Intrinsic::Denominator => nums.of_real(real::denominator(&nums, real(&nums, operands.get(0))?)?),
@@ -128,7 +150,11 @@ impl Intrinsic {
             Intrinsic::StringToNumber => {
                 let strings = Strings::new(mc);
                 let string = strings.string(operands.get(0)).ok_or(Fault::WrongType)?;
-                let radix = if operands.count() == 2 { operands.get(1).as_fixnum().ok_or(Fault::WrongType)? } else { 10 };
+                let radix = if operands.count() == 2 {
+                    operands.get(1).as_fixnum().ok_or(Fault::WrongType)?
+                } else {
+                    10
+                };
                 let radix = [2, 8, 10, 16].into_iter().find(|&allowed| allowed == radix).ok_or(Fault::OutOfRange)? as u32;
                 // Parsing a multi-precision integer has approximately quadratic computational
                 // complexity relative to its digit count (up to 4 bits per digit).
@@ -193,13 +219,28 @@ impl Intrinsic {
                     }
                     Intrinsic::BitField => {
                         let (start, end) = bit_range(operands.get(1), operands.get(2))?;
-                        charge_bits(mc, fuel, if negative { end - start } else { len.saturating_sub(start).min(end - start) })?;
+                        let bits = if negative {
+                            end - start
+                        } else {
+                            len.saturating_sub(start).min(end - start)
+                        };
+                        charge_bits(mc, fuel, bits)?;
                         int::bit_field(&nums, integer, start, end)?
                     }
                     _ => {
                         let (source, (start, end)) = (nums.integer(operands.get(1)).ok_or(Fault::WrongType)?, bit_range(operands.get(2), operands.get(3))?);
-                        let field = if int::sign(&nums, source) == Ordering::Less { end - start } else { int::integer_length(&nums, source).min(end - start) };
-                        let bits = if negative { end } else if field == 0 { len } else { len.max(start + field) };
+                        let field = if int::sign(&nums, source) == Ordering::Less {
+                            end - start
+                        } else {
+                            int::integer_length(&nums, source).min(end - start)
+                        };
+                        let bits = if negative {
+                            end
+                        } else if field == 0 {
+                            len
+                        } else {
+                            len.max(start + field)
+                        };
                         charge_bits(mc, fuel, bits)?;
                         int::bit_field_replace(&nums, integer, source, start, end)?
                     }
@@ -236,7 +277,11 @@ impl Intrinsic {
 /// the quotient is exactly representable as a fixnum; otherwise returns `None`.
 fn fixnum_div<'gc>(dividend: Value<'gc>, divisor: Value<'gc>) -> Option<Value<'gc>> {
     let (dividend, divisor) = (dividend.as_fixnum()?, divisor.as_fixnum()?);
-    if divisor != 0 && dividend % divisor == 0 { Value::fixnum(dividend / divisor) } else { None }
+    if divisor != 0 && dividend % divisor == 0 {
+        Value::fixnum(dividend / divisor)
+    } else {
+        None
+    }
 }
 
 /// Folds the arithmetic operation `op` (`+`, `-`, `*` or `/`) over `first` and the elements of
@@ -335,11 +380,19 @@ pub(super) fn divide<'gc>(mc: &Mutation<'gc>, fuel: &mut Fuel, op: Intrinsic, di
             Intrinsic::Remainder => left % right,
             Intrinsic::FloorQuotient => {
                 let quotient = left / right;
-                if left % right != 0 && (left < 0) != (right < 0) { quotient - 1 } else { quotient }
+                if left % right != 0 && (left < 0) != (right < 0) {
+                    quotient - 1
+                } else {
+                    quotient
+                }
             }
             _ => {
                 let remainder = left % right;
-                if remainder != 0 && (remainder < 0) != (right < 0) { remainder + right } else { remainder }
+                if remainder != 0 && (remainder < 0) != (right < 0) {
+                    remainder + right
+                } else {
+                    remainder
+                }
             }
         };
         if let Some(value) = Value::fixnum(fast) {
@@ -464,7 +517,11 @@ pub(super) fn compare<'gc>(mc: &Mutation<'gc>, op: Intrinsic, mut xs: impl Itera
     }
     #[inline(always)]
     fn check<'gc>(nums: &Nums<'_, 'gc>, op: Intrinsic, value: Value<'gc>) -> Result<(), Fault> {
-        if op == Intrinsic::NumEq { number(nums, value).map(drop) } else { real(nums, value).map(drop) }
+        if op == Intrinsic::NumEq {
+            number(nums, value).map(drop)
+        } else {
+            real(nums, value).map(drop)
+        }
     }
     let nums = Nums::new(mc);
     let mut before = xs.next().ok_or(Fault::Arity)?;

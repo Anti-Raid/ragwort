@@ -57,7 +57,11 @@ impl Refs {
     pub(super) fn target(self, word: u64) -> Option<u32> {
         match self {
             Self::None => None,
-            Self::Values => if word & TAG == OBJECT { Some((word >> 32) as u32) } else { None },
+            Self::Values => if word & TAG == OBJECT {
+                Some((word >> 32) as u32)
+            } else {
+                None
+            },
             Self::Members | Self::Weaks => Some(word as u32).filter(|&target| target != 0),
         }
     }

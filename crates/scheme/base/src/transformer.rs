@@ -19,7 +19,12 @@ impl<'a, 'gc> Expander<'a, 'gc> {
             match *self.proper(bind)?.as_slice() {
                 [id, expr] if self.is_id(id) => {
                     ids.push(self.engine.tree.with(id, scope, Op::Add)?);
-                    exprs.push(if recursive { self.engine.tree.with(expr, scope, Op::Add)? } else { expr });
+                    let scoped = if recursive {
+                        self.engine.tree.with(expr, scope, Op::Add)?
+                    } else {
+                        expr
+                    };
+                    exprs.push(scoped);
                 }
                 _ => return Err(self.error(ExpandErrorKind::BadSyntax, bind)),
             }

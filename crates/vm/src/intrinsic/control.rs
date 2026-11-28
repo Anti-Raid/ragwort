@@ -19,7 +19,11 @@ impl Intrinsic {
     #[inline(never)]
     pub(super) fn dynamic<'gc>(self, mc: &Mutation<'gc>, task: Gc<'gc, Task>, operands: impl Operands<'gc>, fuel: &mut Fuel) -> Result<Value<'gc>, Fault> {
         if self == Intrinsic::FrameMarks {
-            let tag = if operands.get(2).is_false() { None } else { Some(prompts::tag_of(mc, operands.get(2))?) };
+            let tag = if operands.get(2).is_false() {
+                None
+            } else {
+                Some(prompts::tag_of(mc, operands.get(2))?)
+            };
             return Ok(made(mc, fuel, prompts::part_marks(mc, task, operands.get(0), operands.get(1), tag)?));
         }
         let winders = operands.get(0);
@@ -89,7 +93,11 @@ impl Intrinsic {
                 for i in (1..operands.count()).rev() {
                     irritants = pairs.cons(operands.get(i), irritants)?.value(mc);
                 }
-                let fault = if self == Intrinsic::MakeError { Fault::Error } else { Fault::Syntax };
+                let fault = if self == Intrinsic::MakeError {
+                    Fault::Error
+                } else {
+                    Fault::Syntax
+                };
                 made(mc, fuel, Value::object(mc, Condition::new(mc, mc.frozen(Failure { fault, operation: None })?, operands.get(0), irritants, Value::FALSE)?))
             }
             Intrinsic::ErrorObjectMessage => {

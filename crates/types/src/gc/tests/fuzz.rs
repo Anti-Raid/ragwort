@@ -126,7 +126,12 @@ fn verify_obj<'gc>(
         let data = o.data(mc).map_or(&[][..], |d| d);
         assert!(data.iter().copied().eq((0..m.data as u64).map(|i| 5 * id as u64 + i)), "obj {id} data");
         let host = o.owned(mc).map(|h| *h.get(mc).unwrap());
-        assert_eq!(host, if m.host { Some(id as u64 * 3) } else { None }, "obj {id} host");
+        let expected = if m.host {
+            Some(id as u64 * 3)
+        } else {
+            None
+        };
+        assert_eq!(host, expected, "obj {id} host");
         check_weak(o.cache(mc).map(|w| w.id(mc)), m.weak, live);
         cur = o.next(mc);
         want = m.next;
@@ -261,8 +266,16 @@ fn model_fuzz() {
                 _ => rng.below(8),
             };
             let host = rng.chance(3);
-            let data = if rng.chance(4) { rng.below(600) } else { rng.below(4) };
-            let r = if world.roots.is_empty() { 0 } else { rng.below(world.roots.len()) };
+            let data = if rng.chance(4) {
+                rng.below(600)
+            } else {
+                rng.below(4)
+            };
+            let r = if world.roots.is_empty() {
+                0
+            } else {
+                rng.below(world.roots.len())
+            };
             let live = world.live();
             // The plan for a text operation, computed from the model: the slot whose object gets new text,
             // and the text that the object should then hold.
@@ -270,7 +283,11 @@ fn model_fuzz() {
             let mut cut = None;
             let text_plan = match op {
                 16 => {
-                    let max = if rng.chance(8) { 600 } else { 40 };
+                    let max = if rng.chance(8) {
+                        600
+                    } else {
+                        40
+                    };
                     let fresh = random_text(&mut rng, max);
                     world.slots[a].map(|_| (a, fresh))
                 }
@@ -302,7 +319,14 @@ fn model_fuzz() {
                 10 => arena.collect_slice(1 + rng.below(20_000)),
                 11 if rng.chance(4) => arena.collect(),
                 11 => arena.collect_minor(),
-                12 => arena.set_stress(if rng.chance(2) { None } else { Some(1 + rng.below(500)) }),
+                12 => {
+                    let stress = if rng.chance(2) {
+                        None
+                    } else {
+                        Some(1 + rng.below(500))
+                    };
+                    arena.set_stress(stress)
+                }
                 13 => arena.set_evacuate_all(rng.chance(3)),
                 8 if !world.roots.is_empty() => drop(world.roots.swap_remove(r)),
                 _ => {
@@ -358,7 +382,11 @@ fn model_fuzz() {
                             }
                             16 if plan.is_some() => {
                                 let fresh = plan.as_ref().unwrap().1.clone();
-                                let s = if external { h.external(ExternalText::new(fresh))? } else { from_str(&h, &fresh)? };
+                                let s = if external {
+                                    h.external(ExternalText::new(fresh))?
+                                } else {
+                                    from_str(&h, &fresh)?
+                                };
                                 items.get(a).unwrap().set_text(mc, s.value());
                                 Got::Done
                             }
@@ -380,7 +408,11 @@ fn model_fuzz() {
                             }
                             20 if ready => {
                                 let (t, key) = (table::<Ephemerons>(mc, 1), Value::object(mc, items.get(a).unwrap()));
-                                let old = if remove { t.remove_eq(mc, key)? } else { t.insert_eq(mc, key, Value::object(mc, items.get(b).unwrap()))? };
+                                let old = if remove {
+                                    t.remove_eq(mc, key)?
+                                } else {
+                                    t.insert_eq(mc, key, Value::object(mc, items.get(b).unwrap()))?
+                                };
                                 Got::Id(old.and_then(|v| id_of(mc, v)))
                             }
                             21 if ready => {

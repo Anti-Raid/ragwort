@@ -94,7 +94,11 @@ impl<'gc, S: Item> GcVec<'gc, S> {
     #[inline]
     pub fn get(self, mc: &Mutation<'gc>, index: usize) -> Option<S::Out<'gc>> {
         let (slots, len) = self.parts(mc)?;
-        if index < len { Some(slots.get(index)) } else { None }
+        if index < len {
+            Some(slots.get(index))
+        } else {
+            None
+        }
     }
 
     /// Sets item `index` to `value`. Returns whether `index` was in bounds. If it was not, nothing is written.
@@ -116,7 +120,11 @@ impl<'gc, S: Item> GcVec<'gc, S> {
             return Ok(());
         }
         let doubled = (capacity * 2).max(4);
-        let slots = if doubled > needed { mc.optional(|| mc.alloc_items::<VecSlots<S>, 0>([], doubled, Value::from_bits(0))).ok() } else { None };
+        let slots = if doubled > needed {
+            mc.optional(|| mc.alloc_items::<VecSlots<S>, 0>([], doubled, Value::from_bits(0))).ok()
+        } else {
+            None
+        };
         let slots = match slots {
             Some(slots) => slots,
             None => mc.alloc_items::<VecSlots<S>, 0>([], needed, Value::from_bits(0))?,

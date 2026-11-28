@@ -23,13 +23,15 @@
 //! # Macros across modules
 //!
 //! A module can provide a macro that it defines at the top level. The module keeps the macro's transformer in a variable slot, and its
-//! export says which language the macro's output is in. See [`Export::transformer`](ragwort_compiler::module::Export::transformer).
+//! export says which language the macro's output is in. A module keeps the transformer of a macro only if another module can reach the macro. See
+//! [`ModuleBuilder::finish`](ragwort_compiler::module::ModuleBuilder::finish). See [`Export::transformer`](ragwort_compiler::module::Export::transformer).
 //! Another module can use the macro if the output is made of core forms, or if both modules have the same language.
 //!
 //! The output of a macro refers to bindings of the macro's own module. This works as follows:
 //!
 //! - Each identifier in a syntax object carries a binding value. For a module-level name, the value names the module that binds it. See [`Engine::binding_value`].
 //! - A module's own names get their module when the module is finished. See [`Engine::seal`]. The module also keeps the binding of each such name, even if it does not export it.
+//! - A variable or a macro that a macro's output defined has no name in the module. Its binding value holds its slot instead, and the module keeps it by slot.
 //! - When another module expands the macro's output, an identifier that the macro introduced lacks that module's own scope. The engine then resolves
 //!   it by its binding value. See [`Engine::origin`].
 

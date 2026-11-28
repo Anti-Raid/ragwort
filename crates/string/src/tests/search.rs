@@ -12,7 +12,14 @@ fn naive_last(text: &[char], pattern: &[char], to: usize) -> Option<usize> {
 /// Returns `len` random letters. Most are one of two letters, so patterns often match in part. Occasionally a letter is drawn from all five, which include wider characters.
 fn few_letters(rng: &mut Rng, len: usize) -> Vec<char> {
     let letters = ['a', 'b', 'c', 'Ā', '😀'];
-    (0..len).map(|_| letters[if rng.below(8) == 0 { rng.below(5) } else { rng.below(2) }]).collect()
+    (0..len).map(|_| {
+        let choice = if rng.below(8) == 0 {
+            rng.below(5)
+        } else {
+            rng.below(2)
+        };
+        letters[choice]
+    }).collect()
 }
 
 fn text_of(h: &TestHost, s: TestStr) -> Vec<char> {
@@ -45,7 +52,11 @@ fn find_agrees_with_a_naive_search() {
     let h = TestHost::with_capacity(1 << 20);
     let mut rng = Rng(7);
     for _ in 0..4000 {
-        let n = if rng.below(10) == 0 { rng.below(700) } else { rng.below(60) };
+        let n = if rng.below(10) == 0 {
+            rng.below(700)
+        } else {
+            rng.below(60)
+        };
         let text = few_letters(&mut rng, n);
         let pattern = pattern_for(&mut rng, &text);
         let (from, to) = (rng.below(text.len() + 1), rng.below(text.len() + 1));
@@ -123,7 +134,11 @@ fn prefixes_and_suffixes() {
 
 fn split_model(text: &[char], separator: &[char]) -> Vec<Vec<char>> {
     if separator.is_empty() {
-        return if text.is_empty() { vec![vec![]] } else { text.iter().map(|&c| vec![c]).collect() };
+        return if text.is_empty() {
+            vec![vec![]]
+        } else {
+            text.iter().map(|&c| vec![c]).collect()
+        };
     }
     let (mut out, mut at) = (Vec::new(), 0);
     while let Some(i) = naive(text, separator, at) {
@@ -141,7 +156,11 @@ fn splits_agree_with_a_model() {
     for _ in 0..2000 {
         let n = rng.below(50);
         let text = few_letters(&mut rng, n);
-        let n = if rng.below(10) == 0 { 0 } else { 1 + rng.below(2) };
+        let n = if rng.below(10) == 0 {
+            0
+        } else {
+            1 + rng.below(2)
+        };
         let separator = few_letters(&mut rng, n);
         let want = split_model(&text, &separator);
         let limit = rng.below(want.len() + 2);

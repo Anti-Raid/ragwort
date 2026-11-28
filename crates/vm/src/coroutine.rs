@@ -258,7 +258,11 @@ impl<'gc> Outer<'_, 'gc> {
         stack.set_top(base);
         // If base is 0, no continuation records hold frames on this segment, so the entire segment can be
         // reclaimed.
-        let freed = if base == 0 { Some(stack.segment(mc)) } else { None };
+        let freed = if base == 0 {
+            Some(stack.segment(mc))
+        } else {
+            None
+        };
         task.set_state(mc, state);
         task.set_resumer(mc, Value::FALSE);
         prompts::empty(mc, task);
@@ -368,7 +372,11 @@ pub(crate) fn park<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>, fp: usize, at: 
     let (Ok(fp), Ok(pc)) = (u32::try_from(fp), u32::try_from(at.pc)) else { return false };
     task.set_park_fp(mc, fp);
     task.set_park_pc(mc, pc);
-    task.set_park_base(mc, u32::from(at.base) | if tried { TRIED } else { 0 });
+    task.set_park_base(mc, u32::from(at.base) | if tried {
+        TRIED
+    } else {
+        0
+    });
     true
 }
 
@@ -381,7 +389,11 @@ pub(crate) fn is_parked<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>) -> bool {
 /// Returns the slot where the parked frames of `task` end, or `None` if it is not parked.
 pub(crate) fn parked_top<'gc>(mc: &Mutation<'gc>, task: Gc<'gc, Task>) -> Option<usize> {
     let park = task.park_base(mc);
-    if park == 0 { None } else { Some((task.park_fp(mc) + (park & 0xFF)) as usize) }
+    if park == 0 {
+        None
+    } else {
+        Some((task.park_fp(mc) + (park & 0xFF)) as usize)
+    }
 }
 
 /// Saves the parked frames of the suspended task `task` to its chain. The record is the same as the

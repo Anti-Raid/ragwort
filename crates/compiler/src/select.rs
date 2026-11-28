@@ -36,7 +36,11 @@ pub(crate) fn select<'t, 'gc>(arena: &'t Arena, function: &'t l5::Function<'t, '
     let values = function.values as usize;
     // When the parameters outnumber the argument registers, the last register holds the surplus arguments as a list.
     let total = function.params.len() + usize::from(function.rest.is_some());
-    let unpacked = if total <= usize::from(MAX_PARAMS) { &[][..] } else { &function.params[usize::from(MAX_PARAMS - 1)..] };
+    let unpacked = if total <= usize::from(MAX_PARAMS) {
+        &[][..]
+    } else {
+        &function.params[usize::from(MAX_PARAMS - 1)..]
+    };
     let Operands { imms, hinted } = operands(arena, function);
     let mut uses = arena.vec_of(0u32, values);
     for block in &function.blocks {
@@ -90,7 +94,11 @@ pub(crate) fn select<'t, 'gc>(arena: &'t Arena, function: &'t l5::Function<'t, '
             (_, l5::End::TailPrim { prim, args, spread }) => End::TailPrim { prim: *prim, args, spread: *spread },
         };
         // An instruction fused into the end of the block keeps its own site.
-        let end_site = if fused { block.sites[kept] } else { block.end_site };
+        let end_site = if fused {
+            block.sites[kept]
+        } else {
+            block.end_site
+        };
         blocks.push(l6::BlockData { insts, end, end_site });
     }
     l6::Function { source: function, blocks, unpacked, uses, to, order, hints }
@@ -111,7 +119,12 @@ fn selected<'t, 'gc>(inst: &'t l5::Inst<'t, 'gc>, site: u32, imms: &[Option<Imm<
             // A hinted table instruction reads its table and its last argument. Its hint holds the key. A read whose default is `#f` reads only the table.
             (None, Some(hint), Prim::Intrinsic(Intrinsic::TableRef)) => {
                 let plain = hinted[dst.0 as usize].is_some_and(|hinted| hinted.plain);
-                (Kind::TableRef(hint), Some(args[0]), if plain { &[][..] } else { &args[2..] })
+                let extra = if plain {
+                    &[][..]
+                } else {
+                    &args[2..]
+                };
+                (Kind::TableRef(hint), Some(args[0]), extra)
             }
             (None, Some(hint), _) => (Kind::TableSet(hint), Some(args[0]), &args[2..]),
             (None, None, _) => (Kind::Prim { prim: *prim, spread: *spread }, None, args.as_slice()),
@@ -243,7 +256,12 @@ fn layout<'t>(arena: &'t Arena, function: &l5::Function<'_, '_>, to: &[usize], f
                 let (then, other) = (to[then.0 as usize], to[other.0 as usize]);
                 let invert = fusable[block] && recurs(arena, function, to, &placed, other) && !recurs(arena, function, to, &placed, then);
                 inverted[block] = invert;
-                stack.extend(if invert { [then, other] } else { [other, then] });
+                let branches = if invert {
+                    [then, other]
+                } else {
+                    [other, then]
+                };
+                stack.extend(branches);
             }
             l5::End::Return(_) | l5::End::TailCall { .. } | l5::End::TailPrim { .. } => {}
         }

@@ -32,7 +32,11 @@ pub(crate) fn emit<'gc>(mc: &Mutation<'gc>, owner: Option<Gc<'gc, objects::Modul
     let code = module.function(program.root(), &[])?;
     while let Some(Pending { slot, function, captures, closure }) = module.pending.pop() {
         let bytecode = module.function(&program.functions[function as usize], &captures)?;
-        let value = if closure { Value::object(mc, Closure::new(mc, Some(bytecode), 0, Value::VOID)?) } else { Value::object(mc, bytecode) };
+        let value = if closure {
+            Value::object(mc, Closure::new(mc, Some(bytecode), 0, Value::VOID)?)
+        } else {
+            Value::object(mc, bytecode)
+        };
         module.constants[slot as usize] = value;
         module.index.insert(value.to_bits(), slot);
     }
@@ -412,7 +416,11 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
                 return Ok(());
             }
         }
-        let host = if let Prim::Host(def) = prim { Some(self.module.host(def)?) } else { None };
+        let host = if let Prim::Host(def) = prim {
+            Some(self.module.host(def)?)
+        } else {
+            None
+        };
         let count = args.len() as u8;
         let staged = self.stage(base, None, args, matches!(prim, Prim::Intrinsic(_)));
         // A `collect` is a call whose values are loaded as a list.
@@ -469,7 +477,12 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
             }
             (SlotOp::Store | SlotOp::StoreChecked, &[value]) => {
                 let src = self.read(value, 0);
-                self.ops.push(if op == SlotOp::Store { Op::StoreSlot { src, slot } } else { Op::StoreSlotChecked { src, slot } });
+                let store = if op == SlotOp::Store {
+                    Op::StoreSlot { src, slot }
+                } else {
+                    Op::StoreSlotChecked { src, slot }
+                };
+                self.ops.push(store);
                 if self.used(dst) {
                     let index = self.module.constant(Value::VOID)?;
                     let target = self.target(dst);
@@ -577,7 +590,11 @@ impl<'m, 'a, 't, 'gc> Emitter<'m, 'a, 't, 'gc> {
                 self.go(then, next);
             }
             End::BranchPrim { intrinsic, args, then, other, branch_if, .. } => {
-                let (target, fall) = if branch_if { (then, other) } else { (other, then) };
+                let (target, fall) = if branch_if {
+                    (then, other)
+                } else {
+                    (other, then)
+                };
                 let op = match *args {
                     [a0] => Op::BranchIntrinsic1 { a: self.read(a0, 0), intrinsic, branch_if, offset: 0 },
                     [a0, a1] => {

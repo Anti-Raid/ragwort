@@ -149,7 +149,11 @@ fn powers() {
             flo(f64::NAN),
         ];
         for _ in 0..ROUNDS / WIDTHS.len() / 4 {
-            let z = if rng.bool() { special_bases[rng.below(special_bases.len() as u64) as usize] } else { moderate(&h, &mut rng, true) };
+            let z = if rng.bool() {
+                special_bases[rng.below(special_bases.len() as u64) as usize]
+            } else {
+                moderate(&h, &mut rng, true)
+            };
             let w = match rng.below(3) {
                 0 => moderate(&h, &mut rng, false),
                 _ => exponents[rng.below(exponents.len() as u64) as usize],
@@ -184,7 +188,14 @@ fn racket(h: &TestHost, z: TestNumber) -> String {
         match x {
             TestReal::Exact(r) => rational::to_string(h, r, 10).unwrap(),
             TestReal::Flonum(f) if f.is_nan() => "+nan.0".into(),
-            TestReal::Flonum(f) if f.is_infinite() => (if f > 0.0 { "+inf.0" } else { "-inf.0" }).into(),
+            TestReal::Flonum(f) if f.is_infinite() => {
+                let text = if f > 0.0 {
+                    "+inf.0"
+                } else {
+                    "-inf.0"
+                };
+                text.into()
+            }
             TestReal::Flonum(f) if f.fract() == 0.0 && f.abs() < 1e16 => format!("{f:.1}"),
             TestReal::Flonum(f) if f != 0.0 && f.abs() < 1e-4 => format!("{f:e}").replace("e-", "e-"),
             TestReal::Flonum(f) => format!("{f}"),
@@ -194,8 +205,16 @@ fn racket(h: &TestHost, z: TestNumber) -> String {
         TestNumber::Real(x) => real(h, x),
         TestNumber::Complex(re, im) => {
             let im = real(h, im);
-            let sign = if im.starts_with(['-', '+']) { "" } else { "+" };
-            let re = if crate::real::is_exact_zero(h, re) { String::new() } else { real(h, re) };
+            let sign = if im.starts_with(['-', '+']) {
+                ""
+            } else {
+                "+"
+            };
+            let re = if crate::real::is_exact_zero(h, re) {
+                String::new()
+            } else {
+                real(h, re)
+            };
             format!("{re}{sign}{im}i")
         }
     }
@@ -390,7 +409,11 @@ fn racket_agrees_past_the_range_of_doubles() {
     // Returns `n · 10^k` as an exact number.
     fn exact(h: &TestHost, n: i64, k: i64) -> TestReal {
         let power = int::expt(h, int(h, 10), k.unsigned_abs()).unwrap();
-        let r = if k >= 0 { TestRational::Int(int::mul(h, int(h, n), power).unwrap()) } else { rational::from_parts(h, int(h, n), power).unwrap() };
+        let r = if k >= 0 {
+            TestRational::Int(int::mul(h, int(h, n), power).unwrap())
+        } else {
+            rational::from_parts(h, int(h, n), power).unwrap()
+        };
         TestReal::Exact(r)
     }
     fn complex(h: &TestHost, a: TestReal, b: TestReal) -> TestNumber {
@@ -431,7 +454,11 @@ fn special_values_follow_annex_g() {
         }
     }
     fn close(want: f64, got: f64, any_sign: bool, scale: f64) -> bool {
-        let (want, got) = if any_sign { (want.abs(), got.abs()) } else { (want, got) };
+        let (want, got) = if any_sign {
+            (want.abs(), got.abs())
+        } else {
+            (want, got)
+        };
         want.is_nan() && got.is_nan()
             || want.to_bits() == got.to_bits()
             || want.is_finite() && got.is_finite() && (want != 0.0 || got != 0.0) && (want - got).abs() <= 4.0 * f64::EPSILON * scale

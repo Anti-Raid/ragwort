@@ -89,7 +89,12 @@ fn caseless_comparison_orders_by_the_folds() {
             let n = rng.below(5);
             (0..n).map(|_| ['a', 'B', 'c', 'D', 'A'][rng.below(5)]).collect()
         };
-        let s = shapes(&h, &text, rng.below(text.len() + 1))[rng.below(if text.len() >= 2 { 4 } else { 2 })];
+        let shape_count = if text.len() >= 2 {
+            4
+        } else {
+            2
+        };
+        let s = shapes(&h, &text, rng.below(text.len() + 1))[rng.below(shape_count)];
         let fold = text_of(&h, foldcase(&h, s).unwrap());
         for (t, other) in pool.iter().rev().take(8) {
             assert_eq!(compare_ci(&h, s, *t), Ok(fold.chars().cmp(other.chars())), "{text:?} vs {other:?}");

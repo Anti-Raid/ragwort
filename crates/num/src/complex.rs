@@ -107,7 +107,11 @@ pub fn rectangular<H: ComplexHost>(h: &H, re: H::Real, im: H::Real) -> Res<H> {
 /// Implements `make-polar`: returns `modulus·cos(a) + modulus·sin(a)·i`.
 pub fn polar<H: ComplexHost>(h: &H, modulus: H::Real, a: H::Real) -> Res<H> {
     let float = real::to_f64(h, a)?;
-    let sin = if real::is_exact_zero(h, a) { a } else { h.flonum(float.sin())? };
+    let sin = if real::is_exact_zero(h, a) {
+        a
+    } else {
+        h.flonum(float.sin())?
+    };
     rectangular(h, real::mul(h, modulus, h.flonum(float.cos())?)?, real::mul(h, modulus, sin)?)
 }
 
@@ -132,7 +136,11 @@ pub fn to_string<H: ComplexHost>(h: &H, z: H::Number, radix: u32) -> Result<Stri
         ComplexView::Complex { re, im } => (re, im),
     };
     let zero = matches!(h.real_view(re), RealView::Exact(value) if rational::sign(h, value).is_eq());
-    let mut out = if zero { String::new() } else { real::to_string(h, re, radix)? };
+    let mut out = if zero {
+        String::new()
+    } else {
+        real::to_string(h, re, radix)?
+    };
     let im = real::to_string(h, im, radix)?;
     if !im.starts_with(['+', '-']) {
         out.push('+');
@@ -244,7 +252,11 @@ pub fn div<H: ComplexHost>(h: &H, x: H::Number, y: H::Number) -> Res<H> {
 /// Returns `value · 2^scale`, exactly.
 fn times_power_of_two<H: RealHost>(h: &H, value: H::Rational, scale: i64) -> Result<H::Rational, H::Error> {
     let power = h.of_int(int::arithmetic_shift(h, int::from_i64(h, 1)?, scale.abs())?);
-    if scale >= 0 { rational::mul(h, value, power) } else { rational::div(h, value, power) }
+    if scale >= 0 {
+        rational::mul(h, value, power)
+    } else {
+        rational::div(h, value, power)
+    }
 }
 
 /// Returns an estimate of `log2 |value|` that is within one of the true value. `value` must not be zero.
@@ -287,7 +299,12 @@ fn exact_sqrt<H: RealHost>(h: &H, value: H::Rational) -> Result<Option<H::Ration
     #[inline(always)]
     fn root<H: RealHost>(h: &H, integer: H::Int) -> Result<Option<H::Int>, H::Error> {
         let candidate = int::isqrt(h, integer)?;
-        Ok(if int::compare(h, int::mul(h, candidate, candidate)?, integer) == Ordering::Equal { Some(candidate) } else { None })
+        let root = if int::compare(h, int::mul(h, candidate, candidate)?, integer) == Ordering::Equal {
+            Some(candidate)
+        } else {
+            None
+        };
+        Ok(root)
     }
     let Some(num) = root(h, rational::numerator(h, value))? else { return Ok(None) };
     let Some(den) = root(h, rational::denominator(h, value)?)? else { return Ok(None) };
@@ -308,7 +325,11 @@ fn sqrt_real<H: RealHost>(h: &H, x: H::Real) -> RealRes<H> {
         return h.flonum(float.sqrt());
     }
     let (mantissa, scale) = split(h, value)?;
-    let (mantissa, scale) = if scale % 2 == 0 { (mantissa, scale) } else { (mantissa * 2.0, scale - 1) };
+    let (mantissa, scale) = if scale % 2 == 0 {
+        (mantissa, scale)
+    } else {
+        (mantissa * 2.0, scale - 1)
+    };
     h.flonum(cfloat::ldexp(mantissa.sqrt(), scale / 2))
 }
 
@@ -395,7 +416,11 @@ pub fn sqrt<H: ComplexHost>(h: &H, z: H::Number) -> Res<H> {
             let real_root = exact_sqrt(h, half(h, rational::add(h, modulus, a)?)?)?;
             let imag_root = exact_sqrt(h, half(h, rational::sub(h, modulus, a)?)?)?;
             if let (Some(real_root), Some(imag_root)) = (real_root, imag_root) {
-                let imag_root = if rational::sign(h, b) == Ordering::Less { rational::neg(h, imag_root)? } else { imag_root };
+                let imag_root = if rational::sign(h, b) == Ordering::Less {
+                    rational::neg(h, imag_root)?
+                } else {
+                    imag_root
+                };
                 return rectangular(h, h.of_rational(real_root), h.of_rational(imag_root));
             }
         }
@@ -572,7 +597,14 @@ fn integer_power<H: ComplexHost>(h: &H, z: H::Number, n: H::Int) -> Res<H> {
         };
         return match int::to_i64(h, n) {
             Some(exponent) => Ok(h.of_real(h.of_rational(rational::expt(h, fraction, exponent)?))),
-            None if real::eqv(h, b, real::from_i64(h, -1)?) => exact_int(h, if int::is_even(h, n) { 1 } else { -1 }),
+            None if real::eqv(h, b, real::from_i64(h, -1)?) => {
+                let sign = if int::is_even(h, n) {
+                    1
+                } else {
+                    -1
+                };
+                exact_int(h, sign)
+            }
             // The exponent does not fit in an `i64`, so the result for any other base needs more bits than memory can hold.
             None => Err(int::too_big(h)),
         };
@@ -594,5 +626,9 @@ fn integer_power<H: ComplexHost>(h: &H, z: H::Number, n: H::Int) -> Res<H> {
             base = mul(h, base, base)?;
         }
     }
-    if exponent < 0 { div(h, exact_int(h, 1)?, result) } else { Ok(result) }
+    if exponent < 0 {
+        div(h, exact_int(h, 1)?, result)
+    } else {
+        Ok(result)
+    }
 }

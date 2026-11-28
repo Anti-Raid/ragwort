@@ -230,7 +230,11 @@ impl std::fmt::Display for Function<'_, '_> {
                 End::Jump(to, operands) => writeln!(formatter, "  jump {to}({})", Vals(operands))?,
                 End::Branch { test, then, other } => writeln!(formatter, "  branch {test} {then} {other}")?,
                 End::BranchPrim { intrinsic, args: operands, then, other, branch_if } => {
-                    let jumps = if branch_if { ", jumps if true" } else { "" };
+                    let jumps = if branch_if {
+                        ", jumps if true"
+                    } else {
+                        ""
+                    };
                     writeln!(formatter, "  branch-on {}{} {then} {other}{jumps}", intrinsic.name(), args(operands))?;
                 }
                 End::Return(value) => writeln!(formatter, "  return {value}")?,

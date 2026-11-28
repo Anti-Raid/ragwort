@@ -69,7 +69,11 @@ impl StackRecord {
 
     fn set_ordinary(&self, heap: Heap<'_>, end: usize, attached: bool) {
         if let Some(word) = heap.words().get(self.segment.get() as usize + 1) {
-            let flag = if attached { ATTACHED } else { 0 };
+            let flag = if attached {
+                ATTACHED
+            } else {
+                0
+            };
             word.set(flag | u64::from(end.try_into().unwrap_or(u32::MAX)));
         }
     }

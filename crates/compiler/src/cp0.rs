@@ -345,7 +345,11 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             }
             Task::Within(binds) => {
                 let body = self.pop();
-                if self.out[binds].is_empty() { body } else { self.out.add(Node::Let(binds, body)) }
+                if self.out[binds].is_empty() {
+                    body
+                } else {
+                    self.out.add(Node::Let(binds, body))
+                }
             }
             Task::Seq => {
                 let (second, first) = (self.pop(), self.pop());
@@ -555,7 +559,11 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             (Node::Ref(left), Node::Ref(right)) => left == right,
             _ => false,
         };
-        if same { self.seq(test, consequent) } else { self.out.add(Node::If(test, consequent, other)) }
+        if same {
+            self.seq(test, consequent)
+        } else {
+            self.out.add(Node::If(test, consequent, other))
+        }
     }
 
     /// Simplifies `(if test then other)` given an already-optimized `test` expression, folding branches or recording dominating branch facts.
@@ -566,7 +574,14 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             let node = self.out[test];
             match node {
                 // Constant condition folding: `(if <false-const> then other) -> other` and `(if <truthy-const> then other) -> then`.
-                Node::Quote(value) => then.push(Task::Arm(if value.is_false() { other } else { consequent })),
+                Node::Quote(value) => {
+                    let taken = if value.is_false() {
+                        other
+                    } else {
+                        consequent
+                    };
+                    then.push(Task::Arm(taken))
+                }
                 // Variable known to be truthy along the current dominating branch: folds directly to the `then` branch.
                 Node::Ref(var) if self.truthy_vars.contains(&var) => then.push(Task::Arm(consequent)),
                 // Variable known to be false along the current dominating branch: folds directly to the `other` branch.
@@ -632,7 +647,11 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                         && let Some(kind) = self.struct_type(kind) =>
                 {
                     let truthy = match subject {
-                        Subject::Local(var) => if self.truthy_vars.insert(var) { Some(var) } else { None },
+                        Subject::Local(var) => if self.truthy_vars.insert(var) {
+                            Some(var)
+                        } else {
+                            None
+                        },
                         Subject::Slot(_) => None,
                     };
                     then.extend([Task::ArmOf(consequent, subject, kind, true), Task::DerivedElse { truthy, subject, kind, other, test }]);
@@ -695,7 +714,14 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             small = stats.valid_calls == stats.total && self.small_as_written(fun);
         }
         match init {
-            Init::Src(expr) => then.extend([if small { Task::Small(expr) } else { Task::Expr(expr) }, Task::Val(var)]),
+            Init::Src(expr) => {
+                let task = if small {
+                    Task::Small(expr)
+                } else {
+                    Task::Expr(expr)
+                };
+                then.extend([task, Task::Val(var)])
+            }
             Init::Done(init) => self.bound(var, init),
         }
     }
@@ -907,7 +933,11 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
             made = match wrap {
                 Task::Then(prefix) => self.seq(prefix, made),
                 Task::Within(binds) => {
-                    if self.out[binds].is_empty() { made } else { self.out.add(Node::Let(binds, made)) }
+                    if self.out[binds].is_empty() {
+                        made
+                    } else {
+                        self.out.add(Node::Let(binds, made))
+                    }
                 }
                 _ => unreachable!("only binding forms float out"),
             };
@@ -977,7 +1007,11 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         let direct = match *args.as_slice() {
             [consumer, producer] if matches!(self.out[consumer], Node::Lambda(_) | Node::Ref(_) | Node::Quote(_)) => self.lambda(producer).and_then(|fun| {
                 let function = self.out[fun];
-                if self.out[function.params].is_empty() && function.rest.is_none() { Some((consumer, producer, function.body)) } else { None }
+                if self.out[function.params].is_empty() && function.rest.is_none() {
+                    Some((consumer, producer, function.body))
+                } else {
+                    None
+                }
             }),
             _ => None,
         };
@@ -1078,7 +1112,12 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
     }
 
     fn truth(&mut self, truthy: bool) -> Id<'d> {
-        self.quote(if truthy { Value::TRUE } else { Value::FALSE })
+        let boolean = if truthy {
+            Value::TRUE
+        } else {
+            Value::FALSE
+        };
+        self.quote(boolean)
     }
 
     fn rules(&mut self, prim: Prim, intrinsic: Intrinsic, mut args: Vec<Id<'d>>) -> Id<'d> {
@@ -1339,7 +1378,11 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
         }
         let mut expr = func.body;
         while let Node::If(test, consequent, other) = self.out[expr] {
-            expr = if self.decided(test)? { consequent } else { other };
+            expr = if self.decided(test)? {
+                consequent
+            } else {
+                other
+            };
         }
         match self.out[expr] {
             Node::App(to, args) if self.out[args].is_empty() && matches!(self.out[to], Node::Ref(_)) => Some(to),
@@ -1468,7 +1511,11 @@ impl<'s, 'd, 'gc> Cp0<'_, '_, 's, 'd, 'gc> {
                         return None;
                     }
                     // Because the struct type is statically verified, replace the checked accessor with an unchecked field read; immutable fields return constant values.
-                    let unchecked = if structs::is_mutable(mc, kind, position) { Intrinsic::StructField } else { Intrinsic::StructFixedField };
+                    let unchecked = if structs::is_mutable(mc, kind, position) {
+                        Intrinsic::StructField
+                    } else {
+                        Intrinsic::StructFixedField
+                    };
                     return Some(self.opt_intrinsic(Prim::Intrinsic(unchecked), vec![read, at]));
                 }
                 // When an ephemeral struct is constructed solely to read a single field, extract that field directly and sequence remaining field expressions for effects.

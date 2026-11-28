@@ -38,7 +38,11 @@ pub fn rfind<H: Host>(h: &H, string: H::Str, pattern: H::Str, to: usize) -> Resu
 
 /// Returns the range of a text of `n` bytes to search. A forward search covers `at..n`, and a backward search (`BACK`) covers `0..at`.
 fn room<const BACK: bool>(at: usize, n: usize) -> Range<usize> {
-    if BACK { 0..at } else { at..n }
+    if BACK {
+        0..at
+    } else {
+        at..n
+    }
 }
 
 #[inline(never)]
@@ -75,13 +79,14 @@ fn find_units<H: Host, const BACK: bool>(h: &H, text: Units<'_>, chars: usize, p
     let Some(found) = found else { return Ok(None) };
     let byte = found + room.start;
     // In an ASCII text a byte offset is a character index. Otherwise the characters before the match are counted.
-    Ok(Some(if chars == text.len() {
+    let index = if chars == text.len() {
         byte
     } else if BACK {
         text.slice(0..byte).count_chars()
     } else {
         at + text.slice(at_byte..byte).count_chars()
-    }))
+    };
+    Ok(Some(index))
 }
 
 /// Returns the byte offset of the last occurrence of `pattern` in `string` that ends at or before byte offset `to`. Fails if `to` does not lie between two characters.
@@ -131,26 +136,55 @@ pub fn find_bytes<H: Host>(h: &H, string: H::Str, pattern: H::Str, from: usize) 
 fn search<const BACK: bool>(text: Units<'_>, pattern: Units<'_>) -> Option<usize> {
     #[inline(always)]
     fn at<const BACK: bool>(n: usize, i: usize) -> usize {
-        if BACK { n - 1 - i } else { i }
+        if BACK {
+            n - 1 - i
+        } else {
+            i
+        }
     }
     let cell = Cell::new(0);
     let text = text.anchored(&cell);
     let (n, pattern_len) = (text.len(), pattern.len());
     let found = match pattern_len {
-        0 => return Some(if BACK { n } else { 0 }),
+        0 => {
+            let found = if BACK {
+                n
+            } else {
+                0
+            };
+            return Some(found)
+        }
         1 => return find_byte::<BACK>(text, pattern.byte(0)),
         2..=COPIED_PATTERN => {
             let mut buf = [0; COPIED_PATTERN];
-            buf.iter_mut().zip(0..pattern_len).for_each(|(slot, i)| *slot = u32::from(pattern.byte(if BACK { pattern_len - 1 - i } else { i })));
+            buf.iter_mut().zip(0..pattern_len).for_each(|(slot, i)| {
+                let position = if BACK {
+                    pattern_len - 1 - i
+                } else {
+                    i
+                };
+                *slot = u32::from(pattern.byte(position));
+            });
             let copied = &buf[..pattern_len];
             match text {
                 Units::Packed(packed) => two_way(|i| u32::from(packed.byte(at::<BACK>(n, i))), n, |i| copied[i], pattern_len),
                 _ => two_way(|i| u32::from(text.byte(at::<BACK>(n, i))), n, |i| copied[i], pattern_len),
             }
         }
-        _ => two_way(|i| u32::from(text.byte(at::<BACK>(n, i))), n, |i| u32::from(pattern.byte(if BACK { pattern_len - 1 - i } else { i })), pattern_len),
+        _ => two_way(|i| u32::from(text.byte(at::<BACK>(n, i))), n, |i| {
+            let position = if BACK {
+                pattern_len - 1 - i
+            } else {
+                i
+            };
+            u32::from(pattern.byte(position))
+        }, pattern_len),
     };
-    found.map(|i| if BACK { n - pattern_len - i } else { i })
+    found.map(|i| if BACK {
+        n - pattern_len - i
+    } else {
+        i
+    })
 }
 
 /// Returns the offset of the first byte of `text` equal to `byte`, or of the last such byte if `BACK`.
@@ -245,7 +279,11 @@ fn two_way(text: impl Fn(usize) -> u32, n: usize, pattern: impl Fn(usize) -> u32
 /// of the later of the two maximal suffixes, one for each ordering of bytes. That split is a critical factorization.
 fn critical_factorization(pattern: impl Fn(usize) -> u32 + Copy, pattern_len: usize) -> (usize, usize) {
     let (a, b) = (maximal_suffix(pattern, pattern_len, Ordering::Less), maximal_suffix(pattern, pattern_len, Ordering::Greater));
-    if a.0 > b.0 { a } else { b }
+    if a.0 > b.0 {
+        a
+    } else {
+        b
+    }
 }
 
 /// Returns the start index of the maximal suffix of the pattern and the period of that suffix. `order` selects the ordering
@@ -309,7 +347,11 @@ fn char_size_at<H: Host>(h: &H, mut string: H::Str, mut at: usize) -> usize {
             StrView::Rope { flat: Some(flat), .. } => string = flat,
             StrView::Rope { left, right, .. } => {
                 let left_bytes = byte_len(h, left);
-                (string, at) = if at < left_bytes { (left, at) } else { (right, at - left_bytes) };
+                (string, at) = if at < left_bytes {
+                    (left, at)
+                } else {
+                    (right, at - left_bytes)
+                };
             }
         }
     }
@@ -439,7 +481,11 @@ fn trimmed<H: Host>(h: &H, string: H::Str, start: bool, end: bool) -> Res<H> {
     let text = flatten(h, string)?;
     let units = flat(h, text).expect("flattened");
     let n = units.len();
-    let from = if start { spaces_end(units, 0) } else { 0 };
+    let from = if start {
+        spaces_end(units, 0)
+    } else {
+        0
+    };
     let mut to = n;
     while end && to > from {
         let before = units.before(to);

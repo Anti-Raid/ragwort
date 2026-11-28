@@ -329,7 +329,11 @@ fn equality_goes_as_deep_as_it_should() {
         // Structural equality memoizes visits to shared subgraphs to avoid exponential traversal: a 64-level DAG of `(cons x x)` or `(vector x x)` containing 2^64 paths completes efficiently in linear time.
         fn shared<'gc>(mc: &Mutation<'gc>, leaf: Value<'gc>, vector: bool) -> Value<'gc> {
             (0..64).fold(leaf, |node, _| {
-                if vector { Vectors::new(mc).immutable_from_slice(&[node, node]).unwrap().value(mc) } else { Pairs::new(mc).cons(node, node).unwrap().value(mc) }
+                if vector {
+                    Vectors::new(mc).immutable_from_slice(&[node, node]).unwrap().value(mc)
+                } else {
+                    Pairs::new(mc).cons(node, node).unwrap().value(mc)
+                }
             })
         }
         for vector in [false, true] {
@@ -340,7 +344,12 @@ fn equality_goes_as_deep_as_it_should() {
             let links: Vec<_> = (0..count).map(|_| Vectors::new(mc).make(2, fix(0)).unwrap()).collect();
             for (i, link) in links.iter().enumerate() {
                 link.items(mc).set(mc, 0, links[(i + 1) % count].value(mc));
-                link.items(mc).set(mc, 1, fix(if i == count - 1 { last } else { 0 }));
+                let number = if i == count - 1 {
+                    last
+                } else {
+                    0
+                };
+                link.items(mc).set(mc, 1, fix(number));
             }
             links[0].value(mc)
         }
@@ -601,13 +610,28 @@ fn structs_are_of_their_types_and_equal_by_their_fields_or_themselves() {
         let q = run(mc, Intrinsic::MakeStruct, &[point4, fix(1), fix(2), fix(3), fix(4)]).unwrap();
         // Validates `struct-derived-from?`: verifies that an instance matches its concrete type descriptor and all ancestor supertypes, but does not match unrelated types or non-struct values.
         for (v, kind, is) in [(p, point, true), (p, point3, false), (p, other, false), (q, point, true), (q, point3, true), (q, point4, true), (q, other, false), (fix(1), point, false)] {
-            assert_eq!(run(mc, Intrinsic::IsStructDerivedFrom, &[v, kind]), Ok(if is { Value::TRUE } else { Value::FALSE }));
+            let expected = if is {
+                Value::TRUE
+            } else {
+                Value::FALSE
+            };
+            assert_eq!(run(mc, Intrinsic::IsStructDerivedFrom, &[v, kind]), Ok(expected));
         }
         for (v, is) in [(p, true), (q, true), (point, false), (fix(1), false), (pairs.list(&[p]).unwrap(), false)] {
-            assert_eq!(run(mc, Intrinsic::IsStruct, &[v]), Ok(if is { Value::TRUE } else { Value::FALSE }));
+            let expected = if is {
+                Value::TRUE
+            } else {
+                Value::FALSE
+            };
+            assert_eq!(run(mc, Intrinsic::IsStruct, &[v]), Ok(expected));
         }
         for (v, is) in [(point, true), (point4, true), (p, false), (fix(1), false)] {
-            assert_eq!(run(mc, Intrinsic::IsStructType, &[v]), Ok(if is { Value::TRUE } else { Value::FALSE }));
+            let expected = if is {
+                Value::TRUE
+            } else {
+                Value::FALSE
+            };
+            assert_eq!(run(mc, Intrinsic::IsStructType, &[v]), Ok(expected));
         }
         assert_eq!(run(mc, Intrinsic::StructRef, &[q, point, fix(1)]), Ok(fix(2)));
         assert_eq!(run(mc, Intrinsic::StructRef, &[q, point4, fix(3)]), Ok(fix(4)));

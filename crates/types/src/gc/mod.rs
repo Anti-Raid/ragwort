@@ -317,7 +317,11 @@ fn encode(double: f64) -> Option<u64> {
     let top = bits >> 60 & 0b111;
     if top == 0b011 || top == 0b100 {
         let word = bits.rotate_left(3) | FLONUM;
-        return if word.wrapping_sub(ZERO) > LAST_SPECIAL { Some(word) } else { None };
+        return if word.wrapping_sub(ZERO) > LAST_SPECIAL {
+            Some(word)
+        } else {
+            None
+        };
     }
     let index = SPECIALS.iter().position(|&special| special == bits)?;
     Some(ZERO + 4 * index as u64)
@@ -448,7 +452,11 @@ impl Desc {
         let mut desc = Self::of::<T>(0).items(items);
         let mut i = 0;
         while i < roles.len() {
-            let bit = if desc.fields < 64 { 1 << desc.fields } else { 0 };
+            let bit = if desc.fields < 64 {
+                1 << desc.fields
+            } else {
+                0
+            };
             assert!(bit != 0 || matches!(roles[i], Role::Word), "only the first 64 fields can hold references");
             match roles[i] {
                 Role::Word => {}
@@ -473,9 +481,17 @@ impl Desc {
         if field >= self.fields as usize {
             return None;
         }
-        let bit = if field < 64 { 1 << field } else { 0 };
-        let prev = if field >= 1 && field <= 64 { 1 << (field - 1) } else { 0 };
-        Some(if self.values & bit != 0 {
+        let bit = if field < 64 {
+            1 << field
+        } else {
+            0
+        };
+        let prev = if field >= 1 && field <= 64 {
+            1 << (field - 1)
+        } else {
+            0
+        };
+        let role = if self.values & bit != 0 {
             Role::Value
         } else if self.members & bit != 0 {
             Role::Member
@@ -491,7 +507,8 @@ impl Desc {
             return None;
         } else {
             Role::Word
-        })
+        };
+        Some(role)
     }
 
     pub const fn numbered(self, number: u16) -> Self {
@@ -541,7 +558,11 @@ impl Desc {
     }
 
     fn size(&self, header: u64) -> usize {
-        1 + self.fields as usize + if self.items == Items::None { 0 } else { (header >> 32) as usize }
+        1 + self.fields as usize + if self.items == Items::None {
+            0
+        } else {
+            (header >> 32) as usize
+        }
     }
 }
 
@@ -640,7 +661,11 @@ impl<'gc> Value<'gc> {
     /// Returns the byte offset of a string cursor and the hash of the text that it was made for, or `None` if the value is not a cursor.
     #[inline]
     pub const fn as_cursor(self) -> Option<(usize, u32)> {
-        if self.word & TAG == CURSOR { Some(((self.word as u32 >> 4) as usize, (self.word >> 32) as u32)) } else { None }
+        if self.word & TAG == CURSOR {
+            Some(((self.word as u32 >> 4) as usize, (self.word >> 32) as u32))
+        } else {
+            None
+        }
     }
 
     /// Returns the value with the bits `word`. Every word is a valid value. An object reference that matches no object reads as some other object or as no object.
@@ -655,12 +680,20 @@ impl<'gc> Value<'gc> {
     #[inline]
     pub fn fixnum(number: i64) -> Option<Self> {
         let word = (number as u64) << 1;
-        if (word as i64) >> 1 == number { Some(Self::from_bits(word)) } else { None }
+        if (word as i64) >> 1 == number {
+            Some(Self::from_bits(word))
+        } else {
+            None
+        }
     }
 
     #[inline]
     pub fn as_fixnum(self) -> Option<i64> {
-        if self.word & 1 == 0 { Some(self.word as i64 >> 1) } else { None }
+        if self.word & 1 == 0 {
+            Some(self.word as i64 >> 1)
+        } else {
+            None
+        }
     }
 
     pub const MAX_FIXNUM: i64 = i64::MAX >> 1;
@@ -746,20 +779,32 @@ impl<'gc> Value<'gc> {
     /// Returns the object if the value refers to a `T`. Compares the type number stored in the value with `tag`, without reading the object.
     #[inline]
     pub fn downcast_tag<T: Object>(self, tag: TypeTag<'gc, T>) -> Option<Gc<'gc, T>> {
-        if self.word & (TYPE_BITS << 16 | TAG) == u64::from(tag.ty) << 16 | OBJECT { Some(Gc::new((self.word >> 32) as u32)) } else { None }
+        if self.word & (TYPE_BITS << 16 | TAG) == u64::from(tag.ty) << 16 | OBJECT {
+            Some(Gc::new((self.word >> 32) as u32))
+        } else {
+            None
+        }
     }
 
     /// Returns the type number and index of the object that the value refers to, or `None` if it refers to no object. For `objects!` kinds.
     #[doc(hidden)]
     #[inline]
     pub fn object_parts(self) -> Option<(u16, u32)> {
-        if self.word & TAG == OBJECT { Some(((self.word >> 16 & TYPE_BITS) as u16, (self.word >> 32) as u32)) } else { None }
+        if self.word & TAG == OBJECT {
+            Some(((self.word >> 16 & TYPE_BITS) as u16, (self.word >> 32) as u32))
+        } else {
+            None
+        }
     }
 
     /// Returns the value as an [`Immediate`], or `None` if it refers to an object.
     #[inline]
     pub fn immediate(self) -> Option<Immediate> {
-        if self.word & TAG != OBJECT { Some(Immediate(self.word)) } else { None }
+        if self.word & TAG != OBJECT {
+            Some(Immediate(self.word))
+        } else {
+            None
+        }
     }
 }
 
@@ -851,7 +896,11 @@ impl<'gc, T: Object> Gc<'gc, T> {
     }
 
     pub fn len(self, mc: &Mutation<'gc>) -> usize {
-        if T::DESC.items == Items::None { 0 } else { (mc.heap.words()[mask(self.index as usize)].get() >> 32) as usize }
+        if T::DESC.items == Items::None {
+            0
+        } else {
+            (mc.heap.words()[mask(self.index as usize)].get() >> 32) as usize
+        }
     }
 
     pub fn is_empty(self, mc: &Mutation<'gc>) -> bool {
@@ -1204,7 +1253,11 @@ impl<'gc> AnyHostRef<'gc> {
 
     /// Returns a typed reference if the value is alive and is a `T`.
     pub fn downcast<T: Any>(self, mc: &Mutation<'gc>) -> Option<HostRef<'gc, T>> {
-        if self.is::<T>(mc) { Some(self.assume()) } else { None }
+        if self.is::<T>(mc) {
+            Some(self.assume())
+        } else {
+            None
+        }
     }
 
     /// Returns a typed reference without checking the type. `HostRef::get` checks the type on every read.
@@ -1363,7 +1416,11 @@ impl<'a> Page<'a> {
     #[inline]
     fn large(self) -> Option<u32> {
         let word = self.0[PAGE_WORDS - 1].get();
-        if word & LARGE != 0 { Some((word >> 32) as u32) } else { None }
+        if word & LARGE != 0 {
+            Some((word >> 32) as u32)
+        } else {
+            None
+        }
     }
 
     fn set_large(self, first: Option<u32>) {
@@ -1409,7 +1466,12 @@ impl Flag<'_> {
     #[inline]
     fn set(self, on: bool) {
         let word = self.word.get();
-        self.word.set(if on { word | self.bit } else { word & !self.bit });
+        let updated = if on {
+            word | self.bit
+        } else {
+            word & !self.bit
+        };
+        self.word.set(updated);
     }
 
     /// Sets the flag and returns what it was.
@@ -1489,7 +1551,11 @@ impl PageSet {
     /// Returns the pages in the set, in ascending order. If `take` is true, the iterator also removes them from the set.
     fn iter(&self, take: bool) -> impl Iterator<Item = usize> + '_ {
         self.0.iter().enumerate().flat_map(move |(i, word)| {
-            let mut bits = if take { word.replace(0) } else { word.get() };
+            let mut bits = if take {
+                word.replace(0)
+            } else {
+                word.get()
+            };
             std::iter::from_fn(move || {
                 if bits == 0 {
                     return None;
@@ -2101,7 +2167,12 @@ impl Arena {
     pub fn fail_after(&mut self, allocations: Option<u64>) {
         let meta = &self.meta;
         meta.budget.fail_after(allocations);
-        meta.end.set(if meta.budget.injecting() { meta.cursor.get() } else { meta.hole_end.get() });
+        let limit = if meta.budget.injecting() {
+            meta.cursor.get()
+        } else {
+            meta.hole_end.get()
+        };
+        meta.end.set(limit);
     }
 
     /// For testing. Makes every step end with a minor collection and a cycle slice of `work` bytes. `None` turns this off.
@@ -2360,7 +2431,11 @@ impl<'a> Heap<'a> {
     #[inline]
     fn alloc(self, desc: &'static Desc, fields: &[u64], len: usize, item: u64) -> Result<u32, OutOfMemory> {
         let ty = self.type_index(desc).ok_or_else(|| self.m.budget.fail())?;
-        let len = if desc.items == Items::None { 0 } else { len };
+        let len = if desc.items == Items::None {
+            0
+        } else {
+            len
+        };
         if len > u32::MAX as usize {
             return Err(self.m.budget.fail());
         }
@@ -2453,7 +2528,12 @@ impl<'a> Heap<'a> {
         let at = meta.cursor.get();
         if at + size <= meta.hole_end.get() {
             meta.cursor.set(at + size);
-            meta.end.set(if meta.budget.injecting() { at + size } else { meta.hole_end.get() });
+            let limit = if meta.budget.injecting() {
+                at + size
+            } else {
+                meta.hole_end.get()
+            };
+            meta.end.set(limit);
             return Ok(at);
         }
         if size > PAGE - LINE {
@@ -2480,7 +2560,12 @@ impl<'a> Heap<'a> {
             if end - start >= size {
                 meta.cursor.set(start + size);
                 meta.hole_end.set(end);
-                meta.end.set(if meta.budget.injecting() { start + size } else { end });
+                let limit = if meta.budget.injecting() {
+                    start + size
+                } else {
+                    end
+                };
+                meta.end.set(limit);
                 return Ok(start);
             }
         }
@@ -2533,7 +2618,11 @@ impl<'a> Heap<'a> {
             self.sweep_before_use(index);
             let page = self.page(index);
             let free = page.used().get() == 0 && !(evacuation && page.evacuating().get());
-            run = if free { run + 1 } else { 0 };
+            run = if free {
+                run + 1
+            } else {
+                0
+            };
             if run == count {
                 let first = index + 1 - count;
                 self.recommit(first..index + 1)?;
@@ -2676,7 +2765,11 @@ impl<'a> Heap<'a> {
     #[inline]
     fn ephemeron_at(self, slot: usize) -> Option<(Value<'a>, Value<'a>)> {
         let key = Value::from_bits(self.words()[slot].get());
-        if key != Value::BROKEN { Some((key, Value::from_bits(self.words()[slot + 1].get()))) } else { None }
+        if key != Value::BROKEN {
+            Some((key, Value::from_bits(self.words()[slot + 1].get())))
+        } else {
+            None
+        }
     }
 
     /// Stores an ephemeron's `key` and `value` at `slot`. Neither is shaded while marking, because the value is traced once the key is found live.
@@ -2870,7 +2963,11 @@ impl<'a> Heap<'a> {
             let Some(index) = work.gray.pop() else { return Some(left) };
             left = left.saturating_sub(self.trace(index as usize, work) * 8);
         }
-        if work.gray.is_empty() { Some(0) } else { None }
+        if work.gray.is_empty() {
+            Some(0)
+        } else {
+            None
+        }
     }
 
     /// Ends marking in one atomic phase. Rescans the roots, because a write to a root applies no barrier. Then clears dead weak references,
@@ -3011,7 +3108,12 @@ impl<'a> Heap<'a> {
         page.used().set(lines);
         if page.counted().replace(lines != 0) != (lines != 0) {
             let occupied = self.m.occupied.get();
-            self.m.occupied.set(if lines != 0 { occupied + 1 } else { occupied - 1 });
+            let count = if lines != 0 {
+                occupied + 1
+            } else {
+                occupied - 1
+            };
+            self.m.occupied.set(count);
         }
         // The last page of a large object can also hold small objects, which can outlive the large object. So `large` is cleared once the large object is dead.
         if lines == 0 || page.large().is_some_and(|first| !self.has_bit(first as usize * PAGE, Bits::Marks)) {
@@ -3311,7 +3413,11 @@ impl<'a> Heap<'a> {
             let Some(desc) = self.words().get(object).and_then(|header| self.desc(header.get())) else { continue };
             let Some(slot) = self.words().get(object + at as usize) else { continue };
             let field = at as usize - 1;
-            let bit = if field < 64 { 1 << field } else { 0 };
+            let bit = if field < 64 {
+                1 << field
+            } else {
+                0
+            };
             let index = if field >= desc.fields as usize {
                 matches!(desc.items, Items::Members | Items::Weaks)
             } else {

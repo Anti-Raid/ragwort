@@ -155,7 +155,11 @@ impl Machine {
             _ => Waiting::No,
         };
         if self.finished {
-            let state = if matches!(outcome, Ok(Outcome::Done(_))) { coroutine::DEAD } else { coroutine::FAILED };
+            let state = if matches!(outcome, Ok(Outcome::Done(_))) {
+                coroutine::DEAD
+            } else {
+                coroutine::FAILED
+            };
             self.task.get(mc).expect("a machine runs in its own arena").set_state(mc, state);
         }
         self.save(mc, task, &regs);
@@ -201,7 +205,11 @@ impl Machine {
     /// call [`Machine::run`] in the next step. See [`Machine::run`].
     pub fn raise<'gc>(&mut self, mc: &Mutation<'gc>, raised: Value<'gc>) -> Result<Outcome<'gc>, Fault> {
         // A raise that was postponed for the collector is still pending, and the host may request it again.
-        let on = if self.waiting == Waiting::Raise { Waiting::Raise } else { Waiting::Host };
+        let on = if self.waiting == Waiting::Raise {
+            Waiting::Raise
+        } else {
+            Waiting::Host
+        };
         self.answer(mc, on, raised)?;
         self.waiting = Waiting::Raise;
         self.run(mc)
@@ -211,7 +219,12 @@ impl Machine {
     /// on the next run.
     fn answer<'gc>(&mut self, mc: &Mutation<'gc>, on: Waiting, value: Value<'gc>) -> Result<(), Fault> {
         if self.waiting != on {
-            return Err(if self.finished { Fault::Finished } else { Fault::NotPending });
+            let fault = if self.finished {
+                Fault::Finished
+            } else {
+                Fault::NotPending
+            };
+            return Err(fault);
         }
         coroutine::current(mc, self.task.get(mc).expect("a machine runs in its own arena")).set_acc(mc, value);
         Ok(())
@@ -225,7 +238,12 @@ impl Machine {
         (self.fp, self.pc) = (regs.fp, regs.pc);
         task.set_acc(mc, regs.acc);
         // The list is meaningful only when the accumulator holds the marker. A stale list is dropped here, so it does not stay alive past this run.
-        task.set_values(mc, if regs.acc == Value::VALUES { regs.values } else { Value::NULL });
+        let values = if regs.acc == Value::VALUES {
+            regs.values
+        } else {
+            Value::NULL
+        };
+        task.set_values(mc, values);
         let len = self.stack.segment(mc).len(mc);
         self.stack.set_top((regs.fp + WINDOW).min(len));
     }
@@ -238,7 +256,11 @@ impl Machine {
         let waiting = std::mem::replace(&mut self.waiting, Waiting::No);
         if waiting != Waiting::No {
             let mut outer = Outer::new(mc, &mut self.stack, root, *task, regs, self.segment);
-            let step = if waiting == Waiting::Raise { outer.raise(outer.regs.acc, false) } else { outer.resume() };
+            let step = if waiting == Waiting::Raise {
+                outer.raise(outer.regs.acc, false)
+            } else {
+                outer.resume()
+            };
             *task = outer.task();
             if let Some(outcome) = step? {
                 return Ok(outcome);
@@ -359,7 +381,11 @@ impl<'a, 'gc> Outer<'a, 'gc> {
             Blame::Instruction => {
                 let (Some(code), Ok(frame)) = (self.regs.code, self.segments.frame(self.regs.fp)) else { return Ok(Origin { operation: None, irritants: Value::NULL }) };
                 // `received` is the number of values the accumulator held when the instruction failed. It held one value, or the marker and a list of values.
-                let received = if self.regs.acc == Value::VALUES { Pairs::new(mc).list_len(self.regs.values) } else { Some(1) };
+                let received = if self.regs.acc == Value::VALUES {
+                    Pairs::new(mc).list_len(self.regs.values)
+                } else {
+                    Some(1)
+                };
                 let received = received.and_then(|received| i64::try_from(received).ok()).and_then(Value::fixnum).unwrap_or(Value::VOID);
                 report::origin(mc, frame, code, self.regs.pc, received, fault)
             }
@@ -372,7 +398,11 @@ impl<'a, 'gc> Outer<'a, 'gc> {
     /// occurred. `blame` selects the operation and irritants that the condition reports.
     fn fault(&mut self, fault: Fault, blame: Blame<'gc>) -> Step<'gc> {
         let mc = self.mc();
-        let first = if matches!(blame, Blame::Instruction) { self.regs.code.map(|code| (code, self.regs.pc)) } else { None };
+        let first = if matches!(blame, Blame::Instruction) {
+            self.regs.code.map(|code| (code, self.regs.pc))
+        } else {
+            None
+        };
         let origin = self.origin(fault, blame)?;
         let failure = Failure { fault, operation: origin.operation };
         let raised = Value::object(mc, Condition::new(mc, mc.frozen(failure)?, Value::VOID, origin.irritants, Value::FALSE)?);
@@ -420,7 +450,11 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         }
         let Some(to) = coroutine::of(mc, task.resumer(mc)) else { return Ok(Some(Outcome::Raised(obj))) };
         // A coroutine that fails while a reset is closing it is still reset. The value is still raised in the task that requested the reset.
-        let renew = if task.state(mc) == coroutine::CLOSING { task.body(mc) } else { Value::FALSE };
+        let renew = if task.state(mc) == coroutine::CLOSING {
+            task.body(mc)
+        } else {
+            Value::FALSE
+        };
         self.end(task, coroutine::FAILED, to)?;
         if renew != Value::FALSE {
             coroutine::reset(mc, task, renew);
@@ -581,7 +615,11 @@ impl<'a, 'gc> Outer<'a, 'gc> {
     /// slots are saved to the chain here, once, and the parked frame becomes the bottom frame.
     fn park(&mut self, base: u8, tail: bool, tried: bool) -> Result<(), Fault> {
         let (mc, task) = (self.mc(), self.task());
-        let caller = if tail { Some(frame::link_of(mc, self.segments.frame(self.regs.fp)?)?) } else { None };
+        let caller = if tail {
+            Some(frame::link_of(mc, self.segments.frame(self.regs.fp)?)?)
+        } else {
+            None
+        };
         let Some((fp, parked)) = coroutine::place(self.regs.fp, self.regs.pc, base, caller) else { return self.keep(base, tail) };
         if fp - self.segments.stack.base() > coroutine::PARKED {
             let link = frame::link_of(mc, self.segments.frame(fp)?)?;
@@ -678,7 +716,11 @@ impl<'a, 'gc> Outer<'a, 'gc> {
         if args.contains(&Value::VALUES) {
             return Err(Fault::WrongType);
         }
-        let passed = if args.len() <= MAX_ARGS { self.pass(args)? } else { Passed::list(Pairs::new(self.mc()).list(args)?) };
+        let passed = if args.len() <= MAX_ARGS {
+            self.pass(args)?
+        } else {
+            Passed::list(Pairs::new(self.mc()).list(args)?)
+        };
         self.start(procedure, passed)
     }
 

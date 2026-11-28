@@ -613,7 +613,11 @@ fn deferred_host_calls_go_to_what_runs_the_machine() {
             match outcome.unwrap() {
                 Outcome::Deferred(waits) => {
                     asked.push(*waits.into_inner().downcast::<Option<i64>>().unwrap());
-                    outcome = if asked.len() == 3 { machine.run(mc) } else { machine.reply(mc, Value::fixnum(asked.len() as i64).unwrap()) };
+                    outcome = if asked.len() == 3 {
+                        machine.run(mc)
+                    } else {
+                        machine.reply(mc, Value::fixnum(asked.len() as i64).unwrap())
+                    };
                 }
                 Outcome::Paused => outcome = machine.run(mc),
                 Outcome::Done(v) => break (asked, show(mc, v), format!("{:?}", machine.reply(mc, Value::NULL).err())),

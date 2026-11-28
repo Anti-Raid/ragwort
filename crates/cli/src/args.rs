@@ -118,7 +118,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
             return Ok(Command::Help);
         }
         if arg == "--image" || arg == "-o" {
-            let file = if arg == "-o" { &mut output } else { &mut image };
+            let file = if arg == "-o" {
+                &mut output
+            } else {
+                &mut image
+            };
             if file.is_some() {
                 return Err(format!("`{arg}` is given twice"));
             }
@@ -149,7 +153,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
         if folder.is_empty() {
             return Err(format!("`{arg}` names no folder"));
         }
-        let name = if name.is_empty() { folder.trim_end_matches('/') } else { name };
+        let name = if name.is_empty() {
+            folder.trim_end_matches('/')
+        } else {
+            name
+        };
         if modules.iter().any(|module| module.name == name) {
             return Err(format!("the module `{name}` is given twice"));
         }

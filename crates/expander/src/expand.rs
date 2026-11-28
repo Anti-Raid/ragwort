@@ -75,15 +75,29 @@ pub trait Expand<'a, 'gc: 'a>: Host<'a, 'gc> {
     /// Creates the transformer of `form`, a `define-syntax` at the top level. Returns the identifier that `form` binds, and the index of the transformer.
     fn define_syntax_now(&mut self, form: Stx) -> Result<(Stx, u32), ExpandError> {
         let (id, expr) = self.syntax_definition(form)?;
-        let core = self.expand_now(expr)?;
-        Ok((id, self.made_transformer(&core, expr, form)?))
+        // The syntax quoted from here on belongs to this transformer. See `Engine::macro_refs`.
+        let outer = std::mem::take(&mut self.quoted);
+        self.in_transformer = true;
+        let core = self.expand_now(expr);
+        self.in_transformer = false;
+        let refers_to = std::mem::replace(&mut self.quoted, outer);
+        let macro_index = self.made_transformer(&core?, expr, form)?;
+        self.macro_refs[macro_index as usize] = refers_to;
+        Ok((id, macro_index))
     }
 
     /// Expands `expr`, the transformer expression of a macro that the form `at` defines. Then compiles and runs
     /// the expansion, stores the transformer, and passes its index to `then`.
     fn transformer(&mut self, expr: Stx, at: Stx, then: impl FnOnce(&mut Self, u32) -> Result<Ex<'a, 'gc, Self>, ExpandError> + 'a) -> Result<Ex<'a, 'gc, Self>, ExpandError> {
+        let outer = std::mem::take(&mut self.quoted);
         Self::expr(expr, move |this, core| {
             let macro_index = this.made_transformer(&core, expr, at)?;
+            // A macro defined in a body is used only in that body, so its templates do not leave the module. Inside the transformer of a top-level
+            // macro, they are counted with that transformer.
+            let inner = std::mem::replace(&mut this.quoted, outer);
+            if this.in_transformer {
+                this.quoted.extend(inner);
+            }
             then(this, macro_index)
         })
     }

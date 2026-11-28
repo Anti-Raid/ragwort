@@ -49,6 +49,19 @@ pub struct Interface {
     /// - each binding that the module's syntax refers to and that the module does not export
     /// - each binding that the module exports only under another name
     locals: HashMap<Box<str>, Export>,
+    /// The exports that the module passes on from another module, keyed by export name.
+    forwards: HashMap<Box<str>, Forward>,
+    /// Bindings that the module does not bind by name, keyed by slot: the variables and macros that a macro's output defined. Each entry
+    /// is the binding's name and its export. It holds only the bindings that the module's syntax refers to.
+    hidden: HashMap<u32, (Box<str>, Export)>,
+}
+
+/// An export that a module passes on from another module. `holder` is the slot of the exporting module that holds the other module, and `name` is the
+/// name that the other module exports the binding under.
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+pub struct Forward {
+    pub holder: u32,
+    pub name: Box<str>,
 }
 
 impl Interface {
@@ -60,6 +73,12 @@ impl Interface {
     /// refers to such a binding. The binding need not be exported.
     pub fn internal(&self, name: &str) -> Option<(&str, &Export)> {
         self.locals.get_key_value(name).or_else(|| self.exports.get_key_value(name)).map(|(name, export)| (&**name, export))
+    }
+
+    /// Returns the binding in `slot` that the module does not bind by name, with its name. An identifier that one of the module's macros introduces
+    /// refers to such a binding if another macro's output defined it.
+    pub fn hidden(&self, slot: u32) -> Option<(&str, &Export)> {
+        self.hidden.get(&slot).map(|(name, export)| (&**name, export))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Export)> {
@@ -89,15 +108,42 @@ fn read_exports(input: &mut Reader<'_>) -> Result<HashMap<Box<str>, Export>, Mal
 
 /// Serializes module exports sorted lexicographically by export name.
 impl Wire for Interface {
-    const SHAPE: u64 = shape_of("Interface with locals");
+    const SHAPE: u64 = shape_of("Interface with locals, forwards and hidden");
 
     fn write(&self, out: &mut Writer) {
         write_exports(&self.exports, out);
         write_exports(&self.locals, out);
+        let mut forwards: Vec<(&Box<str>, &Forward)> = self.forwards.iter().collect();
+        forwards.sort_by_key(|&(name, _)| name);
+        out.length(forwards.len());
+        for (name, forward) in forwards {
+            name.write(out);
+            forward.write(out);
+        }
+        let mut hidden: Vec<(&u32, &(Box<str>, Export))> = self.hidden.iter().collect();
+        hidden.sort_by_key(|&(slot, _)| slot);
+        out.length(hidden.len());
+        for (&slot, (name, export)) in hidden {
+            out.u32(slot);
+            name.write(out);
+            export.write(out);
+        }
     }
 
     fn read(input: &mut Reader<'_>) -> Result<Self, Malformed> {
-        Ok(Self { exports: read_exports(input)?, locals: read_exports(input)? })
+        let (exports, locals) = (read_exports(input)?, read_exports(input)?);
+        let mut forwards = HashMap::default();
+        for _ in 0..input.length()? {
+            let name = Box::<str>::read(input)?;
+            forwards.insert(name, Forward::read(input)?);
+        }
+        let mut hidden = HashMap::default();
+        for _ in 0..input.length()? {
+            let slot = input.u32()?;
+            let name = Box::<str>::read(input)?;
+            hidden.insert(slot, (name, Export::read(input)?));
+        }
+        Ok(Self { exports, locals, forwards, hidden })
     }
 }
 
@@ -131,7 +177,7 @@ pub const INTERFACE: Kind = Kind { save: save_interface, read: read_interface, s
 
 /// Type shape hash for [`Interface`], updated whenever the binary wire format of any interface type changes.
 const SHAPE: u64 = {
-    let shapes = [Interface::SHAPE, Export::SHAPE, StructDef::SHAPE, Field::SHAPE, Inline::SHAPE, Template::SHAPE, Prim::SHAPE, crate::SlotOp::SHAPE];
+    let shapes = [Interface::SHAPE, Forward::SHAPE, Export::SHAPE, StructDef::SHAPE, Field::SHAPE, Inline::SHAPE, Template::SHAPE, Prim::SHAPE, crate::SlotOp::SHAPE];
     let (mut shape, mut i) = (0, 0);
     while i < shapes.len() {
         shape = mix(shape, shapes[i]);
@@ -253,7 +299,11 @@ impl<'gc> Import<'gc> {
 
     /// Checks that a call of the import with `args` arguments can be compiled. The call is valid if it can be inlined, or if the import is usable as a value.
     pub fn callable(self, mc: &Mutation<'gc>, args: usize) -> Result<(), Unusable> {
-        if self.inlined(mc, args).is_some() { Ok(()) } else { self.usable(mc) }
+        if self.inlined(mc, args).is_some() {
+            Ok(())
+        } else {
+            self.usable(mc)
+        }
     }
 
     /// Returns the inline template for a call of the import with `args` arguments, or `None` if the call cannot be inlined.
@@ -267,7 +317,11 @@ impl<'gc> Import<'gc> {
     pub(crate) fn inlined(self, mc: &Mutation<'gc>, args: usize) -> Option<&'gc Inline> {
         let inline = self.export.inline.as_ref()?;
         let fits = inline.inlines(args) && self.variable(mc, self.export.slot).is_some() && inline.slots().all(|slot| self.variable(mc, slot).is_some());
-        if fits { Some(inline) } else { None }
+        if fits {
+            Some(inline)
+        } else {
+            None
+        }
     }
 
     /// Returns the struct definition metadata and runtime type descriptor if this import represents a struct constructor or type name.
@@ -283,7 +337,11 @@ impl<'gc> Import<'gc> {
             return None;
         }
         let value = items.get(slot as usize);
-        if value == Value::UNDEFINED { None } else { Some(value) }
+        if value == Value::UNDEFINED {
+            None
+        } else {
+            Some(value)
+        }
     }
 }
 
@@ -296,6 +354,12 @@ impl<'gc> Imports<'gc> {
     pub fn all(mc: &Mutation<'gc>, module: Gc<'gc, Module>) -> Option<Self> {
         let interface = interface(mc, module)?;
         let mut imports: Vec<_> = interface.iter().map(|(name, export)| (name.to_owned(), Import { module, export, name })).collect();
+        // An export that the module passes on is an import of the module that defines the binding.
+        for (name, forward) in &interface.forwards {
+            let origin = module.items(mc).get(forward.holder as usize).downcast::<Module>(mc)?;
+            let (origin_name, export) = self::interface(mc, origin)?.exports.get_key_value(&forward.name)?;
+            imports.push((name.to_string(), Import { module: origin, export, name: origin_name }));
+        }
         imports.sort_by(|left, right| left.0.cmp(&right.0));
         Some(Self(imports))
     }
@@ -375,7 +439,11 @@ impl<L: Copy> RequireSpec<L> {
             imports = match filter {
                 Filter::Only(names) | Filter::Except(names) => {
                     let just: Vec<String> = names.iter().map(|(name, _)| name.clone()).collect();
-                    let kept = if matches!(filter, Filter::Only(..)) { imports.only(&just) } else { imports.except(&just) };
+                    let kept = if matches!(filter, Filter::Only(..)) {
+                        imports.only(&just)
+                    } else {
+                        imports.except(&just)
+                    };
                     kept.map_err(|missing| at(names, missing).expect("a missing name is one of the spec's"))?
                 }
                 Filter::Prefix(prefix) => imports.prefix(prefix),
@@ -557,7 +625,11 @@ impl Inline {
     fn new(params: u32, optional: u32, rest: bool, locals: u32, body: Template) -> Self {
         let mut events = Vec::new();
         body.events(&mut events);
-        let uses: Vec<u32> = events.iter().filter_map(|event| if let Event::Param(param) = *event { Some(param) } else { None }).collect();
+        let uses: Vec<u32> = events.iter().filter_map(|event| if let Event::Param(param) = *event {
+            Some(param)
+        } else {
+            None
+        }).collect();
         let last_use = events.iter().rposition(|event| matches!(event, Event::Param(_)));
         let first_other = events.iter().position(|event| *event == Event::Other);
         let in_order = uses.iter().copied().eq(0..params + u32::from(rest));
@@ -631,7 +703,11 @@ impl Inline {
         if let Some(list) = inner {
             body = target.bind(vec![list], body);
         }
-        if binds.is_empty() { body } else { target.bind(binds, body) }
+        if binds.is_empty() {
+            body
+        } else {
+            target.bind(binds, body)
+        }
     }
 }
 
@@ -878,13 +954,15 @@ pub enum Binding<'gc> {
 
 /// The kind of definition exported under an export name.
 #[derive(Clone, Copy)]
-enum Provided {
+enum Provided<'gc> {
     /// Exports a module variable slot.
     Variable(u32),
     /// Exports the struct type descriptor for pattern matching only, omitting its constructor.
     Matching(u32),
     /// Exports the macro whose transformer is in the slot. The second field is the tag of the macro's language.
     Macro(u32, u8),
+    /// Passes on an import. The second field is the slot that holds the module of the import.
+    Forward(Import<'gc>, u32),
 }
 
 /// Allocates local variables and lambda IDs for a module. The numbers are unique across the whole module.
@@ -969,8 +1047,12 @@ pub struct Require<'gc> {
 pub enum Provide<'gc> {
     /// Exports the module variable named by the symbol `name` under the name `external`.
     Variable { name: Value<'gc>, external: String, span: SyntaxSpan<'gc> },
-    /// Exports every variable that the module defines, under its own name.
+    /// Exports every variable and every macro that the module defines, under its own name.
     AllDefined(SyntaxSpan<'gc>),
+    /// Exports every variable that the module defines, under its own name, and none of its macros.
+    AllVariables(SyntaxSpan<'gc>),
+    /// Exports every binding that the module requires from the module named `module`, under the name that this module uses for it.
+    AllFrom { module: String, span: SyntaxSpan<'gc> },
     /// Exports every binding of the struct declared as `name`. If `constructors` is false, the constructors are not exported, and the struct's name can be used only in `match` patterns.
     Struct { name: Value<'gc>, constructors: bool, span: SyntaxSpan<'gc> },
 }
@@ -1097,6 +1179,28 @@ impl<'gc> Unit<'_, 'gc> {
     }
 }
 
+/// Returns the position `slot` of a variable in a module's list of names as a slot number.
+fn bound_slot(slot: usize) -> u32 {
+    u32::try_from(slot).expect("a module has fewer than 2^32 variables")
+}
+
+/// A name that a require bound in the module: as text, and as a symbol.
+#[derive(Clone)]
+struct Required<'gc> {
+    external: Box<str>,
+    name: Value<'gc>,
+}
+
+/// What another module can reach of a module. See [`ModuleBuilder::finish`].
+struct Reached<'gc> {
+    /// The slots of the macros whose transformers the module keeps.
+    macros: HashSet<u32>,
+    /// The names of bindings that reachable syntax refers to.
+    names: Vec<Value<'gc>>,
+    /// The slots of bindings without a name that reachable syntax refers to.
+    slots: Vec<u32>,
+}
+
 /// Incremental module builder for language front ends.
 /// Front ends first declare imports, definitions, and exports; call [`ModuleBuilder::start`] to allocate the module;
 /// sequentially lower and compile top-level forms via [`ModuleBuilder::compile`]; and finally call [`ModuleBuilder::finish`]
@@ -1110,7 +1214,11 @@ pub struct ModuleBuilder<'gc> {
     /// Top-level bindings declared by definitions and explicit imports, as well as fallback implicit imports shadowed by them.
     bindings: HashMap<u64, Binding<'gc>>,
     implicit: HashMap<u64, Import<'gc>>,
-    exports: Vec<(Box<str>, Provided)>,
+    /// The modules that the module requires implicitly.
+    implicit_modules: Vec<Gc<'gc, Module>>,
+    /// The names that each explicit require bound, keyed by the required module's name as written.
+    required: Vec<(Box<str>, Vec<Required<'gc>>)>,
+    exports: Vec<(Box<str>, Provided<'gc>)>,
     assigned: HashSet<u32>,
     inlines: HashMap<u32, Inline>,
     /// Maps keyword procedure slots to their underlying core implementation slot and keyword call shape.
@@ -1126,10 +1234,20 @@ pub struct ModuleBuilder<'gc> {
     provides: Vec<Provide<'gc>>,
     /// The macros that the module defines by name, keyed by the bits of the name's symbol. Each entry is the slot that holds the transformer, and the tag of the macro's language.
     macros: HashMap<u64, (u32, u8)>,
-    /// The values that slots hold from the start of the module: the transformers of its macros.
+    /// The macros that the module does not bind by name, keyed by the slot that holds the transformer. The value is the tag of the macro's language.
+    private_macros: HashMap<u32, u8>,
+    /// The transformer of each macro that the module defines, with the slot that holds it once the module is finished. A slot gets its transformer only if
+    /// another module can reach the macro. See [`ModuleBuilder::finish`].
     presets: Vec<(u32, Value<'gc>)>,
+    /// For each macro, by the slot of its transformer: the bindings of the module that the macro's output can refer to. An entry is a name, or the slot of a binding
+    /// that the module does not bind by name, as a fixnum.
+    macro_refs: HashMap<u32, Vec<Value<'gc>>>,
+    /// The modules whose exports the module passes on, each with the slot that holds it.
+    holders: Vec<(Gc<'gc, Module>, u32)>,
     /// The names that the module's syntax refers to. See [`ModuleBuilder::refer`].
     referenced: Vec<Value<'gc>>,
+    /// The slots that the module's syntax refers to. See [`ModuleBuilder::refer_slot`].
+    referenced_slots: Vec<u32>,
     locals: Locals<'gc>,
     module: Option<Gc<'gc, Module>>,
 }
@@ -1144,6 +1262,8 @@ impl<'gc> ModuleBuilder<'gc> {
             defined_by: Vec::new(),
             bindings: HashMap::default(),
             implicit: HashMap::default(),
+            implicit_modules: Vec::new(),
+            required: Vec::new(),
             exports: Vec::new(),
             assigned: HashSet::default(),
             inlines: HashMap::default(),
@@ -1154,8 +1274,12 @@ impl<'gc> ModuleBuilder<'gc> {
             declared: HashMap::default(),
             provides: Vec::new(),
             macros: HashMap::default(),
+            private_macros: HashMap::default(),
             presets: Vec::new(),
+            macro_refs: HashMap::default(),
+            holders: Vec::new(),
             referenced: Vec::new(),
+            referenced_slots: Vec::new(),
             locals: Locals::default(),
             module: None,
         }
@@ -1205,13 +1329,47 @@ impl<'gc> ModuleBuilder<'gc> {
         Ok(slot)
     }
 
+    /// Declares a macro that the module does not bind by name, such as one that a macro's output defines. `name` is its display name. Returns the slot that holds the transformer.
+    pub fn define_private_macro(&mut self, name: Value<'gc>, form: u32, language: u8, transformer: Value<'gc>) -> Result<u32, ModuleError> {
+        let slot = self.define_private(name, form)?;
+        self.private_macros.insert(slot, language);
+        self.presets.push((slot, transformer));
+        Ok(slot)
+    }
+
     /// Returns whether the module defines a macro named `name`.
     pub fn defines_macro(&self, name: Value<'gc>) -> bool {
         self.macros.contains_key(&name.to_bits())
     }
 
-    /// Records that the module's syntax refers to the module-level binding named `name`. The output of a macro that the module
-    /// exports can then refer to the binding from another module, even if the module does not export the binding.
+    /// Returns the slot that holds the transformer of the macro that the module defines under `name`.
+    /// A module's files in different languages find each other's macros this way.
+    pub fn macro_named(&self, name: Value<'gc>) -> Option<u32> {
+        self.macros.get(&name.to_bits()).map(|&(slot, _)| slot)
+    }
+
+    /// Returns the macro whose transformer `slot` holds: the tag of its language, and the transformer. Returns `None` if the slot holds no macro of the module.
+    pub fn macro_at(&self, slot: u32) -> Option<(u8, Value<'gc>)> {
+        let named = self.macros.values().find(|&&(held, _)| held == slot).map(|&(_, language)| language);
+        let language = named.or_else(|| self.private_macros.get(&slot).copied())?;
+        let &(_, transformer) = self.presets.iter().find(|&&(preset, _)| preset == slot)?;
+        Some((language, transformer))
+    }
+
+    /// Records that syntax in the module's code refers to the binding in `slot`, which the module does not bind by name. Another module can get that syntax, so
+    /// the module keeps the binding.
+    pub fn refer_slot(&mut self, slot: u32) {
+        self.referenced_slots.push(slot);
+    }
+
+    /// Records what the output of the macro in `slot` can refer to. Each entry of `to` is the name of a binding of the module, or the slot of a binding that the module does
+    /// not bind by name, as a fixnum. If another module can reach the macro, the module keeps these bindings too.
+    pub fn macro_refers(&mut self, slot: u32, to: Vec<Value<'gc>>) {
+        self.macro_refs.insert(slot, to);
+    }
+
+    /// Records that syntax in the module's code refers to the module-level binding named `name`. Another module can get that syntax, so
+    /// the module keeps the binding, even if it does not export it.
     pub fn refer(&mut self, name: Value<'gc>) {
         self.referenced.push(name);
     }
@@ -1229,11 +1387,19 @@ impl<'gc> ModuleBuilder<'gc> {
     }
 
     /// Binds all exported names in `imports` into the module's top-level scope.
-    pub fn require(&mut self, mc: &Mutation<'gc>, symbols: Symbols<'gc>, imports: Imports<'gc>) -> Result<(), ModuleError> {
+    ///
+    /// `from` is the name of the required module, as the code wrote it. [`ModuleBuilder::provide_all_from`] finds the imports by that name.
+    pub fn require(&mut self, mc: &Mutation<'gc>, symbols: Symbols<'gc>, from: &str, imports: Imports<'gc>) -> Result<(), ModuleError> {
         let strings = Strings::new(mc);
+        let mut names = Vec::with_capacity(imports.0.len());
         for (name, import) in imports.0 {
             let symbol = symbols.intern_str(&strings, &name).map_err(|_| ModuleError::OutOfMemory)?;
             self.import(symbol.value(mc), import)?;
+            names.push(Required { external: name.into_boxed_str(), name: symbol.value(mc) });
+        }
+        match self.required.iter_mut().find(|(module, _)| **module == *from) {
+            Some((_, required)) => required.extend(names),
+            None => self.required.push((from.into(), names)),
         }
         Ok(())
     }
@@ -1245,19 +1411,68 @@ impl<'gc> ModuleBuilder<'gc> {
             let symbol = symbols.intern_str(&strings, &name).map_err(|_| ModuleError::OutOfMemory)?;
             self.implicit.insert(symbol.value(mc).to_bits(), import);
         }
+        self.implicit_modules.push(module);
         Ok(())
     }
 
-    /// Exports the module variable named `name` under public export name `external`.
+    /// Exports every binding that the module requires from the module named `from`, under the name that this module uses for it. So a filter such as a prefix on
+    /// the require also applies to the exports. `from` is the name as a require wrote it, or the name of a module that is required implicitly.
+    ///
+    /// Call it after every require is declared, and before the module starts. A name that the module already exports as the same binding is skipped.
+    pub fn provide_all_from(&mut self, mc: &Mutation<'gc>, symbols: Symbols<'gc>, from: &str) -> Result<(), ModuleError> {
+        let strings = Strings::new(mc);
+        let mut names: Vec<Required<'gc>> = match self.required.iter().find(|(module, _)| **module == *from) {
+            Some((_, names)) => names.clone(),
+            None => Vec::new(),
+        };
+        if names.is_empty() {
+            // An implicit require binds a name only where the module has no binding of its own for it.
+            let named = self.implicit_modules.iter().copied().find(|module| Symbol::of(module.name(mc)).is_some_and(|name| chars(&strings, name.name(mc)).eq(from.chars())));
+            let Some(module) = named else { return Err(ModuleError::NotDefined) };
+            for (name, import) in Imports::all(mc, module).unwrap_or_default().0 {
+                let symbol = symbols.intern_str(&strings, &name).map_err(|_| ModuleError::OutOfMemory)?.value(mc);
+                if matches!(self.binding(symbol), Some(Binding::Import(bound)) if bound.same(import)) {
+                    names.push(Required { external: name.into_boxed_str(), name: symbol });
+                }
+            }
+        }
+        for Required { external, name } in names {
+            let Some(Binding::Import(import)) = self.binding(name) else { continue };
+            let passed_on = self.exports.iter().any(|&(ref exported, provided)| **exported == *external && matches!(provided, Provided::Forward(other, _) if other.same(import)));
+            if !passed_on {
+                self.provide(&external, name)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Exports the binding named `name` under public export name `external`. The binding is a variable or a macro that the module defines, or
+    /// an import, which the module then passes on. Call it before the module starts.
     pub fn provide(&mut self, external: &str, name: Value<'gc>) -> Result<(), ModuleError> {
         if let Some(&(slot, language)) = self.macros.get(&name.to_bits()) {
             return self.provide_as(external, Provided::Macro(slot, language));
         }
-        let Some(&Binding::Slot(slot)) = self.bindings.get(&name.to_bits()) else { return Err(ModuleError::NotDefined) };
-        self.provide_as(external, Provided::Variable(slot))
+        match self.binding(name) {
+            Some(Binding::Slot(slot)) => self.provide_as(external, Provided::Variable(slot)),
+            Some(Binding::Import(import)) => {
+                let holder = self.holder(import.module)?;
+                self.provide_as(external, Provided::Forward(import, holder))
+            }
+            None => Err(ModuleError::NotDefined),
+        }
     }
 
-    fn provide_as(&mut self, external: &str, provided: Provided) -> Result<(), ModuleError> {
+    /// Returns the slot that holds `module`, whose exports this module passes on. The slot is created on first use.
+    fn holder(&mut self, module: Gc<'gc, Module>) -> Result<u32, ModuleError> {
+        if let Some(&(_, holder)) = self.holders.iter().find(|(held, _)| *held == module) {
+            return Ok(holder);
+        }
+        let holder = self.define_private(self.name, 0)?;
+        self.holders.push((module, holder));
+        Ok(holder)
+    }
+
+    fn provide_as(&mut self, external: &str, provided: Provided<'gc>) -> Result<(), ModuleError> {
         if self.exports.iter().any(|(name, _)| **name == *external) {
             return Err(ModuleError::Duplicate);
         }
@@ -1285,7 +1500,25 @@ impl<'gc> ModuleBuilder<'gc> {
         Ok(())
     }
 
-    /// Exports all uniquely named top-level module variables under their respective symbol names.
+    /// Exports every variable that the module defines by name, under its own name. Unlike [`ModuleBuilder::provide_all`], it exports no macro. So the
+    /// module keeps the transformers of its macros only if something else makes another module able to reach them.
+    pub fn provide_all_variables(&mut self, mc: &Mutation<'gc>) -> Result<(), ModuleError> {
+        let strings = Strings::new(mc);
+        let mut public = Vec::new();
+        for (slot, name) in self.names.iter().enumerate() {
+            if matches!(self.bindings.get(&name.to_bits()), Some(&Binding::Slot(bound)) if bound as usize == slot) {
+                public.push((bound_slot(slot), *name));
+            }
+        }
+        for (slot, name) in public {
+            let symbol = Symbol::of(name).expect("variables are named by symbols");
+            let external: String = chars(&strings, symbol.name(mc)).collect();
+            self.provide_as(&external, Provided::Variable(slot))?;
+        }
+        Ok(())
+    }
+
+    /// Exports every variable and every macro that the module defines by name, under its own name.
     pub fn provide_all(&mut self, mc: &Mutation<'gc>) -> Result<(), ModuleError> {
         let strings = Strings::new(mc);
         let public = self.names.iter().enumerate().filter(|&(slot, name)| match self.macros.get(&name.to_bits()) {
@@ -1310,7 +1543,11 @@ impl<'gc> ModuleBuilder<'gc> {
     /// with all host functions transitively required by imported modules, ensuring host calls in inlined functions resolve correctly.
     pub fn start(&mut self, mc: &Mutation<'gc>) -> Result<Gc<'gc, Module>, OutOfMemory> {
         let mut hosts: Vec<&'static HostDef> = self.hosts.iter().collect();
-        let imported = self.bindings.values().filter_map(|binding| if let Binding::Import(import) = binding { Some(import) } else { None }).chain(self.implicit.values());
+        let imported = self.bindings.values().filter_map(|binding| if let Binding::Import(import) = binding {
+            Some(import)
+        } else {
+            None
+        }).chain(self.implicit.values());
         let mut seen = Vec::new();
         for import in imported {
             if seen.contains(&import.module) {
@@ -1324,8 +1561,8 @@ impl<'gc> ModuleBuilder<'gc> {
             }
         }
         let module = ragwort_vm::module::new(mc, self.name, &self.names, hosts)?;
-        for &(slot, value) in &self.presets {
-            module.items(mc).set(mc, slot as usize, value);
+        for &(held, holder) in &self.holders {
+            module.items(mc).set(mc, holder as usize, Value::object(mc, held));
         }
         self.module = Some(module);
         Ok(module)
@@ -1369,13 +1606,22 @@ impl<'gc> ModuleBuilder<'gc> {
     fn struct_call(&self, slot: u32, form: u32) -> Option<Call<'gc>> {
         let (inline, kind) = self.procedures.get(&slot)?;
         let defined = self.defined_by.get(slot as usize).is_some_and(|&by| by < form);
-        Some(Call::new(inline.clone(), *kind, if !defined { Some(Place::Slot { slot, checked: true }) } else { None }))
+        let check = if !defined {
+            Some(Place::Slot { slot, checked: true })
+        } else {
+            None
+        };
+        Some(Call::new(inline.clone(), *kind, check))
     }
 
     /// Returns the constant value of variable `slot` in form `form` if it has already been initialized (such as a struct type descriptor defined in an earlier form).
     pub fn constant(&self, slot: u32, form: u32) -> Option<Value<'gc>> {
         let (kind, _) = self.kinds.get(&slot)?;
-        if self.defined_by.get(slot as usize).is_some_and(|&by| by < form) { Some(*kind) } else { None }
+        if self.defined_by.get(slot as usize).is_some_and(|&by| by < form) {
+            Some(*kind)
+        } else {
+            None
+        }
     }
 
     /// Marks variable `slot` as mutated. Returns an error if the variable is immutable: a keyword procedure, or a binding of a struct declaration.
@@ -1410,7 +1656,7 @@ impl<'gc> ModuleBuilder<'gc> {
                         SpecError::NotProvided(span) => (ModuleError::NotProvided, span),
                     })?;
                     let symbols = Symbols::of_arena(mc).map_err(|error| (error.into(), require.span))?;
-                    self.require(mc, symbols, imports).map_err(|error| (error, require.span))?;
+                    self.require(mc, symbols, &require.spec.module, imports).map_err(|error| (error, require.span))?;
                 }
             }
             // Exports are applied later, because a later form may define the provided name.
@@ -1439,6 +1685,11 @@ impl<'gc> ModuleBuilder<'gc> {
             match provide {
                 Provide::Variable { name, external, span } => self.provide(&external, name).map_err(|error| (error, span))?,
                 Provide::AllDefined(span) => self.provide_all(mc).map_err(|error| (error, span))?,
+                Provide::AllVariables(span) => self.provide_all_variables(mc).map_err(|error| (error, span))?,
+                Provide::AllFrom { module, span } => {
+                    let symbols = Symbols::of_arena(mc).map_err(|error| (error.into(), span))?;
+                    self.provide_all_from(mc, symbols, &module).map_err(|error| (error, span))?;
+                }
                 Provide::Struct { name, constructors, span } => {
                     let Some(Binding::Slot(constructor)) = self.binding(name) else { return Err((ModuleError::NotDefined, span)) };
                     self.provide_struct(mc, constructor, constructors).map_err(|error| (error, span))?;
@@ -1476,7 +1727,12 @@ impl<'gc> ModuleBuilder<'gc> {
                 // For a keyword procedure, the lambda is lowered to the core procedure, and the core has its own slot.
                 let procedure = matches!(value, Core::Lambda(_) | Core::OptionalLambda(_));
                 let defined = self.cores.get(&slot).map_or(slot, |&(core, _)| core);
-                (Core::Set(Place::Slot { slot, checked: false }, Box::new(value)), if procedure { Some(defined) } else { None })
+                let defining = if procedure {
+                    Some(defined)
+                } else {
+                    None
+                };
+                (Core::Set(Place::Slot { slot, checked: false }, Box::new(value)), defining)
             }
         };
         let unit = Unit { builder: self, form, defining, assigned: RefCell::default() };
@@ -1489,11 +1745,58 @@ impl<'gc> ModuleBuilder<'gc> {
         Ok(thunk)
     }
 
+    /// Returns what another module can reach of the module's macros and of the bindings that they refer to.
+    fn reached(&self) -> Reached<'gc> {
+        let mut reached = Reached { macros: HashSet::default(), names: Vec::new(), slots: Vec::new() };
+        let mut todo: Vec<Value<'gc>> = self.referenced.clone();
+        for &slot in &self.referenced_slots {
+            todo.push(Value::fixnum(i64::from(slot)).expect("slots are fixnums"));
+        }
+        for &(_, provided) in &self.exports {
+            if let Provided::Macro(slot, _) = provided
+                && reached.macros.insert(slot)
+            {
+                todo.extend(self.macro_refs.get(&slot).into_iter().flatten().copied());
+            }
+        }
+        let mut seen = HashSet::default();
+        while let Some(key) = todo.pop() {
+            if !seen.insert(key.to_bits()) {
+                continue;
+            }
+            // A fixnum is the slot of a binding without a name. Anything else is a name.
+            let held = match key.as_fixnum().and_then(|slot| u32::try_from(slot).ok()) {
+                Some(slot) => {
+                    reached.slots.push(slot);
+                    if self.private_macros.contains_key(&slot) {
+                        Some(slot)
+                    } else {
+                        None
+                    }
+                }
+                None => {
+                    reached.names.push(key);
+                    self.macros.get(&key.to_bits()).map(|&(slot, _)| slot)
+                }
+            };
+            if let Some(slot) = held
+                && reached.macros.insert(slot)
+            {
+                todo.extend(self.macro_refs.get(&slot).into_iter().flatten().copied());
+            }
+        }
+        reached
+    }
+
     /// Returns the export of variable `slot`. The `core` field is left as `None`, even for a keyword procedure.
     fn export(&self, slot: u32) -> Export {
         let mutable = self.assigned.contains(&slot);
         // Do not inline procedures that read mutated module slots; otherwise callers would observe stale values captured at import time.
-        let inline = if mutable { None } else { self.procedures.get(&slot).map(|(inline, _)| inline).or(self.inlines.get(&slot)).filter(|inline| inline.slots().all(|read| !self.assigned.contains(&read))).cloned() };
+        let inline = if mutable {
+            None
+        } else {
+            self.procedures.get(&slot).map(|(inline, _)| inline).or(self.inlines.get(&slot)).filter(|inline| inline.slots().all(|read| !self.assigned.contains(&read))).cloned()
+        };
         Export { slot, mutable, inline, core: None, structure: self.structs.get(&slot).cloned().map(Box::new), transformer: None }
     }
 
@@ -1518,16 +1821,35 @@ impl<'gc> ModuleBuilder<'gc> {
     }
 
     /// Finalizes the module after all top-level forms are compiled, publishing its [`Interface`] and returning the module instance.
+    ///
+    /// The module keeps the transformer of a macro only if another module can reach the macro. That is the case for:
+    ///
+    /// - a macro that the module provides
+    /// - a macro that the output of such a macro can refer to, directly or through further macros. See [`ModuleBuilder::macro_refers`].
+    /// - a macro that syntax in the module's code refers to. See [`ModuleBuilder::refer`].
+    ///
+    /// The transformer of any other macro is dropped with the builder. The bindings that the kept macros and that syntax refer to are kept in the interface in the same way.
     pub fn finish(mut self, mc: &Mutation<'gc>) -> Result<Gc<'gc, Module>, OutOfMemory> {
         let module = match self.module {
             Some(module) => module,
             None => self.start(mc)?,
         };
+        let reached = self.reached();
+        for &(slot, transformer) in &self.presets {
+            if reached.macros.contains(&slot) {
+                module.items(mc).set(mc, slot as usize, transformer);
+            }
+        }
         let mut exports = HashMap::default();
+        let mut forwards = HashMap::default();
         for &(ref name, provided) in &self.exports {
             let out = match provided {
                 Provided::Variable(slot) => self.variable(slot),
                 Provided::Macro(slot, language) => Self::transformer(slot, language),
+                Provided::Forward(import, holder) => {
+                    forwards.insert(name.clone(), Forward { holder, name: import.name.into() });
+                    continue;
+                }
                 // Bind the export to the struct type descriptor slot rather than the constructor, restricting use to pattern matching.
                 Provided::Matching(constructor) => {
                     let def = self.structs.get(&constructor).expect("a struct's constructor").clone();
@@ -1542,14 +1864,14 @@ impl<'gc> ModuleBuilder<'gc> {
         for &(ref external, provided) in &self.exports {
             let slot = match provided {
                 Provided::Variable(slot) | Provided::Macro(slot, _) => slot,
-                Provided::Matching(_) => continue,
+                Provided::Matching(_) | Provided::Forward(..) => continue,
             };
             let internal = self.text(mc, slot);
             if internal != **external {
                 locals.insert(internal.into(), exports[external].clone());
             }
         }
-        for &name in &self.referenced {
+        for &name in &reached.names {
             let (slot, local) = match (self.macros.get(&name.to_bits()), self.bindings.get(&name.to_bits())) {
                 (Some(&(slot, language)), _) => (slot, Self::transformer(slot, language)),
                 (None, Some(&Binding::Slot(slot))) => (slot, self.variable(slot)),
@@ -1560,7 +1882,15 @@ impl<'gc> ModuleBuilder<'gc> {
                 locals.insert(internal.into(), local);
             }
         }
-        ragwort_vm::module::set_interface(mc, module, Interface { exports, locals })?;
+        let mut hidden = HashMap::default();
+        for &slot in &reached.slots {
+            let export = match self.private_macros.get(&slot) {
+                Some(&language) => Self::transformer(slot, language),
+                None => self.variable(slot),
+            };
+            hidden.insert(slot, (self.text(mc, slot).into(), export));
+        }
+        ragwort_vm::module::set_interface(mc, module, Interface { exports, locals, forwards, hidden })?;
         Ok(module)
     }
 }

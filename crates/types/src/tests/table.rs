@@ -115,7 +115,11 @@ fn entries_stay_in_the_order_they_were_added() {
             table.set(mc, fix(extra), Value::NULL).unwrap();
         }
         let kept = keys.iter().filter(|&&key| key % 10 == 0 && key != keys[3]).map(|&key| fix(key));
-        let last = if keys[3] % 10 == 0 { Some(fix(keys[3])) } else { None };
+        let last = if keys[3] % 10 == 0 {
+            Some(fix(keys[3]))
+        } else {
+            None
+        };
         let expected: Vec<_> = kept.chain(last).chain((5000..9000).map(fix)).collect();
         assert_eq!(table.entries(mc).unwrap().map(|(key, _)| key).collect::<Vec<_>>(), expected);
         assert_eq!(table.len(mc), expected.len());
@@ -159,7 +163,12 @@ fn keys_are_the_same_by_value_or_by_identity_as_their_kind_has_it() {
         assert_eq!(table.get(mc, symbol(mc, "other")), Ok(None));
         // Numbers are compared by value and exactness.
         fn big<'gc>(nums: &Nums<'_, 'gc>, negative: bool) -> Value<'gc> {
-            int::from_i128(nums, if negative { -(1 << 100) } else { 1 << 100 }).unwrap().value()
+            let large = if negative {
+                -(1 << 100)
+            } else {
+                1 << 100
+            };
+            int::from_i128(nums, large).unwrap().value()
         }
         let (one, one_inexact, huge) = (add(mc, table, fix(1)), add(mc, table, Value::flonum(mc, 1.0).unwrap()), add(mc, table, big(&nums, false)));
         assert_eq!(table.get(mc, fix(1)), Ok(Some(one)));
@@ -340,7 +349,12 @@ impl ExternalTable for Author {
     }
 
     fn get<'gc>(&self, mc: &Mutation<'gc>, key: Key<'_>) -> Result<Option<Value<'gc>>, Error> {
-        Ok(if self.has(key) { Some(text(mc, self.0)) } else { None })
+        let found = if self.has(key) {
+            Some(text(mc, self.0))
+        } else {
+            None
+        };
+        Ok(found)
     }
 
     fn keys(&self) -> impl Iterator<Item = Key<'_>> {
@@ -1313,13 +1327,25 @@ impl Event {
     const FIELDS: [&str; 3] = ["x", "y", "z"];
 
     fn field<'gc>(&self, position: usize) -> Option<Value<'gc>> {
-        if position < if self.partial { 2 } else { 3 } { Some(fix(position as i64 + 1)) } else { None }
+        if position < if self.partial {
+            2
+        } else {
+            3
+        } {
+            Some(fix(position as i64 + 1))
+        } else {
+            None
+        }
     }
 }
 
 impl ExternalTable for Event {
     fn len(&self) -> usize {
-        if self.partial { 2 } else { 3 }
+        if self.partial {
+            2
+        } else {
+            3
+        }
     }
 
     fn has(&self, key: Key<'_>) -> bool {

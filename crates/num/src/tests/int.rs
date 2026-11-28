@@ -276,7 +276,11 @@ fn square_roots() {
             let s = abs(&h, h.random(&mut rng, 6)).unwrap();
             let square = mul(&h, s, s).unwrap();
             let one = from_i64(&h, 1).unwrap();
-            let below = if sign(&h, square) == Ordering::Greater { sub(&h, square, one).unwrap() } else { square };
+            let below = if sign(&h, square) == Ordering::Greater {
+                sub(&h, square, one).unwrap()
+            } else {
+                square
+            };
             for x in [square, below, add(&h, square, one).unwrap(), abs(&h, h.random(&mut rng, 8)).unwrap()] {
                 oracle.case("isqrt", &[h.show(x)], h.show(isqrt(&h, x).unwrap()));
             }

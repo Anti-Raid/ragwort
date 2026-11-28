@@ -146,7 +146,11 @@ impl<'a, 'gc> Tree<'a, 'gc> {
             Shape::Datum(value) => View::Datum(value),
             Shape::List { first, len, dotted } => {
                 let mut items = self.kids_of(stx, first, len)?;
-                let tail = if dotted { items.pop() } else { None };
+                let tail = if dotted {
+                    items.pop()
+                } else {
+                    None
+                };
                 View::List(items, tail)
             }
             Shape::Vector { first, len } => View::Vector(self.kids_of(stx, first, len)?),
@@ -239,7 +243,11 @@ impl<'a, 'gc> Tree<'a, 'gc> {
                 Task::Visit(stx) => stx,
                 Task::List(len, dotted) => {
                     let mut items = done.split_off(done.len() - len as usize);
-                    let tail = if dotted { items.pop().expect("a dotted list has a tail") } else { Value::NULL };
+                    let tail = if dotted {
+                        items.pop().expect("a dotted list has a tail")
+                    } else {
+                        Value::NULL
+                    };
                     done.push(Pairs::new(mc).list_with_tail(items, tail)?);
                     continue;
                 }

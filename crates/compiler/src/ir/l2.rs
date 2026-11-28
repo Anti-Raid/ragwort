@@ -86,7 +86,11 @@ impl<'id, 'gc> L2<'id, 'gc> {
         let (&kind, values) = self[args].split_first()?;
         let Node::Quote(kind) = self[kind] else { return None };
         let kind = kind.downcast::<StructType>(mc)?;
-        if kind.fields(mc) as usize == values.len() { Some((kind, args)) } else { None }
+        if kind.fields(mc) as usize == values.len() {
+            Some((kind, args))
+        } else {
+            None
+        }
     }
 
     /// Returns whether evaluating `id` cannot fault or cause side effects.

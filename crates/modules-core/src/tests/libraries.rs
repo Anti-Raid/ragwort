@@ -266,7 +266,7 @@ static REPEAT: Library = Library {
     files: &[LibraryFile::scheme(
         "repeat.rg",
         "(require lib/loops)
-         (provide repeat)
+         (provide repeat tally)
          (define (step n) (+ n 1))
          (define-syntax repeat
            (syntax-rules (times)
@@ -288,7 +288,7 @@ fn a_librarys_macros_work_from_its_image() {
                 (repeat 4 times (set! total (+ total 10)))
                 (list total (tally 'done) (tally 'again))";
     assert_eq!(program(&mut arena, &libraries, None, text).unwrap(), "(40 1 2)");
-    // Each arena has its own state of the library that the macro's output uses.
+    // Each arena has its own state of the library that the macro's output uses. `lib/repeat` passes on `tally` from `lib/loops`.
     let mut other = started(&libraries);
-    assert_eq!(program(&mut other, &libraries, None, "(require lib/loops) (tally 'first)").unwrap(), "1");
+    assert_eq!(program(&mut other, &libraries, None, "(require lib/repeat) (tally 'first)").unwrap(), "1");
 }

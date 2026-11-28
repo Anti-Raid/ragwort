@@ -207,7 +207,11 @@ impl<'gc> Compound<'gc> {
         }
         // Struct instances belonging to an identity type compare `equal?` strictly by pointer identity (`eq?`).
         if let Some(made) = value.downcast::<objects::Struct>(mc) {
-            return if made.kind(mc).is_some_and(|kind| !structs::type_flags(mc, kind).contains(TypeFlags::IDENTITY)) { Some(Compound::Struct(made)) } else { None };
+            return if made.kind(mc).is_some_and(|kind| !structs::type_flags(mc, kind).contains(TypeFlags::IDENTITY)) {
+                Some(Compound::Struct(made))
+            } else {
+                None
+            };
         }
         value.downcast::<objects::Box>(mc).map(Compound::Box)
     }
@@ -281,7 +285,11 @@ impl Classes<'_> {
         if first == second {
             return Ok(true);
         }
-        let (small, large) = if self.size[first] < self.size[second] { (first, second) } else { (second, first) };
+        let (small, large) = if self.size[first] < self.size[second] {
+            (first, second)
+        } else {
+            (second, first)
+        };
         self.parent[small] = large;
         self.size[large] += self.size[small];
         Ok(false)

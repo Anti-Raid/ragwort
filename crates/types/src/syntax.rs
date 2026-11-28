@@ -138,7 +138,11 @@ fn frozen_slice<'gc, T: Copy + Default + 'static>(
 fn line_starts(bytes: &[u8]) -> impl Iterator<Item = u32> + '_ {
     std::iter::once(0).chain(bytes.iter().enumerate().filter_map(|(i, &byte)| {
         // CRLF is one newline; a lone CR also starts a line.
-        if byte == b'\n' || byte == b'\r' && bytes.get(i + 1) != Some(&b'\n') { Some((i + 1) as u32) } else { None }
+        if byte == b'\n' || byte == b'\r' && bytes.get(i + 1) != Some(&b'\n') {
+            Some((i + 1) as u32)
+        } else {
+            None
+        }
     }))
 }
 
@@ -155,7 +159,11 @@ impl<'gc> SyntaxSpan<'gc> {
     /// Returns a span of `source`, or `None` unless `start <= end <= source.byte_len()`.
     #[inline]
     pub fn new(mc: &Mutation<'gc>, source: SyntaxSource<'gc>, start: u32, end: u32) -> Option<Self> {
-        if start <= end && end as usize <= source.byte_len(mc) { Some(Self { source: Some(source), start, end }) } else { None }
+        if start <= end && end as usize <= source.byte_len(mc) {
+            Some(Self { source: Some(source), start, end })
+        } else {
+            None
+        }
     }
 
     fn of(source: Option<Gc<'gc, objects::SyntaxSource>>, word: u64) -> Self {

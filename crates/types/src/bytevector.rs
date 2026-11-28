@@ -267,7 +267,11 @@ impl<'gc> AnyBytevector<'gc> {
     #[inline]
     pub fn get(self, mc: &Mutation<'gc>, index: usize) -> Option<u8> {
         let Some((len, words)) = self.inside(mc) else { return self.outside(mc, |bytes| bytes.get(index).copied()) };
-        if index < len { Some((words.get(index / 8) >> (index % 8 * 8)) as u8) } else { None }
+        if index < len {
+            Some((words.get(index / 8) >> (index % 8 * 8)) as u8)
+        } else {
+            None
+        }
     }
 
     /// Returns the `size` bytes from `index` as an integer, least significant first. `size` is 1 to 8. Returns `None` if the bytes are not all within the bytevector.

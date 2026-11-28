@@ -152,7 +152,11 @@ impl<'gc> Context<'_, 'gc> {
     pub(crate) fn hint(&self, hint: u16) -> Option<(Slots<'gc>, usize)> {
         let hints = self.code.hints(self.mc)?.items(self.mc);
         let slot = HINT_SLOTS * usize::from(hint);
-        if slot + HINT_SLOTS <= hints.len() { Some((hints, slot)) } else { None }
+        if slot + HINT_SLOTS <= hints.len() {
+            Some((hints, slot))
+        } else {
+            None
+        }
     }
 
     /// Reads the key of hint `hint` in the table in register `table`, at the first place that the hint remembers. That place has the key whenever the instruction reads tables of one shape, or one table, again and again.
@@ -553,7 +557,11 @@ impl Op {
                     return Err(Fault::Malformed);
                 }
                 // Arithmetic and comparison of two small integers is done here, as in `Op::CallIntrinsic2`. A procedure whose body is `(+ a b)` ends with this instruction.
-                let small = if args == 2 { intrinsic.small(frame.get(base), frame.get(base + 1)) } else { None };
+                let small = if args == 2 {
+                    intrinsic.small(frame.get(base), frame.get(base + 1))
+                } else {
+                    None
+                };
                 cx.acc = match small {
                     Some(value) => value,
                     None => {

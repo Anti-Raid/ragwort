@@ -85,7 +85,11 @@ impl<'gc, T: Object> Raw<'gc> for Gc<'gc, T> {
     #[inline]
     fn member<U: Object>(self, mc: &Mutation<'gc>, field: usize) -> Option<Gc<'gc, U>> {
         let index = self.word(mc, field) as u32;
-        if index != 0 { Some(Gc::new(index)) } else { None }
+        if index != 0 {
+            Some(Gc::new(index))
+        } else {
+            None
+        }
     }
 
     #[inline]

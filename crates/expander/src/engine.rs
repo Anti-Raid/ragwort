@@ -29,10 +29,10 @@ pub const MACRO_FUEL: u64 = 1 << 26;
 /// - 0: a local variable. The number is its `Var` number.
 /// - 1: a macro. The number is the index of its transformer in `Engine::macros`.
 /// - 2: a `syntax-case` pattern variable. The number is the `Var` number of the local that holds its match.
-/// - 3: a private module variable, which the module does not bind by name, such as one that a macro's output defines. The number is its slot.
 ///
-/// `Named(module, name)` is a binding known by name. It holds the raw bits of two values:
+/// `Named(module, name)` is a binding of a module. It holds the raw bits of two values:
 /// - For a variable or a macro that the module being expanded binds by name, the module's name and the identifier's name.
+/// - For a variable or a macro that the output of a macro defined at the top level, the module's name and the binding's slot as a fixnum. The module does not bind it by name.
 /// - For an import, the exporting module and the name that the module itself uses for the binding.
 /// - For an identifier with no binding, the name of the module being expanded and the identifier's name.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -59,6 +59,14 @@ pub enum Binding<'gc, K> {
     /// A pattern variable of `syntax-case`. Only a `syntax` template can refer to it. `var` is the local that holds
     /// its match. `depth` is the number of ellipses that the variable is under. The match is a list nested `depth` levels deep.
     Pattern { var: Var, depth: u32 },
+}
+
+/// What a lookup of an identifier found.
+pub(crate) enum Found<'gc, K> {
+    Bound(Binding<'gc, K>),
+    /// A macro that the module binds by name, and that this load has no binding for: a file of the module in another language defined it. The number is the slot that
+    /// holds its transformer.
+    ModuleMacro(u32),
 }
 
 /// The state of one expansion. `K` is the front end's type of keywords.
@@ -99,8 +107,18 @@ pub struct Engine<'a, 'gc, K> {
     /// For each entry of `macros`, where the macro is bound by name: a module or a module's name, and the macro's name in that module. `None` for a macro
     /// that no module binds by name.
     pub(crate) macro_names: Vec<Option<(Value<'gc>, Value<'gc>)>>,
+    /// For each entry of `macros` that a top-level form of this load defines: the bindings of the module that the macro's quoted syntax refers to. It is empty for every other entry.
+    pub(crate) macro_refs: Vec<Vec<Value<'gc>>>,
     /// The index in `macros` of each macro of another module that the load has used, keyed by the raw bits of the module and the slot of the transformer.
     imported: Map<(u64, u32), u32>,
+    /// The index in `macros` of each macro that the load has used from a file of the module in another language, keyed by the slot of the transformer.
+    shared: Map<u32, u32>,
+    /// Whether the syntax being converted to syntax objects is quoted: it is part of the code, such as a template. See [`Engine::quote`].
+    pub(crate) quoting: bool,
+    /// The bindings of the module that quoted syntax refers to, collected since the last transformer started: names, and the slots of bindings without a name as fixnums.
+    pub(crate) quoted: Vec<Value<'gc>>,
+    /// Whether the expression being expanded is the transformer of a macro defined at the top level.
+    pub(crate) in_transformer: bool,
     /// The machine that runs the transformers. It is created when the first transformer runs, and reused for the later ones.
     pub machine: Option<Machine>,
     /// The fuel that `machine` gets when it is created. All transformers of the load share it.
@@ -215,7 +233,12 @@ impl<'a, 'gc, K: Copy + PartialEq + fmt::Debug> Engine<'a, 'gc, K> {
             language,
             macros: Vec::new(),
             macro_names: Vec::new(),
+            macro_refs: Vec::new(),
             imported: Map::default(),
+            shared: Map::default(),
+            quoting: false,
+            quoted: Vec::new(),
+            in_transformer: false,
             machine: None,
             fuel: MACRO_FUEL,
             unwrapped: Map::default(),
@@ -309,7 +332,11 @@ impl<'a, 'gc, K: Copy + PartialEq + fmt::Debug> Engine<'a, 'gc, K> {
 
     /// Returns `error`. If `error` has an empty span, as an out-of-memory error has, the result has the span of `stx` instead.
     pub fn placed(&self, error: ExpandError, stx: Stx) -> ExpandError {
-        if error.start == error.end { self.error(error.kind, stx) } else { error }
+        if error.start == error.end {
+            self.error(error.kind, stx)
+        } else {
+            error
+        }
     }
 
     /// Returns the binding that the identifier `id` refers to. An import of a macro is returned as the macro.
@@ -317,10 +344,36 @@ impl<'a, 'gc, K: Copy + PartialEq + fmt::Debug> Engine<'a, 'gc, K> {
         let symbol = self.tree.symbol(id).expect("only identifiers resolve");
         let set = self.tree.scopes_of(id)?;
         let origin = self.origin(id, set);
-        match self.resolve_name(symbol, set, origin).map_err(|Ambiguous| self.error(ExpandErrorKind::Ambiguous, id))? {
-            Binding::Import(import) if import.export.transformer.is_some() => Ok(Binding::Macro(self.imported_macro(import, id)?)),
-            binding => Ok(binding),
+        match self.find(symbol, set, origin).map_err(|Ambiguous| self.error(ExpandErrorKind::Ambiguous, id))? {
+            Found::Bound(Binding::Import(import)) if import.export.transformer.is_some() => Ok(Binding::Macro(self.imported_macro(import, id)?)),
+            Found::ModuleMacro(slot) => Ok(Binding::Macro(self.module_macro(symbol, slot, id)?)),
+            Found::Bound(binding) => Ok(binding),
         }
+    }
+
+    /// Returns the index in `macros` of the macro named `symbol` that another file of the module defines. `slot` holds its transformer, and `at` is the identifier that refers to it.
+    fn module_macro(&mut self, symbol: Symbol<'gc>, slot: u32, at: Stx) -> Result<u32, ExpandError> {
+        if let Some(&macro_index) = self.shared.get(&slot) {
+            return Ok(macro_index);
+        }
+        let Some((language, transformer)) = self.module.macro_at(slot) else { return Err(self.error(ExpandErrorKind::Unbound, at)) };
+        if language != module::CORE && language != self.language {
+            return Err(self.error(ExpandErrorKind::Language, at));
+        }
+        // The module binds the macro by name, or keeps it by its slot.
+        let name = symbol.value(self.mc);
+        let bound_as = if self.module.macro_named(name) == Some(slot) {
+            name
+        } else {
+            Value::fixnum(i64::from(slot)).expect("slots are fixnums")
+        };
+        let macro_index = u32::try_from(self.macros.len()).map_err(|_| self.error(ExpandErrorKind::Transformer, at))?;
+        self.tree.scopes.charge(size_of::<(u32, u32)>())?;
+        self.macros.push(transformer);
+        self.macro_refs.push(Vec::new());
+        self.macro_names.push(Some((self.module.name(), bound_as)));
+        self.shared.insert(slot, macro_index);
+        Ok(macro_index)
     }
 
     /// Returns whether the identifier `id` was read from the module's own source, or made by one of the module's own macros. Any other
@@ -333,7 +386,11 @@ impl<'a, 'gc, K: Copy + PartialEq + fmt::Debug> Engine<'a, 'gc, K> {
     /// Returns the origin of the identifier `id`, whose scope set is `set`, if a macro of another module introduced `id`. Such an identifier lacks the
     /// `TOP` scope, which everything read from the module's own source has.
     pub fn origin(&self, id: Stx, set: Set) -> Option<Value<'gc>> {
-        if self.tree.scopes.contains(set, TOP) { None } else { self.tree.origin(id) }
+        if self.tree.scopes.contains(set, TOP) {
+            None
+        } else {
+            self.tree.origin(id)
+        }
     }
 
     /// Returns the index in `macros` of the transformer of `import`, an import of a macro. `at` is the identifier that refers to the macro.
@@ -347,82 +404,124 @@ impl<'a, 'gc, K: Copy + PartialEq + fmt::Debug> Engine<'a, 'gc, K> {
             return Err(self.error(ExpandErrorKind::Language, at));
         }
         let items = import.module.items(mc);
-        let transformer = if (import.export.slot as usize) < items.len() { items.get(import.export.slot as usize) } else { Value::UNDEFINED };
+        let transformer = if (import.export.slot as usize) < items.len() {
+            items.get(import.export.slot as usize)
+        } else {
+            Value::UNDEFINED
+        };
         if transformer == Value::UNDEFINED {
             return Err(self.error(ExpandErrorKind::Unbound, at));
         }
         let macro_index = u32::try_from(self.macros.len()).map_err(|_| self.error(ExpandErrorKind::Transformer, at))?;
         self.tree.scopes.charge(size_of::<((u64, u32), u32)>())?;
         self.macros.push(transformer);
+        self.macro_refs.push(Vec::new());
         self.macro_names.push(Some((Value::object(mc, import.module), internal_name(mc, import))));
         self.imported.insert(imported_key, macro_index);
         Ok(macro_index)
     }
 
     /// Binds the identifier `id` to the macro with index `macro_index`, which the top-level form with index `form` defines. If `id` was read
-    /// from the module's source, the module binds the macro by name, and can provide it.
+    /// from the module's source, the module binds the macro by name, and can provide it. Otherwise a macro's output defined the macro, and the module keeps it by its slot.
     pub fn bind_macro(&mut self, id: Stx, macro_index: u32, form: u32) -> Result<(), ExpandError> {
         self.bind(id, Binding::Macro(macro_index))?;
-        if self.tree.scopes_of(id)? == self.top {
-            let name = self.tree.symbol(id).expect("only identifiers are bound").value(self.mc);
-            self.module.define_macro(name, form, self.language, self.macros[macro_index as usize]).map_err(|error| self.module_error(error, id))?;
+        let name = self.tree.symbol(id).expect("only identifiers are bound").value(self.mc);
+        let transformer = self.macros[macro_index as usize];
+        let slot = if self.tree.scopes_of(id)? == self.top {
+            let slot = self.module.define_macro(name, form, self.language, transformer).map_err(|error| self.module_error(error, id))?;
             self.macro_names[macro_index as usize] = Some((self.module.name(), name));
-        }
+            slot
+        } else {
+            let slot = self.module.define_private_macro(name, form, self.language, transformer).map_err(|error| self.module_error(error, id))?;
+            self.macro_names[macro_index as usize] = Some((self.module.name(), Value::fixnum(i64::from(slot)).expect("slots are fixnums")));
+            slot
+        };
+        // The module keeps the transformer only if another module can reach the macro. It then also keeps what the macro's output refers to.
+        let refers_to = std::mem::take(&mut self.macro_refs[macro_index as usize]);
+        self.module.macro_refers(slot, refers_to);
         Ok(())
     }
 
     /// Returns what the identifier named `symbol` refers to in the module of its origin. `origin` is the binding value that a macro of that module gave the identifier.
-    fn resolve_origin(&self, symbol: Symbol<'gc>, origin: Value<'gc>) -> Binding<'gc, K> {
+    fn resolve_origin(&self, symbol: Symbol<'gc>, origin: Value<'gc>) -> Found<'gc, K> {
         let mc = self.mc;
         let name_key = key(symbol, mc);
         // A symbol is the binding value of a keyword or a core form.
         if Symbol::of(origin).is_some() {
-            return match (self.keywords.get(&name_key), self.core_names.get(&name_key)) {
+            return Found::Bound(match (self.keywords.get(&name_key), self.core_names.get(&name_key)) {
                 (Some(&keyword), _) => Binding::Keyword(keyword),
                 (None, Some(&form)) => Binding::Core(form),
                 (None, None) => Binding::Free,
-            };
+            });
         }
         let named = AnyVector::of(origin).filter(|vector| vector.len(mc) == 2);
-        let Some((module, name)) = named.and_then(|vector| Some((vector.get(mc, 0)?.downcast::<Module>(mc)?, Symbol::of(vector.get(mc, 1)?)?))) else { return Binding::Free };
-        let name: String = chars(&self.strings, name.name(mc)).collect();
-        match module::interface(mc, module).and_then(|interface| interface.internal(&name)) {
+        let Some((bound_in, key)) = named.and_then(|vector| Some((vector.get(mc, 0)?, vector.get(mc, 1)?))) else { return Found::Bound(Binding::Free) };
+        let slot = key.as_fixnum().and_then(|slot| u32::try_from(slot).ok());
+        // The macro is of a file of this module in another language. The module is not finished, so its builder has the binding.
+        if bound_in == self.module.name() {
+            let found = match (slot, Symbol::of(key)) {
+                (Some(slot), _) => Some(slot),
+                (None, Some(_)) => self.module.macro_named(key),
+                (None, None) => None,
+            };
+            return match (found.filter(|&slot| self.module.macro_at(slot).is_some()), slot, self.module.binding(key)) {
+                (Some(slot), _, _) => Found::ModuleMacro(slot),
+                (None, Some(slot), _) => Found::Bound(Binding::Slot(slot)),
+                (None, None, Some(module::Binding::Slot(slot))) => Found::Bound(Binding::Slot(slot)),
+                (None, None, Some(module::Binding::Import(import))) => Found::Bound(Binding::Import(import)),
+                (None, None, None) => Found::Bound(Binding::Free),
+            };
+        }
+        let Some(module) = bound_in.downcast::<Module>(mc) else { return Found::Bound(Binding::Free) };
+        let Some(interface) = module::interface(mc, module) else { return Found::Bound(Binding::Free) };
+        // The module binds a name, or it keeps a binding that a macro's output defined by its slot.
+        let found = match (Symbol::of(key), slot) {
+            (Some(name), _) => interface.internal(&chars(&self.strings, name.name(mc)).collect::<String>()),
+            (None, Some(slot)) => interface.hidden(slot),
+            (None, None) => None,
+        };
+        Found::Bound(match found {
             Some((name, export)) => Binding::Import(Import { module, export, name }),
             None => Binding::Free,
-        }
+        })
     }
 
-    /// Returns the binding that an identifier named `symbol` with the scope set `set` refers to. `origin` is the identifier's origin, if it has one. See [`Engine::origin`].
-    pub fn resolve_name(&self, symbol: Symbol<'gc>, set: Set, origin: Option<Value<'gc>>) -> Result<Binding<'gc, K>, Ambiguous> {
+    /// Finds what an identifier named `symbol` with the scope set `set` refers to. `origin` is the identifier's origin, if it has one. See [`Engine::origin`].
+    pub(crate) fn find(&self, symbol: Symbol<'gc>, set: Set, origin: Option<Value<'gc>>) -> Result<Found<'gc, K>, Ambiguous> {
         let name_key = key(symbol, self.mc);
         if let Some(binding) = self.bindings.resolve(&self.tree.scopes, name_key, set)? {
-            return Ok(binding);
+            return Ok(Found::Bound(binding));
         }
         if let Some(origin) = origin {
             return Ok(self.resolve_origin(symbol, origin));
         }
         // An identifier with the `CORE` scope refers to a core form, even if the module binds the same name.
         if self.tree.scopes.contains(set, CORE) {
-            return Ok(self.core_names.get(&name_key).map_or(Binding::Free, |&form| Binding::Core(form)));
+            return Ok(Found::Bound(self.core_names.get(&name_key).map_or(Binding::Free, |&form| Binding::Core(form))));
         }
         // An identifier with the `BASE` scope refers to the prelude's binding, even if the module binds the same name.
         let base = self.tree.scopes.contains(set, BASE);
-        if !base && let Some(binding) = self.module.binding(symbol.value(self.mc)) {
-            return Ok(match binding {
+        // Only an identifier with the `TOP` scope refers to the module's bindings by name. Any other identifier comes from another module's expansion.
+        let own = self.tree.scopes.contains(set, TOP);
+        if own && !base && let Some(slot) = self.module.macro_named(symbol.value(self.mc)) {
+            return Ok(Found::ModuleMacro(slot));
+        }
+        if own && !base && let Some(binding) = self.module.binding(symbol.value(self.mc)) {
+            return Ok(Found::Bound(match binding {
                 module::Binding::Slot(slot) => Binding::Slot(slot),
                 module::Binding::Import(import) => Binding::Import(import),
-            });
+            }));
         }
         if let Some(&keyword) = self.keywords.get(&name_key) {
-            return Ok(Binding::Keyword(keyword));
+            return Ok(Found::Bound(Binding::Keyword(keyword)));
         }
         if self.source_core && let Some(&form) = self.core_names.get(&name_key) {
-            return Ok(Binding::Core(form));
+            return Ok(Found::Bound(Binding::Core(form)));
         }
         if base && let Some(&import) = self.base_cells.get(&name_key) {
-            return Ok(Binding::Import(import));
+            return Ok(Found::Bound(Binding::Import(import)));
         }
-        Ok(Binding::Free)
+        Ok(Found::Bound(Binding::Free))
     }
 
     pub fn bind(&mut self, id: Stx, binding: Binding<'gc, K>) -> Result<(), ExpandError> {
@@ -498,25 +597,33 @@ impl<'a, 'gc, K: Copy + PartialEq + fmt::Debug> Engine<'a, 'gc, K> {
         Ok(self.tree.id(symbol, self.base, span)?)
     }
 
-    /// Records which names the module's syntax refers to, so the module keeps their bindings for the macros that it exports. Call it after every
+    /// Collects the binding values of the module's own names, and tells the module's builder which bindings the syntax quoted in the module's code refers to. Call it after every
     /// form of the module is expanded, and before the module's builder is finished. Then pass the finished module to [`Sealed::patch`].
     pub fn seal(&mut self) -> Sealed<'gc> {
         let mc = self.mc;
         let own = self.module.name().to_bits();
+        // What is left in `quoted` was quoted outside the transformer of a top-level macro. Code can pass such syntax to another module.
+        for key in std::mem::take(&mut self.quoted) {
+            match key.as_fixnum().and_then(|slot| u32::try_from(slot).ok()) {
+                Some(slot) => self.module.refer_slot(slot),
+                None => self.module.refer(key),
+            }
+        }
         let mut patches = Vec::new();
         for (stamp, &value) in &self.binding_values {
             let Stamp::Named(bound_in, _) = *stamp else { continue };
             let Some(binding) = Vectors::new(mc).mutable(value).filter(|_| bound_in == own) else { continue };
             let name = binding.items(mc).get(1);
+            if name.as_fixnum().is_some() {
+                patches.push((binding, Patch::Own));
+                continue;
+            }
             let patch = match self.module.binding(name) {
                 _ if self.module.defines_macro(name) => Patch::Own,
                 Some(module::Binding::Slot(_)) => Patch::Own,
                 Some(module::Binding::Import(import)) => Patch::Import(Value::object(mc, import.module), internal_name(mc, import)),
                 None => continue,
             };
-            if matches!(patch, Patch::Own) {
-                self.module.refer(name);
-            }
             patches.push((binding, patch));
         }
         Sealed { patches }

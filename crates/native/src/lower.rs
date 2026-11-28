@@ -527,7 +527,11 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
             }
             let items = self.proper(spec)?;
             let Some((&head, args)) = items.split_first() else { return Err(self.error(ExpandErrorKind::BadSyntax, spec)) };
-            let word = if self.is_id(head) { self.text(head) } else { None };
+            let word = if self.is_id(head) {
+                self.text(head)
+            } else {
+                None
+            };
             let (filter, inner) = match (word.as_deref(), args) {
                 (Some("only-in"), &[inner, ref names @ ..]) => (Filter::Only(self.identifiers(names)?), inner),
                 (Some("except-in"), &[inner, ref names @ ..]) => (Filter::Except(self.identifiers(names)?), inner),
@@ -556,9 +560,20 @@ impl<'a, 'gc> Lowerer<'a, 'gc> {
         }
         let items = self.proper(spec)?;
         let Some((&head, args)) = items.split_first() else { return Err(self.error(ExpandErrorKind::BadSyntax, spec)) };
-        let word = if self.is_id(head) { self.text(head) } else { None };
+        let word = if self.is_id(head) {
+            self.text(head)
+        } else {
+            None
+        };
         match (word.as_deref(), args) {
             (Some("all-defined-out"), []) => out.push(Provide::AllDefined(span)),
+            (Some("all-var-defined-out"), []) => out.push(Provide::AllVariables(span)),
+            (Some("all-from-out"), modules) => {
+                for &module in modules {
+                    let Some(name) = self.text(module) else { return Err(self.error(ExpandErrorKind::BadSyntax, module)) };
+                    out.push(Provide::AllFrom { module: name, span: self.engine.tree.span(module) });
+                }
+            }
             (Some("struct-out"), &[name, ref options @ ..]) => {
                 if !self.is_id(name) {
                     return Err(self.error(ExpandErrorKind::BadSyntax, name));
